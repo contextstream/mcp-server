@@ -17,6 +17,33 @@ const uuidSchema = z.string().uuid();
 export class ContextStreamClient {
   constructor(private config: Config) {}
 
+  /**
+   * Update the client's default workspace/project IDs at runtime.
+   *
+   * This is useful for multi-workspace users: once a session is initialized
+   * (via repo mapping or explicit session_init), the MCP server can treat that
+   * workspace as the default for subsequent calls that don't explicitly include
+   * `workspace_id` in the request payload/path/query.
+   */
+  setDefaults(input: { workspace_id?: string; project_id?: string }) {
+    if (input.workspace_id) {
+      try {
+        uuidSchema.parse(input.workspace_id);
+        this.config.defaultWorkspaceId = input.workspace_id;
+      } catch {
+        // ignore invalid IDs
+      }
+    }
+    if (input.project_id) {
+      try {
+        uuidSchema.parse(input.project_id);
+        this.config.defaultProjectId = input.project_id;
+      } catch {
+        // ignore invalid IDs
+      }
+    }
+  }
+
   private withDefaults<T extends { workspace_id?: string; project_id?: string }>(
     input: T
   ): T {

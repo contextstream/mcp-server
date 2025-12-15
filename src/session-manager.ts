@@ -46,6 +46,15 @@ export class SessionManager {
   markInitialized(context: Record<string, unknown>) {
     this.initialized = true;
     this.context = context;
+
+    // Promote resolved workspace/project to client defaults so subsequent calls
+    // (including those without explicit workspace_id in payload/path/query)
+    // can still send X-Workspace-Id for workspace-pooled rate limits.
+    const workspaceId = typeof context.workspace_id === 'string' ? (context.workspace_id as string) : undefined;
+    const projectId = typeof context.project_id === 'string' ? (context.project_id as string) : undefined;
+    if (workspaceId || projectId) {
+      this.client.setDefaults({ workspace_id: workspaceId, project_id: projectId });
+    }
   }
 
   /**
@@ -193,6 +202,10 @@ export class SessionManager {
 
       this.initialized = true;
       this.context = context;
+      this.client.setDefaults({
+        workspace_id: typeof context.workspace_id === 'string' ? (context.workspace_id as string) : undefined,
+        project_id: typeof context.project_id === 'string' ? (context.project_id as string) : undefined,
+      });
 
       console.error('[ContextStream] Workspace resolved:', context.workspace_name, '(source:', context.workspace_source, ')');
 

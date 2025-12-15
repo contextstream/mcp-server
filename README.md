@@ -119,6 +119,8 @@ CONTEXTSTREAM_API_KEY = "your_api_key"
 
 > Codex expects snake_case `mcp_servers` keys. After editing, fully restart Codex.
 
+> For workspace-pooled rate limiting (Team/Enterprise), the MCP server sends `X-Workspace-Id` based on the active repo/session (or explicit `workspace_id` in tool calls). You can optionally set `CONTEXTSTREAM_WORKSPACE_ID` as a fallback default, but it’s not required and isn’t a good fit if you frequently switch workspaces.
+
 ### AI Rules Files (Recommended)
 
 Adding rules files ensures your AI automatically uses ContextStream for memory on every conversation.

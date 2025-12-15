@@ -13,6 +13,9 @@ startCommand:
       CONTEXTSTREAM_API_KEY:
         type: string
         description: Your ContextStream API key (get one at contextstream.io)
+      CONTEXTSTREAM_WORKSPACE_ID:
+        type: string
+        description: Optional default workspace ID (enables workspace-pooled rate limiting for Team/Enterprise)
     required:
       - CONTEXTSTREAM_API_KEY
   commandFunction: |-
@@ -21,6 +24,7 @@ startCommand:
       args: ["-y", "@contextstream/mcp-server"],
       env: {
         CONTEXTSTREAM_API_URL: config.CONTEXTSTREAM_API_URL || "https://api.contextstream.io",
-        CONTEXTSTREAM_API_KEY: config.CONTEXTSTREAM_API_KEY
+        CONTEXTSTREAM_API_KEY: config.CONTEXTSTREAM_API_KEY,
+        ...(config.CONTEXTSTREAM_WORKSPACE_ID ? { CONTEXTSTREAM_WORKSPACE_ID: config.CONTEXTSTREAM_WORKSPACE_ID } : {})
       }
     })

@@ -47,6 +47,12 @@ export interface RequestOptions {
   signal?: AbortSignal;
   retries?: number;
   retryDelay?: number;
+  /**
+   * Optional workspace ID for workspace-pooled rate limiting (Team/Enterprise plans).
+   * If omitted, this is inferred from `body.workspace_id`, query `workspace_id`, or well-known URL paths,
+   * and finally falls back to `config.defaultWorkspaceId` when present.
+   */
+  workspaceId?: string;
 }
 
 const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
@@ -75,6 +81,12 @@ export async function request<T>(
   };
   if (apiKey) headers['X-API-Key'] = apiKey;
   if (jwt) headers['Authorization'] = `Bearer ${jwt}`;
+  const workspaceId =
+    options.workspaceId ||
+    inferWorkspaceIdFromBody(options.body) ||
+    inferWorkspaceIdFromPath(apiPath) ||
+    config.defaultWorkspaceId;
+  if (workspaceId) headers['X-Workspace-Id'] = workspaceId;
 
   const fetchOptions: RequestInit = {
     method: options.method || (options.body ? 'POST' : 'GET'),
@@ -133,8 +145,14 @@ export async function request<T>(
     }
 
     if (!response.ok) {
-      const message = payload?.message || payload?.error || response.statusText;
-      lastError = new HttpError(response.status, message, payload);
+      const rateLimit = parseRateLimitHeaders(response.headers);
+      const enrichedPayload = attachRateLimit(payload, rateLimit);
+
+      const message = extractErrorMessage(enrichedPayload, response.statusText);
+      lastError = new HttpError(response.status, message, enrichedPayload);
+
+      const apiCode = extractErrorCode(enrichedPayload);
+      if (apiCode) lastError.code = apiCode;
       
       // Retry on retryable status codes
       if (RETRYABLE_STATUSES.has(response.status) && attempt < maxRetries) {
@@ -151,4 +169,104 @@ export async function request<T>(
   }
 
   throw lastError || new HttpError(0, 'Request failed after retries');
+}
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && UUID_RE.test(value);
+}
+
+function inferWorkspaceIdFromBody(body: unknown): string | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const maybe = (body as any).workspace_id;
+  return isUuid(maybe) ? maybe : undefined;
+}
+
+function inferWorkspaceIdFromPath(apiPath: string): string | undefined {
+  // Query param (e.g., /projects?workspace_id=...)
+  const qIndex = apiPath.indexOf('?');
+  if (qIndex >= 0) {
+    try {
+      const query = apiPath.slice(qIndex + 1);
+      const params = new URLSearchParams(query);
+      const ws = params.get('workspace_id');
+      if (isUuid(ws)) return ws;
+    } catch {
+      // ignore
+    }
+  }
+
+  // Common path patterns:
+  // - /workspaces/:id
+  // - /memory/events/workspace/:id
+  // - /memory/nodes/workspace/:id
+  const match = apiPath.match(
+    /\/(?:workspaces|workspace)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i
+  );
+  return match?.[1];
+}
+
+type RateLimitHeaders = {
+  limit: number;
+  remaining: number;
+  reset: number;
+  scope: string;
+  plan: string;
+  group: string;
+  retryAfter?: number;
+};
+
+function parseRateLimitHeaders(headers: Headers): RateLimitHeaders | null {
+  const limit = headers.get('X-RateLimit-Limit');
+  if (!limit) return null;
+
+  const retryAfter = headers.get('Retry-After');
+
+  return {
+    limit: parseInt(limit, 10),
+    remaining: parseInt(headers.get('X-RateLimit-Remaining') || '0', 10),
+    reset: parseInt(headers.get('X-RateLimit-Reset') || '0', 10),
+    scope: headers.get('X-RateLimit-Scope') || 'unknown',
+    plan: headers.get('X-RateLimit-Plan') || 'unknown',
+    group: headers.get('X-RateLimit-Group') || 'default',
+    retryAfter: retryAfter ? parseInt(retryAfter, 10) : undefined,
+  };
+}
+
+function attachRateLimit(payload: any, rateLimit: RateLimitHeaders | null): any {
+  if (!rateLimit) return payload;
+
+  if (payload && typeof payload === 'object') {
+    return { ...payload, rate_limit: rateLimit };
+  }
+
+  return { error: payload, rate_limit: rateLimit };
+}
+
+function extractErrorMessage(payload: any, fallback: string): string {
+  if (!payload) return fallback;
+
+  // ContextStream API error format: { error: { code, message, details }, ... }
+  const nested = payload?.error;
+  if (nested && typeof nested === 'object' && typeof nested.message === 'string') {
+    return nested.message;
+  }
+
+  if (typeof payload.message === 'string') return payload.message;
+  if (typeof payload.error === 'string') return payload.error;
+  if (typeof payload.detail === 'string') return payload.detail;
+
+  return fallback;
+}
+
+function extractErrorCode(payload: any): string | null {
+  if (!payload) return null;
+  const nested = payload?.error;
+  if (nested && typeof nested === 'object' && typeof nested.code === 'string' && nested.code.trim()) {
+    return nested.code.trim();
+  }
+  if (typeof payload.code === 'string' && payload.code.trim()) return payload.code.trim();
+  return null;
 }

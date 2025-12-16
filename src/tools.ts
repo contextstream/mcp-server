@@ -1020,7 +1020,7 @@ Automatically detects code files and skips ignored directories like node_modules
       title: 'Initialize conversation session',
       description: `Initialize a new conversation session and automatically retrieve relevant context.
 This is the FIRST tool AI assistants should call when starting a conversation.
-Returns: workspace info, project info, recent memory, recent decisions, and relevant context.
+Returns: workspace info, project info, recent memory, recent decisions, relevant context, and high-priority lessons.
 Automatically detects the IDE workspace/project path and can auto-index code.
 
 IMPORTANT: Pass the user's FIRST MESSAGE as context_hint to get semantically relevant context!
@@ -1877,7 +1877,7 @@ Format options:
 - 'readable': Line-separated with labels
 - 'structured': JSON-like grouped format
 
-Type codes: W=Workspace, P=Project, D=Decision, M=Memory, I=Insight, T=Task
+Type codes: W=Workspace, P=Project, D=Decision, M=Memory, I=Insight, T=Task, L=Lesson
 
 Example usage:
 1. User asks "how should I implement auth?"

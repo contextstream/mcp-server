@@ -21,6 +21,8 @@ You have access to ContextStream MCP tools for persistent memory and context.
 | **1st message** | \`session_init(folder_path="...", context_hint="<user's message>")\` |
 | **2nd+ messages** | \`context_smart(user_message="<user's message>")\` |
 | **After completing task** | \`session_capture(...)\` - MUST capture decisions/insights |
+| **User frustration/correction** | \`session_capture_lesson(...)\` - MUST capture lessons |
+| **Command/tool error + fix** | \`session_capture_lesson(...)\` - MUST capture lessons |
 
 **NO EXCEPTIONS.** Do not skip even if you think you have enough context.
 
@@ -73,6 +75,52 @@ You have access to ContextStream MCP tools for persistent memory and context.
 
 **When user asks about past decisions:**
 - Use \`session_recall\` - do NOT ask user to repeat themselves
+
+---
+
+### Lesson Capture (MANDATORY)
+
+When:
+1. **Expresses frustration** (caps, profanity, "COME ON", "WTF", repeated corrections)
+2. **Corrects you** ("No, you should...", "That's wrong", "Fix this")
+3. **Points out a mistake** (broken code, wrong approach, production issue)
+4. **A command/tool call fails and you learn the correct fix** (even if the user didn’t explicitly correct you)
+
+You MUST immediately call \`session_capture_lesson\` with:
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| \`title\` | What to remember | "Verify assets in git before pushing" |
+| \`severity\` | \`critical\`/\`high\`/\`medium\`/\`low\` | \`critical\` for production issues |
+| \`category\` | \`workflow\`/\`code_quality\`/\`verification\`/\`communication\`/\`project_specific\` | \`workflow\` |
+| \`trigger\` | What action caused the problem | "Pushed code referencing images without committing them" |
+| \`impact\` | What went wrong | "Production 404 errors - broken landing page" |
+| \`prevention\` | How to prevent in future | "Run git status to check untracked files before pushing" |
+| \`keywords\` | Keywords for matching | \`["git", "images", "assets", "push"]\` |
+
+**Example call:**
+\`\`\`json
+{
+  "title": "Always verify assets in git before pushing code references",
+  "severity": "critical",
+  "category": "workflow",
+  "trigger": "Pushed code referencing /screenshots/*.png without committing images",
+  "impact": "Production 404 errors - broken landing page",
+  "prevention": "Run 'git status' to check untracked files before pushing code that references static assets",
+  "keywords": ["git", "images", "assets", "push", "404", "static"]
+}
+\`\`\`
+
+**Why this matters:**
+- Lessons are surfaced automatically in \`session_init\` and \`context_smart\`
+- Future sessions will warn you before repeating the same mistake
+- This prevents production issues and user frustration
+
+**Severity guide:**
+- \`critical\`: Production outages, data loss, security issues
+- \`high\`: Breaking changes, significant user impact
+- \`medium\`: Workflow inefficiencies, minor bugs
+- \`low\`: Style/preference corrections
 
 ---
 

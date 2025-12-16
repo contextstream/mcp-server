@@ -302,6 +302,25 @@ export class SessionManager {
       });
     }
 
+    // High-priority lessons (warnings from past mistakes)
+    const lessonsWarning = typeof context.lessons_warning === 'string' ? (context.lessons_warning as string) : undefined;
+    const lessons = Array.isArray(context.lessons)
+      ? (context.lessons as Array<{ title?: string; severity?: string }>)
+      : [];
+    if (lessonsWarning || lessons.length > 0) {
+      parts.push('');
+      parts.push('⚠️  Lessons (review before changes):');
+      if (lessonsWarning) {
+        parts.push(`   ${lessonsWarning}`);
+      }
+      lessons.slice(0, 3).forEach(l => {
+        const title = l.title || 'Lesson';
+        const severity = l.severity || 'unknown';
+        parts.push(`   • [${severity}] ${title}`);
+      });
+      parts.push('   Use session_get_lessons(query="...") for details.');
+    }
+
     // IDE roots with detection method
     parts.push('');
     if (context.ide_roots && (context.ide_roots as string[]).length > 0) {

@@ -4,6 +4,7 @@ import type { ContextStreamClient } from './client.js';
 import { readFilesFromDirectory, readAllFilesInBatches } from './files.js';
 import { SessionManager } from './session-manager.js';
 import { getAvailableEditors, generateRuleContent, generateAllRuleFiles } from './rules-templates.js';
+import { VERSION } from './version.js';
 
 type StructuredContent = { [x: string]: unknown } | undefined;
 type ToolTextResult = {
@@ -190,6 +191,19 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
   }
 
   // Auth
+  registerTool(
+    'mcp_server_version',
+    {
+      title: 'Get MCP server version',
+      description: 'Return the running ContextStream MCP server package version',
+      inputSchema: z.object({}),
+    },
+    async () => {
+      const result = { name: 'contextstream-mcp', version: VERSION };
+      return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+    }
+  );
+
   registerTool(
     'auth_me',
     {

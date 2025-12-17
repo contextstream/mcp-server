@@ -9,8 +9,7 @@ import { SessionManager } from './session-manager.js';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-
-const VERSION = '0.3.4';
+import { VERSION } from './version.js';
 
 /**
  * Check if this is the first run and show star message if so.
@@ -111,7 +110,7 @@ async function main() {
   registerPrompts(server);
 
   // Log startup info (to stderr to not interfere with stdio protocol)
-  console.error(`ContextStream MCP server starting...`);
+  console.error(`ContextStream MCP server v${VERSION} starting...`);
   console.error(`API URL: ${config.apiUrl}`);
   console.error(`Auth: ${config.apiKey ? 'API Key' : config.jwt ? 'JWT' : 'None'}`);
   console.error(`Auto-Context: ENABLED (context loads on first tool call)`);

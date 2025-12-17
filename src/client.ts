@@ -60,6 +60,29 @@ export class ContextStreamClient {
     return request(this.config, '/auth/me');
   }
 
+  // Credits / Billing (used for plan gating)
+  async getCreditBalance(): Promise<any> {
+    const cacheKey = CacheKeys.creditBalance();
+    const cached = globalCache.get(cacheKey);
+    if (cached) return cached;
+
+    const result = await request(this.config, '/credits/balance', { method: 'GET' }) as any;
+    const data = result && typeof result === 'object' && 'data' in result && (result as any).data ? (result as any).data : result;
+
+    globalCache.set(cacheKey, data, CacheTTL.CREDIT_BALANCE);
+    return data;
+  }
+
+  async getPlanName(): Promise<string | null> {
+    try {
+      const balance = await this.getCreditBalance();
+      const planName = balance?.plan?.name;
+      return typeof planName === 'string' ? planName.toLowerCase() : null;
+    } catch {
+      return null;
+    }
+  }
+
   // Workspaces & Projects
   listWorkspaces(params?: { page?: number; page_size?: number }) {
     const query = new URLSearchParams();
@@ -589,25 +612,21 @@ export class ContextStreamClient {
               return context;
             }
           } else {
-            // No workspaces exist - create one with folder name
-            const newWorkspace = await this.createWorkspace({
-              name: folderName || 'My Workspace',
-              description: `Workspace created for ${rootPath}`,
-              visibility: 'private',
-            }) as { id?: string; name?: string };
-            if (newWorkspace.id) {
-              workspaceId = newWorkspace.id;
-              workspaceName = newWorkspace.name;
-              context.workspace_source = 'auto_created';
-              context.workspace_created = true;
-              
-              // Save to local config for next time
-              writeLocalConfig(rootPath, {
-                workspace_id: newWorkspace.id,
-                workspace_name: newWorkspace.name,
-                associated_at: new Date().toISOString(),
-              });
-            }
+            // No workspaces exist yet. Ask the user for a name rather than
+            // auto-creating a workspace from the folder name.
+            const folderDisplayName = rootPath?.split('/').pop() || 'this folder';
+
+            context.status = 'requires_workspace_name';
+            context.workspace_source = 'none_found';
+            context.ide_roots = ideRoots;
+            context.folder_name = folderDisplayName;
+            context.folder_path = rootPath;
+            context.suggested_project_name = folderDisplayName;
+            context.message =
+              `No workspaces found for this account. Ask the user for a name for a new workspace, then create a project for "${folderDisplayName}".`;
+
+            // Return early - agent needs user input (workspace name)
+            return context;
           }
         } catch (e) {
           context.workspace_error = String(e);

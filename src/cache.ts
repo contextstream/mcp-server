@@ -117,6 +117,9 @@ export const CacheTTL = {
   
   // User preferences - cache for 5 minutes
   USER_PREFS: 5 * 60 * 1000,
+
+  // Credits/plan - cache briefly to reflect upgrades quickly
+  CREDIT_BALANCE: 60 * 1000,
 } as const;
 
 // Cache key builders
@@ -130,6 +133,7 @@ export const CacheKeys = {
   memoryEvents: (workspaceId: string) => `memory:${workspaceId}`,
   search: (query: string, workspaceId?: string) => 
     `search:${workspaceId || ''}:${query}`,
+  creditBalance: () => 'credits:balance',
 } as const;
 
 // Global cache instance

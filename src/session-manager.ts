@@ -236,6 +236,26 @@ export class SessionManager {
     parts.push('═══════════════════════════════════════════');
 
     // Status
+    if (context.status === 'requires_workspace_name') {
+      parts.push('');
+      parts.push('⚠️  NO WORKSPACE FOUND');
+      parts.push(`Folder: ${context.folder_name || 'unknown'}`);
+      parts.push('');
+      parts.push('Please ask the user for a name for the new workspace.');
+      parts.push('Then create a project for this folder.');
+      parts.push('');
+      parts.push('Recommended: call `workspace_bootstrap` with:');
+      if (typeof context.folder_path === 'string') {
+        parts.push(`  - folder_path: ${context.folder_path}`);
+      } else {
+        parts.push('  - folder_path: (your repo folder path)');
+      }
+      parts.push('  - workspace_name: "<user-provided name>"');
+      parts.push('');
+      parts.push('═══════════════════════════════════════════');
+      return parts.join('\n');
+    }
+
     if (context.status === 'requires_workspace_selection') {
       parts.push('');
       parts.push('⚠️  NEW FOLDER DETECTED');

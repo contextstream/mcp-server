@@ -40,7 +40,7 @@ export function registerResources(server: McpServer, client: ContextStreamClient
     'contextstream-projects',
     new ResourceTemplate('contextstream:projects/{workspaceId}', { list: undefined }),
     { title: 'Projects for workspace', description: 'Projects in the specified workspace' },
-    async (uri, { workspaceId }) => {
+    async (uri: URL, { workspaceId }: { workspaceId: string | string[] }) => {
       const wsId = Array.isArray(workspaceId) ? workspaceId[0] : workspaceId;
       const data = await client.listProjects({ workspace_id: wsId });
       return wrapText(uri.href, JSON.stringify(data, null, 2));

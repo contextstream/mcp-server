@@ -6,6 +6,11 @@ import { SessionManager } from './session-manager.js';
 import { getAvailableEditors, generateRuleContent, generateAllRuleFiles } from './rules-templates.js';
 
 type StructuredContent = { [x: string]: unknown } | undefined;
+type ToolTextResult = {
+  content: Array<{ type: 'text'; text: string }>;
+  structuredContent?: StructuredContent;
+  isError?: boolean;
+};
 
 function formatContent(data: unknown) {
   return JSON.stringify(data, null, 2);
@@ -19,6 +24,48 @@ function toStructured(data: unknown): StructuredContent {
 }
 
 export function registerTools(server: McpServer, client: ContextStreamClient, sessionManager?: SessionManager) {
+  const upgradeUrl = process.env.CONTEXTSTREAM_UPGRADE_URL || 'https://contextstream.io/pricing';
+  const defaultProTools = new Set<string>([
+    // AI endpoints (typically paid/credit-metered)
+    'ai_context',
+    'ai_enhanced_context',
+    'ai_context_budget',
+    'ai_embeddings',
+    'ai_plan',
+    'ai_tasks',
+  ]);
+
+  const proTools = (() => {
+    const raw = process.env.CONTEXTSTREAM_PRO_TOOLS;
+    if (!raw) return defaultProTools;
+    const parsed = raw
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+    return parsed.length > 0 ? new Set(parsed) : defaultProTools;
+  })();
+
+  function getToolAccessTier(toolName: string): 'free' | 'pro' {
+    return proTools.has(toolName) ? 'pro' : 'free';
+  }
+
+  function getToolAccessLabel(toolName: string): 'Free' | 'PRO' {
+    return getToolAccessTier(toolName) === 'pro' ? 'PRO' : 'Free';
+  }
+
+  async function gateIfProTool(toolName: string): Promise<ToolTextResult | null> {
+    if (getToolAccessTier(toolName) !== 'pro') return null;
+
+    const planName = await client.getPlanName();
+    if (planName !== 'free') return null;
+
+    return errorResult(
+      [
+        `Access denied: \`${toolName}\` requires ContextStream PRO.`,
+        `Upgrade: ${upgradeUrl}`,
+      ].join('\n')
+    );
+  }
   
   /**
    * AUTO-CONTEXT WRAPPER
@@ -81,11 +128,21 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
   function registerTool<T extends z.ZodType>(
     name: string,
     config: { title: string; description: string; inputSchema: T },
-    handler: (input: z.infer<T>) => Promise<{ content: Array<{ type: 'text'; text: string }>; structuredContent?: StructuredContent }>
+    handler: (input: z.infer<T>) => Promise<ToolTextResult>
   ) {
+    const accessLabel = getToolAccessLabel(name);
+    const labeledConfig = {
+      ...config,
+      title: `${config.title} (${accessLabel})`,
+      description: `${config.description}\n\nAccess: ${accessLabel}${accessLabel === 'PRO' ? ` (upgrade: ${upgradeUrl})` : ''}`,
+    };
+
     // Wrap handler with error handling to ensure proper serialization
     const safeHandler = async (input: z.infer<T>) => {
       try {
+        const gated = await gateIfProTool(name);
+        if (gated) return gated;
+
         return await handler(input);
       } catch (error: any) {
         // Convert error to a properly serializable format
@@ -103,9 +160,28 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     
     server.registerTool(
       name,
-      config,
+      labeledConfig,
       wrapWithAutoContext(name, safeHandler)
     );
+  }
+
+  function errorResult(text: string): ToolTextResult {
+    return {
+      content: [{ type: 'text' as const, text }],
+      isError: true,
+    };
+  }
+
+  function resolveWorkspaceId(explicitWorkspaceId?: string): string | undefined {
+    if (explicitWorkspaceId) return explicitWorkspaceId;
+    const ctx = sessionManager?.getContext();
+    return typeof ctx?.workspace_id === 'string' ? (ctx.workspace_id as string) : undefined;
+  }
+
+  function resolveProjectId(explicitProjectId?: string): string | undefined {
+    if (explicitProjectId) return explicitProjectId;
+    const ctx = sessionManager?.getContext();
+    return typeof ctx?.project_id === 'string' ? (ctx.project_id as string) : undefined;
   }
 
   // Auth
@@ -256,10 +332,15 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     {
       title: 'Index project',
       description: 'Trigger indexing for a project',
-      inputSchema: z.object({ project_id: z.string().uuid() }),
+      inputSchema: z.object({ project_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.indexProject(input.project_id);
+      const projectId = resolveProjectId(input.project_id);
+      if (!projectId) {
+        return errorResult('Error: project_id is required. Please call session_init first or provide project_id explicitly.');
+      }
+
+      const result = await client.indexProject(projectId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -640,10 +721,15 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     {
       title: 'Get project',
       description: 'Get project details by ID',
-      inputSchema: z.object({ project_id: z.string().uuid() }),
+      inputSchema: z.object({ project_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.getProject(input.project_id);
+      const projectId = resolveProjectId(input.project_id);
+      if (!projectId) {
+        return errorResult('Error: project_id is required. Please call session_init first or provide project_id explicitly.');
+      }
+
+      const result = await client.getProject(projectId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -653,10 +739,15 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     {
       title: 'Project overview',
       description: 'Get project overview with summary information',
-      inputSchema: z.object({ project_id: z.string().uuid() }),
+      inputSchema: z.object({ project_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.projectOverview(input.project_id);
+      const projectId = resolveProjectId(input.project_id);
+      if (!projectId) {
+        return errorResult('Error: project_id is required. Please call session_init first or provide project_id explicitly.');
+      }
+
+      const result = await client.projectOverview(projectId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -666,10 +757,15 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     {
       title: 'Project statistics',
       description: 'Get project statistics (files, lines, complexity)',
-      inputSchema: z.object({ project_id: z.string().uuid() }),
+      inputSchema: z.object({ project_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.projectStatistics(input.project_id);
+      const projectId = resolveProjectId(input.project_id);
+      if (!projectId) {
+        return errorResult('Error: project_id is required. Please call session_init first or provide project_id explicitly.');
+      }
+
+      const result = await client.projectStatistics(projectId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -679,10 +775,15 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     {
       title: 'List project files',
       description: 'List all indexed files in a project',
-      inputSchema: z.object({ project_id: z.string().uuid() }),
+      inputSchema: z.object({ project_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.projectFiles(input.project_id);
+      const projectId = resolveProjectId(input.project_id);
+      if (!projectId) {
+        return errorResult('Error: project_id is required. Please call session_init first or provide project_id explicitly.');
+      }
+
+      const result = await client.projectFiles(projectId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -692,10 +793,15 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     {
       title: 'Index status',
       description: 'Get project indexing status',
-      inputSchema: z.object({ project_id: z.string().uuid() }),
+      inputSchema: z.object({ project_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.projectIndexStatus(input.project_id);
+      const projectId = resolveProjectId(input.project_id);
+      if (!projectId) {
+        return errorResult('Error: project_id is required. Please call session_init first or provide project_id explicitly.');
+      }
+
+      const result = await client.projectIndexStatus(projectId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -708,21 +814,26 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
 This indexes your entire project by reading files in batches.
 Automatically detects code files and skips ignored directories like node_modules, target, dist, etc.`,
       inputSchema: z.object({
-        project_id: z.string().uuid().describe('Project to ingest files into'),
+        project_id: z.string().uuid().optional().describe('Project to ingest files into (defaults to current session project)'),
         path: z.string().describe('Local directory path to read files from'),
       }),
     },
     async (input) => {
+      const projectId = resolveProjectId(input.project_id);
+      if (!projectId) {
+        return errorResult('Error: project_id is required. Please call session_init first or provide project_id explicitly.');
+      }
+
       // Start ingestion in background to avoid blocking the agent
       (async () => {
         try {
           let totalIndexed = 0;
           let batchCount = 0;
           
-          console.error(`[ContextStream] Starting background ingestion for project ${input.project_id} from ${input.path}`);
+          console.error(`[ContextStream] Starting background ingestion for project ${projectId} from ${input.path}`);
           
           for await (const batch of readAllFilesInBatches(input.path, { batchSize: 50 })) {
-            const result = await client.ingestFiles(input.project_id, batch) as { data?: { files_indexed: number } };
+            const result = await client.ingestFiles(projectId, batch) as { data?: { files_indexed: number } };
             totalIndexed += result.data?.files_indexed ?? batch.length;
             batchCount++;
           }
@@ -736,7 +847,7 @@ Automatically detects code files and skips ignored directories like node_modules
       const summary = {
         status: 'started',
         message: 'Ingestion running in background',
-        project_id: input.project_id,
+        project_id: projectId,
         path: input.path,
         note: "Use 'projects_index_status' to monitor progress."
       };
@@ -757,10 +868,15 @@ Automatically detects code files and skips ignored directories like node_modules
     {
       title: 'Get workspace',
       description: 'Get workspace details by ID',
-      inputSchema: z.object({ workspace_id: z.string().uuid() }),
+      inputSchema: z.object({ workspace_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.getWorkspace(input.workspace_id);
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.getWorkspace(workspaceId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -770,10 +886,15 @@ Automatically detects code files and skips ignored directories like node_modules
     {
       title: 'Workspace overview',
       description: 'Get workspace overview with summary information',
-      inputSchema: z.object({ workspace_id: z.string().uuid() }),
+      inputSchema: z.object({ workspace_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.workspaceOverview(input.workspace_id);
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.workspaceOverview(workspaceId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -783,10 +904,15 @@ Automatically detects code files and skips ignored directories like node_modules
     {
       title: 'Workspace analytics',
       description: 'Get workspace usage analytics',
-      inputSchema: z.object({ workspace_id: z.string().uuid() }),
+      inputSchema: z.object({ workspace_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.workspaceAnalytics(input.workspace_id);
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.workspaceAnalytics(workspaceId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -796,10 +922,15 @@ Automatically detects code files and skips ignored directories like node_modules
     {
       title: 'Workspace content',
       description: 'List content in a workspace',
-      inputSchema: z.object({ workspace_id: z.string().uuid() }),
+      inputSchema: z.object({ workspace_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.workspaceContent(input.workspace_id);
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.workspaceContent(workspaceId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -931,10 +1062,15 @@ Automatically detects code files and skips ignored directories like node_modules
     {
       title: 'Memory timeline',
       description: 'Get chronological timeline of memory events for a workspace',
-      inputSchema: z.object({ workspace_id: z.string().uuid() }),
+      inputSchema: z.object({ workspace_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.memoryTimeline(input.workspace_id);
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.memoryTimeline(workspaceId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -944,10 +1080,15 @@ Automatically detects code files and skips ignored directories like node_modules
     {
       title: 'Memory summary',
       description: 'Get condensed summary of workspace memory',
-      inputSchema: z.object({ workspace_id: z.string().uuid() }),
+      inputSchema: z.object({ workspace_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.memorySummary(input.workspace_id);
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.memorySummary(workspaceId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -958,10 +1099,15 @@ Automatically detects code files and skips ignored directories like node_modules
     {
       title: 'Find circular dependencies',
       description: 'Detect circular dependencies in project code',
-      inputSchema: z.object({ project_id: z.string().uuid() }),
+      inputSchema: z.object({ project_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.findCircularDependencies(input.project_id);
+      const projectId = resolveProjectId(input.project_id);
+      if (!projectId) {
+        return errorResult('Error: project_id is required. Please call session_init first or provide project_id explicitly.');
+      }
+
+      const result = await client.findCircularDependencies(projectId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -971,10 +1117,15 @@ Automatically detects code files and skips ignored directories like node_modules
     {
       title: 'Find unused code',
       description: 'Detect unused code in project',
-      inputSchema: z.object({ project_id: z.string().uuid() }),
+      inputSchema: z.object({ project_id: z.string().uuid().optional() }),
     },
     async (input) => {
-      const result = await client.findUnusedCode(input.project_id);
+      const projectId = resolveProjectId(input.project_id);
+      if (!projectId) {
+        return errorResult('Error: project_id is required. Please call session_init first or provide project_id explicitly.');
+      }
+
+      const result = await client.findUnusedCode(projectId);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -1143,6 +1294,140 @@ Optionally generates AI editor rules for automatic ContextStream usage.`,
         editor_rules_generated: rulesGenerated.length > 0 ? rulesGenerated : undefined,
       };
       
+      return { content: [{ type: 'text' as const, text: formatContent(response) }], structuredContent: toStructured(response) };
+    }
+  );
+
+  registerTool(
+    'workspace_bootstrap',
+    {
+      title: 'Create workspace + project from folder',
+      description: `Create a new workspace (user-provided name) and onboard the current folder as a project.
+This is useful when session_init returns status='requires_workspace_name' (no workspaces exist yet) or when you want to create a new workspace for a repo.
+
+Behavior:
+- Creates a workspace with the given name
+- Associates the folder to that workspace (writes .contextstream/config.json)
+- Initializes a session for the folder, which creates the project (folder name) and starts indexing (if enabled)`,
+      inputSchema: z.object({
+        workspace_name: z.string().min(1).describe('Name for the new workspace (ask the user)'),
+        folder_path: z.string().optional().describe('Absolute folder path (defaults to IDE root/cwd)'),
+        description: z.string().optional().describe('Optional workspace description'),
+        visibility: z.enum(['private', 'public']).optional().describe('Workspace visibility (default: private)'),
+        create_parent_mapping: z.boolean().optional().describe('Also create a parent folder mapping (e.g., /dev/company/* -> workspace)'),
+        generate_editor_rules: z.boolean().optional().describe('Generate AI editor rules in the folder for automatic ContextStream usage'),
+        context_hint: z.string().optional().describe('Optional context hint for session initialization'),
+        auto_index: z.boolean().optional().describe('Automatically create and index project from folder (default: true)'),
+      }),
+    },
+    async (input) => {
+      // Resolve folder path (prefer explicit; fallback to IDE roots; then cwd)
+      let folderPath = input.folder_path;
+      if (!folderPath) {
+        try {
+          const rootsResponse = await server.server.listRoots();
+          if (rootsResponse?.roots && rootsResponse.roots.length > 0) {
+            folderPath = rootsResponse.roots[0].uri.replace('file://', '');
+          }
+        } catch {
+          // IDE may not support roots - that's okay
+        }
+      }
+
+      if (!folderPath) {
+        folderPath = process.cwd();
+      }
+
+      if (!folderPath) {
+        return errorResult('Error: folder_path is required. Provide folder_path or run from a project directory.');
+      }
+
+      const folderName = folderPath.split('/').pop() || 'My Project';
+
+      const newWorkspace = await client.createWorkspace({
+        name: input.workspace_name,
+        description: input.description || `Workspace created for ${folderPath}`,
+        visibility: input.visibility || 'private',
+      }) as { id?: string; name?: string };
+
+      if (!newWorkspace?.id) {
+        return errorResult('Error: failed to create workspace.');
+      }
+
+      // Persist folder -> workspace mapping (and optional parent mapping)
+      const associateResult = await client.associateWorkspace({
+        folder_path: folderPath,
+        workspace_id: newWorkspace.id,
+        workspace_name: newWorkspace.name || input.workspace_name,
+        create_parent_mapping: input.create_parent_mapping,
+      });
+
+      // Optionally generate editor rules
+      let rulesGenerated: string[] = [];
+      if (input.generate_editor_rules) {
+        const fs = await import('fs');
+        const path = await import('path');
+
+        for (const editor of getAvailableEditors()) {
+          const rule = generateRuleContent(editor, {
+            workspaceName: newWorkspace.name || input.workspace_name,
+            workspaceId: newWorkspace.id,
+          });
+          if (!rule) continue;
+
+          const filePath = path.join(folderPath, rule.filename);
+          try {
+            let existingContent = '';
+            try {
+              existingContent = fs.readFileSync(filePath, 'utf-8');
+            } catch {
+              // File doesn't exist
+            }
+
+            if (!existingContent) {
+              fs.writeFileSync(filePath, rule.content);
+              rulesGenerated.push(rule.filename);
+            } else if (!existingContent.includes('ContextStream Integration')) {
+              fs.writeFileSync(filePath, existingContent + '\n\n' + rule.content);
+              rulesGenerated.push(rule.filename + ' (appended)');
+            }
+          } catch {
+            // Ignore per-file failures
+          }
+        }
+      }
+
+      // Initialize a session for this folder; this creates the project (folder name) and starts indexing (if enabled)
+      const session = await client.initSession(
+        {
+          workspace_id: newWorkspace.id,
+          context_hint: input.context_hint,
+          include_recent_memory: true,
+          include_decisions: true,
+          auto_index: input.auto_index,
+        },
+        [folderPath]
+      ) as Record<string, unknown>;
+
+      // Mark session as initialized so subsequent tool calls can omit IDs
+      if (sessionManager) {
+        sessionManager.markInitialized(session);
+      }
+
+      const response = {
+        ...session,
+        bootstrap: {
+          folder_path: folderPath,
+          project_name: folderName,
+          workspace: {
+            id: newWorkspace.id,
+            name: newWorkspace.name || input.workspace_name,
+          },
+          association: associateResult,
+          editor_rules_generated: rulesGenerated.length > 0 ? rulesGenerated : undefined,
+        },
+      };
+
       return { content: [{ type: 'text' as const, text: formatContent(response) }], structuredContent: toStructured(response) };
     }
   );
@@ -1347,10 +1632,10 @@ Returns lessons filtered by:
         workspace_id: workspaceId,
         project_id: projectId,
         limit: input.limit * 2, // Fetch more to filter
-      });
+      }) as { results?: any[] };
 
       // Filter for lessons and apply filters
-      let lessons = (searchResult?.results || []).filter((item: any) => {
+      let lessons = (searchResult.results || []).filter((item: any) => {
         const tags = item.metadata?.tags || [];
         const isLesson = tags.includes('lesson');
         if (!isLesson) return false;
@@ -1385,12 +1670,12 @@ Returns lessons filtered by:
         const severity = tags.find((t: string) => t.startsWith('severity:'))?.split(':')[1] || 'medium';
         const category = tags.find((t: string) => ['workflow', 'code_quality', 'verification', 'communication', 'project_specific'].includes(t)) || 'unknown';
 
-        const severityEmoji = {
+        const severityEmoji = ({
           low: '🟢',
           medium: '🟡',
           high: '🟠',
           critical: '🔴',
-        }[severity] || '⚪';
+        } as Record<string, string>)[severity] || '⚪';
 
         return `${i + 1}. ${severityEmoji} **${lesson.title}**\n   Category: ${category} | Severity: ${severity}\n   ${lesson.content?.slice(0, 200)}...`;
       }).join('\n\n');

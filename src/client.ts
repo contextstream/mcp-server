@@ -14,6 +14,15 @@ import { globalCache, CacheKeys, CacheTTL } from './cache.js';
 
 const uuidSchema = z.string().uuid();
 
+function unwrapApiResponse<T>(result: unknown): T {
+  if (!result || typeof result !== 'object') return result as T;
+  const maybe = result as any;
+  if (typeof maybe.success === 'boolean' && 'data' in maybe) {
+    return maybe.data as T;
+  }
+  return result as T;
+}
+
 export class ContextStreamClient {
   constructor(private config: Config) {}
 
@@ -92,8 +101,9 @@ export class ContextStreamClient {
     return request(this.config, `/workspaces${suffix}`);
   }
 
-  createWorkspace(input: { name: string; description?: string; visibility?: string }) {
-    return request(this.config, '/workspaces', { body: input });
+  async createWorkspace(input: { name: string; description?: string; visibility?: string }) {
+    const result = await request(this.config, '/workspaces', { body: input });
+    return unwrapApiResponse(result);
   }
 
   updateWorkspace(workspaceId: string, input: { name?: string; description?: string; visibility?: string }) {
@@ -116,9 +126,10 @@ export class ContextStreamClient {
     return request(this.config, `/projects${suffix}`);
   }
 
-  createProject(input: { name: string; description?: string; workspace_id?: string }) {
+  async createProject(input: { name: string; description?: string; workspace_id?: string }) {
     const payload = this.withDefaults(input);
-    return request(this.config, '/projects', { body: payload });
+    const result = await request(this.config, '/projects', { body: payload });
+    return unwrapApiResponse(result);
   }
 
   updateProject(projectId: string, input: { name?: string; description?: string }) {

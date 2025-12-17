@@ -149,10 +149,15 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
         const errorMessage = error?.message || String(error);
         const errorDetails = error?.body || error?.details || null;
         const errorCode = error?.code || error?.status || 'UNKNOWN_ERROR';
+
+        const isPlanLimit =
+          String(errorCode).toUpperCase() === 'FORBIDDEN' &&
+          String(errorMessage).toLowerCase().includes('plan limit reached');
+        const upgradeHint = isPlanLimit ? `\nUpgrade: ${upgradeUrl}` : '';
         
         // Re-throw with a proper Error that has a string message
         const serializedError = new Error(
-          `[${errorCode}] ${errorMessage}${errorDetails ? `: ${JSON.stringify(errorDetails)}` : ''}`
+          `[${errorCode}] ${errorMessage}${upgradeHint}${errorDetails ? `: ${JSON.stringify(errorDetails)}` : ''}`
         );
         throw serializedError;
       }

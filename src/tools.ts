@@ -1233,10 +1233,15 @@ This does semantic search on the first message. You only need context_smart on s
 
         text = [
           'Action required: no workspaces found for this account.',
-          'Ask the user for a name for the new workspace, then run `workspace_bootstrap`.',
+          'Ask the user for a name for the new workspace (recommended), then run `workspace_bootstrap`.',
           folderPath
             ? `Recommended: workspace_bootstrap(workspace_name: \"<name>\", folder_path: \"${folderPath}\")`
             : 'Recommended: workspace_bootstrap(workspace_name: \"<name>\", folder_path: \"<your repo folder>\")',
+          '',
+          'If you want to continue without a workspace for now, re-run:',
+          folderPath
+            ? `  session_init(folder_path: \"${folderPath}\", allow_no_workspace: true)`
+            : '  session_init(folder_path: \"<your repo folder>\", allow_no_workspace: true)',
           '',
           '--- Raw Response ---',
           '',
@@ -1265,6 +1270,13 @@ This does semantic search on the first message. You only need context_smart on s
         }
         lines.push('');
         lines.push('Then run `workspace_associate` with the selected workspace_id and your folder_path.');
+        lines.push('');
+        lines.push('If you want to continue without a workspace for now, re-run:');
+        if (typeof input.folder_path === 'string' && input.folder_path) {
+          lines.push(`  session_init(folder_path: \"${input.folder_path}\", allow_no_workspace: true)`);
+        } else {
+          lines.push('  session_init(folder_path: \"<your repo folder>\", allow_no_workspace: true)');
+        }
         lines.push('');
         lines.push('--- Raw Response ---');
         lines.push('');

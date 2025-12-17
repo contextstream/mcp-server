@@ -241,7 +241,7 @@ export class SessionManager {
       parts.push('⚠️  NO WORKSPACE FOUND');
       parts.push(`Folder: ${context.folder_name || 'unknown'}`);
       parts.push('');
-      parts.push('Please ask the user for a name for the new workspace.');
+      parts.push('Please ask the user for a name for the new workspace (recommended).');
       parts.push('Then create a project for this folder.');
       parts.push('');
       parts.push('Recommended: call `workspace_bootstrap` with:');
@@ -251,6 +251,9 @@ export class SessionManager {
         parts.push('  - folder_path: (your repo folder path)');
       }
       parts.push('  - workspace_name: "<user-provided name>"');
+      parts.push('');
+      parts.push('To continue without a workspace for now:');
+      parts.push('  - call `session_init` again with `allow_no_workspace: true`');
       parts.push('');
       parts.push('═══════════════════════════════════════════');
       return parts.join('\n');
@@ -271,6 +274,9 @@ export class SessionManager {
       parts.push('  • Or create a new workspace');
       parts.push('');
       parts.push('Use workspace_associate tool after user selects.');
+      parts.push('');
+      parts.push('To continue without a workspace for now:');
+      parts.push('  - call `session_init` again with `allow_no_workspace: true`');
       parts.push('═══════════════════════════════════════════');
       return parts.join('\n');
     }

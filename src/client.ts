@@ -2340,4 +2340,197 @@ export class ContextStreamClient {
     if (params?.limit) query.set('limit', String(params.limit));
     return request(this.config, `/workspaces/${withDefaults.workspace_id}/slack/search?${query.toString()}`, { method: 'GET' });
   }
+
+  // ============================================
+  // GitHub Integration Methods
+  // ============================================
+
+  /**
+   * Get GitHub integration statistics and overview
+   */
+  async githubStats(params: {
+    workspace_id?: string;
+  }): Promise<{
+    summary: {
+      total_issues: number;
+      total_prs: number;
+      total_releases: number;
+      total_comments: number;
+      repos_synced: number;
+      contributors: number;
+    };
+    repos: Array<{
+      repo_name: string;
+      issue_count: number;
+      pr_count: number;
+      release_count: number;
+      comment_count: number;
+      last_activity_at: string | null;
+    }>;
+    activity: Array<{
+      date: string;
+      issues: number;
+      prs: number;
+      comments: number;
+    }>;
+    sync_status: {
+      status: string;
+      last_sync_at: string | null;
+      next_sync_at: string | null;
+      error_message: string | null;
+    };
+  }> {
+    const withDefaults = this.withDefaults(params || {});
+    if (!withDefaults.workspace_id) {
+      throw new Error('workspace_id is required for GitHub stats');
+    }
+    return request(this.config, `/workspaces/${withDefaults.workspace_id}/github/stats`, { method: 'GET' });
+  }
+
+  /**
+   * Get GitHub repository stats
+   */
+  async githubRepos(params: {
+    workspace_id?: string;
+  }): Promise<Array<{
+    repo_name: string;
+    issue_count: number;
+    pr_count: number;
+    release_count: number;
+    comment_count: number;
+    last_activity_at: string | null;
+  }>> {
+    const withDefaults = this.withDefaults(params || {});
+    if (!withDefaults.workspace_id) {
+      throw new Error('workspace_id is required for GitHub repos');
+    }
+    return request(this.config, `/workspaces/${withDefaults.workspace_id}/github/repos`, { method: 'GET' });
+  }
+
+  /**
+   * Get recent GitHub activity feed
+   */
+  async githubActivity(params: {
+    workspace_id?: string;
+    limit?: number;
+    offset?: number;
+    repo?: string;
+    type?: string;
+  }): Promise<Array<{
+    id: string;
+    item_type: string;
+    repo: string;
+    number: number | null;
+    title: string;
+    content_preview: string | null;
+    state: string | null;
+    author: string | null;
+    url: string | null;
+    labels: string[];
+    comment_count: number;
+    occurred_at: string;
+  }>> {
+    const withDefaults = this.withDefaults(params || {});
+    if (!withDefaults.workspace_id) {
+      throw new Error('workspace_id is required for GitHub activity');
+    }
+    const query = new URLSearchParams();
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.offset) query.set('offset', String(params.offset));
+    if (params?.repo) query.set('repo', params.repo);
+    if (params?.type) query.set('type', params.type);
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return request(this.config, `/workspaces/${withDefaults.workspace_id}/github/activity${suffix}`, { method: 'GET' });
+  }
+
+  /**
+   * Get GitHub issues and PRs
+   */
+  async githubIssues(params: {
+    workspace_id?: string;
+    limit?: number;
+    offset?: number;
+    state?: string;
+    repo?: string;
+  }): Promise<Array<{
+    id: string;
+    item_type: string;
+    repo: string;
+    number: number | null;
+    title: string;
+    content_preview: string | null;
+    state: string | null;
+    author: string | null;
+    url: string | null;
+    labels: string[];
+    comment_count: number;
+    occurred_at: string;
+  }>> {
+    const withDefaults = this.withDefaults(params || {});
+    if (!withDefaults.workspace_id) {
+      throw new Error('workspace_id is required for GitHub issues');
+    }
+    const query = new URLSearchParams();
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.offset) query.set('offset', String(params.offset));
+    if (params?.state) query.set('state', params.state);
+    if (params?.repo) query.set('repo', params.repo);
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return request(this.config, `/workspaces/${withDefaults.workspace_id}/github/issues${suffix}`, { method: 'GET' });
+  }
+
+  /**
+   * Get top GitHub contributors
+   */
+  async githubContributors(params: {
+    workspace_id?: string;
+    limit?: number;
+  }): Promise<Array<{
+    username: string;
+    contribution_count: number;
+    avatar_url: string | null;
+  }>> {
+    const withDefaults = this.withDefaults(params || {});
+    if (!withDefaults.workspace_id) {
+      throw new Error('workspace_id is required for GitHub contributors');
+    }
+    const query = new URLSearchParams();
+    if (params?.limit) query.set('limit', String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return request(this.config, `/workspaces/${withDefaults.workspace_id}/github/contributors${suffix}`, { method: 'GET' });
+  }
+
+  /**
+   * Search GitHub content
+   */
+  async githubSearch(params: {
+    workspace_id?: string;
+    q: string;
+    limit?: number;
+  }): Promise<{
+    items: Array<{
+      id: string;
+      item_type: string;
+      repo: string;
+      number: number | null;
+      title: string;
+      content_preview: string | null;
+      state: string | null;
+      author: string | null;
+      url: string | null;
+      labels: string[];
+      comment_count: number;
+      occurred_at: string;
+    }>;
+    total: number;
+  }> {
+    const withDefaults = this.withDefaults(params || {});
+    if (!withDefaults.workspace_id) {
+      throw new Error('workspace_id is required for GitHub search');
+    }
+    const query = new URLSearchParams();
+    query.set('q', params.q);
+    if (params?.limit) query.set('limit', String(params.limit));
+    return request(this.config, `/workspaces/${withDefaults.workspace_id}/github/search?${query.toString()}`, { method: 'GET' });
+  }
 }

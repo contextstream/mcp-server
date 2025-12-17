@@ -2491,4 +2491,161 @@ Also auto-maps Slack users to ContextStream users by email.`,
       };
     }
   );
+
+  // ============================================
+  // GitHub Integration Tools
+  // ============================================
+
+  registerTool(
+    'github_stats',
+    {
+      title: 'GitHub overview stats',
+      description: `Get GitHub integration statistics and overview for a workspace.
+Returns: total issues, PRs, releases, comments, repository stats, activity trends, and sync status.
+Use this to understand GitHub activity and engagement patterns across synced repositories.`,
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+      }),
+    },
+    async (input) => {
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.githubStats({ workspace_id: workspaceId });
+      return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+    }
+  );
+
+  registerTool(
+    'github_repos',
+    {
+      title: 'List GitHub repositories',
+      description: `Get synced GitHub repositories with statistics for a workspace.
+Returns: repository names with issue, PR, release, and comment counts, plus last activity timestamps.`,
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+      }),
+    },
+    async (input) => {
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.githubRepos({ workspace_id: workspaceId });
+      return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+    }
+  );
+
+  registerTool(
+    'github_contributors',
+    {
+      title: 'GitHub top contributors',
+      description: `Get top GitHub contributors for a workspace.
+Returns: usernames with contribution counts, sorted by activity level.`,
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+        limit: z.number().optional().describe('Maximum contributors to return (default: 20)'),
+      }),
+    },
+    async (input) => {
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.githubContributors({ workspace_id: workspaceId, limit: input.limit });
+      return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+    }
+  );
+
+  registerTool(
+    'github_activity',
+    {
+      title: 'GitHub activity feed',
+      description: `Get recent GitHub activity feed for a workspace.
+Returns: issues, PRs, releases, and comments with details like state, author, labels.
+Can filter by repository or type (issue, pull_request, release, comment).`,
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+        limit: z.number().optional().describe('Maximum items to return (default: 50)'),
+        offset: z.number().optional().describe('Pagination offset'),
+        repo: z.string().optional().describe('Filter by repository name'),
+        type: z.enum(['issue', 'pull_request', 'release', 'comment']).optional().describe('Filter by item type'),
+      }),
+    },
+    async (input) => {
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.githubActivity({
+        workspace_id: workspaceId,
+        limit: input.limit,
+        offset: input.offset,
+        repo: input.repo,
+        type: input.type,
+      });
+      return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+    }
+  );
+
+  registerTool(
+    'github_issues',
+    {
+      title: 'GitHub issues and PRs',
+      description: `Get GitHub issues and pull requests for a workspace.
+Returns: issues/PRs with title, state, author, labels, comment count.
+Can filter by state (open/closed) or repository.`,
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+        limit: z.number().optional().describe('Maximum items to return (default: 50)'),
+        offset: z.number().optional().describe('Pagination offset'),
+        state: z.enum(['open', 'closed']).optional().describe('Filter by state'),
+        repo: z.string().optional().describe('Filter by repository name'),
+      }),
+    },
+    async (input) => {
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.githubIssues({
+        workspace_id: workspaceId,
+        limit: input.limit,
+        offset: input.offset,
+        state: input.state,
+        repo: input.repo,
+      });
+      return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+    }
+  );
+
+  registerTool(
+    'github_search',
+    {
+      title: 'Search GitHub content',
+      description: `Search GitHub issues, PRs, and comments for a workspace.
+Returns: matching items with repository, title, state, and content preview.
+Use this to find specific issues, PRs, or discussions.`,
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+        q: z.string().describe('Search query'),
+        limit: z.number().optional().describe('Maximum results (default: 50)'),
+      }),
+    },
+    async (input) => {
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return errorResult('Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly.');
+      }
+
+      const result = await client.githubSearch({ workspace_id: workspaceId, q: input.q, limit: input.limit });
+      return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+    }
+  );
 }

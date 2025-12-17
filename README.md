@@ -20,7 +20,7 @@ No special syntax. No commands to learn. Just ask.
 
 > **Tip:** For best results, add the [recommended editor rules](https://contextstream.io/docs/quickstart) so your AI consistently calls `session_init` / `context_smart` automatically.
 
-![ContextStream in action](mcp.gif.gif)
+![ContextStream in action](compare1.gif)
 
 ## Features
 

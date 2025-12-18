@@ -450,7 +450,16 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       const name = normalizeInput(await rl.question('Workspace name: '));
       if (!name) throw new Error('Workspace name is required.');
       const description = normalizeInput(await rl.question('Workspace description (optional): '));
-      const visibility = normalizeInput(await rl.question('Visibility [private/public] (default private): ')) || 'private';
+      let visibility = 'private';
+      while (true) {
+        const raw = normalizeInput(await rl.question('Visibility [private/team/org] (default private): ')) || 'private';
+        const normalized = raw.trim().toLowerCase() === 'public' ? 'org' : raw.trim().toLowerCase();
+        if (normalized === 'private' || normalized === 'team' || normalized === 'org') {
+          visibility = normalized;
+          break;
+        }
+        console.log('Invalid visibility. Choose: private, team, org.');
+      }
 
       if (!dryRun) {
         const created = (await client.createWorkspace({ name, description: description || undefined, visibility })) as any;
@@ -490,7 +499,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     // Rules mode + editors
     console.log('Rule verbosity:');
     console.log('  1) Minimal (recommended)');
-    console.log('  2) Full (more guidance, more tokens)');
+    console.log('  2) Full (more context and guidance, more tokens)');
     const modeChoice = normalizeInput(await rl.question('Choose [1/2] (default 1): ')) || '1';
     const mode: RuleMode = modeChoice === '2' ? 'full' : 'minimal';
 

@@ -19,6 +19,8 @@ export class MemoryCache {
   constructor(cleanupIntervalMs = 60_000) {
     // Periodic cleanup of expired entries
     this.cleanupInterval = setInterval(() => this.cleanup(), cleanupIntervalMs);
+    // Don't keep the process alive for one-shot commands like `--version`
+    this.cleanupInterval.unref?.();
   }
 
   /**

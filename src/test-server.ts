@@ -61,15 +61,18 @@ async function startMcpServer(): Promise<void> {
   console.log(`[MCP Test Server] API URL: ${config.apiUrl}`);
   console.log(`[MCP Test Server] Auth: ${config.apiKey ? 'API Key' : config.jwt ? 'JWT' : 'None'}`);
 
+  // Build env vars, only including auth vars if they have values
+  // (empty strings fail Zod's min(1) validation)
+  const mcpEnv: Record<string, string> = {
+    ...process.env as Record<string, string>,
+    CONTEXTSTREAM_API_URL: config.apiUrl,
+  };
+  if (config.apiKey) mcpEnv.CONTEXTSTREAM_API_KEY = config.apiKey;
+  if (config.jwt) mcpEnv.CONTEXTSTREAM_JWT = config.jwt;
+
   mcpProcess = spawn('node', ['dist/index.js'], {
     cwd: process.cwd(),
-    env: {
-      ...process.env,
-      // Pass through the config
-      CONTEXTSTREAM_API_URL: config.apiUrl,
-      CONTEXTSTREAM_API_KEY: config.apiKey || '',
-      CONTEXTSTREAM_JWT: config.jwt || '',
-    },
+    env: mcpEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 

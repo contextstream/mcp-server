@@ -24,6 +24,30 @@ function unwrapApiResponse<T>(result: unknown): T {
   return result as T;
 }
 
+function normalizeNodeType(input: string): string {
+  const t = String(input ?? '').trim().toLowerCase();
+  switch (t) {
+    case 'fact':
+    case 'insight':
+    case 'note':
+      return 'Fact';
+    case 'decision':
+      return 'Decision';
+    case 'preference':
+      return 'Preference';
+    case 'constraint':
+      return 'Constraint';
+    case 'habit':
+      return 'Habit';
+    case 'lesson':
+      return 'Lesson';
+    default:
+      throw new Error(
+        `Invalid node_type: ${JSON.stringify(input)} (expected one of fact|decision|preference|constraint|habit|lesson)`
+      );
+  }
+}
+
 export class ContextStreamClient {
   constructor(private config: Config) {}
 
@@ -119,14 +143,21 @@ export class ContextStreamClient {
     return unwrapApiResponse(result);
   }
 
-  updateWorkspace(workspaceId: string, input: { name?: string; description?: string; visibility?: string }) {
+  async updateWorkspace(workspaceId: string, input: { name?: string; description?: string; visibility?: string }) {
     uuidSchema.parse(workspaceId);
-    return request(this.config, `/workspaces/${workspaceId}`, { method: 'PUT', body: input });
+    const result = await request(this.config, `/workspaces/${workspaceId}`, { method: 'PUT', body: input });
+    // Invalidate caches so subsequent reads reflect updates.
+    globalCache.delete(CacheKeys.workspace(workspaceId));
+    globalCache.delete(`workspace_overview:${workspaceId}`);
+    return result;
   }
 
-  deleteWorkspace(workspaceId: string) {
+  async deleteWorkspace(workspaceId: string) {
     uuidSchema.parse(workspaceId);
-    return request(this.config, `/workspaces/${workspaceId}`, { method: 'DELETE' });
+    const result = await request(this.config, `/workspaces/${workspaceId}`, { method: 'DELETE' });
+    globalCache.delete(CacheKeys.workspace(workspaceId));
+    globalCache.delete(`workspace_overview:${workspaceId}`);
+    return result;
   }
 
   listProjects(params?: { workspace_id?: string; page?: number; page_size?: number }) {
@@ -145,14 +176,20 @@ export class ContextStreamClient {
     return unwrapApiResponse(result);
   }
 
-  updateProject(projectId: string, input: { name?: string; description?: string }) {
+  async updateProject(projectId: string, input: { name?: string; description?: string }) {
     uuidSchema.parse(projectId);
-    return request(this.config, `/projects/${projectId}`, { method: 'PUT', body: input });
+    const result = await request(this.config, `/projects/${projectId}`, { method: 'PUT', body: input });
+    globalCache.delete(CacheKeys.project(projectId));
+    globalCache.delete(`project_overview:${projectId}`);
+    return result;
   }
 
-  deleteProject(projectId: string) {
+  async deleteProject(projectId: string) {
     uuidSchema.parse(projectId);
-    return request(this.config, `/projects/${projectId}`, { method: 'DELETE' });
+    const result = await request(this.config, `/projects/${projectId}`, { method: 'DELETE' });
+    globalCache.delete(CacheKeys.project(projectId));
+    globalCache.delete(`project_overview:${projectId}`);
+    return result;
   }
 
   indexProject(projectId: string) {
@@ -249,7 +286,33 @@ export class ContextStreamClient {
     content: string;
     relations?: Array<{ type: string; target_id: string }>;
   }) {
-    return request(this.config, '/memory/nodes', { body: this.withDefaults(body) });
+    const withDefaults = this.withDefaults(body);
+    if (!withDefaults.workspace_id) {
+      throw new Error('workspace_id is required for creating knowledge nodes');
+    }
+
+    const summary =
+      String(withDefaults.title ?? '').trim() ||
+      String(withDefaults.content ?? '').trim().slice(0, 120) ||
+      'Untitled';
+    const details = String(withDefaults.content ?? '').trim();
+
+    // API expects CreateKnowledgeNodeRequest.
+    const apiBody: Record<string, any> = {
+      workspace_id: withDefaults.workspace_id,
+      project_id: withDefaults.project_id,
+      node_type: normalizeNodeType(withDefaults.node_type),
+      summary,
+      details: details || undefined,
+      valid_from: new Date().toISOString(),
+    };
+
+    if (withDefaults.relations && withDefaults.relations.length) {
+      // Preserve requested relations in node context (API does not currently accept relations on create).
+      apiBody.context = { relations: withDefaults.relations };
+    }
+
+    return request(this.config, '/memory/nodes', { body: apiBody });
   }
 
   listKnowledgeNodes(params?: { workspace_id?: string; project_id?: string; limit?: number }) {
@@ -439,7 +502,8 @@ export class ContextStreamClient {
 
   deleteMemoryEvent(eventId: string) {
     uuidSchema.parse(eventId);
-    return request(this.config, `/memory/events/${eventId}`, { method: 'DELETE' });
+    return request(this.config, `/memory/events/${eventId}`, { method: 'DELETE' })
+      .then((r) => (r === '' || r == null ? { success: true } : r));
   }
 
   distillMemoryEvent(eventId: string) {
@@ -454,17 +518,53 @@ export class ContextStreamClient {
 
   updateKnowledgeNode(nodeId: string, body: { title?: string; content?: string; relations?: Array<{ type: string; target_id: string }> }) {
     uuidSchema.parse(nodeId);
-    return request(this.config, `/memory/nodes/${nodeId}`, { method: 'PUT', body });
+    const apiBody: Record<string, any> = {};
+    if (body.title !== undefined) apiBody.summary = body.title;
+    if (body.content !== undefined) apiBody.details = body.content;
+    if (body.relations && body.relations.length) apiBody.context = { relations: body.relations };
+    return request(this.config, `/memory/nodes/${nodeId}`, { method: 'PUT', body: apiBody });
   }
 
   deleteKnowledgeNode(nodeId: string) {
     uuidSchema.parse(nodeId);
-    return request(this.config, `/memory/nodes/${nodeId}`, { method: 'DELETE' });
+    return request(this.config, `/memory/nodes/${nodeId}`, { method: 'DELETE' })
+      .then((r) => (r === '' || r == null ? { success: true } : r));
   }
 
   supersedeKnowledgeNode(nodeId: string, body: { new_content: string; reason?: string }) {
     uuidSchema.parse(nodeId);
-    return request(this.config, `/memory/nodes/${nodeId}/supersede`, { body });
+    return (async () => {
+      const existingResp = await this.getKnowledgeNode(nodeId) as any;
+      const existing = unwrapApiResponse<any>(existingResp);
+      if (!existing || !existing.workspace_id) {
+        throw new Error('Failed to load existing node before superseding');
+      }
+
+      const createdResp = await this.createKnowledgeNode({
+        workspace_id: existing.workspace_id,
+        project_id: existing.project_id ?? undefined,
+        node_type: existing.node_type,
+        title: existing.summary ?? 'Superseded node',
+        content: body.new_content,
+      }) as any;
+      const created = unwrapApiResponse<any>(createdResp);
+      if (!created?.id) {
+        throw new Error('Failed to create replacement node for supersede');
+      }
+
+      await request(this.config, `/memory/nodes/${nodeId}/supersede`, { body: { superseded_by: created.id } });
+
+      return {
+        success: true,
+        data: {
+          status: 'superseded',
+          old_node_id: nodeId,
+          new_node_id: created.id,
+          reason: body.reason ?? null,
+        },
+        error: null,
+      };
+    })();
   }
 
   memoryTimeline(workspaceId: string) {

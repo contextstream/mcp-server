@@ -54,19 +54,20 @@ function parseToolList(raw: string): Set<string> {
 }
 
 function resolveToolFilter(): { allowlist: Set<string> | null; source: string | null } {
+  const defaultToolset = CORE_TOOLSET;
   const allowlistRaw = process.env.CONTEXTSTREAM_TOOL_ALLOWLIST;
   if (allowlistRaw) {
     const allowlist = parseToolList(allowlistRaw);
     if (allowlist.size === 0) {
-      console.error('[ContextStream] CONTEXTSTREAM_TOOL_ALLOWLIST is empty; using full tool list.');
-      return { allowlist: null, source: null };
+      console.error('[ContextStream] CONTEXTSTREAM_TOOL_ALLOWLIST is empty; using core tool list.');
+      return { allowlist: defaultToolset, source: 'core' };
     }
     return { allowlist, source: 'allowlist' };
   }
 
   const toolsetRaw = process.env.CONTEXTSTREAM_TOOLSET;
   if (!toolsetRaw) {
-    return { allowlist: null, source: null };
+    return { allowlist: defaultToolset, source: 'core' };
   }
 
   const key = toolsetRaw.trim().toLowerCase();
@@ -79,8 +80,8 @@ function resolveToolFilter(): { allowlist: Set<string> | null; source: string | 
     return { allowlist: resolved, source: key };
   }
 
-  console.error(`[ContextStream] Unknown CONTEXTSTREAM_TOOLSET "${toolsetRaw}". Using full tool list.`);
-  return { allowlist: null, source: null };
+  console.error(`[ContextStream] Unknown CONTEXTSTREAM_TOOLSET "${toolsetRaw}". Using core tool list.`);
+  return { allowlist: defaultToolset, source: 'core' };
 }
 
 function formatContent(data: unknown) {
@@ -138,7 +139,10 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
   const toolAllowlist = toolFilter.allowlist;
   if (toolAllowlist) {
     const source = toolFilter.source ?? 'custom';
-    console.error(`[ContextStream] Toolset limited (${source}): ${toolAllowlist.size} tools.`);
+    const hint = source === 'core'
+      ? ' Set CONTEXTSTREAM_TOOLSET=full to expose all tools.'
+      : '';
+    console.error(`[ContextStream] Toolset limited (${source}): ${toolAllowlist.size} tools.${hint}`);
   }
   const defaultProTools = new Set<string>([
     // AI endpoints (typically paid/credit-metered)

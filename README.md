@@ -161,7 +161,7 @@ claude mcp add --transport stdio contextstream --scope user \
   npx -y @contextstream/mcp-server
 ```
 
-Tip: Claude Code warns on large tool contexts. Use `CONTEXTSTREAM_TOOLSET=core` to reduce the tool list.
+Tip: Claude Code warns on large tool contexts. The default toolset is `core`.
 Set `CONTEXTSTREAM_TOOLSET=full` to expose everything.
 
 Windows caveat (native Windows, not WSL): if `npx` isn’t found, use `cmd /c npx -y @contextstream/mcp-server` after `--`.
@@ -204,7 +204,7 @@ You can authenticate using either:
 | `CONTEXTSTREAM_WORKSPACE_ID` | No | Default workspace ID fallback |
 | `CONTEXTSTREAM_PROJECT_ID` | No | Default project ID fallback |
 | `CONTEXTSTREAM_USER_AGENT` | No | Custom user agent string |
-| `CONTEXTSTREAM_TOOLSET` | No | Tool bundle to expose (`full` or `core`) |
+| `CONTEXTSTREAM_TOOLSET` | No | Tool bundle to expose (`core` default, or `full`) |
 | `CONTEXTSTREAM_TOOL_ALLOWLIST` | No | Comma-separated tool names to expose (overrides toolset) |
 | `CONTEXTSTREAM_PRO_TOOLS` | No | Comma-separated tool names treated as PRO (default: `ai_context,ai_enhanced_context,ai_context_budget,ai_embeddings,ai_plan,ai_tasks`) |
 | `CONTEXTSTREAM_UPGRADE_URL` | No | Upgrade link shown when Free users call PRO tools (default: `https://contextstream.io/pricing`) |

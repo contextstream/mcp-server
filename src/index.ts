@@ -71,7 +71,7 @@ Environment variables:
   CONTEXTSTREAM_JWT       JWT for authentication (alternative to API key)
   CONTEXTSTREAM_WORKSPACE_ID  Optional default workspace ID
   CONTEXTSTREAM_PROJECT_ID    Optional default project ID
-  CONTEXTSTREAM_TOOLSET       Optional tool bundle (full|core). Use core to reduce tool context size.
+  CONTEXTSTREAM_TOOLSET       Optional tool bundle (core|full). Defaults to core to reduce tool context size.
   CONTEXTSTREAM_TOOL_ALLOWLIST Optional comma-separated tool names to expose (overrides toolset)
   CONTEXTSTREAM_PRO_TOOLS     Optional comma-separated PRO tool names (default: AI tools)
   CONTEXTSTREAM_UPGRADE_URL   Optional upgrade URL shown for PRO tools on Free plan

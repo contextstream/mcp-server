@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { ContextStreamClient } from './client.js';
@@ -245,6 +246,37 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     if (explicitProjectId) return explicitProjectId;
     const ctx = sessionManager?.getContext();
     return typeof ctx?.project_id === 'string' ? (ctx.project_id as string) : undefined;
+  }
+
+  async function validateReadableDirectory(inputPath: string): Promise<{ ok: true; resolvedPath: string } | { ok: false; error: string }> {
+    const resolvedPath = path.resolve(inputPath);
+    let stats: fs.Stats;
+    try {
+      stats = await fs.promises.stat(resolvedPath);
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') {
+        return { ok: false, error: `Error: path does not exist: ${inputPath}` };
+      }
+      return {
+        ok: false,
+        error: `Error: unable to access path: ${inputPath}${error?.message ? ` (${error.message})` : ''}`,
+      };
+    }
+
+    if (!stats.isDirectory()) {
+      return { ok: false, error: `Error: path is not a directory: ${inputPath}` };
+    }
+
+    try {
+      await fs.promises.access(resolvedPath, fs.constants.R_OK | fs.constants.X_OK);
+    } catch (error: any) {
+      return {
+        ok: false,
+        error: `Error: path is not readable: ${inputPath}${error?.code ? ` (${error.code})` : ''}`,
+      };
+    }
+
+    return { ok: true, resolvedPath };
   }
 
   // Auth
@@ -900,15 +932,20 @@ Automatically detects code files and skips ignored directories like node_modules
         return errorResult('Error: project_id is required. Please call session_init first or provide project_id explicitly.');
       }
 
+      const pathCheck = await validateReadableDirectory(input.path);
+      if (!pathCheck.ok) {
+        return errorResult(pathCheck.error);
+      }
+
       // Start ingestion in background to avoid blocking the agent
       (async () => {
         try {
           let totalIndexed = 0;
           let batchCount = 0;
           
-          console.error(`[ContextStream] Starting background ingestion for project ${projectId} from ${input.path}`);
+          console.error(`[ContextStream] Starting background ingestion for project ${projectId} from ${pathCheck.resolvedPath}`);
           
-          for await (const batch of readAllFilesInBatches(input.path, { batchSize: 50 })) {
+          for await (const batch of readAllFilesInBatches(pathCheck.resolvedPath, { batchSize: 50 })) {
             const result = await client.ingestFiles(projectId, batch) as { data?: { files_indexed: number } };
             totalIndexed += result.data?.files_indexed ?? batch.length;
             batchCount++;

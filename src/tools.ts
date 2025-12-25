@@ -455,7 +455,9 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     },
     async (input) => {
       const result = await client.deleteWorkspace(input.workspace_id);
-      return { content: [{ type: 'text' as const, text: formatContent(result || { success: true, message: 'Workspace deleted successfully' }) }], structuredContent: toStructured(result) };
+      // Normalize response to match {success, data, error, metadata} structure
+      const normalized = result || { success: true, data: { id: input.workspace_id, deleted: true }, error: null, metadata: {} };
+      return { content: [{ type: 'text' as const, text: formatContent(normalized) }], structuredContent: toStructured(normalized) };
     }
   );
 
@@ -519,7 +521,9 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     },
     async (input) => {
       const result = await client.deleteProject(input.project_id);
-      return { content: [{ type: 'text' as const, text: formatContent(result || { success: true, message: 'Project deleted successfully' }) }], structuredContent: toStructured(result) };
+      // Normalize response to match {success, data, error, metadata} structure
+      const normalized = result || { success: true, data: { id: input.project_id, deleted: true }, error: null, metadata: {} };
+      return { content: [{ type: 'text' as const, text: formatContent(normalized) }], structuredContent: toStructured(normalized) };
     }
   );
 
@@ -710,6 +714,7 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
       inputSchema: z.object({
         workspace_id: z.string().uuid().optional(),
         project_id: z.string().uuid().optional(),
+        category: z.string().optional().describe('Optional category filter. If not specified, returns all decisions regardless of category.'),
         limit: z.number().optional(),
       }),
     },

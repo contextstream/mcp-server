@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import * as path from 'node:path';
 import { z } from 'zod';
 import type { Config } from './config.js';
-import { request } from './http.js';
+import { request, HttpError } from './http.js';
 import { readFilesFromDirectory, readAllFilesInBatches } from './files.js';
 import {
   resolveWorkspace,
@@ -48,6 +48,9 @@ function normalizeNodeType(input: string): string {
   }
 }
 
+const AI_PLAN_TIMEOUT_MS = 50_000;
+const AI_PLAN_RETRIES = 0;
+
 export class ContextStreamClient {
   constructor(private config: Config) {}
 
@@ -87,6 +90,31 @@ export class ContextStreamClient {
       workspace_id: input.workspace_id || defaultWorkspaceId,
       project_id: input.project_id || defaultProjectId,
     } as T;
+  }
+
+  private coerceUuid(value?: string): string | undefined {
+    if (!value) return undefined;
+    try {
+      uuidSchema.parse(value);
+      return value;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private requireNonEmpty(value: unknown, field: string, tool: string): string {
+    const text = String(value ?? '').trim();
+    if (!text) {
+      throw new HttpError(400, `${field} is required for ${tool}`);
+    }
+    return text;
+  }
+
+  private isBadRequestDeserialization(error: unknown): boolean {
+    if (!(error instanceof HttpError)) return false;
+    if (String(error.code || '').toUpperCase() !== 'BAD_REQUEST') return false;
+    const message = String(error.message || '').toLowerCase();
+    return message.includes('deserialize') || message.includes('deserial');
   }
 
   // Auth
@@ -138,9 +166,12 @@ export class ContextStreamClient {
     return request(this.config, `/workspaces${suffix}`);
   }
 
-  async createWorkspace(input: { name: string; description?: string; visibility?: string }) {
+  async createWorkspace(
+    input: { name: string; description?: string; visibility?: string },
+    options?: { unwrap?: boolean }
+  ) {
     const result = await request(this.config, '/workspaces', { body: input });
-    return unwrapApiResponse(result);
+    return options?.unwrap === false ? result : unwrapApiResponse(result);
   }
 
   async updateWorkspace(workspaceId: string, input: { name?: string; description?: string; visibility?: string }) {
@@ -170,10 +201,13 @@ export class ContextStreamClient {
     return request(this.config, `/projects${suffix}`);
   }
 
-  async createProject(input: { name: string; description?: string; workspace_id?: string }) {
+  async createProject(
+    input: { name: string; description?: string; workspace_id?: string },
+    options?: { unwrap?: boolean }
+  ) {
     const payload = this.withDefaults(input);
     const result = await request(this.config, '/projects', { body: payload });
-    return unwrapApiResponse(result);
+    return options?.unwrap === false ? result : unwrapApiResponse(result);
   }
 
   async updateProject(projectId: string, input: { name?: string; description?: string }) {
@@ -331,42 +365,259 @@ export class ContextStreamClient {
     return request(this.config, '/memory/search', { body: this.withDefaults(body) });
   }
 
-  memoryDecisions(params?: { workspace_id?: string; project_id?: string; limit?: number }) {
+  memoryDecisions(params?: { workspace_id?: string; project_id?: string; category?: string; limit?: number }) {
     const query = new URLSearchParams();
     const withDefaults = this.withDefaults(params || {});
     if (withDefaults.workspace_id) query.set('workspace_id', withDefaults.workspace_id);
     if (withDefaults.project_id) query.set('project_id', withDefaults.project_id);
+    if (params?.category) query.set('category', params.category);
     if (params?.limit) query.set('limit', String(params.limit));
     const suffix = query.toString() ? `?${query.toString()}` : '';
     return request(this.config, `/memory/search/decisions${suffix}`, { method: 'GET' });
   }
 
   // Graph
-  graphRelated(body: { workspace_id?: string; project_id?: string; node_id: string; limit?: number }) {
-    return request(this.config, '/graph/knowledge/related', { body: this.withDefaults(body) });
+  graphRelated(body: {
+    workspace_id?: string;
+    project_id?: string;
+    node_id: string;
+    limit?: number;
+    relation_types?: string[];
+    max_depth?: number;
+  }) {
+    const withDefaults = this.withDefaults(body);
+    const apiBody = {
+      node_id: withDefaults.node_id,
+      relation_types: body.relation_types,
+      max_depth: body.max_depth ?? body.limit,
+      workspace_id: withDefaults.workspace_id,
+      project_id: withDefaults.project_id,
+    };
+    return request(this.config, '/graph/knowledge/related', { body: apiBody });
   }
 
-  graphPath(body: { workspace_id?: string; project_id?: string; source_id: string; target_id: string }) {
-    return request(this.config, '/graph/knowledge/path', { body: this.withDefaults(body) });
+  graphPath(body: {
+    workspace_id?: string;
+    project_id?: string;
+    source_id?: string;
+    target_id?: string;
+    from?: string;
+    to?: string;
+    max_depth?: number;
+  }) {
+    const withDefaults = this.withDefaults(body);
+    const from = body.from ?? withDefaults.source_id;
+    const to = body.to ?? withDefaults.target_id;
+    const apiBody = {
+      from,
+      to,
+      max_depth: body.max_depth,
+      workspace_id: withDefaults.workspace_id,
+      project_id: withDefaults.project_id,
+    };
+    return request(this.config, '/graph/knowledge/path', { body: apiBody });
   }
 
-  graphDecisions(body?: { workspace_id?: string; project_id?: string; limit?: number }) {
-    return request(this.config, '/graph/knowledge/decisions', { body: this.withDefaults(body || {}) });
+  graphDecisions(body?: {
+    workspace_id?: string;
+    project_id?: string;
+    limit?: number;
+    category?: string;
+    from?: string;
+    to?: string;
+  }) {
+    const withDefaults = this.withDefaults(body || {});
+    const now = new Date();
+    const defaultFrom = new Date(now);
+    defaultFrom.setUTCFullYear(now.getUTCFullYear() - 5);
+    const apiBody = {
+      workspace_id: withDefaults.workspace_id,
+      project_id: withDefaults.project_id,
+      category: body?.category ?? 'general',
+      from: body?.from ?? defaultFrom.toISOString(),
+      to: body?.to ?? now.toISOString(),
+    };
+    return request(this.config, '/graph/knowledge/decisions', { body: apiBody });
   }
 
-  graphDependencies(body: { target: { type: string; id: string }; max_depth?: number; include_transitive?: boolean }) {
-    return request(this.config, '/graph/dependencies', { body });
+  async graphDependencies(body: {
+    target: { type: string; id: string; path?: string };
+    max_depth?: number;
+    include_transitive?: boolean;
+  }) {
+    const rawType = String(body.target?.type ?? '').toLowerCase();
+    let targetType: 'module' | 'function' | 'type' | 'variable' = 'function';
+    switch (rawType) {
+      case 'module':
+      case 'file':
+      case 'path':
+        targetType = 'module';
+        break;
+      case 'type':
+        targetType = 'type';
+        break;
+      case 'variable':
+      case 'var':
+      case 'const':
+        targetType = 'variable';
+        break;
+      case 'function':
+      case 'method':
+        targetType = 'function';
+        break;
+      default:
+        targetType = 'function';
+    }
+
+    const target =
+      targetType === 'module'
+        ? { type: targetType, path: body.target.path ?? body.target.id }
+        : { type: targetType, id: body.target.id };
+
+    return request(this.config, '/graph/dependencies', {
+      body: {
+        target,
+        max_depth: body.max_depth,
+        include_transitive: body.include_transitive,
+      },
+    });
   }
 
-  graphCallPath(body: { source: { type: string; id: string }; target: { type: string; id: string }; max_depth?: number }) {
-    return request(this.config, '/graph/call-paths', { body });
+  graphCallPath(body: {
+    source: { type: string; id: string };
+    target: { type: string; id: string };
+    max_depth?: number;
+    from_function_id?: string;
+    to_function_id?: string;
+  }) {
+    const apiBody = {
+      from_function_id: body.from_function_id ?? body.source?.id,
+      to_function_id: body.to_function_id ?? body.target?.id,
+      max_depth: body.max_depth,
+    };
+    return request(this.config, '/graph/call-paths', { body: apiBody });
   }
 
-  graphImpact(body: { target: { type: string; id: string }; max_depth?: number }) {
-    return request(this.config, '/graph/impact-analysis', { body });
+  graphImpact(body: {
+    target: { type: string; id: string };
+    max_depth?: number;
+    change_type?: string;
+    target_id?: string;
+    element_name?: string;
+  }) {
+    const targetId = body.target_id ?? body.target?.id;
+    const elementName = body.element_name ?? body.target?.id ?? body.target?.type ?? 'unknown';
+    const apiBody = {
+      change_type: body.change_type ?? 'modify_signature',
+      target_id: targetId,
+      element_name: elementName,
+    };
+    return request(this.config, '/graph/impact-analysis', { body: apiBody });
   }
 
   // AI
+  private buildAiContextRequest(input: {
+    query: string;
+    project_id?: string;
+    max_tokens?: number;
+    max_sections?: number;
+    token_budget?: number;
+    token_soft_limit?: number;
+    include_dependencies?: boolean;
+    include_tests?: boolean;
+    limit?: number;
+  }) {
+    const payload: Record<string, unknown> = {
+      query: input.query,
+    };
+
+    if (input.project_id) payload.project_id = input.project_id;
+    if (typeof input.max_tokens === 'number') payload.max_tokens = input.max_tokens;
+    if (typeof input.token_budget === 'number') payload.token_budget = input.token_budget;
+    if (typeof input.token_soft_limit === 'number') payload.token_soft_limit = input.token_soft_limit;
+    if (typeof input.include_dependencies === 'boolean') {
+      payload.include_dependencies = input.include_dependencies;
+    }
+    if (typeof input.include_tests === 'boolean') {
+      payload.include_tests = input.include_tests;
+    }
+
+    const rawLimit =
+      typeof input.max_sections === 'number' ? input.max_sections : input.limit;
+    if (typeof rawLimit === 'number' && Number.isFinite(rawLimit)) {
+      const bounded = Math.max(1, Math.min(20, Math.floor(rawLimit)));
+      payload.max_sections = bounded;
+    }
+
+    return payload;
+  }
+
+  private buildAiPlanRequest(input: {
+    description?: string;
+    requirements?: string;
+    project_id?: string;
+    max_steps?: number;
+    context?: string;
+    constraints?: string[];
+  }) {
+    const requirements = input.requirements ?? input.description;
+    if (!requirements || !requirements.trim()) {
+      throw new Error('description is required for ai_plan');
+    }
+
+    const payload: Record<string, unknown> = {
+      requirements,
+    };
+
+    if (input.project_id) payload.project_id = input.project_id;
+    if (typeof input.max_steps === 'number') payload.max_steps = input.max_steps;
+    if (input.context) payload.context = input.context;
+    if (input.constraints) payload.constraints = input.constraints;
+
+    return payload;
+  }
+
+  private normalizeTaskGranularity(value?: string): 'low' | 'medium' | 'high' | undefined {
+    if (!value) return undefined;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'low' || normalized === 'medium' || normalized === 'high') {
+      return normalized;
+    }
+    if (normalized === 'coarse' || normalized === 'broad') return 'low';
+    if (normalized === 'fine' || normalized === 'detailed') return 'high';
+    return undefined;
+  }
+
+  private buildAiTasksRequest(input: {
+    description?: string;
+    plan?: string;
+    project_id?: string;
+    granularity?: string;
+    max_tasks?: number;
+    include_estimates?: boolean;
+  }) {
+    const plan = input.plan ?? input.description;
+    if (!plan || !plan.trim()) {
+      throw new Error('description is required for ai_tasks');
+    }
+
+    const payload: Record<string, unknown> = {
+      plan,
+    };
+
+    if (input.project_id) payload.project_id = input.project_id;
+
+    const granularity = this.normalizeTaskGranularity(input.granularity);
+    if (granularity) payload.granularity = granularity;
+
+    if (typeof input.max_tasks === 'number') payload.max_tasks = input.max_tasks;
+    if (typeof input.include_estimates === 'boolean') {
+      payload.include_estimates = input.include_estimates;
+    }
+
+    return payload;
+  }
+
   aiContext(body: {
     query: string;
     workspace_id?: string;
@@ -376,7 +627,18 @@ export class ContextStreamClient {
     include_memory?: boolean;
     limit?: number;
   }) {
-    return request(this.config, '/ai/context', { body: this.withDefaults(body) });
+    const { query, project_id, limit, workspace_id } = this.withDefaults(body);
+    const safeQuery = this.requireNonEmpty(query, 'query', 'ai_context');
+    const safeProjectId = this.coerceUuid(project_id);
+    const payload = this.buildAiContextRequest({ query: safeQuery, project_id: safeProjectId, limit });
+    return request(this.config, '/ai/context', { body: payload, workspaceId: workspace_id })
+      .catch((error) => {
+        if (this.isBadRequestDeserialization(error)) {
+          const minimalPayload = this.buildAiContextRequest({ query: safeQuery });
+          return request(this.config, '/ai/context', { body: minimalPayload, workspaceId: workspace_id });
+        }
+        throw error;
+      });
   }
 
   aiEmbeddings(body: { text: string }) {
@@ -384,11 +646,48 @@ export class ContextStreamClient {
   }
 
   aiPlan(body: { description: string; project_id?: string; complexity?: string }) {
-    return request(this.config, '/ai/plan/generate', { body: this.withDefaults(body) });
+    const { description, project_id } = this.withDefaults(body);
+    const safeDescription = this.requireNonEmpty(description, 'description', 'ai_plan');
+    const safeProjectId = this.coerceUuid(project_id);
+    const payload = this.buildAiPlanRequest({ description: safeDescription, project_id: safeProjectId });
+    const requestOptions = { body: payload, timeoutMs: AI_PLAN_TIMEOUT_MS, retries: AI_PLAN_RETRIES };
+    return request(this.config, '/ai/plan/generate', requestOptions)
+      .catch((error) => {
+        if (this.isBadRequestDeserialization(error)) {
+          const minimalPayload = this.buildAiPlanRequest({ description: safeDescription });
+          return request(this.config, '/ai/plan/generate', {
+            body: minimalPayload,
+            timeoutMs: AI_PLAN_TIMEOUT_MS,
+            retries: AI_PLAN_RETRIES,
+          });
+        }
+        if (error instanceof HttpError && error.status === 0 && /timeout/i.test(error.message)) {
+          const seconds = Math.ceil(AI_PLAN_TIMEOUT_MS / 1000);
+          throw new HttpError(
+            503,
+            `AI plan generation timed out after ${seconds} seconds. Try a shorter description, reduce max_steps, or retry later.`
+          );
+        }
+        throw error;
+      });
   }
 
   aiTasks(body: { plan_id?: string; description?: string; project_id?: string; granularity?: string }) {
-    return request(this.config, '/ai/tasks/generate', { body: this.withDefaults(body) });
+    if (!body.description && body.plan_id) {
+      throw new Error('plan_id is not supported for ai_tasks; provide description instead.');
+    }
+    const { description, project_id, granularity } = this.withDefaults(body);
+    const safeDescription = this.requireNonEmpty(description, 'description', 'ai_tasks');
+    const safeProjectId = this.coerceUuid(project_id);
+    const payload = this.buildAiTasksRequest({ description: safeDescription, project_id: safeProjectId, granularity });
+    return request(this.config, '/ai/tasks/generate', { body: payload })
+      .catch((error) => {
+        if (this.isBadRequestDeserialization(error)) {
+          const minimalPayload = this.buildAiTasksRequest({ description: safeDescription });
+          return request(this.config, '/ai/tasks/generate', { body: minimalPayload });
+        }
+        throw error;
+      });
   }
 
   aiEnhancedContext(body: {
@@ -400,7 +699,18 @@ export class ContextStreamClient {
     include_memory?: boolean;
     limit?: number;
   }) {
-    return request(this.config, '/ai/context/enhanced', { body: this.withDefaults(body) });
+    const { query, project_id, limit, workspace_id } = this.withDefaults(body);
+    const safeQuery = this.requireNonEmpty(query, 'query', 'ai_enhanced_context');
+    const safeProjectId = this.coerceUuid(project_id);
+    const payload = this.buildAiContextRequest({ query: safeQuery, project_id: safeProjectId, limit });
+    return request(this.config, '/ai/context/enhanced', { body: payload, workspaceId: workspace_id })
+      .catch((error) => {
+        if (this.isBadRequestDeserialization(error)) {
+          const minimalPayload = this.buildAiContextRequest({ query: safeQuery });
+          return request(this.config, '/ai/context/enhanced', { body: minimalPayload, workspaceId: workspace_id });
+        }
+        throw error;
+      });
   }
 
   // Project extended operations (with caching)
@@ -591,12 +901,12 @@ export class ContextStreamClient {
   }
 
   // Graph extended operations
-  findCircularDependencies(projectId: string) {
+  async findCircularDependencies(projectId: string) {
     uuidSchema.parse(projectId);
     return request(this.config, `/graph/circular-dependencies/${projectId}`, { method: 'GET' });
   }
 
-  findUnusedCode(projectId: string) {
+  async findUnusedCode(projectId: string) {
     uuidSchema.parse(projectId);
     return request(this.config, `/graph/unused-code/${projectId}`, { method: 'GET' });
   }

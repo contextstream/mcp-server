@@ -47,6 +47,7 @@ export interface RequestOptions {
   signal?: AbortSignal;
   retries?: number;
   retryDelay?: number;
+  timeoutMs?: number;
   /**
    * Optional workspace ID for workspace-pooled rate limiting (Team/Enterprise plans).
    * If omitted, this is inferred from `body.workspace_id`, query `workspace_id`, or well-known URL paths,
@@ -74,6 +75,10 @@ export async function request<T>(
   const url = `${apiUrl.replace(/\/$/, '')}${apiPath}`;
   const maxRetries = options.retries ?? MAX_RETRIES;
   const baseDelay = options.retryDelay ?? BASE_DELAY;
+  const timeoutMs =
+    typeof options.timeoutMs === 'number' && options.timeoutMs > 0
+      ? options.timeoutMs
+      : 180_000;
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -101,7 +106,7 @@ export async function request<T>(
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 180_000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     // Combine user signal with timeout
     if (options.signal) {
@@ -120,7 +125,8 @@ export async function request<T>(
         if (options.signal?.aborted) {
           throw new HttpError(0, 'Request cancelled by user');
         }
-        throw new HttpError(0, 'Request timeout after 180 seconds');
+        const seconds = Math.ceil(timeoutMs / 1000);
+        throw new HttpError(0, `Request timeout after ${seconds} seconds`);
       }
       
       lastError = new HttpError(0, error?.message || 'Network error');
@@ -148,7 +154,12 @@ export async function request<T>(
       const rateLimit = parseRateLimitHeaders(response.headers);
       const enrichedPayload = attachRateLimit(payload, rateLimit);
 
-      const message = extractErrorMessage(enrichedPayload, response.statusText);
+      const message = rewriteNotFoundMessage({
+        status: response.status,
+        path: apiPath,
+        message: extractErrorMessage(enrichedPayload, response.statusText),
+        payload: enrichedPayload,
+      });
       lastError = new HttpError(response.status, message, enrichedPayload);
 
       const apiCode = extractErrorCode(enrichedPayload);
@@ -269,4 +280,26 @@ function extractErrorCode(payload: any): string | null {
   }
   if (typeof payload.code === 'string' && payload.code.trim()) return payload.code.trim();
   return null;
+}
+
+function detectIntegrationProvider(path: string): 'github' | 'slack' | null {
+  if (/\/github(\/|$)/i.test(path)) return 'github';
+  if (/\/slack(\/|$)/i.test(path)) return 'slack';
+  return null;
+}
+
+function rewriteNotFoundMessage(input: {
+  status: number;
+  path: string;
+  message: string;
+  payload: any;
+}): string {
+  if (input.status !== 404) return input.message;
+
+  const provider = detectIntegrationProvider(input.path);
+  if (!provider) return input.message;
+  if (!/\/workspaces\//i.test(input.path)) return input.message;
+
+  const label = provider === 'github' ? 'GitHub' : 'Slack';
+  return `${label} integration is not connected for this workspace. Connect ${label} in workspace integrations and retry. If you intended a different workspace, pass workspace_id.`;
 }

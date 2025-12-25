@@ -209,6 +209,34 @@ You can authenticate using either:
 | `CONTEXTSTREAM_PRO_TOOLS` | No | Comma-separated tool names treated as PRO (default: `ai_context,ai_enhanced_context,ai_context_budget,ai_embeddings,ai_plan,ai_tasks`) |
 | `CONTEXTSTREAM_UPGRADE_URL` | No | Upgrade link shown when Free users call PRO tools (default: `https://contextstream.io/pricing`) |
 
+### Server-side environment variables (API)
+
+The following environment variables are configured on the ContextStream API server (not in your MCP client config):
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `QA_FILE_WRITE_ROOT` | No | Server-side root directory for `write_to_disk` file writes. When set, the API allows the `projects_ingest_local` tool to write ingested files to disk for testing/QA purposes. Files are written under `<QA_FILE_WRITE_ROOT>/<project_id>/<relative_path>`. If not set, `write_to_disk` requests are rejected. |
+
+#### File write parameters for `projects_ingest_local`
+
+The `projects_ingest_local` tool accepts two optional parameters for QA/testing scenarios:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `write_to_disk` | boolean | `false` | When `true`, writes ingested files to disk on the API server under `QA_FILE_WRITE_ROOT` before indexing. Requires the API to have `QA_FILE_WRITE_ROOT` configured. |
+| `overwrite` | boolean | `false` | When `true` (and `write_to_disk` is enabled), allows overwriting existing files. Otherwise, existing files are skipped. |
+
+**Example usage:**
+```json
+{
+  "path": "/path/to/local/project",
+  "write_to_disk": true,
+  "overwrite": false
+}
+```
+
+**Note:** The `write_to_disk` feature is intended for testing, QA, and development scenarios where you need to materialize files on a test server. In production, `QA_FILE_WRITE_ROOT` should typically be unset to disable file writes.
+
 ## Usage patterns
 
 ### Recommended flow for AI tools

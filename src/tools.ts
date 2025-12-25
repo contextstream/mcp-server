@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { ContextStreamClient } from './client.js';
-import { readFilesFromDirectory, readAllFilesInBatches } from './files.js';
+import { readFilesFromDirectory, readAllFilesInBatches, countIndexableFiles } from './files.js';
 import { SessionManager } from './session-manager.js';
 import { getAvailableEditors, generateRuleContent, generateAllRuleFiles } from './rules-templates.js';
 import { VERSION } from './version.js';
@@ -291,12 +291,22 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
           String(errorCode).toUpperCase() === 'FORBIDDEN' &&
           String(errorMessage).toLowerCase().includes('plan limit reached');
         const upgradeHint = isPlanLimit ? `\nUpgrade: ${upgradeUrl}` : '';
-        
-        // Re-throw with a proper Error that has a string message
-        const serializedError = new Error(
-          `[${errorCode}] ${errorMessage}${upgradeHint}${errorDetails ? `: ${JSON.stringify(errorDetails)}` : ''}`
-        );
-        throw serializedError;
+
+        // Return structured error response instead of throwing
+        const errorPayload = {
+          success: false,
+          error: {
+            code: errorCode,
+            message: errorMessage,
+            details: errorDetails,
+          },
+        };
+        const errorText = `[${errorCode}] ${errorMessage}${upgradeHint}${errorDetails ? `: ${JSON.stringify(errorDetails)}` : ''}`;
+        return {
+          content: [{ type: 'text' as const, text: errorText }],
+          structuredContent: errorPayload,
+          isError: true,
+        };
       }
     };
     
@@ -410,7 +420,7 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
       }),
     },
     async (input) => {
-      const result = await client.createWorkspace(input, { unwrap: false });
+      const result = await client.createWorkspace(input);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -475,7 +485,7 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
       }),
     },
     async (input) => {
-      const result = await client.createProject(input, { unwrap: false });
+      const result = await client.createProject(input);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -767,9 +777,14 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     'graph_dependencies',
     {
       title: 'Code dependencies',
-      description: 'Dependency graph query',
+      description: `Dependency graph query
+
+Access: Free`,
       inputSchema: z.object({
-        target: z.object({ type: z.string(), id: z.string() }),
+        target: z.object({
+          type: z.string().describe('Code element type. Accepted values: module (aliases: file, path), function (alias: method), type (aliases: struct, enum, trait, class), variable (aliases: data, const, constant). For knowledge/memory nodes, use graph_path with UUID ids instead.'),
+          id: z.string().describe('Element identifier. For module type, use file path (e.g., "src/auth.rs"). For function/type/variable, use the element id.'),
+        }),
         max_depth: z.number().optional(),
         include_transitive: z.boolean().optional(),
       }),
@@ -784,10 +799,18 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     'graph_call_path',
     {
       title: 'Call path',
-      description: 'Find call path between two targets',
+      description: `Find call path between two targets
+
+Access: Free`,
       inputSchema: z.object({
-        source: z.object({ type: z.string(), id: z.string() }),
-        target: z.object({ type: z.string(), id: z.string() }),
+        source: z.object({
+          type: z.string().describe('Must be "function" (alias: method). Only function types are supported for call path analysis. For knowledge/memory nodes, use graph_path with UUID ids instead.'),
+          id: z.string().describe('Source function identifier.'),
+        }),
+        target: z.object({
+          type: z.string().describe('Must be "function" (alias: method). Only function types are supported for call path analysis.'),
+          id: z.string().describe('Target function identifier.'),
+        }),
         max_depth: z.number().optional(),
       }),
     },
@@ -801,8 +824,16 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     'graph_impact',
     {
       title: 'Impact analysis',
-      description: 'Analyze impact of a target node',
-      inputSchema: z.object({ target: z.object({ type: z.string(), id: z.string() }), max_depth: z.number().optional() }),
+      description: `Analyze impact of a target node
+
+Access: Free`,
+      inputSchema: z.object({
+        target: z.object({
+          type: z.string().describe('Code element type. Accepted values: module (aliases: file, path), function (alias: method), type (aliases: struct, enum, trait, class), variable (aliases: data, const, constant). For knowledge/memory nodes, use graph_path with UUID ids instead.'),
+          id: z.string().describe('Element identifier. For module type, use file path (e.g., "src/auth.rs"). For function/type/variable, use the element id.'),
+        }),
+        max_depth: z.number().optional(),
+      }),
     },
     async (input) => {
       const result = await client.graphImpact(input);
@@ -1002,6 +1033,8 @@ Automatically detects code files and skips ignored directories like node_modules
       inputSchema: z.object({
         project_id: z.string().uuid().optional().describe('Project to ingest files into (defaults to current session project)'),
         path: z.string().describe('Local directory path to read files from'),
+        write_to_disk: z.boolean().optional().describe('When true, write files to disk under QA_FILE_WRITE_ROOT before indexing (for testing/QA)'),
+        overwrite: z.boolean().optional().describe('Allow overwriting existing files when write_to_disk is enabled'),
       }),
     },
     async (input) => {
@@ -1015,20 +1048,36 @@ Automatically detects code files and skips ignored directories like node_modules
         return errorResult(pathCheck.error);
       }
 
+      // Quick check: does directory contain any indexable files?
+      const fileCheck = await countIndexableFiles(pathCheck.resolvedPath, { maxFiles: 1 });
+      if (fileCheck.count === 0) {
+        return errorResult(
+          `Error: no indexable files found in directory: ${input.path}. ` +
+          `The directory may be empty or contain only ignored files/directories. ` +
+          `Supported file types include: .ts, .js, .py, .rs, .go, .java, .md, .json, etc.`
+        );
+      }
+
+      // Capture ingest options for passing to API
+      const ingestOptions = {
+        ...(input.write_to_disk !== undefined && { write_to_disk: input.write_to_disk }),
+        ...(input.overwrite !== undefined && { overwrite: input.overwrite }),
+      };
+
       // Start ingestion in background to avoid blocking the agent
       (async () => {
         try {
           let totalIndexed = 0;
           let batchCount = 0;
-          
+
           console.error(`[ContextStream] Starting background ingestion for project ${projectId} from ${pathCheck.resolvedPath}`);
-          
+
           for await (const batch of readAllFilesInBatches(pathCheck.resolvedPath, { batchSize: 50 })) {
-            const result = await client.ingestFiles(projectId, batch) as { data?: { files_indexed: number } };
+            const result = await client.ingestFiles(projectId, batch, ingestOptions) as { data?: { files_indexed: number } };
             totalIndexed += result.data?.files_indexed ?? batch.length;
             batchCount++;
           }
-          
+
           console.error(`[ContextStream] Completed background ingestion: ${totalIndexed} files in ${batchCount} batches`);
         } catch (error) {
           console.error(`[ContextStream] Ingestion failed:`, error);
@@ -1040,13 +1089,15 @@ Automatically detects code files and skips ignored directories like node_modules
         message: 'Ingestion running in background',
         project_id: projectId,
         path: input.path,
+        ...(input.write_to_disk && { write_to_disk: input.write_to_disk }),
+        ...(input.overwrite && { overwrite: input.overwrite }),
         note: "Use 'projects_index_status' to monitor progress."
       };
-      
-      return { 
-        content: [{ 
-          type: 'text' as const, 
-          text: `Ingestion started in background for directory: ${input.path}. Use 'projects_index_status' to monitor progress.` 
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Ingestion started in background for directory: ${input.path}. Use 'projects_index_status' to monitor progress.`
         }],
         structuredContent: toStructured(summary)
       };

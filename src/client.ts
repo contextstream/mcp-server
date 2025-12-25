@@ -446,11 +446,24 @@ export class ContextStreamClient {
   /**
    * Ingest files for indexing
    * This uploads files to the API for indexing
+   * @param projectId - Project UUID
+   * @param files - Array of files to ingest
+   * @param options - Optional ingest options
+   * @param options.write_to_disk - When true, write files to disk under QA_FILE_WRITE_ROOT before indexing
+   * @param options.overwrite - Allow overwriting existing files when write_to_disk is enabled
    */
-  ingestFiles(projectId: string, files: Array<{ path: string; content: string; language?: string }>) {
+  ingestFiles(
+    projectId: string,
+    files: Array<{ path: string; content: string; language?: string }>,
+    options?: { write_to_disk?: boolean; overwrite?: boolean }
+  ) {
     uuidSchema.parse(projectId);
     return request(this.config, `/projects/${projectId}/files/ingest`, {
-      body: { files },
+      body: {
+        files,
+        ...(options?.write_to_disk !== undefined && { write_to_disk: options.write_to_disk }),
+        ...(options?.overwrite !== undefined && { overwrite: options.overwrite }),
+      },
     });
   }
 

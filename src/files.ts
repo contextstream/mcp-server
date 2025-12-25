@@ -224,6 +224,72 @@ export async function* readAllFilesInBatches(
 }
 
 /**
+ * Check if a directory contains any indexable files.
+ * Stops as soon as it finds one file for efficiency.
+ * Returns count=0 if directory is empty or has no indexable files.
+ */
+export async function countIndexableFiles(
+  rootPath: string,
+  options: {
+    maxFiles?: number; // Stop counting after this many (default 1 for quick check)
+    maxFileSize?: number;
+  } = {}
+): Promise<{ count: number; stopped: boolean }> {
+  const maxFiles = options.maxFiles ?? 1;
+  const maxFileSize = options.maxFileSize ?? MAX_FILE_SIZE;
+  let count = 0;
+  let stopped = false;
+
+  async function walkDir(dir: string): Promise<void> {
+    if (count >= maxFiles) {
+      stopped = true;
+      return;
+    }
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (count >= maxFiles) {
+        stopped = true;
+        return;
+      }
+
+      const fullPath = path.join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        if (IGNORE_DIRS.has(entry.name)) continue;
+        await walkDir(fullPath);
+      } else if (entry.isFile()) {
+        if (IGNORE_FILES.has(entry.name)) continue;
+
+        const ext = entry.name.split('.').pop()?.toLowerCase() ?? '';
+        if (!CODE_EXTENSIONS.has(ext)) continue;
+
+        try {
+          const stat = await fs.promises.stat(fullPath);
+          if (stat.size > maxFileSize) continue;
+          count++;
+          if (count >= maxFiles) {
+            stopped = true;
+            return;
+          }
+        } catch {
+          // Skip unreadable files
+        }
+      }
+    }
+  }
+
+  await walkDir(rootPath);
+  return { count, stopped };
+}
+
+/**
  * Get language from file extension
  */
 export function detectLanguage(filePath: string): string {

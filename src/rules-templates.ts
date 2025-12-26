@@ -116,6 +116,14 @@ If context still feels missing, increase \`max_tokens\` and/or call \`session_re
 
 ---
 
+### Search (ContextStream-first)
+
+- Before scanning the repo or grepping, use \`session_smart_search\` to locate relevant files, patterns, and prior context.
+- Follow up with \`session_recall\` if you need deeper history on a specific topic.
+- Only fall back to raw file scans (\`rg\`, \`ls\`, \`find\`) when ContextStream search doesn't surface what you need.
+
+---
+
 ### Lesson Capture (MANDATORY)
 
 When:
@@ -191,6 +199,7 @@ const CONTEXTSTREAM_RULES_MINIMAL = `
 - Every user message: \`context_smart(user_message="<user_message>", format="minified", max_tokens=400)\` BEFORE answering.
   - Use \`max_tokens=200\` for trivial/local edits, \`max_tokens=800\` for deep debugging/architecture.
 - If prior context is missing or user asks past decisions: \`session_recall(query="<question>")\`, then answer.
+- For code/file discovery, use \`session_smart_search\` before raw repo scans (\`rg\`, \`ls\`, \`find\`); fall back only if needed.
 - After meaningful work/decisions/preferences: \`session_capture(event_type=decision|preference|task|insight, title="…", content="…")\`.
 - On frustration/corrections/tool mistakes: \`session_capture_lesson(...)\`.
 `.trim();

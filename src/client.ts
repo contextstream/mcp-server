@@ -12,6 +12,7 @@ import {
   type WorkspaceConfig
 } from './workspace-config.js';
 import { globalCache, CacheKeys, CacheTTL } from './cache.js';
+import { VERSION } from './version.js';
 
 const uuidSchema = z.string().uuid();
 
@@ -1336,6 +1337,7 @@ export class ContextStreamClient {
         session_id: params.session_id,
         include_recent_memory: params.include_recent_memory ?? true,
         include_decisions: params.include_decisions ?? true,
+        client_version: VERSION,
       },
     }) as { data?: SessionContextData } | SessionContextData;
 

@@ -929,6 +929,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     console.log('\nNext steps:');
     console.log('- Restart your editor/CLI after changing MCP config or rules.');
+    console.log('- Prefer ContextStream search first: use session_smart_search (or mcp__contextstream__session_smart_search) before raw repo scans (rg/ls/find).');
     console.log('- If any tools require UI-based MCP setup (e.g. Cline/Kilo/Roo global), follow https://contextstream.io/docs/mcp.');
   } finally {
     rl.close();

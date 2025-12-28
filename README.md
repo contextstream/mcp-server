@@ -186,6 +186,7 @@ args = ["-y", "@contextstream/mcp-server"]
 [mcp_servers.contextstream.env]
 CONTEXTSTREAM_API_URL = "https://api.contextstream.io"
 CONTEXTSTREAM_API_KEY = "your_api_key"
+# Optional: CONTEXTSTREAM_TOOLSET = "full"  # default is "core"
 ```
 
 After editing, restart your MCP client so it reloads the server configuration.

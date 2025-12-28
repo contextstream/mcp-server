@@ -250,7 +250,7 @@ function claudeDesktopConfigPath(): string | null {
   return null;
 }
 
-async function upsertCodexTomlConfig(filePath: string, params: { apiUrl: string; apiKey: string }): Promise<'created' | 'updated' | 'skipped'> {
+async function upsertCodexTomlConfig(filePath: string, params: { apiUrl: string; apiKey: string; toolset?: string }): Promise<'created' | 'updated' | 'skipped'> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const exists = await fileExists(filePath);
   const existing = exists ? await fs.readFile(filePath, 'utf8').catch(() => '') : '';
@@ -258,6 +258,7 @@ async function upsertCodexTomlConfig(filePath: string, params: { apiUrl: string;
   const marker = '[mcp_servers.contextstream]';
   const envMarker = '[mcp_servers.contextstream.env]';
 
+  const toolsetLine = params.toolset ? `CONTEXTSTREAM_TOOLSET = "${params.toolset}"\n` : '';
   const block =
     `\n\n# ContextStream MCP server\n` +
     `[mcp_servers.contextstream]\n` +
@@ -265,7 +266,8 @@ async function upsertCodexTomlConfig(filePath: string, params: { apiUrl: string;
     `args = ["-y", "@contextstream/mcp-server"]\n\n` +
     `[mcp_servers.contextstream.env]\n` +
     `CONTEXTSTREAM_API_URL = "${params.apiUrl}"\n` +
-    `CONTEXTSTREAM_API_KEY = "${params.apiKey}"\n`;
+    `CONTEXTSTREAM_API_KEY = "${params.apiKey}"\n` +
+    toolsetLine;
 
   if (!exists) {
     await fs.writeFile(filePath, block.trimStart(), 'utf8');
@@ -668,7 +670,10 @@ export async function runSetupWizard(args: string[]): Promise<void> {
               console.log(`- ${EDITOR_LABELS[editor]}: would update ${filePath}`);
               continue;
             }
-            const status = await upsertCodexTomlConfig(filePath, { apiUrl, apiKey });
+            const codexParams = toolset === 'full'
+              ? { apiUrl, apiKey, toolset: 'full' }
+              : { apiUrl, apiKey };
+            const status = await upsertCodexTomlConfig(filePath, codexParams);
             writeActions.push({ kind: 'mcp-config', target: filePath, status });
             console.log(`- ${EDITOR_LABELS[editor]}: ${status} ${filePath}`);
             continue;

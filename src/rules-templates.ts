@@ -333,7 +333,7 @@ To expose all tools below, set \`CONTEXTSTREAM_TOOLSET=full\` in your MCP config
 \`slack_stats\`, \`slack_channels\`, \`slack_contributors\`, \`slack_activity\`, \`slack_discussions\`, \`slack_search\`, \`slack_sync_users\`, \`slack_knowledge\`, \`slack_summary\`
 
 **Cross-Source Integrations** (PRO):
-\`integrations_status\`, \`integrations_search\`, \`integrations_summary\`
+\`integrations_status\`, \`integrations_search\`, \`integrations_summary\`, \`integrations_knowledge\`
 
 See full documentation: https://contextstream.io/docs/mcp/tools
 `.trim();

@@ -91,6 +91,8 @@ These clients use the `mcpServers` JSON schema:
 
 Many other MCP JSON clients also use this same `mcpServers` shape (including Claude Code project scope via `.mcp.json`).
 
+**Core toolset (default, ~17 tools):**
+
 ```json
 {
   "mcpServers": {
@@ -106,9 +108,29 @@ Many other MCP JSON clients also use this same `mcpServers` shape (including Cla
 }
 ```
 
+**Full toolset (~86 tools):**
+
+```json
+{
+  "mcpServers": {
+    "contextstream": {
+      "command": "npx",
+      "args": ["-y", "@contextstream/mcp-server"],
+      "env": {
+        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+        "CONTEXTSTREAM_API_KEY": "your_api_key",
+        "CONTEXTSTREAM_TOOLSET": "full"
+      }
+    }
+  }
+}
+```
+
 ### VS Code (`.vscode/mcp.json`)
 
 VS Code uses a different schema with a top-level `servers` map:
+
+**Core toolset (default):**
 
 ```json
 {
@@ -120,6 +142,25 @@ VS Code uses a different schema with a top-level `servers` map:
       "env": {
         "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
         "CONTEXTSTREAM_API_KEY": "your_api_key"
+      }
+    }
+  }
+}
+```
+
+**Full toolset (~86 tools):**
+
+```json
+{
+  "servers": {
+    "contextstream": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@contextstream/mcp-server"],
+      "env": {
+        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+        "CONTEXTSTREAM_API_KEY": "your_api_key",
+        "CONTEXTSTREAM_TOOLSET": "full"
       }
     }
   }
@@ -156,27 +197,46 @@ Strong recommendation: VS Code supports `inputs` so you don’t have to hardcode
 
 User scope (all projects):
 
+**Core toolset (recommended for Claude Code):**
+
 ```bash
 claude mcp add --transport stdio contextstream --scope user \
   --env CONTEXTSTREAM_API_URL=https://api.contextstream.io \
   --env CONTEXTSTREAM_API_KEY=YOUR_KEY \
-  --env CONTEXTSTREAM_TOOLSET=core -- \
-  npx -y @contextstream/mcp-server
+  -- npx -y @contextstream/mcp-server
 ```
 
-Tip: Claude Code warns on large tool contexts. The default toolset is `core`.
-Set `CONTEXTSTREAM_TOOLSET=full` to expose everything.
-
-Windows caveat (native Windows, not WSL): if `npx` isn’t found, use `cmd /c npx -y @contextstream/mcp-server` after `--`.
-
-Alternative (JSON form):
+**Full toolset (~86 tools):**
 
 ```bash
+claude mcp add --transport stdio contextstream --scope user \
+  --env CONTEXTSTREAM_API_URL=https://api.contextstream.io \
+  --env CONTEXTSTREAM_API_KEY=YOUR_KEY \
+  --env CONTEXTSTREAM_TOOLSET=full \
+  -- npx -y @contextstream/mcp-server
+```
+
+Note: Claude Code may warn about large tool contexts when using `full`. The default is `core` (~17 tools).
+
+Windows caveat (native Windows, not WSL): if `npx` isn't found, use `cmd /c npx -y @contextstream/mcp-server` after `--`.
+
+**Alternative (JSON form):**
+
+Core:
+```bash
 claude mcp add-json contextstream \
-'{"type":"stdio","command":"npx","args":["-y","@contextstream/mcp-server"],"env":{"CONTEXTSTREAM_API_URL":"https://api.contextstream.io","CONTEXTSTREAM_API_KEY":"your_api_key","CONTEXTSTREAM_TOOLSET":"core"}}'
+'{"type":"stdio","command":"npx","args":["-y","@contextstream/mcp-server"],"env":{"CONTEXTSTREAM_API_URL":"https://api.contextstream.io","CONTEXTSTREAM_API_KEY":"your_api_key"}}'
+```
+
+Full:
+```bash
+claude mcp add-json contextstream \
+'{"type":"stdio","command":"npx","args":["-y","@contextstream/mcp-server"],"env":{"CONTEXTSTREAM_API_URL":"https://api.contextstream.io","CONTEXTSTREAM_API_KEY":"your_api_key","CONTEXTSTREAM_TOOLSET":"full"}}'
 ```
 
 ### Codex CLI (`~/.codex/config.toml`)
+
+**Core toolset (default):**
 
 ```toml
 [mcp_servers.contextstream]
@@ -186,7 +246,19 @@ args = ["-y", "@contextstream/mcp-server"]
 [mcp_servers.contextstream.env]
 CONTEXTSTREAM_API_URL = "https://api.contextstream.io"
 CONTEXTSTREAM_API_KEY = "your_api_key"
-# Optional: CONTEXTSTREAM_TOOLSET = "full"  # default is "core"
+```
+
+**Full toolset (~86 tools):**
+
+```toml
+[mcp_servers.contextstream]
+command = "npx"
+args = ["-y", "@contextstream/mcp-server"]
+
+[mcp_servers.contextstream.env]
+CONTEXTSTREAM_API_URL = "https://api.contextstream.io"
+CONTEXTSTREAM_API_KEY = "your_api_key"
+CONTEXTSTREAM_TOOLSET = "full"
 ```
 
 After editing, restart your MCP client so it reloads the server configuration.

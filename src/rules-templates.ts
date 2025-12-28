@@ -287,7 +287,18 @@ session_recall(query="what did we decide about caching?")
 
 ### Full Tool Catalog
 
-The following tools are available when \`CONTEXTSTREAM_TOOLSET=full\` (default is \`core\`, which includes only the essential session/context tools above):
+To expose all tools below, set \`CONTEXTSTREAM_TOOLSET=full\` in your MCP config. The default (\`core\`) includes only the essential session/context tools above.
+
+**To enable full toolset in your MCP config:**
+\`\`\`json
+{
+  "env": {
+    "CONTEXTSTREAM_TOOLSET": "full"
+  }
+}
+\`\`\`
+
+**Available tool categories (when \`CONTEXTSTREAM_TOOLSET=full\`):**
 
 **Session/Context** (included in core):
 \`session_init\`, \`context_smart\`, \`session_summary\`, \`session_capture\`, \`session_capture_lesson\`, \`session_get_lessons\`, \`session_recall\`, \`session_remember\`, \`session_get_user_context\`, \`session_smart_search\`, \`session_compress\`, \`session_delta\`, \`generate_editor_rules\`, \`workspace_associate\`, \`workspace_bootstrap\`
@@ -332,7 +343,20 @@ const CONTEXTSTREAM_RULES_MINIMAL = `
 - For code/file discovery, use \`session_smart_search\` before raw repo scans (\`rg\`, \`ls\`, \`find\`); fall back only if needed.
 - After meaningful work/decisions/preferences: \`session_capture(event_type=decision|preference|task|insight, title="…", content="…")\`.
 - On frustration/corrections/tool mistakes: \`session_capture_lesson(...)\`.
-- Full tool catalog (workspaces, projects, search, memory, graph, AI, integrations): see https://contextstream.io/docs/mcp/tools
+
+### Tool Catalog
+
+By default, the MCP server exposes **core** tools (~17 essential session/context tools). To expose the **full** catalog (~86 tools including workspaces, projects, search, memory, graph, AI, and integrations), set \`CONTEXTSTREAM_TOOLSET=full\` in your MCP config:
+
+\`\`\`json
+{
+  "env": {
+    "CONTEXTSTREAM_TOOLSET": "full"
+  }
+}
+\`\`\`
+
+Full tool reference: https://contextstream.io/docs/mcp/tools
 `.trim();
 
 export const TEMPLATES: Record<string, RuleTemplate> = {

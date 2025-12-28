@@ -596,8 +596,13 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     // Toolset selection
     console.log('\nMCP toolset (which tools to expose to the AI):');
     console.log('  1) Core (recommended) — essential session/context tools (~17 tools, lower token overhead)');
+    console.log('     Best for: most users, Claude Code, Claude Desktop (avoids large-context warnings)');
     console.log('  2) Full — all tools including workspaces, projects, search, memory, graph, AI, integrations (~86 tools)');
+    console.log('     Best for: power users needing direct access to all workspace/project/graph/AI tools');
     console.log('     Note: Claude Code/Desktop may warn about large tool lists when using full toolset.');
+    console.log('');
+    console.log('  Tip: You can switch toolsets later by editing the MCP config and setting CONTEXTSTREAM_TOOLSET=full');
+    console.log('       See https://contextstream.io/docs/mcp/tools for the full tool catalog.');
     const toolsetChoice = normalizeInput(await rl.question('Choose [1/2] (default 1): ')) || '1';
     const toolset: Toolset = toolsetChoice === '2' ? 'full' : 'core';
 

@@ -7,6 +7,7 @@ import { readFilesFromDirectory, readAllFilesInBatches, countIndexableFiles } fr
 import { SessionManager } from './session-manager.js';
 import { getAvailableEditors, generateRuleContent, generateAllRuleFiles } from './rules-templates.js';
 import { VERSION } from './version.js';
+import { generateToolCatalog, getCoreToolsHint, type CatalogFormat } from './tool-catalog.js';
 
 type StructuredContent = { [x: string]: unknown } | undefined;
 type ToolTextResult = {
@@ -20,6 +21,7 @@ const recentLessonCaptures = new Map<string, number>();
 
 const CORE_TOOLSET = new Set<string>([
   'session_init',
+  'session_tools',
   'context_smart',
   'session_summary',
   'session_capture',
@@ -1455,7 +1457,10 @@ This does semantic search on the first message. You only need context_smart on s
       }
       
       const result = await client.initSession(input, ideRoots) as Record<string, unknown>;
-      
+
+      // Add compact tool reference to help AI know available tools
+      result.tools_hint = getCoreToolsHint();
+
       // Mark session as initialized to prevent auto-init on subsequent tool calls
       if (sessionManager) {
         sessionManager.markInitialized(result);
@@ -1529,6 +1534,41 @@ This does semantic search on the first message. You only need context_smart on s
       }
 
       return { content: [{ type: 'text' as const, text }], structuredContent: toStructured(result) };
+    }
+  );
+
+  registerTool(
+    'session_tools',
+    {
+      title: 'Get available ContextStream tools',
+      description: `Get an ultra-compact list of all available ContextStream MCP tools.
+Use this when you need to know what tools are available without reading full descriptions.
+
+Returns a token-efficient tool catalog (~120 tokens) organized by category.
+
+Format options:
+- 'grouped' (default): Category: tool(hint) tool(hint) - best for quick reference
+- 'minimal': Category:tool|tool|tool - most compact
+- 'full': Detailed list with descriptions
+
+Example output (grouped):
+Session: init(start-conv) smart(each-msg) capture(save) recall(find) remember(quick)
+Search: semantic(meaning) hybrid(combo) keyword(exact)
+Memory: events(crud) nodes(knowledge) search(find) decisions(choices)`,
+      inputSchema: z.object({
+        format: z.enum(['grouped', 'minimal', 'full']).optional().default('grouped')
+          .describe('Output format: grouped (default, ~120 tokens), minimal (~80 tokens), or full (~200 tokens)'),
+        category: z.string().optional()
+          .describe('Filter to specific category: Session, Search, Memory, Knowledge, Graph, Workspace, Project, AI'),
+      }),
+    },
+    async (input) => {
+      const format = (input.format || 'grouped') as CatalogFormat;
+      const catalog = generateToolCatalog(format, input.category);
+      return {
+        content: [{ type: 'text' as const, text: catalog }],
+        structuredContent: { format, catalog },
+      };
     }
   );
 

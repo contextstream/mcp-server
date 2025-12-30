@@ -1258,6 +1258,30 @@ export class ContextStreamClient {
         // Merge batched response into context
         if (batchedContext.workspace) {
           context.workspace = batchedContext.workspace;
+          // CRITICAL: If API returned a different workspace (e.g., access denied on original),
+          // update workspace_id to use the one we actually have access to.
+          // This prevents FORBIDDEN errors on subsequent calls.
+          if (batchedContext.workspace.id && batchedContext.workspace.id !== workspaceId) {
+            console.error(`[ContextStream] Workspace mismatch: config=${workspaceId}, API returned=${batchedContext.workspace.id}. Using API workspace.`);
+            const oldWorkspaceId = workspaceId;
+            workspaceId = batchedContext.workspace.id;
+            workspaceName = batchedContext.workspace.name;
+            context.workspace_id = workspaceId;
+            context.workspace_name = workspaceName;
+            context.workspace_source = 'api_fallback';
+            context.workspace_mismatch_warning = `Config had workspace ${oldWorkspaceId} but you don't have access. Using ${workspaceId} instead.`;
+
+            // Update local config to prevent this from happening again
+            if (rootPath) {
+              writeLocalConfig(rootPath, {
+                workspace_id: workspaceId,
+                workspace_name: workspaceName,
+                project_id: projectId,
+                associated_at: new Date().toISOString(),
+              });
+              console.error(`[ContextStream] Updated local config with accessible workspace: ${workspaceId}`);
+            }
+          }
         }
         if (batchedContext.project) {
           context.project = batchedContext.project;

@@ -30,9 +30,9 @@ const LIGHT_TOOLSET = new Set<string>([
   'mcp_server_version',
 ]);
 
-// Standard toolset: Balanced set for most users (default)
+// Standard toolset: Balanced set for most users (default) - ~50 tools
 const STANDARD_TOOLSET = new Set<string>([
-  // Core session tools
+  // Core session tools (13)
   'session_init',
   'session_tools',
   'context_smart',
@@ -46,28 +46,49 @@ const STANDARD_TOOLSET = new Set<string>([
   'session_smart_search',
   'session_compress',
   'session_delta',
-  // Setup and configuration
+  // Setup and configuration (3)
   'generate_editor_rules',
   'workspace_associate',
   'workspace_bootstrap',
-  // Project management
+  // Workspace management (2)
+  'workspaces_list',
+  'workspaces_get',
+  // Project management (6)
   'projects_create',
   'projects_list',
   'projects_get',
   'projects_overview',
   'projects_statistics',
-  // Project indexing - essential for code context
+  'projects_update',
+  // Project indexing (4)
   'projects_ingest_local',
   'projects_index',
   'projects_index_status',
   'projects_files',
-  // Memory - search and decisions
+  // Memory events (6)
   'memory_search',
   'memory_decisions',
-  // Knowledge graph - related nodes and decisions
+  'memory_create_event',
+  'memory_list_events',
+  'memory_timeline',
+  'memory_summary',
+  // Memory nodes (2)
+  'memory_create_node',
+  'memory_list_nodes',
+  // Knowledge graph analysis (8)
   'graph_related',
   'graph_decisions',
-  // Utility
+  'graph_path',
+  'graph_dependencies',
+  'graph_call_path',
+  'graph_impact',
+  'graph_circular_dependencies',
+  'graph_unused_code',
+  // Search (3)
+  'search_semantic',
+  'search_hybrid',
+  'search_keyword',
+  // Utility (2)
   'auth_me',
   'mcp_server_version',
 ]);

@@ -1,6 +1,6 @@
 {
   "name": "@contextstream/mcp-server",
-  "version": "0.3.47",
+  "version": "0.3.48",
   "description": "MCP server exposing ContextStream public API - code context, memory, search, and AI tools for developers",
   "type": "module",
   "license": "MIT",

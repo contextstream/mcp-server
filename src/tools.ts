@@ -52,6 +52,11 @@ const STANDARD_TOOLSET = new Set<string>([
   'workspace_bootstrap',
   'projects_create',
   'projects_list',
+  // Project indexing - essential for code context
+  'projects_ingest_local',
+  'projects_index',
+  'projects_index_status',
+  'projects_files',
   // Utility
   'auth_me',
   'mcp_server_version',

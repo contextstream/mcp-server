@@ -50,13 +50,23 @@ const STANDARD_TOOLSET = new Set<string>([
   'generate_editor_rules',
   'workspace_associate',
   'workspace_bootstrap',
+  // Project management
   'projects_create',
   'projects_list',
+  'projects_get',
+  'projects_overview',
+  'projects_statistics',
   // Project indexing - essential for code context
   'projects_ingest_local',
   'projects_index',
   'projects_index_status',
   'projects_files',
+  // Memory - search and decisions
+  'memory_search',
+  'memory_decisions',
+  // Knowledge graph - related nodes and decisions
+  'graph_related',
+  'graph_decisions',
   // Utility
   'auth_me',
   'mcp_server_version',

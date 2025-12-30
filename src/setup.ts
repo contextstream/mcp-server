@@ -627,7 +627,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     console.log('\nMCP toolset (which tools to expose to the AI):');
     console.log('  1) Light — minimal essential tools for fastest responses (~7 tools)');
     console.log('     Best for: simple tasks, resource-constrained environments');
-    console.log('  2) Standard (recommended) — balanced set of session and context tools (~20 tools)');
+    console.log('  2) Standard (recommended) — balanced set of session, project, and knowledge tools (~30 tools)');
     console.log('     Best for: most users, balances speed with capabilities');
     console.log('  3) Complete — all tools including memory, knowledge graph, AI, integrations (~86 tools)');
     console.log('     Best for: power users needing full workspace/project/graph capabilities');
@@ -981,7 +981,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       const skipped = writeActions.filter((a) => a.status === 'skipped').length;
       const dry = writeActions.filter((a) => a.status === 'dry-run').length;
       console.log(`Summary: ${created} created, ${updated} updated, ${appended} appended, ${skipped} skipped, ${dry} dry-run.`);
-      const toolsetDesc = toolset === 'light' ? '~7 tools' : toolset === 'complete' ? '~86 tools' : '~20 tools';
+      const toolsetDesc = toolset === 'light' ? '~7 tools' : toolset === 'complete' ? '~86 tools' : '~30 tools';
       console.log(`Toolset: ${toolset} (${toolsetDesc})`);
     }
 

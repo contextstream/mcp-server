@@ -625,12 +625,12 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     // Toolset selection
     console.log('\nMCP toolset (which tools to expose to the AI):');
-    console.log('  1) Light — minimal essential tools for fastest responses (~7 tools)');
-    console.log('     Best for: simple tasks, resource-constrained environments');
-    console.log('  2) Standard (recommended) — session, project, memory, graph, and search tools (~50 tools)');
+    console.log('  1) Light — core session, project, and basic memory/graph tools (~30 tools)');
+    console.log('     Best for: faster responses, simpler workflows, resource-constrained environments');
+    console.log('  2) Standard (recommended) — adds workspace, memory CRUD, graph analysis, search (~50 tools)');
     console.log('     Best for: most users, full development workflow with memory and code analysis');
-    console.log('  3) Complete — all tools including memory, knowledge graph, AI, integrations (~86 tools)');
-    console.log('     Best for: power users needing full workspace/project/graph capabilities');
+    console.log('  3) Complete — all tools including AI, GitHub, Slack integrations (~86 tools)');
+    console.log('     Best for: power users needing integrations and advanced features');
     console.log('');
     console.log('  Tip: Change later by setting CONTEXTSTREAM_TOOLSET=light|standard|complete');
     const toolsetChoice = normalizeInput(await rl.question('Choose [1/2/3] (default 2): ')) || '2';
@@ -981,7 +981,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       const skipped = writeActions.filter((a) => a.status === 'skipped').length;
       const dry = writeActions.filter((a) => a.status === 'dry-run').length;
       console.log(`Summary: ${created} created, ${updated} updated, ${appended} appended, ${skipped} skipped, ${dry} dry-run.`);
-      const toolsetDesc = toolset === 'light' ? '~7 tools' : toolset === 'complete' ? '~86 tools' : '~50 tools';
+      const toolsetDesc = toolset === 'light' ? '~30 tools' : toolset === 'complete' ? '~86 tools' : '~50 tools';
       console.log(`Toolset: ${toolset} (${toolsetDesc})`);
     }
 

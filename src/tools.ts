@@ -19,13 +19,44 @@ type ToolTextResult = {
 const LESSON_DEDUP_WINDOW_MS = 2 * 60 * 1000;
 const recentLessonCaptures = new Map<string, number>();
 
-// Light toolset: Essential tools for fast, minimal interactions
+// Light toolset: Core session, project, and basic memory tools (~30 tools)
 const LIGHT_TOOLSET = new Set<string>([
+  // Core session tools (13)
   'session_init',
+  'session_tools',
   'context_smart',
+  'session_summary',
   'session_capture',
+  'session_capture_lesson',
+  'session_get_lessons',
   'session_recall',
   'session_remember',
+  'session_get_user_context',
+  'session_smart_search',
+  'session_compress',
+  'session_delta',
+  // Setup and configuration (3)
+  'generate_editor_rules',
+  'workspace_associate',
+  'workspace_bootstrap',
+  // Project management (5)
+  'projects_create',
+  'projects_list',
+  'projects_get',
+  'projects_overview',
+  'projects_statistics',
+  // Project indexing (4)
+  'projects_ingest_local',
+  'projects_index',
+  'projects_index_status',
+  'projects_files',
+  // Memory basics (2)
+  'memory_search',
+  'memory_decisions',
+  // Graph basics (2)
+  'graph_related',
+  'graph_decisions',
+  // Utility (2)
   'auth_me',
   'mcp_server_version',
 ]);

@@ -3209,4 +3209,153 @@ export class ContextStreamClient {
     if (params?.limit) urlParams.set('limit', String(params.limit));
     return request(this.config, `/integrations/knowledge?${urlParams.toString()}`, { method: 'GET' });
   }
+
+  // ============================================
+  // Reminder Methods
+  // ============================================
+
+  /**
+   * List reminders for the user
+   */
+  async remindersList(params?: {
+    workspace_id?: string;
+    project_id?: string;
+    status?: string;
+    priority?: string;
+    limit?: number;
+  }): Promise<{
+    reminders: Array<{
+      id: string;
+      title: string;
+      content: string;
+      remind_at: string;
+      priority: string;
+      status: string;
+      keywords: string[];
+      memory_event_id: string | null;
+      created_at: string;
+    }>;
+    total: number;
+  }> {
+    const withDefaults = this.withDefaults(params || {});
+    const query = new URLSearchParams();
+    if (withDefaults.workspace_id) query.set('workspace_id', withDefaults.workspace_id);
+    if (withDefaults.project_id) query.set('project_id', withDefaults.project_id);
+    if (params?.status) query.set('status', params.status);
+    if (params?.priority) query.set('priority', params.priority);
+    if (params?.limit) query.set('limit', String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return request(this.config, `/reminders${suffix}`, { method: 'GET' });
+  }
+
+  /**
+   * Get active reminders (pending, overdue, due soon)
+   */
+  async remindersActive(params?: {
+    workspace_id?: string;
+    project_id?: string;
+    context?: string;
+    limit?: number;
+  }): Promise<{
+    reminders: Array<{
+      id: string;
+      title: string;
+      content_preview: string;
+      remind_at: string;
+      priority: string;
+      urgency: string;
+      keywords: string[];
+      memory_event_id: string | null;
+    }>;
+    overdue_count: number;
+  }> {
+    const withDefaults = this.withDefaults(params || {});
+    const query = new URLSearchParams();
+    if (withDefaults.workspace_id) query.set('workspace_id', withDefaults.workspace_id);
+    if (withDefaults.project_id) query.set('project_id', withDefaults.project_id);
+    if (params?.context) query.set('context', params.context);
+    if (params?.limit) query.set('limit', String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return request(this.config, `/reminders/active${suffix}`, { method: 'GET' });
+  }
+
+  /**
+   * Create a new reminder
+   */
+  async remindersCreate(params: {
+    workspace_id?: string;
+    project_id?: string;
+    title: string;
+    content: string;
+    remind_at: string;
+    priority?: string;
+    keywords?: string[];
+    recurrence?: string;
+    memory_event_id?: string;
+  }): Promise<{
+    id: string;
+    title: string;
+    content: string;
+    remind_at: string;
+    priority: string;
+    status: string;
+  }> {
+    const withDefaults = this.withDefaults(params);
+    return request(this.config, '/reminders', {
+      body: {
+        workspace_id: withDefaults.workspace_id,
+        project_id: withDefaults.project_id,
+        title: params.title,
+        content: params.content,
+        remind_at: params.remind_at,
+        priority: params.priority || 'normal',
+        keywords: params.keywords || [],
+        recurrence: params.recurrence,
+        memory_event_id: params.memory_event_id,
+      },
+    });
+  }
+
+  /**
+   * Snooze a reminder
+   */
+  async remindersSnooze(params: {
+    reminder_id: string;
+    until: string;
+  }): Promise<{ id: string; snoozed_until: string; status: string }> {
+    uuidSchema.parse(params.reminder_id);
+    return request(this.config, `/reminders/${params.reminder_id}/snooze`, {
+      body: { until: params.until },
+    });
+  }
+
+  /**
+   * Mark a reminder as completed
+   */
+  async remindersComplete(params: {
+    reminder_id: string;
+  }): Promise<{ id: string; status: string; completed_at: string }> {
+    uuidSchema.parse(params.reminder_id);
+    return request(this.config, `/reminders/${params.reminder_id}/complete`, { method: 'POST' });
+  }
+
+  /**
+   * Dismiss a reminder
+   */
+  async remindersDismiss(params: {
+    reminder_id: string;
+  }): Promise<{ id: string; status: string; dismissed_at: string }> {
+    uuidSchema.parse(params.reminder_id);
+    return request(this.config, `/reminders/${params.reminder_id}/dismiss`, { method: 'POST' });
+  }
+
+  /**
+   * Delete a reminder
+   */
+  async remindersDelete(params: {
+    reminder_id: string;
+  }): Promise<{ success: boolean }> {
+    uuidSchema.parse(params.reminder_id);
+    return request(this.config, `/reminders/${params.reminder_id}`, { method: 'DELETE' });
+  }
 }

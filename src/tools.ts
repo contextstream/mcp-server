@@ -56,6 +56,9 @@ const LIGHT_TOOLSET = new Set<string>([
   // Graph basics (2)
   'graph_related',
   'graph_decisions',
+  // Reminders (2)
+  'reminders_list',
+  'reminders_active',
   // Utility (2)
   'auth_me',
   'mcp_server_version',
@@ -119,6 +122,13 @@ const STANDARD_TOOLSET = new Set<string>([
   'search_semantic',
   'search_hybrid',
   'search_keyword',
+  // Reminders (6)
+  'reminders_list',
+  'reminders_active',
+  'reminders_create',
+  'reminders_snooze',
+  'reminders_complete',
+  'reminders_dismiss',
   // Utility (2)
   'auth_me',
   'mcp_server_version',
@@ -3378,6 +3388,200 @@ Use this to verify integrations are healthy and syncing properly.`,
       }).join('\n');
 
       return { content: [{ type: 'text' as const, text: formatted }], structuredContent: toStructured(result) };
+    }
+  );
+
+  // ============================================
+  // Reminder Tools
+  // ============================================
+
+  registerTool(
+    'reminders_list',
+    {
+      title: 'List reminders',
+      description: `List all reminders for the current user.
+Returns: reminders with title, content, remind_at, priority, status, and keywords.
+Can filter by status (pending, completed, dismissed, snoozed) and priority (low, normal, high, urgent).
+
+Use this to see what reminders you have set.`,
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+        project_id: z.string().uuid().optional(),
+        status: z.enum(['pending', 'completed', 'dismissed', 'snoozed']).optional().describe('Filter by status'),
+        priority: z.enum(['low', 'normal', 'high', 'urgent']).optional().describe('Filter by priority'),
+        limit: z.number().optional().describe('Maximum reminders to return (default: 20)'),
+      }),
+    },
+    async (input) => {
+      const result = await client.remindersList({
+        workspace_id: input.workspace_id,
+        project_id: input.project_id,
+        status: input.status,
+        priority: input.priority,
+        limit: input.limit,
+      });
+      if (!result.reminders || result.reminders.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No reminders found.' }] };
+      }
+      return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+    }
+  );
+
+  registerTool(
+    'reminders_active',
+    {
+      title: 'Get active reminders',
+      description: `Get active reminders that are pending, overdue, or due soon.
+Returns: reminders with urgency levels (overdue, due_soon, today, upcoming).
+Optionally provide context (e.g., current task description) to get contextually relevant reminders.
+
+Use this to see what reminders need attention now.`,
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+        project_id: z.string().uuid().optional(),
+        context: z.string().optional().describe('Optional context to match relevant reminders (e.g., current task)'),
+        limit: z.number().optional().describe('Maximum reminders to return (default: 10)'),
+      }),
+    },
+    async (input) => {
+      const result = await client.remindersActive({
+        workspace_id: input.workspace_id,
+        project_id: input.project_id,
+        context: input.context,
+        limit: input.limit,
+      });
+
+      if (!result.reminders || result.reminders.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No active reminders.' }] };
+      }
+
+      // Format with urgency indicators
+      const formatted = result.reminders.map(r => {
+        const icon = r.urgency === 'overdue' ? '🔴' : r.urgency === 'due_soon' ? '🟠' : r.urgency === 'today' ? '🟡' : '🔵';
+        const priority = r.priority !== 'normal' ? ` [${r.priority}]` : '';
+        return `${icon} ${r.title}${priority}\n   Due: ${new Date(r.remind_at).toLocaleString()}\n   ${r.content_preview}`;
+      }).join('\n\n');
+
+      const header = result.overdue_count > 0 ? `⚠️ ${result.overdue_count} overdue reminder(s)\n\n` : '';
+
+      return { content: [{ type: 'text' as const, text: header + formatted }], structuredContent: toStructured(result) };
+    }
+  );
+
+  registerTool(
+    'reminders_create',
+    {
+      title: 'Create a reminder',
+      description: `Create a new reminder for a specific date/time.
+Set reminders to be notified about tasks, follow-ups, or important dates.
+
+Priority levels: low, normal, high, urgent
+Recurrence: daily, weekly, monthly (optional)
+
+Example: Create a reminder to "Review PR #123" for tomorrow at 10am with high priority.`,
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+        project_id: z.string().uuid().optional(),
+        title: z.string().describe('Reminder title (brief, descriptive)'),
+        content: z.string().describe('Reminder details/description'),
+        remind_at: z.string().describe('When to remind (ISO 8601 datetime, e.g., "2025-01-15T10:00:00Z")'),
+        priority: z.enum(['low', 'normal', 'high', 'urgent']).optional().describe('Priority level (default: normal)'),
+        keywords: z.array(z.string()).optional().describe('Keywords for contextual surfacing'),
+        recurrence: z.enum(['daily', 'weekly', 'monthly']).optional().describe('Recurrence pattern'),
+      }),
+    },
+    async (input) => {
+      const result = await client.remindersCreate({
+        workspace_id: input.workspace_id,
+        project_id: input.project_id,
+        title: input.title,
+        content: input.content,
+        remind_at: input.remind_at,
+        priority: input.priority,
+        keywords: input.keywords,
+        recurrence: input.recurrence,
+      });
+
+      const due = new Date(result.remind_at).toLocaleString();
+      return {
+        content: [{ type: 'text' as const, text: `✅ Reminder created: "${result.title}"\nDue: ${due}\nPriority: ${result.priority}\nID: ${result.id}` }],
+        structuredContent: toStructured(result)
+      };
+    }
+  );
+
+  registerTool(
+    'reminders_snooze',
+    {
+      title: 'Snooze a reminder',
+      description: `Snooze a reminder until a later time.
+Use this to postpone a reminder without dismissing it.
+
+Common snooze durations:
+- 1 hour: add 1 hour to current time
+- 4 hours: add 4 hours
+- Tomorrow: next day at 9am
+- Next week: 7 days from now`,
+      inputSchema: z.object({
+        reminder_id: z.string().uuid().describe('ID of the reminder to snooze'),
+        until: z.string().describe('When to resurface the reminder (ISO 8601 datetime)'),
+      }),
+    },
+    async (input) => {
+      const result = await client.remindersSnooze({
+        reminder_id: input.reminder_id,
+        until: input.until,
+      });
+
+      const snoozedUntil = new Date(result.snoozed_until).toLocaleString();
+      return {
+        content: [{ type: 'text' as const, text: `😴 Reminder snoozed until ${snoozedUntil}` }],
+        structuredContent: toStructured(result)
+      };
+    }
+  );
+
+  registerTool(
+    'reminders_complete',
+    {
+      title: 'Complete a reminder',
+      description: `Mark a reminder as completed.
+Use this when the task or action associated with the reminder is done.`,
+      inputSchema: z.object({
+        reminder_id: z.string().uuid().describe('ID of the reminder to complete'),
+      }),
+    },
+    async (input) => {
+      const result = await client.remindersComplete({
+        reminder_id: input.reminder_id,
+      });
+
+      return {
+        content: [{ type: 'text' as const, text: `✅ Reminder completed!` }],
+        structuredContent: toStructured(result)
+      };
+    }
+  );
+
+  registerTool(
+    'reminders_dismiss',
+    {
+      title: 'Dismiss a reminder',
+      description: `Dismiss a reminder without completing it.
+Use this to remove a reminder that is no longer relevant.`,
+      inputSchema: z.object({
+        reminder_id: z.string().uuid().describe('ID of the reminder to dismiss'),
+      }),
+    },
+    async (input) => {
+      const result = await client.remindersDismiss({
+        reminder_id: input.reminder_id,
+      });
+
+      return {
+        content: [{ type: 'text' as const, text: `🗑️ Reminder dismissed.` }],
+        structuredContent: toStructured(result)
+      };
     }
   );
 }

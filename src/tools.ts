@@ -19,7 +19,7 @@ type ToolTextResult = {
 const LESSON_DEDUP_WINDOW_MS = 2 * 60 * 1000;
 const recentLessonCaptures = new Map<string, number>();
 
-// Light toolset: Core session, project, and basic memory tools (~30 tools)
+// Light toolset: Core session, project, and basic memory tools (~31 tools)
 const LIGHT_TOOLSET = new Set<string>([
   // Core session tools (13)
   'session_init',
@@ -50,9 +50,10 @@ const LIGHT_TOOLSET = new Set<string>([
   'projects_index',
   'projects_index_status',
   'projects_files',
-  // Memory basics (2)
+  // Memory basics (3)
   'memory_search',
   'memory_decisions',
+  'memory_get_event',
   // Graph basics (2)
   'graph_related',
   'graph_decisions',
@@ -64,7 +65,7 @@ const LIGHT_TOOLSET = new Set<string>([
   'mcp_server_version',
 ]);
 
-// Standard toolset: Balanced set for most users (default) - ~50 tools
+// Standard toolset: Balanced set for most users (default) - ~53 tools
 const STANDARD_TOOLSET = new Set<string>([
   // Core session tools (13)
   'session_init',
@@ -99,11 +100,14 @@ const STANDARD_TOOLSET = new Set<string>([
   'projects_index',
   'projects_index_status',
   'projects_files',
-  // Memory events (6)
+  // Memory events (9)
   'memory_search',
   'memory_decisions',
   'memory_create_event',
   'memory_list_events',
+  'memory_get_event',
+  'memory_update_event',
+  'memory_delete_event',
   'memory_timeline',
   'memory_summary',
   // Memory nodes (2)
@@ -1381,8 +1385,8 @@ Automatically detects code files and skips ignored directories like node_modules
     'memory_get_event',
     {
       title: 'Get memory event',
-      description: 'Get a specific memory event by ID',
-      inputSchema: z.object({ event_id: z.string().uuid() }),
+      description: 'Get a specific memory event by ID with FULL content (not truncated). Use this when you need the complete content of a memory event, not just the preview returned by search/recall.',
+      inputSchema: z.object({ event_id: z.string().uuid().describe('The UUID of the memory event to retrieve') }),
     },
     async (input) => {
       const result = await client.getMemoryEvent(input.event_id);

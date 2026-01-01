@@ -88,6 +88,7 @@ const CONTEXTSTREAM_TOOL_NAMES = [
   'graph_impact',
   'graph_circular_dependencies',
   'graph_unused_code',
+  'graph_ingest',
   'graph_contradictions',
   // AI (PRO)
   'ai_context',
@@ -321,7 +322,7 @@ To expose all tools below, set \`CONTEXTSTREAM_TOOLSET=full\` in your MCP config
 \`memory_create_event\`, \`memory_bulk_ingest\`, \`memory_list_events\`, \`memory_create_node\`, \`memory_list_nodes\`, \`memory_search\`, \`memory_decisions\`, \`memory_get_event\`, \`memory_update_event\`, \`memory_delete_event\`, \`memory_distill_event\`, \`memory_get_node\`, \`memory_update_node\`, \`memory_delete_node\`, \`memory_supersede_node\`, \`memory_timeline\`, \`memory_summary\`
 
 **Graph** (code analysis):
-\`graph_related\`, \`graph_path\`, \`graph_decisions\`, \`graph_dependencies\`, \`graph_call_path\`, \`graph_impact\`, \`graph_circular_dependencies\`, \`graph_unused_code\`, \`graph_contradictions\`
+\`graph_related\`, \`graph_path\`, \`graph_decisions\`, \`graph_dependencies\`, \`graph_call_path\`, \`graph_impact\`, \`graph_circular_dependencies\`, \`graph_unused_code\`, \`graph_ingest\`, \`graph_contradictions\`
 
 **AI** (PRO):
 \`ai_context\`, \`ai_enhanced_context\`, \`ai_context_budget\`, \`ai_embeddings\`, \`ai_plan\`, \`ai_tasks\`

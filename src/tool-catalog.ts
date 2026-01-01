@@ -78,6 +78,7 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: 'path', hint: 'trace' },
       { name: 'decisions', hint: 'choices' },
       { name: 'dependencies', hint: 'deps' },
+      { name: 'ingest', hint: 'build' },
       { name: 'impact', hint: 'changes' },
       { name: 'contradictions', hint: 'conflicts' },
     ],

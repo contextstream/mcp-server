@@ -122,6 +122,7 @@ const STANDARD_TOOLSET = new Set<string>([
   'graph_impact',
   'graph_circular_dependencies',
   'graph_unused_code',
+  'graph_ingest',
   // Search (3)
   'search_semantic',
   'search_hybrid',
@@ -1040,6 +1041,27 @@ Access: Free`,
     },
     async (input) => {
       const result = await client.graphImpact(input);
+      return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+    }
+  );
+
+  registerTool(
+    'graph_ingest',
+    {
+      title: 'Ingest code graph',
+      description: 'Build and persist the dependency graph for a project',
+      inputSchema: z.object({
+        project_id: z.string().uuid().optional(),
+        wait: z.boolean().optional().describe('If true, wait for ingestion to finish before returning.'),
+      }),
+    },
+    async (input) => {
+      const projectId = resolveProjectId(input.project_id);
+      if (!projectId) {
+        return errorResult('Error: project_id is required. Please call session_init first or provide project_id explicitly.');
+      }
+
+      const result = await client.graphIngest({ project_id: projectId, wait: input.wait });
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );

@@ -525,6 +525,21 @@ export class ContextStreamClient {
     return request(this.config, '/graph/impact-analysis', { body: apiBody });
   }
 
+  graphIngest(body: { project_id?: string; wait?: boolean }) {
+    const withDefaults = this.withDefaults(body);
+    const projectId = withDefaults.project_id;
+    if (!projectId) {
+      throw new Error('project_id is required to ingest the graph.');
+    }
+    uuidSchema.parse(projectId);
+
+    const apiBody: Record<string, unknown> = {};
+    if (body.wait !== undefined) {
+      apiBody.wait = body.wait;
+    }
+    return request(this.config, `/graph/ingest/${projectId}`, { body: apiBody });
+  }
+
   // AI
   private buildAiContextRequest(input: {
     query: string;

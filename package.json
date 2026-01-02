@@ -1,5 +1,6 @@
 {
   "name": "@contextstream/mcp-server",
+  "mcpName": "io.github.contextstream/mcp-server",
   "version": "0.3.61",
   "description": "MCP server exposing ContextStream public API - code context, memory, search, and AI tools for developers",
   "type": "module",

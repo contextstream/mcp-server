@@ -1,0 +1,27 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.contextstream/mcp-server",
+  "title": "ContextStream MCP Server",
+  "description": "ContextStream MCP server for code context, memory, search, and AI tools.",
+  "version": "0.3.61",
+  "repository": {
+    "url": "https://github.com/contextstream/mcp-server",
+    "source": "github"
+  },
+  "websiteUrl": "https://contextstream.io/docs/mcp",
+  "tags": [
+    "code-context",
+    "memory",
+    "search",
+    "knowledge-graph",
+    "ai-tools"
+  ],
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@contextstream/mcp-server",
+      "version": "0.3.61",
+      "transport": { "type": "stdio" }
+    }
+  ]
+}

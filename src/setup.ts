@@ -148,6 +148,153 @@ function globalRulesPathForEditor(editor: EditorKey): string | null {
   }
 }
 
+async function anyPathExists(paths: string[]): Promise<boolean> {
+  for (const candidate of paths) {
+    if (await fileExists(candidate)) return true;
+  }
+  return false;
+}
+
+async function isCodexInstalled(): Promise<boolean> {
+  const home = homedir();
+  const envHome = process.env.CODEX_HOME;
+  const candidates = [
+    envHome,
+    path.join(home, '.codex'),
+    path.join(home, '.codex', 'config.toml'),
+    path.join(home, '.config', 'codex'),
+  ].filter((candidate): candidate is string => Boolean(candidate));
+  return anyPathExists(candidates);
+}
+
+async function isClaudeInstalled(): Promise<boolean> {
+  const home = homedir();
+  const candidates = [
+    path.join(home, '.claude'),
+    path.join(home, '.config', 'claude'),
+  ];
+  const desktopConfig = claudeDesktopConfigPath();
+  if (desktopConfig) candidates.push(desktopConfig);
+
+  if (process.platform === 'darwin') {
+    candidates.push(path.join(home, 'Library', 'Application Support', 'Claude'));
+  } else if (process.platform === 'win32') {
+    const appData = process.env.APPDATA;
+    if (appData) candidates.push(path.join(appData, 'Claude'));
+  }
+
+  return anyPathExists(candidates);
+}
+
+async function isWindsurfInstalled(): Promise<boolean> {
+  const home = homedir();
+  const candidates = [
+    path.join(home, '.codeium'),
+    path.join(home, '.codeium', 'windsurf'),
+    path.join(home, '.config', 'codeium'),
+  ];
+
+  if (process.platform === 'darwin') {
+    candidates.push(path.join(home, 'Library', 'Application Support', 'Windsurf'));
+    candidates.push(path.join(home, 'Library', 'Application Support', 'Codeium'));
+  } else if (process.platform === 'win32') {
+    const appData = process.env.APPDATA;
+    if (appData) {
+      candidates.push(path.join(appData, 'Windsurf'));
+      candidates.push(path.join(appData, 'Codeium'));
+    }
+  }
+
+  return anyPathExists(candidates);
+}
+
+async function isClineInstalled(): Promise<boolean> {
+  const home = homedir();
+  const candidates = [
+    path.join(home, 'Documents', 'Cline'),
+    path.join(home, '.cline'),
+    path.join(home, '.config', 'cline'),
+  ];
+  return anyPathExists(candidates);
+}
+
+async function isKiloInstalled(): Promise<boolean> {
+  const home = homedir();
+  const candidates = [
+    path.join(home, '.kilocode'),
+    path.join(home, '.config', 'kilocode'),
+  ];
+  return anyPathExists(candidates);
+}
+
+async function isRooInstalled(): Promise<boolean> {
+  const home = homedir();
+  const candidates = [
+    path.join(home, '.roo'),
+    path.join(home, '.config', 'roo'),
+  ];
+  return anyPathExists(candidates);
+}
+
+async function isAiderInstalled(): Promise<boolean> {
+  const home = homedir();
+  const candidates = [
+    path.join(home, '.aider.conf.yml'),
+    path.join(home, '.config', 'aider'),
+  ];
+  return anyPathExists(candidates);
+}
+
+// Best-effort detection to avoid creating editor configs when the editor isn't installed.
+async function isCursorInstalled(): Promise<boolean> {
+  const home = homedir();
+  const candidates: string[] = [path.join(home, '.cursor')];
+
+  if (process.platform === 'darwin') {
+    candidates.push('/Applications/Cursor.app');
+    candidates.push(path.join(home, 'Applications', 'Cursor.app'));
+    candidates.push(path.join(home, 'Library', 'Application Support', 'Cursor'));
+  } else if (process.platform === 'win32') {
+    const localApp = process.env.LOCALAPPDATA;
+    const programFiles = process.env.ProgramFiles;
+    const programFilesX86 = process.env['ProgramFiles(x86)'];
+    if (localApp) candidates.push(path.join(localApp, 'Programs', 'Cursor', 'Cursor.exe'));
+    if (localApp) candidates.push(path.join(localApp, 'Cursor', 'Cursor.exe'));
+    if (programFiles) candidates.push(path.join(programFiles, 'Cursor', 'Cursor.exe'));
+    if (programFilesX86) candidates.push(path.join(programFilesX86, 'Cursor', 'Cursor.exe'));
+  } else {
+    candidates.push('/usr/bin/cursor');
+    candidates.push('/usr/local/bin/cursor');
+    candidates.push('/opt/Cursor');
+    candidates.push('/opt/cursor');
+  }
+
+  return anyPathExists(candidates);
+}
+
+async function isEditorInstalled(editor: EditorKey): Promise<boolean> {
+  switch (editor) {
+    case 'codex':
+      return isCodexInstalled();
+    case 'claude':
+      return isClaudeInstalled();
+    case 'cursor':
+      return isCursorInstalled();
+    case 'windsurf':
+      return isWindsurfInstalled();
+    case 'cline':
+      return isClineInstalled();
+    case 'kilo':
+      return isKiloInstalled();
+    case 'roo':
+      return isRooInstalled();
+    case 'aider':
+      return isAiderInstalled();
+    default:
+      return false;
+  }
+}
+
 type McpServerJson = {
   command: string;
   args: string[];
@@ -657,8 +804,40 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     const selectedRaw = normalizeInput(await rl.question('Editors [all]: ')) || 'all';
     const selectedNums = parseNumberList(selectedRaw, editors.length);
     const selectedEditors = selectedNums.length ? selectedNums.map((n) => editors[n - 1]) : editors;
-    const hasCodex = selectedEditors.includes('codex');
-    const hasProjectMcpEditors = selectedEditors.some((e) => supportsProjectMcpConfig(e));
+
+    const editorDetected = new Map<EditorKey, boolean>();
+    for (const editor of selectedEditors) {
+      editorDetected.set(editor, await isEditorInstalled(editor));
+    }
+    // If the wizard is running in Codex CLI, favor configuring Codex even if not detected.
+    if (process.env.CODEX_CLI || process.env.CODEX_HOME) {
+      editorDetected.set('codex', true);
+    }
+    const undetectedEditors = selectedEditors.filter((editor) => !editorDetected.get(editor));
+    let allowUndetectedEditors = false;
+    if (undetectedEditors.length) {
+      console.log('\nEditors not detected on this system:');
+      undetectedEditors.forEach((editor) => console.log(`- ${EDITOR_LABELS[editor]}`));
+      console.log('If your editor is installed but not detected, choose "yes" to force config.');
+      const confirm = normalizeInput(await rl.question('Configure these anyway? [y/N]: ')).toLowerCase();
+      allowUndetectedEditors = confirm === 'y' || confirm === 'yes';
+    }
+
+    const configuredEditors = allowUndetectedEditors
+      ? selectedEditors
+      : selectedEditors.filter((editor) => editorDetected.get(editor));
+    const skippedEditors = selectedEditors.filter((editor) => !configuredEditors.includes(editor));
+    if (skippedEditors.length) {
+      console.log('\nSkipping editor setup:');
+      skippedEditors.forEach((editor) => console.log(`- ${EDITOR_LABELS[editor]}`));
+    }
+    if (configuredEditors.length) {
+      console.log('\nConfiguring editors:');
+      configuredEditors.forEach((editor) => console.log(`- ${EDITOR_LABELS[editor]}`));
+    }
+
+    const hasCodex = configuredEditors.includes('codex');
+    const hasProjectMcpEditors = configuredEditors.some((e) => supportsProjectMcpConfig(e));
 
     console.log('\nInstall rules as:');
     console.log('  1) Global');
@@ -709,7 +888,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     const needsGlobalMcpConfig = mcpScope === 'global' || mcpScope === 'both' || (mcpScope === 'project' && hasCodex);
     if (needsGlobalMcpConfig) {
       console.log('\nInstalling global MCP config...');
-      for (const editor of selectedEditors) {
+      for (const editor of configuredEditors) {
         // If user selected Project-only, only Codex gets a global config (it has no per-project option).
         if (mcpScope === 'project' && editor !== 'codex') continue;
         try {
@@ -765,10 +944,10 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 	            continue;
 	          }
 
-	          if (editor === 'cursor') {
-	            const filePath = path.join(homedir(), '.cursor', 'mcp.json');
-	            if (dryRun) {
-	              writeActions.push({ kind: 'mcp-config', target: filePath, status: 'dry-run' });
+          if (editor === 'cursor') {
+            const filePath = path.join(homedir(), '.cursor', 'mcp.json');
+            if (dryRun) {
+              writeActions.push({ kind: 'mcp-config', target: filePath, status: 'dry-run' });
 	              console.log(`- ${EDITOR_LABELS[editor]}: would update ${filePath}`);
 	              continue;
 	            }
@@ -799,7 +978,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     // Global rules
     if (scope === 'global' || scope === 'both') {
       console.log('\nInstalling global rules...');
-      for (const editor of selectedEditors) {
+      for (const editor of configuredEditors) {
         const filePath = globalRulesPathForEditor(editor);
         if (!filePath) {
           console.log(`- ${EDITOR_LABELS[editor]}: global rules need manual setup (project rules supported).`);
@@ -906,7 +1085,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
       // Project MCP configs per editor
       if (mcpScope === 'project' || mcpScope === 'both') {
-        for (const editor of selectedEditors) {
+        for (const editor of configuredEditors) {
           try {
 	          if (editor === 'cursor') {
 	            const cursorPath = path.join(projectPath, '.cursor', 'mcp.json');
@@ -965,6 +1144,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       // Project rules per editor
       for (const editor of selectedEditors) {
         if (scope !== 'project' && scope !== 'both') continue;
+        if (!configuredEditors.includes(editor)) continue;
         const rule = generateRuleContent(editor, {
           workspaceName,
           workspaceId: workspaceId && workspaceId !== 'dry-run' ? workspaceId : undefined,

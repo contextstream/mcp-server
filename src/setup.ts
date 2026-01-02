@@ -520,7 +520,8 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
         apiKey = createdKey.secret_key.trim();
         apiKeySource = 'browser';
-        console.log(`\nCreated API key: ${maskApiKey(apiKey)}\n`);
+        const maskedNewKey = maskApiKey(apiKey);
+        console.log(`\nCreated API key: ${maskedNewKey}\n`);
       }
     }
 
@@ -542,14 +543,15 @@ export async function runSetupWizard(args: string[]): Promise<void> {
           ? me.email
           : undefined;
 
-    console.log(`Authenticated as: ${email || 'unknown user'} (${maskApiKey(apiKey)})\n`);
+    const maskedKey = maskApiKey(apiKey);
+    console.log(`Authenticated as: ${email || 'unknown user'} (${maskedKey})\n`);
 
     // Persist for future setup runs so users don't have to log in again.
     // (The MCP config files we write also include the API key, but setup itself should be able to reuse it.)
     if (!dryRun && (apiKeySource === 'browser' || apiKeySource === 'paste')) {
       try {
         const saved = await writeSavedCredentials({ apiUrl, apiKey, email });
-        console.log(`Saved API key for future runs: ${saved.path} (${maskApiKey(apiKey)})\n`);
+        console.log(`Saved API key for future runs: ${saved.path} (${maskedKey})\n`);
       } catch (err: any) {
         const msg = err instanceof Error ? err.message : String(err);
         console.log(`Warning: failed to save API key for future runs (${credentialsFilePath()}): ${msg}\n`);

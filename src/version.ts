@@ -3,6 +3,9 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
+const UPGRADE_COMMAND = 'npm update -g @contextstream/mcp-server';
+const NPM_LATEST_URL = 'https://registry.npmjs.org/@contextstream/mcp-server/latest';
+
 export function getVersion(): string {
   try {
     const require = createRequire(import.meta.url);
@@ -39,7 +42,15 @@ interface VersionCache {
   checkedAt: number;
 }
 
+export interface VersionNotice {
+  current: string;
+  latest: string;
+  behind: true;
+  upgrade_command: string;
+}
+
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+let latestVersionPromise: Promise<string | null> | null = null;
 
 function getCacheFilePath(): string {
   return join(homedir(), '.contextstream', 'version-cache.json');
@@ -74,51 +85,52 @@ function writeCache(latestVersion: string): void {
   }
 }
 
+async function fetchLatestVersion(): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+
+    const response = await fetch(NPM_LATEST_URL, {
+      signal: controller.signal,
+      headers: { 'Accept': 'application/json' },
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) return null;
+
+    const data = await response.json() as { version?: string };
+    return typeof data.version === 'string' ? data.version : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveLatestVersion(): Promise<string | null> {
+  const cached = readCache();
+  if (cached) return cached.latestVersion;
+
+  if (!latestVersionPromise) {
+    latestVersionPromise = fetchLatestVersion().finally(() => {
+      latestVersionPromise = null;
+    });
+  }
+
+  const latestVersion = await latestVersionPromise;
+  if (latestVersion) {
+    writeCache(latestVersion);
+  }
+  return latestVersion;
+}
+
 /**
  * Check npm registry for the latest version and compare against current.
  * Shows a warning to stderr if a newer version is available.
  * Uses a 24-hour cache to avoid hitting npm on every startup.
  */
 export async function checkForUpdates(): Promise<void> {
-  const currentVersion = VERSION;
-  if (currentVersion === 'unknown') return;
-
-  try {
-    // Check cache first
-    const cached = readCache();
-    if (cached) {
-      if (compareVersions(currentVersion, cached.latestVersion) < 0) {
-        showUpdateWarning(currentVersion, cached.latestVersion);
-      }
-      return;
-    }
-
-    // Fetch latest version from npm registry
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000); // 5 second timeout
-
-    const response = await fetch('https://registry.npmjs.org/@contextstream/mcp-server/latest', {
-      signal: controller.signal,
-      headers: { 'Accept': 'application/json' },
-    });
-    clearTimeout(timeout);
-
-    if (!response.ok) return;
-
-    const data = await response.json() as { version?: string };
-    const latestVersion = data.version;
-
-    if (typeof latestVersion !== 'string') return;
-
-    // Cache the result
-    writeCache(latestVersion);
-
-    // Compare versions
-    if (compareVersions(currentVersion, latestVersion) < 0) {
-      showUpdateWarning(currentVersion, latestVersion);
-    }
-  } catch {
-    // Silently ignore network errors - don't block startup
+  const notice = await getUpdateNotice();
+  if (notice?.behind) {
+    showUpdateWarning(notice.current, notice.latest);
   }
 }
 
@@ -127,9 +139,32 @@ function showUpdateWarning(currentVersion: string, latestVersion: string): void 
   console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.error(`⚠️  Update available: v${currentVersion} → v${latestVersion}`);
   console.error('');
-  console.error('   Run: npm update -g @contextstream/mcp-server');
+  console.error(`   Run: ${UPGRADE_COMMAND}`);
   console.error('');
   console.error('   Then restart your AI tool to use the new version.');
   console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.error('');
+}
+
+export async function getUpdateNotice(): Promise<VersionNotice | null> {
+  const currentVersion = VERSION;
+  if (currentVersion === 'unknown') return null;
+
+  try {
+    const latestVersion = await resolveLatestVersion();
+    if (!latestVersion) return null;
+
+    if (compareVersions(currentVersion, latestVersion) < 0) {
+      return {
+        current: currentVersion,
+        latest: latestVersion,
+        behind: true,
+        upgrade_command: UPGRADE_COMMAND,
+      };
+    }
+  } catch {
+    // ignore version check failures
+  }
+
+  return null;
 }

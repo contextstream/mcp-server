@@ -2807,9 +2807,12 @@ This saves ~80% tokens compared to including full chat history.`,
 
       // Return context directly for easy inclusion in AI prompts
       const footer = `\n---\n🎯 ${result.sources_used} sources | ~${result.token_estimate} tokens | format: ${result.format}`;
+      const versionNoticeLine = result.version_notice?.behind
+        ? `\n[VERSION_NOTICE] current=${result.version_notice.current} latest=${result.version_notice.latest} upgrade="${result.version_notice.upgrade_command}"`
+        : '';
 
       return {
-        content: [{ type: 'text' as const, text: result.context + footer }],
+        content: [{ type: 'text' as const, text: result.context + footer + versionNoticeLine }],
         structuredContent: toStructured(result),
       };
     }

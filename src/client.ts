@@ -12,7 +12,7 @@ import {
   type WorkspaceConfig
 } from './workspace-config.js';
 import { globalCache, CacheKeys, CacheTTL } from './cache.js';
-import { VERSION } from './version.js';
+import { VERSION, getUpdateNotice, type VersionNotice } from './version.js';
 
 const uuidSchema = z.string().uuid();
 
@@ -2282,6 +2282,7 @@ export class ContextStreamClient {
     format: string;
     sources_used: number;
     errors?: string[];
+    version_notice?: VersionNotice;
   }> {
     const withDefaults = this.withDefaults(params);
     const maxTokens = params.max_tokens || 800;
@@ -2476,6 +2477,13 @@ export class ContextStreamClient {
       candidateContext = context;
     }
 
+    let versionNotice: VersionNotice | null = null;
+    try {
+      versionNotice = await getUpdateNotice();
+    } catch {
+      // ignore version check failures
+    }
+
     this.trackTokenSavings({
       tool: 'context_smart',
       workspace_id: withDefaults.workspace_id,
@@ -2496,6 +2504,7 @@ export class ContextStreamClient {
       token_estimate: Math.ceil(context.length / 4),
       format,
       sources_used: items.filter(i => context.includes(i.value.slice(0, 20))).length,
+      ...(versionNotice ? { version_notice: versionNotice } : {}),
       ...(errors.length > 0 && { errors }), // Include errors for debugging
     };
   }

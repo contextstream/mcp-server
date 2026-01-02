@@ -30,6 +30,10 @@ const REQUIRE_AUTH = (process.env.MCP_HTTP_REQUIRE_AUTH || 'true').toLowerCase()
 const ENABLE_JSON_RESPONSE = (process.env.MCP_HTTP_JSON_RESPONSE || 'false').toLowerCase() === 'true';
 const ENABLE_PROMPTS = (process.env.CONTEXTSTREAM_ENABLE_PROMPTS || 'true').toLowerCase() !== 'false';
 const WELL_KNOWN_CONFIG_PATH = '/.well-known/mcp-config';
+const WELL_KNOWN_CONFIG_PATHS = new Set([
+  WELL_KNOWN_CONFIG_PATH,
+  '/.well-known/mcp-config.json',
+]);
 const WELL_KNOWN_CARD_PATHS = new Set([
   '/.well-known/mcp.json',
   '/.well-known/mcp-server.json',
@@ -143,6 +147,7 @@ function buildServerCard(baseUrl: string): Record<string, unknown> {
     title: 'ContextStream MCP Server',
     description: 'ContextStream MCP server for code context, memory, search, and AI tools.',
     version: VERSION,
+    homepage: 'https://contextstream.io/docs/mcp',
     websiteUrl: 'https://contextstream.io/docs/mcp',
     repository: {
       url: 'https://github.com/contextstream/mcp-server',
@@ -305,7 +310,7 @@ export async function runHttpGateway(): Promise<void> {
       return;
     }
 
-    if (url.pathname === WELL_KNOWN_CONFIG_PATH) {
+    if (WELL_KNOWN_CONFIG_PATHS.has(url.pathname)) {
       writeJson(res, 200, buildMcpConfigSchema(getBaseUrl(req)));
       return;
     }

@@ -346,6 +346,8 @@ export class ContextStreamClient {
     title: string;
     content: string;
     metadata?: Record<string, unknown>;
+    provenance?: Record<string, unknown>;
+    code_refs?: Array<{ file_path: string; symbol_id?: string; symbol_name?: string }>;
   }) {
     const withDefaults = this.withDefaults(body);
     
@@ -1596,6 +1598,8 @@ export class ContextStreamClient {
     content: string;
     tags?: string[];
     importance?: 'low' | 'medium' | 'high' | 'critical';
+    provenance?: Record<string, unknown>;
+    code_refs?: Array<{ file_path: string; symbol_id?: string; symbol_name?: string }>;
   }) {
     const withDefaults = this.withDefaults(params);
 
@@ -1644,6 +1648,8 @@ export class ContextStreamClient {
       event_type: apiEventType,
       title: params.title,
       content: params.content,
+      provenance: params.provenance,
+      code_refs: params.code_refs,
       metadata: {
         original_type: params.event_type,
         session_id: params.session_id,
@@ -1652,6 +1658,30 @@ export class ContextStreamClient {
         captured_at: new Date().toISOString(),
         source: 'mcp_auto_capture',
       },
+    });
+  }
+
+  submitContextFeedback(body: {
+    workspace_id?: string;
+    project_id?: string;
+    item_id: string;
+    item_type: 'memory_event' | 'knowledge_node' | 'code_chunk';
+    feedback_type: 'relevant' | 'irrelevant' | 'pin';
+    query_text?: string;
+    metadata?: Record<string, unknown>;
+  }) {
+    return request(this.config, '/context/smart/feedback', { body: this.withDefaults(body) });
+  }
+
+  decisionTrace(body: {
+    query: string;
+    workspace_id?: string;
+    project_id?: string;
+    limit?: number;
+    include_impact?: boolean;
+  }) {
+    return request(this.config, '/memory/search/decisions/trace', {
+      body: this.withDefaults(body),
     });
   }
 

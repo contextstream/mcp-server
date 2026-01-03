@@ -20,6 +20,7 @@ const CONTEXTSTREAM_TOOL_NAMES = [
   // Session/Context (standard)
   'session_init',
   'context_smart',
+  'context_feedback',
   'session_summary',
   'session_capture',
   'session_capture_lesson',
@@ -69,6 +70,7 @@ const CONTEXTSTREAM_TOOL_NAMES = [
   'memory_list_nodes',
   'memory_search',
   'memory_decisions',
+  'decision_trace',
   'memory_get_event',
   'memory_update_event',
   'memory_delete_event',
@@ -239,7 +241,7 @@ To expose all tools below, set \`CONTEXTSTREAM_TOOLSET=complete\` in your MCP co
 **Available tool categories (when \`CONTEXTSTREAM_TOOLSET=complete\`):**
 
 **Session/Context** (included in standard):
-\`session_init\`, \`context_smart\`, \`session_summary\`, \`session_capture\`, \`session_capture_lesson\`, \`session_get_lessons\`, \`session_recall\`, \`session_remember\`, \`session_get_user_context\`, \`session_smart_search\`, \`session_compress\`, \`session_delta\`, \`generate_editor_rules\`, \`workspace_associate\`, \`workspace_bootstrap\`
+\`session_init\`, \`context_smart\`, \`context_feedback\`, \`session_summary\`, \`session_capture\`, \`session_capture_lesson\`, \`session_get_lessons\`, \`session_recall\`, \`session_remember\`, \`session_get_user_context\`, \`session_smart_search\`, \`session_compress\`, \`session_delta\`, \`generate_editor_rules\`, \`workspace_associate\`, \`workspace_bootstrap\`
 
 **Workspaces**:
 \`workspaces_list\`, \`workspaces_create\`, \`workspaces_update\`, \`workspaces_delete\`, \`workspaces_get\`, \`workspaces_overview\`, \`workspaces_analytics\`, \`workspaces_content\`
@@ -251,7 +253,7 @@ To expose all tools below, set \`CONTEXTSTREAM_TOOLSET=complete\` in your MCP co
 \`search_semantic\`, \`search_hybrid\`, \`search_keyword\`, \`search_pattern\`, \`search_suggestions\`
 
 **Memory**:
-\`memory_create_event\`, \`memory_bulk_ingest\`, \`memory_list_events\`, \`memory_create_node\`, \`memory_list_nodes\`, \`memory_search\`, \`memory_decisions\`, \`memory_get_event\`, \`memory_update_event\`, \`memory_delete_event\`, \`memory_distill_event\`, \`memory_get_node\`, \`memory_update_node\`, \`memory_delete_node\`, \`memory_supersede_node\`, \`memory_timeline\`, \`memory_summary\`
+\`memory_create_event\`, \`memory_bulk_ingest\`, \`memory_list_events\`, \`memory_create_node\`, \`memory_list_nodes\`, \`memory_search\`, \`memory_decisions\`, \`decision_trace\`, \`memory_get_event\`, \`memory_update_event\`, \`memory_delete_event\`, \`memory_distill_event\`, \`memory_get_node\`, \`memory_update_node\`, \`memory_delete_node\`, \`memory_supersede_node\`, \`memory_timeline\`, \`memory_summary\`
 
 **Graph** (code analysis):
 \`graph_related\`, \`graph_path\`, \`graph_decisions\`, \`graph_dependencies\`, \`graph_call_path\`, \`graph_impact\`, \`graph_circular_dependencies\`, \`graph_unused_code\`, \`graph_ingest\`, \`graph_contradictions\`

@@ -88,6 +88,7 @@ const WRITE_VERBS = new Set([
   'add',
   'remove',
   'revoke',
+  'feedback',
   'upload',
   'compress',
   'init',
@@ -112,6 +113,7 @@ const READ_ONLY_OVERRIDES = new Set([
   'workspaces_get',
   'memory_search',
   'memory_decisions',
+  'decision_trace',
   'memory_get_event',
   'memory_list_events',
   'memory_list_nodes',
@@ -290,6 +292,7 @@ const LIGHT_TOOLSET = new Set<string>([
   'session_init',
   'session_tools',
   'context_smart',
+  'context_feedback',
   'session_summary',
   'session_capture',
   'session_capture_lesson',
@@ -368,6 +371,7 @@ const STANDARD_TOOLSET = new Set<string>([
   // Memory events (9)
   'memory_search',
   'memory_decisions',
+  'decision_trace',
   'memory_create_event',
   'memory_list_events',
   'memory_get_event',
@@ -1223,6 +1227,21 @@ Access: Free`,
         title: z.string(),
         content: z.string(),
         metadata: z.record(z.any()).optional(),
+        provenance: z.object({
+          repo: z.string().optional(),
+          branch: z.string().optional(),
+          commit_sha: z.string().optional(),
+          pr_url: z.string().url().optional(),
+          issue_url: z.string().url().optional(),
+          slack_thread_url: z.string().url().optional(),
+        }).optional(),
+        code_refs: z.array(
+          z.object({
+            file_path: z.string(),
+            symbol_id: z.string().optional(),
+            symbol_name: z.string().optional(),
+          })
+        ).optional(),
       }),
     },
     async (input) => {
@@ -1341,6 +1360,25 @@ Access: Free`,
     },
     async (input) => {
       const result = await client.memoryDecisions(input);
+      return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+    }
+  );
+
+  registerTool(
+    'decision_trace',
+    {
+      title: 'Decision trace',
+      description: 'Trace decisions to provenance, code references, and impact',
+      inputSchema: z.object({
+        query: z.string(),
+        workspace_id: z.string().uuid().optional(),
+        project_id: z.string().uuid().optional(),
+        limit: z.number().optional(),
+        include_impact: z.boolean().optional().describe('Include impact analysis when graph data is available'),
+      }),
+    },
+    async (input) => {
+      const result = await client.decisionTrace(input);
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -2504,6 +2542,21 @@ Use this to persist decisions, insights, preferences, or important information.`
         content: z.string().describe('Full content/details to capture'),
         tags: z.array(z.string()).optional().describe('Tags for categorization'),
         importance: z.enum(['low', 'medium', 'high', 'critical']).optional().describe('Importance level'),
+        provenance: z.object({
+          repo: z.string().optional(),
+          branch: z.string().optional(),
+          commit_sha: z.string().optional(),
+          pr_url: z.string().url().optional(),
+          issue_url: z.string().url().optional(),
+          slack_thread_url: z.string().url().optional(),
+        }).optional(),
+        code_refs: z.array(
+          z.object({
+            file_path: z.string(),
+            symbol_id: z.string().optional(),
+            symbol_name: z.string().optional(),
+          })
+        ).optional(),
       }),
     },
     async (input) => {
@@ -3266,6 +3319,47 @@ This saves ~80% tokens compared to including full chat history.`,
 
       return {
         content: [{ type: 'text' as const, text: result.context + footer + versionNoticeLine }],
+        structuredContent: toStructured(result),
+      };
+    }
+  );
+
+  registerTool(
+    'context_feedback',
+    {
+      title: 'Submit smart context feedback',
+      description: 'Send relevance feedback (relevant/irrelevant/pin) for context_smart items.',
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+        project_id: z.string().uuid().optional(),
+        item_id: z.string().describe('Item ID returned by context_smart'),
+        item_type: z.enum(['memory_event', 'knowledge_node', 'code_chunk']),
+        feedback_type: z.enum(['relevant', 'irrelevant', 'pin']),
+        query_text: z.string().optional(),
+        metadata: z.record(z.any()).optional(),
+      }),
+    },
+    async (input) => {
+      // Get workspace_id from session context if not provided
+      let workspaceId = input.workspace_id;
+      let projectId = input.project_id;
+
+      if (!workspaceId && sessionManager) {
+        const ctx = sessionManager.getContext();
+        if (ctx) {
+          workspaceId = ctx.workspace_id as string | undefined;
+          projectId = projectId || ctx.project_id as string | undefined;
+        }
+      }
+
+      const result = await client.submitContextFeedback({
+        ...input,
+        workspace_id: workspaceId,
+        project_id: projectId,
+      });
+
+      return {
+        content: [{ type: 'text' as const, text: formatContent(result) }],
         structuredContent: toStructured(result),
       };
     }

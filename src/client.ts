@@ -3478,4 +3478,229 @@ export class ContextStreamClient {
     uuidSchema.parse(params.reminder_id);
     return request(this.config, `/reminders/${params.reminder_id}`, { method: 'DELETE' });
   }
+
+  // ============================================
+  // Plans & Tasks
+  // ============================================
+
+  /**
+   * Create a new implementation plan
+   */
+  async createPlan(params: {
+    workspace_id?: string;
+    project_id?: string;
+    title: string;
+    content?: string;
+    description?: string;
+    goals?: string[];
+    steps?: Array<{ id: string; title: string; description?: string; order: number; estimated_effort?: string }>;
+    status?: 'draft' | 'active' | 'completed' | 'archived' | 'abandoned';
+    tags?: string[];
+    due_at?: string;
+    source_tool?: string;
+  }) {
+    const withDefaults = this.withDefaults(params);
+    if (!withDefaults.workspace_id) {
+      throw new Error('workspace_id is required for creating plans');
+    }
+    return request(this.config, '/plans', { body: withDefaults });
+  }
+
+  /**
+   * List plans with optional filters
+   */
+  async listPlans(params?: {
+    workspace_id?: string;
+    project_id?: string;
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }) {
+    const withDefaults = this.withDefaults(params || {});
+    const query = new URLSearchParams();
+    if (withDefaults.workspace_id) query.set('workspace_id', withDefaults.workspace_id);
+    if (withDefaults.project_id) query.set('project_id', withDefaults.project_id);
+    if (params?.status) query.set('status', params.status);
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.offset) query.set('offset', String(params.offset));
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return request(this.config, `/plans${suffix}`, { method: 'GET' });
+  }
+
+  /**
+   * Get a plan by ID, optionally including its tasks
+   */
+  async getPlan(params: {
+    plan_id: string;
+    include_tasks?: boolean;
+  }) {
+    uuidSchema.parse(params.plan_id);
+    const query = new URLSearchParams();
+    if (params.include_tasks !== false) query.set('include_tasks', 'true');
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return request(this.config, `/plans/${params.plan_id}${suffix}`, { method: 'GET' });
+  }
+
+  /**
+   * Update an existing plan
+   */
+  async updatePlan(params: {
+    plan_id: string;
+    title?: string;
+    content?: string;
+    description?: string;
+    goals?: string[];
+    steps?: Array<{ id: string; title: string; description?: string; order: number; estimated_effort?: string }>;
+    status?: 'draft' | 'active' | 'completed' | 'archived' | 'abandoned';
+    tags?: string[];
+    due_at?: string;
+  }) {
+    uuidSchema.parse(params.plan_id);
+    const { plan_id, ...updates } = params;
+    return request(this.config, `/plans/${plan_id}`, { method: 'PATCH', body: updates });
+  }
+
+  /**
+   * Delete a plan
+   */
+  async deletePlan(params: {
+    plan_id: string;
+  }) {
+    uuidSchema.parse(params.plan_id);
+    return request(this.config, `/plans/${params.plan_id}`, { method: 'DELETE' });
+  }
+
+  /**
+   * Get tasks for a specific plan
+   */
+  async getPlanTasks(params: {
+    plan_id: string;
+  }) {
+    uuidSchema.parse(params.plan_id);
+    return request(this.config, `/plans/${params.plan_id}/tasks`, { method: 'GET' });
+  }
+
+  /**
+   * Create a task within a plan
+   */
+  async createPlanTask(params: {
+    plan_id: string;
+    title: string;
+    content?: string;
+    description?: string;
+    status?: 'pending' | 'in_progress' | 'completed' | 'blocked' | 'cancelled';
+    priority?: 'low' | 'medium' | 'high' | 'urgent';
+    order?: number;
+    plan_step_id?: string;
+    code_refs?: Array<{ file_path: string; symbol_name?: string; line_range?: [number, number] }>;
+    tags?: string[];
+  }) {
+    uuidSchema.parse(params.plan_id);
+    const { plan_id, ...taskData } = params;
+    return request(this.config, `/plans/${plan_id}/tasks`, { body: taskData });
+  }
+
+  /**
+   * Reorder tasks within a plan
+   */
+  async reorderPlanTasks(params: {
+    plan_id: string;
+    task_ids: string[];
+  }) {
+    uuidSchema.parse(params.plan_id);
+    return request(this.config, `/plans/${params.plan_id}/tasks/reorder`, {
+      method: 'PATCH',
+      body: { task_ids: params.task_ids },
+    });
+  }
+
+  /**
+   * Create a standalone task (optionally linked to a plan)
+   */
+  async createTask(params: {
+    workspace_id?: string;
+    project_id?: string;
+    title: string;
+    content?: string;
+    description?: string;
+    plan_id?: string;
+    plan_step_id?: string;
+    status?: 'pending' | 'in_progress' | 'completed' | 'blocked' | 'cancelled';
+    priority?: 'low' | 'medium' | 'high' | 'urgent';
+    order?: number;
+    code_refs?: Array<{ file_path: string; symbol_name?: string; line_range?: [number, number] }>;
+    tags?: string[];
+  }) {
+    const withDefaults = this.withDefaults(params);
+    if (!withDefaults.workspace_id) {
+      throw new Error('workspace_id is required for creating tasks');
+    }
+    return request(this.config, '/tasks', { body: withDefaults });
+  }
+
+  /**
+   * List tasks with optional filters
+   */
+  async listTasks(params?: {
+    workspace_id?: string;
+    project_id?: string;
+    plan_id?: string;
+    status?: string;
+    priority?: string;
+    limit?: number;
+    offset?: number;
+  }) {
+    const withDefaults = this.withDefaults(params || {});
+    const query = new URLSearchParams();
+    if (withDefaults.workspace_id) query.set('workspace_id', withDefaults.workspace_id);
+    if (withDefaults.project_id) query.set('project_id', withDefaults.project_id);
+    if (params?.plan_id) query.set('plan_id', params.plan_id);
+    if (params?.status) query.set('status', params.status);
+    if (params?.priority) query.set('priority', params.priority);
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.offset) query.set('offset', String(params.offset));
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return request(this.config, `/tasks${suffix}`, { method: 'GET' });
+  }
+
+  /**
+   * Get a task by ID
+   */
+  async getTask(params: {
+    task_id: string;
+  }) {
+    uuidSchema.parse(params.task_id);
+    return request(this.config, `/tasks/${params.task_id}`, { method: 'GET' });
+  }
+
+  /**
+   * Update an existing task
+   */
+  async updateTask(params: {
+    task_id: string;
+    title?: string;
+    content?: string;
+    description?: string;
+    status?: 'pending' | 'in_progress' | 'completed' | 'blocked' | 'cancelled';
+    priority?: 'low' | 'medium' | 'high' | 'urgent';
+    order?: number;
+    plan_step_id?: string;
+    code_refs?: Array<{ file_path: string; symbol_name?: string; line_range?: [number, number] }>;
+    tags?: string[];
+    blocked_reason?: string;
+  }) {
+    uuidSchema.parse(params.task_id);
+    const { task_id, ...updates } = params;
+    return request(this.config, `/tasks/${task_id}`, { method: 'PATCH', body: updates });
+  }
+
+  /**
+   * Delete a task
+   */
+  async deleteTask(params: {
+    task_id: string;
+  }) {
+    uuidSchema.parse(params.task_id);
+    return request(this.config, `/tasks/${params.task_id}`, { method: 'DELETE' });
+  }
 }

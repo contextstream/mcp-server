@@ -35,6 +35,11 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: 'capture_lesson', hint: 'mistake' },
       { name: 'get_user_context', hint: 'prefs' },
       { name: 'smart_search', hint: 'deep-find' },
+      // Plan actions
+      { name: 'capture_plan', hint: 'save-plan' },
+      { name: 'get_plan', hint: 'get-plan' },
+      { name: 'update_plan', hint: 'edit-plan' },
+      { name: 'list_plans', hint: 'list-plans' },
     ],
   },
   {
@@ -58,6 +63,13 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: 'decisions', hint: 'choices' },
       { name: 'timeline', hint: 'history' },
       { name: 'distill_event', hint: 'extract' },
+      // Task actions
+      { name: 'create_task', hint: 'new-task' },
+      { name: 'get_task', hint: 'get-task' },
+      { name: 'update_task', hint: 'edit-task' },
+      { name: 'delete_task', hint: 'rm-task' },
+      { name: 'list_tasks', hint: 'list-tasks' },
+      { name: 'reorder_tasks', hint: 'sort-tasks' },
     ],
   },
   {

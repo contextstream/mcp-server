@@ -5547,18 +5547,20 @@ Use this to remove a reminder that is no longer relevant.`,
       'session',
       {
         title: 'Session',
-        description: `Session management operations. Actions: capture (save decision/insight), capture_lesson (save lesson from mistake), get_lessons (retrieve lessons), recall (natural language recall), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (context-enriched search), decision_trace (trace decision provenance).`,
+        description: `Session management operations. Actions: capture (save decision/insight), capture_lesson (save lesson from mistake), get_lessons (retrieve lessons), recall (natural language recall), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (context-enriched search), decision_trace (trace decision provenance). Plan actions: capture_plan (save implementation plan), get_plan (retrieve plan with tasks), update_plan (modify plan), list_plans (list all plans).`,
         inputSchema: z.object({
           action: z.enum([
             'capture', 'capture_lesson', 'get_lessons', 'recall', 'remember',
-            'user_context', 'summary', 'compress', 'delta', 'smart_search', 'decision_trace'
+            'user_context', 'summary', 'compress', 'delta', 'smart_search', 'decision_trace',
+            // Plan actions
+            'capture_plan', 'get_plan', 'update_plan', 'list_plans'
           ]).describe('Action to perform'),
           workspace_id: z.string().uuid().optional(),
           project_id: z.string().uuid().optional(),
           // Content params
           query: z.string().optional().describe('Query for recall/search/lessons/decision_trace'),
           content: z.string().optional().describe('Content for capture/remember/compress'),
-          title: z.string().optional().describe('Title for capture/capture_lesson'),
+          title: z.string().optional().describe('Title for capture/capture_lesson/capture_plan'),
           event_type: z.enum(['decision', 'preference', 'insight', 'task', 'bug', 'feature', 'correction', 'lesson', 'warning', 'frustration', 'conversation']).optional().describe('Event type for capture'),
           importance: z.enum(['low', 'medium', 'high', 'critical']).optional(),
           tags: z.array(z.string()).optional(),
@@ -5590,6 +5592,21 @@ Use this to remove a reminder that is no longer relevant.`,
             issue_url: z.string().url().optional(),
             slack_thread_url: z.string().url().optional(),
           }).optional(),
+          // Plan-specific params
+          plan_id: z.string().uuid().optional().describe('Plan ID for get_plan/update_plan'),
+          description: z.string().optional().describe('Description for capture_plan'),
+          goals: z.array(z.string()).optional().describe('Goals for capture_plan'),
+          steps: z.array(z.object({
+            id: z.string(),
+            title: z.string(),
+            description: z.string().optional(),
+            order: z.number(),
+            estimated_effort: z.enum(['small', 'medium', 'large']).optional(),
+          })).optional().describe('Implementation steps for capture_plan'),
+          status: z.enum(['draft', 'active', 'completed', 'archived', 'abandoned']).optional().describe('Plan status'),
+          due_at: z.string().optional().describe('Due date for plan (ISO timestamp)'),
+          source_tool: z.string().optional().describe('Tool that generated this plan'),
+          include_tasks: z.boolean().optional().describe('Include tasks when getting plan'),
         }),
       },
       async (input) => {
@@ -5766,6 +5783,72 @@ Use this to remove a reminder that is no longer relevant.`,
             return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
           }
 
+          // Plan actions
+          case 'capture_plan': {
+            if (!input.title) {
+              return errorResult('capture_plan requires: title');
+            }
+            if (!workspaceId) {
+              return errorResult('capture_plan requires workspace_id. Call session_init first.');
+            }
+            const result = await client.createPlan({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              title: input.title,
+              content: input.content,
+              description: input.description,
+              goals: input.goals,
+              steps: input.steps,
+              status: input.status || 'draft',
+              tags: input.tags,
+              due_at: input.due_at,
+              source_tool: input.source_tool || 'mcp',
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'get_plan': {
+            if (!input.plan_id) {
+              return errorResult('get_plan requires: plan_id');
+            }
+            const result = await client.getPlan({
+              plan_id: input.plan_id,
+              include_tasks: input.include_tasks !== false,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'update_plan': {
+            if (!input.plan_id) {
+              return errorResult('update_plan requires: plan_id');
+            }
+            const result = await client.updatePlan({
+              plan_id: input.plan_id,
+              title: input.title,
+              content: input.content,
+              description: input.description,
+              goals: input.goals,
+              steps: input.steps,
+              status: input.status,
+              tags: input.tags,
+              due_at: input.due_at,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'list_plans': {
+            if (!workspaceId) {
+              return errorResult('list_plans requires workspace_id. Call session_init first.');
+            }
+            const result = await client.listPlans({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              status: input.status,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
           default:
             return errorResult(`Unknown action: ${input.action}`);
         }
@@ -5779,12 +5862,14 @@ Use this to remove a reminder that is no longer relevant.`,
       'memory',
       {
         title: 'Memory',
-        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event. Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary.`,
+        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event. Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task, delete_task, list_tasks, reorder_tasks.`,
         inputSchema: z.object({
           action: z.enum([
             'create_event', 'get_event', 'update_event', 'delete_event', 'list_events', 'distill_event',
             'create_node', 'get_node', 'update_node', 'delete_node', 'list_nodes', 'supersede_node',
-            'search', 'decisions', 'timeline', 'summary'
+            'search', 'decisions', 'timeline', 'summary',
+            // Task actions
+            'create_task', 'get_task', 'update_task', 'delete_task', 'list_tasks', 'reorder_tasks'
           ]).describe('Action to perform'),
           workspace_id: z.string().uuid().optional(),
           project_id: z.string().uuid().optional(),
@@ -5821,6 +5906,17 @@ Use this to remove a reminder that is no longer relevant.`,
             symbol_id: z.string().optional(),
             symbol_name: z.string().optional(),
           })).optional(),
+          // Task-specific params
+          task_id: z.string().uuid().optional().describe('Task ID for get_task/update_task/delete_task'),
+          plan_id: z.string().uuid().optional().describe('Parent plan ID for create_task/list_tasks'),
+          plan_step_id: z.string().optional().describe('Which plan step this task implements'),
+          description: z.string().optional().describe('Description for task'),
+          task_status: z.enum(['pending', 'in_progress', 'completed', 'blocked', 'cancelled']).optional().describe('Task status'),
+          priority: z.enum(['low', 'medium', 'high', 'urgent']).optional().describe('Task priority'),
+          order: z.number().optional().describe('Task order within plan'),
+          task_ids: z.array(z.string().uuid()).optional().describe('Task IDs for reorder_tasks'),
+          blocked_reason: z.string().optional().describe('Reason when task is blocked'),
+          tags: z.array(z.string()).optional().describe('Tags for task'),
         }),
       },
       async (input) => {
@@ -5987,6 +6083,100 @@ Use this to remove a reminder that is no longer relevant.`,
           case 'summary': {
             const result = await client.memorySummary({
               workspace_id: workspaceId,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          // Task actions
+          case 'create_task': {
+            if (!input.title) {
+              return errorResult('create_task requires: title');
+            }
+            if (!workspaceId) {
+              return errorResult('create_task requires workspace_id. Call session_init first.');
+            }
+            const result = await client.createTask({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              title: input.title,
+              content: input.content,
+              description: input.description,
+              plan_id: input.plan_id,
+              plan_step_id: input.plan_step_id,
+              status: input.task_status,
+              priority: input.priority,
+              order: input.order,
+              code_refs: input.code_refs,
+              tags: input.tags,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'get_task': {
+            if (!input.task_id) {
+              return errorResult('get_task requires: task_id');
+            }
+            const result = await client.getTask({
+              task_id: input.task_id,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'update_task': {
+            if (!input.task_id) {
+              return errorResult('update_task requires: task_id');
+            }
+            const result = await client.updateTask({
+              task_id: input.task_id,
+              title: input.title,
+              content: input.content,
+              description: input.description,
+              status: input.task_status,
+              priority: input.priority,
+              order: input.order,
+              plan_step_id: input.plan_step_id,
+              code_refs: input.code_refs,
+              tags: input.tags,
+              blocked_reason: input.blocked_reason,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'delete_task': {
+            if (!input.task_id) {
+              return errorResult('delete_task requires: task_id');
+            }
+            const result = await client.deleteTask({
+              task_id: input.task_id,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'list_tasks': {
+            if (!workspaceId) {
+              return errorResult('list_tasks requires workspace_id. Call session_init first.');
+            }
+            const result = await client.listTasks({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              plan_id: input.plan_id,
+              status: input.task_status,
+              priority: input.priority,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'reorder_tasks': {
+            if (!input.plan_id) {
+              return errorResult('reorder_tasks requires: plan_id');
+            }
+            if (!input.task_ids || input.task_ids.length === 0) {
+              return errorResult('reorder_tasks requires: task_ids (array of task IDs in new order)');
+            }
+            const result = await client.reorderPlanTasks({
+              plan_id: input.plan_id,
+              task_ids: input.task_ids,
             });
             return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
           }

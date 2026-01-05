@@ -480,6 +480,115 @@ const TOKEN_SENSITIVE_CLIENTS = new Set([
 // CONTEXTSTREAM_AUTO_TOOLSET=true | false (default: false - disabled until strategies 4-7 implemented)
 const AUTO_TOOLSET_ENABLED = process.env.CONTEXTSTREAM_AUTO_TOOLSET === 'true';
 
+// =============================================================================
+// Strategy 4: Schema Minimization Mode
+// =============================================================================
+// Environment variable to control schema verbosity
+// CONTEXTSTREAM_SCHEMA_MODE=compact | full (default: full)
+// Compact mode reduces tool descriptions and parameter descriptions to minimize token overhead
+const SCHEMA_MODE = process.env.CONTEXTSTREAM_SCHEMA_MODE || 'full';
+const COMPACT_SCHEMA_ENABLED = SCHEMA_MODE === 'compact';
+
+/**
+ * Compactify a tool description for token savings.
+ * - Keeps only the first sentence or line
+ * - Removes examples, code blocks, and verbose explanations
+ * - Max ~100 characters
+ */
+function compactifyDescription(description: string): string {
+  if (!description) return '';
+
+  // Remove markdown code blocks
+  let compact = description.replace(/```[\s\S]*?```/g, '');
+
+  // Remove inline code examples after "Example:"
+  compact = compact.replace(/\n*Example:[\s\S]*$/i, '');
+
+  // Remove "Access: ..." lines (these are added separately anyway in non-compact mode)
+  compact = compact.replace(/\n*Access:.*$/gm, '');
+
+  // Take first line or first sentence
+  const firstLine = compact.split('\n')[0].trim();
+  const firstSentence = firstLine.split(/\.(?:\s|$)/)[0];
+
+  // Prefer first sentence if it's not too short, otherwise use first line
+  let result = firstSentence.length >= 20 ? firstSentence : firstLine;
+
+  // Truncate if still too long
+  if (result.length > 120) {
+    result = result.substring(0, 117) + '...';
+  }
+
+  return result;
+}
+
+/**
+ * Compactify parameter descriptions in a Zod schema.
+ * In compact mode, we skip auto-generated descriptions entirely and only keep
+ * explicitly provided descriptions, shortened to their essence.
+ */
+function compactifyParamDescription(description: string | undefined): string | undefined {
+  if (!description) return undefined;
+
+  // Keep only first clause, max 40 chars
+  const firstClause = description.split(/[.,;]/)[0].trim();
+  if (firstClause.length > 40) {
+    return firstClause.substring(0, 37) + '...';
+  }
+  return firstClause;
+}
+
+/**
+ * Apply compact parameter descriptions to a schema.
+ * Unlike applyParamDescriptions, this SKIPS auto-generating descriptions
+ * and only keeps/shortens explicitly provided ones.
+ */
+function applyCompactParamDescriptions(schema: z.ZodTypeAny): z.ZodTypeAny {
+  if (!(schema instanceof z.ZodObject)) {
+    return schema;
+  }
+
+  const shape = schema.shape;
+  let changed = false;
+  const nextShape: ZodRawShape = {};
+
+  for (const [key, field] of Object.entries(shape) as Array<[string, z.ZodTypeAny]>) {
+    let nextField: z.ZodTypeAny = field;
+    const existingDescription = getDescription(field);
+
+    if (field instanceof z.ZodObject) {
+      const nested = applyCompactParamDescriptions(field);
+      if (nested !== field) {
+        nextField = nested;
+        changed = true;
+      }
+    }
+
+    // In compact mode, only keep explicitly provided descriptions (shortened)
+    // Don't auto-generate descriptions for params without them
+    if (existingDescription) {
+      const compact = compactifyParamDescription(existingDescription);
+      if (compact && compact !== existingDescription) {
+        nextField = nextField.describe(compact);
+        changed = true;
+      }
+    }
+    // Note: We intentionally DON'T add descriptions for params without them
+
+    nextShape[key] = nextField;
+  }
+
+  if (!changed) return schema;
+
+  let nextSchema: z.ZodTypeAny = z.object(nextShape);
+  const def = (schema as { _def?: { catchall?: z.ZodTypeAny; unknownKeys?: string } })._def;
+  if (def?.catchall) nextSchema = (nextSchema as z.ZodObject<any>).catchall(def.catchall);
+  if (def?.unknownKeys === 'passthrough') nextSchema = (nextSchema as z.ZodObject<any>).passthrough();
+  if (def?.unknownKeys === 'strict') nextSchema = (nextSchema as z.ZodObject<any>).strict();
+
+  return nextSchema;
+}
+
 /**
  * Detect if we're running inside Claude Code using environment variables (Option A - Fallback).
  * Claude Code sets CLAUDECODE=1 and CLAUDE_CODE_ENTRYPOINT when spawning MCP servers.
@@ -792,6 +901,13 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     console.error('[ContextStream] Set CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS=false to disable.');
   } else {
     console.error('[ContextStream] Integration auto-hide: disabled');
+  }
+
+  // Log schema mode status (Strategy 4)
+  if (COMPACT_SCHEMA_ENABLED) {
+    console.error('[ContextStream] Schema mode: COMPACT (shorter descriptions, minimal params)');
+  } else {
+    console.error('[ContextStream] Schema mode: full (set CONTEXTSTREAM_SCHEMA_MODE=compact to reduce token overhead)');
   }
   const defaultProTools = new Set<string>([
     // AI endpoints (typically paid/credit-metered)
@@ -1240,14 +1356,29 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
 
     const accessLabel = getToolAccessLabel(name);
     const showUpgrade = accessLabel !== 'Free';
+
+    // Strategy 4: Apply schema compactification in compact mode
+    let finalDescription: string;
+    let finalSchema: z.ZodTypeAny | undefined;
+
+    if (COMPACT_SCHEMA_ENABLED) {
+      // Compact mode: shorter descriptions, no access labels, minimal param descriptions
+      finalDescription = compactifyDescription(config.description);
+      finalSchema = config.inputSchema ? applyCompactParamDescriptions(config.inputSchema) : undefined;
+    } else {
+      // Full mode: verbose descriptions with access labels
+      finalDescription = `${config.description}\n\nAccess: ${accessLabel}${showUpgrade ? ` (upgrade: ${upgradeUrl})` : ''}`;
+      finalSchema = config.inputSchema ? applyParamDescriptions(config.inputSchema) : undefined;
+    }
+
     const labeledConfig = {
       ...config,
-      title: `${config.title} (${accessLabel})`,
-      description: `${config.description}\n\nAccess: ${accessLabel}${showUpgrade ? ` (upgrade: ${upgradeUrl})` : ''}`,
+      title: COMPACT_SCHEMA_ENABLED ? config.title : `${config.title} (${accessLabel})`,
+      description: finalDescription,
     };
     const annotatedConfig = {
       ...labeledConfig,
-      inputSchema: labeledConfig.inputSchema ? applyParamDescriptions(labeledConfig.inputSchema) : undefined,
+      inputSchema: finalSchema,
       annotations: {
         ...inferToolAnnotations(name),
         ...(labeledConfig as { annotations?: ToolAnnotations }).annotations,

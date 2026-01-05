@@ -1,134 +1,149 @@
 # ContextStream MCP Server
 
-Persistent memory, semantic search, and code intelligence for any MCP-compatible AI tool.
+Persistent memory, semantic search, and code intelligence for any MCP-compatible AI tool (Cursor, Claude Code, Windsurf, VS Code, Claude Desktop, Codex CLI, etc.).
 
-ContextStream is a shared "brain" for your AI workflows. It stores decisions, preferences, and lessons, and lets your AI tools search and analyze your codebase with consistent context across sessions.
+ContextStream is a shared "brain" for AI-assisted development. It stores decisions, preferences, lessons, tasks, and project context — and lets your AI tools search and analyze your codebase with consistent context across sessions.
 
-**v0.4.x:** Consolidated domain tools (~11 tools) for ~75% token reduction vs previous versions.
+**v0.4.x:** Consolidated domain tools (~11 tools) for **~75% lower tool-registry token overhead** vs previous versions.
+
+---
 
 ## Just Ask
 
-**You don't need to memorize tool names.** Just describe what you want and your AI uses the right ContextStream tools automatically:
+**You don't need to memorize tool names.** Describe what you want and your AI will call the right ContextStream tools:
 
-| You say... | ContextStream does... |
-|------------|----------------------|
-| "session summary" | Gets a summary of your workspace context |
-| "what did we decide about auth?" | Recalls past decisions about authentication |
-| "remember we're using PostgreSQL" | Saves this to memory for future sessions |
-| "search for payment code" | Searches your codebase semantically |
-| "what depends on UserService?" | Analyzes code dependencies |
+| You say… | ContextStream does… |
+|----------|---------------------|
+| "session summary" | Summarizes current workspace/project context |
+| "what did we decide about auth?" | Recalls decisions related to authentication |
+| "remember we're using PostgreSQL" | Captures that fact for future sessions |
+| "search for payment code" | Searches your codebase semantically/hybrid/keyword |
+| "what depends on UserService?" | Analyzes dependency graph & impact |
 
-No special syntax. No commands to learn. Just ask.
-
-> **Tip:** For best results, add the [recommended editor rules](https://contextstream.io/docs/quickstart) so your AI consistently calls `session_init` / `context_smart` automatically.
+> **Tip:** For best results, add the **recommended editor rules** so your AI reliably calls `session_init` / `context_smart` when appropriate:
+> https://contextstream.io/docs/quickstart
 
 ![ContextStream in action](compare1.gif)
 
+---
+
+## Choose Your Mode (Token Footprint)
+
+MCP clients often inject the tool catalog into the model context. v0.4.x is designed to keep that overhead small.
+
+| Mode | What it exposes | Best for | Enable |
+|------|-----------------|----------|--------|
+| **Consolidated** (default) | ~11 domain tools with `action` / `mode` dispatch | Most users (recommended) | `CONTEXTSTREAM_CONSOLIDATED=true` |
+| **Router** (extreme minimization) | ~2 meta-tools (`contextstream`, `contextstream_help`) | Tight context budgets / many MCP servers | `CONTEXTSTREAM_PROGRESSIVE_MODE=true` |
+| **Legacy** (granular tools) | Older `light/standard/complete` toolsets | Back-compat / old prompts | `CONTEXTSTREAM_CONSOLIDATED=false` |
+
+> **Note:** The env var name for Router mode is `CONTEXTSTREAM_PROGRESSIVE_MODE` (historical naming). It enables the ~2-tool "router" surface.
+
+---
+
 ## Features
 
-- **Consolidated domain tools** (v0.4.x): ~11 tools with action/mode dispatch (~75% token reduction)
+- **Consolidated domain tools** (v0.4.x): short tool list with action/mode dispatch
 - Session-aware context loading (`session_init`, `context_smart`)
-- Memory capture and recall (decisions, preferences, tasks, bugs, lessons)
+- Memory capture + recall (decisions, preferences, lessons, tasks, bugs)
 - Code search (semantic, hybrid, keyword, pattern)
-- Knowledge graph and code analysis (dependencies, impact, call paths, circular deps, unused code)
+- Knowledge graph + code analysis (dependencies, impact, call paths, circular deps, unused code)
 - Graph ingestion for full graph builds (`graph(action="ingest")`)
 - Local repo ingestion for indexing (`project(action="ingest_local")`)
-- Auto-context: on the first tool call in a new session, the server can auto-initialize context
+- Auto-context: on first tool call in a new session, the server can auto-initialize context
 
-## Graph tiers
+---
 
-- **Pro (Graph-Lite):** module-level import graph, dependencies, and 1-hop impact
-- **Elite/Team (Full Graph):** module + call + dataflow + type layers, plus `graph_ingest`
+## Graph Tiers
+
+| Tier | Capabilities |
+|------|--------------|
+| **Pro (Graph-Lite)** | Module-level import graph, dependencies, and 1-hop impact |
+| **Elite/Team (Full Graph)** | Module + call + dataflow + type layers, plus full graph ingestion |
+
+---
 
 ## Requirements
 
-- Node.js 18+
-- A ContextStream account and either an API key or a JWT
+- **Node.js 18+**
+- A **ContextStream account**
+- Auth via **API key** or **JWT**
 
-## Quickstart
+Default API URL: `https://api.contextstream.io`
 
-### Setup wizard (recommended)
+---
 
-This interactive wizard sets up authentication, installs editor rules, and writes MCP config files for the tools you select.
+## Quickstart (2 minutes)
+
+### 1) Run the Setup Wizard (recommended)
+
+The wizard:
+- Authenticates (browser/device login by default)
+- Creates/stores an API key
+- Installs recommended editor rules (optional)
+- Writes MCP config files for supported tools
 
 ```bash
 npx -y @contextstream/mcp-server setup
 ```
 
-Notes:
-- Uses browser/device login by default and creates an API key for you.
-- Prompts for **toolset selection**: `consolidated` (default, ~11 domain tools) or `router` (~2 meta-tools for maximum token reduction).
-- v0.4.x uses consolidated domain tools by default for ~75% token reduction vs previous versions.
-- To avoid re-auth prompts on subsequent runs, the wizard saves that API key to `~/.contextstream/credentials.json` (and also writes it into the MCP config files it generates). Delete that file to force a fresh login.
-- Codex CLI MCP config is global-only (`~/.codex/config.toml`), so the wizard will always write Codex config globally when selected.
-- Some tools still require UI/CLI-based MCP setup (the wizard will tell you when it can't write a config).
-- Preview changes without writing files: `npx -y @contextstream/mcp-server setup --dry-run`
+**Useful flags:**
 
-### Run the server
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Preview without writing files |
 
-Run directly (recommended for MCP configs):
+**Notes:**
+- The wizard stores credentials at `~/.contextstream/credentials.json` for convenience. Delete it to force a fresh login.
+- Codex CLI MCP config is global-only (`~/.codex/config.toml`), so the wizard writes Codex config globally when selected.
+- Some tools still require UI/CLI setup (the wizard will tell you when it can't write a config).
+
+### 2) Run the MCP Server
+
+**Recommended** (works well with MCP configs):
 
 ```bash
 npx -y @contextstream/mcp-server
 ```
 
-Or install globally:
+**Or install globally:**
 
 ```bash
 npm install -g @contextstream/mcp-server
 contextstream-mcp
 ```
 
-### Keeping updated
+### 3) Keeping Updated
 
-To get the latest features and bug fixes, update periodically:
+**If you use `npx`:** Restart your AI tool/editor and run ContextStream again
+(or pin the version: `npx -y @contextstream/mcp-server@0.4.3`)
+
+**If you installed globally:**
 
 ```bash
 npm update -g @contextstream/mcp-server
 ```
 
-The MCP server will warn you when a newer version is available. After updating, restart your AI tool to use the new version.
+After updating, restart your AI tool/editor so it reloads the tool catalog.
 
-## Configure your MCP client
+---
 
-### Manual setup
+## Configure Your MCP Client (Manual)
 
-If you ran the [setup wizard](#setup-wizard-recommended), you can usually skip this section.
-
-If you prefer to configure things by hand (or your tool can't be auto-configured), add the ContextStream MCP server to your client using one of the examples below.
-
-**v0.4.x Toolsets**: By default, the server exposes **consolidated domain tools** (~11 tools with action/mode dispatch). This is the recommended mode for all users. Optionally enable **router mode** (`CONTEXTSTREAM_PROGRESSIVE_MODE=true`) for ~2 meta-tools with maximum token reduction. See the [full tool catalog](https://contextstream.io/docs/mcp/tools).
+> If you ran the setup wizard, you can usually skip this.
 
 ### Cursor / Windsurf / Claude Desktop (JSON)
 
-These clients use the `mcpServers` JSON schema:
+These clients use an `mcpServers` JSON config:
 
-- Cursor: `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project)
-- Windsurf: `~/.codeium/windsurf/mcp_config.json`
-- Claude Desktop:
-  - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-  - Windows: `%APPDATA%\\Claude\\claude_desktop_config.json`
+| Client | Config path |
+|--------|-------------|
+| **Cursor** | `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project) |
+| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` |
+| **Claude Desktop (macOS)** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| **Claude Desktop (Windows)** | `%APPDATA%\Claude\claude_desktop_config.json` |
 
-Many other MCP JSON clients also use this same `mcpServers` shape (including Claude Code project scope via `.mcp.json`).
-
-**Consolidated (default, ~11 domain tools):**
-
-```json
-{
-  "mcpServers": {
-    "contextstream": {
-      "command": "npx",
-      "args": ["-y", "@contextstream/mcp-server"],
-      "env": {
-        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
-        "CONTEXTSTREAM_API_KEY": "your_api_key"
-      }
-    }
-  }
-}
-```
-
-**Router mode (~2 meta-tools, maximum token reduction):**
+**Consolidated (default):**
 
 ```json
 {
@@ -138,30 +153,7 @@ Many other MCP JSON clients also use this same `mcpServers` shape (including Cla
       "args": ["-y", "@contextstream/mcp-server"],
       "env": {
         "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
-        "CONTEXTSTREAM_API_KEY": "your_api_key",
-        "CONTEXTSTREAM_PROGRESSIVE_MODE": "true"
-      }
-    }
-  }
-}
-```
-
-### VS Code (`.vscode/mcp.json`)
-
-VS Code uses a different schema with a top-level `servers` map:
-
-**Consolidated (default, ~11 domain tools):**
-
-```json
-{
-  "servers": {
-    "contextstream": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@contextstream/mcp-server"],
-      "env": {
-        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
-        "CONTEXTSTREAM_API_KEY": "your_api_key"
+        "CONTEXTSTREAM_API_KEY": "YOUR_API_KEY"
       }
     }
   }
@@ -172,14 +164,13 @@ VS Code uses a different schema with a top-level `servers` map:
 
 ```json
 {
-  "servers": {
+  "mcpServers": {
     "contextstream": {
-      "type": "stdio",
       "command": "npx",
       "args": ["-y", "@contextstream/mcp-server"],
       "env": {
         "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
-        "CONTEXTSTREAM_API_KEY": "your_api_key",
+        "CONTEXTSTREAM_API_KEY": "YOUR_API_KEY",
         "CONTEXTSTREAM_PROGRESSIVE_MODE": "true"
       }
     }
@@ -187,7 +178,27 @@ VS Code uses a different schema with a top-level `servers` map:
 }
 ```
 
-Strong recommendation: VS Code supports `inputs` so you don’t have to hardcode secrets in a committed file:
+### VS Code (`.vscode/mcp.json`)
+
+VS Code uses a top-level `servers` map:
+
+```json
+{
+  "servers": {
+    "contextstream": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@contextstream/mcp-server"],
+      "env": {
+        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+        "CONTEXTSTREAM_API_KEY": "YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
+
+**Strong recommendation:** Use `inputs` so you don't commit secrets:
 
 ```json
 {
@@ -215,9 +226,7 @@ Strong recommendation: VS Code supports `inputs` so you don’t have to hardcode
 
 ### Claude Code (CLI)
 
-User scope (all projects):
-
-**Consolidated (default, ~11 domain tools):**
+**User scope (all projects):**
 
 ```bash
 claude mcp add --transport stdio contextstream --scope user \
@@ -226,7 +235,7 @@ claude mcp add --transport stdio contextstream --scope user \
   -- npx -y @contextstream/mcp-server
 ```
 
-**Router mode (~2 meta-tools):**
+**Router mode:**
 
 ```bash
 claude mcp add --transport stdio contextstream --scope user \
@@ -236,28 +245,10 @@ claude mcp add --transport stdio contextstream --scope user \
   -- npx -y @contextstream/mcp-server
 ```
 
-Note: v0.4.x uses consolidated domain tools by default (~11 tools), which is well within Claude Code's context limits. Router mode reduces to ~2 meta-tools for maximum token savings.
-
-Windows caveat (native Windows, not WSL): if `npx` isn't found, use `cmd /c npx -y @contextstream/mcp-server` after `--`.
-
-**Alternative (JSON form):**
-
-Consolidated:
-```bash
-claude mcp add-json contextstream \
-'{"type":"stdio","command":"npx","args":["-y","@contextstream/mcp-server"],"env":{"CONTEXTSTREAM_API_URL":"https://api.contextstream.io","CONTEXTSTREAM_API_KEY":"your_api_key"}}'
-```
-
-Router:
-```bash
-claude mcp add-json contextstream \
-'{"type":"stdio","command":"npx","args":["-y","@contextstream/mcp-server"],"env":{"CONTEXTSTREAM_API_URL":"https://api.contextstream.io","CONTEXTSTREAM_API_KEY":"your_api_key","CONTEXTSTREAM_PROGRESSIVE_MODE":"true"}}'
-```
+> **Windows caveat** (native Windows, not WSL): if `npx` isn't found, use `cmd /c npx -y @contextstream/mcp-server` after `--`.
 
 ### Codex CLI (`~/.codex/config.toml`)
 
-**Consolidated (default, ~11 domain tools):**
-
 ```toml
 [mcp_servers.contextstream]
 command = "npx"
@@ -265,146 +256,120 @@ args = ["-y", "@contextstream/mcp-server"]
 
 [mcp_servers.contextstream.env]
 CONTEXTSTREAM_API_URL = "https://api.contextstream.io"
-CONTEXTSTREAM_API_KEY = "your_api_key"
+CONTEXTSTREAM_API_KEY = "YOUR_API_KEY"
 ```
 
-**Router mode (~2 meta-tools):**
+---
 
-```toml
-[mcp_servers.contextstream]
-command = "npx"
-args = ["-y", "@contextstream/mcp-server"]
+## Tool Overview (v0.4.x Consolidated)
 
-[mcp_servers.contextstream.env]
-CONTEXTSTREAM_API_URL = "https://api.contextstream.io"
-CONTEXTSTREAM_API_KEY = "your_api_key"
-CONTEXTSTREAM_PROGRESSIVE_MODE = "true"
-```
+In consolidated mode, you call **domain tools** with `action` / `mode`:
 
-After editing, restart your MCP client so it reloads the server configuration.
+### Core
 
-## Authentication
-
-You can authenticate using either:
-
-- `CONTEXTSTREAM_API_KEY` (recommended for local/dev)
-- `CONTEXTSTREAM_JWT` (useful for hosted or user-session flows)
-
-## Environment variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `CONTEXTSTREAM_API_URL` | Yes | Base API URL (e.g. `https://api.contextstream.io`) |
-| `CONTEXTSTREAM_API_KEY` | Yes* | API key (*required unless `CONTEXTSTREAM_JWT` is set) |
-| `CONTEXTSTREAM_JWT` | Yes* | JWT (*required unless `CONTEXTSTREAM_API_KEY` is set) |
-| `CONTEXTSTREAM_WORKSPACE_ID` | No | Default workspace ID fallback |
-| `CONTEXTSTREAM_PROJECT_ID` | No | Default project ID fallback |
-| `CONTEXTSTREAM_USER_AGENT` | No | Custom user agent string |
-| `CONTEXTSTREAM_CONSOLIDATED` | No | Enable consolidated domain tools (default: `true` in v0.4.x). Set to `false` to use individual tools. |
-| `CONTEXTSTREAM_PROGRESSIVE_MODE` | No | Enable router mode with ~2 meta-tools for maximum token reduction (default: `false`). |
-| `CONTEXTSTREAM_TOOLSET` | No | **Legacy.** Tool bundle for non-consolidated mode: `light` (~30), `standard` (~50), `complete` (~86). Ignored when `CONTEXTSTREAM_CONSOLIDATED=true`. |
-| `CONTEXTSTREAM_TOOL_ALLOWLIST` | No | Comma-separated tool names to expose (overrides toolset) |
-| `CONTEXTSTREAM_PRO_TOOLS` | No | Comma-separated tool names treated as PRO (default: `ai_context,ai_enhanced_context,ai_context_budget,ai_embeddings,ai_plan,ai_tasks`) |
-| `CONTEXTSTREAM_UPGRADE_URL` | No | Upgrade link shown when Free users call PRO tools (default: `https://contextstream.io/pricing`) |
-
-### Server-side environment variables (API)
-
-The following environment variables are configured on the ContextStream API server (not in your MCP client config):
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `QA_FILE_WRITE_ROOT` | No | Server-side root directory for `write_to_disk` file writes. When set, the API allows the `projects_ingest_local` tool to write ingested files to disk for testing/QA purposes. Files are written under `<QA_FILE_WRITE_ROOT>/<project_id>/<relative_path>`. If not set, `write_to_disk` requests are rejected. |
-
-#### File write parameters for `projects_ingest_local`
-
-The `projects_ingest_local` tool accepts two optional parameters for QA/testing scenarios:
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `write_to_disk` | boolean | `false` | When `true`, writes ingested files to disk on the API server under `QA_FILE_WRITE_ROOT` before indexing. Requires the API to have `QA_FILE_WRITE_ROOT` configured. |
-| `overwrite` | boolean | `false` | When `true` (and `write_to_disk` is enabled), allows overwriting existing files. Otherwise, existing files are skipped. |
-
-**Example usage:**
-```json
-{
-  "path": "/path/to/local/project",
-  "write_to_disk": true,
-  "overwrite": false
-}
-```
-
-**Note:** The `write_to_disk` feature is intended for testing, QA, and development scenarios where you need to materialize files on a test server. In production, `QA_FILE_WRITE_ROOT` should typically be unset to disable file writes.
-
-## v0.4.x Consolidated Domain Tools
-
-v0.4.x introduces **consolidated domain tools** - ~11 tools that wrap ~60+ capabilities using action/mode dispatch. This reduces token overhead by ~75% compared to previous versions.
+| Tool | Description |
+|------|-------------|
+| `session_init` | Initialize workspace/project context |
+| `context_smart` | Retrieve the best bounded context for the current message |
 
 ### Domain Tools
 
-| Tool | Actions/Modes | Description |
-|------|---------------|-------------|
-| `session_init` | - | Initialize session context |
-| `context_smart` | - | Get relevant context for current message |
-| `search` | semantic, hybrid, keyword, pattern | Search code and memory |
-| `session` | capture, recall, remember, get_lessons, capture_lesson, ... | Session and memory operations |
-| `memory` | create_event, list_events, create_node, list_nodes, ... | Memory CRUD operations |
-| `graph` | dependencies, impact, call_path, related, ingest, ... | Code graph analysis |
-| `project` | list, get, create, index, ingest_local, ... | Project management |
-| `workspace` | list, get, associate, bootstrap | Workspace management |
-| `reminder` | list, create, snooze, complete, dismiss | Reminder management |
-| `integration` | status, search, activity, ... (provider: slack, github) | Integration access |
-| `help` | tools, auth, version, editor_rules | Help and utilities |
+| Tool | Description |
+|------|-------------|
+| `search` | `mode=semantic\|hybrid\|keyword\|pattern` |
+| `session` | `action=capture\|recall\|remember\|get_lessons\|capture_lesson\|...` |
+| `memory` | Events + nodes CRUD, decisions, lessons, etc. |
+| `graph` | Dependencies, impact, call_path, ingest, etc. |
+| `project` | Indexing, ingest_local, stats, files, etc. |
+| `workspace` | List, get, associate, bootstrap |
+| `reminder` | List, create, snooze, complete, dismiss |
+| `integration` | `provider=slack\|github`, search, activity, etc. |
+| `help` | Tools, auth, version, editor_rules |
 
-### Action Dispatch Pattern
+### Examples
 
-Instead of calling `search_semantic(query="auth")`, call:
 ```
-search(mode="semantic", query="auth")
-```
-
-Instead of calling `session_capture(...)`, call:
-```
-session(action="capture", event_type="decision", title="...", content="...")
+search(mode="semantic", query="auth middleware")
+memory(action="create_node", node_type="decision", title="Auth strategy", content="...")
+graph(action="impact", target="UserService")
 ```
 
-Full tool reference: https://contextstream.io/docs/mcp/tools
+**Full tool catalog:** https://contextstream.io/docs/mcp/tools
 
-## Usage patterns
+---
 
-### Recommended flow for AI tools
+## Authentication
 
-1. Start of a conversation: call `session_init(folder_path="...", context_hint="<first user message>")`
-2. Before subsequent responses: call `context_smart(user_message="<current user message>")`
-3. After important outcomes: call `session_capture(...)` or `session_capture_lesson(...)`
+Set **one** of:
 
-### Omit workspace/project IDs (recommended)
+| Variable | Use case |
+|----------|----------|
+| `CONTEXTSTREAM_API_KEY` | Recommended for local/dev |
+| `CONTEXTSTREAM_JWT` | Useful for hosted/user-session flows |
 
-Most tools accept omitted `workspace_id` / `project_id` and will use the current session defaults.
+---
 
-- If you see “workspace_id is required”, call `session_init` first (or pass the ID explicitly).
-- If you regularly work in the same repo, use `workspace_associate` once so the server can auto-select the right workspace for that folder.
+## Environment Variables
 
-### First-time setup (no workspaces yet)
+### Required
 
-If your account has no workspaces, ContextStream will prompt your AI assistant to ask you for a workspace name.
+| Variable | Description |
+|----------|-------------|
+| `CONTEXTSTREAM_API_URL` | Base API URL (default `https://api.contextstream.io`) |
+| `CONTEXTSTREAM_API_KEY` | API key (unless using JWT) |
+| `CONTEXTSTREAM_JWT` | JWT (unless using API key) |
 
-- Provide a workspace name (e.g., your company/team/product)
-- The current folder is created as a project inside that workspace
-- Recommended: call `workspace_bootstrap(workspace_name="...", folder_path="...")`
+### Token + Tool Surface Controls
 
-## Free vs PRO tools
+| Variable | Description |
+|----------|-------------|
+| `CONTEXTSTREAM_CONSOLIDATED` | `true` (default in v0.4.x) uses consolidated domain tools |
+| `CONTEXTSTREAM_PROGRESSIVE_MODE` | Enables Router mode (~2 meta-tools) |
+| `CONTEXTSTREAM_TOOLSET` | Legacy granular tool bundle: `light` / `standard` / `complete` (only when consolidated is off) |
+| `CONTEXTSTREAM_TOOL_ALLOWLIST` | Comma-separated tool names to expose (legacy granular mode) |
+| `CONTEXTSTREAM_SCHEMA_MODE` | Reduce schema verbosity; e.g., `compact` |
+| `CONTEXTSTREAM_OUTPUT_FORMAT` | Output formatting; e.g., `compact` / `pretty` |
 
-Tools are labeled as `(Free)` or `(PRO)` in the MCP tool list.
+### Optional Defaults
 
-- Default PRO tools: `ai_context`, `ai_enhanced_context`, `ai_context_budget`, `ai_embeddings`, `ai_plan`, `ai_tasks`
-- If a Free-plan user calls a PRO tool, the server returns an upgrade message with a link.
-- Override the PRO list via `CONTEXTSTREAM_PRO_TOOLS` and the upgrade link via `CONTEXTSTREAM_UPGRADE_URL`.
+| Variable | Description |
+|----------|-------------|
+| `CONTEXTSTREAM_WORKSPACE_ID` | Default workspace fallback |
+| `CONTEXTSTREAM_PROJECT_ID` | Default project ID fallback |
+| `CONTEXTSTREAM_USER_AGENT` | Custom user agent string |
+| `CONTEXTSTREAM_PRO_TOOLS` | Comma-separated tool names treated as PRO |
+| `CONTEXTSTREAM_UPGRADE_URL` | Upgrade link for Free users calling PRO tools |
+
+---
+
+## Migration Notes (pre-0.4.x → 0.4.x)
+
+Most workflows **just work**, but tool names change in consolidated mode.
+
+| Before (granular) | After (consolidated) |
+|-------------------|----------------------|
+| `search_semantic(query="auth")` | `search(mode="semantic", query="auth")` |
+| `session_capture(...)` | `session(action="capture", ...)` |
+| `graph_dependencies(...)` | `graph(action="dependencies", ...)` |
+
+If you rely on granular tool names, you can temporarily set:
+
+```bash
+CONTEXTSTREAM_CONSOLIDATED=false
+```
+
+---
 
 ## Troubleshooting
 
-- Tools not appearing: restart the client after editing MCP config; confirm Node 18+ is available to the client runtime.
-- Unauthorized errors: verify `CONTEXTSTREAM_API_URL` and `CONTEXTSTREAM_API_KEY` (or `CONTEXTSTREAM_JWT`).
-- Wrong workspace/project: use `workspace_associate` to map the current repo folder to the correct workspace.
+| Issue | Solution |
+|-------|----------|
+| **Tools not appearing** | Restart the client after editing MCP config; confirm Node 18+ is available in the client runtime |
+| **Unauthorized / 401** | Verify `CONTEXTSTREAM_API_URL` + `CONTEXTSTREAM_API_KEY` (or JWT) |
+| **Wrong workspace/project** | Run `session_init` and/or associate your folder with the correct workspace |
+| **Client warns about tool context size** | Use Router mode (`CONTEXTSTREAM_PROGRESSIVE_MODE=true`), or keep consolidated mode and reduce schema/output verbosity |
+
+---
 
 ## Development
 
@@ -417,13 +382,20 @@ npm run typecheck
 npm run build
 ```
 
+---
+
 ## Links
 
-- Website: https://contextstream.io
-- Docs: https://contextstream.io/docs/mcp
-- Pricing: https://contextstream.io/pricing
-- npm: https://www.npmjs.com/package/@contextstream/mcp-server
-- GitHub: https://github.com/contextstream/mcp-server
+| Resource | URL |
+|----------|-----|
+| **Website** | https://contextstream.io |
+| **Docs** | https://contextstream.io/docs/mcp |
+| **Tool Catalog** | https://contextstream.io/docs/mcp/tools |
+| **Pricing** | https://contextstream.io/pricing |
+| **npm** | https://www.npmjs.com/package/@contextstream/mcp-server |
+| **GitHub** | https://github.com/contextstream/mcp-server |
+
+---
 
 ## License
 

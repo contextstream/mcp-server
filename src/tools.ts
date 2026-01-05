@@ -974,6 +974,34 @@ const COMPACT_OUTPUT = OUTPUT_FORMAT === 'compact';
 // END Strategy 7
 // =============================================================================
 
+// =============================================================================
+// Strategy 8: Consolidated Domain Tools (v0.4.x default)
+// =============================================================================
+// Environment variable to control consolidated mode
+// CONTEXTSTREAM_CONSOLIDATED=true | false (default: true in v0.4.x)
+// When enabled, registers ~11 domain tools instead of ~58 individual tools
+// This provides ~75% token reduction while maintaining full functionality
+const CONSOLIDATED_MODE = process.env.CONTEXTSTREAM_CONSOLIDATED !== 'false';
+
+// Consolidated tools list - these are the only tools registered in consolidated mode
+const CONSOLIDATED_TOOLS = new Set<string>([
+  'session_init',    // Standalone - complex initialization
+  'context_smart',   // Standalone - called every message
+  'search',          // Consolidates search_semantic, search_hybrid, search_keyword, search_pattern
+  'session',         // Consolidates session_capture, session_recall, etc.
+  'memory',          // Consolidates memory_create_event, memory_get_event, etc.
+  'graph',           // Consolidates graph_dependencies, graph_impact, etc.
+  'project',         // Consolidates projects_list, projects_create, etc.
+  'workspace',       // Consolidates workspaces_list, workspace_associate, etc.
+  'reminder',        // Consolidates reminders_list, reminders_create, etc.
+  'integration',     // Consolidates slack_*, github_*, integrations_*
+  'help',            // Consolidates session_tools, auth_me, mcp_server_version, etc.
+]);
+
+// =============================================================================
+// END Strategy 8
+// =============================================================================
+
 const TOOLSET_ALIASES: Record<string, Set<string> | null> = {
   // Light mode - minimal, fastest
   light: LIGHT_TOOLSET,
@@ -1264,6 +1292,14 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     console.error('[ContextStream] Output format: COMPACT (minified JSON, ~30% fewer tokens per response)');
   } else {
     console.error('[ContextStream] Output format: pretty (set CONTEXTSTREAM_OUTPUT_FORMAT=compact for fewer tokens)');
+  }
+
+  // Log consolidated mode status (Strategy 8)
+  if (CONSOLIDATED_MODE) {
+    console.error(`[ContextStream] Consolidated mode: ENABLED (~${CONSOLIDATED_TOOLS.size} domain tools, ~75% token reduction)`);
+    console.error('[ContextStream] Set CONTEXTSTREAM_CONSOLIDATED=false to use individual tools.');
+  } else {
+    console.error('[ContextStream] Consolidated mode: disabled (using individual tools)');
   }
 
   // Store server reference for deferred tool registration
@@ -1827,8 +1863,23 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     config: { title: string; description: string; inputSchema: T },
     handler: (input: z.infer<T>, extra?: MessageExtraInfo) => Promise<ToolTextResult>
   ) {
-    // Check toolset allowlist first
-    if (toolAllowlist && !toolAllowlist.has(name)) {
+    // Strategy 8: Consolidated mode - only register consolidated domain tools
+    // Skip individual tools (they're accessed via domain tool dispatch)
+    if (CONSOLIDATED_MODE && !CONSOLIDATED_TOOLS.has(name)) {
+      // Store handler for consolidated tools to dispatch to
+      operationsRegistry.set(name, {
+        name,
+        title: config.title,
+        description: config.description,
+        inputSchema: config.inputSchema,
+        handler,
+        category: inferOperationCategory(name),
+      });
+      return;
+    }
+
+    // Check toolset allowlist first (only applies in non-consolidated mode)
+    if (!CONSOLIDATED_MODE && toolAllowlist && !toolAllowlist.has(name)) {
       // In router mode, still store in registry even if not in allowlist
       // (the router can access all operations)
       if (ROUTER_MODE && !ROUTER_DIRECT_TOOLS.has(name)) {
@@ -1846,7 +1897,7 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
 
     // Option B: Skip registration for integration tools when auto-hide is enabled
     // and integrations are not connected. This reduces the tool registry size.
-    if (!shouldRegisterIntegrationTool(name)) {
+    if (!CONSOLIDATED_MODE && !shouldRegisterIntegrationTool(name)) {
       return;
     }
 
@@ -5423,4 +5474,1270 @@ Use this to remove a reminder that is no longer relevant.`,
       };
     }
   );
+
+  // =============================================================================
+  // CONSOLIDATED DOMAIN TOOLS (Strategy 8)
+  // =============================================================================
+  // These tools are only registered when CONSOLIDATED_MODE is enabled (default in v0.4.x)
+  // They consolidate ~58 individual tools into ~11 domain tools with action dispatch
+
+  if (CONSOLIDATED_MODE) {
+    // -------------------------------------------------------------------------
+    // search - Consolidates search_semantic, search_hybrid, search_keyword, search_pattern
+    // -------------------------------------------------------------------------
+    registerTool(
+      'search',
+      {
+        title: 'Search',
+        description: `Search workspace memory and knowledge. Modes: semantic (meaning-based), hybrid (semantic + keyword), keyword (exact match), pattern (regex).`,
+        inputSchema: z.object({
+          mode: z.enum(['semantic', 'hybrid', 'keyword', 'pattern']).describe('Search mode'),
+          query: z.string().describe('Search query'),
+          workspace_id: z.string().uuid().optional(),
+          project_id: z.string().uuid().optional(),
+          limit: z.number().optional(),
+        }),
+      },
+      async (input) => {
+        const params = {
+          query: input.query,
+          workspace_id: resolveWorkspaceId(input.workspace_id),
+          project_id: resolveProjectId(input.project_id),
+          limit: input.limit,
+        };
+
+        let result;
+        switch (input.mode) {
+          case 'semantic':
+            result = await client.searchSemantic(params);
+            break;
+          case 'hybrid':
+            result = await client.searchHybrid(params);
+            break;
+          case 'keyword':
+            result = await client.searchKeyword(params);
+            break;
+          case 'pattern':
+            result = await client.searchPattern(params);
+            break;
+        }
+
+        return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+      }
+    );
+
+    // -------------------------------------------------------------------------
+    // session - Consolidates session management tools
+    // -------------------------------------------------------------------------
+    registerTool(
+      'session',
+      {
+        title: 'Session',
+        description: `Session management operations. Actions: capture (save decision/insight), capture_lesson (save lesson from mistake), get_lessons (retrieve lessons), recall (natural language recall), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (context-enriched search), decision_trace (trace decision provenance).`,
+        inputSchema: z.object({
+          action: z.enum([
+            'capture', 'capture_lesson', 'get_lessons', 'recall', 'remember',
+            'user_context', 'summary', 'compress', 'delta', 'smart_search', 'decision_trace'
+          ]).describe('Action to perform'),
+          workspace_id: z.string().uuid().optional(),
+          project_id: z.string().uuid().optional(),
+          // Content params
+          query: z.string().optional().describe('Query for recall/search/lessons/decision_trace'),
+          content: z.string().optional().describe('Content for capture/remember/compress'),
+          title: z.string().optional().describe('Title for capture/capture_lesson'),
+          event_type: z.enum(['decision', 'preference', 'insight', 'task', 'bug', 'feature', 'correction', 'lesson', 'warning', 'frustration', 'conversation']).optional().describe('Event type for capture'),
+          importance: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+          tags: z.array(z.string()).optional(),
+          // Lesson-specific
+          category: z.enum(['workflow', 'code_quality', 'verification', 'communication', 'project_specific']).optional(),
+          trigger: z.string().optional().describe('What caused the problem'),
+          impact: z.string().optional().describe('What went wrong'),
+          prevention: z.string().optional().describe('How to prevent in future'),
+          severity: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+          keywords: z.array(z.string()).optional(),
+          // Other params
+          since: z.string().optional().describe('ISO timestamp for delta'),
+          limit: z.number().optional(),
+          max_tokens: z.number().optional().describe('Max tokens for summary'),
+          include_decisions: z.boolean().optional(),
+          include_related: z.boolean().optional(),
+          include_impact: z.boolean().optional(),
+          session_id: z.string().optional(),
+          code_refs: z.array(z.object({
+            file_path: z.string(),
+            symbol_id: z.string().optional(),
+            symbol_name: z.string().optional(),
+          })).optional(),
+          provenance: z.object({
+            repo: z.string().optional(),
+            branch: z.string().optional(),
+            commit_sha: z.string().optional(),
+            pr_url: z.string().url().optional(),
+            issue_url: z.string().url().optional(),
+            slack_thread_url: z.string().url().optional(),
+          }).optional(),
+        }),
+      },
+      async (input) => {
+        const workspaceId = resolveWorkspaceId(input.workspace_id);
+        const projectId = resolveProjectId(input.project_id);
+
+        switch (input.action) {
+          case 'capture': {
+            if (!input.event_type || !input.title || !input.content) {
+              return errorResult('capture requires: event_type, title, content');
+            }
+            const result = await client.captureContext({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              event_type: input.event_type,
+              title: input.title,
+              content: input.content,
+              importance: input.importance,
+              tags: input.tags,
+              session_id: input.session_id,
+              code_refs: input.code_refs,
+              provenance: input.provenance,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'capture_lesson': {
+            if (!input.title || !input.category || !input.trigger || !input.impact || !input.prevention) {
+              return errorResult('capture_lesson requires: title, category, trigger, impact, prevention');
+            }
+            const lessonInput = {
+              title: input.title,
+              category: input.category,
+              trigger: input.trigger,
+              impact: input.impact,
+              prevention: input.prevention,
+              severity: input.severity || 'medium',
+              keywords: input.keywords,
+              workspace_id: workspaceId,
+              project_id: projectId,
+            };
+            const signature = buildLessonSignature(lessonInput as any, workspaceId || 'global', projectId);
+            if (isDuplicateLessonCapture(signature)) {
+              return { content: [{ type: 'text' as const, text: formatContent({ deduplicated: true, message: 'Lesson already captured recently' }) }] };
+            }
+            const result = await client.captureLesson(lessonInput);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'get_lessons': {
+            const result = await client.getLessons({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              query: input.query,
+              category: input.category,
+              severity: input.severity,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'recall': {
+            if (!input.query) {
+              return errorResult('recall requires: query');
+            }
+            const result = await client.recallContext({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              query: input.query,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'remember': {
+            if (!input.content) {
+              return errorResult('remember requires: content');
+            }
+            const result = await client.rememberContext({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              content: input.content,
+              importance: input.importance,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'user_context': {
+            const result = await client.getUserContext({ workspace_id: workspaceId });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'summary': {
+            const result = await client.getSessionSummary({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              max_tokens: input.max_tokens,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'compress': {
+            if (!input.content) {
+              return errorResult('compress requires: content (the chat history to compress)');
+            }
+            const result = await client.compressSession({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              chat_history: input.content,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'delta': {
+            if (!input.since) {
+              return errorResult('delta requires: since (ISO timestamp)');
+            }
+            const result = await client.getSessionDelta({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              since: input.since,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'smart_search': {
+            if (!input.query) {
+              return errorResult('smart_search requires: query');
+            }
+            const result = await client.smartSearch({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              query: input.query,
+              include_decisions: input.include_decisions,
+              include_related: input.include_related,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'decision_trace': {
+            if (!input.query) {
+              return errorResult('decision_trace requires: query');
+            }
+            const result = await client.decisionTrace({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              query: input.query,
+              include_impact: input.include_impact,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          default:
+            return errorResult(`Unknown action: ${input.action}`);
+        }
+      }
+    );
+
+    // -------------------------------------------------------------------------
+    // memory - Consolidates memory event and node operations
+    // -------------------------------------------------------------------------
+    registerTool(
+      'memory',
+      {
+        title: 'Memory',
+        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event. Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary.`,
+        inputSchema: z.object({
+          action: z.enum([
+            'create_event', 'get_event', 'update_event', 'delete_event', 'list_events', 'distill_event',
+            'create_node', 'get_node', 'update_node', 'delete_node', 'list_nodes', 'supersede_node',
+            'search', 'decisions', 'timeline', 'summary'
+          ]).describe('Action to perform'),
+          workspace_id: z.string().uuid().optional(),
+          project_id: z.string().uuid().optional(),
+          // ID params
+          event_id: z.string().uuid().optional(),
+          node_id: z.string().uuid().optional(),
+          // Content params
+          title: z.string().optional(),
+          content: z.string().optional(),
+          event_type: z.string().optional(),
+          node_type: z.string().optional(),
+          metadata: z.record(z.any()).optional(),
+          // Query params
+          query: z.string().optional(),
+          category: z.string().optional(),
+          limit: z.number().optional(),
+          // Node relations
+          relations: z.array(z.object({
+            type: z.string(),
+            target_id: z.string().uuid(),
+          })).optional(),
+          new_node_id: z.string().uuid().optional().describe('For supersede: the new node ID'),
+          // Provenance
+          provenance: z.object({
+            repo: z.string().optional(),
+            branch: z.string().optional(),
+            commit_sha: z.string().optional(),
+            pr_url: z.string().url().optional(),
+            issue_url: z.string().url().optional(),
+            slack_thread_url: z.string().url().optional(),
+          }).optional(),
+          code_refs: z.array(z.object({
+            file_path: z.string(),
+            symbol_id: z.string().optional(),
+            symbol_name: z.string().optional(),
+          })).optional(),
+        }),
+      },
+      async (input) => {
+        const workspaceId = resolveWorkspaceId(input.workspace_id);
+        const projectId = resolveProjectId(input.project_id);
+
+        switch (input.action) {
+          case 'create_event': {
+            if (!input.event_type || !input.title || !input.content) {
+              return errorResult('create_event requires: event_type, title, content');
+            }
+            const result = await client.createMemoryEvent({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              event_type: input.event_type,
+              title: input.title,
+              content: input.content,
+              metadata: input.metadata,
+              provenance: input.provenance,
+              code_refs: input.code_refs,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'get_event': {
+            if (!input.event_id) {
+              return errorResult('get_event requires: event_id');
+            }
+            const result = await client.getMemoryEvent(input.event_id);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'update_event': {
+            if (!input.event_id) {
+              return errorResult('update_event requires: event_id');
+            }
+            const result = await client.updateMemoryEvent({
+              event_id: input.event_id,
+              title: input.title,
+              content: input.content,
+              metadata: input.metadata,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'delete_event': {
+            if (!input.event_id) {
+              return errorResult('delete_event requires: event_id');
+            }
+            const result = await client.deleteMemoryEvent(input.event_id);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'list_events': {
+            const result = await client.listMemoryEvents({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'distill_event': {
+            if (!input.event_id) {
+              return errorResult('distill_event requires: event_id');
+            }
+            const result = await client.distillEvent(input.event_id);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'create_node': {
+            if (!input.node_type || !input.title || !input.content) {
+              return errorResult('create_node requires: node_type, title, content');
+            }
+            const result = await client.createKnowledgeNode({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              node_type: input.node_type,
+              title: input.title,
+              content: input.content,
+              relations: input.relations,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'get_node': {
+            if (!input.node_id) {
+              return errorResult('get_node requires: node_id');
+            }
+            const result = await client.getKnowledgeNode(input.node_id);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'update_node': {
+            if (!input.node_id) {
+              return errorResult('update_node requires: node_id');
+            }
+            const result = await client.updateKnowledgeNode({
+              node_id: input.node_id,
+              title: input.title,
+              content: input.content,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'delete_node': {
+            if (!input.node_id) {
+              return errorResult('delete_node requires: node_id');
+            }
+            const result = await client.deleteKnowledgeNode(input.node_id);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'list_nodes': {
+            const result = await client.listKnowledgeNodes({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'supersede_node': {
+            if (!input.node_id || !input.new_node_id) {
+              return errorResult('supersede_node requires: node_id, new_node_id');
+            }
+            const result = await client.supersedeKnowledgeNode({
+              node_id: input.node_id,
+              new_node_id: input.new_node_id,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'search': {
+            if (!input.query) {
+              return errorResult('search requires: query');
+            }
+            const result = await client.searchMemory({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              query: input.query,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'decisions': {
+            const result = await client.memoryDecisions({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              category: input.category,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'timeline': {
+            const result = await client.memoryTimeline({
+              workspace_id: workspaceId,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'summary': {
+            const result = await client.memorySummary({
+              workspace_id: workspaceId,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          default:
+            return errorResult(`Unknown action: ${input.action}`);
+        }
+      }
+    );
+
+    // -------------------------------------------------------------------------
+    // graph - Consolidates code graph analysis tools
+    // -------------------------------------------------------------------------
+    registerTool(
+      'graph',
+      {
+        title: 'Graph',
+        description: `Code graph analysis. Actions: dependencies (module deps), impact (change impact), call_path (function call path), related (related nodes), path (path between nodes), decisions (decision history), ingest (build graph), circular_dependencies, unused_code, contradictions.`,
+        inputSchema: z.object({
+          action: z.enum([
+            'dependencies', 'impact', 'call_path', 'related', 'path',
+            'decisions', 'ingest', 'circular_dependencies', 'unused_code', 'contradictions'
+          ]).describe('Action to perform'),
+          workspace_id: z.string().uuid().optional(),
+          project_id: z.string().uuid().optional(),
+          // ID params
+          node_id: z.string().uuid().optional().describe('For related/contradictions'),
+          source_id: z.string().uuid().optional().describe('For path'),
+          target_id: z.string().uuid().optional().describe('For path'),
+          // Target specification
+          target: z.object({
+            type: z.string().describe('module|function|type|variable'),
+            id: z.string().describe('Element identifier'),
+          }).optional().describe('For dependencies/impact'),
+          source: z.object({
+            type: z.string().describe('function'),
+            id: z.string().describe('Function identifier'),
+          }).optional().describe('For call_path'),
+          // Options
+          max_depth: z.number().optional(),
+          include_transitive: z.boolean().optional(),
+          limit: z.number().optional(),
+          wait: z.boolean().optional().describe('For ingest: wait for completion'),
+        }),
+      },
+      async (input) => {
+        const workspaceId = resolveWorkspaceId(input.workspace_id);
+        const projectId = resolveProjectId(input.project_id);
+
+        // Check graph tier for gated tools
+        const gatedActions = ['related', 'path', 'decisions', 'call_path', 'circular_dependencies', 'unused_code', 'ingest', 'contradictions'];
+        if (gatedActions.includes(input.action)) {
+          const gate = await gateIfGraphTool(`graph_${input.action}`, input);
+          if (gate) return gate;
+        }
+
+        switch (input.action) {
+          case 'dependencies': {
+            if (!input.target) {
+              return errorResult('dependencies requires: target { type, id }');
+            }
+            const result = await client.graphDependencies({
+              target: input.target,
+              max_depth: input.max_depth,
+              include_transitive: input.include_transitive,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'impact': {
+            if (!input.target) {
+              return errorResult('impact requires: target { type, id }');
+            }
+            const result = await client.graphImpact({
+              target: input.target,
+              max_depth: input.max_depth,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'call_path': {
+            if (!input.source || !input.target) {
+              return errorResult('call_path requires: source { type, id }, target { type, id }');
+            }
+            const result = await client.graphCallPath({
+              source: input.source,
+              target: input.target,
+              max_depth: input.max_depth,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'related': {
+            if (!input.node_id) {
+              return errorResult('related requires: node_id');
+            }
+            const result = await client.graphRelated({
+              node_id: input.node_id,
+              workspace_id: workspaceId,
+              project_id: projectId,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'path': {
+            if (!input.source_id || !input.target_id) {
+              return errorResult('path requires: source_id, target_id');
+            }
+            const result = await client.graphPath({
+              source_id: input.source_id,
+              target_id: input.target_id,
+              workspace_id: workspaceId,
+              project_id: projectId,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'decisions': {
+            const result = await client.graphDecisions({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'ingest': {
+            if (!projectId) {
+              return errorResult('ingest requires: project_id');
+            }
+            const result = await client.graphIngest({
+              project_id: projectId,
+              wait: input.wait,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'circular_dependencies': {
+            if (!projectId) {
+              return errorResult('circular_dependencies requires: project_id');
+            }
+            const result = await client.findCircularDependencies(projectId);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'unused_code': {
+            if (!projectId) {
+              return errorResult('unused_code requires: project_id');
+            }
+            const result = await client.findUnusedCode(projectId);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'contradictions': {
+            if (!input.node_id) {
+              return errorResult('contradictions requires: node_id');
+            }
+            const result = await client.findContradictions(input.node_id);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          default:
+            return errorResult(`Unknown action: ${input.action}`);
+        }
+      }
+    );
+
+    // -------------------------------------------------------------------------
+    // project - Consolidates project management tools
+    // -------------------------------------------------------------------------
+    registerTool(
+      'project',
+      {
+        title: 'Project',
+        description: `Project management. Actions: list, get, create, update, index (trigger indexing), overview, statistics, files, index_status, ingest_local (index local folder).`,
+        inputSchema: z.object({
+          action: z.enum([
+            'list', 'get', 'create', 'update', 'index',
+            'overview', 'statistics', 'files', 'index_status', 'ingest_local'
+          ]).describe('Action to perform'),
+          workspace_id: z.string().uuid().optional(),
+          project_id: z.string().uuid().optional(),
+          // Create/update params
+          name: z.string().optional(),
+          description: z.string().optional(),
+          folder_path: z.string().optional(),
+          generate_editor_rules: z.boolean().optional(),
+          // Ingest params
+          path: z.string().optional().describe('Local path to ingest'),
+          overwrite: z.boolean().optional(),
+          write_to_disk: z.boolean().optional(),
+          // Pagination
+          page: z.number().optional(),
+          page_size: z.number().optional(),
+        }),
+      },
+      async (input) => {
+        const workspaceId = resolveWorkspaceId(input.workspace_id);
+        const projectId = resolveProjectId(input.project_id);
+
+        switch (input.action) {
+          case 'list': {
+            const result = await client.listProjects({
+              workspace_id: workspaceId,
+              page: input.page,
+              page_size: input.page_size,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'get': {
+            if (!projectId) {
+              return errorResult('get requires: project_id');
+            }
+            const result = await client.getProject(projectId);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'create': {
+            if (!input.name) {
+              return errorResult('create requires: name');
+            }
+            const result = await client.createProject({
+              workspace_id: workspaceId,
+              name: input.name,
+              description: input.description,
+              folder_path: input.folder_path,
+              generate_editor_rules: input.generate_editor_rules,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'update': {
+            if (!projectId) {
+              return errorResult('update requires: project_id');
+            }
+            const result = await client.updateProject({
+              project_id: projectId,
+              name: input.name,
+              description: input.description,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'index': {
+            if (!projectId) {
+              return errorResult('index requires: project_id');
+            }
+            const result = await client.indexProject(projectId);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'overview': {
+            if (!projectId) {
+              return errorResult('overview requires: project_id');
+            }
+            const result = await client.projectOverview(projectId);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'statistics': {
+            if (!projectId) {
+              return errorResult('statistics requires: project_id');
+            }
+            const result = await client.projectStatistics(projectId);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'files': {
+            if (!projectId) {
+              return errorResult('files requires: project_id');
+            }
+            const result = await client.projectFiles(projectId);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'index_status': {
+            if (!projectId) {
+              return errorResult('index_status requires: project_id');
+            }
+            const result = await client.projectIndexStatus(projectId);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'ingest_local': {
+            if (!input.path) {
+              return errorResult('ingest_local requires: path');
+            }
+            const validPath = await validateReadableDirectory(input.path);
+            if (!validPath.ok) {
+              return errorResult(validPath.error);
+            }
+            const files = await readAllFilesInBatches(validPath.resolvedPath, async (batch) => {
+              await client.ingestLocalFiles({
+                project_id: projectId,
+                files: batch,
+                overwrite: input.overwrite,
+                write_to_disk: input.write_to_disk,
+              });
+            });
+            const result = { files_ingested: files, project_id: projectId };
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          default:
+            return errorResult(`Unknown action: ${input.action}`);
+        }
+      }
+    );
+
+    // -------------------------------------------------------------------------
+    // workspace - Consolidates workspace management tools
+    // -------------------------------------------------------------------------
+    registerTool(
+      'workspace',
+      {
+        title: 'Workspace',
+        description: `Workspace management. Actions: list, get, associate (link folder to workspace), bootstrap (create workspace and initialize).`,
+        inputSchema: z.object({
+          action: z.enum(['list', 'get', 'associate', 'bootstrap']).describe('Action to perform'),
+          workspace_id: z.string().uuid().optional(),
+          // Associate/bootstrap params
+          folder_path: z.string().optional(),
+          workspace_name: z.string().optional(),
+          create_parent_mapping: z.boolean().optional(),
+          generate_editor_rules: z.boolean().optional(),
+          // Bootstrap-specific
+          description: z.string().optional(),
+          visibility: z.enum(['private', 'public']).optional(),
+          auto_index: z.boolean().optional(),
+          context_hint: z.string().optional(),
+          // Pagination
+          page: z.number().optional(),
+          page_size: z.number().optional(),
+        }),
+      },
+      async (input) => {
+        switch (input.action) {
+          case 'list': {
+            const result = await client.listWorkspaces({
+              page: input.page,
+              page_size: input.page_size,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'get': {
+            if (!input.workspace_id) {
+              return errorResult('get requires: workspace_id');
+            }
+            const result = await client.getWorkspace(input.workspace_id);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'associate': {
+            if (!input.folder_path || !input.workspace_id) {
+              return errorResult('associate requires: folder_path, workspace_id');
+            }
+            const result = await client.associateWorkspace({
+              folder_path: input.folder_path,
+              workspace_id: input.workspace_id,
+              workspace_name: input.workspace_name,
+              create_parent_mapping: input.create_parent_mapping,
+              generate_editor_rules: input.generate_editor_rules,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'bootstrap': {
+            if (!input.workspace_name) {
+              return errorResult('bootstrap requires: workspace_name');
+            }
+            const result = await client.bootstrapWorkspace({
+              workspace_name: input.workspace_name,
+              folder_path: input.folder_path,
+              description: input.description,
+              visibility: input.visibility,
+              create_parent_mapping: input.create_parent_mapping,
+              generate_editor_rules: input.generate_editor_rules,
+              auto_index: input.auto_index,
+              context_hint: input.context_hint,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          default:
+            return errorResult(`Unknown action: ${input.action}`);
+        }
+      }
+    );
+
+    // -------------------------------------------------------------------------
+    // reminder - Consolidates reminder management tools
+    // -------------------------------------------------------------------------
+    registerTool(
+      'reminder',
+      {
+        title: 'Reminder',
+        description: `Reminder management. Actions: list, active (pending/overdue), create, snooze, complete, dismiss.`,
+        inputSchema: z.object({
+          action: z.enum(['list', 'active', 'create', 'snooze', 'complete', 'dismiss']).describe('Action to perform'),
+          workspace_id: z.string().uuid().optional(),
+          project_id: z.string().uuid().optional(),
+          reminder_id: z.string().uuid().optional(),
+          // Create params
+          title: z.string().optional(),
+          content: z.string().optional(),
+          remind_at: z.string().optional().describe('ISO 8601 datetime'),
+          priority: z.enum(['low', 'normal', 'high', 'urgent']).optional(),
+          recurrence: z.enum(['daily', 'weekly', 'monthly']).optional(),
+          keywords: z.array(z.string()).optional(),
+          // Snooze params
+          until: z.string().optional().describe('ISO 8601 datetime'),
+          // Filter params
+          status: z.enum(['pending', 'completed', 'dismissed', 'snoozed']).optional(),
+          context: z.string().optional(),
+          limit: z.number().optional(),
+        }),
+      },
+      async (input) => {
+        const workspaceId = resolveWorkspaceId(input.workspace_id);
+        const projectId = resolveProjectId(input.project_id);
+
+        switch (input.action) {
+          case 'list': {
+            const result = await client.remindersList({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              status: input.status,
+              priority: input.priority,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'active': {
+            const result = await client.remindersActive({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              context: input.context,
+              limit: input.limit,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'create': {
+            if (!input.title || !input.content || !input.remind_at) {
+              return errorResult('create requires: title, content, remind_at');
+            }
+            const result = await client.remindersCreate({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              title: input.title,
+              content: input.content,
+              remind_at: input.remind_at,
+              priority: input.priority,
+              recurrence: input.recurrence,
+              keywords: input.keywords,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'snooze': {
+            if (!input.reminder_id || !input.until) {
+              return errorResult('snooze requires: reminder_id, until');
+            }
+            const result = await client.remindersSnooze({
+              reminder_id: input.reminder_id,
+              until: input.until,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'complete': {
+            if (!input.reminder_id) {
+              return errorResult('complete requires: reminder_id');
+            }
+            const result = await client.remindersComplete({
+              reminder_id: input.reminder_id,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'dismiss': {
+            if (!input.reminder_id) {
+              return errorResult('dismiss requires: reminder_id');
+            }
+            const result = await client.remindersDismiss({
+              reminder_id: input.reminder_id,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          default:
+            return errorResult(`Unknown action: ${input.action}`);
+        }
+      }
+    );
+
+    // -------------------------------------------------------------------------
+    // integration - Consolidates Slack/GitHub/cross-integration tools
+    // -------------------------------------------------------------------------
+    registerTool(
+      'integration',
+      {
+        title: 'Integration',
+        description: `Integration operations for Slack and GitHub. Provider: slack, github, all. Actions: status, search, stats, activity, contributors, knowledge, summary, channels (slack), discussions (slack), repos (github), issues (github).`,
+        inputSchema: z.object({
+          provider: z.enum(['slack', 'github', 'all']).describe('Integration provider'),
+          action: z.enum([
+            'status', 'search', 'stats', 'activity', 'contributors', 'knowledge', 'summary',
+            'channels', 'discussions', 'sync_users', 'repos', 'issues'
+          ]).describe('Action to perform'),
+          workspace_id: z.string().uuid().optional(),
+          project_id: z.string().uuid().optional(),
+          query: z.string().optional(),
+          limit: z.number().optional(),
+          since: z.string().optional(),
+          until: z.string().optional(),
+        }),
+      },
+      async (input) => {
+        const workspaceId = resolveWorkspaceId(input.workspace_id);
+        const projectId = resolveProjectId(input.project_id);
+
+        // Check integration gating
+        const integrationGated = await gateIfIntegrationTool(
+          input.provider === 'slack' ? 'slack_search' :
+          input.provider === 'github' ? 'github_search' :
+          'integrations_status'
+        );
+        if (integrationGated) return integrationGated;
+
+        const params = {
+          workspace_id: workspaceId,
+          project_id: projectId,
+          query: input.query,
+          limit: input.limit,
+          since: input.since,
+          until: input.until,
+        };
+
+        switch (input.action) {
+          case 'status': {
+            const result = await client.integrationsStatus(params);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'search': {
+            if (input.provider === 'slack') {
+              const result = await client.slackSearch(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            } else if (input.provider === 'github') {
+              const result = await client.githubSearch(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            } else {
+              const result = await client.integrationsSearch(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            }
+          }
+
+          case 'stats': {
+            if (input.provider === 'slack') {
+              const result = await client.slackStats(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            } else if (input.provider === 'github') {
+              const result = await client.githubStats(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            }
+            return errorResult('stats requires provider: slack or github');
+          }
+
+          case 'activity': {
+            if (input.provider === 'slack') {
+              const result = await client.slackActivity(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            } else if (input.provider === 'github') {
+              const result = await client.githubActivity(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            }
+            return errorResult('activity requires provider: slack or github');
+          }
+
+          case 'contributors': {
+            if (input.provider === 'slack') {
+              const result = await client.slackContributors(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            } else if (input.provider === 'github') {
+              const result = await client.githubContributors(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            }
+            return errorResult('contributors requires provider: slack or github');
+          }
+
+          case 'knowledge': {
+            if (input.provider === 'slack') {
+              const result = await client.slackKnowledge(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            } else if (input.provider === 'github') {
+              const result = await client.githubKnowledge(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            } else {
+              const result = await client.integrationsKnowledge(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            }
+          }
+
+          case 'summary': {
+            if (input.provider === 'slack') {
+              const result = await client.slackSummary(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            } else if (input.provider === 'github') {
+              const result = await client.githubSummary(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            } else {
+              const result = await client.integrationsSummary(params);
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            }
+          }
+
+          case 'channels': {
+            if (input.provider !== 'slack') {
+              return errorResult('channels is only available for slack provider');
+            }
+            const result = await client.slackChannels(params);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'discussions': {
+            if (input.provider !== 'slack') {
+              return errorResult('discussions is only available for slack provider');
+            }
+            const result = await client.slackDiscussions(params);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'sync_users': {
+            if (input.provider !== 'slack') {
+              return errorResult('sync_users is only available for slack provider');
+            }
+            const result = await client.slackSyncUsers(params);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'repos': {
+            if (input.provider !== 'github') {
+              return errorResult('repos is only available for github provider');
+            }
+            const result = await client.githubRepos(params);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'issues': {
+            if (input.provider !== 'github') {
+              return errorResult('issues is only available for github provider');
+            }
+            const result = await client.githubIssues(params);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          default:
+            return errorResult(`Unknown action: ${input.action}`);
+        }
+      }
+    );
+
+    // -------------------------------------------------------------------------
+    // help - Consolidates utility and help tools
+    // -------------------------------------------------------------------------
+    registerTool(
+      'help',
+      {
+        title: 'Help',
+        description: `Utility and help. Actions: tools (list available tools), auth (current user), version (server version), editor_rules (generate AI editor rules), enable_bundle (enable tool bundle in progressive mode).`,
+        inputSchema: z.object({
+          action: z.enum(['tools', 'auth', 'version', 'editor_rules', 'enable_bundle']).describe('Action to perform'),
+          // For tools
+          format: z.enum(['grouped', 'minimal', 'full']).optional(),
+          category: z.string().optional(),
+          // For editor_rules
+          folder_path: z.string().optional(),
+          editors: z.array(z.string()).optional(),
+          mode: z.enum(['minimal', 'full']).optional(),
+          dry_run: z.boolean().optional(),
+          workspace_id: z.string().uuid().optional(),
+          workspace_name: z.string().optional(),
+          project_name: z.string().optional(),
+          additional_rules: z.string().optional(),
+          // For enable_bundle
+          bundle: z.enum(['session', 'memory', 'search', 'graph', 'workspace', 'project', 'reminders', 'integrations']).optional(),
+          list_bundles: z.boolean().optional(),
+        }),
+      },
+      async (input) => {
+        switch (input.action) {
+          case 'tools': {
+            const format = (input.format || 'grouped') as CatalogFormat;
+            const catalog = generateToolCatalog(format, input.category);
+
+            // In consolidated mode, also show domain tools info
+            const consolidatedInfo = CONSOLIDATED_MODE
+              ? `\n\n[Consolidated Mode]\nDomain tools: ${Array.from(CONSOLIDATED_TOOLS).join(', ')}\nEach domain tool has an 'action' parameter for specific operations.`
+              : '';
+
+            return {
+              content: [{ type: 'text' as const, text: catalog + consolidatedInfo }],
+              structuredContent: {
+                format,
+                catalog,
+                consolidated_mode: CONSOLIDATED_MODE,
+                domain_tools: CONSOLIDATED_MODE ? Array.from(CONSOLIDATED_TOOLS) : undefined,
+              },
+            };
+          }
+
+          case 'auth': {
+            const result = await client.me();
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'version': {
+            const result = { name: 'contextstream-mcp', version: VERSION };
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'editor_rules': {
+            if (!input.folder_path) {
+              return errorResult('editor_rules requires: folder_path');
+            }
+            const result = await generateAllRuleFiles(input.folder_path, {
+              editors: input.editors as any,
+              mode: input.mode,
+              dryRun: input.dry_run,
+              workspaceId: input.workspace_id,
+              workspaceName: input.workspace_name,
+              projectName: input.project_name,
+              additionalRules: input.additional_rules,
+            });
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          case 'enable_bundle': {
+            if (input.list_bundles) {
+              const bundles = getBundleInfo();
+              const result = {
+                progressive_mode: PROGRESSIVE_MODE,
+                consolidated_mode: CONSOLIDATED_MODE,
+                bundles,
+                hint: CONSOLIDATED_MODE
+                  ? 'Consolidated mode is enabled. All operations are available via domain tools.'
+                  : PROGRESSIVE_MODE
+                    ? 'Progressive mode is enabled. Use enable_bundle to unlock additional tools.'
+                    : 'Neither progressive nor consolidated mode is enabled.',
+              };
+              return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+            }
+
+            if (!input.bundle) {
+              return errorResult('enable_bundle requires: bundle (or use list_bundles: true)');
+            }
+
+            if (CONSOLIDATED_MODE) {
+              return {
+                content: [{ type: 'text' as const, text: 'Consolidated mode is enabled. All operations are available via domain tools (search, session, memory, graph, project, workspace, reminder, integration, help).' }],
+              };
+            }
+
+            if (!PROGRESSIVE_MODE) {
+              return {
+                content: [{ type: 'text' as const, text: 'Progressive mode is not enabled. All tools from your toolset are already available.' }],
+              };
+            }
+
+            const result = enableBundle(input.bundle);
+            return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
+          }
+
+          default:
+            return errorResult(`Unknown action: ${input.action}`);
+        }
+      }
+    );
+
+    console.error(`[ContextStream] Consolidated mode: Registered ${CONSOLIDATED_TOOLS.size} domain tools.`);
+  }
+
+  // =============================================================================
+  // END CONSOLIDATED DOMAIN TOOLS
+  // =============================================================================
 }

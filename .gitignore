@@ -25,3 +25,5 @@ Thumbs.db
 
 # Test coverage
 coverage/
+.mcp.json
+.cursor/mcp.json

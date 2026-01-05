@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { loadConfig } from './config.js';
 import { ContextStreamClient } from './client.js';
-import { registerTools } from './tools.js';
+import { registerTools, setupClientDetection } from './tools.js';
 import { registerResources } from './resources.js';
 import { registerPrompts } from './prompts.js';
 import { SessionManager } from './session-manager.js';
@@ -78,6 +78,8 @@ Environment variables:
   CONTEXTSTREAM_PROJECT_ID    Optional default project ID
   CONTEXTSTREAM_TOOLSET       Tool mode: light|standard|complete (default: standard)
   CONTEXTSTREAM_TOOL_ALLOWLIST Optional comma-separated tool names to expose (overrides toolset)
+  CONTEXTSTREAM_AUTO_TOOLSET  Auto-detect client and adjust toolset (default: false)
+  CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS  Auto-hide Slack/GitHub tools when not connected (default: true)
   CONTEXTSTREAM_PRO_TOOLS     Optional comma-separated PRO tool names (default: AI tools)
   CONTEXTSTREAM_UPGRADE_URL   Optional upgrade URL shown for PRO tools on Free plan
   CONTEXTSTREAM_ENABLE_PROMPTS Enable MCP prompts list (default: true)
@@ -138,6 +140,10 @@ async function main() {
     name: 'contextstream-mcp',
     version: VERSION,
   });
+
+  // Set up client detection callback (Strategy 3 - Option B Primary)
+  // This will detect token-sensitive clients (Claude Code, Claude Desktop) on MCP initialize
+  setupClientDetection(server);
 
   // Create session manager for auto-context feature
   // This enables automatic context loading on the FIRST tool call of any session

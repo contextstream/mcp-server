@@ -785,14 +785,15 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     // Toolset selection
     console.log('\nMCP toolset (which tools to expose to the AI):');
-    console.log('  1) Light — core session, project, and basic memory/graph tools (~30 tools)');
-    console.log('     Best for: faster responses, simpler workflows, resource-constrained environments');
-    console.log('  2) Standard (recommended) — adds workspace, memory CRUD, graph analysis, search (~50 tools)');
+    console.log('  1) Light — core session, project, and basic memory/graph tools (~31 tools)');
+    console.log('     Best for: Claude Code, faster responses, token-constrained environments');
+    console.log('  2) Standard (recommended) — adds workspace, memory CRUD, graph analysis, search (~58 tools)');
     console.log('     Best for: most users, full development workflow with memory + code analysis');
     console.log('  3) Complete — all tools including full graph + AI, GitHub, Slack integrations (~86 tools)');
     console.log('     Best for: Elite users or power users needing full graph + integrations');
     console.log('');
-    console.log('  Tip: Elite users should choose Complete to unlock full graph tools (call path, path, circular, unused).');
+    console.log('  Note: Slack/GitHub tools are auto-hidden until you connect those integrations.');
+    console.log('  Tip: Elite users should choose Complete to unlock full graph tools.');
     console.log('  Tip: Change later by setting CONTEXTSTREAM_TOOLSET=light|standard|complete');
     const toolsetDefault = detectedGraphTier === 'full' ? '3' : '2';
     const toolsetChoice = normalizeInput(await rl.question(`Choose [1/2/3] (default ${toolsetDefault}): `)) || toolsetDefault;
@@ -1176,8 +1177,9 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       const skipped = writeActions.filter((a) => a.status === 'skipped').length;
       const dry = writeActions.filter((a) => a.status === 'dry-run').length;
       console.log(`Summary: ${created} created, ${updated} updated, ${appended} appended, ${skipped} skipped, ${dry} dry-run.`);
-      const toolsetDesc = toolset === 'light' ? '~30 tools' : toolset === 'complete' ? '~86 tools' : '~50 tools';
+      const toolsetDesc = toolset === 'light' ? '~31 tools' : toolset === 'complete' ? '~86 tools' : '~58 tools';
       console.log(`Toolset: ${toolset} (${toolsetDesc})`);
+      console.log(`Auto-hide: Slack/GitHub tools hidden until integrations connected.`);
     }
 
     console.log('\nNext steps:');

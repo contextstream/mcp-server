@@ -288,7 +288,7 @@ const CONTEXTSTREAM_RULES_MINIMAL = `
 
 ### Tool Catalog
 
-By default, the MCP server exposes the **standard** toolset (~50 tools). To expose fewer tools, set \`CONTEXTSTREAM_TOOLSET=light\`. To expose everything (~86 tools), set \`CONTEXTSTREAM_TOOLSET=complete\` in your MCP config:
+By default, the MCP server exposes the **standard** toolset (~58 tools). To expose fewer tools, set \`CONTEXTSTREAM_TOOLSET=light\`. To expose everything (~86 tools), set \`CONTEXTSTREAM_TOOLSET=complete\` in your MCP config:
 
 \`\`\`json
 {

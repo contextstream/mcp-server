@@ -333,12 +333,13 @@ const LIGHT_TOOLSET = new Set<string>([
   'mcp_server_version',
 ]);
 
-// Standard toolset: Balanced set for most users (default) - ~53 tools
+// Standard toolset: Balanced set for most users (default) - ~58 tools
 const STANDARD_TOOLSET = new Set<string>([
-  // Core session tools (13)
+  // Core session tools (14)
   'session_init',
   'session_tools',
   'context_smart',
+  'context_feedback',
   'session_summary',
   'session_capture',
   'session_capture_lesson',
@@ -379,9 +380,15 @@ const STANDARD_TOOLSET = new Set<string>([
   'memory_delete_event',
   'memory_timeline',
   'memory_summary',
-  // Memory nodes (2)
+  // Memory nodes (6) - full CRUD for memory hygiene
   'memory_create_node',
   'memory_list_nodes',
+  'memory_get_node',
+  'memory_update_node',
+  'memory_delete_node',
+  'memory_supersede_node',
+  // Memory distillation (1)
+  'memory_distill_event',
   // Knowledge graph analysis (8)
   'graph_related',
   'graph_decisions',
@@ -411,6 +418,119 @@ const STANDARD_TOOLSET = new Set<string>([
 // Complete toolset: All tools (resolved as null allowlist)
 // Includes: workspaces, projects, memory, knowledge graph, AI, integrations
 
+// Integration tools - only exposed when integrations are connected
+// This set is used for:
+// 1. Auto-hiding when integrations are not connected (Option B - dynamic)
+// 2. Lazy evaluation fallback with helpful error messages (Option A)
+const SLACK_TOOLS = new Set<string>([
+  'slack_stats',
+  'slack_channels',
+  'slack_search',
+  'slack_discussions',
+  'slack_activity',
+  'slack_contributors',
+  'slack_knowledge',
+  'slack_summary',
+  'slack_sync_users',
+]);
+
+const GITHUB_TOOLS = new Set<string>([
+  'github_stats',
+  'github_repos',
+  'github_search',
+  'github_issues',
+  'github_activity',
+  'github_contributors',
+  'github_knowledge',
+  'github_summary',
+]);
+
+const CROSS_INTEGRATION_TOOLS = new Set<string>([
+  'integrations_status',
+  'integrations_search',
+  'integrations_summary',
+  'integrations_knowledge',
+]);
+
+// All integration tools combined
+const ALL_INTEGRATION_TOOLS = new Set<string>([
+  ...SLACK_TOOLS,
+  ...GITHUB_TOOLS,
+  ...CROSS_INTEGRATION_TOOLS,
+]);
+
+// Environment variable to control integration tool auto-hiding
+// CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS=true (default) | false
+const AUTO_HIDE_INTEGRATIONS = process.env.CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS !== 'false';
+
+// ============================================
+// CLIENT DETECTION (Strategy 3)
+// ============================================
+
+// Token-sensitive clients that benefit from smaller tool registries
+const TOKEN_SENSITIVE_CLIENTS = new Set([
+  'claude',
+  'claude-code',
+  'claude code',
+  'claude desktop',
+  'anthropic',
+]);
+
+// Environment variable to control auto-toolset behavior
+// CONTEXTSTREAM_AUTO_TOOLSET=true | false (default: false - disabled until strategies 4-7 implemented)
+const AUTO_TOOLSET_ENABLED = process.env.CONTEXTSTREAM_AUTO_TOOLSET === 'true';
+
+/**
+ * Detect if we're running inside Claude Code using environment variables (Option A - Fallback).
+ * Claude Code sets CLAUDECODE=1 and CLAUDE_CODE_ENTRYPOINT when spawning MCP servers.
+ */
+function detectClaudeCodeFromEnv(): boolean {
+  return (
+    process.env.CLAUDECODE === '1' ||
+    process.env.CLAUDE_CODE_ENTRYPOINT !== undefined ||
+    process.env.CLAUDE_CODE === '1'
+  );
+}
+
+/**
+ * Check if a client name indicates a token-sensitive client.
+ */
+function isTokenSensitiveClient(clientName: string | undefined): boolean {
+  if (!clientName) return false;
+  const normalized = clientName.toLowerCase().trim();
+  for (const pattern of TOKEN_SENSITIVE_CLIENTS) {
+    if (normalized.includes(pattern)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Get the recommended toolset for a detected client.
+ * Returns null if no recommendation (use user's explicit setting or default).
+ */
+function getRecommendedToolset(clientName: string | undefined, fromEnv: boolean): Set<string> | null {
+  // If auto-toolset is disabled, don't make recommendations
+  if (!AUTO_TOOLSET_ENABLED) return null;
+
+  // Check if it's a token-sensitive client
+  if (isTokenSensitiveClient(clientName) || fromEnv) {
+    // Recommend light toolset for Claude Code / Claude Desktop
+    return LIGHT_TOOLSET;
+  }
+
+  return null;
+}
+
+// Track detected client info (updated when MCP initialize is received)
+let detectedClientInfo: { name?: string; version?: string } | null = null;
+let clientDetectedFromEnv = false;
+
+// ============================================
+// END CLIENT DETECTION
+// ============================================
+
 const TOOLSET_ALIASES: Record<string, Set<string> | null> = {
   // Light mode - minimal, fastest
   light: LIGHT_TOOLSET,
@@ -423,6 +543,8 @@ const TOOLSET_ALIASES: Record<string, Set<string> | null> = {
   complete: null,
   full: null,
   all: null,
+  // Auto mode - handled separately in resolveToolFilter, but listed here for reference
+  // auto: STANDARD_TOOLSET (will be adjusted based on client detection)
 };
 
 function parseToolList(raw: string): Set<string> {
@@ -434,21 +556,46 @@ function parseToolList(raw: string): Set<string> {
   );
 }
 
-function resolveToolFilter(): { allowlist: Set<string> | null; source: string } {
+function resolveToolFilter(): { allowlist: Set<string> | null; source: string; autoDetected: boolean } {
   const allowlistRaw = process.env.CONTEXTSTREAM_TOOL_ALLOWLIST;
   if (allowlistRaw) {
     const allowlist = parseToolList(allowlistRaw);
     if (allowlist.size === 0) {
       console.error('[ContextStream] CONTEXTSTREAM_TOOL_ALLOWLIST is empty; using standard toolset.');
-      return { allowlist: STANDARD_TOOLSET, source: 'standard' };
+      return { allowlist: STANDARD_TOOLSET, source: 'standard', autoDetected: false };
     }
-    return { allowlist, source: 'allowlist' };
+    return { allowlist, source: 'allowlist', autoDetected: false };
   }
 
   const toolsetRaw = process.env.CONTEXTSTREAM_TOOLSET;
+
+  // If no explicit toolset is set, check for client detection (Strategy 3 - Option A Fallback)
   if (!toolsetRaw) {
+    // Check environment for Claude Code indicators
+    clientDetectedFromEnv = detectClaudeCodeFromEnv();
+
+    if (clientDetectedFromEnv && AUTO_TOOLSET_ENABLED) {
+      const recommended = getRecommendedToolset(undefined, true);
+      if (recommended) {
+        console.error('[ContextStream] Detected Claude Code via environment. Using light toolset for optimal token usage.');
+        return { allowlist: recommended, source: 'auto-claude', autoDetected: true };
+      }
+    }
+
     // Default to standard toolset
-    return { allowlist: STANDARD_TOOLSET, source: 'standard' };
+    return { allowlist: STANDARD_TOOLSET, source: 'standard', autoDetected: false };
+  }
+
+  // Handle 'auto' toolset explicitly
+  if (toolsetRaw.trim().toLowerCase() === 'auto') {
+    clientDetectedFromEnv = detectClaudeCodeFromEnv();
+    if (clientDetectedFromEnv) {
+      console.error('[ContextStream] TOOLSET=auto: Detected Claude Code, using light toolset.');
+      return { allowlist: LIGHT_TOOLSET, source: 'auto-claude', autoDetected: true };
+    }
+    // Will be updated when clientInfo is received (Option B)
+    console.error('[ContextStream] TOOLSET=auto: Will adjust toolset based on MCP client (currently standard).');
+    return { allowlist: STANDARD_TOOLSET, source: 'auto-pending', autoDetected: true };
   }
 
   const key = toolsetRaw.trim().toLowerCase();
@@ -456,13 +603,13 @@ function resolveToolFilter(): { allowlist: Set<string> | null; source: string } 
     const resolved = TOOLSET_ALIASES[key];
     // null means complete/full toolset
     if (resolved === null) {
-      return { allowlist: null, source: 'complete' };
+      return { allowlist: null, source: 'complete', autoDetected: false };
     }
-    return { allowlist: resolved, source: key };
+    return { allowlist: resolved, source: key, autoDetected: false };
   }
 
   console.error(`[ContextStream] Unknown CONTEXTSTREAM_TOOLSET "${toolsetRaw}". Using standard toolset.`);
-  return { allowlist: STANDARD_TOOLSET, source: 'standard' };
+  return { allowlist: STANDARD_TOOLSET, source: 'standard', autoDetected: false };
 }
 
 function formatContent(data: unknown) {
@@ -549,20 +696,102 @@ function isDuplicateLessonCapture(signature: string) {
   return false;
 }
 
+/**
+ * Set up the MCP oninitialized callback to detect client info (Strategy 3 - Option B Primary).
+ * This should be called after createing the McpServer but before connecting.
+ *
+ * When the MCP client sends clientInfo during initialization, we check if it's a
+ * token-sensitive client and emit tools/list_changed if we should reduce the toolset.
+ */
+export function setupClientDetection(server: McpServer): void {
+  // Skip if auto-toolset is disabled
+  if (!AUTO_TOOLSET_ENABLED) {
+    console.error('[ContextStream] Auto-toolset: DISABLED (set CONTEXTSTREAM_AUTO_TOOLSET=true to enable)');
+    return;
+  }
+
+  // If we already detected from environment, no need for dynamic detection
+  if (clientDetectedFromEnv) {
+    console.error('[ContextStream] Client detection: Already detected Claude Code from environment');
+    return;
+  }
+
+  // Set up the oninitialized callback on the low-level server
+  const lowLevelServer = (server as any).server;
+  if (!lowLevelServer) {
+    console.error('[ContextStream] Warning: Could not access low-level MCP server for client detection');
+    return;
+  }
+
+  lowLevelServer.oninitialized = () => {
+    try {
+      // Get clientInfo from the server
+      const clientVersion = lowLevelServer.getClientVersion?.();
+      if (clientVersion) {
+        detectedClientInfo = clientVersion;
+        const clientName = clientVersion.name || 'unknown';
+        const clientVer = clientVersion.version || 'unknown';
+        console.error(`[ContextStream] MCP Client detected: ${clientName} v${clientVer}`);
+
+        // Check if we should switch to a lighter toolset
+        if (isTokenSensitiveClient(clientName)) {
+          console.error('[ContextStream] Token-sensitive client detected. Consider using CONTEXTSTREAM_TOOLSET=light for optimal performance.');
+
+          // Emit tools/list_changed notification if the client supports it
+          // Note: This won't actually change the tools (they're already registered),
+          // but it signals to clients that support dynamic updates
+          try {
+            lowLevelServer.sendToolsListChanged?.();
+            console.error('[ContextStream] Emitted tools/list_changed notification');
+          } catch (error) {
+            // Client might not support this notification
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[ContextStream] Error in client detection callback:', error);
+    }
+  };
+
+  console.error('[ContextStream] Client detection: Callback registered for MCP initialize');
+}
+
 export function registerTools(server: McpServer, client: ContextStreamClient, sessionManager?: SessionManager) {
   const upgradeUrl = process.env.CONTEXTSTREAM_UPGRADE_URL || 'https://contextstream.io/pricing';
   const toolFilter = resolveToolFilter();
   const toolAllowlist = toolFilter.allowlist;
+
+  // Log toolset selection with auto-detection info
   if (toolAllowlist) {
     const source = toolFilter.source;
-    const hint = source === 'light'
+    const autoNote = toolFilter.autoDetected ? ' (auto-detected)' : '';
+    const hint = source === 'light' || source === 'auto-claude'
       ? ' Set CONTEXTSTREAM_TOOLSET=standard or complete for more tools.'
       : source === 'standard'
         ? ' Set CONTEXTSTREAM_TOOLSET=complete for all tools.'
-        : '';
-    console.error(`[ContextStream] Toolset: ${source} (${toolAllowlist.size} tools).${hint}`);
+        : source === 'auto-pending'
+          ? ' Toolset may be adjusted when MCP client is detected.'
+          : '';
+    console.error(`[ContextStream] Toolset: ${source} (${toolAllowlist.size} tools)${autoNote}.${hint}`);
   } else {
     console.error(`[ContextStream] Toolset: complete (all tools).`);
+  }
+
+  // Log auto-toolset status (Strategy 3)
+  if (AUTO_TOOLSET_ENABLED) {
+    if (clientDetectedFromEnv) {
+      console.error('[ContextStream] Auto-toolset: ACTIVE (Claude Code detected from environment)');
+    } else {
+      console.error('[ContextStream] Auto-toolset: ENABLED (will detect MCP client on initialize)');
+    }
+  }
+
+  // Log integration auto-hide status (Strategy 2)
+  if (AUTO_HIDE_INTEGRATIONS) {
+    console.error(`[ContextStream] Integration auto-hide: ENABLED (${ALL_INTEGRATION_TOOLS.size} tools hidden until integrations connected)`);
+    console.error('[ContextStream] Set CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS=false to disable.');
+  } else {
+    console.error('[ContextStream] Integration auto-hide: disabled');
   }
   const defaultProTools = new Set<string>([
     // AI endpoints (typically paid/credit-metered)
@@ -656,6 +885,205 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
       ].join('\n')
     );
   }
+
+  // ============================================
+  // INTEGRATION STATUS TRACKING (Strategy 2)
+  // ============================================
+
+  // Track integration status - updated when session_init or integrations_status is called
+  let integrationStatus: {
+    checked: boolean;
+    slack: boolean;
+    github: boolean;
+    workspaceId?: string;
+  } = { checked: false, slack: false, github: false };
+
+  // Track if we've already notified about tools list change
+  let toolsListChangedNotified = false;
+
+  /**
+   * Check integration status for the current workspace.
+   * Caches result per workspace to avoid repeated API calls.
+   */
+  async function checkIntegrationStatus(workspaceId?: string): Promise<{ slack: boolean; github: boolean }> {
+    // If we already checked for this workspace, return cached result
+    if (integrationStatus.checked && integrationStatus.workspaceId === workspaceId) {
+      return { slack: integrationStatus.slack, github: integrationStatus.github };
+    }
+
+    // If no workspace, assume no integrations
+    if (!workspaceId) {
+      return { slack: false, github: false };
+    }
+
+    try {
+      const status = await client.integrationsStatus({ workspace_id: workspaceId });
+      const slackConnected = status?.some((s: { provider: string; status: string }) =>
+        s.provider === 'slack' && s.status === 'connected'
+      ) ?? false;
+      const githubConnected = status?.some((s: { provider: string; status: string }) =>
+        s.provider === 'github' && s.status === 'connected'
+      ) ?? false;
+
+      integrationStatus = {
+        checked: true,
+        slack: slackConnected,
+        github: githubConnected,
+        workspaceId,
+      };
+
+      console.error(`[ContextStream] Integration status: Slack=${slackConnected}, GitHub=${githubConnected}`);
+
+      return { slack: slackConnected, github: githubConnected };
+    } catch (error) {
+      console.error('[ContextStream] Failed to check integration status:', error);
+      // On error, assume no integrations
+      return { slack: false, github: false };
+    }
+  }
+
+  /**
+   * Update integration status (called from session_init or integrations_status tools).
+   * If integrations are newly detected, emit tools/list_changed notification.
+   */
+  function updateIntegrationStatus(status: { slack: boolean; github: boolean }, workspaceId?: string) {
+    const hadSlack = integrationStatus.slack;
+    const hadGithub = integrationStatus.github;
+
+    integrationStatus = {
+      checked: true,
+      slack: status.slack,
+      github: status.github,
+      workspaceId,
+    };
+
+    // If integrations were newly detected and we're auto-hiding, notify about tool list change
+    if (AUTO_HIDE_INTEGRATIONS && !toolsListChangedNotified) {
+      const newlyConnected = (!hadSlack && status.slack) || (!hadGithub && status.github);
+      if (newlyConnected) {
+        try {
+          // Emit notification that tools list has changed
+          // This allows clients that support dynamic tool updates to refresh
+          (server as any).server?.sendToolsListChanged?.();
+          toolsListChangedNotified = true;
+          console.error('[ContextStream] Emitted tools/list_changed notification (integrations detected)');
+        } catch (error) {
+          console.error('[ContextStream] Failed to emit tools/list_changed:', error);
+        }
+      }
+    }
+  }
+
+  /**
+   * Gate function for integration tools (Option A - Lazy Evaluation).
+   * Returns an error result if the required integration is not connected.
+   */
+  async function gateIfIntegrationTool(toolName: string): Promise<ToolTextResult | null> {
+    // Skip gating if auto-hide is disabled
+    if (!AUTO_HIDE_INTEGRATIONS) return null;
+
+    // Determine which integration this tool requires
+    const requiresSlack = SLACK_TOOLS.has(toolName);
+    const requiresGithub = GITHUB_TOOLS.has(toolName);
+    const requiresCrossIntegration = CROSS_INTEGRATION_TOOLS.has(toolName);
+
+    // Not an integration tool
+    if (!requiresSlack && !requiresGithub && !requiresCrossIntegration) {
+      return null;
+    }
+
+    // Get workspace ID from session context
+    const workspaceId = sessionManager?.getContext()?.workspace_id as string | undefined;
+
+    // Check integration status
+    const status = await checkIntegrationStatus(workspaceId);
+
+    // Gate Slack tools
+    if (requiresSlack && !status.slack) {
+      return errorResult(
+        [
+          `Integration not connected: \`${toolName}\` requires Slack integration.`,
+          '',
+          'To use Slack tools:',
+          '1. Go to https://contextstream.io/settings/integrations',
+          '2. Connect your Slack workspace',
+          '3. Try this command again',
+          '',
+          'Note: Even without explicit Slack tools, context_smart and session_smart_search',
+          'will automatically include relevant Slack context when the integration is connected.',
+        ].join('\n')
+      );
+    }
+
+    // Gate GitHub tools
+    if (requiresGithub && !status.github) {
+      return errorResult(
+        [
+          `Integration not connected: \`${toolName}\` requires GitHub integration.`,
+          '',
+          'To use GitHub tools:',
+          '1. Go to https://contextstream.io/settings/integrations',
+          '2. Connect your GitHub repositories',
+          '3. Try this command again',
+          '',
+          'Note: Even without explicit GitHub tools, context_smart and session_smart_search',
+          'will automatically include relevant GitHub context when the integration is connected.',
+        ].join('\n')
+      );
+    }
+
+    // Gate cross-integration tools (require at least one integration)
+    if (requiresCrossIntegration && !status.slack && !status.github) {
+      return errorResult(
+        [
+          `Integration not connected: \`${toolName}\` requires at least one integration (Slack or GitHub).`,
+          '',
+          'To use cross-integration tools:',
+          '1. Go to https://contextstream.io/settings/integrations',
+          '2. Connect Slack and/or GitHub',
+          '3. Try this command again',
+        ].join('\n')
+      );
+    }
+
+    return null;
+  }
+
+  /**
+   * Determine if an integration tool should be registered at startup.
+   * When AUTO_HIDE_INTEGRATIONS is true, integration tools are hidden by default
+   * and only shown after integration status is confirmed.
+   */
+  function shouldRegisterIntegrationTool(toolName: string): boolean {
+    if (!AUTO_HIDE_INTEGRATIONS) return true;
+
+    // If we haven't checked integrations yet, don't register integration tools
+    // They'll be gated by lazy evaluation if called anyway
+    if (!integrationStatus.checked) {
+      return !ALL_INTEGRATION_TOOLS.has(toolName);
+    }
+
+    // Register Slack tools only if Slack is connected
+    if (SLACK_TOOLS.has(toolName)) {
+      return integrationStatus.slack;
+    }
+
+    // Register GitHub tools only if GitHub is connected
+    if (GITHUB_TOOLS.has(toolName)) {
+      return integrationStatus.github;
+    }
+
+    // Register cross-integration tools if at least one integration is connected
+    if (CROSS_INTEGRATION_TOOLS.has(toolName)) {
+      return integrationStatus.slack || integrationStatus.github;
+    }
+
+    return true;
+  }
+
+  // ============================================
+  // END INTEGRATION STATUS TRACKING
+  // ============================================
 
   async function gateIfGraphTool(toolName: string, input?: any): Promise<ToolTextResult | null> {
     const requiredTier = graphToolTiers.get(toolName);
@@ -789,15 +1217,27 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
   /**
    * Helper to register a tool with auto-context wrapper applied.
    * This is a drop-in replacement for server.registerTool that adds auto-context.
+   *
+   * Includes integration-aware tool hiding:
+   * - Option B (dynamic): Skip registration if integration tools and integrations not connected
+   * - Option A (lazy): Gate at runtime with helpful error if integration not connected
    */
   function registerTool<T extends z.ZodType>(
     name: string,
     config: { title: string; description: string; inputSchema: T },
     handler: (input: z.infer<T>, extra?: MessageExtraInfo) => Promise<ToolTextResult>
   ) {
+    // Check toolset allowlist first
     if (toolAllowlist && !toolAllowlist.has(name)) {
       return;
     }
+
+    // Option B: Skip registration for integration tools when auto-hide is enabled
+    // and integrations are not connected. This reduces the tool registry size.
+    if (!shouldRegisterIntegrationTool(name)) {
+      return;
+    }
+
     const accessLabel = getToolAccessLabel(name);
     const showUpgrade = accessLabel !== 'Free';
     const labeledConfig = {
@@ -817,8 +1257,14 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
     // Wrap handler with error handling to ensure proper serialization
     const safeHandler = async (input: z.infer<T>, extra?: MessageExtraInfo) => {
       try {
-        const gated = await gateIfProTool(name);
-        if (gated) return gated;
+        // Gate PRO tools
+        const proGated = await gateIfProTool(name);
+        if (proGated) return proGated;
+
+        // Option A: Lazy evaluation for integration tools
+        // Even if tool was registered, check if integration is actually connected
+        const integrationGated = await gateIfIntegrationTool(name);
+        if (integrationGated) return integrationGated;
 
         return await handler(input, extra);
       } catch (error: any) {
@@ -2181,6 +2627,28 @@ This does semantic search on the first message. You only need context_smart on s
       // Mark session as initialized to prevent auto-init on subsequent tool calls
       if (sessionManager) {
         sessionManager.markInitialized(result);
+      }
+
+      // Check integration status and update tracking (Strategy 2)
+      // This enables dynamic tool list updates for connected integrations
+      const workspaceId = typeof result.workspace_id === 'string' ? (result.workspace_id as string) : undefined;
+      if (workspaceId && AUTO_HIDE_INTEGRATIONS) {
+        try {
+          const intStatus = await checkIntegrationStatus(workspaceId);
+          updateIntegrationStatus(intStatus, workspaceId);
+
+          // Add integration info to result for visibility
+          (result as any).integrations = {
+            slack_connected: intStatus.slack,
+            github_connected: intStatus.github,
+            auto_hide_enabled: true,
+            hint: intStatus.slack || intStatus.github
+              ? 'Integration tools are now available in the tool list.'
+              : 'Connect integrations at https://contextstream.io/settings/integrations to enable Slack/GitHub tools.',
+          };
+        } catch (error) {
+          console.error('[ContextStream] Failed to check integration status in session_init:', error);
+        }
       }
 
       const status = typeof result.status === 'string' ? (result.status as string) : '';
@@ -3952,6 +4420,18 @@ Use this to verify integrations are healthy and syncing properly.`,
       }
 
       const result = await client.integrationsStatus({ workspace_id: workspaceId });
+
+      // Update integration status tracking (Strategy 2)
+      if (AUTO_HIDE_INTEGRATIONS) {
+        const slackConnected = result?.some((s: { provider: string; status: string }) =>
+          s.provider === 'slack' && s.status === 'connected'
+        ) ?? false;
+        const githubConnected = result?.some((s: { provider: string; status: string }) =>
+          s.provider === 'github' && s.status === 'connected'
+        ) ?? false;
+        updateIntegrationStatus({ slack: slackConnected, github: githubConnected }, workspaceId);
+      }
+
       if (result.length === 0) {
         return { content: [{ type: 'text' as const, text: 'No integrations configured for this workspace.' }] };
       }

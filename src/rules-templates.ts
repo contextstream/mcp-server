@@ -12,121 +12,27 @@ export interface RuleTemplate {
 const DEFAULT_CLAUDE_MCP_SERVER_NAME = 'contextstream';
 
 /**
- * Complete list of all ContextStream MCP tools.
+ * Complete list of all ContextStream MCP tools (v0.4.x consolidated architecture).
  * This list is used for Claude Code prefixing and should match tools.ts exactly.
- * Grouped by category for maintainability.
+ *
+ * v0.4.x uses consolidated domain tools (~11 tools) by default for ~75% token reduction.
  */
 const CONTEXTSTREAM_TOOL_NAMES = [
-  // Session/Context (standard)
+  // Standalone tools (always present)
   'session_init',
   'context_smart',
   'context_feedback',
-  'session_summary',
-  'session_capture',
-  'session_capture_lesson',
-  'session_get_lessons',
-  'session_recall',
-  'session_remember',
-  'session_get_user_context',
-  'session_smart_search',
-  'session_compress',
-  'session_delta',
-  // Editor Rules
-  'generate_editor_rules',
-  // Workspaces
-  'workspace_associate',
-  'workspace_bootstrap',
-  'workspaces_list',
-  'workspaces_create',
-  'workspaces_update',
-  'workspaces_delete',
-  'workspaces_get',
-  'workspaces_overview',
-  'workspaces_analytics',
-  'workspaces_content',
-  // Projects
-  'projects_list',
-  'projects_create',
-  'projects_update',
-  'projects_delete',
-  'projects_get',
-  'projects_overview',
-  'projects_statistics',
-  'projects_files',
-  'projects_index',
-  'projects_index_status',
-  'projects_ingest_local',
-  // Search
-  'search_semantic',
-  'search_hybrid',
-  'search_keyword',
-  'search_pattern',
-  'search_suggestions',
-  // Memory
-  'memory_create_event',
-  'memory_bulk_ingest',
-  'memory_list_events',
-  'memory_create_node',
-  'memory_list_nodes',
-  'memory_search',
-  'memory_decisions',
-  'decision_trace',
-  'memory_get_event',
-  'memory_update_event',
-  'memory_delete_event',
-  'memory_distill_event',
-  'memory_get_node',
-  'memory_update_node',
-  'memory_delete_node',
-  'memory_supersede_node',
-  'memory_timeline',
-  'memory_summary',
-  // Graph
-  'graph_related',
-  'graph_path',
-  'graph_decisions',
-  'graph_dependencies',
-  'graph_call_path',
-  'graph_impact',
-  'graph_circular_dependencies',
-  'graph_unused_code',
-  'graph_ingest',
-  'graph_contradictions',
-  // AI (PRO)
-  'ai_context',
-  'ai_enhanced_context',
-  'ai_context_budget',
-  'ai_embeddings',
-  'ai_plan',
-  'ai_tasks',
-  // GitHub Integration (PRO)
-  'github_stats',
-  'github_repos',
-  'github_contributors',
-  'github_activity',
-  'github_issues',
-  'github_search',
-  // Slack Integration (PRO)
-  'slack_stats',
-  'slack_channels',
-  'slack_contributors',
-  'slack_activity',
-  'slack_discussions',
-  'slack_search',
-  'slack_sync_users',
-  'slack_knowledge',
-  'slack_summary',
-  // GitHub additional
-  'github_knowledge',
-  'github_summary',
-  // Cross-source integrations
-  'integrations_status',
-  'integrations_search',
-  'integrations_summary',
-  'integrations_knowledge',
-  // Auth/Meta
-  'auth_me',
-  'mcp_server_version',
+
+  // Consolidated domain tools (v0.4.x default)
+  'search',       // Modes: semantic, hybrid, keyword, pattern
+  'session',      // Actions: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search, decision_trace
+  'memory',       // Actions: create_event, get_event, update_event, delete_event, list_events, distill_event, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, search, decisions, timeline, summary
+  'graph',        // Actions: dependencies, impact, call_path, related, path, decisions, ingest, circular_dependencies, unused_code, contradictions
+  'project',      // Actions: list, get, create, update, index, overview, statistics, files, index_status, ingest_local
+  'workspace',    // Actions: list, get, associate, bootstrap
+  'reminder',     // Actions: list, active, create, snooze, complete, dismiss
+  'integration',  // Provider: slack, github, all; Actions: status, search, stats, activity, contributors, knowledge, summary, channels, discussions, sync_users, repos, issues
+  'help',         // Actions: tools, auth, version, editor_rules, enable_bundle
 ] as const;
 
 function applyMcpToolPrefix(markdown: string, toolPrefix: string): string {
@@ -137,9 +43,10 @@ function applyMcpToolPrefix(markdown: string, toolPrefix: string): string {
 }
 
 const CONTEXTSTREAM_RULES_FULL = `
-## ContextStream Integration (Enhanced)
+## ContextStream v0.4.x Integration (Enhanced)
 
 You have access to ContextStream MCP tools for persistent memory and context.
+v0.4.x uses **~11 consolidated domain tools** for ~75% token reduction vs previous versions.
 
 ## TL;DR - REQUIRED EVERY MESSAGE
 
@@ -147,12 +54,36 @@ You have access to ContextStream MCP tools for persistent memory and context.
 |---------|--------------|
 | **1st message** | \`session_init(folder_path="...", context_hint="<user's message>")\` |
 | **2nd+ messages** | \`context_smart(user_message="<user's message>", format="minified", max_tokens=400)\` |
-| **Before risky/non-trivial work** | \`session_get_lessons(query="<topic>")\` |
-| **After completing task** | \`session_capture(...)\` - MUST capture decisions/insights |
-| **User frustration/correction** | \`session_capture_lesson(...)\` - MUST capture lessons |
-| **Command/tool error + fix** | \`session_capture_lesson(...)\` - MUST capture lessons |
+| **Before risky/non-trivial work** | \`session(action="get_lessons", query="<topic>")\` |
+| **After completing task** | \`session(action="capture", event_type="decision", ...)\` - MUST capture |
+| **User frustration/correction** | \`session(action="capture_lesson", ...)\` - MUST capture lessons |
+| **Command/tool error + fix** | \`session(action="capture_lesson", ...)\` - MUST capture lessons |
 
 **NO EXCEPTIONS.** Do not skip even if you think you have enough context.
+
+---
+
+## Consolidated Domain Tools Architecture
+
+v0.4.x consolidates ~58 individual tools into ~11 domain tools with action/mode dispatch:
+
+### Standalone Tools (Always Call)
+- **\`session_init\`** - Initialize session with workspace detection + context
+- **\`context_smart\`** - Semantic search for relevant context (CALL EVERY MESSAGE)
+
+### Domain Tools (Use action/mode parameter)
+
+| Domain | Actions/Modes | Example |
+|--------|---------------|---------|
+| **\`search\`** | mode: semantic, hybrid, keyword, pattern | \`search(mode="hybrid", query="auth implementation")\` |
+| **\`session\`** | action: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search, decision_trace | \`session(action="capture", event_type="decision", title="Use JWT", content="...")\` |
+| **\`memory\`** | action: create_event, get_event, update_event, delete_event, list_events, distill_event, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, search, decisions, timeline, summary | \`memory(action="list_events", limit=10)\` |
+| **\`graph\`** | action: dependencies, impact, call_path, related, path, decisions, ingest, circular_dependencies, unused_code, contradictions | \`graph(action="impact", symbol_name="AuthService")\` |
+| **\`project\`** | action: list, get, create, update, index, overview, statistics, files, index_status, ingest_local | \`project(action="statistics")\` |
+| **\`workspace\`** | action: list, get, associate, bootstrap | \`workspace(action="list")\` |
+| **\`reminder\`** | action: list, active, create, snooze, complete, dismiss | \`reminder(action="active")\` |
+| **\`integration\`** | provider: slack/github/all; action: status, search, stats, activity, contributors, knowledge, summary, channels, discussions, sync_users, repos, issues | \`integration(provider="github", action="search", query="...")\` |
+| **\`help\`** | action: tools, auth, version, editor_rules, enable_bundle | \`help(action="tools")\` |
 
 ---
 
@@ -178,127 +109,125 @@ You have access to ContextStream MCP tools for persistent memory and context.
 
 - For trivial/local edits: \`context_smart(..., max_tokens=200)\`
 - Default: \`context_smart(..., max_tokens=400)\`
-- Deep debugging/architecture or heavy "what did we decide?": \`context_smart(..., max_tokens=800)\`
-- Keep \`format="minified"\` (default) unless you're debugging tool output
+- Deep debugging/architecture: \`context_smart(..., max_tokens=800)\`
+- Keep \`format="minified"\` (default) unless debugging
 
-If context still feels missing, increase \`max_tokens\` and/or call \`session_recall\` for a focused deep lookup.
+If context still feels missing, use \`session(action="recall", query="...")\` for focused deep lookup.
 
 ---
 
 ### Preferences & Lessons (Use Early)
 
-- If preferences or style matter, call \`session_get_user_context\`.
-- Before risky changes or when past mistakes may apply, call \`session_get_lessons(query="<topic>")\`.
-- When frustration, corrections, or tool mistakes occur, immediately call \`session_capture_lesson\`.
+- If preferences/style matter: \`session(action="user_context")\`
+- Before risky changes: \`session(action="get_lessons", query="<topic>")\`
+- On frustration/corrections: \`session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...")\`
 
 ---
 
-### Search, Graphs, and Code Intelligence (ContextStream-first)
+### Search & Code Intelligence (ContextStream-first)
 
-- Default order: \`session_smart_search\` -> \`search_hybrid\`/\`search_keyword\`/\`search_semantic\` -> graph tools -> local repo scans (rg/ls/find) only if ContextStream returns no results.
-- Use \`session_smart_search\` before scanning the repo or grepping.
-- Use \`search_semantic\`/\`search_hybrid\`/\`search_keyword\` for targeted queries.
-- For dependencies/impact/call paths, use \`graph_dependencies\`, \`graph_impact\`, and \`graph_call_path\`.
-- If the toolset is complete (Elite), prefer \`graph_call_path\` and \`graph_path\` for call relationships instead of manual searches.
-- If the graph is missing or stale, run \`graph_ingest\` (async by default with \`wait: false\`). Tell the user it can take a few minutes; optionally call \`projects_statistics\` to estimate time.
+**Search order:**
+1. \`session(action="smart_search", query="...")\` - context-enriched
+2. \`search(mode="hybrid", query="...")\` - semantic + keyword
+3. \`graph(action="dependencies", ...)\` - code structure
+4. Local repo scans (rg/ls/find) - only if ContextStream returns no results
+
+**Code Analysis:**
+- Dependencies: \`graph(action="dependencies", file_path="...")\`
+- Change impact: \`graph(action="impact", symbol_name="...")\`
+- Call path: \`graph(action="call_path", from_symbol="...", to_symbol="...")\`
+- Build graph: \`graph(action="ingest")\` - async, can take a few minutes
 
 ---
 
 ### Distillation & Memory Hygiene
 
-- Use \`session_summary\` for a fast workspace snapshot.
-- Use \`session_compress\` when the chat is long or context limits are near.
-- Use \`memory_summary\` for recent work summaries and \`memory_distill_event\` to condense noisy memory entries.
+- Quick context: \`session(action="summary")\`
+- Long chat: \`session(action="compress", content="...")\`
+- Memory summary: \`memory(action="summary")\`
+- Condense noisy entries: \`memory(action="distill_event", event_id="...")\`
 
 ---
 
 ### When to Capture (MANDATORY)
 
-| When | Tool | Example |
+| When | Call | Example |
 |------|------|---------|
-| User makes a decision | \`session_capture\` | "Let's use PostgreSQL" -> capture as decision |
-| User states preference | \`session_capture\` | "I prefer TypeScript" -> capture as preference |
-| You complete a task | \`session_capture\` | Capture what was done, decisions made |
-| Need past context | \`session_recall\` | "What did we decide about X?" |
+| User makes decision | \`session(action="capture", event_type="decision", ...)\` | "Let's use PostgreSQL" |
+| User states preference | \`session(action="capture", event_type="preference", ...)\` | "I prefer TypeScript" |
+| You complete a task | \`session(action="capture", event_type="task", ...)\` | Capture what was done |
+| Need past context | \`session(action="recall", query="...")\` | "What did we decide about X?" |
 
 **You MUST capture after completing any significant task.** This ensures future sessions have context.
 
 ---
 
-### Full Tool Catalog
+### Complete Action Reference
 
-To expose all tools below, set \`CONTEXTSTREAM_TOOLSET=complete\` in your MCP config. The default (\`standard\`) includes the essential session, search, memory, and graph tools above.
+**session actions:**
+- \`capture\` - Save decision/insight/task (requires: event_type, title, content)
+- \`capture_lesson\` - Save lesson from mistake (requires: title, category, trigger, impact, prevention)
+- \`get_lessons\` - Retrieve relevant lessons (optional: query, category, severity)
+- \`recall\` - Natural language memory recall (requires: query)
+- \`remember\` - Quick save to memory (requires: content)
+- \`user_context\` - Get user preferences/style
+- \`summary\` - Workspace summary
+- \`compress\` - Compress long conversation
+- \`delta\` - Changes since timestamp
+- \`smart_search\` - Context-enriched search
+- \`decision_trace\` - Trace decision provenance
 
-**To enable the complete toolset in your MCP config:**
-\`\`\`json
-{
-  "env": {
-    "CONTEXTSTREAM_TOOLSET": "complete"
-  }
-}
-\`\`\`
+**memory actions:**
+- Event CRUD: \`create_event\`, \`get_event\`, \`update_event\`, \`delete_event\`, \`list_events\`, \`distill_event\`
+- Node CRUD: \`create_node\`, \`get_node\`, \`update_node\`, \`delete_node\`, \`list_nodes\`, \`supersede_node\`
+- Query: \`search\`, \`decisions\`, \`timeline\`, \`summary\`
 
-**Available tool categories (when \`CONTEXTSTREAM_TOOLSET=complete\`):**
-
-**Session/Context** (included in standard):
-\`session_init\`, \`context_smart\`, \`context_feedback\`, \`session_summary\`, \`session_capture\`, \`session_capture_lesson\`, \`session_get_lessons\`, \`session_recall\`, \`session_remember\`, \`session_get_user_context\`, \`session_smart_search\`, \`session_compress\`, \`session_delta\`, \`generate_editor_rules\`, \`workspace_associate\`, \`workspace_bootstrap\`
-
-**Workspaces**:
-\`workspaces_list\`, \`workspaces_create\`, \`workspaces_update\`, \`workspaces_delete\`, \`workspaces_get\`, \`workspaces_overview\`, \`workspaces_analytics\`, \`workspaces_content\`
-
-**Projects**:
-\`projects_list\`, \`projects_create\`, \`projects_update\`, \`projects_delete\`, \`projects_get\`, \`projects_overview\`, \`projects_statistics\`, \`projects_files\`, \`projects_index\`, \`projects_index_status\`, \`projects_ingest_local\`
-
-**Search**:
-\`search_semantic\`, \`search_hybrid\`, \`search_keyword\`, \`search_pattern\`, \`search_suggestions\`
-
-**Memory**:
-\`memory_create_event\`, \`memory_bulk_ingest\`, \`memory_list_events\`, \`memory_create_node\`, \`memory_list_nodes\`, \`memory_search\`, \`memory_decisions\`, \`decision_trace\`, \`memory_get_event\`, \`memory_update_event\`, \`memory_delete_event\`, \`memory_distill_event\`, \`memory_get_node\`, \`memory_update_node\`, \`memory_delete_node\`, \`memory_supersede_node\`, \`memory_timeline\`, \`memory_summary\`
-
-**Graph** (code analysis):
-\`graph_related\`, \`graph_path\`, \`graph_decisions\`, \`graph_dependencies\`, \`graph_call_path\`, \`graph_impact\`, \`graph_circular_dependencies\`, \`graph_unused_code\`, \`graph_ingest\`, \`graph_contradictions\`
-
-**AI** (PRO):
-\`ai_context\`, \`ai_enhanced_context\`, \`ai_context_budget\`, \`ai_embeddings\`, \`ai_plan\`, \`ai_tasks\`
-
-**GitHub Integration** (PRO):
-\`github_stats\`, \`github_repos\`, \`github_contributors\`, \`github_activity\`, \`github_issues\`, \`github_search\`, \`github_knowledge\`, \`github_summary\`
-
-**Slack Integration** (PRO):
-\`slack_stats\`, \`slack_channels\`, \`slack_contributors\`, \`slack_activity\`, \`slack_discussions\`, \`slack_search\`, \`slack_sync_users\`, \`slack_knowledge\`, \`slack_summary\`
-
-**Cross-Source Integrations** (PRO):
-\`integrations_status\`, \`integrations_search\`, \`integrations_summary\`, \`integrations_knowledge\`
+**graph actions:**
+- Analysis: \`dependencies\`, \`impact\`, \`call_path\`, \`related\`, \`path\`
+- Quality: \`circular_dependencies\`, \`unused_code\`, \`contradictions\`
+- Management: \`ingest\`, \`decisions\`
 
 See full documentation: https://contextstream.io/docs/mcp/tools
 `.trim();
 
 const CONTEXTSTREAM_RULES_MINIMAL = `
-## ContextStream (Standard)
+## ContextStream v0.4.x (Consolidated Domain Tools)
 
-- First user message: \`session_init(folder_path="<cwd>", context_hint="<user_message>")\`, then answer.
-- Every user message: \`context_smart(user_message="<user_message>", format="minified", max_tokens=400)\` BEFORE answering.
-  - Use \`max_tokens=200\` for trivial/local edits, \`max_tokens=800\` for deep debugging/architecture.
-- Before risky/non-trivial work: check \`session_get_lessons(query="<topic>")\`; use \`session_get_user_context\` when preferences/style matter.
-- For discovery: use \`session_smart_search\` first; use \`search_semantic\`/\`search_hybrid\`/\`search_keyword\` for targeted lookups; avoid local scans until ContextStream returns no results.
-- For code intelligence: use \`graph_dependencies\`/\`graph_impact\`/\`graph_call_path\`; if the toolset is complete (Elite), prefer \`graph_call_path\`/\`graph_path\` for call relationships; run \`graph_ingest\` if the graph is missing (async by default, can take a few minutes).
-- For distillation: use \`session_summary\` for quick context; use \`session_compress\` for long chats; use \`memory_summary\` or \`memory_distill_event\` to condense memory.
-- After meaningful work/decisions/preferences: \`session_capture(event_type=decision|preference|task|insight, title="...", content="...")\`.
-- On frustration/corrections/tool mistakes: \`session_capture_lesson(...)\`.
+v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous versions.
 
-### Tool Catalog
+### Required Every Message
 
-By default, the MCP server exposes the **standard** toolset (~58 tools). To expose fewer tools, set \`CONTEXTSTREAM_TOOLSET=light\`. To expose everything (~86 tools), set \`CONTEXTSTREAM_TOOLSET=complete\` in your MCP config:
+| Message | What to Call |
+|---------|--------------|
+| **1st message** | \`session_init(folder_path="<cwd>", context_hint="<user_message>")\` |
+| **2nd+ messages** | \`context_smart(user_message="<user_message>", format="minified", max_tokens=400)\` |
+| **Capture decisions** | \`session(action="capture", event_type="decision", title="...", content="...")\` |
+| **Before risky work** | \`session(action="get_lessons", query="<topic>")\` |
+| **On user frustration** | \`session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...")\` |
 
-\`\`\`json
-{
-  "env": {
-    "CONTEXTSTREAM_TOOLSET": "complete"
-  }
-}
-\`\`\`
+### Quick Reference: Domain Tools
 
-Full tool reference: https://contextstream.io/docs/mcp/tools
+| Tool | Common Usage |
+|------|--------------|
+| \`search\` | \`search(mode="semantic", query="...")\` — modes: semantic, hybrid, keyword, pattern |
+| \`session\` | \`session(action="capture", ...)\` — actions: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search |
+| \`memory\` | \`memory(action="list_events", ...)\` — CRUD for events/nodes, search, decisions, timeline, summary |
+| \`graph\` | \`graph(action="dependencies", ...)\` — dependencies, impact, call_path, related, ingest |
+| \`project\` | \`project(action="list", ...)\` — list, get, create, update, index, statistics |
+| \`workspace\` | \`workspace(action="list", ...)\` — list, get, associate, bootstrap |
+| \`integration\` | \`integration(provider="github", action="search", ...)\` — GitHub/Slack integration |
+| \`help\` | \`help(action="tools")\` — tools, auth, version, editor_rules |
+
+### Behavior Rules
+
+- **First message**: Always call \`session_init\` with context_hint
+- **Every message after**: Always call \`context_smart\` BEFORE responding (semantic search for relevant context)
+- **For discovery**: Use \`session(action="smart_search")\` or \`search(mode="hybrid")\` before local repo scans
+- **For code analysis**: Use \`graph(action="dependencies")\` or \`graph(action="impact")\` for call/dependency analysis
+- **After completing work**: Always capture decisions/insights with \`session(action="capture")\`
+- **On mistakes/corrections**: Immediately capture lessons with \`session(action="capture_lesson")\`
+
+Full docs: https://contextstream.io/docs/mcp/tools
 `.trim();
 
 export const TEMPLATES: Record<string, RuleTemplate> = {

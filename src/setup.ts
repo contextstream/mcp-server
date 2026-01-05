@@ -12,7 +12,7 @@ import { VERSION } from './version.js';
 import { credentialsFilePath, normalizeApiUrl, readSavedCredentials, writeSavedCredentials } from './credentials.js';
 
 type RuleMode = 'minimal' | 'full';
-type Toolset = 'light' | 'standard' | 'complete';
+type Toolset = 'consolidated' | 'router';
 type InstallScope = 'global' | 'project' | 'both';
 type McpScope = InstallScope | 'skip';
 
@@ -301,14 +301,16 @@ type McpServerJson = {
   env: Record<string, string>;
 };
 
-function buildContextStreamMcpServer(params: { apiUrl: string; apiKey: string; toolset?: string }): McpServerJson {
+function buildContextStreamMcpServer(params: { apiUrl: string; apiKey: string; toolset?: Toolset }): McpServerJson {
   const env: Record<string, string> = {
     CONTEXTSTREAM_API_URL: params.apiUrl,
     CONTEXTSTREAM_API_KEY: params.apiKey,
   };
-  if (params.toolset) {
-    env.CONTEXTSTREAM_TOOLSET = params.toolset;
+  // v0.4.x: consolidated is default (true), router mode uses PROGRESSIVE_MODE
+  if (params.toolset === 'router') {
+    env.CONTEXTSTREAM_PROGRESSIVE_MODE = 'true';
   }
+  // consolidated is the default, no env var needed
   return {
     command: 'npx',
     args: ['-y', '@contextstream/mcp-server'],
@@ -323,14 +325,16 @@ type VsCodeServerJson = {
   env: Record<string, string>;
 };
 
-function buildContextStreamVsCodeServer(params: { apiUrl: string; apiKey: string; toolset?: string }): VsCodeServerJson {
+function buildContextStreamVsCodeServer(params: { apiUrl: string; apiKey: string; toolset?: Toolset }): VsCodeServerJson {
   const env: Record<string, string> = {
     CONTEXTSTREAM_API_URL: params.apiUrl,
     CONTEXTSTREAM_API_KEY: params.apiKey,
   };
-  if (params.toolset) {
-    env.CONTEXTSTREAM_TOOLSET = params.toolset;
+  // v0.4.x: consolidated is default (true), router mode uses PROGRESSIVE_MODE
+  if (params.toolset === 'router') {
+    env.CONTEXTSTREAM_PROGRESSIVE_MODE = 'true';
   }
+  // consolidated is the default, no env var needed
   return {
     type: 'stdio',
     command: 'npx',
@@ -427,7 +431,7 @@ function claudeDesktopConfigPath(): string | null {
   return null;
 }
 
-async function upsertCodexTomlConfig(filePath: string, params: { apiUrl: string; apiKey: string; toolset?: string }): Promise<'created' | 'updated' | 'skipped'> {
+async function upsertCodexTomlConfig(filePath: string, params: { apiUrl: string; apiKey: string; toolset?: Toolset }): Promise<'created' | 'updated' | 'skipped'> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const exists = await fileExists(filePath);
   const existing = exists ? await fs.readFile(filePath, 'utf8').catch(() => '') : '';
@@ -435,7 +439,8 @@ async function upsertCodexTomlConfig(filePath: string, params: { apiUrl: string;
   const marker = '[mcp_servers.contextstream]';
   const envMarker = '[mcp_servers.contextstream.env]';
 
-  const toolsetLine = params.toolset ? `CONTEXTSTREAM_TOOLSET = "${params.toolset}"\n` : '';
+  // v0.4.x: consolidated is default, router uses PROGRESSIVE_MODE
+  const toolsetLine = params.toolset === 'router' ? `CONTEXTSTREAM_PROGRESSIVE_MODE = "true"\n` : '';
   const block =
     `\n\n# ContextStream MCP server\n` +
     `[mcp_servers.contextstream]\n` +
@@ -783,21 +788,18 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     const planLabel = detectedPlanName ?? 'unknown';
     console.log(`\nDetected plan: ${planLabel} (graph: ${graphTierLabel})`);
 
-    // Toolset selection
+    // Toolset selection (v0.4.x consolidated architecture)
     console.log('\nMCP toolset (which tools to expose to the AI):');
-    console.log('  1) Light — core session, project, and basic memory/graph tools (~31 tools)');
-    console.log('     Best for: Claude Code, faster responses, token-constrained environments');
-    console.log('  2) Standard (recommended) — adds workspace, memory CRUD, graph analysis, search (~58 tools)');
-    console.log('     Best for: most users, full development workflow with memory + code analysis');
-    console.log('  3) Complete — all tools including full graph + AI, GitHub, Slack integrations (~86 tools)');
-    console.log('     Best for: Elite users or power users needing full graph + integrations');
+    console.log('  1) Standard (recommended) — consolidated domain tools (~11 tools, ~75% token reduction)');
+    console.log('     Best for: all users, full functionality with minimal token overhead');
+    console.log('     Includes: session_init, context_smart + 9 domain tools (search, session, memory, graph, etc.)');
+    console.log('  2) Router — ultra-minimal with AI routing (~2 meta-tools)');
+    console.log('     Best for: experimental, routes requests through session_init + context_smart only');
     console.log('');
-    console.log('  Note: Slack/GitHub tools are auto-hidden until you connect those integrations.');
-    console.log('  Tip: Elite users should choose Complete to unlock full graph tools.');
-    console.log('  Tip: Change later by setting CONTEXTSTREAM_TOOLSET=light|standard|complete');
-    const toolsetDefault = detectedGraphTier === 'full' ? '3' : '2';
-    const toolsetChoice = normalizeInput(await rl.question(`Choose [1/2/3] (default ${toolsetDefault}): `)) || toolsetDefault;
-    const toolset: Toolset = toolsetChoice === '1' ? 'light' : toolsetChoice === '3' ? 'complete' : 'standard';
+    console.log('  Note: v0.4.x uses consolidated domain tools by default for ~75% token reduction.');
+    console.log('  Tip: Change later by setting CONTEXTSTREAM_CONSOLIDATED=true|false');
+    const toolsetChoice = normalizeInput(await rl.question('Choose [1/2] (default 1): ')) || '1';
+    const toolset: Toolset = toolsetChoice === '2' ? 'router' : 'consolidated';
 
     const editors: EditorKey[] = ['codex', 'claude', 'cursor', 'windsurf', 'cline', 'kilo', 'roo', 'aider'];
     console.log('\nSelect editors to configure (comma-separated numbers, or "all"):');
@@ -875,15 +877,10 @@ export async function runSetupWizard(args: string[]): Promise<void> {
               : 'both';
 
     // Build MCP server configs with selected toolset
-    // For standard toolset, we don't need to include it in the env (it's the default)
-    // For complete toolset, we include it explicitly so the server knows to expose all tools
-    const mcpServer = toolset === 'complete'
-      ? buildContextStreamMcpServer({ apiUrl, apiKey, toolset: 'complete' })
-      : buildContextStreamMcpServer({ apiUrl, apiKey });
+    // v0.4.x: consolidated (~11 tools) is default, router (~2 tools) uses PROGRESSIVE_MODE
+    const mcpServer = buildContextStreamMcpServer({ apiUrl, apiKey, toolset });
     const mcpServerClaude = buildContextStreamMcpServer({ apiUrl, apiKey, toolset });
-    const vsCodeServer = toolset === 'complete'
-      ? buildContextStreamVsCodeServer({ apiUrl, apiKey, toolset: 'complete' })
-      : buildContextStreamVsCodeServer({ apiUrl, apiKey });
+    const vsCodeServer = buildContextStreamVsCodeServer({ apiUrl, apiKey, toolset });
 
     // Global MCP config
     const needsGlobalMcpConfig = mcpScope === 'global' || mcpScope === 'both' || (mcpScope === 'project' && hasCodex);
@@ -900,10 +897,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
               console.log(`- ${EDITOR_LABELS[editor]}: would update ${filePath}`);
               continue;
             }
-            const codexParams = toolset === 'complete'
-              ? { apiUrl, apiKey, toolset: 'complete' }
-              : { apiUrl, apiKey };
-            const status = await upsertCodexTomlConfig(filePath, codexParams);
+            const status = await upsertCodexTomlConfig(filePath, { apiUrl, apiKey, toolset });
             writeActions.push({ kind: 'mcp-config', target: filePath, status });
             console.log(`- ${EDITOR_LABELS[editor]}: ${status} ${filePath}`);
             continue;
@@ -940,7 +934,8 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             }
 
 	            console.log('- Claude Code: global MCP config is best done via `claude mcp add --transport stdio ...` (see docs).');
-	            console.log(`  macOS/Linux: claude mcp add --transport stdio contextstream --scope user --env CONTEXTSTREAM_API_URL=... --env CONTEXTSTREAM_API_KEY=... --env CONTEXTSTREAM_TOOLSET=${toolset} -- npx -y @contextstream/mcp-server`);
+	            const envHint = toolset === 'router' ? ' --env CONTEXTSTREAM_PROGRESSIVE_MODE=true' : '';
+	            console.log(`  macOS/Linux: claude mcp add --transport stdio contextstream --scope user --env CONTEXTSTREAM_API_URL=... --env CONTEXTSTREAM_API_KEY=...${envHint} -- npx -y @contextstream/mcp-server`);
 	            console.log('  Windows (native): use `cmd /c npx -y @contextstream/mcp-server` after `--` if `npx` is not found.');
 	            continue;
 	          }
@@ -1177,18 +1172,17 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       const skipped = writeActions.filter((a) => a.status === 'skipped').length;
       const dry = writeActions.filter((a) => a.status === 'dry-run').length;
       console.log(`Summary: ${created} created, ${updated} updated, ${appended} appended, ${skipped} skipped, ${dry} dry-run.`);
-      const toolsetDesc = toolset === 'light' ? '~31 tools' : toolset === 'complete' ? '~86 tools' : '~58 tools';
+      const toolsetDesc = toolset === 'router' ? '~2 meta-tools (router mode)' : '~11 domain tools (consolidated)';
       console.log(`Toolset: ${toolset} (${toolsetDesc})`);
-      console.log(`Auto-hide: Slack/GitHub tools hidden until integrations connected.`);
+      console.log(`Token reduction: ~75% compared to previous versions.`);
     }
 
     console.log('\nNext steps:');
     console.log('- Restart your editor/CLI after changing MCP config or rules.');
-    console.log('- Prefer ContextStream search first: use session_smart_search (or mcp__contextstream__session_smart_search) before raw repo scans (rg/ls/find).');
+    console.log('- v0.4.x uses consolidated domain tools by default (~11 tools vs ~58 in v0.3.x).');
     console.log('- If any tools require UI-based MCP setup (e.g. Cline/Kilo/Roo global), follow https://contextstream.io/docs/mcp.');
-    if (toolset === 'complete') {
-      console.log('- For full graph tools, run graph_ingest once per project (async; can take a few minutes).');
-      console.log('- Note: Claude Code/Desktop may warn about large tool contexts. This is expected with the complete toolset.');
+    if (toolset === 'router') {
+      console.log('- Router mode uses 2 meta-tools (session_init + context_smart) for ultra-minimal token usage.');
     }
   } finally {
     rl.close();

@@ -5617,9 +5617,21 @@ Use this to remove a reminder that is no longer relevant.`,
           }
 
           case 'capture_lesson': {
-            if (!input.title || !input.category || !input.trigger || !input.impact || !input.prevention) {
-              return errorResult('capture_lesson requires: title, category, trigger, impact, prevention');
+            if (!input.title || !input.trigger || !input.impact || !input.prevention) {
+              return errorResult('capture_lesson requires: title, trigger, impact, prevention');
             }
+            const lessonContent = [
+              `## ${input.title}`,
+              `**Severity:** ${input.severity || 'medium'}`,
+              input.category ? `**Category:** ${input.category}` : '',
+              `### Trigger`,
+              input.trigger,
+              `### Impact`,
+              input.impact,
+              `### Prevention`,
+              input.prevention,
+            ].filter(Boolean).join('\n');
+
             const lessonInput = {
               title: input.title,
               category: input.category,
@@ -5635,7 +5647,15 @@ Use this to remove a reminder that is no longer relevant.`,
             if (isDuplicateLessonCapture(signature)) {
               return { content: [{ type: 'text' as const, text: formatContent({ deduplicated: true, message: 'Lesson already captured recently' }) }] };
             }
-            const result = await client.captureLesson(lessonInput);
+            const result = await client.captureContext({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              event_type: 'lesson',
+              title: input.title,
+              content: lessonContent,
+              importance: input.severity === 'critical' ? 'critical' : input.severity === 'high' ? 'high' : 'medium',
+              tags: input.keywords || [],
+            });
             return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
           }
 

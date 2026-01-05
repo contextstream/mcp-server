@@ -961,6 +961,19 @@ function getOperationSchema(name: string): OperationSchemaInfo | null {
 // END Strategy 6
 // =============================================================================
 
+// =============================================================================
+// Strategy 7: Tool Output Verbosity Reduction
+// =============================================================================
+// Environment variable to control output format
+// CONTEXTSTREAM_OUTPUT_FORMAT=compact | pretty (default: compact)
+// Compact mode uses minified JSON (~30% fewer tokens per response)
+const OUTPUT_FORMAT = process.env.CONTEXTSTREAM_OUTPUT_FORMAT || 'compact';
+const COMPACT_OUTPUT = OUTPUT_FORMAT === 'compact';
+
+// =============================================================================
+// END Strategy 7
+// =============================================================================
+
 const TOOLSET_ALIASES: Record<string, Set<string> | null> = {
   // Light mode - minimal, fastest
   light: LIGHT_TOOLSET,
@@ -1042,8 +1055,10 @@ function resolveToolFilter(): { allowlist: Set<string> | null; source: string; a
   return { allowlist: STANDARD_TOOLSET, source: 'standard', autoDetected: false };
 }
 
-function formatContent(data: unknown) {
-  return JSON.stringify(data, null, 2);
+// Strategy 7: Use compact JSON by default to reduce token usage
+function formatContent(data: unknown, forceFormat?: 'compact' | 'pretty') {
+  const usePretty = forceFormat === 'pretty' || (!forceFormat && !COMPACT_OUTPUT);
+  return usePretty ? JSON.stringify(data, null, 2) : JSON.stringify(data);
 }
 
 function toStructured(data: unknown): StructuredContent {
@@ -1242,6 +1257,13 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
   if (ROUTER_MODE) {
     console.error('[ContextStream] Router mode: ENABLED (all operations accessed via contextstream/contextstream_help)');
     console.error('[ContextStream] Only 2 tools registered. Use contextstream_help to see available operations.');
+  }
+
+  // Log output format status (Strategy 7)
+  if (COMPACT_OUTPUT) {
+    console.error('[ContextStream] Output format: COMPACT (minified JSON, ~30% fewer tokens per response)');
+  } else {
+    console.error('[ContextStream] Output format: pretty (set CONTEXTSTREAM_OUTPUT_FORMAT=compact for fewer tokens)');
   }
 
   // Store server reference for deferred tool registration

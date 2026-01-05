@@ -5660,12 +5660,13 @@ Use this to remove a reminder that is no longer relevant.`,
           }
 
           case 'get_lessons': {
-            const result = await client.getLessons({
+            if (!workspaceId) {
+              return errorResult('get_lessons requires workspace_id. Call session_init first.');
+            }
+            const result = await client.getHighPriorityLessons({
               workspace_id: workspaceId,
               project_id: projectId,
-              query: input.query,
-              category: input.category,
-              severity: input.severity,
+              context_hint: input.query,
               limit: input.limit,
             });
             return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
@@ -5675,10 +5676,12 @@ Use this to remove a reminder that is no longer relevant.`,
             if (!input.query) {
               return errorResult('recall requires: query');
             }
-            const result = await client.recallContext({
+            const result = await client.smartSearch({
               workspace_id: workspaceId,
               project_id: projectId,
               query: input.query,
+              include_related: input.include_related,
+              include_decisions: input.include_decisions,
             });
             return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
           }
@@ -5687,7 +5690,7 @@ Use this to remove a reminder that is no longer relevant.`,
             if (!input.content) {
               return errorResult('remember requires: content');
             }
-            const result = await client.rememberContext({
+            const result = await client.sessionRemember({
               workspace_id: workspaceId,
               project_id: projectId,
               content: input.content,
@@ -5702,7 +5705,7 @@ Use this to remove a reminder that is no longer relevant.`,
           }
 
           case 'summary': {
-            const result = await client.getSessionSummary({
+            const result = await client.getContextSummary({
               workspace_id: workspaceId,
               project_id: projectId,
               max_tokens: input.max_tokens,

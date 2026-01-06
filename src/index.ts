@@ -85,6 +85,8 @@ Environment variables:
   CONTEXTSTREAM_PROGRESSIVE_MODE  Progressive disclosure: true|false (default: false, starts with ~13 core tools)
   CONTEXTSTREAM_ROUTER_MODE   Router pattern: true|false (default: false, exposes only 2 meta-tools)
   CONTEXTSTREAM_OUTPUT_FORMAT Output verbosity: compact|pretty (default: compact, ~30% fewer tokens)
+  CONTEXTSTREAM_SEARCH_LIMIT  Default MCP search limit (default: 3)
+  CONTEXTSTREAM_SEARCH_MAX_CHARS  Max chars per search result content (default: 400)
   CONTEXTSTREAM_CONSOLIDATED  Consolidated domain tools: true|false (default: true in v0.4.x, ~75% token reduction)
   CONTEXTSTREAM_CONTEXT_PACK  Enable Context Pack in context_smart: true|false (default: true)
   CONTEXTSTREAM_PRO_TOOLS     Optional comma-separated PRO tool names (default: AI tools)

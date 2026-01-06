@@ -25,7 +25,7 @@ Rules Version: 0.4.16
 
 | Tool | Common Usage |
 |------|--------------|
-| `search` | `search(mode="semantic", query="...")` — modes: semantic, hybrid, keyword, pattern |
+| `search` | `search(mode="semantic", query="...", limit=3)` — modes: semantic, hybrid, keyword, pattern |
 | `session` | `session(action="capture", ...)` — actions: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search |
 | `memory` | `memory(action="list_events", ...)` — CRUD for events/nodes, search, decisions, timeline, summary |
 | `graph` | `graph(action="dependencies", ...)` — dependencies, impact, call_path, related, ingest |
@@ -40,6 +40,7 @@ Rules Version: 0.4.16
 - **Every message after**: Always call `context_smart` BEFORE responding (semantic search for relevant context)
 - **Before searching files/code**: Check `project(action="index_status")`; if missing/stale run `project(action="ingest_local", path="<cwd>")` or `project(action="index")`, and use `graph(action="ingest")` if needed
 - **For discovery**: Use `session(action="smart_search")` or `search(mode="hybrid")` before any local repo scans
+- **Search defaults**: `search` returns top 3 results with compact snippets; use `limit`, `offset`, and `content_max_chars` to expand
 - **For file/function/config lookups**: Use `search`/`graph` first; only fall back to rg/ls/find if ContextStream returns no results
 - **For code analysis**: Use `graph(action="dependencies")` or `graph(action="impact")` for call/dependency analysis
 - **On [RULES_NOTICE]**: Use `generate_rules()` to update rules

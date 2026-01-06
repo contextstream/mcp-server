@@ -289,7 +289,7 @@ In consolidated mode, you call **domain tools** with `action` / `mode`:
 ### Examples
 
 ```
-search(mode="semantic", query="auth middleware")
+search(mode="semantic", query="auth middleware", limit=3)
 memory(action="create_node", node_type="decision", title="Auth strategy", content="...")
 graph(action="impact", target="UserService")
 ```
@@ -330,6 +330,8 @@ Set **one** of:
 | `CONTEXTSTREAM_TOOL_ALLOWLIST` | Comma-separated tool names to expose (legacy granular mode) |
 | `CONTEXTSTREAM_SCHEMA_MODE` | Reduce schema verbosity; e.g., `compact` |
 | `CONTEXTSTREAM_OUTPUT_FORMAT` | Output formatting; e.g., `compact` / `pretty` |
+| `CONTEXTSTREAM_SEARCH_LIMIT` | Default MCP search limit (default: 3) |
+| `CONTEXTSTREAM_SEARCH_MAX_CHARS` | Max chars per search result content (default: 400) |
 
 ### Optional Defaults
 

@@ -298,7 +298,14 @@ export class ContextStreamClient {
   }
 
   // Search - each method adds required search_type and filters fields
-  searchSemantic(body: { query: string; workspace_id?: string; project_id?: string; limit?: number }) {
+  searchSemantic(body: {
+    query: string;
+    workspace_id?: string;
+    project_id?: string;
+    limit?: number;
+    offset?: number;
+    content_max_chars?: number;
+  }) {
     return request(this.config, '/search/semantic', { 
       body: { 
         ...this.withDefaults(body), 
@@ -308,7 +315,14 @@ export class ContextStreamClient {
     });
   }
 
-  searchHybrid(body: { query: string; workspace_id?: string; project_id?: string; limit?: number }) {
+  searchHybrid(body: {
+    query: string;
+    workspace_id?: string;
+    project_id?: string;
+    limit?: number;
+    offset?: number;
+    content_max_chars?: number;
+  }) {
     return request(this.config, '/search/hybrid', { 
       body: { 
         ...this.withDefaults(body), 
@@ -318,7 +332,14 @@ export class ContextStreamClient {
     });
   }
 
-  searchKeyword(body: { query: string; workspace_id?: string; project_id?: string; limit?: number }) {
+  searchKeyword(body: {
+    query: string;
+    workspace_id?: string;
+    project_id?: string;
+    limit?: number;
+    offset?: number;
+    content_max_chars?: number;
+  }) {
     return request(this.config, '/search/keyword', { 
       body: { 
         ...this.withDefaults(body), 
@@ -328,7 +349,14 @@ export class ContextStreamClient {
     });
   }
 
-  searchPattern(body: { query: string; workspace_id?: string; project_id?: string; limit?: number }) {
+  searchPattern(body: {
+    query: string;
+    workspace_id?: string;
+    project_id?: string;
+    limit?: number;
+    offset?: number;
+    content_max_chars?: number;
+  }) {
     return request(this.config, '/search/pattern', { 
       body: { 
         ...this.withDefaults(body), 

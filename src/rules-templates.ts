@@ -86,7 +86,7 @@ v0.4.x consolidates ~58 individual tools into ~11 domain tools with action/mode 
 
 | Domain | Actions/Modes | Example |
 |--------|---------------|---------|
-| **\`search\`** | mode: semantic, hybrid, keyword, pattern | \`search(mode="hybrid", query="auth implementation")\` |
+| **\`search\`** | mode: semantic, hybrid, keyword, pattern | \`search(mode="hybrid", query="auth implementation", limit=3)\` |
 | **\`session\`** | action: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search, decision_trace | \`session(action="capture", event_type="decision", title="Use JWT", content="...")\` |
 | **\`memory\`** | action: create_event, get_event, update_event, delete_event, list_events, distill_event, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, search, decisions, timeline, summary | \`memory(action="list_events", limit=10)\` |
 | **\`graph\`** | action: dependencies, impact, call_path, related, path, decisions, ingest, circular_dependencies, unused_code, contradictions | \`graph(action="impact", symbol_name="AuthService")\` |
@@ -159,10 +159,12 @@ Only after this preflight, proceed with search/analysis below.
 
 **Search order:**
 1. \`session(action="smart_search", query="...")\` - context-enriched
-2. \`search(mode="hybrid", query="...")\` or \`search(mode="keyword", query="<filename>")\`
+2. \`search(mode="hybrid", query="...", limit=3)\` or \`search(mode="keyword", query="<filename>", limit=3)\`
 3. \`project(action="files")\` - file tree/list (only when needed)
 4. \`graph(action="dependencies", ...)\` - code structure
 5. Local repo scans (rg/ls/find) - only if ContextStream returns no results, errors, or the user explicitly asks
+
+**Search defaults:** \`search\` returns the top 3 results with compact snippets. Use \`limit\` + \`offset\` for pagination, and \`content_max_chars\` to expand snippets when needed.
 
 If ContextStream returns results, stop and use them. Do NOT use local Search/Explore/Read unless you need exact code edits.
 
@@ -265,7 +267,7 @@ Rules Version: ${RULES_VERSION}
 
 | Tool | Common Usage |
 |------|--------------|
-| \`search\` | \`search(mode="semantic", query="...")\` — modes: semantic, hybrid, keyword, pattern |
+| \`search\` | \`search(mode="semantic", query="...", limit=3)\` — modes: semantic, hybrid, keyword, pattern |
 | \`session\` | \`session(action="capture", ...)\` — actions: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search |
 | \`memory\` | \`memory(action="list_events", ...)\` — CRUD for events/nodes, search, decisions, timeline, summary |
 | \`graph\` | \`graph(action="dependencies", ...)\` — dependencies, impact, call_path, related, ingest |

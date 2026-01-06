@@ -1491,8 +1491,15 @@ function getOperationSchema(name: string): OperationSchemaInfo | null {
 // Environment variable to control output format
 // CONTEXTSTREAM_OUTPUT_FORMAT=compact | pretty (default: compact)
 // Compact mode uses minified JSON (~30% fewer tokens per response)
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(raw ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 const OUTPUT_FORMAT = process.env.CONTEXTSTREAM_OUTPUT_FORMAT || 'compact';
 const COMPACT_OUTPUT = OUTPUT_FORMAT === 'compact';
+const DEFAULT_SEARCH_LIMIT = parsePositiveInt(process.env.CONTEXTSTREAM_SEARCH_LIMIT, 3);
+const DEFAULT_SEARCH_CONTENT_MAX_CHARS = parsePositiveInt(process.env.CONTEXTSTREAM_SEARCH_MAX_CHARS, 400);
 
 // =============================================================================
 // END Strategy 7
@@ -2993,14 +3000,43 @@ Access: Free`,
     query: z.string(),
     workspace_id: z.string().uuid().optional(),
     project_id: z.string().uuid().optional(),
-    limit: z.number().optional(),
+    limit: z.number().optional().describe('Max results to return (default: 3)'),
+    offset: z.number().optional().describe('Offset for pagination'),
+    content_max_chars: z.number().optional().describe('Max chars per result content (default: 400)'),
   });
+
+  function normalizeSearchParams(input: {
+    query: string;
+    workspace_id?: string;
+    project_id?: string;
+    limit?: number;
+    offset?: number;
+    content_max_chars?: number;
+  }) {
+    const limit =
+      typeof input.limit === 'number' && input.limit > 0
+        ? Math.min(Math.floor(input.limit), 100)
+        : DEFAULT_SEARCH_LIMIT;
+    const offset = typeof input.offset === 'number' && input.offset > 0 ? Math.floor(input.offset) : undefined;
+    const contentMax =
+      typeof input.content_max_chars === 'number' && input.content_max_chars > 0
+        ? Math.max(50, Math.min(Math.floor(input.content_max_chars), 10000))
+        : DEFAULT_SEARCH_CONTENT_MAX_CHARS;
+    return {
+      query: input.query,
+      workspace_id: resolveWorkspaceId(input.workspace_id),
+      project_id: resolveProjectId(input.project_id),
+      limit,
+      offset,
+      content_max_chars: contentMax,
+    };
+  }
 
   registerTool(
     'search_semantic',
     { title: 'Semantic search', description: 'Semantic vector search', inputSchema: searchSchema },
     async (input) => {
-      const result = await client.searchSemantic(input);
+      const result = await client.searchSemantic(normalizeSearchParams(input));
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -3009,7 +3045,7 @@ Access: Free`,
     'search_hybrid',
     { title: 'Hybrid search', description: 'Hybrid search (semantic + keyword)', inputSchema: searchSchema },
     async (input) => {
-      const result = await client.searchHybrid(input);
+      const result = await client.searchHybrid(normalizeSearchParams(input));
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -3018,7 +3054,7 @@ Access: Free`,
     'search_keyword',
     { title: 'Keyword search', description: 'Keyword search', inputSchema: searchSchema },
     async (input) => {
-      const result = await client.searchKeyword(input);
+      const result = await client.searchKeyword(normalizeSearchParams(input));
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -3027,7 +3063,7 @@ Access: Free`,
     'search_pattern',
     { title: 'Pattern search', description: 'Pattern/regex search', inputSchema: searchSchema },
     async (input) => {
-      const result = await client.searchPattern(input);
+      const result = await client.searchPattern(normalizeSearchParams(input));
       return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
     }
   );
@@ -6172,16 +6208,13 @@ Use this to remove a reminder that is no longer relevant.`,
           query: z.string().describe('Search query'),
           workspace_id: z.string().uuid().optional(),
           project_id: z.string().uuid().optional(),
-          limit: z.number().optional(),
+          limit: z.number().optional().describe('Max results to return (default: 3)'),
+          offset: z.number().optional().describe('Offset for pagination'),
+          content_max_chars: z.number().optional().describe('Max chars per result content (default: 400)'),
         }),
       },
       async (input) => {
-        const params = {
-          query: input.query,
-          workspace_id: resolveWorkspaceId(input.workspace_id),
-          project_id: resolveProjectId(input.project_id),
-          limit: input.limit,
-        };
+        const params = normalizeSearchParams(input);
 
         let result;
         switch (input.mode) {

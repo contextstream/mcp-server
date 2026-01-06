@@ -42,7 +42,7 @@ Rules Version: 0.4.16
 - **For discovery**: Use `session(action="smart_search")` or `search(mode="hybrid")` before any local repo scans
 - **For file/function/config lookups**: Use `search`/`graph` first; only fall back to rg/ls/find if ContextStream returns no results
 - **For code analysis**: Use `graph(action="dependencies")` or `graph(action="impact")` for call/dependency analysis
-- **On [RULES_NOTICE]**: Use `generate_editor_rules(folder_path="<cwd>")` to update rules
+- **On [RULES_NOTICE]**: Use `generate_rules()` to update rules
 - **After completing work**: Always capture decisions/insights with `session(action="capture")`
 - **On mistakes/corrections**: Immediately capture lessons with `session(action="capture_lesson")`
 

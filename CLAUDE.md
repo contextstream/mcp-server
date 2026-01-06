@@ -42,7 +42,7 @@ Rules Version: 0.4.16
 - **For discovery**: Use `mcp__contextstream__session(action="smart_search")` or `mcp__contextstream__search(mode="hybrid")` before any local repo scans
 - **For file/function/config lookups**: Use `mcp__contextstream__search`/`mcp__contextstream__graph` first; only fall back to rg/ls/find if ContextStream returns no results
 - **For code analysis**: Use `mcp__contextstream__graph(action="dependencies")` or `mcp__contextstream__graph(action="impact")` for call/dependency analysis
-- **On [RULES_NOTICE]**: Use `mcp__contextstream__generate_editor_rules(folder_path="<cwd>")` to update rules
+- **On [RULES_NOTICE]**: Use `mcp__contextstream__generate_rules()` to update rules
 - **After completing work**: Always capture decisions/insights with `mcp__contextstream__session(action="capture")`
 - **On mistakes/corrections**: Immediately capture lessons with `mcp__contextstream__session(action="capture_lesson")`
 

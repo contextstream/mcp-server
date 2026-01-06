@@ -25,6 +25,7 @@ const CONTEXTSTREAM_TOOL_NAMES = [
   'session_init',
   'context_smart',
   'context_feedback',
+  'generate_rules',
 
   // Consolidated domain tools (v0.4.x default)
   'search',       // Modes: semantic, hybrid, keyword, pattern
@@ -128,7 +129,7 @@ If context still feels missing, use \`session(action="recall", query="...")\` fo
 
 ### Rules Update Notices
 
-- If you see **\[RULES_NOTICE]**, update rules via \`generate_editor_rules(folder_path="<cwd>")\` (or rerun setup).
+- If you see **\[RULES_NOTICE]**, update rules via \`generate_rules()\` (or rerun setup).
 - If you see **\[VERSION_NOTICE]**, tell the user to update MCP using the provided command.
 
 ---
@@ -282,7 +283,7 @@ Rules Version: ${RULES_VERSION}
 - **For file/function/config lookups**: Use \`search\`/\`graph\` first; only fall back to rg/ls/find if ContextStream returns no results
 - **If ContextStream returns results**: Do NOT use local Search/Explore/Read; only open specific files when needed for exact edits
 - **For code analysis**: Use \`graph(action="dependencies")\` or \`graph(action="impact")\` for call/dependency analysis
-- **On [RULES_NOTICE]**: Use \`generate_editor_rules(folder_path="<cwd>")\` to update rules
+- **On [RULES_NOTICE]**: Use \`generate_rules()\` to update rules
 - **After completing work**: Always capture decisions/insights with \`session(action="capture")\`
 - **On mistakes/corrections**: Immediately capture lessons with \`session(action="capture_lesson")\`
 

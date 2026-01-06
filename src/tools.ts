@@ -77,7 +77,7 @@ type RulesNotice = {
   files_checked: string[];
   files_outdated?: string[];
   files_missing_version?: string[];
-  update_tool: 'generate_editor_rules';
+  update_tool: 'generate_rules';
   update_args: {
     folder_path?: string;
     editors?: string[];
@@ -209,14 +209,12 @@ function getRulesNotice(folderPath: string | null, clientName?: string): RulesNo
   const candidates = resolveRulesCandidatePaths(folderPath, editorKey);
   const existing = candidates.filter((filePath) => fs.existsSync(filePath));
   if (existing.length === 0) {
-    const updateCommand = folderPath
-      ? `generate_editor_rules(folder_path="${folderPath}")`
-      : 'generate_editor_rules(folder_path="<cwd>")';
+    const updateCommand = 'generate_rules()';
     const notice: RulesNotice = {
       status: 'missing',
       latest: RULES_VERSION,
       files_checked: candidates,
-      update_tool: 'generate_editor_rules',
+      update_tool: 'generate_rules',
       update_args: {
         ...(folderPath ? { folder_path: folderPath } : {}),
         editors: editorKey ? [editorKey] : ['all'],
@@ -254,9 +252,7 @@ function getRulesNotice(folderPath: string | null, clientName?: string): RulesNo
   }
 
   const current = versions.sort(compareVersions).at(-1);
-  const updateCommand = folderPath
-    ? `generate_editor_rules(folder_path="${folderPath}")`
-    : 'generate_editor_rules(folder_path="<cwd>")';
+  const updateCommand = 'generate_rules()';
 
   const notice: RulesNotice = {
     status: filesOutdated.length > 0 ? 'behind' : 'unknown',
@@ -265,7 +261,7 @@ function getRulesNotice(folderPath: string | null, clientName?: string): RulesNo
     files_checked: existing,
     ...(filesOutdated.length > 0 ? { files_outdated: filesOutdated } : {}),
     ...(filesMissingVersion.length > 0 ? { files_missing_version: filesMissingVersion } : {}),
-    update_tool: 'generate_editor_rules',
+    update_tool: 'generate_rules',
     update_args: {
       ...(folderPath ? { folder_path: folderPath } : {}),
       editors: editorKey ? [editorKey] : ['all'],
@@ -531,6 +527,68 @@ async function writeEditorRules(options: {
   return results;
 }
 
+type RuleWriteResult = { editor: string; filename: string; status: string };
+
+function listGlobalRuleTargets(editors: string[]): Array<{ editor: string; filePath: string }> {
+  const targets: Array<{ editor: string; filePath: string }> = [];
+  for (const editor of editors) {
+    const globalPaths = RULES_GLOBAL_FILES[editor];
+    if (!globalPaths || globalPaths.length === 0) {
+      continue;
+    }
+    for (const filePath of globalPaths) {
+      targets.push({ editor, filePath });
+    }
+  }
+  return targets;
+}
+
+async function writeGlobalRules(options: {
+  editors: string[];
+  mode?: 'minimal' | 'full';
+  overwriteExisting?: boolean;
+}): Promise<Array<RuleWriteResult & { scope: 'global' }>> {
+  const results: Array<RuleWriteResult & { scope: 'global' }> = [];
+
+  for (const editor of options.editors) {
+    const rule = generateRuleContent(editor, {
+      mode: options.mode,
+    });
+
+    if (!rule) {
+      results.push({ editor, filename: '', status: 'unknown editor', scope: 'global' });
+      continue;
+    }
+
+    const globalPaths = RULES_GLOBAL_FILES[editor] ?? [];
+    if (globalPaths.length === 0) {
+      results.push({ editor, filename: rule.filename, status: 'skipped (no global path)', scope: 'global' });
+      continue;
+    }
+
+    for (const filePath of globalPaths) {
+      if (fs.existsSync(filePath) && !options.overwriteExisting) {
+        results.push({ editor, filename: filePath, status: 'skipped (exists)', scope: 'global' });
+        continue;
+      }
+      try {
+        const status = await upsertRuleFile(filePath, rule.content);
+        results.push({ editor, filename: filePath, status, scope: 'global' });
+      } catch (err) {
+        results.push({
+          editor,
+          filename: filePath,
+          status: `error: ${(err as Error).message}`,
+          scope: 'global',
+        });
+      }
+    }
+  }
+
+  rulesNoticeCache.clear();
+  return results;
+}
+
 const WRITE_VERBS = new Set([
   'create',
   'update',
@@ -768,6 +826,7 @@ const LIGHT_TOOLSET = new Set<string>([
   'session_delta',
   // Setup and configuration (3)
   'generate_editor_rules',
+  'generate_rules',
   'workspace_associate',
   'workspace_bootstrap',
   // Project management (5)
@@ -815,6 +874,7 @@ const STANDARD_TOOLSET = new Set<string>([
   'session_delta',
   // Setup and configuration (3)
   'generate_editor_rules',
+  'generate_rules',
   'workspace_associate',
   'workspace_bootstrap',
   // Workspace management (2)
@@ -1140,6 +1200,7 @@ const TOOL_BUNDLES: Record<string, Set<string>> = {
     'session_delta',
     'decision_trace',
     'generate_editor_rules',
+    'generate_rules',
   ]),
 
   // Memory bundle (~12 tools) - full memory CRUD operations
@@ -1330,7 +1391,7 @@ function inferOperationCategory(name: string): string {
   if (name.startsWith('reminder')) return 'Reminders';
   if (name.startsWith('slack_') || name.startsWith('github_') || name.startsWith('integration')) return 'Integrations';
   if (name.startsWith('ai_')) return 'AI';
-  if (name === 'auth_me' || name === 'mcp_server_version' || name === 'generate_editor_rules') return 'Utility';
+  if (name === 'auth_me' || name === 'mcp_server_version' || name === 'generate_editor_rules' || name === 'generate_rules') return 'Utility';
   if (name === 'tools_enable_bundle' || name === 'contextstream' || name === 'contextstream_help') return 'Meta';
   return 'Other';
 }
@@ -1450,6 +1511,7 @@ const CONSOLIDATED_MODE = process.env.CONTEXTSTREAM_CONSOLIDATED !== 'false';
 const CONSOLIDATED_TOOLS = new Set<string>([
   'session_init',    // Standalone - complex initialization
   'context_smart',   // Standalone - called every message
+  'generate_rules',  // Standalone - rule generation helper
   'search',          // Consolidates search_semantic, search_hybrid, search_keyword, search_pattern
   'session',         // Consolidates session_capture, session_recall, etc.
   'memory',          // Consolidates memory_create_event, memory_get_event, etc.
@@ -4705,6 +4767,122 @@ Example: "What were the auth decisions?" or "What are my TypeScript preferences?
   );
 
   // Editor rules generation
+  registerTool(
+    'generate_rules',
+    {
+      title: 'Generate ContextStream rules',
+      description: `Generate AI rule files for editors (Windsurf, Cursor, Cline, Kilo Code, Roo Code, Claude Code, Aider).
+Defaults to the current project folder; no folder_path required when run from a project.
+Supported editors: ${getAvailableEditors().join(', ')}`,
+      inputSchema: z.object({
+        folder_path: z.string().optional().describe('Absolute path to the project folder (defaults to IDE root/cwd)'),
+        editors: z.array(z.enum(['codex', 'windsurf', 'cursor', 'cline', 'kilo', 'roo', 'claude', 'aider', 'all']))
+          .optional()
+          .describe('Which editors to generate rules for. Defaults to all.'),
+        workspace_name: z.string().optional().describe('Workspace name to include in rules'),
+        workspace_id: z.string().uuid().optional().describe('Workspace ID to include in rules'),
+        project_name: z.string().optional().describe('Project name to include in rules'),
+        additional_rules: z.string().optional().describe('Additional project-specific rules to append'),
+        mode: z.enum(['minimal', 'full']).optional().describe('Rule verbosity mode (default: minimal)'),
+        overwrite_existing: z.boolean().optional().describe('Allow overwriting existing rule files (ContextStream block only)'),
+        apply_global: z.boolean().optional().describe('Also write global rule files for supported editors'),
+        dry_run: z.boolean().optional().describe('If true, return content without writing files'),
+      }),
+    },
+    async (input) => {
+      const folderPath = resolveFolderPath(input.folder_path, sessionManager);
+      if (!folderPath) {
+        return errorResult('Error: folder_path is required. Provide folder_path or run from a project directory.');
+      }
+
+      const editors = input.editors?.includes('all') || !input.editors
+        ? getAvailableEditors()
+        : input.editors.filter(e => e !== 'all');
+
+      const results: RuleWriteResult[] = [];
+
+      if (input.dry_run) {
+        for (const editor of editors) {
+          const rule = generateRuleContent(editor, {
+            workspaceName: input.workspace_name,
+            workspaceId: input.workspace_id,
+            projectName: input.project_name,
+            additionalRules: input.additional_rules,
+            mode: input.mode,
+          });
+
+          if (!rule) {
+            results.push({ editor, filename: '', status: 'unknown editor' });
+            continue;
+          }
+
+          results.push({
+            editor,
+            filename: rule.filename,
+            status: 'dry run - would update',
+          });
+        }
+      } else {
+        const writeResults = await writeEditorRules({
+          folderPath,
+          editors,
+          workspaceName: input.workspace_name,
+          workspaceId: input.workspace_id,
+          projectName: input.project_name,
+          additionalRules: input.additional_rules,
+          mode: input.mode,
+          overwriteExisting: input.overwrite_existing,
+        });
+        results.push(...writeResults);
+      }
+
+      const globalTargets = listGlobalRuleTargets(editors);
+      let globalResults: Array<RuleWriteResult & { scope: 'global' }> | undefined;
+
+      if (input.apply_global) {
+        if (input.dry_run) {
+          globalResults = globalTargets.map((target) => ({
+            editor: target.editor,
+            filename: target.filePath,
+            status: 'dry run - would update',
+            scope: 'global',
+          }));
+        } else {
+          globalResults = await writeGlobalRules({
+            editors,
+            mode: input.mode,
+            overwriteExisting: input.overwrite_existing,
+          });
+        }
+      }
+
+      const createdCount = results.filter(r => r.status === 'created' || r.status === 'updated' || r.status === 'appended').length;
+      const skippedCount = results.filter(r => r.status.startsWith('skipped')).length;
+      const baseMessage = input.dry_run
+        ? 'Dry run complete. Use dry_run: false to write files.'
+        : skippedCount > 0
+          ? `Generated ${createdCount} rule files. ${skippedCount} skipped (existing files). Re-run with overwrite_existing: true to replace ContextStream blocks.`
+          : `Generated ${createdCount} rule files.`;
+
+      const globalPrompt = input.apply_global
+        ? 'Global rule update complete.'
+        : globalTargets.length > 0
+          ? 'Apply rules globally too? Re-run with apply_global: true.'
+          : 'No global rule locations are known for these editors.';
+
+      const summary = {
+        folder: folderPath,
+        results,
+        ...(globalResults ? { global_results: globalResults } : {}),
+        ...(globalTargets.length > 0 ? { global_targets: globalTargets } : {}),
+        message: baseMessage,
+        global_prompt: globalPrompt,
+      };
+
+      return { content: [{ type: 'text' as const, text: formatContent(summary) }], structuredContent: toStructured(summary) };
+    }
+  );
+
   registerTool(
     'generate_editor_rules',
     {

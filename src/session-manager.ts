@@ -41,6 +41,13 @@ export class SessionManager {
   }
 
   /**
+   * Get the current folder path (if known)
+   */
+  getFolderPath(): string | null {
+    return this.folderPath;
+  }
+
+  /**
    * Mark session as manually initialized (e.g., when session_init is called explicitly)
    */
   markInitialized(context: Record<string, unknown>) {
@@ -54,6 +61,11 @@ export class SessionManager {
     const projectId = typeof context.project_id === 'string' ? (context.project_id as string) : undefined;
     if (workspaceId || projectId) {
       this.client.setDefaults({ workspace_id: workspaceId, project_id: projectId });
+    }
+
+    const contextFolderPath = typeof context.folder_path === 'string' ? (context.folder_path as string) : undefined;
+    if (contextFolderPath) {
+      this.folderPath = contextFolderPath;
     }
   }
 
@@ -173,6 +185,10 @@ export class SessionManager {
     // Use folder path hint if IDE roots not available
     if (this.ideRoots.length === 0 && this.folderPath) {
       this.ideRoots = [this.folderPath];
+    }
+
+    if (this.ideRoots.length > 0) {
+      this.folderPath = this.ideRoots[0];
     }
 
     // Perform initialization

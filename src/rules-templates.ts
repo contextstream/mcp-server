@@ -1,3 +1,5 @@
+import { VERSION } from './version.js';
+
 /**
  * Editor-specific rule templates for ContextStream integration.
  * These instruct AI assistants to automatically use ContextStream for memory and context.
@@ -10,6 +12,7 @@ export interface RuleTemplate {
 }
 
 const DEFAULT_CLAUDE_MCP_SERVER_NAME = 'contextstream';
+export const RULES_VERSION = VERSION === 'unknown' ? '0.0.0' : VERSION;
 
 /**
  * Complete list of all ContextStream MCP tools (v0.4.x consolidated architecture).
@@ -47,6 +50,7 @@ const CONTEXTSTREAM_RULES_FULL = `
 
 You have access to ContextStream MCP tools for persistent memory and context.
 v0.4.x uses **~11 consolidated domain tools** for ~75% token reduction vs previous versions.
+Rules Version: ${RULES_VERSION}
 
 ## TL;DR - REQUIRED EVERY MESSAGE
 
@@ -118,6 +122,13 @@ If context still feels missing, use \`session(action="recall", query="...")\` fo
 
 ---
 
+### Rules Update Notices
+
+- If you see **\[RULES_NOTICE]**, update rules via \`generate_editor_rules(folder_path="<cwd>")\` (or rerun setup).
+- If you see **\[VERSION_NOTICE]**, tell the user to update MCP using the provided command.
+
+---
+
 ### Preferences & Lessons (Use Early)
 
 - If preferences/style matter: \`session(action="user_context")\`
@@ -135,6 +146,7 @@ Before searching files or code, confirm the project is indexed and the graph is 
    - Local repo: \`project(action="ingest_local", path="<cwd>")\`
    - Otherwise: \`project(action="index")\`
 3. If graph queries are empty/unavailable: \`graph(action="ingest")\`
+4. If indexing is in progress, tell the user and wait; do not fall back to local scans.
 
 Only after this preflight, proceed with search/analysis below.
 
@@ -142,9 +154,12 @@ Only after this preflight, proceed with search/analysis below.
 
 **Search order:**
 1. \`session(action="smart_search", query="...")\` - context-enriched
-2. \`search(mode="hybrid", query="...")\` - semantic + keyword
-3. \`graph(action="dependencies", ...)\` - code structure
-4. Local repo scans (rg/ls/find) - only if ContextStream returns no results
+2. \`search(mode="hybrid", query="...")\` or \`search(mode="keyword", query="<filename>")\`
+3. \`project(action="files")\` - file tree/list (only when needed)
+4. \`graph(action="dependencies", ...)\` - code structure
+5. Local repo scans (rg/ls/find) - only if ContextStream returns no results or is unavailable
+
+Use ContextStream results directly; only open files if you need exact code.
 
 **Code Analysis:**
 - Dependencies: \`graph(action="dependencies", file_path="...")\`
@@ -225,6 +240,7 @@ const CONTEXTSTREAM_RULES_MINIMAL = `
 ## ContextStream v0.4.x (Consolidated Domain Tools)
 
 v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous versions.
+Rules Version: ${RULES_VERSION}
 
 ### Required Every Message
 
@@ -246,7 +262,7 @@ v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous v
 | \`session\` | \`session(action="capture", ...)\` — actions: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search |
 | \`memory\` | \`memory(action="list_events", ...)\` — CRUD for events/nodes, search, decisions, timeline, summary |
 | \`graph\` | \`graph(action="dependencies", ...)\` — dependencies, impact, call_path, related, ingest |
-| \`project\` | \`project(action="list", ...)\` — list, get, create, update, index, statistics |
+| \`project\` | \`project(action="list", ...)\` - list, get, create, update, index, overview, statistics, files, index_status, ingest_local |
 | \`workspace\` | \`workspace(action="list", ...)\` — list, get, associate, bootstrap |
 | \`integration\` | \`integration(provider="github", action="search", ...)\` — GitHub/Slack integration |
 | \`help\` | \`help(action="tools")\` — tools, auth, version, editor_rules |
@@ -256,8 +272,10 @@ v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous v
 - **First message**: Always call \`session_init\` with context_hint
 - **Every message after**: Always call \`context_smart\` BEFORE responding (semantic search for relevant context)
 - **Before searching files/code**: Check \`project(action="index_status")\`; if missing/stale run \`project(action="ingest_local", path="<cwd>")\` or \`project(action="index")\`, and use \`graph(action="ingest")\` if needed
-- **For discovery**: Use \`session(action="smart_search")\` or \`search(mode="hybrid")\` before local repo scans
+- **For discovery**: Use \`session(action="smart_search")\` or \`search(mode="hybrid")\` before any local repo scans
+- **For file/function/config lookups**: Use \`search\`/\`graph\` first; only fall back to rg/ls/find if ContextStream returns no results
 - **For code analysis**: Use \`graph(action="dependencies")\` or \`graph(action="impact")\` for call/dependency analysis
+- **On [RULES_NOTICE]**: Use \`generate_editor_rules(folder_path="<cwd>")\` to update rules
 - **After completing work**: Always capture decisions/insights with \`session(action="capture")\`
 - **On mistakes/corrections**: Immediately capture lessons with \`session(action="capture_lesson")\`
 

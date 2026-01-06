@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { VERSION } from './version.js';
 
 const DEFAULT_API_URL = 'https://api.contextstream.io';
 
@@ -16,7 +17,7 @@ const configSchema = z.object({
   jwt: z.string().min(1).optional(),
   defaultWorkspaceId: z.string().uuid().optional(),
   defaultProjectId: z.string().uuid().optional(),
-  userAgent: z.string().default('contextstream-mcp/0.1.0'),
+  userAgent: z.string().default(`contextstream-mcp/${VERSION}`),
   allowHeaderAuth: z.boolean().optional(),
   contextPackEnabled: z.boolean().default(true),
 });

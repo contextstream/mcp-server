@@ -1,13 +1,14 @@
 import { z, type ZodRawShape } from 'zod';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { homedir } from 'node:os';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { MessageExtraInfo, ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
 import type { ContextStreamClient } from './client.js';
 import { readFilesFromDirectory, readAllFilesInBatches, countIndexableFiles } from './files.js';
 import { SessionManager } from './session-manager.js';
-import { getAvailableEditors, generateRuleContent, generateAllRuleFiles } from './rules-templates.js';
-import { VERSION } from './version.js';
+import { getAvailableEditors, generateRuleContent, generateAllRuleFiles, RULES_VERSION } from './rules-templates.js';
+import { VERSION, getUpdateNotice } from './version.js';
 import { generateToolCatalog, getCoreToolsHint, type CatalogFormat } from './tool-catalog.js';
 import { getAuthOverride, runWithAuthOverride, type AuthOverride } from './auth-context.js';
 
@@ -66,6 +67,303 @@ const uuidSchema = z.string().uuid();
 function normalizeUuid(value?: string): string | undefined {
   if (!value) return undefined;
   return uuidSchema.safeParse(value).success ? value : undefined;
+}
+
+type RulesNotice = {
+  status: 'behind' | 'missing' | 'unknown';
+  current?: string;
+  latest: string;
+  files_checked: string[];
+  files_outdated?: string[];
+  files_missing_version?: string[];
+  update_tool: 'generate_editor_rules';
+  update_args: {
+    folder_path?: string;
+    editors?: string[];
+    mode?: 'minimal' | 'full';
+  };
+  update_command: string;
+};
+
+const RULES_NOTICE_CACHE_TTL_MS = 10 * 60 * 1000;
+const RULES_VERSION_REGEX = /Rules Version:\s*([0-9][0-9A-Za-z.\-]*)/i;
+
+const RULES_PROJECT_FILES: Record<string, string> = {
+  codex: 'AGENTS.md',
+  claude: 'CLAUDE.md',
+  cursor: '.cursorrules',
+  windsurf: '.windsurfrules',
+  cline: '.clinerules',
+  kilo: path.join('.kilocode', 'rules', 'contextstream.md'),
+  roo: path.join('.roo', 'rules', 'contextstream.md'),
+  aider: '.aider.conf.yml',
+};
+
+const RULES_GLOBAL_FILES: Partial<Record<string, string[]>> = {
+  codex: [path.join(homedir(), '.codex', 'AGENTS.md')],
+  windsurf: [path.join(homedir(), '.codeium', 'windsurf', 'memories', 'global_rules.md')],
+  kilo: [path.join(homedir(), '.kilocode', 'rules', 'contextstream.md')],
+  roo: [path.join(homedir(), '.roo', 'rules', 'contextstream.md')],
+};
+
+const rulesNoticeCache = new Map<string, { checkedAt: number; notice: RulesNotice | null }>();
+
+function compareVersions(v1: string, v2: string): number {
+  const parts1 = v1.split('.').map(Number);
+  const parts2 = v2.split('.').map(Number);
+
+  for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
+    const p1 = parts1[i] ?? 0;
+    const p2 = parts2[i] ?? 0;
+    if (p1 < p2) return -1;
+    if (p1 > p2) return 1;
+  }
+  return 0;
+}
+
+function extractRulesVersion(content: string): string | null {
+  const match = content.match(RULES_VERSION_REGEX);
+  return match?.[1]?.trim() ?? null;
+}
+
+function detectEditorFromClientName(clientName?: string): string | null {
+  if (!clientName) return null;
+  const normalized = clientName.toLowerCase().trim();
+  if (normalized.includes('cursor')) return 'cursor';
+  if (normalized.includes('windsurf') || normalized.includes('codeium')) return 'windsurf';
+  if (normalized.includes('claude')) return 'claude';
+  if (normalized.includes('cline')) return 'cline';
+  if (normalized.includes('kilo')) return 'kilo';
+  if (normalized.includes('roo')) return 'roo';
+  if (normalized.includes('codex')) return 'codex';
+  if (normalized.includes('aider')) return 'aider';
+  return null;
+}
+
+function resolveRulesCandidatePaths(folderPath: string | null, editorKey: string | null): string[] {
+  const candidates = new Set<string>();
+
+  const addProject = (key: string) => {
+    if (!folderPath) return;
+    const rel = RULES_PROJECT_FILES[key];
+    if (rel) {
+      candidates.add(path.join(folderPath, rel));
+    }
+  };
+
+  const addGlobal = (key: string) => {
+    const paths = RULES_GLOBAL_FILES[key];
+    if (!paths) return;
+    for (const p of paths) {
+      candidates.add(p);
+    }
+  };
+
+  if (editorKey) {
+    addProject(editorKey);
+    addGlobal(editorKey);
+  } else {
+    for (const key of Object.keys(RULES_PROJECT_FILES)) {
+      addProject(key);
+      addGlobal(key);
+    }
+  }
+
+  return Array.from(candidates);
+}
+
+function resolveFolderPath(inputPath?: string, sessionManager?: SessionManager): string | null {
+  if (inputPath) return inputPath;
+  const fromSession = sessionManager?.getFolderPath();
+  if (fromSession) return fromSession;
+  const ctxPath = sessionManager?.getContext();
+  const contextFolder = ctxPath && typeof ctxPath.folder_path === 'string' ? (ctxPath.folder_path as string) : null;
+  if (contextFolder) return contextFolder;
+
+  const cwd = process.cwd();
+  const indicators = ['.git', 'package.json', 'Cargo.toml', 'pyproject.toml', '.contextstream'];
+  const hasIndicator = indicators.some((entry) => {
+    try {
+      return fs.existsSync(path.join(cwd, entry));
+    } catch {
+      return false;
+    }
+  });
+  return hasIndicator ? cwd : null;
+}
+
+function getRulesNotice(folderPath: string | null, clientName?: string): RulesNotice | null {
+  if (!RULES_VERSION || RULES_VERSION === '0.0.0') return null;
+
+  const editorKey = detectEditorFromClientName(clientName);
+  if (!folderPath && !editorKey) {
+    return null;
+  }
+  const cacheKey = `${folderPath ?? 'none'}|${editorKey ?? 'all'}`;
+  const cached = rulesNoticeCache.get(cacheKey);
+  if (cached && Date.now() - cached.checkedAt < RULES_NOTICE_CACHE_TTL_MS) {
+    return cached.notice;
+  }
+
+  const candidates = resolveRulesCandidatePaths(folderPath, editorKey);
+  const existing = candidates.filter((filePath) => fs.existsSync(filePath));
+  if (existing.length === 0) {
+    const updateCommand = folderPath
+      ? `generate_editor_rules(folder_path="${folderPath}")`
+      : 'generate_editor_rules(folder_path="<cwd>")';
+    const notice: RulesNotice = {
+      status: 'missing',
+      latest: RULES_VERSION,
+      files_checked: candidates,
+      update_tool: 'generate_editor_rules',
+      update_args: {
+        ...(folderPath ? { folder_path: folderPath } : {}),
+        editors: editorKey ? [editorKey] : ['all'],
+      },
+      update_command: updateCommand,
+    };
+    rulesNoticeCache.set(cacheKey, { checkedAt: Date.now(), notice });
+    return notice;
+  }
+
+  const filesMissingVersion: string[] = [];
+  const filesOutdated: string[] = [];
+  const versions: string[] = [];
+
+  for (const filePath of existing) {
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const version = extractRulesVersion(content);
+      if (!version) {
+        filesMissingVersion.push(filePath);
+        continue;
+      }
+      versions.push(version);
+      if (compareVersions(version, RULES_VERSION) < 0) {
+        filesOutdated.push(filePath);
+      }
+    } catch {
+      filesMissingVersion.push(filePath);
+    }
+  }
+
+  if (filesOutdated.length === 0 && filesMissingVersion.length === 0) {
+    rulesNoticeCache.set(cacheKey, { checkedAt: Date.now(), notice: null });
+    return null;
+  }
+
+  const current = versions.sort(compareVersions).at(-1);
+  const updateCommand = folderPath
+    ? `generate_editor_rules(folder_path="${folderPath}")`
+    : 'generate_editor_rules(folder_path="<cwd>")';
+
+  const notice: RulesNotice = {
+    status: filesOutdated.length > 0 ? 'behind' : 'unknown',
+    current,
+    latest: RULES_VERSION,
+    files_checked: existing,
+    ...(filesOutdated.length > 0 ? { files_outdated: filesOutdated } : {}),
+    ...(filesMissingVersion.length > 0 ? { files_missing_version: filesMissingVersion } : {}),
+    update_tool: 'generate_editor_rules',
+    update_args: {
+      ...(folderPath ? { folder_path: folderPath } : {}),
+      editors: editorKey ? [editorKey] : ['all'],
+    },
+    update_command: updateCommand,
+  };
+
+  rulesNoticeCache.set(cacheKey, { checkedAt: Date.now(), notice });
+  return notice;
+}
+
+const CONTEXTSTREAM_START_MARKER = '<!-- BEGIN ContextStream -->';
+const CONTEXTSTREAM_END_MARKER = '<!-- END ContextStream -->';
+
+function wrapWithMarkers(content: string): string {
+  return `${CONTEXTSTREAM_START_MARKER}\n${content.trim()}\n${CONTEXTSTREAM_END_MARKER}`;
+}
+
+async function upsertRuleFile(filePath: string, content: string): Promise<'created' | 'updated' | 'appended'> {
+  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+  const wrappedContent = wrapWithMarkers(content);
+
+  let existing = '';
+  try {
+    existing = await fs.promises.readFile(filePath, 'utf8');
+  } catch {
+    // file does not exist yet
+  }
+
+  if (!existing) {
+    await fs.promises.writeFile(filePath, wrappedContent + '\n', 'utf8');
+    return 'created';
+  }
+
+  const startIdx = existing.indexOf(CONTEXTSTREAM_START_MARKER);
+  const endIdx = existing.indexOf(CONTEXTSTREAM_END_MARKER);
+
+  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+    const before = existing.substring(0, startIdx);
+    const after = existing.substring(endIdx + CONTEXTSTREAM_END_MARKER.length);
+    const updated = before.trimEnd() + '\n\n' + wrappedContent + '\n' + after.trimStart();
+    await fs.promises.writeFile(filePath, updated.trim() + '\n', 'utf8');
+    return 'updated';
+  }
+
+  const joined = existing.trimEnd() + '\n\n' + wrappedContent + '\n';
+  await fs.promises.writeFile(filePath, joined, 'utf8');
+  return 'appended';
+}
+
+async function writeEditorRules(options: {
+  folderPath: string;
+  editors?: string[];
+  workspaceName?: string;
+  workspaceId?: string;
+  projectName?: string;
+  additionalRules?: string;
+  mode?: 'minimal' | 'full';
+}): Promise<Array<{ editor: string; filename: string; status: string }>> {
+  const editors = options.editors && options.editors.length > 0
+    ? options.editors
+    : getAvailableEditors();
+
+  const results: Array<{ editor: string; filename: string; status: string }> = [];
+
+  for (const editor of editors) {
+    const rule = generateRuleContent(editor, {
+      workspaceName: options.workspaceName,
+      workspaceId: options.workspaceId,
+      projectName: options.projectName,
+      additionalRules: options.additionalRules,
+      mode: options.mode,
+    });
+
+    if (!rule) {
+      results.push({ editor, filename: '', status: 'unknown editor' });
+      continue;
+    }
+
+    const filePath = path.join(options.folderPath, rule.filename);
+    try {
+      const status = await upsertRuleFile(filePath, rule.content);
+      results.push({ editor, filename: rule.filename, status });
+    } catch (err) {
+      results.push({
+        editor,
+        filename: rule.filename,
+        status: `error: ${(err as Error).message}`,
+      });
+    }
+  }
+
+  for (const key of rulesNoticeCache.keys()) {
+    if (key.startsWith(`${options.folderPath}|`)) {
+      rulesNoticeCache.delete(key);
+    }
+  }
+
+  return results;
 }
 
 const WRITE_VERBS = new Set([
@@ -2376,33 +2674,15 @@ Access: Free`,
 
           // Generate editor rules if requested
           if (input.generate_editor_rules) {
-            for (const editor of getAvailableEditors()) {
-              const rule = generateRuleContent(editor, {
-                workspaceId: workspaceId,
-                projectName: input.name,
-              });
-              if (rule) {
-                const filePath = path.join(input.folder_path, rule.filename);
-                try {
-                  let existingContent = '';
-                  try {
-                    existingContent = fs.readFileSync(filePath, 'utf-8');
-                  } catch {
-                    // File doesn't exist
-                  }
-
-                  if (!existingContent) {
-                    fs.writeFileSync(filePath, rule.content);
-                    rulesGenerated.push(rule.filename);
-                  } else if (!existingContent.includes('ContextStream')) {
-                    fs.writeFileSync(filePath, existingContent + '\n\n' + rule.content);
-                    rulesGenerated.push(rule.filename + ' (appended)');
-                  }
-                } catch {
-                  // Ignore errors for individual files
-                }
-              }
-            }
+            const ruleResults = await writeEditorRules({
+              folderPath: input.folder_path,
+              editors: getAvailableEditors(),
+              workspaceId: workspaceId,
+              projectName: input.name,
+            });
+            rulesGenerated = ruleResults
+              .filter(r => r.status === 'created' || r.status === 'updated' || r.status === 'appended')
+              .map(r => (r.status === 'created' ? r.filename : `${r.filename} (${r.status})`));
           }
         } catch (err: unknown) {
           // Log but don't fail - project was created successfully
@@ -3460,6 +3740,29 @@ This does semantic search on the first message. You only need context_smart on s
         sessionManager.markInitialized(result);
       }
 
+      const folderPathForRules = input.folder_path || ideRoots[0] || resolveFolderPath(undefined, sessionManager);
+      if (sessionManager && folderPathForRules) {
+        sessionManager.setFolderPath(folderPathForRules);
+      }
+
+      let rulesNotice: RulesNotice | null = null;
+      if (folderPathForRules || detectedClientInfo?.name) {
+        rulesNotice = getRulesNotice(folderPathForRules, detectedClientInfo?.name);
+        if (rulesNotice) {
+          (result as any).rules_notice = rulesNotice;
+        }
+      }
+
+      let versionNotice: Awaited<ReturnType<typeof getUpdateNotice>> | null = null;
+      try {
+        versionNotice = await getUpdateNotice();
+      } catch {
+        // ignore version check failures
+      }
+      if (versionNotice) {
+        (result as any).version_notice = versionNotice;
+      }
+
       // Check integration status and update tracking (Strategy 2)
       // This enables dynamic tool list updates for connected integrations
       const workspaceId = typeof result.workspace_id === 'string' ? (result.workspace_id as string) : undefined;
@@ -3558,6 +3861,18 @@ This does semantic search on the first message. You only need context_smart on s
         text = [`Warning: ${workspaceWarning}`, '', formatContent(result)].join('\n');
       }
 
+      const noticeLines: string[] = [];
+      if (rulesNotice) {
+        const current = rulesNotice.current ?? 'unknown';
+        noticeLines.push(`[RULES_NOTICE] status=${rulesNotice.status} current=${current} latest=${rulesNotice.latest} update="${rulesNotice.update_command}"`);
+      }
+      if (versionNotice?.behind) {
+        noticeLines.push(`[VERSION_NOTICE] current=${versionNotice.current} latest=${versionNotice.latest} upgrade="${versionNotice.upgrade_command}"`);
+      }
+      if (noticeLines.length > 0) {
+        text = `${text}\n\n${noticeLines.join('\n')}`;
+      }
+
       return { content: [{ type: 'text' as const, text }], structuredContent: toStructured(result) };
     }
   );
@@ -3652,37 +3967,15 @@ Optionally generates AI editor rules for automatic ContextStream usage.`,
       // Optionally generate editor rules
       let rulesGenerated: string[] = [];
       if (input.generate_editor_rules) {
-        const fs = await import('fs');
-        const path = await import('path');
-        
-        for (const editor of getAvailableEditors()) {
-          const rule = generateRuleContent(editor, {
-            workspaceName: input.workspace_name,
-            workspaceId: input.workspace_id,
-          });
-          if (rule) {
-            const filePath = path.join(input.folder_path, rule.filename);
-            try {
-              // Only create if doesn't exist or already has ContextStream section
-              let existingContent = '';
-              try {
-                existingContent = fs.readFileSync(filePath, 'utf-8');
-              } catch {
-                // File doesn't exist
-              }
-              
-              if (!existingContent) {
-                fs.writeFileSync(filePath, rule.content);
-                rulesGenerated.push(rule.filename);
-              } else if (!existingContent.includes('ContextStream Integration')) {
-                fs.writeFileSync(filePath, existingContent + '\n\n' + rule.content);
-                rulesGenerated.push(rule.filename + ' (appended)');
-              }
-            } catch {
-              // Ignore errors for individual files
-            }
-          }
-        }
+        const ruleResults = await writeEditorRules({
+          folderPath: input.folder_path,
+          editors: getAvailableEditors(),
+          workspaceName: input.workspace_name,
+          workspaceId: input.workspace_id,
+        });
+        rulesGenerated = ruleResults
+          .filter(r => r.status === 'created' || r.status === 'updated' || r.status === 'appended')
+          .map(r => (r.status === 'created' ? r.filename : `${r.filename} (${r.status})`));
       }
       
       const response = {
@@ -3776,36 +4069,15 @@ Behavior:
       // Optionally generate editor rules
       let rulesGenerated: string[] = [];
       if (input.generate_editor_rules) {
-        const fs = await import('fs');
-        const path = await import('path');
-
-        for (const editor of getAvailableEditors()) {
-          const rule = generateRuleContent(editor, {
-            workspaceName: newWorkspace.name || input.workspace_name,
-            workspaceId: newWorkspace.id,
-          });
-          if (!rule) continue;
-
-          const filePath = path.join(folderPath, rule.filename);
-          try {
-            let existingContent = '';
-            try {
-              existingContent = fs.readFileSync(filePath, 'utf-8');
-            } catch {
-              // File doesn't exist
-            }
-
-            if (!existingContent) {
-              fs.writeFileSync(filePath, rule.content);
-              rulesGenerated.push(rule.filename);
-            } else if (!existingContent.includes('ContextStream Integration')) {
-              fs.writeFileSync(filePath, existingContent + '\n\n' + rule.content);
-              rulesGenerated.push(rule.filename + ' (appended)');
-            }
-          } catch {
-            // Ignore per-file failures
-          }
-        }
+        const ruleResults = await writeEditorRules({
+          folderPath,
+          editors: getAvailableEditors(),
+          workspaceName: newWorkspace.name || input.workspace_name,
+          workspaceId: newWorkspace.id,
+        });
+        rulesGenerated = ruleResults
+          .filter(r => r.status === 'created' || r.status === 'updated' || r.status === 'appended')
+          .map(r => (r.status === 'created' ? r.filename : `${r.filename} (${r.status})`));
       }
 
       // Initialize a session for this folder; this creates the project (folder name) and starts indexing (if enabled)
@@ -4255,7 +4527,7 @@ Example: "What were the auth decisions?" or "What are my TypeScript preferences?
 These rules instruct the AI to automatically use ContextStream for memory and context.
 Supported editors: ${getAvailableEditors().join(', ')}`,
       inputSchema: z.object({
-        folder_path: z.string().describe('Absolute path to the project folder'),
+        folder_path: z.string().optional().describe('Absolute path to the project folder (defaults to IDE root/cwd)'),
         editors: z.array(z.enum(['codex', 'windsurf', 'cursor', 'cline', 'kilo', 'roo', 'claude', 'aider', 'all']))
           .optional()
           .describe('Which editors to generate rules for. Defaults to all.'),
@@ -4268,74 +4540,58 @@ Supported editors: ${getAvailableEditors().join(', ')}`,
       }),
     },
     async (input) => {
-      const fs = await import('fs');
-      const path = await import('path');
-      
-      const editors = input.editors?.includes('all') || !input.editors 
-        ? getAvailableEditors() 
+      const folderPath = resolveFolderPath(input.folder_path, sessionManager);
+      if (!folderPath) {
+        return errorResult('Error: folder_path is required. Provide folder_path or run from a project directory.');
+      }
+
+      const editors = input.editors?.includes('all') || !input.editors
+        ? getAvailableEditors()
         : input.editors.filter(e => e !== 'all');
-      
+
       const results: Array<{ editor: string; filename: string; status: string; content?: string }> = [];
-      
-      for (const editor of editors) {
-        const rule = generateRuleContent(editor, {
+
+      if (input.dry_run) {
+        for (const editor of editors) {
+          const rule = generateRuleContent(editor, {
+            workspaceName: input.workspace_name,
+            workspaceId: input.workspace_id,
+            projectName: input.project_name,
+            additionalRules: input.additional_rules,
+            mode: input.mode,
+          });
+
+          if (!rule) {
+            results.push({ editor, filename: '', status: 'unknown editor' });
+            continue;
+          }
+
+          results.push({
+            editor,
+            filename: rule.filename,
+            status: 'dry run - would update',
+            content: rule.content,
+          });
+        }
+      } else {
+        const writeResults = await writeEditorRules({
+          folderPath,
+          editors,
           workspaceName: input.workspace_name,
           workspaceId: input.workspace_id,
           projectName: input.project_name,
           additionalRules: input.additional_rules,
           mode: input.mode,
         });
-        
-        if (!rule) {
-          results.push({ editor, filename: '', status: 'unknown editor' });
-          continue;
-        }
-        
-        const filePath = path.join(input.folder_path, rule.filename);
-        
-        if (input.dry_run) {
-          results.push({ 
-            editor, 
-            filename: rule.filename, 
-            status: 'dry run - would create',
-            content: rule.content,
-          });
-        } else {
-          try {
-            // Check if file exists and has custom content
-            let existingContent = '';
-            try {
-              existingContent = fs.readFileSync(filePath, 'utf-8');
-            } catch {
-              // File doesn't exist
-            }
-            
-            if (existingContent && !existingContent.includes('ContextStream Integration')) {
-              // Append to existing file
-              const updatedContent = existingContent + '\n\n' + rule.content;
-              fs.writeFileSync(filePath, updatedContent);
-              results.push({ editor, filename: rule.filename, status: 'appended to existing' });
-            } else {
-              // Create or overwrite
-              fs.writeFileSync(filePath, rule.content);
-              results.push({ editor, filename: rule.filename, status: 'created' });
-            }
-          } catch (err) {
-            results.push({ 
-              editor, 
-              filename: rule.filename, 
-              status: `error: ${(err as Error).message}`,
-            });
-          }
-        }
+        results.push(...writeResults);
       }
       
       const summary = {
-        folder: input.folder_path,
+        folder: folderPath,
         results,
         message: input.dry_run 
           ? 'Dry run complete. Use dry_run: false to write files.'
-          : `Generated ${results.filter(r => r.status === 'created' || r.status.includes('appended')).length} rule files.`,
+          : `Generated ${results.filter(r => r.status === 'created' || r.status === 'updated' || r.status === 'appended').length} rule files.`,
       };
       
       return { content: [{ type: 'text' as const, text: formatContent(summary) }], structuredContent: toStructured(summary) };
@@ -4645,13 +4901,34 @@ This saves ~80% tokens compared to including full chat history.`,
 
       // Return context directly for easy inclusion in AI prompts
       const footer = `\n---\n🎯 ${result.sources_used} sources | ~${result.token_estimate} tokens | format: ${result.format}`;
-      const versionNoticeLine = result.version_notice?.behind
-        ? `\n[VERSION_NOTICE] current=${result.version_notice.current} latest=${result.version_notice.latest} upgrade="${result.version_notice.upgrade_command}"`
+      const folderPathForRules = resolveFolderPath(undefined, sessionManager);
+      const rulesNotice = getRulesNotice(folderPathForRules, detectedClientInfo?.name);
+
+      let versionNotice = result.version_notice;
+      if (!versionNotice) {
+        try {
+          versionNotice = await getUpdateNotice();
+        } catch {
+          // ignore version check failures
+        }
+      }
+
+      const rulesNoticeLine = rulesNotice
+        ? `\n[RULES_NOTICE] status=${rulesNotice.status} current=${rulesNotice.current ?? 'unknown'} latest=${rulesNotice.latest} update="${rulesNotice.update_command}"`
+        : '';
+      const versionNoticeLine = versionNotice?.behind
+        ? `\n[VERSION_NOTICE] current=${versionNotice.current} latest=${versionNotice.latest} upgrade="${versionNotice.upgrade_command}"`
         : '';
 
+      const enrichedResult = {
+        ...result,
+        ...(rulesNotice ? { rules_notice: rulesNotice } : {}),
+        ...(versionNotice ? { version_notice: versionNotice } : {}),
+      };
+
       return {
-        content: [{ type: 'text' as const, text: result.context + footer + versionNoticeLine }],
-        structuredContent: toStructured(result),
+        content: [{ type: 'text' as const, text: result.context + footer + rulesNoticeLine + versionNoticeLine }],
+        structuredContent: toStructured(enrichedResult),
       };
     }
   );

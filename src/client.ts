@@ -2405,6 +2405,9 @@ export class ContextStreamClient {
           format,
           mode,
           distill: params.distill,
+          client_version: VERSION,
+          rules_version: VERSION,
+          notice_inline: false,
         },
       });
       const data = unwrapApiResponse<any>(apiResult);

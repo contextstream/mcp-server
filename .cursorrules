@@ -7,6 +7,7 @@
 ## ContextStream v0.4.x (Consolidated Domain Tools)
 
 v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous versions.
+Rules Version: 0.4.16
 
 ### Required Every Message
 
@@ -18,6 +19,10 @@ v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous v
 | **Before risky work** | `session(action="get_lessons", query="<topic>")` |
 | **On user frustration** | `session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...")` |
 
+**Context Pack (Pro+):** If enabled, use `context_smart(..., mode="pack", distill=true)` for code/file queries. If unavailable, omit `mode`.
+
+**Context Pack (Pro+):** If enabled, use `context_smart(..., mode="pack", distill=true)` for code/file queries. If unavailable, omit `mode`.
+
 ### Quick Reference: Domain Tools
 
 | Tool | Common Usage |
@@ -26,7 +31,7 @@ v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous v
 | `session` | `session(action="capture", ...)` — actions: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search |
 | `memory` | `memory(action="list_events", ...)` — CRUD for events/nodes, search, decisions, timeline, summary |
 | `graph` | `graph(action="dependencies", ...)` — dependencies, impact, call_path, related, ingest |
-| `project` | `project(action="list", ...)` — list, get, create, update, index, statistics |
+| `project` | `project(action="list", ...)` - list, get, create, update, index, overview, statistics, files, index_status, ingest_local |
 | `workspace` | `workspace(action="list", ...)` — list, get, associate, bootstrap |
 | `integration` | `integration(provider="github", action="search", ...)` — GitHub/Slack integration |
 | `help` | `help(action="tools")` — tools, auth, version, editor_rules |
@@ -35,8 +40,11 @@ v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous v
 
 - **First message**: Always call `session_init` with context_hint
 - **Every message after**: Always call `context_smart` BEFORE responding (semantic search for relevant context)
-- **For discovery**: Use `session(action="smart_search")` or `search(mode="hybrid")` before local repo scans
+- **Before searching files/code**: Check `project(action="index_status")`; if missing/stale run `project(action="ingest_local", path="<cwd>")` or `project(action="index")`, and use `graph(action="ingest")` if needed
+- **For discovery**: Use `session(action="smart_search")` or `search(mode="hybrid")` before any local repo scans
+- **For file/function/config lookups**: Use `search`/`graph` first; only fall back to rg/ls/find if ContextStream returns no results
 - **For code analysis**: Use `graph(action="dependencies")` or `graph(action="impact")` for call/dependency analysis
+- **On [RULES_NOTICE]**: Use `generate_editor_rules(folder_path="<cwd>")` to update rules
 - **After completing work**: Always capture decisions/insights with `session(action="capture")`
 - **On mistakes/corrections**: Immediately capture lessons with `session(action="capture_lesson")`
 

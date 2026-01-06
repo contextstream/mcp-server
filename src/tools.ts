@@ -6473,19 +6473,30 @@ Use this to remove a reminder that is no longer relevant.`,
             if (!input.path) {
               return errorResult('ingest_local requires: path');
             }
+            if (!projectId) {
+              return errorResult('ingest_local requires: project_id');
+            }
             const validPath = await validateReadableDirectory(input.path);
             if (!validPath.ok) {
               return errorResult(validPath.error);
             }
-            const files = await readAllFilesInBatches(validPath.resolvedPath, async (batch) => {
-              await client.ingestLocalFiles({
-                project_id: projectId,
-                files: batch,
+            let totalFiles = 0;
+            let batches = 0;
+            for await (const batch of readAllFilesInBatches(validPath.resolvedPath, { batchSize: 50 })) {
+              if (batch.length === 0) continue;
+              await client.ingestFiles(projectId, batch, {
                 overwrite: input.overwrite,
                 write_to_disk: input.write_to_disk,
               });
-            });
-            const result = { files_ingested: files, project_id: projectId };
+              totalFiles += batch.length;
+              batches += 1;
+            }
+            const result = {
+              project_id: projectId,
+              files_ingested: totalFiles,
+              batches,
+              path: validPath.resolvedPath,
+            };
             return { content: [{ type: 'text' as const, text: formatContent(result) }], structuredContent: toStructured(result) };
           }
 

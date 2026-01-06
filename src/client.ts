@@ -3728,12 +3728,15 @@ export class ContextStreamClient {
     status?: 'pending' | 'in_progress' | 'completed' | 'blocked' | 'cancelled';
     priority?: 'low' | 'medium' | 'high' | 'urgent';
     order?: number;
+    /** Link task to a plan (UUID) or set to null to unlink from current plan */
+    plan_id?: string | null;
     plan_step_id?: string;
     code_refs?: Array<{ file_path: string; symbol_name?: string; line_range?: [number, number] }>;
     tags?: string[];
     blocked_reason?: string;
   }) {
     uuidSchema.parse(params.task_id);
+    if (params.plan_id) uuidSchema.parse(params.plan_id);
     const { task_id, ...updates } = params;
     return request(this.config, `/tasks/${task_id}`, { method: 'PATCH', body: updates });
   }

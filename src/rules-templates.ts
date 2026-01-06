@@ -176,6 +176,21 @@ Only after this preflight, proceed with search/analysis below.
 
 ---
 
+### Plans & Tasks
+
+When user asks to create a plan or implementation roadmap:
+1. Create plan: \`session(action="capture_plan", title="Plan Title", description="...", goals=["goal1", "goal2"], steps=[{id: "1", title: "Step 1", order: 1}, ...])\`
+2. Get plan_id from response, then create tasks: \`memory(action="create_task", title="Task Title", plan_id="<plan_id>", priority="high|medium|low", description="...")\`
+
+To manage existing plans/tasks:
+- List plans: \`session(action="list_plans")\`
+- Get plan with tasks: \`session(action="get_plan", plan_id="<uuid>", include_tasks=true)\`
+- List tasks: \`memory(action="list_tasks", plan_id="<uuid>")\` or \`memory(action="list_tasks")\` for all
+- Update task status: \`memory(action="update_task", task_id="<uuid>", task_status="pending|in_progress|completed|blocked")\`
+- Delete: \`memory(action="delete_task", task_id="<uuid>")\` or \`memory(action="delete_event", event_id="<plan_uuid>")\`
+
+---
+
 ### Complete Action Reference
 
 **session actions:**
@@ -243,6 +258,19 @@ v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous v
 - **For code analysis**: Use \`graph(action="dependencies")\` or \`graph(action="impact")\` for call/dependency analysis
 - **After completing work**: Always capture decisions/insights with \`session(action="capture")\`
 - **On mistakes/corrections**: Immediately capture lessons with \`session(action="capture_lesson")\`
+
+### Plans & Tasks
+
+When user asks to create a plan or implementation roadmap:
+1. Create plan: \`session(action="capture_plan", title="Plan Title", description="...", goals=["goal1", "goal2"], steps=[{id: "1", title: "Step 1", order: 1}, ...])\`
+2. Get plan_id from response, then create tasks: \`memory(action="create_task", title="Task Title", plan_id="<plan_id>", priority="high|medium|low", description="...")\`
+
+To manage existing plans/tasks:
+- List plans: \`session(action="list_plans")\`
+- Get plan with tasks: \`session(action="get_plan", plan_id="<uuid>", include_tasks=true)\`
+- List tasks: \`memory(action="list_tasks", plan_id="<uuid>")\` or \`memory(action="list_tasks")\` for all
+- Update task status: \`memory(action="update_task", task_id="<uuid>", task_status="pending|in_progress|completed|blocked")\`
+- Delete: \`memory(action="delete_task", task_id="<uuid>")\` or \`memory(action="delete_event", event_id="<plan_uuid>")\`
 
 Full docs: https://contextstream.io/docs/mcp/tools
 `.trim();

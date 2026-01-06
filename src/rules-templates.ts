@@ -40,8 +40,8 @@ const CONTEXTSTREAM_TOOL_NAMES = [
 
 function applyMcpToolPrefix(markdown: string, toolPrefix: string): string {
   const toolPattern = CONTEXTSTREAM_TOOL_NAMES.join('|');
-  // Avoid double-prefixing tools already in the Claude format `mcp__<server>__<tool>`
-  const toolRegex = new RegExp(`(?<!__)\\b(${toolPattern})\\b`, 'g');
+  // Only prefix tool calls like `tool(...)` and avoid double-prefixing `mcp__<server>__tool(...)`.
+  const toolRegex = new RegExp(`(?<!__)\\b(${toolPattern})\\b(?=\\s*\\()`, 'g');
   return markdown.replace(toolRegex, `${toolPrefix}$1`);
 }
 
@@ -66,6 +66,8 @@ Rules Version: ${RULES_VERSION}
 **NO EXCEPTIONS.** Do not skip even if you think you have enough context.
 
 **Context Pack (Pro+):** If enabled, use \`context_smart(..., mode="pack", distill=true)\` for code/file queries. If unavailable, omit \`mode\` and use standard \`context_smart\`.
+
+**Tool naming:** Use the exact tool names exposed by your MCP client. Claude Code typically uses \`mcp__<server>__<tool>\` where \`<server>\` matches your MCP config (often \`contextstream\`). If a tool call fails with "No such tool available", refresh rules and match the tool list.
 
 ---
 
@@ -253,6 +255,8 @@ Rules Version: ${RULES_VERSION}
 | **On user frustration** | \`session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...")\` |
 
 **Context Pack (Pro+):** If enabled, use \`context_smart(..., mode="pack", distill=true)\` for code/file queries. If unavailable, omit \`mode\`.
+
+**Tool naming:** Use the exact tool names exposed by your MCP client. Claude Code typically uses \`mcp__<server>__<tool>\` where \`<server>\` matches your MCP config (often \`contextstream\`). If a tool call fails with "No such tool available", refresh rules and match the tool list.
 
 ### Quick Reference: Domain Tools
 

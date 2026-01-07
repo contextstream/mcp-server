@@ -52,6 +52,8 @@ MCP clients often inject the tool catalog into the model context. v0.4.x is desi
 - Local repo ingestion for indexing (`project(action="ingest_local")`)
 - Auto-context: on first tool call in a new session, the server can auto-initialize context
 
+> **⚠️ Search-First Rule:** For best results, your AI should use ContextStream `search(mode="hybrid")` **before** local tools like Glob/Grep/Read. This is enforced via editor rules and `context_smart` responses.
+
 ---
 
 ## Graph Tiers

@@ -157,16 +157,18 @@ Only after this preflight, proceed with search/analysis below.
 
 ### Search & Code Intelligence (ContextStream-first)
 
+⚠️ **STOP: Before using Glob/Grep/Read/Explore** → Call \`search(mode="hybrid")\` FIRST. Use local tools ONLY if ContextStream returns 0 results.
+
 **Search order:**
 1. \`session(action="smart_search", query="...")\` - context-enriched
 2. \`search(mode="hybrid", query="...", limit=3)\` or \`search(mode="keyword", query="<filename>", limit=3)\`
 3. \`project(action="files")\` - file tree/list (only when needed)
 4. \`graph(action="dependencies", ...)\` - code structure
-5. Local repo scans (rg/ls/find) - only if ContextStream returns no results, errors, or the user explicitly asks
+5. Local repo scans (rg/ls/find) - ONLY if ContextStream returns no results, errors, or the user explicitly asks
 
 **Search defaults:** \`search\` returns the top 3 results with compact snippets. Use \`limit\` + \`offset\` for pagination, and \`content_max_chars\` to expand snippets when needed.
 
-If ContextStream returns results, stop and use them. Do NOT use local Search/Explore/Read unless you need exact code edits.
+If ContextStream returns results, stop and use them. NEVER use local Search/Explore/Read unless you need exact code edits or ContextStream returned 0 results.
 
 **Code Analysis:**
 - Dependencies: \`graph(action="dependencies", file_path="...")\`
@@ -278,10 +280,12 @@ Rules Version: ${RULES_VERSION}
 
 ### Behavior Rules
 
+⚠️ **STOP: Before using Glob/Grep/Read/Explore** → Call \`search(mode="hybrid")\` FIRST. Use local tools ONLY if ContextStream returns 0 results.
+
 - **First message**: Call \`session_init\` with context_hint, then call \`context_smart\` before any other tool or response
 - **Every message after**: Always call \`context_smart\` BEFORE responding (semantic search for relevant context)
 - **Before searching files/code**: Check \`project(action="index_status")\`; if missing/stale run \`project(action="ingest_local", path="<cwd>")\` or \`project(action="index")\`, and use \`graph(action="ingest")\` if needed
-- **For discovery**: Use \`session(action="smart_search")\` or \`search(mode="hybrid")\` before any local repo scans
+- **For discovery**: Use \`session(action="smart_search")\` or \`search(mode="hybrid")\` — NEVER use local Glob/Grep/Read first
 - **For file/function/config lookups**: Use \`search\`/\`graph\` first; only fall back to rg/ls/find if ContextStream returns no results
 - **If ContextStream returns results**: Do NOT use local Search/Explore/Read; only open specific files when needed for exact edits
 - **For code analysis**: Use \`graph(action="dependencies")\` or \`graph(action="impact")\` for call/dependency analysis

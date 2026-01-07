@@ -2582,16 +2582,22 @@ export class ContextStreamClient {
 
     // Sort by relevance
     items.sort((a, b) => b.relevance - a.relevance);
-    
+
     // Build context string based on format
     let context: string;
     let charsUsed = 0;
     const maxChars = maxTokens * 4; // ~4 chars per token
     let candidateContext: string;
-    
+
+    // Critical rule prefix - MUST appear FIRST before any context data
+    // This ensures AI sees the ContextStream-first search requirement prominently
+    const CS_FIRST_RULE = '⚠️ STOP: Before Glob/Grep/Read → search(mode=hybrid) FIRST. Local tools ONLY if 0 results.';
+    const CS_FIRST_RULE_MINIFIED = 'R:CS-first|Idx:project.index_status->ingest|NoLocalScanUnlessCSempty';
+
     if (format === 'minified') {
-      // Ultra-compact format: TYPE:value|TYPE:value|...
-      const parts: string[] = [];
+      // Ultra-compact format: Rule prefix + TYPE:value|TYPE:value|...
+      const parts: string[] = [CS_FIRST_RULE_MINIFIED];
+      charsUsed = CS_FIRST_RULE_MINIFIED.length + 1;
       for (const item of items) {
         const entry = `${item.type}:${item.value}`;
         if (charsUsed + entry.length + 1 > maxChars) break;
@@ -2599,10 +2605,11 @@ export class ContextStreamClient {
         charsUsed += entry.length + 1;
       }
       context = parts.join('|');
-      candidateContext = items.map((i) => `${i.type}:${i.value}`).join('|');
+      candidateContext = [CS_FIRST_RULE_MINIFIED, ...items.map((i) => `${i.type}:${i.value}`)].join('|');
     } else if (format === 'structured') {
-      // JSON-like compact format
-      const grouped: Record<string, string[]> = {};
+      // JSON-like compact format with rule prefix
+      const grouped: Record<string, string[]> = { R: [CS_FIRST_RULE] };
+      charsUsed = CS_FIRST_RULE.length + 10;
       for (const item of items) {
         if (charsUsed > maxChars) break;
         if (!grouped[item.type]) grouped[item.type] = [];
@@ -2611,15 +2618,16 @@ export class ContextStreamClient {
       }
       context = JSON.stringify(grouped);
 
-      const candidateGrouped: Record<string, string[]> = {};
+      const candidateGrouped: Record<string, string[]> = { R: [CS_FIRST_RULE] };
       for (const item of items) {
         if (!candidateGrouped[item.type]) candidateGrouped[item.type] = [];
         candidateGrouped[item.type].push(item.value);
       }
       candidateContext = JSON.stringify(candidateGrouped);
     } else {
-      // Readable format (default)
-      const lines: string[] = ['[CTX]'];
+      // Readable format (default) with rule prefix at top
+      const lines: string[] = [CS_FIRST_RULE, '', '[CTX]'];
+      charsUsed = CS_FIRST_RULE.length + 10;
       for (const item of items) {
         const line = `${item.type}:${item.value}`;
         if (charsUsed + line.length + 1 > maxChars) break;
@@ -2629,7 +2637,7 @@ export class ContextStreamClient {
       lines.push('[/CTX]');
       context = lines.join('\n');
 
-      const candidateLines: string[] = ['[CTX]'];
+      const candidateLines: string[] = [CS_FIRST_RULE, '', '[CTX]'];
       for (const item of items) {
         candidateLines.push(`${item.type}:${item.value}`);
       }
@@ -2637,12 +2645,12 @@ export class ContextStreamClient {
       candidateContext = candidateLines.join('\n');
     }
     
-    // If context is empty but we have workspace, add a hint
+    // If context is empty but we have workspace, add a hint (still include critical rule)
     if (context.length === 0 && withDefaults.workspace_id) {
       const wsHint = items.find(i => i.type === 'W')?.value || withDefaults.workspace_id;
       context = format === 'minified'
-        ? `W:${wsHint}|[NO_MATCHES]`
-        : `[CTX]\nW:${wsHint}\n[NO_MATCHES]\n[/CTX]`;
+        ? `${CS_FIRST_RULE_MINIFIED}|W:${wsHint}|[NO_MATCHES]`
+        : `${CS_FIRST_RULE}\n\n[CTX]\nW:${wsHint}\n[NO_MATCHES]\n[/CTX]`;
       candidateContext = context;
     }
 

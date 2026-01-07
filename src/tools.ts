@@ -2324,6 +2324,11 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
           String(errorMessage).toLowerCase().includes('plan limit reached');
         const upgradeHint = isPlanLimit ? `\nUpgrade: ${upgradeUrl}` : '';
 
+        const isUnauthorized = String(errorCode).toUpperCase() === 'UNAUTHORIZED';
+        const sessionHint = isUnauthorized
+          ? `\nHint: Run session_init(folder_path="<your_project_path>") first to establish a session, or check that your API key is valid.`
+          : '';
+
         const errorPayload = {
           success: false,
           error: {
@@ -2332,7 +2337,7 @@ export function registerTools(server: McpServer, client: ContextStreamClient, se
             details: errorDetails,
           },
         };
-        const errorText = `[${errorCode}] ${errorMessage}${upgradeHint}${errorDetails ? `: ${JSON.stringify(errorDetails)}` : ''}`;
+        const errorText = `[${errorCode}] ${errorMessage}${upgradeHint}${sessionHint}${errorDetails ? `: ${JSON.stringify(errorDetails)}` : ''}`;
         return {
           content: [{ type: 'text' as const, text: errorText }],
           structuredContent: errorPayload,

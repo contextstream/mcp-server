@@ -283,6 +283,7 @@ Rules Version: ${RULES_VERSION}
 ⚠️ **STOP: Before using Glob/Grep/Read/Explore** → Call \`search(mode="hybrid")\` FIRST. Use local tools ONLY if ContextStream returns 0 results.
 
 - **First message**: Call \`session_init\` with context_hint, then call \`context_smart\` before any other tool or response
+- **On [INGEST_RECOMMENDED]**: Ask the user if they want to enable semantic code search. Explain: "Indexing your codebase enables AI-powered code search, dependency analysis, and better context. This takes a few minutes." If user agrees, run the provided \`project(action="ingest_local")\` command.
 - **Every message after**: Always call \`context_smart\` BEFORE responding (semantic search for relevant context)
 - **Before searching files/code**: Check \`project(action="index_status")\`; if missing/stale run \`project(action="ingest_local", path="<cwd>")\` or \`project(action="index")\`, and use \`graph(action="ingest")\` if needed
 - **For discovery**: Use \`session(action="smart_search")\` or \`search(mode="hybrid")\` — NEVER use local Glob/Grep/Read first

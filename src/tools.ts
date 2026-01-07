@@ -3969,8 +3969,12 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       title: 'Initialize conversation session',
       description: `Initialize a new conversation session and automatically retrieve relevant context.
 This is the FIRST tool AI assistants should call when starting a conversation.
-Returns: workspace info, project info, recent memory, recent decisions, relevant context, and high-priority lessons.
-Automatically detects the IDE workspace/project path and can auto-index code.
+Returns: workspace info, project info, recent memory, recent decisions, relevant context, high-priority lessons, and ingest_recommendation.
+
+The ingest_recommendation field indicates if the project needs indexing for code search:
+- If [INGEST_RECOMMENDED] appears, ask the user if they want to enable semantic code search
+- Benefits: AI-powered code understanding, dependency analysis, better context retrieval
+- If user agrees, run: project(action="ingest_local", path="<project_path>")
 
 IMPORTANT: Pass the user's FIRST MESSAGE as context_hint to get semantically relevant context!
 Example: session_init(folder_path="/path/to/project", context_hint="how do I implement auth?")
@@ -4144,8 +4148,31 @@ This does semantic search on the first message. You only need context_smart on s
       if (versionNotice?.behind) {
         noticeLines.push(`[VERSION_NOTICE] current=${versionNotice.current} latest=${versionNotice.latest} upgrade="${versionNotice.upgrade_command}"`);
       }
+
+      // Add ingest recommendation notice if applicable
+      const ingestRec = result.ingest_recommendation as {
+        recommended?: boolean;
+        status?: string;
+        reason?: string;
+        benefits?: string[];
+        command?: string;
+      } | undefined;
+
+      if (ingestRec?.recommended) {
+        const benefitsList = ingestRec.benefits?.slice(0, 3).map(b => `  • ${b}`).join('\n') || '';
+        noticeLines.push(
+          `[INGEST_RECOMMENDED] status=${ingestRec.status}`,
+          `Reason: ${ingestRec.reason}`,
+          ingestRec.benefits ? `Benefits:\n${benefitsList}` : '',
+          `Action: Ask the user if they want to enable code search by running:`,
+          `  ${ingestRec.command || 'project(action="ingest_local", path="<project_path>")'}`
+        );
+      } else if (ingestRec?.status === 'auto_started') {
+        noticeLines.push(`[INGEST_STATUS] Background indexing started. Codebase will be searchable shortly.`);
+      }
+
       if (noticeLines.length > 0) {
-        text = `${text}\n\n${noticeLines.join('\n')}`;
+        text = `${text}\n\n${noticeLines.filter(Boolean).join('\n')}`;
       }
 
       return { content: [{ type: 'text' as const, text }], structuredContent: toStructured(result) };

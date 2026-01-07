@@ -69,6 +69,28 @@ function normalizeGraphTier(value: string): GraphTier | null {
 const AI_PLAN_TIMEOUT_MS = 50_000;
 const AI_PLAN_RETRIES = 0;
 
+// Ingest recommendation benefits - shown when prompting user to ingest
+const INGEST_BENEFITS = [
+  'Enable semantic code search across your entire codebase',
+  'Get AI-powered code understanding and context for your questions',
+  'Unlock dependency analysis and impact assessment',
+  'Allow the AI assistant to find relevant code without manual file navigation',
+  'Build a searchable knowledge base of your codebase structure',
+];
+
+// Ingest recommendation status types
+type IngestStatus = 'not_indexed' | 'indexed' | 'stale' | 'recently_indexed' | 'auto_started';
+
+interface IngestRecommendation {
+  recommended: boolean;
+  status: IngestStatus;
+  indexed_files?: number;
+  last_indexed?: string;
+  reason: string;
+  benefits?: string[];
+  command?: string;
+}
+
 export class ContextStreamClient {
   constructor(private config: Config) {}
 
@@ -865,6 +887,115 @@ export class ContextStreamClient {
   }
 
   /**
+   * Check if project ingestion is recommended and return a recommendation.
+   * This is used by session_init to inform the AI about the project's index status.
+   *
+   * @param projectId - Project UUID
+   * @param folderPath - Optional folder path for generating the ingest command
+   * @returns IngestRecommendation with status, reason, and benefits if recommended
+   */
+  async checkIngestRecommendation(
+    projectId: string,
+    folderPath?: string
+  ): Promise<IngestRecommendation> {
+    try {
+      const status = await this.projectIndexStatus(projectId) as {
+        data?: {
+          indexed_files?: number;
+          total_files?: number;
+          last_updated?: string;
+          status?: string;
+          status_detail?: string;
+        };
+        indexed_files?: number;
+        total_files?: number;
+        last_updated?: string;
+        status?: string;
+        status_detail?: string;
+      };
+
+      // Extract data from nested or flat response
+      const data = status.data || status;
+      const indexedFiles = data.indexed_files ?? 0;
+      const lastUpdated = data.last_updated;
+      const statusDetail = data.status_detail;
+
+      // Check if stale (more than 24 hours old)
+      const isStale = lastUpdated
+        ? Date.now() - new Date(lastUpdated).getTime() > 24 * 60 * 60 * 1000
+        : false;
+
+      // Check if recently indexed (within last hour)
+      const isRecent = lastUpdated
+        ? Date.now() - new Date(lastUpdated).getTime() < 60 * 60 * 1000
+        : false;
+
+      // Build the ingest command
+      const ingestCommand = folderPath
+        ? `project(action="ingest_local", path="${folderPath}")`
+        : `project(action="ingest_local", path="<your_project_path>")`;
+
+      // No files indexed - definitely recommend
+      if (indexedFiles === 0 || statusDetail === 'no_files_indexed') {
+        return {
+          recommended: true,
+          status: 'not_indexed',
+          indexed_files: 0,
+          reason: 'No files have been indexed yet. Ingesting your codebase will enable semantic search and AI-powered code understanding.',
+          benefits: INGEST_BENEFITS,
+          command: ingestCommand,
+        };
+      }
+
+      // Files are stale - recommend re-ingest
+      if (isStale) {
+        return {
+          recommended: true,
+          status: 'stale',
+          indexed_files: indexedFiles,
+          last_indexed: lastUpdated,
+          reason: `Index is over 24 hours old (${indexedFiles} files). Re-ingesting will capture any recent changes.`,
+          benefits: ['Capture recent code changes', 'Update dependency analysis', 'Improve search accuracy'],
+          command: ingestCommand,
+        };
+      }
+
+      // Recently indexed - no action needed
+      if (isRecent) {
+        return {
+          recommended: false,
+          status: 'recently_indexed',
+          indexed_files: indexedFiles,
+          last_indexed: lastUpdated,
+          reason: `Project was recently indexed (${indexedFiles} files). No action needed.`,
+        };
+      }
+
+      // Indexed but not recent - inform but don't strongly recommend
+      return {
+        recommended: false,
+        status: 'indexed',
+        indexed_files: indexedFiles,
+        last_indexed: lastUpdated,
+        reason: `Project is indexed (${indexedFiles} files). Consider re-indexing if you've made significant changes.`,
+      };
+    } catch (error) {
+      // If we can't check status, recommend ingesting to be safe
+      const ingestCommand = folderPath
+        ? `project(action="ingest_local", path="${folderPath}")`
+        : `project(action="ingest_local", path="<your_project_path>")`;
+
+      return {
+        recommended: true,
+        status: 'not_indexed',
+        reason: 'Unable to determine index status. Ingesting will ensure your codebase is searchable.',
+        benefits: INGEST_BENEFITS,
+        command: ingestCommand,
+      };
+    }
+  }
+
+  /**
    * Ingest files for indexing
    * This uploads files to the API for indexing
    * @param projectId - Project UUID
@@ -1315,24 +1446,54 @@ export class ContextStreamClient {
           }
         }
         
-        // Ingest files if auto_index is enabled (default: true)
-        // Runs in BACKGROUND - does not block session_init
-        if (projectId && (params.auto_index === undefined || params.auto_index === true)) {
-          context.indexing_status = 'started';
-          
-          // Fire-and-forget: start indexing in background
-          const projectIdCopy = projectId;
-          const rootPathCopy = rootPath;
-          (async () => {
-            try {
-              for await (const batch of readAllFilesInBatches(rootPathCopy, { batchSize: 50 })) {
-                await this.ingestFiles(projectIdCopy, batch);
+        // Check ingest recommendation and handle based on auto_index setting
+        if (projectId) {
+          const autoIndex = params.auto_index === undefined || params.auto_index === true;
+
+          if (autoIndex) {
+            // Auto-index enabled (default): Start ingestion in background and inform user
+            context.indexing_status = 'started';
+            context.ingest_recommendation = {
+              recommended: false,
+              status: 'auto_started',
+              reason: 'Background ingestion started automatically. Your codebase will be searchable shortly.',
+            } as IngestRecommendation;
+
+            // Fire-and-forget: start indexing in background
+            const projectIdCopy = projectId;
+            const rootPathCopy = rootPath;
+            (async () => {
+              try {
+                for await (const batch of readAllFilesInBatches(rootPathCopy, { batchSize: 50 })) {
+                  await this.ingestFiles(projectIdCopy, batch);
+                }
+                console.error(`[ContextStream] Background indexing completed for ${rootPathCopy}`);
+              } catch (e) {
+                console.error(`[ContextStream] Background indexing failed:`, e);
               }
-              console.error(`[ContextStream] Background indexing completed for ${rootPathCopy}`);
+            })();
+          } else {
+            // Auto-index disabled: Check index status and return recommendation
+            // This allows the AI to prompt the user about ingesting
+            try {
+              const recommendation = await this.checkIngestRecommendation(projectId, rootPath);
+              context.ingest_recommendation = recommendation;
+
+              if (recommendation.recommended) {
+                console.error(`[ContextStream] Ingest recommended for ${rootPath}: ${recommendation.status}`);
+              }
             } catch (e) {
-              console.error(`[ContextStream] Background indexing failed:`, e);
+              console.error(`[ContextStream] Failed to check ingest recommendation:`, e);
+              // Provide a fallback recommendation
+              context.ingest_recommendation = {
+                recommended: true,
+                status: 'not_indexed',
+                reason: 'Unable to determine index status. Consider ingesting to enable code search.',
+                benefits: INGEST_BENEFITS,
+                command: `project(action="ingest_local", path="${rootPath}")`,
+              } as IngestRecommendation;
             }
-          })();
+          }
         }
       } catch (e) {
         context.project_error = String(e);
@@ -1429,6 +1590,29 @@ export class ContextStreamClient {
         // Fallback to individual calls if batched endpoint fails
         console.error('[ContextStream] Batched endpoint failed, falling back to individual calls:', e);
         await this._fetchSessionContextFallback(context, workspaceId, projectId, params);
+      }
+    }
+
+    // ========================================
+    // STEP 4: Check Ingest Recommendation for Existing Projects
+    // If project was loaded from config (not discovered above), check index status
+    // ========================================
+    if (projectId && !context.ingest_recommendation) {
+      try {
+        const recommendation = await this.checkIngestRecommendation(projectId, rootPath);
+        context.ingest_recommendation = recommendation;
+
+        if (recommendation.recommended) {
+          console.error(`[ContextStream] Ingest recommended for existing project ${projectId}: ${recommendation.status}`);
+        }
+      } catch (e) {
+        console.error(`[ContextStream] Failed to check ingest recommendation for existing project:`, e);
+        // Provide informational status even on error
+        context.ingest_recommendation = {
+          recommended: false,
+          status: 'indexed',
+          reason: 'Unable to determine exact index status. Use project(action="index_status") to check.',
+        } as IngestRecommendation;
       }
     }
 

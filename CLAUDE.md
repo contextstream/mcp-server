@@ -37,9 +37,10 @@ Rules Version: 0.4.24
 ⚠️ **STOP: Before using Search/Glob/Grep/Read/Explore** → Call `mcp__contextstream__search(mode="hybrid")` FIRST. Use local tools ONLY if ContextStream returns 0 results.
 
 - **First message**: Call `session_init` with context_hint, then call `context_smart` before any other tool or response
+- **On [INGEST_RECOMMENDED]**: Ask the user if they want to enable semantic code search. Explain: "Indexing your codebase enables AI-powered code search, dependency analysis, and better context. This takes a few minutes." If user agrees, run the provided `mcp__contextstream__project(action="ingest_local")` command.
 - **Every message after**: Always call `context_smart` BEFORE responding (semantic search for relevant context)
 - **Before searching files/code**: Check `mcp__contextstream__project(action="index_status")`; if missing/stale run `mcp__contextstream__project(action="ingest_local", path="<cwd>")` or `mcp__contextstream__project(action="index")`, and use `mcp__contextstream__graph(action="ingest")` if needed
-- **For discovery**: Use `mcp__contextstream__session(action="smart_search")` or `mcp__contextstream__search(mode="hybrid")` before any local repo scans
+- **For discovery**: Use `mcp__contextstream__session(action="smart_search")` or `mcp__contextstream__search(mode="hybrid")` — NEVER use local Glob/Grep/Read first
 - **For file/function/config lookups**: Use `search`/`graph` first; only fall back to rg/ls/find if ContextStream returns no results
 - **If ContextStream returns results**: Do NOT use local Search/Explore/Read; only open specific files when needed for exact edits
 - **For code analysis**: Use `mcp__contextstream__graph(action="dependencies")` or `mcp__contextstream__graph(action="impact")` for call/dependency analysis

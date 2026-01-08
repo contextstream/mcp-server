@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import { z } from 'zod';
 import type { Config } from './config.js';
 import { request, HttpError } from './http.js';
-import { readFilesFromDirectory, readAllFilesInBatches } from './files.js';
+import { readFilesFromDirectory, readAllFilesInBatches, readChangedFilesInBatches } from './files.js';
 import {
   resolveWorkspace,
   readLocalConfig,
@@ -92,6 +92,12 @@ interface IngestRecommendation {
 }
 
 export class ContextStreamClient {
+  private sessionStartTime?: number;
+  private sessionProjectId?: string;
+  private sessionRootPath?: string;
+  private lastRefreshCheckTime?: number;
+  private indexRefreshInProgress = false;
+
   constructor(private config: Config) {}
 
   /**
@@ -379,12 +385,34 @@ export class ContextStreamClient {
     offset?: number;
     content_max_chars?: number;
   }) {
-    return request(this.config, '/search/pattern', { 
-      body: { 
-        ...this.withDefaults(body), 
+    return request(this.config, '/search/pattern', {
+      body: {
+        ...this.withDefaults(body),
         search_type: 'pattern',
         filters: body.workspace_id ? {} : { file_types: [], languages: [], file_paths: [], exclude_paths: [], content_types: [], tags: [] }
-      } 
+      }
+    });
+  }
+
+  /**
+   * Exhaustive search returns ALL matches from the index.
+   * Use this when you need complete coverage like grep.
+   * Includes index_freshness to indicate result trustworthiness.
+   */
+  searchExhaustive(body: {
+    query: string;
+    workspace_id?: string;
+    project_id?: string;
+    limit?: number;
+    offset?: number;
+    content_max_chars?: number;
+  }) {
+    return request(this.config, '/search/exhaustive', {
+      body: {
+        ...this.withDefaults(body),
+        search_type: 'exhaustive',
+        filters: body.workspace_id ? {} : { file_types: [], languages: [], file_paths: [], exclude_paths: [], content_types: [], tags: [] }
+      }
     });
   }
 
@@ -1205,6 +1233,9 @@ export class ContextStreamClient {
       initialized_at: new Date().toISOString(),
     };
 
+    // Track session start time for long-session re-index checks
+    this.sessionStartTime = Date.now();
+
     const rootPath = ideRoots.length > 0 ? ideRoots[0] : undefined;
 
     // ========================================
@@ -1506,6 +1537,10 @@ export class ContextStreamClient {
     context.project_id = projectId;
     context.ide_roots = ideRoots;
 
+    // Store session state for long-session re-index checks in context_smart
+    this.sessionProjectId = projectId;
+    this.sessionRootPath = rootPath;
+
     if (!workspaceId) {
       context.workspace_warning =
         'No workspace was resolved for this session. Workspace-level tools (memory/search/graph) may not work until you associate this folder with a workspace.';
@@ -1596,14 +1631,64 @@ export class ContextStreamClient {
     // ========================================
     // STEP 4: Check Ingest Recommendation for Existing Projects
     // If project was loaded from config (not discovered above), check index status
+    // Auto-index if stale (>1 hour) or never indexed
     // ========================================
     if (projectId && !context.ingest_recommendation) {
       try {
         const recommendation = await this.checkIngestRecommendation(projectId, rootPath);
-        context.ingest_recommendation = recommendation;
+        const autoIndex = params.auto_index !== false;
 
-        if (recommendation.recommended) {
-          console.error(`[ContextStream] Ingest recommended for existing project ${projectId}: ${recommendation.status}`);
+        // Check if index needs refreshing (>1 hour old OR never indexed)
+        const needsRefresh = recommendation.status === 'not_indexed' ||
+          recommendation.status === 'stale' ||
+          recommendation.status === 'indexed';  // 'indexed' means 1-24 hours old
+
+        if (autoIndex && rootPath && needsRefresh && recommendation.status !== 'recently_indexed') {
+          // Auto-index enabled and index is stale - trigger background re-indexing
+          const useIncremental = recommendation.last_indexed && recommendation.status !== 'not_indexed';
+          console.error(`[ContextStream] Auto-refreshing stale index for project ${projectId}: ${recommendation.status} (${useIncremental ? 'incremental' : 'full'})`);
+
+          context.indexing_status = 'refreshing';
+          context.ingest_recommendation = {
+            recommended: false,
+            status: 'auto_refreshing',
+            indexed_files: recommendation.indexed_files,
+            last_indexed: recommendation.last_indexed,
+            reason: useIncremental
+              ? 'Incremental index refresh started automatically (only changed files).'
+              : 'Background index refresh started automatically to capture recent changes.',
+          } as IngestRecommendation;
+
+          // Fire-and-forget: start re-indexing in background
+          const projectIdCopy = projectId;
+          const rootPathCopy = rootPath;
+          const lastIndexedCopy = recommendation.last_indexed;
+          (async () => {
+            try {
+              // Use incremental indexing if we have a last_indexed timestamp
+              if (useIncremental && lastIndexedCopy) {
+                const sinceDate = new Date(lastIndexedCopy);
+                for await (const batch of readChangedFilesInBatches(rootPathCopy, sinceDate, { batchSize: 50 })) {
+                  await this.ingestFiles(projectIdCopy, batch);
+                }
+                console.error(`[ContextStream] Incremental index refresh completed for ${rootPathCopy}`);
+              } else {
+                for await (const batch of readAllFilesInBatches(rootPathCopy, { batchSize: 50 })) {
+                  await this.ingestFiles(projectIdCopy, batch);
+                }
+                console.error(`[ContextStream] Full index refresh completed for ${rootPathCopy}`);
+              }
+            } catch (e) {
+              console.error(`[ContextStream] Background index refresh failed:`, e);
+            }
+          })();
+        } else {
+          // Not auto-indexing - just return the recommendation
+          context.ingest_recommendation = recommendation;
+
+          if (recommendation.recommended) {
+            console.error(`[ContextStream] Ingest recommended for existing project ${projectId}: ${recommendation.status}`);
+          }
         }
       } catch (e) {
         console.error(`[ContextStream] Failed to check ingest recommendation for existing project:`, e);
@@ -2591,6 +2676,7 @@ export class ContextStreamClient {
     project_id?: string;
     errors?: string[];
     version_notice?: VersionNotice;
+    index_status?: 'refreshing' | 'fresh' | 'stale';
   }> {
     const withDefaults = this.withDefaults(params);
     const maxTokens = params.max_tokens || 800;
@@ -2605,6 +2691,63 @@ export class ContextStreamClient {
         format,
         sources_used: 0,
       };
+    }
+
+    // ========================================
+    // Long-session re-index check
+    // If session >30 mins AND we haven't checked in 10 mins, check index freshness
+    // ========================================
+    const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+    const TEN_MINUTES_MS = 10 * 60 * 1000;
+    const now = Date.now();
+    const sessionAge = this.sessionStartTime ? now - this.sessionStartTime : 0;
+    const timeSinceLastCheck = this.lastRefreshCheckTime ? now - this.lastRefreshCheckTime : Infinity;
+
+    if (
+      sessionAge > THIRTY_MINUTES_MS &&
+      timeSinceLastCheck > TEN_MINUTES_MS &&
+      this.sessionProjectId &&
+      this.sessionRootPath &&
+      !this.indexRefreshInProgress
+    ) {
+      this.lastRefreshCheckTime = now;
+
+      // Fire-and-forget: check index and refresh if stale
+      const projectIdCopy = this.sessionProjectId;
+      const rootPathCopy = this.sessionRootPath;
+      (async () => {
+        try {
+          const recommendation = await this.checkIngestRecommendation(projectIdCopy, rootPathCopy);
+          const needsRefresh = recommendation.status === 'not_indexed' ||
+            recommendation.status === 'stale' ||
+            recommendation.status === 'indexed';  // 'indexed' means 1-24 hours old
+
+          if (needsRefresh && recommendation.status !== 'recently_indexed') {
+            this.indexRefreshInProgress = true;
+            const useIncremental = recommendation.last_indexed && recommendation.status !== 'not_indexed';
+            console.error(`[ContextStream] Long session re-index: refreshing stale index for project ${projectIdCopy} (session age: ${Math.round(sessionAge / 60000)} mins, ${useIncremental ? 'incremental' : 'full'})`);
+            try {
+              if (useIncremental && recommendation.last_indexed) {
+                const sinceDate = new Date(recommendation.last_indexed);
+                for await (const batch of readChangedFilesInBatches(rootPathCopy, sinceDate, { batchSize: 50 })) {
+                  await this.ingestFiles(projectIdCopy, batch);
+                }
+                console.error(`[ContextStream] Long session incremental re-index completed for ${rootPathCopy}`);
+              } else {
+                for await (const batch of readAllFilesInBatches(rootPathCopy, { batchSize: 50 })) {
+                  await this.ingestFiles(projectIdCopy, batch);
+                }
+                console.error(`[ContextStream] Long session full re-index completed for ${rootPathCopy}`);
+              }
+            } finally {
+              this.indexRefreshInProgress = false;
+            }
+          }
+        } catch (e) {
+          console.error(`[ContextStream] Long session re-index check failed:`, e);
+          this.indexRefreshInProgress = false;
+        }
+      })();
     }
 
     try {
@@ -2640,6 +2783,7 @@ export class ContextStreamClient {
         project_id: withDefaults.project_id,
         ...(versionNotice ? { version_notice: versionNotice } : {}),
         ...(Array.isArray(data?.errors) ? { errors: data.errors } : {}),
+        ...(this.indexRefreshInProgress ? { index_status: 'refreshing' as const } : {}),
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -2869,6 +3013,7 @@ export class ContextStreamClient {
       project_id: withDefaults.project_id,
       ...(versionNotice ? { version_notice: versionNotice } : {}),
       ...(errors.length > 0 && { errors }), // Include errors for debugging
+      ...(this.indexRefreshInProgress ? { index_status: 'refreshing' as const } : {}),
     };
   }
 

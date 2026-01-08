@@ -224,6 +224,81 @@ export async function* readAllFilesInBatches(
 }
 
 /**
+ * Read only files that have been modified since a given timestamp.
+ * Used for incremental indexing to avoid re-processing unchanged files.
+ * Returns files in batches via async generator for memory efficiency.
+ */
+export async function* readChangedFilesInBatches(
+  rootPath: string,
+  sinceTimestamp: Date,
+  options: {
+    batchSize?: number;
+    maxFileSize?: number;
+  } = {}
+): AsyncGenerator<FileToIngest[], void, unknown> {
+  const batchSize = options.batchSize ?? 50;
+  const maxFileSize = options.maxFileSize ?? MAX_FILE_SIZE;
+  const sinceMs = sinceTimestamp.getTime();
+  let batch: FileToIngest[] = [];
+  let filesScanned = 0;
+  let filesChanged = 0;
+
+  async function* walkDir(dir: string, relativePath: string = ''): AsyncGenerator<FileToIngest, void, unknown> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      const relPath = path.join(relativePath, entry.name);
+
+      if (entry.isDirectory()) {
+        if (IGNORE_DIRS.has(entry.name)) continue;
+        yield* walkDir(fullPath, relPath);
+      } else if (entry.isFile()) {
+        if (IGNORE_FILES.has(entry.name)) continue;
+
+        const ext = entry.name.split('.').pop()?.toLowerCase() ?? '';
+        if (!CODE_EXTENSIONS.has(ext)) continue;
+
+        try {
+          const stat = await fs.promises.stat(fullPath);
+          filesScanned++;
+
+          // Skip files not modified since the last index
+          if (stat.mtimeMs <= sinceMs) continue;
+
+          if (stat.size > maxFileSize) continue;
+
+          const content = await fs.promises.readFile(fullPath, 'utf-8');
+          filesChanged++;
+          yield { path: relPath, content };
+        } catch {
+          // Skip unreadable files
+        }
+      }
+    }
+  }
+
+  for await (const file of walkDir(rootPath)) {
+    batch.push(file);
+    if (batch.length >= batchSize) {
+      yield batch;
+      batch = [];
+    }
+  }
+
+  if (batch.length > 0) {
+    yield batch;
+  }
+
+  console.error(`[ContextStream] Incremental scan: ${filesChanged} changed files out of ${filesScanned} scanned (since ${sinceTimestamp.toISOString()})`);
+}
+
+/**
  * Check if a directory contains any indexable files.
  * Stops as soon as it finds one file for efficiency.
  * Returns count=0 if directory is empty or has no indexable files.

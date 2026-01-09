@@ -47,6 +47,16 @@ function applyMcpToolPrefix(markdown: string, toolPrefix: string): string {
 }
 
 const CONTEXTSTREAM_RULES_FULL = `
+## 🚨 CRITICAL RULE - READ EVERY TURN 🚨
+
+**BEFORE using Glob, Grep, Search, Read (for discovery), or Explore:**
+\`\`\`
+STOP → Call search(mode="hybrid", query="...") FIRST
+\`\`\`
+Only use local tools if ContextStream returns 0 results. This applies to EVERY search throughout the ENTIRE conversation, not just the first message.
+
+---
+
 ## ContextStream v0.4.x Integration (Enhanced)
 
 You have access to ContextStream MCP tools for persistent memory and context.
@@ -59,6 +69,7 @@ Rules Version: ${RULES_VERSION}
 |---------|--------------|
 | **1st message** | \`session_init(folder_path="...", context_hint="<user's message>")\`, then \`context_smart(user_message="<user's message>", format="minified", max_tokens=400)\` |
 | **2nd+ messages** | \`context_smart(user_message="<user's message>", format="minified", max_tokens=400)\` |
+| **🔍 ANY code search** | \`search(mode="hybrid", query="...")\` — ALWAYS before Glob/Grep/Search/Read |
 | **Before risky/non-trivial work** | \`session(action="get_lessons", query="<topic>")\` |
 | **After completing task** | \`session(action="capture", event_type="decision", ...)\` - MUST capture |
 | **User frustration/correction** | \`session(action="capture_lesson", ...)\` - MUST capture lessons |
@@ -275,6 +286,16 @@ See full documentation: https://contextstream.io/docs/mcp/tools
 `.trim();
 
 const CONTEXTSTREAM_RULES_MINIMAL = `
+## 🚨 CRITICAL RULE - READ EVERY TURN 🚨
+
+**BEFORE using Glob, Grep, Search, Read (for discovery), or Explore:**
+\`\`\`
+STOP → Call search(mode="hybrid", query="...") FIRST
+\`\`\`
+Only use local tools if ContextStream returns 0 results. This applies to EVERY search throughout the ENTIRE conversation, not just the first message.
+
+---
+
 ## ContextStream v0.4.x (Consolidated Domain Tools)
 
 v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous versions.
@@ -286,6 +307,7 @@ Rules Version: ${RULES_VERSION}
 |---------|--------------|
 | **1st message** | \`session_init(folder_path="<cwd>", context_hint="<user_message>")\`, then \`context_smart(user_message="<user_message>", format="minified", max_tokens=400)\` |
 | **2nd+ messages** | \`context_smart(user_message="<user_message>", format="minified", max_tokens=400)\` |
+| **🔍 ANY code search** | \`search(mode="hybrid", query="...")\` — ALWAYS before Glob/Grep/Search/Read |
 | **Capture decisions** | \`session(action="capture", event_type="decision", title="...", content="...")\` |
 | **Before risky work** | \`session(action="get_lessons", query="<topic>")\` |
 | **On user frustration** | \`session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...")\` |

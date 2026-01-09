@@ -3,7 +3,7 @@
 ## ContextStream v0.4.x (Consolidated Domain Tools)
 
 v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous versions.
-Rules Version: 0.4.25
+Rules Version: 0.4.26
 
 ### Required Every Message
 

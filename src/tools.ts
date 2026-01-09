@@ -3019,6 +3019,7 @@ Access: Free`,
     content_max_chars?: number;
     context_lines?: number;
     exact_match_boost?: number;
+    output_format?: 'full' | 'paths' | 'minimal' | 'count';
   }) {
     const limit =
       typeof input.limit === 'number' && input.limit > 0
@@ -3046,6 +3047,7 @@ Access: Free`,
       content_max_chars: contentMax,
       context_lines: contextLines,
       exact_match_boost: exactMatchBoost,
+      output_format: input.output_format,
     };
   }
 
@@ -6246,7 +6248,9 @@ Use this to remove a reminder that is no longer relevant.`,
       'search',
       {
         title: 'Search',
-        description: `Search workspace memory and knowledge. Modes: semantic (meaning-based), hybrid (semantic + keyword), keyword (exact match), pattern (regex), exhaustive (all matches like grep).`,
+        description: `Search workspace memory and knowledge. Modes: semantic (meaning-based), hybrid (semantic + keyword), keyword (exact match), pattern (regex), exhaustive (all matches like grep).
+
+Output formats: full (default, includes content), paths (file paths only - 80% token savings), minimal (compact - 60% savings), count (match counts only - 90% savings).`,
         inputSchema: z.object({
           mode: z.enum(['semantic', 'hybrid', 'keyword', 'pattern', 'exhaustive']).describe('Search mode'),
           query: z.string().describe('Search query'),
@@ -6257,6 +6261,7 @@ Use this to remove a reminder that is no longer relevant.`,
           content_max_chars: z.number().optional().describe('Max chars per result content (default: 400)'),
           context_lines: z.number().min(0).max(10).optional().describe('Lines of context around matches (like grep -C)'),
           exact_match_boost: z.number().min(1).max(10).optional().describe('Boost factor for exact matches (default: 2.0)'),
+          output_format: z.enum(['full', 'paths', 'minimal', 'count']).optional().describe('Response format: full (default), paths (80% savings), minimal (60% savings), count (90% savings)'),
         }),
       },
       async (input) => {

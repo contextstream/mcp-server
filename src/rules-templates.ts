@@ -159,12 +159,40 @@ Only after this preflight, proceed with search/analysis below.
 
 ⚠️ **STOP: Before using Search/Glob/Grep/Read/Explore** → Call \`search(mode="hybrid")\` FIRST. Use local tools ONLY if ContextStream returns 0 results.
 
+**❌ WRONG workflow (wastes tokens, slow):**
+\`\`\`
+Grep "function" → Read file1.ts → Read file2.ts → Read file3.ts → finally understand
+\`\`\`
+
+**✅ CORRECT workflow (fast, complete):**
+\`\`\`
+search(mode="hybrid", query="function implementation") → done (results include context)
+\`\`\`
+
+**Why?** ContextStream search returns semantic matches + context + file locations in ONE call. Local tools require multiple round-trips.
+
 **Search order:**
 1. \`session(action="smart_search", query="...")\` - context-enriched
 2. \`search(mode="hybrid", query="...", limit=3)\` or \`search(mode="keyword", query="<filename>", limit=3)\`
 3. \`project(action="files")\` - file tree/list (only when needed)
 4. \`graph(action="dependencies", ...)\` - code structure
 5. Local repo scans (rg/ls/find) - ONLY if ContextStream returns no results, errors, or the user explicitly asks
+
+**Search Mode Selection:**
+
+| Need | Mode | Example |
+|------|------|---------|
+| Find code by meaning | \`hybrid\` | "authentication logic", "error handling" |
+| Exact string/symbol | \`keyword\` | "UserAuthService", "API_KEY" |
+| File patterns | \`pattern\` | "*.sql", "test_*.py" |
+| ALL matches (refactoring) | \`exhaustive\` | "oldFunctionName" (rename across codebase) |
+| Conceptual search | \`semantic\` | "how does caching work" |
+
+**Token Efficiency:** Use \`output_format\` to reduce response size:
+- \`full\` (default): Full content for understanding code
+- \`paths\`: File paths only (80% token savings) - use for file listings
+- \`minimal\`: Compact format (60% savings) - use for refactoring
+- \`count\`: Match counts only (90% savings) - use for quick checks
 
 **Search defaults:** \`search\` returns the top 3 results with compact snippets. Use \`limit\` + \`offset\` for pagination, and \`content_max_chars\` to expand snippets when needed.
 
@@ -282,6 +310,18 @@ Rules Version: ${RULES_VERSION}
 
 ⚠️ **STOP: Before using Search/Glob/Grep/Read/Explore** → Call \`search(mode="hybrid")\` FIRST. Use local tools ONLY if ContextStream returns 0 results.
 
+**❌ WRONG workflow (wastes tokens, slow):**
+\`\`\`
+Grep "function" → Read file1.ts → Read file2.ts → Read file3.ts → finally understand
+\`\`\`
+
+**✅ CORRECT workflow (fast, complete):**
+\`\`\`
+search(mode="hybrid", query="function implementation") → done (results include context)
+\`\`\`
+
+**Why?** ContextStream search returns semantic matches + context + file locations in ONE call. Local tools require multiple round-trips.
+
 - **First message**: Call \`session_init\` with context_hint, then call \`context_smart\` before any other tool or response
 - **On [INGEST_RECOMMENDED]**: Ask the user if they want to enable semantic code search. Explain: "Indexing your codebase enables AI-powered code search, dependency analysis, and better context. This takes a few minutes." If user agrees, run the provided \`project(action="ingest_local")\` command.
 - **Every message after**: Always call \`context_smart\` BEFORE responding (semantic search for relevant context)
@@ -293,6 +333,24 @@ Rules Version: ${RULES_VERSION}
 - **On [RULES_NOTICE]**: Use \`generate_rules()\` to update rules
 - **After completing work**: Always capture decisions/insights with \`session(action="capture")\`
 - **On mistakes/corrections**: Immediately capture lessons with \`session(action="capture_lesson")\`
+
+### Search Mode Selection
+
+| Need | Mode | Example |
+|------|------|---------|
+| Find code by meaning | \`hybrid\` | "authentication logic", "error handling" |
+| Exact string/symbol | \`keyword\` | "UserAuthService", "API_KEY" |
+| File patterns | \`pattern\` | "*.sql", "test_*.py" |
+| ALL matches (refactoring) | \`exhaustive\` | "oldFunctionName" (rename across codebase) |
+| Conceptual search | \`semantic\` | "how does caching work" |
+
+### Token Efficiency
+
+Use \`output_format\` to reduce response size:
+- \`full\` (default): Full content for understanding code
+- \`paths\`: File paths only (80% token savings) - use for file listings
+- \`minimal\`: Compact format (60% savings) - use for refactoring
+- \`count\`: Match counts only (90% savings) - use for quick checks
 
 ### Plans & Tasks
 

@@ -336,11 +336,13 @@ export class ContextStreamClient {
     content_max_chars?: number;
     context_lines?: number;
     exact_match_boost?: number;
+    output_format?: 'full' | 'paths' | 'minimal' | 'count';
   }) {
     return request(this.config, '/search/semantic', {
       body: {
         ...this.withDefaults(body),
         search_type: 'semantic',
+        output_format: body.output_format,
         filters: body.workspace_id ? {} : { file_types: [], languages: [], file_paths: [], exclude_paths: [], content_types: [], tags: [] }
       }
     });
@@ -355,11 +357,13 @@ export class ContextStreamClient {
     content_max_chars?: number;
     context_lines?: number;
     exact_match_boost?: number;
+    output_format?: 'full' | 'paths' | 'minimal' | 'count';
   }) {
     return request(this.config, '/search/hybrid', {
       body: {
         ...this.withDefaults(body),
         search_type: 'hybrid',
+        output_format: body.output_format,
         filters: body.workspace_id ? {} : { file_types: [], languages: [], file_paths: [], exclude_paths: [], content_types: [], tags: [] }
       }
     });
@@ -374,11 +378,13 @@ export class ContextStreamClient {
     content_max_chars?: number;
     context_lines?: number;
     exact_match_boost?: number;
+    output_format?: 'full' | 'paths' | 'minimal' | 'count';
   }) {
     return request(this.config, '/search/keyword', {
       body: {
         ...this.withDefaults(body),
         search_type: 'keyword',
+        output_format: body.output_format,
         filters: body.workspace_id ? {} : { file_types: [], languages: [], file_paths: [], exclude_paths: [], content_types: [], tags: [] }
       }
     });
@@ -393,11 +399,13 @@ export class ContextStreamClient {
     content_max_chars?: number;
     context_lines?: number;
     exact_match_boost?: number;
+    output_format?: 'full' | 'paths' | 'minimal' | 'count';
   }) {
     return request(this.config, '/search/pattern', {
       body: {
         ...this.withDefaults(body),
         search_type: 'pattern',
+        output_format: body.output_format,
         filters: body.workspace_id ? {} : { file_types: [], languages: [], file_paths: [], exclude_paths: [], content_types: [], tags: [] }
       }
     });
@@ -417,11 +425,13 @@ export class ContextStreamClient {
     content_max_chars?: number;
     context_lines?: number;
     exact_match_boost?: number;
+    output_format?: 'full' | 'paths' | 'minimal' | 'count';
   }) {
     return request(this.config, '/search/exhaustive', {
       body: {
         ...this.withDefaults(body),
         search_type: 'exhaustive',
+        output_format: body.output_format,
         filters: body.workspace_id ? {} : { file_types: [], languages: [], file_paths: [], exclude_paths: [], content_types: [], tags: [] }
       }
     });

@@ -1,10 +1,19 @@
 # ContextStream MCP Server
 
+**Get set up in 30 seconds (recommended):**
+
+```bash
+npx -y @contextstream/mcp-server setup
+```
+
+This wizard authenticates you, creates/stores an API key, installs editor rules, and writes MCP config files.
+
 Persistent memory, semantic search, and code intelligence for any MCP-compatible AI tool (Cursor, Claude Code, Windsurf, VS Code, Claude Desktop, Codex CLI, etc.).
 
-ContextStream is a shared "brain" for AI-assisted development. It stores decisions, preferences, notes (including implementation notes), lessons, tasks, and project context — and lets your AI tools search and analyze your codebase with consistent context across sessions.
-
-**v0.4.x:** Consolidated domain tools (~11 tools) for **~75% lower tool-registry token overhead** vs previous versions.
+**At a glance:**
+- Shared "brain" for decisions, preferences, notes (including implementation notes), lessons, tasks, and project context.
+- Search + analysis across sessions with consistent context (semantic/hybrid/keyword + graph tools).
+- v0.4.x consolidated domain tools (~11 tools) for ~75% lower tool-registry token overhead vs previous versions.
 
 ---
 

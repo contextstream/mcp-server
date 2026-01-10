@@ -2,7 +2,7 @@
 
 Persistent memory, semantic search, and code intelligence for any MCP-compatible AI tool (Cursor, Claude Code, Windsurf, VS Code, Claude Desktop, Codex CLI, etc.).
 
-ContextStream is a shared "brain" for AI-assisted development. It stores decisions, preferences, lessons, tasks, and project context — and lets your AI tools search and analyze your codebase with consistent context across sessions.
+ContextStream is a shared "brain" for AI-assisted development. It stores decisions, preferences, notes (including implementation notes), lessons, tasks, and project context — and lets your AI tools search and analyze your codebase with consistent context across sessions.
 
 **v0.4.x:** Consolidated domain tools (~11 tools) for **~75% lower tool-registry token overhead** vs previous versions.
 
@@ -45,7 +45,7 @@ MCP clients often inject the tool catalog into the model context. v0.4.x is desi
 
 - **Consolidated domain tools** (v0.4.x): short tool list with action/mode dispatch
 - Session-aware context loading (`session_init`, `context_smart`)
-- Memory capture + recall (decisions, preferences, lessons, tasks, bugs)
+- Memory capture + recall (decisions, preferences, notes, implementation notes, lessons, tasks, bugs)
 - Code search (semantic, hybrid, keyword, pattern)
 - Knowledge graph + code analysis (dependencies, impact, call paths, circular deps, unused code)
 - Graph ingestion for full graph builds (`graph(action="ingest")`)

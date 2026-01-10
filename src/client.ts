@@ -1936,7 +1936,7 @@ export class ContextStreamClient {
     workspace_id?: string;
     project_id?: string;
     session_id?: string;
-    event_type: 'conversation' | 'decision' | 'insight' | 'preference' | 'task' | 'bug' | 'feature' | 'plan' | 'correction' | 'lesson' | 'warning' | 'frustration';
+    event_type: 'conversation' | 'decision' | 'insight' | 'preference' | 'note' | 'implementation' | 'task' | 'bug' | 'feature' | 'plan' | 'correction' | 'lesson' | 'warning' | 'frustration';
     title: string;
     content: string;
     tags?: string[];
@@ -1969,6 +1969,8 @@ export class ContextStreamClient {
       case 'decision':
       case 'insight':
       case 'preference':
+      case 'note':
+      case 'implementation':
         apiEventType = 'manual_note';
         tags.push(params.event_type);
         break;

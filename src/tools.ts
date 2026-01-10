@@ -88,6 +88,8 @@ type RulesNotice = {
 
 const RULES_NOTICE_CACHE_TTL_MS = 10 * 60 * 1000;
 const RULES_VERSION_REGEX = /Rules Version:\s*([0-9][0-9A-Za-z.\-]*)/i;
+const CONTEXTSTREAM_START_MARKER = '<!-- BEGIN ContextStream -->';
+const CONTEXTSTREAM_END_MARKER = '<!-- END ContextStream -->';
 
 const RULES_PROJECT_FILES: Record<string, string> = {
   codex: 'AGENTS.md',
@@ -122,9 +124,29 @@ function compareVersions(v1: string, v2: string): number {
   return 0;
 }
 
+function extractRulesVersions(content: string): string[] {
+  const regex = new RegExp(RULES_VERSION_REGEX.source, 'gi');
+  return Array.from(content.matchAll(regex))
+    .map((match) => match[1]?.trim())
+    .filter((version): version is string => Boolean(version));
+}
+
+function extractContextStreamMarkerBlock(content: string): string | null {
+  const startIdx = content.indexOf(CONTEXTSTREAM_START_MARKER);
+  const endIdx = content.indexOf(CONTEXTSTREAM_END_MARKER);
+  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+    return null;
+  }
+  return content.slice(startIdx + CONTEXTSTREAM_START_MARKER.length, endIdx).trim();
+}
+
 function extractRulesVersion(content: string): string | null {
-  const match = content.match(RULES_VERSION_REGEX);
-  return match?.[1]?.trim() ?? null;
+  const markerBlock = extractContextStreamMarkerBlock(content);
+  const candidates = markerBlock ? extractRulesVersions(markerBlock) : extractRulesVersions(content);
+  if (candidates.length === 0) {
+    return null;
+  }
+  return candidates.sort(compareVersions).at(-1) ?? null;
 }
 
 function detectEditorFromClientName(clientName?: string): string | null {
@@ -273,8 +295,6 @@ function getRulesNotice(folderPath: string | null, clientName?: string): RulesNo
   return notice;
 }
 
-const CONTEXTSTREAM_START_MARKER = '<!-- BEGIN ContextStream -->';
-const CONTEXTSTREAM_END_MARKER = '<!-- END ContextStream -->';
 const LEGACY_CONTEXTSTREAM_HINTS = [
   'contextstream integration',
   'contextstream v0.4',
@@ -4456,7 +4476,7 @@ Use this to persist decisions, insights, preferences, or important information.`
         project_id: z.string().uuid().optional(),
         session_id: z.string().optional().describe('Session ID to associate with this capture'),
         event_type: z.enum([
-          'conversation', 'decision', 'insight', 'preference', 'task', 'bug', 'feature',
+          'conversation', 'decision', 'insight', 'preference', 'note', 'implementation', 'task', 'bug', 'feature',
           // Plans & Tasks feature
           'plan',          // Implementation plan
           // Lesson system types
@@ -6314,7 +6334,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           query: z.string().optional().describe('Query for recall/search/lessons/decision_trace'),
           content: z.string().optional().describe('Content for capture/remember/compress'),
           title: z.string().optional().describe('Title for capture/capture_lesson/capture_plan'),
-          event_type: z.enum(['decision', 'preference', 'insight', 'task', 'bug', 'feature', 'plan', 'correction', 'lesson', 'warning', 'frustration', 'conversation']).optional().describe('Event type for capture'),
+          event_type: z.enum(['decision', 'preference', 'insight', 'note', 'implementation', 'task', 'bug', 'feature', 'plan', 'correction', 'lesson', 'warning', 'frustration', 'conversation']).optional().describe('Event type for capture'),
           importance: z.enum(['low', 'medium', 'high', 'critical']).optional(),
           tags: z.array(z.string()).optional(),
           // Lesson-specific

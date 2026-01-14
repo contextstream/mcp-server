@@ -1,7 +1,7 @@
 {
   "name": "@contextstream/mcp-server",
   "mcpName": "io.github.contextstreamio/mcp-server",
-  "version": "0.4.28",
+  "version": "0.4.29",
   "description": "ContextStream MCP server - v0.4.x with consolidated domain tools (~11 tools, ~75% token reduction). Code context, memory, search, and AI tools.",
   "type": "module",
   "license": "MIT",

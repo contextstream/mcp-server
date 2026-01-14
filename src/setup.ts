@@ -758,6 +758,7 @@ function buildClientConfig(params: { apiUrl: string; apiKey?: string; jwt?: stri
     defaultWorkspaceId: undefined,
     defaultProjectId: undefined,
     userAgent: `contextstream-mcp/setup/${VERSION}`,
+    contextPackEnabled: true,
   };
 }
 

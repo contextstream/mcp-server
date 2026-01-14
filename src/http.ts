@@ -56,7 +56,7 @@ function statusToCode(status: number): string {
 }
 
 export interface RequestOptions {
-  method?: "GET" | "POST" | "PUT" | "DELETE";
+  method?: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
   body?: any;
   signal?: AbortSignal;
   retries?: number;

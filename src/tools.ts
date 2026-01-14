@@ -1702,6 +1702,112 @@ function toStructured(data: unknown): StructuredContent {
   return undefined;
 }
 
+// =============================================================================
+// Token Savings Tracking
+// =============================================================================
+// Tool-specific multipliers for estimating candidate chars (what default tools would need)
+// Based on empirical observations of Glob/Grep/Read usage patterns
+
+type TokenSavingsToolType =
+  | "context_smart"
+  | "search_semantic"
+  | "search_hybrid"
+  | "search_keyword"
+  | "search_pattern"
+  | "search_exhaustive"
+  | "search_refactor"
+  | "session_recall"
+  | "session_smart_search"
+  | "session_user_context"
+  | "session_summary"
+  | "graph_dependencies"
+  | "graph_impact"
+  | "graph_call_path"
+  | "graph_related"
+  | "memory_search"
+  | "memory_decisions"
+  | "memory_timeline"
+  | "memory_summary";
+
+// Multipliers to estimate what candidate_chars would be without compression
+// These represent typical expansion from compressed context to full file reads
+const CANDIDATE_MULTIPLIERS: Record<TokenSavingsToolType, number> = {
+  // context_smart: Replaces reading multiple files to gather context
+  context_smart: 5.0,
+
+  // search: Semantic search replaces iterative Glob/Grep/Read cycles
+  search_semantic: 4.5,
+  search_hybrid: 4.0,
+  search_keyword: 2.5,
+  search_pattern: 3.0,
+  search_exhaustive: 3.5,
+  search_refactor: 3.0,
+
+  // session: Recall/search replaces reading through history
+  session_recall: 5.0,
+  session_smart_search: 4.0,
+  session_user_context: 3.0,
+  session_summary: 4.0,
+
+  // graph: Would require extensive file traversal
+  graph_dependencies: 8.0,
+  graph_impact: 10.0,
+  graph_call_path: 8.0,
+  graph_related: 6.0,
+
+  // memory: Context retrieval
+  memory_search: 3.5,
+  memory_decisions: 3.0,
+  memory_timeline: 3.0,
+  memory_summary: 4.0,
+};
+
+/**
+ * Track token savings for a tool call (fire-and-forget).
+ * This enables the Token Savings Calculator feature in the dashboard.
+ *
+ * @param client - The ContextStream client
+ * @param tool - The tool type for tracking
+ * @param resultContent - The actual result content (used to calculate context_chars)
+ * @param params - Optional parameters (workspace_id, project_id, max_tokens)
+ */
+function trackToolTokenSavings(
+  client: ContextStreamClient,
+  tool: TokenSavingsToolType,
+  resultContent: unknown,
+  params?: { workspace_id?: string; project_id?: string; max_tokens?: number }
+): void {
+  try {
+    // Calculate context_chars from actual result
+    const contextStr =
+      typeof resultContent === "string" ? resultContent : JSON.stringify(resultContent ?? {});
+    const contextChars = contextStr.length;
+
+    // Estimate candidate_chars based on tool type
+    const multiplier = CANDIDATE_MULTIPLIERS[tool] ?? 3.0;
+    // Add a base overhead to account for minimum file read operations
+    const baseOverhead = 500;
+    const candidateChars = Math.round(contextChars * multiplier + baseOverhead);
+
+    // Fire-and-forget: don't await, don't block on errors
+    client
+      .trackTokenSavings({
+        tool,
+        workspace_id: params?.workspace_id,
+        project_id: params?.project_id,
+        candidate_chars: candidateChars,
+        context_chars: contextChars,
+        max_tokens: params?.max_tokens,
+        metadata: { multiplier, source: "mcp-server" },
+      })
+      .catch(() => {
+        // Silently ignore tracking errors - this is best-effort analytics
+      });
+  } catch {
+    // Silently ignore any errors in tracking setup
+  }
+}
+
 function readStatNumber(payload: unknown, key: string): number | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   const direct = (payload as Record<string, unknown>)[key];
@@ -6215,7 +6321,7 @@ This saves ~80% tokens compared to including full chat history.`,
       let versionNotice = result.version_notice;
       if (!versionNotice) {
         try {
-          versionNotice = await getUpdateNotice();
+          versionNotice = (await getUpdateNotice()) ?? undefined;
         } catch {
           // ignore version check failures
         }
@@ -6233,6 +6339,14 @@ This saves ~80% tokens compared to including full chat history.`,
         ...(rulesNotice ? { rules_notice: rulesNotice } : {}),
         ...(versionNotice ? { version_notice: versionNotice } : {}),
       };
+
+      // Track token savings (fire-and-forget)
+      // context_smart is the most frequently called tool, so tracking is important
+      trackToolTokenSavings(client, "context_smart", result.context, {
+        workspace_id: workspaceId,
+        project_id: projectId,
+        max_tokens: input.max_tokens,
+      });
 
       return {
         content: [
@@ -7355,26 +7469,41 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         const params = normalizeSearchParams(input);
 
         let result;
+        let toolType: TokenSavingsToolType;
         switch (input.mode) {
           case "semantic":
             result = await client.searchSemantic(params);
+            toolType = "search_semantic";
             break;
           case "hybrid":
             result = await client.searchHybrid(params);
+            toolType = "search_hybrid";
             break;
           case "keyword":
             result = await client.searchKeyword(params);
+            toolType = "search_keyword";
             break;
           case "pattern":
             result = await client.searchPattern(params);
+            toolType = "search_pattern";
             break;
           case "exhaustive":
             result = await client.searchExhaustive(params);
+            toolType = "search_exhaustive";
             break;
           case "refactor":
             result = await client.searchRefactor(params);
+            toolType = "search_refactor";
             break;
+          default:
+            toolType = "search_hybrid";
         }
+
+        // Track token savings (fire-and-forget)
+        trackToolTokenSavings(client, toolType, result, {
+          workspace_id: params.workspace_id,
+          project_id: params.project_id,
+        });
 
         return {
           content: [{ type: "text" as const, text: formatContent(result) }],
@@ -7621,6 +7750,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               include_related: input.include_related,
               include_decisions: input.include_decisions,
             });
+            // Track token savings
+            trackToolTokenSavings(client, "session_recall", result, {
+              workspace_id: workspaceId,
+              project_id: projectId,
+            });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
               structuredContent: toStructured(result),
@@ -7631,11 +7765,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.content) {
               return errorResult("remember requires: content");
             }
+            // Map "critical" to "high" for the client API
+            const importance =
+              input.importance === "critical" ? "high" : (input.importance as "low" | "medium" | "high" | undefined);
             const result = await client.sessionRemember({
               workspace_id: workspaceId,
               project_id: projectId,
               content: input.content,
-              importance: input.importance,
+              importance,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -7645,6 +7782,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           case "user_context": {
             const result = await client.getUserContext({ workspace_id: workspaceId });
+            // Track token savings
+            trackToolTokenSavings(client, "session_user_context", result, {
+              workspace_id: workspaceId,
+            });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
               structuredContent: toStructured(result),
@@ -7653,6 +7794,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           case "summary": {
             const result = await client.getContextSummary({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              max_tokens: input.max_tokens,
+            });
+            // Track token savings
+            trackToolTokenSavings(client, "session_summary", result, {
               workspace_id: workspaceId,
               project_id: projectId,
               max_tokens: input.max_tokens,
@@ -7667,7 +7814,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.content) {
               return errorResult("compress requires: content (the chat history to compress)");
             }
-            const result = await client.compressSession({
+            const result = await client.compressChat({
               workspace_id: workspaceId,
               project_id: projectId,
               chat_history: input.content,
@@ -7682,7 +7829,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.since) {
               return errorResult("delta requires: since (ISO timestamp)");
             }
-            const result = await client.getSessionDelta({
+            const result = await client.getContextDelta({
               workspace_id: workspaceId,
               project_id: projectId,
               since: input.since,
@@ -7704,6 +7851,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               query: input.query,
               include_decisions: input.include_decisions,
               include_related: input.include_related,
+            });
+            // Track token savings
+            trackToolTokenSavings(client, "session_smart_search", result, {
+              workspace_id: workspaceId,
+              project_id: projectId,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -7872,7 +8024,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               })
             )
             .optional(),
-          new_node_id: z.string().uuid().optional().describe("For supersede: the new node ID"),
+          new_content: z.string().optional().describe("For supersede_node: the new content to replace the node with"),
+          reason: z.string().optional().describe("For supersede_node: reason for the supersede"),
           // Provenance
           provenance: z
             .object({
@@ -7963,8 +8116,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.event_id) {
               return errorResult("update_event requires: event_id");
             }
-            const result = await client.updateMemoryEvent({
-              event_id: input.event_id,
+            const result = await client.updateMemoryEvent(input.event_id, {
               title: input.title,
               content: input.content,
               metadata: input.metadata,
@@ -8002,7 +8154,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.event_id) {
               return errorResult("distill_event requires: event_id");
             }
-            const result = await client.distillEvent(input.event_id);
+            const result = await client.distillMemoryEvent(input.event_id);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
               structuredContent: toStructured(result),
@@ -8042,8 +8194,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.node_id) {
               return errorResult("update_node requires: node_id");
             }
-            const result = await client.updateKnowledgeNode({
-              node_id: input.node_id,
+            const result = await client.updateKnowledgeNode(input.node_id, {
               title: input.title,
               content: input.content,
             });
@@ -8077,12 +8228,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
 
           case "supersede_node": {
-            if (!input.node_id || !input.new_node_id) {
-              return errorResult("supersede_node requires: node_id, new_node_id");
+            if (!input.node_id || !input.new_content) {
+              return errorResult("supersede_node requires: node_id, new_content");
             }
-            const result = await client.supersedeKnowledgeNode({
-              node_id: input.node_id,
-              new_node_id: input.new_node_id,
+            const result = await client.supersedeKnowledgeNode(input.node_id, {
+              new_content: input.new_content,
+              reason: input.reason,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -8094,11 +8245,16 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.query) {
               return errorResult("search requires: query");
             }
-            const result = await client.searchMemory({
+            const result = await client.memorySearch({
               workspace_id: workspaceId,
               project_id: projectId,
               query: input.query,
               limit: input.limit,
+            });
+            // Track token savings
+            trackToolTokenSavings(client, "memory_search", result, {
+              workspace_id: workspaceId,
+              project_id: projectId,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -8113,6 +8269,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               category: input.category,
               limit: input.limit,
             });
+            // Track token savings
+            trackToolTokenSavings(client, "memory_decisions", result, {
+              workspace_id: workspaceId,
+              project_id: projectId,
+            });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
               structuredContent: toStructured(result),
@@ -8120,7 +8281,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
 
           case "timeline": {
-            const result = await client.memoryTimeline({
+            if (!workspaceId) {
+              return errorResult("timeline requires workspace_id. Call session_init first.");
+            }
+            const result = await client.memoryTimeline(workspaceId);
+            // Track token savings
+            trackToolTokenSavings(client, "memory_timeline", result, {
               workspace_id: workspaceId,
             });
             return {
@@ -8130,7 +8296,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
 
           case "summary": {
-            const result = await client.memorySummary({
+            if (!workspaceId) {
+              return errorResult("summary requires workspace_id. Call session_init first.");
+            }
+            const result = await client.memorySummary(workspaceId);
+            // Track token savings
+            trackToolTokenSavings(client, "memory_summary", result, {
               workspace_id: workspaceId,
             });
             return {
@@ -8153,7 +8324,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               title: input.title,
               content: input.content,
               description: input.description,
-              plan_id: input.plan_id,
+              plan_id: input.plan_id ?? undefined,
               plan_step_id: input.plan_step_id,
               status: input.task_status,
               priority: input.priority,
@@ -8224,7 +8395,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.listTasks({
               workspace_id: workspaceId,
               project_id: projectId,
-              plan_id: input.plan_id,
+              plan_id: input.plan_id ?? undefined,
               status: input.task_status,
               priority: input.priority,
               limit: input.limit,
@@ -8341,6 +8512,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               max_depth: input.max_depth,
               include_transitive: input.include_transitive,
             });
+            // Track token savings
+            trackToolTokenSavings(client, "graph_dependencies", result, {
+              workspace_id: workspaceId,
+              project_id: projectId,
+            });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
               structuredContent: toStructured(result),
@@ -8354,6 +8530,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.graphImpact({
               target: input.target,
               max_depth: input.max_depth,
+            });
+            // Track token savings
+            trackToolTokenSavings(client, "graph_impact", result, {
+              workspace_id: workspaceId,
+              project_id: projectId,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -8370,6 +8551,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               target: input.target,
               max_depth: input.max_depth,
             });
+            // Track token savings
+            trackToolTokenSavings(client, "graph_call_path", result, {
+              workspace_id: workspaceId,
+              project_id: projectId,
+            });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
               structuredContent: toStructured(result),
@@ -8385,6 +8571,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               workspace_id: workspaceId,
               project_id: projectId,
               limit: input.limit,
+            });
+            // Track token savings
+            trackToolTokenSavings(client, "graph_related", result, {
+              workspace_id: workspaceId,
+              project_id: projectId,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -8548,8 +8739,6 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               workspace_id: workspaceId,
               name: input.name,
               description: input.description,
-              folder_path: input.folder_path,
-              generate_editor_rules: input.generate_editor_rules,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -8561,8 +8750,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!projectId) {
               return errorResult("update requires: project_id");
             }
-            const result = await client.updateProject({
-              project_id: projectId,
+            const result = await client.updateProject(projectId, {
               name: input.name,
               description: input.description,
             });
@@ -8728,7 +8916,6 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               workspace_id: input.workspace_id,
               workspace_name: input.workspace_name,
               create_parent_mapping: input.create_parent_mapping,
-              generate_editor_rules: input.generate_editor_rules,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -8740,19 +8927,28 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.workspace_name) {
               return errorResult("bootstrap requires: workspace_name");
             }
-            const result = await client.bootstrapWorkspace({
-              workspace_name: input.workspace_name,
-              folder_path: input.folder_path,
+            // Bootstrap creates a new workspace and optionally associates it with a folder
+            const wsResult = await client.createWorkspace({
+              name: input.workspace_name,
               description: input.description,
               visibility: input.visibility,
-              create_parent_mapping: input.create_parent_mapping,
-              generate_editor_rules: input.generate_editor_rules,
-              auto_index: input.auto_index,
-              context_hint: input.context_hint,
             });
+            const newWorkspaceId = (wsResult as { id?: string })?.id;
+            if (!newWorkspaceId) {
+              return errorResult("Failed to create workspace during bootstrap");
+            }
+            // If folder_path provided, associate the workspace with it
+            if (input.folder_path) {
+              await client.associateWorkspace({
+                folder_path: input.folder_path,
+                workspace_id: newWorkspaceId,
+                workspace_name: input.workspace_name,
+                create_parent_mapping: input.create_parent_mapping,
+              });
+            }
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              content: [{ type: "text" as const, text: formatContent(wsResult) }],
+              structuredContent: toStructured(wsResult),
             };
           }
 
@@ -8957,20 +9153,35 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
 
           case "search": {
+            if (!input.query) {
+              return errorResult("search requires: query");
+            }
             if (input.provider === "slack") {
-              const result = await client.slackSearch(params);
+              const result = await client.slackSearch({
+                workspace_id: workspaceId,
+                q: input.query,
+                limit: input.limit,
+              });
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
                 structuredContent: toStructured(result),
               };
             } else if (input.provider === "github") {
-              const result = await client.githubSearch(params);
+              const result = await client.githubSearch({
+                workspace_id: workspaceId,
+                q: input.query,
+                limit: input.limit,
+              });
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
                 structuredContent: toStructured(result),
               };
             } else {
-              const result = await client.integrationsSearch(params);
+              const result = await client.integrationsSearch({
+                workspace_id: workspaceId,
+                query: input.query,
+                limit: input.limit,
+              });
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
                 structuredContent: toStructured(result),
@@ -9213,17 +9424,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
 
           case "editor_rules": {
-            if (!input.folder_path) {
-              return errorResult("editor_rules requires: folder_path");
-            }
-            const result = await generateAllRuleFiles(input.folder_path, {
-              editors: input.editors as any,
-              mode: input.mode,
-              dryRun: input.dry_run,
+            // Generate rule files content for all supported editors
+            const result = generateAllRuleFiles({
               workspaceId: input.workspace_id,
               workspaceName: input.workspace_name,
               projectName: input.project_name,
               additionalRules: input.additional_rules,
+              mode: input.mode as "minimal" | "full" | undefined,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],

@@ -93,7 +93,7 @@ const INGEST_BENEFITS = [
 ];
 
 // Ingest recommendation status types
-type IngestStatus = "not_indexed" | "indexed" | "stale" | "recently_indexed" | "auto_started";
+type IngestStatus = "not_indexed" | "indexed" | "stale" | "recently_indexed" | "auto_started" | "auto_refreshing";
 
 interface IngestRecommendation {
   recommended: boolean;

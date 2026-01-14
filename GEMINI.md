@@ -1,0 +1,67 @@
+<!-- BEGIN ContextStream -->
+# Antigravity Agent Rules
+## ContextStream v0.4.x (Consolidated Domain Tools)
+
+v0.4.x uses ~11 consolidated domain tools for ~75% token reduction vs previous versions.
+Rules Version: 0.4.27
+
+### Required Every Message
+
+| Message | What to Call |
+|---------|--------------|
+| **1st message** | `session_init(folder_path="<cwd>", context_hint="<user_message>")`, then `context_smart(user_message="<user_message>", format="minified", max_tokens=400)` |
+| **2nd+ messages** | `context_smart(user_message="<user_message>", format="minified", max_tokens=400)` |
+| **Capture decisions** | `session(action="capture", event_type="decision", title="...", content="...")` |
+| **Before risky work** | `session(action="get_lessons", query="<topic>")` |
+| **On user frustration** | `session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...")` |
+
+**Context Pack (Pro+):** If enabled, use `context_smart(..., mode="pack", distill=true)` for code/file queries. If unavailable or disabled, omit `mode` and proceed with standard `context_smart` (the API will fall back).
+
+**Tool naming:** Antigravity uses bare tool names (e.g., `session_init`, `search`) without prefixes. If a tool call fails with "No such tool available", refresh rules and match the tool list.
+
+### Quick Reference: Domain Tools
+
+| Tool | Common Usage |
+|------|--------------|
+| `search` | `search(mode="semantic", query="...", limit=3)` — modes: semantic, hybrid, keyword, pattern |
+| `session` | `session(action="capture", ...)` — actions: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search |
+| `memory` | `memory(action="list_events", ...)` — CRUD for events/nodes, search, decisions, timeline, summary |
+| `graph` | `graph(action="dependencies", ...)` — dependencies, impact, call_path, related, ingest |
+| `project` | `project(action="list", ...)` - list, get, create, update, index, overview, statistics, files, index_status, ingest_local |
+| `workspace` | `workspace(action="list", ...)` — list, get, associate, bootstrap |
+| `integration` | `integration(provider="github", action="search", ...)` — GitHub/Slack integration |
+| `help` | `help(action="tools")` — tools, auth, version, editor_rules |
+
+### Behavior Rules
+
+⚠️ **STOP: Before using Search/Glob/Grep/Read/Explore** → Call `search(mode="hybrid")` FIRST. Use local tools ONLY if ContextStream returns 0 results.
+
+- **First message**: Call `session_init` with context_hint, then call `context_smart` before any other tool or response
+- **On [INGEST_RECOMMENDED]**: Ask the user if they want to enable semantic code search. Explain: "Indexing your codebase enables AI-powered code search, dependency analysis, and better context. This takes a few minutes." If user agrees, run the provided `project(action="ingest_local")` command.
+- **Every message after**: Always call `context_smart` BEFORE responding (semantic search for relevant context)
+- **Before searching files/code**: Check `project(action="index_status")`; if missing/stale run `project(action="ingest_local", path="<cwd>")` or `project(action="index")`, and use `graph(action="ingest")` if needed
+- **For discovery**: Use `session(action="smart_search")` or `search(mode="hybrid")` — NEVER use local Glob/Grep/Read first
+- **For file/function/config lookups**: Use `search`/`graph` first; only fall back to rg/ls/find if ContextStream returns no results
+- **If ContextStream returns results**: Do NOT use local Search/Explore/Read; only open specific files when needed for exact edits
+- **For code analysis**: Use `graph(action="dependencies")` or `graph(action="impact")` for call/dependency analysis
+- **On [RULES_NOTICE]**: Use `generate_rules()` to update rules
+- **After completing work**: Always capture decisions/insights with `session(action="capture")`
+- **On mistakes/corrections**: Immediately capture lessons with `session(action="capture_lesson")`
+
+### Plans & Tasks
+
+When user asks to create a plan or implementation roadmap:
+1. Create plan: `session(action="capture_plan", title="Plan Title", description="...", goals=["goal1", "goal2"], steps=[{id: "1", title: "Step 1", order: 1}, ...])`
+2. Get plan_id from response, then create tasks: `memory(action="create_task", title="Task Title", plan_id="<plan_id>", priority="high|medium|low", description="...")`
+
+To manage existing plans/tasks:
+- List plans: `session(action="list_plans")`
+- Get plan with tasks: `session(action="get_plan", plan_id="<uuid>", include_tasks=true)`
+- List tasks: `memory(action="list_tasks", plan_id="<uuid>")` or `memory(action="list_tasks")` for all
+- Update task status: `memory(action="update_task", task_id="<uuid>", task_status="pending|in_progress|completed|blocked")`
+- Link task to plan: `memory(action="update_task", task_id="<uuid>", plan_id="<plan_uuid>")`
+- Unlink task from plan: `memory(action="update_task", task_id="<uuid>", plan_id=null)`
+- Delete: `memory(action="delete_task", task_id="<uuid>")` or `memory(action="delete_event", event_id="<plan_uuid>")`
+
+Full docs: https://contextstream.io/docs/mcp/tools
+<!-- END ContextStream -->

@@ -270,6 +270,50 @@ CONTEXTSTREAM_API_URL = "https://api.contextstream.io"
 CONTEXTSTREAM_API_KEY = "YOUR_API_KEY"
 ```
 
+### Antigravity (Google)
+
+Antigravity uses project-scoped `.mcp.json` files with the same format as Cursor/Claude Desktop:
+
+**Project configuration (`.mcp.json` in project root):**
+
+```json
+{
+  "mcpServers": {
+    "contextstream": {
+      "command": "npx",
+      "args": ["-y", "@contextstream/mcp-server"],
+      "env": {
+        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+        "CONTEXTSTREAM_API_KEY": "YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
+
+**Windows users:** Use `cmd /c npx` wrapper:
+
+```json
+{
+  "mcpServers": {
+    "contextstream": {
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "@contextstream/mcp-server"],
+      "env": {
+        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+        "CONTEXTSTREAM_API_KEY": "YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
+
+After adding the config, access via the "..." menu → "MCP Servers" → "View raw config" to verify.
+
+**Rules files:**
+- Global rules: `~/.gemini/GEMINI.md`
+- Workspace rules: `.agent/rules/contextstream.md`
+
 ---
 
 ## Tool Overview (v0.4.x Consolidated)

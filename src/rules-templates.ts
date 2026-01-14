@@ -483,9 +483,17 @@ ${rules}
 # Add ContextStream guidance to conventions
 conventions: |
 ${rules
-  .split("\n")
-  .map((line) => "  " + line)
-  .join("\n")}
+        .split("\n")
+        .map((line) => "  " + line)
+        .join("\n")}
+`,
+  },
+
+  antigravity: {
+    filename: "GEMINI.md",
+    description: "Google Antigravity AI rules",
+    build: (rules) => `# Antigravity Agent Rules
+${rules}
 `,
   },
 };

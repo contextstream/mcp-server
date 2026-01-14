@@ -21,7 +21,7 @@ type Toolset = "consolidated" | "router";
 type InstallScope = "global" | "project" | "both";
 type McpScope = InstallScope | "skip";
 
-type EditorKey = "codex" | "claude" | "cursor" | "windsurf" | "cline" | "kilo" | "roo" | "aider";
+type EditorKey = "codex" | "claude" | "cursor" | "windsurf" | "cline" | "kilo" | "roo" | "aider" | "antigravity";
 
 const EDITOR_LABELS: Record<EditorKey, string> = {
   codex: "Codex CLI",
@@ -32,10 +32,11 @@ const EDITOR_LABELS: Record<EditorKey, string> = {
   kilo: "Kilo Code",
   roo: "Roo Code",
   aider: "Aider",
+  antigravity: "Antigravity (Google)",
 };
 
 function supportsProjectMcpConfig(editor: EditorKey): boolean {
-  return editor === "cursor" || editor === "claude" || editor === "kilo" || editor === "roo";
+  return editor === "cursor" || editor === "claude" || editor === "kilo" || editor === "roo" || editor === "antigravity";
 }
 
 function normalizeInput(value: string): string {
@@ -294,6 +295,8 @@ function globalRulesPathForEditor(editor: EditorKey): string | null {
       return path.join(home, ".roo", "rules", "contextstream.md");
     case "aider":
       return path.join(home, ".aider.conf.yml");
+    case "antigravity":
+      return path.join(home, ".gemini", "GEMINI.md");
     case "cursor":
       // Cursor global rules are configured via the app UI; project rules are supported via `.cursorrules`.
       return null;
@@ -414,6 +417,32 @@ async function isCursorInstalled(): Promise<boolean> {
   return anyPathExists(candidates);
 }
 
+async function isAntigravityInstalled(): Promise<boolean> {
+  const home = homedir();
+  const candidates: string[] = [path.join(home, ".gemini")];
+
+  if (process.platform === "darwin") {
+    candidates.push("/Applications/Antigravity.app");
+    candidates.push(path.join(home, "Applications", "Antigravity.app"));
+    candidates.push(path.join(home, "Library", "Application Support", "Antigravity"));
+  } else if (process.platform === "win32") {
+    const localApp = process.env.LOCALAPPDATA;
+    const programFiles = process.env.ProgramFiles;
+    const programFilesX86 = process.env["ProgramFiles(x86)"];
+    if (localApp) candidates.push(path.join(localApp, "Programs", "Antigravity", "Antigravity.exe"));
+    if (localApp) candidates.push(path.join(localApp, "Antigravity", "Antigravity.exe"));
+    if (programFiles) candidates.push(path.join(programFiles, "Antigravity", "Antigravity.exe"));
+    if (programFilesX86) candidates.push(path.join(programFilesX86, "Antigravity", "Antigravity.exe"));
+  } else {
+    candidates.push("/usr/bin/antigravity");
+    candidates.push("/usr/local/bin/antigravity");
+    candidates.push("/opt/Antigravity");
+    candidates.push("/opt/antigravity");
+  }
+
+  return anyPathExists(candidates);
+}
+
 async function isEditorInstalled(editor: EditorKey): Promise<boolean> {
   switch (editor) {
     case "codex":
@@ -432,6 +461,8 @@ async function isEditorInstalled(editor: EditorKey): Promise<boolean> {
       return isRooInstalled();
     case "aider":
       return isAiderInstalled();
+    case "antigravity":
+      return isAntigravityInstalled();
     default:
       return false;
   }
@@ -661,13 +692,13 @@ async function upsertCodexTomlConfig(
     await fs.writeFile(
       filePath,
       existing.trimEnd() +
-        "\n\n" +
-        envMarker +
-        "\n" +
-        `CONTEXTSTREAM_API_URL = "${params.apiUrl}"\n` +
-        `CONTEXTSTREAM_API_KEY = "${params.apiKey}"\n` +
-        toolsetLine +
-        contextPackLine,
+      "\n\n" +
+      envMarker +
+      "\n" +
+      `CONTEXTSTREAM_API_URL = "${params.apiUrl}"\n` +
+      `CONTEXTSTREAM_API_KEY = "${params.apiKey}"\n` +
+      toolsetLine +
+      contextPackLine,
       "utf8"
     );
     return "updated";
@@ -809,7 +840,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     );
     const apiUrl = normalizeApiUrl(
       normalizeInput(await rl.question(`ContextStream API URL [${apiUrlDefault}]: `)) ||
-        apiUrlDefault
+      apiUrlDefault
     );
 
     let apiKey = normalizeInput(process.env.CONTEXTSTREAM_API_KEY || "");
@@ -1117,6 +1148,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       "kilo",
       "roo",
       "aider",
+      "antigravity",
     ];
     console.log('\nSelect editors to configure (comma-separated numbers, or "all"):');
     editors.forEach((e, i) => console.log(`  ${i + 1}) ${EDITOR_LABELS[e]}`));

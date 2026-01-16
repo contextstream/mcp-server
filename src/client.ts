@@ -4238,6 +4238,7 @@ export class ContextStreamClient {
    */
   async createNotionPage(params: {
     workspace_id?: string;
+    project_id?: string;
     title: string;
     content?: string;
     parent_database_id?: string;
@@ -4253,7 +4254,13 @@ export class ContextStreamClient {
     if (!withDefaults.workspace_id) {
       throw new Error("workspace_id is required for creating Notion pages");
     }
-    return request(this.config, `/integrations/notion/pages?workspace_id=${withDefaults.workspace_id}`, {
+    // Build query params including optional project_id
+    const urlParams = new URLSearchParams();
+    urlParams.set("workspace_id", withDefaults.workspace_id);
+    if (withDefaults.project_id) {
+      urlParams.set("project_id", withDefaults.project_id);
+    }
+    return request(this.config, `/integrations/notion/pages?${urlParams.toString()}`, {
       method: "POST",
       body: {
         title: params.title,

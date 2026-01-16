@@ -7078,6 +7078,7 @@ Example prompts:
 - "Create a new page in my Notion workspace"`,
       inputSchema: z.object({
         workspace_id: z.string().uuid().optional().describe("Workspace ID (uses session default if not provided)"),
+        project_id: z.string().uuid().optional().describe("Project ID (uses session default if not provided). If provided, the memory event will be scoped to this project."),
         title: z.string().describe("Page title"),
         content: z.string().optional().describe("Page content in Markdown format"),
         parent_database_id: z.string().optional().describe("Parent database ID to create page in"),
@@ -7086,6 +7087,7 @@ Example prompts:
     },
     async (input) => {
       const workspaceId = resolveWorkspaceId(input.workspace_id);
+      const projectId = resolveProjectId(input.project_id);
       if (!workspaceId) {
         return errorResult(
           "Error: workspace_id is required. Please call session_init first or provide workspace_id explicitly."
@@ -7094,6 +7096,7 @@ Example prompts:
 
       const result = await client.createNotionPage({
         workspace_id: workspaceId,
+        project_id: projectId,
         title: input.title,
         content: input.content,
         parent_database_id: input.parent_database_id,
@@ -9547,6 +9550,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             }
             const result = await client.createNotionPage({
               workspace_id: workspaceId,
+              project_id: projectId,
               title: input.title,
               content: input.content,
               parent_database_id: input.parent_database_id,

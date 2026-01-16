@@ -1,0 +1,26 @@
+ContextStream MCP Server
+Copyright (c) 2025-2026 ContextStream
+
+This product is developed and maintained by ContextStream as part of the
+ContextStream platform (https://contextstream.io).
+
+ContextStream is an independently developed cloud service providing persistent
+memory and cross-session context management for AI coding assistants. The
+platform includes proprietary backend services not included in this repository.
+
+This MCP server is a client library that connects to the ContextStream API.
+It requires a ContextStream account and API key to function.
+
+TRADEMARKS
+
+"ContextStream" and the ContextStream logo are trademarks of ContextStream.
+Use of these trademarks requires prior written permission.
+
+THIRD-PARTY LICENSES
+
+This software uses the following open-source packages:
+- @modelcontextprotocol/sdk (MIT)
+- zod (MIT)
+- Other dependencies listed in package.json
+
+For questions about licensing or trademark usage, contact: legal@contextstream.io

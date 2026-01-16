@@ -16,6 +16,7 @@ import {
 import { VERSION, getUpdateNotice } from "./version.js";
 import { generateToolCatalog, getCoreToolsHint, type CatalogFormat } from "./tool-catalog.js";
 import { getAuthOverride, runWithAuthOverride, type AuthOverride } from "./auth-context.js";
+import { installClaudeCodeHooks } from "./hooks-config.js";
 
 type StructuredContent = { [x: string]: unknown } | undefined;
 type ToolTextResult = {
@@ -26,6 +27,55 @@ type ToolTextResult = {
 
 const LESSON_DEDUP_WINDOW_MS = 2 * 60 * 1000;
 const recentLessonCaptures = new Map<string, number>();
+
+/**
+ * Search rules reminder injected into session_init and context_smart responses.
+ * This keeps the critical instruction in recent context to combat instruction decay.
+ * Can be disabled via CONTEXTSTREAM_SEARCH_REMINDER=false environment variable.
+ */
+const SEARCH_RULES_REMINDER_ENABLED =
+  process.env.CONTEXTSTREAM_SEARCH_REMINDER?.toLowerCase() !== "false";
+
+const SEARCH_RULES_REMINDER = `
+⚠️ [SEARCH RULES - READ EVERY TIME]
+BEFORE using Glob/Grep/Read/Search/Explore → call mcp__contextstream__search(mode="hybrid", query="...") FIRST
+BEFORE using EnterPlanMode/Task(Plan) → call mcp__contextstream__session(action="capture_plan", ...) instead
+Local tools ONLY if ContextStream returns 0 results after retry.
+`.trim();
+
+/**
+ * Lessons reminder injected when there are active lessons.
+ * This ensures AI doesn't repeat past mistakes.
+ */
+const LESSONS_REMINDER_PREFIX = `
+⚠️ [LESSONS - REVIEW BEFORE CHANGES]
+Past mistakes found that may be relevant. STOP and review before proceeding:
+`.trim();
+
+/**
+ * Generate a lessons reminder block if lessons are present in the result.
+ */
+function generateLessonsReminder(result: Record<string, unknown>): string {
+  const lessons = result.lessons as Array<{
+    title?: string;
+    trigger?: string;
+    prevention?: string;
+    severity?: string;
+  }> | undefined;
+
+  if (!lessons || lessons.length === 0) {
+    return "";
+  }
+
+  const lessonLines = lessons.slice(0, 5).map((l, i) => {
+    const severity = l.severity === "critical" ? "🚨" : l.severity === "high" ? "⚠️" : "📝";
+    const title = l.title || "Untitled lesson";
+    const prevention = l.prevention || l.trigger || "";
+    return `${i + 1}. ${severity} ${title}${prevention ? `: ${prevention.slice(0, 100)}` : ""}`;
+  });
+
+  return `\n\n${LESSONS_REMINDER_PREFIX}\n${lessonLines.join("\n")}`;
+}
 
 const DEFAULT_PARAM_DESCRIPTIONS: Record<string, string> = {
   api_key: "ContextStream API key.",
@@ -4943,6 +4993,17 @@ This does semantic search on the first message. You only need context_smart on s
         text = `${text}\n\n${noticeLines.filter(Boolean).join("\n")}`;
       }
 
+      // Inject lessons reminder if there are lessons from past mistakes
+      const lessonsReminder = generateLessonsReminder(result);
+      if (lessonsReminder) {
+        text = `${text}${lessonsReminder}`;
+      }
+
+      // Inject search rules reminder to combat instruction decay
+      if (SEARCH_RULES_REMINDER_ENABLED) {
+        text = `${text}\n\n${SEARCH_RULES_REMINDER}`;
+      }
+
       return {
         content: [{ type: "text" as const, text }],
         structuredContent: toStructured(result),
@@ -5825,6 +5886,10 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
           .boolean()
           .optional()
           .describe("Also write global rule files for supported editors"),
+        install_hooks: z
+          .boolean()
+          .optional()
+          .describe("Install Claude Code hooks to enforce ContextStream-first search. Defaults to true for Claude users. Set to false to skip."),
         dry_run: z.boolean().optional().describe("If true, return content without writing files"),
       }),
     },
@@ -5914,13 +5979,43 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
           ? "Apply rules globally too? Re-run with apply_global: true."
           : "No global rule locations are known for these editors.";
 
+      // Install Claude Code hooks by default when claude is in editors (unless explicitly disabled)
+      let hooksResults: Array<{ file: string; status: string }> | undefined;
+      let hooksPrompt: string | undefined;
+      const hasClaude = editors.includes("claude");
+      const shouldInstallHooks = hasClaude && input.install_hooks !== false;
+
+      if (shouldInstallHooks) {
+        try {
+          if (input.dry_run) {
+            hooksResults = [
+              { file: "~/.claude/hooks/contextstream-redirect.py", status: "dry run - would create" },
+              { file: "~/.claude/hooks/contextstream-reminder.py", status: "dry run - would create" },
+              { file: "~/.claude/settings.json", status: "dry run - would update" },
+            ];
+          } else {
+            const hookResult = await installClaudeCodeHooks({ scope: "user" });
+            hooksResults = [
+              ...hookResult.scripts.map((f) => ({ file: f, status: "created" })),
+              ...hookResult.settings.map((f) => ({ file: f, status: "updated" })),
+            ];
+          }
+        } catch (err) {
+          hooksResults = [{ file: "hooks", status: `error: ${(err as Error).message}` }];
+        }
+      } else if (hasClaude && input.install_hooks === false) {
+        hooksPrompt = "Hooks skipped. Claude may use default tools instead of ContextStream search.";
+      }
+
       const summary = {
         folder: folderPath,
         results,
         ...(globalResults ? { global_results: globalResults } : {}),
         ...(globalTargets.length > 0 ? { global_targets: globalTargets } : {}),
+        ...(hooksResults ? { hooks_results: hooksResults } : {}),
         message: baseMessage,
         global_prompt: globalPrompt,
+        ...(hooksPrompt ? { hooks_prompt: hooksPrompt } : {}),
       };
 
       return {
@@ -6412,11 +6507,23 @@ This saves ~80% tokens compared to including full chat history.`,
         max_tokens: input.max_tokens,
       });
 
+      // Check if lessons are present in the context (L: prefix in minified, or "lesson" keyword)
+      const hasLessons =
+        result.context.includes("|L:") ||
+        result.context.includes("L:") ||
+        result.context.toLowerCase().includes("lesson");
+      const lessonsWarningLine = hasLessons
+        ? "\n\n⚠️ [LESSONS DETECTED] Review the L: items above - these are past mistakes. STOP and review before making similar changes."
+        : "";
+
+      // Inject search rules reminder to combat instruction decay
+      const searchRulesLine = SEARCH_RULES_REMINDER_ENABLED ? `\n\n${SEARCH_RULES_REMINDER}` : "";
+
       return {
         content: [
           {
             type: "text" as const,
-            text: result.context + footer + rulesNoticeLine + versionNoticeLine,
+            text: result.context + footer + lessonsWarningLine + rulesNoticeLine + versionNoticeLine + searchRulesLine,
           },
         ],
         structuredContent: toStructured(enrichedResult),

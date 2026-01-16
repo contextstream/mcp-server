@@ -15,6 +15,10 @@ import {
   readSavedCredentials,
   writeSavedCredentials,
 } from "./credentials.js";
+import {
+  installClaudeCodeHooks,
+  generateHooksDocumentation,
+} from "./hooks-config.js";
 
 type RuleMode = "minimal" | "full";
 type Toolset = "consolidated" | "router";
@@ -1359,6 +1363,58 @@ export async function runSetupWizard(args: string[]): Promise<void> {
           const message = err instanceof Error ? err.message : String(err);
           console.log(`- ${EDITOR_LABELS[editor]}: failed to write MCP config: ${message}`);
         }
+      }
+    }
+
+    // Claude Code hooks (optional but highly recommended)
+    if (configuredEditors.includes("claude")) {
+      console.log("\n┌─────────────────────────────────────────────────────────────────┐");
+      console.log("│  Claude Code Hooks (Recommended)                                │");
+      console.log("└─────────────────────────────────────────────────────────────────┘");
+      console.log("");
+      console.log("  Problem: Claude Code often ignores CLAUDE.md instructions and uses");
+      console.log("  its default tools (Grep/Glob/Search) instead of ContextStream search.");
+      console.log("  This happens because instructions decay over long conversations.");
+      console.log("");
+      console.log("  Solution: Install hooks that:");
+      console.log("  ✓ Block default search tools (Grep/Glob/Search) → redirect to ContextStream");
+      console.log("  ✓ Block built-in plan mode → redirect to ContextStream plans (persistent)");
+      console.log("  ✓ Inject reminders on every message to keep rules in context");
+      console.log("  ✓ Result: Faster searches, persistent plans across sessions");
+      console.log("");
+      console.log("  You can disable hooks anytime with CONTEXTSTREAM_HOOK_ENABLED=false");
+      console.log("");
+      const installHooks = normalizeInput(
+        await rl.question("Install Claude Code hooks? [Y/n] (recommended): ")
+      ).toLowerCase();
+
+      if (installHooks !== "n" && installHooks !== "no") {
+        try {
+          if (dryRun) {
+            console.log("- Would install hooks to ~/.claude/hooks/");
+            console.log("- Would update ~/.claude/settings.json");
+            writeActions.push({ kind: "mcp-config", target: path.join(homedir(), ".claude", "hooks", "contextstream-redirect.py"), status: "dry-run" });
+            writeActions.push({ kind: "mcp-config", target: path.join(homedir(), ".claude", "hooks", "contextstream-reminder.py"), status: "dry-run" });
+            writeActions.push({ kind: "mcp-config", target: path.join(homedir(), ".claude", "settings.json"), status: "dry-run" });
+          } else {
+            const result = await installClaudeCodeHooks({ scope: "user" });
+            result.scripts.forEach(script => {
+              writeActions.push({ kind: "mcp-config", target: script, status: "created" });
+              console.log(`- Created hook: ${script}`);
+            });
+            result.settings.forEach(settings => {
+              writeActions.push({ kind: "mcp-config", target: settings, status: "updated" });
+              console.log(`- Updated settings: ${settings}`);
+            });
+          }
+          console.log("  Hooks installed. Disable with CONTEXTSTREAM_HOOK_ENABLED=false");
+        } catch (err: any) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.log(`- Failed to install hooks: ${message}`);
+        }
+      } else {
+        console.log("- Skipped hooks installation.");
+        console.log("  Note: Without hooks, Claude may still use default tools instead of ContextStream.");
       }
     }
 

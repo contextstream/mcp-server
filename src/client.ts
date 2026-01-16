@@ -4424,13 +4424,23 @@ export class ContextStreamClient {
   }
 
   /**
-   * Search/list pages in Notion
+   * Search/list pages in Notion with smart type detection filtering
    */
   async notionSearchPages(params: {
     workspace_id?: string;
     query?: string;
     database_id?: string;
     limit?: number;
+    /** Filter by detected content type (NotionTask, NotionMeeting, NotionWiki, etc.) */
+    event_type?: string;
+    /** Filter by status property (e.g., 'Done', 'In Progress') */
+    status?: string;
+    /** Filter by priority property (e.g., 'High', 'Medium', 'Low') */
+    priority?: string;
+    /** Filter to pages with or without due dates */
+    has_due_date?: boolean;
+    /** Filter by tags (comma-separated) */
+    tags?: string;
   }): Promise<
     Array<{
       id: string;
@@ -4450,6 +4460,11 @@ export class ContextStreamClient {
     if (params?.query) query.set("query", params.query);
     if (params?.database_id) query.set("database_id", params.database_id);
     if (params?.limit) query.set("limit", String(params.limit));
+    if (params?.event_type) query.set("event_type", params.event_type);
+    if (params?.status) query.set("status", params.status);
+    if (params?.priority) query.set("priority", params.priority);
+    if (params?.has_due_date !== undefined) query.set("has_due_date", String(params.has_due_date));
+    if (params?.tags) query.set("tags", params.tags);
     const suffix = query.toString() ? `?${query.toString()}` : "";
     return request(
       this.config,

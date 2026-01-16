@@ -129,6 +129,15 @@ export const TOOL_CATALOG: ToolCategory[] = [
     name: "Notion",
     tools: [
       { name: "create_page", hint: "new-page" },
+      { name: "search_pages", hint: "find" },
+      { name: "list_databases", hint: "list-dbs" },
+      { name: "get_page", hint: "get" },
+      { name: "query_database", hint: "query-db" },
+      { name: "update_page", hint: "edit" },
+      { name: "stats", hint: "overview" },
+      { name: "activity", hint: "recent" },
+      { name: "knowledge", hint: "insights" },
+      { name: "summary", hint: "brief" },
     ],
   },
 ];

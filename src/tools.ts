@@ -9218,7 +9218,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "integration",
       {
         title: "Integration",
-        description: `Integration operations for Slack, GitHub, and Notion. Provider: slack, github, notion, all. Actions: status, search, stats, activity, contributors, knowledge, summary, channels (slack), discussions (slack), repos (github), issues (github), create_page (notion), list_databases (notion), search_pages (notion), get_page (notion), query_database (notion), update_page (notion).`,
+        description: `Integration operations for Slack, GitHub, and Notion. Provider: slack, github, notion, all. Actions: status, search, stats, activity, contributors, knowledge, summary, channels (slack), discussions (slack), repos (github), issues (github), create_page (notion), list_databases (notion), search_pages (notion with smart type detection - filter by event_type, status, priority, has_due_date, tags), get_page (notion), query_database (notion), update_page (notion).`,
         inputSchema: z.object({
           provider: z.enum(["slack", "github", "notion", "all"]).describe("Integration provider"),
           action: z
@@ -9265,6 +9265,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             direction: z.enum(["ascending", "descending"]),
           })).optional().describe("Sort order (for Notion query_database)"),
           properties: z.record(z.unknown()).optional().describe("Page properties (for Notion update_page)"),
+          // Smart type detection filters (for Notion search_pages)
+          event_type: z.enum(["NotionTask", "NotionMeeting", "NotionWiki", "NotionBugReport", "NotionFeature", "NotionJournal", "NotionPage"]).optional().describe("Filter by detected content type (for Notion search_pages)"),
+          status: z.string().optional().describe("Filter by status property, e.g. 'Done', 'In Progress' (for Notion search_pages)"),
+          priority: z.string().optional().describe("Filter by priority property, e.g. 'High', 'Medium', 'Low' (for Notion search_pages)"),
+          has_due_date: z.boolean().optional().describe("Filter to pages with or without due dates (for Notion search_pages)"),
+          tags: z.string().optional().describe("Filter by tags, comma-separated (for Notion search_pages)"),
         }),
       },
       async (input) => {
@@ -9589,6 +9595,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               query: input.query,
               database_id: input.database_id,
               limit: input.limit,
+              event_type: input.event_type,
+              status: input.status,
+              priority: input.priority,
+              has_due_date: input.has_due_date,
+              tags: input.tags,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(pages) }],

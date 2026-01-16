@@ -8,7 +8,7 @@ ContextStream gives your AI tools persistent context across sessions, semantic c
 npx -y @contextstream/mcp-server setup
 ```
 
-Works with Cursor, Claude Code, Windsurf, VS Code, Claude Desktop, Codex CLI, and more.
+Works with Cursor, Antigravity, Claude Code, Windsurf, VS Code, Claude Desktop, Codex CLI, and more.
 
 ---
 
@@ -117,6 +117,27 @@ ContextStream shines for teams:
 - **Onboarding acceleration** — new team members get full context from day one
 - **Knowledge preservation** — context survives when people leave
 - **Consistent AI behavior** — everyone's AI knows the same preferences
+
+---
+
+## Smarter Context, Fewer Tokens
+
+AI tools typically gather context by reading entire files, running grep searches, and iterating until they find what they need. This burns through your token budget fast.
+
+ContextStream takes a different approach:
+
+**Bounded retrieval** — `context_smart` returns only the context relevant to your current message, within a strict token budget. Instead of reading 10 files to find one decision, you get exactly what matters.
+
+**Semantic search** — Find code by meaning in a single query. No more `grep "auth" → read file → grep "middleware" → read another file` loops. One search, relevant results.
+
+**Smart output formats** — Choose the verbosity you need:
+- Need file locations? Use `paths` format (80% smaller responses)
+- Just checking if something exists? Use `count` format (90% smaller)
+- Need full context? Use `full` format
+
+**AI-powered compression** — For complex queries, Context Pack distills large code contexts into compact, high-signal summaries that preserve file paths, line numbers, and essential snippets.
+
+The result: your AI gets better context while using fewer tokens. Faster responses, lower costs, and more room in the context window for actual work.
 
 ---
 

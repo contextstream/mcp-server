@@ -85,18 +85,16 @@ def main():
             print(f"STOP: Use mcp__contextstream__search(mode=\\"hybrid\\", query=\\"{pattern}\\") instead of Glob.", file=sys.stderr)
             sys.exit(2)
 
-    elif tool == "Grep":
+    elif tool == "Grep" or tool == "Search":
+        # Block ALL Grep/Search operations - use ContextStream search or Read for specific files
         pattern = inp.get("pattern", "")
         path = inp.get("path", "")
-        if is_discovery_grep(path):
-            print(f"STOP: Use mcp__contextstream__search(mode=\\"keyword\\", query=\\"{pattern}\\") instead of Grep.", file=sys.stderr)
-            sys.exit(2)
-
-    elif tool == "Search":
-        # Block the Search tool which is Claude Code's default search
-        query = inp.get("pattern", "") or inp.get("query", "")
-        if query:
-            print(f"STOP: Use mcp__contextstream__search(mode=\\"hybrid\\", query=\\"{query}\\") instead of Search.", file=sys.stderr)
+        if pattern:
+            if path and not is_discovery_grep(path):
+                # Specific file - suggest Read instead
+                print(f"STOP: Use Read(\\"{path}\\") to view file content, or mcp__contextstream__search(mode=\\"keyword\\", query=\\"{pattern}\\") for codebase search.", file=sys.stderr)
+            else:
+                print(f"STOP: Use mcp__contextstream__search(mode=\\"hybrid\\", query=\\"{pattern}\\") instead of {tool}.", file=sys.stderr)
             sys.exit(2)
 
     elif tool == "Task":

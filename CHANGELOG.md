@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.35
+
+**Stronger enforcement for ContextStream-first search.**
+
+The hooks now block *all* Grep/Search operations, not just codebase-wide searches. If your AI tries to grep within a specific file, it gets redirected to use `Read()` instead.
+
+### What's Fixed
+
+- **More aggressive hooks** — Previously, Grep/Search on specific file paths was allowed through. Now all Grep/Search operations are blocked with clear guidance: use `Read()` for viewing specific files, or ContextStream search for codebase queries.
+
+### Upgrading
+
+```bash
+npm update @contextstream/mcp-server
+npx -y @contextstream/mcp-server setup  # Re-run to update hooks
+```
+
+---
+
 ## 0.4.34
 
 **Your AI assistant just got better at following instructions.**

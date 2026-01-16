@@ -67,6 +67,7 @@ This will:
 2. Create and store your API key
 3. Install editor rules for best results
 4. Configure your AI tools automatically
+5. Install Claude Code hooks (optional, recommended)
 
 That's it. Start a conversation and your AI now has memory.
 
@@ -194,6 +195,22 @@ claude mcp add --transport stdio contextstream --scope user \
   -- npx -y @contextstream/mcp-server
 ```
 
+#### Claude Code Hooks (Recommended)
+
+ContextStream can install hooks that enforce best practices:
+
+- **PreToolUse hook** — Redirects Glob/Grep/Search to ContextStream semantic search
+- **UserPromptSubmit hook** — Injects context reminders every message
+
+Install hooks automatically when generating rules:
+
+```bash
+npx -y @contextstream/mcp-server setup
+# Or: mcp__contextstream__generate_rules(editors=["claude"])
+```
+
+Hooks are installed to `~/.claude/hooks/` and configured in `~/.claude/settings.json`. Your custom rules are preserved — only ContextStream blocks are updated.
+
 ### VS Code
 
 Add to `.vscode/mcp.json`:
@@ -244,6 +261,8 @@ CONTEXTSTREAM_API_KEY = "YOUR_API_KEY"
 | `CONTEXTSTREAM_API_URL` | API endpoint (default: `https://api.contextstream.io`) |
 | `CONTEXTSTREAM_WORKSPACE_ID` | Default workspace |
 | `CONTEXTSTREAM_PROJECT_ID` | Default project |
+| `CONTEXTSTREAM_SEARCH_REMINDER` | Set to `false` to disable search-first reminders |
+| `CONTEXTSTREAM_HOOK_ENABLED` | Set to `false` to disable hooks without uninstalling |
 
 ---
 

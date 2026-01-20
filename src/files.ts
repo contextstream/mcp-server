@@ -123,8 +123,15 @@ const IGNORE_FILES = new Set([
 // Max file size to index (1MB)
 const MAX_FILE_SIZE = 1024 * 1024;
 
-// Max number of files to index in one batch
-const MAX_FILES_PER_BATCH = 100;
+// Size-based batching configuration (matching API's BatchConfig::for_api())
+// Max total bytes per batch (10MB)
+const MAX_BATCH_BYTES = 10 * 1024 * 1024;
+
+// Files larger than this are processed individually (2MB)
+const LARGE_FILE_THRESHOLD = 2 * 1024 * 1024;
+
+// Soft limit on files per batch (backup limit if size-based batching allows too many)
+const MAX_FILES_PER_BATCH = 200;
 
 /**
  * Read all indexable files from a directory
@@ -191,24 +198,38 @@ export async function readFilesFromDirectory(
 }
 
 /**
+ * File with size metadata for size-based batching
+ */
+interface FileWithSize extends FileToIngest {
+  sizeBytes: number;
+}
+
+/**
  * Read ALL indexable files from a directory (no limit)
  * Returns files in batches via async generator for memory efficiency
+ * Uses SIZE-BASED BATCHING to prevent batch failures from large files
  */
 export async function* readAllFilesInBatches(
   rootPath: string,
   options: {
-    batchSize?: number;
+    maxBatchBytes?: number;
+    largeFileThreshold?: number;
+    maxFilesPerBatch?: number;
     maxFileSize?: number;
   } = {}
 ): AsyncGenerator<FileToIngest[], void, unknown> {
-  const batchSize = options.batchSize ?? 50;
+  const maxBatchBytes = options.maxBatchBytes ?? MAX_BATCH_BYTES;
+  const largeFileThreshold = options.largeFileThreshold ?? LARGE_FILE_THRESHOLD;
+  const maxFilesPerBatch = options.maxFilesPerBatch ?? MAX_FILES_PER_BATCH;
   const maxFileSize = options.maxFileSize ?? MAX_FILE_SIZE;
-  let batch: FileToIngest[] = [];
+
+  let batch: FileWithSize[] = [];
+  let currentBatchBytes = 0;
 
   async function* walkDir(
     dir: string,
     relativePath: string = ""
-  ): AsyncGenerator<FileToIngest, void, unknown> {
+  ): AsyncGenerator<FileWithSize, void, unknown> {
     let entries: fs.Dirent[];
     try {
       entries = await fs.promises.readdir(dir, { withFileTypes: true });
@@ -234,7 +255,7 @@ export async function* readAllFilesInBatches(
           if (stat.size > maxFileSize) continue;
 
           const content = await fs.promises.readFile(fullPath, "utf-8");
-          yield { path: relPath, content };
+          yield { path: relPath, content, sizeBytes: stat.size };
         } catch {
           // Skip unreadable files
         }
@@ -243,15 +264,38 @@ export async function* readAllFilesInBatches(
   }
 
   for await (const file of walkDir(rootPath)) {
-    batch.push(file);
-    if (batch.length >= batchSize) {
-      yield batch;
-      batch = [];
+    // Large files are processed individually to prevent batch failures
+    if (file.sizeBytes > largeFileThreshold) {
+      // First, yield current batch if not empty
+      if (batch.length > 0) {
+        yield batch.map(({ sizeBytes, ...rest }) => rest);
+        batch = [];
+        currentBatchBytes = 0;
+      }
+      // Yield large file as its own batch
+      yield [{ path: file.path, content: file.content }];
+      continue;
     }
+
+    // Check if adding this file would exceed limits
+    const wouldExceedBytes = currentBatchBytes + file.sizeBytes > maxBatchBytes;
+    const wouldExceedFiles = batch.length >= maxFilesPerBatch;
+
+    if (wouldExceedBytes || wouldExceedFiles) {
+      if (batch.length > 0) {
+        yield batch.map(({ sizeBytes, ...rest }) => rest);
+        batch = [];
+        currentBatchBytes = 0;
+      }
+    }
+
+    // Add to current batch
+    batch.push(file);
+    currentBatchBytes += file.sizeBytes;
   }
 
   if (batch.length > 0) {
-    yield batch;
+    yield batch.map(({ sizeBytes, ...rest }) => rest);
   }
 }
 
@@ -259,26 +303,33 @@ export async function* readAllFilesInBatches(
  * Read only files that have been modified since a given timestamp.
  * Used for incremental indexing to avoid re-processing unchanged files.
  * Returns files in batches via async generator for memory efficiency.
+ * Uses SIZE-BASED BATCHING to prevent batch failures from large files.
  */
 export async function* readChangedFilesInBatches(
   rootPath: string,
   sinceTimestamp: Date,
   options: {
-    batchSize?: number;
+    maxBatchBytes?: number;
+    largeFileThreshold?: number;
+    maxFilesPerBatch?: number;
     maxFileSize?: number;
   } = {}
 ): AsyncGenerator<FileToIngest[], void, unknown> {
-  const batchSize = options.batchSize ?? 50;
+  const maxBatchBytes = options.maxBatchBytes ?? MAX_BATCH_BYTES;
+  const largeFileThreshold = options.largeFileThreshold ?? LARGE_FILE_THRESHOLD;
+  const maxFilesPerBatch = options.maxFilesPerBatch ?? MAX_FILES_PER_BATCH;
   const maxFileSize = options.maxFileSize ?? MAX_FILE_SIZE;
   const sinceMs = sinceTimestamp.getTime();
-  let batch: FileToIngest[] = [];
+
+  let batch: FileWithSize[] = [];
+  let currentBatchBytes = 0;
   let filesScanned = 0;
   let filesChanged = 0;
 
   async function* walkDir(
     dir: string,
     relativePath: string = ""
-  ): AsyncGenerator<FileToIngest, void, unknown> {
+  ): AsyncGenerator<FileWithSize, void, unknown> {
     let entries: fs.Dirent[];
     try {
       entries = await fs.promises.readdir(dir, { withFileTypes: true });
@@ -310,7 +361,7 @@ export async function* readChangedFilesInBatches(
 
           const content = await fs.promises.readFile(fullPath, "utf-8");
           filesChanged++;
-          yield { path: relPath, content };
+          yield { path: relPath, content, sizeBytes: stat.size };
         } catch {
           // Skip unreadable files
         }
@@ -319,15 +370,38 @@ export async function* readChangedFilesInBatches(
   }
 
   for await (const file of walkDir(rootPath)) {
-    batch.push(file);
-    if (batch.length >= batchSize) {
-      yield batch;
-      batch = [];
+    // Large files are processed individually to prevent batch failures
+    if (file.sizeBytes > largeFileThreshold) {
+      // First, yield current batch if not empty
+      if (batch.length > 0) {
+        yield batch.map(({ sizeBytes, ...rest }) => rest);
+        batch = [];
+        currentBatchBytes = 0;
+      }
+      // Yield large file as its own batch
+      yield [{ path: file.path, content: file.content }];
+      continue;
     }
+
+    // Check if adding this file would exceed limits
+    const wouldExceedBytes = currentBatchBytes + file.sizeBytes > maxBatchBytes;
+    const wouldExceedFiles = batch.length >= maxFilesPerBatch;
+
+    if (wouldExceedBytes || wouldExceedFiles) {
+      if (batch.length > 0) {
+        yield batch.map(({ sizeBytes, ...rest }) => rest);
+        batch = [];
+        currentBatchBytes = 0;
+      }
+    }
+
+    // Add to current batch
+    batch.push(file);
+    currentBatchBytes += file.sizeBytes;
   }
 
   if (batch.length > 0) {
-    yield batch;
+    yield batch.map(({ sizeBytes, ...rest }) => rest);
   }
 
   console.error(

@@ -25,5 +25,8 @@ Thumbs.db
 
 # Test coverage
 coverage/
+.vite/
+
+# MCP config
 .mcp.json
 .cursor/mcp.json

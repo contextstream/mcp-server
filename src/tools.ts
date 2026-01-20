@@ -17,6 +17,7 @@ import { VERSION, getUpdateNotice } from "./version.js";
 import { generateToolCatalog, getCoreToolsHint, type CatalogFormat } from "./tool-catalog.js";
 import { getAuthOverride, runWithAuthOverride, type AuthOverride } from "./auth-context.js";
 import { installClaudeCodeHooks, markProjectIndexed } from "./hooks-config.js";
+import { trackToolTokenSavings, type TokenSavingsToolType } from "./token-savings.js";
 
 type StructuredContent = { [x: string]: unknown } | undefined;
 type ToolTextResult = {
@@ -1817,111 +1818,7 @@ function toStructured(data: unknown): StructuredContent {
   return undefined;
 }
 
-// =============================================================================
-// Token Savings Tracking
-// =============================================================================
-// Tool-specific multipliers for estimating candidate chars (what default tools would need)
-// Based on empirical observations of Glob/Grep/Read usage patterns
-
-type TokenSavingsToolType =
-  | "context_smart"
-  | "search_semantic"
-  | "search_hybrid"
-  | "search_keyword"
-  | "search_pattern"
-  | "search_exhaustive"
-  | "search_refactor"
-  | "session_recall"
-  | "session_smart_search"
-  | "session_user_context"
-  | "session_summary"
-  | "graph_dependencies"
-  | "graph_impact"
-  | "graph_call_path"
-  | "graph_related"
-  | "memory_search"
-  | "memory_decisions"
-  | "memory_timeline"
-  | "memory_summary";
-
-// Multipliers to estimate what candidate_chars would be without compression
-// These represent typical expansion from compressed context to full file reads
-const CANDIDATE_MULTIPLIERS: Record<TokenSavingsToolType, number> = {
-  // context_smart: Replaces reading multiple files to gather context
-  context_smart: 5.0,
-
-  // search: Semantic search replaces iterative Glob/Grep/Read cycles
-  search_semantic: 4.5,
-  search_hybrid: 4.0,
-  search_keyword: 2.5,
-  search_pattern: 3.0,
-  search_exhaustive: 3.5,
-  search_refactor: 3.0,
-
-  // session: Recall/search replaces reading through history
-  session_recall: 5.0,
-  session_smart_search: 4.0,
-  session_user_context: 3.0,
-  session_summary: 4.0,
-
-  // graph: Would require extensive file traversal
-  graph_dependencies: 8.0,
-  graph_impact: 10.0,
-  graph_call_path: 8.0,
-  graph_related: 6.0,
-
-  // memory: Context retrieval
-  memory_search: 3.5,
-  memory_decisions: 3.0,
-  memory_timeline: 3.0,
-  memory_summary: 4.0,
-};
-
-/**
- * Track token savings for a tool call (fire-and-forget).
- * This enables the Token Savings Calculator feature in the dashboard.
- *
- * @param client - The ContextStream client
- * @param tool - The tool type for tracking
- * @param resultContent - The actual result content (used to calculate context_chars)
- * @param params - Optional parameters (workspace_id, project_id, max_tokens)
- */
-function trackToolTokenSavings(
-  client: ContextStreamClient,
-  tool: TokenSavingsToolType,
-  resultContent: unknown,
-  params?: { workspace_id?: string; project_id?: string; max_tokens?: number }
-): void {
-  try {
-    // Calculate context_chars from actual result
-    const contextStr =
-      typeof resultContent === "string" ? resultContent : JSON.stringify(resultContent ?? {});
-    const contextChars = contextStr.length;
-
-    // Estimate candidate_chars based on tool type
-    const multiplier = CANDIDATE_MULTIPLIERS[tool] ?? 3.0;
-    // Add a base overhead to account for minimum file read operations
-    const baseOverhead = 500;
-    const candidateChars = Math.round(contextChars * multiplier + baseOverhead);
-
-    // Fire-and-forget: don't await, don't block on errors
-    client
-      .trackTokenSavings({
-        tool,
-        workspace_id: params?.workspace_id,
-        project_id: params?.project_id,
-        candidate_chars: candidateChars,
-        context_chars: contextChars,
-        max_tokens: params?.max_tokens,
-        metadata: { multiplier, source: "mcp-server" },
-      })
-      .catch(() => {
-        // Silently ignore tracking errors - this is best-effort analytics
-      });
-  } catch {
-    // Silently ignore any errors in tracking setup
-  }
-}
+// Token savings tracking is imported from ./token-savings.js
 
 function readStatNumber(payload: unknown, key: string): number | undefined {
   if (!payload || typeof payload !== "object") return undefined;
@@ -7796,14 +7693,16 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             toolType = "search_hybrid";
         }
 
+        const outputText = formatContent(result);
+
         // Track token savings (fire-and-forget)
-        trackToolTokenSavings(client, toolType, result, {
+        trackToolTokenSavings(client, toolType, outputText, {
           workspace_id: params.workspace_id,
           project_id: params.project_id,
         });
 
         return {
-          content: [{ type: "text" as const, text: formatContent(result) }],
+          content: [{ type: "text" as const, text: outputText }],
           structuredContent: toStructured(result),
         };
       }
@@ -8047,13 +7946,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               include_related: input.include_related,
               include_decisions: input.include_decisions,
             });
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "session_recall", result, {
+            trackToolTokenSavings(client, "session_recall", outputText, {
               workspace_id: workspaceId,
               project_id: projectId,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }
@@ -8079,12 +7979,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           case "user_context": {
             const result = await client.getUserContext({ workspace_id: workspaceId });
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "session_user_context", result, {
+            trackToolTokenSavings(client, "session_user_context", outputText, {
               workspace_id: workspaceId,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }
@@ -8095,14 +7996,15 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               project_id: projectId,
               max_tokens: input.max_tokens,
             });
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "session_summary", result, {
+            trackToolTokenSavings(client, "session_summary", outputText, {
               workspace_id: workspaceId,
               project_id: projectId,
               max_tokens: input.max_tokens,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }
@@ -8149,13 +8051,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               include_decisions: input.include_decisions,
               include_related: input.include_related,
             });
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "session_smart_search", result, {
+            trackToolTokenSavings(client, "session_smart_search", outputText, {
               workspace_id: workspaceId,
               project_id: projectId,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }
@@ -8548,13 +8451,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               query: input.query,
               limit: input.limit,
             });
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "memory_search", result, {
+            trackToolTokenSavings(client, "memory_search", outputText, {
               workspace_id: workspaceId,
               project_id: projectId,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }
@@ -8566,13 +8470,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               category: input.category,
               limit: input.limit,
             });
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "memory_decisions", result, {
+            trackToolTokenSavings(client, "memory_decisions", outputText, {
               workspace_id: workspaceId,
               project_id: projectId,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }
@@ -8582,12 +8487,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               return errorResult("timeline requires workspace_id. Call session_init first.");
             }
             const result = await client.memoryTimeline(workspaceId);
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "memory_timeline", result, {
+            trackToolTokenSavings(client, "memory_timeline", outputText, {
               workspace_id: workspaceId,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }
@@ -8597,12 +8503,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               return errorResult("summary requires workspace_id. Call session_init first.");
             }
             const result = await client.memorySummary(workspaceId);
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "memory_summary", result, {
+            trackToolTokenSavings(client, "memory_summary", outputText, {
               workspace_id: workspaceId,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }
@@ -8809,13 +8716,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               max_depth: input.max_depth,
               include_transitive: input.include_transitive,
             });
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "graph_dependencies", result, {
+            trackToolTokenSavings(client, "graph_dependencies", outputText, {
               workspace_id: workspaceId,
               project_id: projectId,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }
@@ -8828,13 +8736,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               target: input.target,
               max_depth: input.max_depth,
             });
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "graph_impact", result, {
+            trackToolTokenSavings(client, "graph_impact", outputText, {
               workspace_id: workspaceId,
               project_id: projectId,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }
@@ -8848,13 +8757,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               target: input.target,
               max_depth: input.max_depth,
             });
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "graph_call_path", result, {
+            trackToolTokenSavings(client, "graph_call_path", outputText, {
               workspace_id: workspaceId,
               project_id: projectId,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }
@@ -8869,13 +8779,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               project_id: projectId,
               limit: input.limit,
             });
+            const outputText = formatContent(result);
             // Track token savings
-            trackToolTokenSavings(client, "graph_related", result, {
+            trackToolTokenSavings(client, "graph_related", outputText, {
               workspace_id: workspaceId,
               project_id: projectId,
             });
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: outputText }],
               structuredContent: toStructured(result),
             };
           }

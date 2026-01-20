@@ -258,7 +258,7 @@ export class ContextStreamClient {
         return "full";
       }
       if (planName.includes("pro")) return "lite";
-      if (planName.includes("free")) return "none";
+      if (planName.includes("free")) return "lite"; // Free has same graph access as Pro, just limited operations
 
       return "lite";
     } catch {
@@ -2497,20 +2497,6 @@ export class ContextStreamClient {
     }
     const summary = finalLines.join("\n");
 
-    // Best-effort analytics: record how much we trimmed vs the full candidate summary.
-    this.trackTokenSavings({
-      tool: "session_summary",
-      workspace_id: withDefaults.workspace_id,
-      project_id: withDefaults.project_id,
-      candidate_chars: candidateSummary.length,
-      context_chars: summary.length,
-      max_tokens: maxTokens,
-      metadata: {
-        decision_count: decisionCount,
-        memory_count: memoryCount,
-      },
-    }).catch(() => {});
-
     return {
       summary,
       workspace_name: workspaceName,
@@ -2871,21 +2857,6 @@ export class ContextStreamClient {
     const context = parts.join("");
     const candidateContext = candidateParts.join("");
     const tokenEstimate = Math.ceil(context.length / charsPerToken);
-
-    this.trackTokenSavings({
-      tool: "ai_context_budget",
-      workspace_id: withDefaults.workspace_id,
-      project_id: withDefaults.project_id,
-      candidate_chars: candidateContext.length,
-      context_chars: context.length,
-      max_tokens: maxTokens,
-      metadata: {
-        include_decisions: params.include_decisions !== false,
-        include_memory: params.include_memory !== false,
-        include_code: !!params.include_code,
-        sources: sources.length,
-      },
-    }).catch(() => {});
 
     return {
       context,
@@ -3334,21 +3305,6 @@ export class ContextStreamClient {
     } catch {
       // ignore version check failures
     }
-
-    this.trackTokenSavings({
-      tool: "context_smart",
-      workspace_id: withDefaults.workspace_id,
-      project_id: withDefaults.project_id,
-      candidate_chars: candidateContext.length,
-      context_chars: context.length,
-      max_tokens: maxTokens,
-      metadata: {
-        format,
-        items: items.length,
-        keywords: keywords.slice(0, 10),
-        errors: errors.length,
-      },
-    }).catch(() => {});
 
     return {
       context,

@@ -1,6 +1,5 @@
-import { defineConfig } from "vitest/config";
-
-export default defineConfig({
+/** @type {import("vitest/config").UserConfig} */
+module.exports = {
   // In some environments node_modules is not writable; avoid Vite writing temp files there.
   cacheDir: ".vite",
   test: {
@@ -13,4 +12,5 @@ export default defineConfig({
       exclude: ["node_modules", "dist", "**/*.test.ts"],
     },
   },
-});
+};
+

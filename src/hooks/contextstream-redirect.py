@@ -32,10 +32,13 @@ import sys
 import os
 import fnmatch
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 # Configuration: Set to False to disable blocking (useful for debugging)
 BLOCKING_ENABLED = os.environ.get("CONTEXTSTREAM_HOOK_ENABLED", "true").lower() == "true"
+
+# Path to the indexed projects status file (matches hooks-config.ts)
+INDEX_STATUS_PATH = Path.home() / ".contextstream" / "indexed-projects.json"
 
 # Default ignore patterns (same as mcp-server/src/ignore.ts)
 DEFAULT_IGNORE_PATTERNS = [
@@ -57,6 +60,42 @@ DEFAULT_IGNORE_PATTERNS = [
     # OS files
     ".DS_Store", "Thumbs.db",
 ]
+
+
+def read_indexed_projects() -> Dict[str, Any]:
+    """Read the indexed projects status file."""
+    try:
+        if INDEX_STATUS_PATH.exists():
+            content = INDEX_STATUS_PATH.read_text()
+            return json.loads(content).get("projects", {})
+    except (json.JSONDecodeError, IOError, OSError):
+        pass
+    return {}
+
+
+def is_project_indexed(project_root: str) -> bool:
+    """Check if a project is registered as indexed in ContextStream.
+
+    Returns True only if the project has been indexed via session_init.
+    This prevents blocking tools for projects that haven't been indexed yet.
+    """
+    if not project_root:
+        return False
+
+    indexed_projects = read_indexed_projects()
+    resolved_path = str(Path(project_root).resolve())
+
+    # Check if this exact path is indexed
+    if resolved_path in indexed_projects:
+        return True
+
+    # Also check with trailing slash normalization
+    normalized = resolved_path.rstrip("/\\")
+    for indexed_path in indexed_projects:
+        if indexed_path.rstrip("/\\") == normalized:
+            return True
+
+    return False
 
 
 def find_project_root(start_path: str) -> Optional[str]:
@@ -295,16 +334,26 @@ def main():
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
 
+    # Check if the target path is in an indexed project
+    # Only block tools if the project is actually indexed in ContextStream
+    target_path = get_target_path(tool_name, tool_input)
+    project_root = find_project_root(target_path) if target_path else None
+
+    # If no project root found, allow local tools (not in any project)
+    if not project_root:
+        sys.exit(0)
+
+    # If project is NOT indexed in ContextStream, allow local tools
+    # This prevents blocking for projects that haven't been set up yet
+    if not is_project_indexed(project_root):
+        sys.exit(0)
+
     # Check if the target path is in an ignored location
     # If so, allow the local tool (don't redirect to ContextStream)
-    target_path = get_target_path(tool_name, tool_input)
-    if target_path:
-        project_root = find_project_root(target_path)
-        if project_root:
-            patterns = load_ignore_patterns(project_root)
-            if is_path_ignored(target_path, patterns, project_root):
-                # Path is ignored - allow local tool since it won't be in ContextStream
-                sys.exit(0)
+    patterns = load_ignore_patterns(project_root)
+    if target_path and is_path_ignored(target_path, patterns, project_root):
+        # Path is ignored - allow local tool since it won't be in ContextStream
+        sys.exit(0)
 
     # Handle different tools
     if tool_name == "Glob":

@@ -220,7 +220,7 @@ export const PRECOMPACT_HOOK_SCRIPT = `#!/usr/bin/env python3
 ContextStream PreCompact Hook for Claude Code
 
 Runs BEFORE conversation context is compacted (manual via /compact or automatic).
-Injects a reminder for the AI to save conversation state using session_capture_smart.
+Automatically saves conversation state to ContextStream by parsing the transcript.
 
 Input (via stdin):
 {
@@ -236,7 +236,7 @@ Output (to stdout):
 {
   "hookSpecificOutput": {
     "hookEventName": "PreCompact",
-    "additionalContext": "... instructions for AI ..."
+    "additionalContext": "... status message ..."
   }
 }
 """
@@ -244,8 +244,102 @@ Output (to stdout):
 import json
 import sys
 import os
+import re
+import urllib.request
+import urllib.error
 
 ENABLED = os.environ.get("CONTEXTSTREAM_PRECOMPACT_ENABLED", "true").lower() == "true"
+AUTO_SAVE = os.environ.get("CONTEXTSTREAM_PRECOMPACT_AUTO_SAVE", "true").lower() == "true"
+API_URL = os.environ.get("CONTEXTSTREAM_API_URL", "https://api.contextstream.io")
+API_KEY = os.environ.get("CONTEXTSTREAM_API_KEY", "")
+
+def parse_transcript(transcript_path):
+    """Parse transcript to extract active files, decisions, and context."""
+    active_files = set()
+    recent_messages = []
+    tool_calls = []
+
+    try:
+        with open(transcript_path, 'r') as f:
+            for line in f:
+                try:
+                    entry = json.loads(line.strip())
+                    msg_type = entry.get("type", "")
+
+                    # Extract files from tool calls
+                    if msg_type == "tool_use":
+                        tool_name = entry.get("name", "")
+                        tool_input = entry.get("input", {})
+                        tool_calls.append({"name": tool_name, "input": tool_input})
+
+                        # Extract file paths from common tools
+                        if tool_name in ["Read", "Write", "Edit", "NotebookEdit"]:
+                            file_path = tool_input.get("file_path") or tool_input.get("notebook_path")
+                            if file_path:
+                                active_files.add(file_path)
+                        elif tool_name == "Glob":
+                            pattern = tool_input.get("pattern", "")
+                            if pattern:
+                                active_files.add(f"[glob:{pattern}]")
+
+                    # Collect recent assistant messages for summary
+                    if msg_type == "assistant" and entry.get("content"):
+                        content = entry.get("content", "")
+                        if isinstance(content, str) and len(content) > 50:
+                            recent_messages.append(content[:500])
+
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        pass
+
+    return {
+        "active_files": list(active_files)[-20:],  # Last 20 files
+        "tool_call_count": len(tool_calls),
+        "message_count": len(recent_messages),
+        "last_tools": [t["name"] for t in tool_calls[-10:]],  # Last 10 tool names
+    }
+
+def save_snapshot(session_id, transcript_data, trigger):
+    """Save snapshot to ContextStream API."""
+    if not API_KEY:
+        return False, "No API key configured"
+
+    snapshot_content = {
+        "session_id": session_id,
+        "trigger": trigger,
+        "captured_at": None,  # API will set timestamp
+        "active_files": transcript_data.get("active_files", []),
+        "tool_call_count": transcript_data.get("tool_call_count", 0),
+        "last_tools": transcript_data.get("last_tools", []),
+        "auto_captured": True,
+    }
+
+    payload = {
+        "event_type": "session_snapshot",
+        "title": f"Auto Pre-compaction Snapshot ({trigger})",
+        "content": json.dumps(snapshot_content),
+        "importance": "high",
+        "tags": ["session_snapshot", "pre_compaction", "auto_captured"],
+        "source_type": "hook",
+    }
+
+    try:
+        req = urllib.request.Request(
+            f"{API_URL}/api/v1/memory/events",
+            data=json.dumps(payload).encode('utf-8'),
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": API_KEY,
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return True, "Snapshot saved"
+    except urllib.error.URLError as e:
+        return False, str(e)
+    except Exception as e:
+        return False, str(e)
 
 def main():
     if not ENABLED:
@@ -256,26 +350,34 @@ def main():
     except:
         sys.exit(0)
 
+    session_id = data.get("session_id", "unknown")
+    transcript_path = data.get("transcript_path", "")
     trigger = data.get("trigger", "unknown")
     custom_instructions = data.get("custom_instructions", "")
 
-    # Build context injection for the AI
-    context = f"""[CONTEXT COMPACTION IMMINENT - {trigger.upper()}]
-CRITICAL: Before context is compacted, you MUST save conversation state:
+    # Parse transcript for context
+    transcript_data = {}
+    if transcript_path and os.path.exists(transcript_path):
+        transcript_data = parse_transcript(transcript_path)
 
-1. IMMEDIATELY call: mcp__contextstream__session(action="capture", event_type="session_snapshot", title="Pre-compaction snapshot", content="<JSON with: conversation_summary, active_goals, recent_decisions, active_files, unfinished_work>")
+    # Auto-save snapshot if enabled
+    auto_save_status = ""
+    if AUTO_SAVE and API_KEY:
+        success, msg = save_snapshot(session_id, transcript_data, trigger)
+        if success:
+            auto_save_status = f"\\n[ContextStream: Auto-saved snapshot with {len(transcript_data.get('active_files', []))} active files]"
+        else:
+            auto_save_status = f"\\n[ContextStream: Auto-save failed - {msg}]"
 
-2. Include in the snapshot:
-   - conversation_summary: Brief summary of what was discussed
-   - active_goals: List of goals/tasks in progress
-   - recent_decisions: Key decisions made in this session
-   - active_files: Files currently being worked on
-   - unfinished_work: Any incomplete tasks
+    # Build context injection for the AI (backup in case auto-save fails)
+    files_list = ", ".join(transcript_data.get("active_files", [])[:5]) or "none detected"
+    context = f"""[CONTEXT COMPACTION - {trigger.upper()}]{auto_save_status}
 
-3. After compaction, call session_init(is_post_compact=true) to restore context.
+Active files detected: {files_list}
+Tool calls in session: {transcript_data.get('tool_call_count', 0)}
 
-{f"User instructions: {custom_instructions}" if custom_instructions else ""}
-[END COMPACTION WARNING]"""
+After compaction, call session_init(is_post_compact=true) to restore context.
+{f"User instructions: {custom_instructions}" if custom_instructions else ""}"""
 
     output = {
         "hookSpecificOutput": {

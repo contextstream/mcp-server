@@ -25,6 +25,15 @@ export class SessionManager {
   private sessionTokens = 0;
   private contextThreshold = 70000; // Conservative default for 100k context window
 
+  // Continuous checkpointing
+  private toolCallCount = 0;
+  private checkpointInterval = 20; // Save checkpoint every N tool calls
+  private lastCheckpointAt = 0;
+  private activeFiles: Set<string> = new Set();
+  private recentToolCalls: Array<{ name: string; timestamp: number }> = [];
+  private checkpointEnabled =
+    process.env.CONTEXTSTREAM_CHECKPOINT_ENABLED?.toLowerCase() === "true";
+
   constructor(
     private server: McpServer,
     private client: ContextStreamClient
@@ -483,6 +492,134 @@ export class SessionManager {
 
     return parts.join("\n");
   }
+
+  // =========================================================================
+  // Continuous Checkpointing
+  // =========================================================================
+
+  /**
+   * Track a tool call for checkpointing purposes.
+   * Call this after each tool execution to track files and trigger periodic checkpoints.
+   */
+  trackToolCall(toolName: string, input?: Record<string, unknown>): void {
+    this.toolCallCount++;
+    this.recentToolCalls.push({ name: toolName, timestamp: Date.now() });
+
+    // Keep only last 50 tool calls
+    if (this.recentToolCalls.length > 50) {
+      this.recentToolCalls = this.recentToolCalls.slice(-50);
+    }
+
+    // Track files from common file operations
+    if (input) {
+      const filePath =
+        (input.file_path as string) || (input.notebook_path as string) || (input.path as string);
+      if (filePath && typeof filePath === "string") {
+        this.activeFiles.add(filePath);
+        // Keep only last 30 files
+        if (this.activeFiles.size > 30) {
+          const arr = Array.from(this.activeFiles);
+          this.activeFiles = new Set(arr.slice(-30));
+        }
+      }
+    }
+
+    // Check if we should save a checkpoint
+    this.maybeCheckpoint();
+  }
+
+  /**
+   * Save a checkpoint if the interval has been reached.
+   */
+  private async maybeCheckpoint(): Promise<void> {
+    if (!this.checkpointEnabled || !this.initialized || !this.context) {
+      return;
+    }
+
+    const callsSinceLastCheckpoint = this.toolCallCount - this.lastCheckpointAt;
+    if (callsSinceLastCheckpoint < this.checkpointInterval) {
+      return;
+    }
+
+    this.lastCheckpointAt = this.toolCallCount;
+    await this.saveCheckpoint("periodic");
+  }
+
+  /**
+   * Get the list of active files being worked on.
+   */
+  getActiveFiles(): string[] {
+    return Array.from(this.activeFiles);
+  }
+
+  /**
+   * Get recent tool call names.
+   */
+  getRecentToolNames(): string[] {
+    return this.recentToolCalls.map((t) => t.name);
+  }
+
+  /**
+   * Get the current tool call count.
+   */
+  getToolCallCount(): number {
+    return this.toolCallCount;
+  }
+
+  /**
+   * Save a checkpoint snapshot to ContextStream.
+   */
+  async saveCheckpoint(trigger: "periodic" | "milestone" | "manual"): Promise<boolean> {
+    if (!this.initialized || !this.context) {
+      return false;
+    }
+
+    const workspaceId = this.context.workspace_id as string | undefined;
+    if (!workspaceId) {
+      return false;
+    }
+
+    const checkpointData = {
+      trigger,
+      checkpoint_number: Math.floor(this.toolCallCount / this.checkpointInterval),
+      tool_call_count: this.toolCallCount,
+      session_tokens: this.sessionTokens,
+      active_files: this.getActiveFiles(),
+      recent_tools: this.getRecentToolNames().slice(-10),
+      captured_at: new Date().toISOString(),
+      auto_captured: true,
+    };
+
+    try {
+      await this.client.captureContext({
+        workspace_id: workspaceId,
+        project_id: this.context.project_id as string | undefined,
+        event_type: "session_snapshot",
+        title: `Checkpoint #${checkpointData.checkpoint_number} (${trigger})`,
+        content: JSON.stringify(checkpointData),
+        importance: trigger === "periodic" ? "low" : "medium",
+        tags: ["session_snapshot", "checkpoint", trigger],
+      });
+      return true;
+    } catch (err) {
+      console.error("[ContextStream] Failed to save checkpoint:", err);
+      return false;
+    }
+  }
+
+  /**
+   * Enable or disable continuous checkpointing.
+   */
+  setCheckpointEnabled(enabled: boolean): void {
+    this.checkpointEnabled = enabled;
+  }
+
+  /**
+   * Set the checkpoint interval (tool calls between checkpoints).
+   */
+  setCheckpointInterval(interval: number): void {
+    this.checkpointInterval = Math.max(5, interval); // Minimum 5 to avoid spam
+  }
 }
 
 /**
@@ -515,6 +652,9 @@ export function withAutoContext<T, R extends { content: Array<{ type: string; te
 
     // Call the original handler
     const result = await handler(input);
+
+    // Track the tool call for continuous checkpointing
+    sessionManager.trackToolCall(toolName, input as Record<string, unknown>);
 
     // Prepend context summary to the first text content (if we auto-initialized)
     if (contextPrefix && result.content && result.content.length > 0) {

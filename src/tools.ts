@@ -4810,19 +4810,27 @@ This does semantic search on the first message. You only need context_smart on s
 
         if (workspaceIdForRestore) {
           try {
-            // Search for the most recent session_snapshot
-            const snapshotSearch = await client.searchEvents({
+            // List recent events and filter for session_snapshot
+            const listResult = await client.listMemoryEvents({
               workspace_id: workspaceIdForRestore,
               project_id: projectIdForRestore,
-              query: "session_snapshot",
-              event_types: ["session_snapshot"],
-              limit: 1,
+              limit: 50,
             });
 
-            const snapshots = (snapshotSearch as any)?.data?.results ||
-              (snapshotSearch as any)?.results ||
-              (snapshotSearch as any)?.data ||
+            const allEvents =
+              (listResult as any)?.data?.items ||
+              (listResult as any)?.items ||
+              (listResult as any)?.data ||
               [];
+
+            // Filter for session_snapshot events (check event_type, metadata.original_type, or tags)
+            const snapshots = allEvents.filter(
+              (e: any) =>
+                e.event_type === "session_snapshot" ||
+                e.metadata?.original_type === "session_snapshot" ||
+                e.metadata?.tags?.includes("session_snapshot") ||
+                e.tags?.includes("session_snapshot")
+            );
 
             if (snapshots && snapshots.length > 0) {
               const latestSnapshot = snapshots[0];
@@ -4833,15 +4841,67 @@ This does semantic search on the first message. You only need context_smart on s
                 snapshotData = { conversation_summary: latestSnapshot.content };
               }
 
+              // Build session linking information
+              const prevSessionId = snapshotData.session_id || latestSnapshot.session_id;
+              const sessionLinking: Record<string, unknown> = {};
+
+              if (prevSessionId) {
+                sessionLinking.previous_session_id = prevSessionId;
+
+                // Build a summary of what the previous session was working on
+                const workingOn: string[] = [];
+                const activeFiles = snapshotData.active_files as string[] | undefined;
+                const lastTools = snapshotData.last_tools as string[] | undefined;
+
+                if (activeFiles && activeFiles.length > 0) {
+                  workingOn.push(`Files: ${activeFiles.slice(0, 5).join(", ")}${activeFiles.length > 5 ? ` (+${activeFiles.length - 5} more)` : ""}`);
+                }
+                if (lastTools && lastTools.length > 0) {
+                  const toolCounts = lastTools.reduce((acc: Record<string, number>, tool: string) => {
+                    acc[tool] = (acc[tool] || 0) + 1;
+                    return acc;
+                  }, {} as Record<string, number>);
+                  const topTools = Object.entries(toolCounts)
+                    .sort(([, a], [, b]) => b - a)
+                    .slice(0, 3)
+                    .map(([tool]) => tool);
+                  workingOn.push(`Recent tools: ${topTools.join(", ")}`);
+                }
+
+                if (workingOn.length > 0) {
+                  sessionLinking.previous_session_summary = workingOn.join("; ");
+                }
+
+                // Check for related sessions (other snapshots with different session_ids)
+                const relatedSessionIds = new Set<string>();
+                snapshots.forEach((s: any) => {
+                  let sData: Record<string, unknown>;
+                  try {
+                    sData = JSON.parse(s.content || "{}");
+                  } catch {
+                    sData = {};
+                  }
+                  const sSessionId = sData.session_id || s.session_id;
+                  if (sSessionId && sSessionId !== prevSessionId) {
+                    relatedSessionIds.add(sSessionId as string);
+                  }
+                });
+                if (relatedSessionIds.size > 0) {
+                  sessionLinking.related_sessions = Array.from(relatedSessionIds);
+                }
+              }
+
               // Add restored context to result
               (result as any).restored_context = {
                 snapshot_id: latestSnapshot.id,
                 captured_at: snapshotData.captured_at || latestSnapshot.created_at,
+                session_linking: Object.keys(sessionLinking).length > 0 ? sessionLinking : undefined,
                 ...snapshotData,
               };
               (result as any).is_post_compact = true;
-              (result as any).post_compact_hint =
-                "Session restored from pre-compaction snapshot. Review the 'restored_context' to continue where you left off.";
+              (result as any).post_compact_hint = prevSessionId
+                ? `Session restored from session ${prevSessionId}. Review 'restored_context' to continue where you left off.`
+                : "Session restored from pre-compaction snapshot. Review the 'restored_context' to continue where you left off.";
             } else {
               (result as any).is_post_compact = true;
               (result as any).post_compact_hint =
@@ -8674,12 +8734,47 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 snapshotData = { conversation_summary: event.content };
               }
 
+              // Build session linking information
+              const sessionId = snapshotData.session_id || event.session_id;
+              const sessionLinking: Record<string, unknown> = {};
+
+              if (sessionId) {
+                sessionLinking.previous_session_id = sessionId;
+
+                // Build a summary of what the previous session was working on
+                const workingOn: string[] = [];
+                const activeFiles = snapshotData.active_files as string[] | undefined;
+                const lastTools = snapshotData.last_tools as string[] | undefined;
+
+                if (activeFiles && activeFiles.length > 0) {
+                  workingOn.push(`Files: ${activeFiles.slice(0, 5).join(", ")}${activeFiles.length > 5 ? ` (+${activeFiles.length - 5} more)` : ""}`);
+                }
+                if (lastTools && lastTools.length > 0) {
+                  const toolCounts = lastTools.reduce((acc: Record<string, number>, tool: string) => {
+                    acc[tool] = (acc[tool] || 0) + 1;
+                    return acc;
+                  }, {} as Record<string, number>);
+                  const topTools = Object.entries(toolCounts)
+                    .sort(([, a], [, b]) => b - a)
+                    .slice(0, 3)
+                    .map(([tool]) => tool);
+                  workingOn.push(`Recent tools: ${topTools.join(", ")}`);
+                }
+
+                if (workingOn.length > 0) {
+                  sessionLinking.previous_session_summary = workingOn.join("; ");
+                }
+              }
+
               const response = {
                 restored: true,
                 snapshot_id: event.id,
                 captured_at: snapshotData.captured_at || event.created_at,
+                session_linking: Object.keys(sessionLinking).length > 0 ? sessionLinking : undefined,
                 ...snapshotData,
-                hint: "Context restored. Continue the conversation with awareness of the above state.",
+                hint: sessionId
+                  ? `Context restored from session ${sessionId}. Continue the conversation with awareness of the above state.`
+                  : "Context restored. Continue the conversation with awareness of the above state.",
               };
 
               return {
@@ -8738,16 +8833,64 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               return {
                 snapshot_id: event.id,
                 captured_at: snapshotData.captured_at || event.created_at,
+                session_id: snapshotData.session_id || event.session_id,
                 ...snapshotData,
               };
             });
+
+            // Build session linking information
+            const latestSnapshot = snapshots[0];
+            const sessionLinking: Record<string, unknown> = {};
+
+            if (latestSnapshot?.session_id) {
+              sessionLinking.previous_session_id = latestSnapshot.session_id;
+
+              // Build a summary of what the previous session was working on
+              const workingOn: string[] = [];
+              const activeFiles = latestSnapshot.active_files as string[] | undefined;
+              const lastTools = latestSnapshot.last_tools as string[] | undefined;
+
+              if (activeFiles && activeFiles.length > 0) {
+                workingOn.push(`Files: ${activeFiles.slice(0, 5).join(", ")}${activeFiles.length > 5 ? ` (+${activeFiles.length - 5} more)` : ""}`);
+              }
+              if (lastTools && lastTools.length > 0) {
+                // Dedupe and show most common tools
+                const toolCounts = lastTools.reduce((acc, tool) => {
+                  acc[tool] = (acc[tool] || 0) + 1;
+                  return acc;
+                }, {} as Record<string, number>);
+                const topTools = Object.entries(toolCounts)
+                  .sort(([, a], [, b]) => b - a)
+                  .slice(0, 3)
+                  .map(([tool]) => tool);
+                workingOn.push(`Recent tools: ${topTools.join(", ")}`);
+              }
+
+              if (workingOn.length > 0) {
+                sessionLinking.previous_session_summary = workingOn.join("; ");
+              }
+
+              // Check for related sessions (other snapshots with different session_ids)
+              const relatedSessionIds = new Set<string>();
+              snapshots.forEach((s: any) => {
+                if (s.session_id && s.session_id !== latestSnapshot.session_id) {
+                  relatedSessionIds.add(s.session_id);
+                }
+              });
+              if (relatedSessionIds.size > 0) {
+                sessionLinking.related_sessions = Array.from(relatedSessionIds);
+              }
+            }
 
             const response = {
               restored: true,
               snapshots_found: snapshots.length,
               latest: snapshots[0],
               all_snapshots: snapshots.length > 1 ? snapshots : undefined,
-              hint: "Context restored. Continue the conversation with awareness of the above state.",
+              session_linking: Object.keys(sessionLinking).length > 0 ? sessionLinking : undefined,
+              hint: sessionLinking.previous_session_id
+                ? `Context restored from session ${sessionLinking.previous_session_id}. Continue the conversation with awareness of the above state.`
+                : "Context restored. Continue the conversation with awareness of the above state.",
             };
 
             return {

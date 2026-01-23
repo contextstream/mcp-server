@@ -22,8 +22,14 @@ export class SessionManager {
   private warningShown = false;
 
   // Token tracking for context pressure calculation
+  // Note: MCP servers cannot see actual token usage (AI responses, thinking, system prompts).
+  // We use a heuristic: tracked tokens + (turns * estimated tokens per turn)
   private sessionTokens = 0;
   private contextThreshold = 70000; // Conservative default for 100k context window
+  private conversationTurns = 0;
+  // Each conversation turn typically includes: user message (~500), AI response (~1500),
+  // system prompt overhead (~500), and reasoning (~1500). Conservative estimate: 3000/turn
+  private static readonly TOKENS_PER_TURN_ESTIMATE = 3000;
 
   // Continuous checkpointing
   private toolCallCount = 0;
@@ -93,17 +99,43 @@ export class SessionManager {
   }
 
   /**
-   * Mark that context_smart has been called in this session
+   * Mark that context_smart has been called in this session.
+   * Also increments the conversation turn counter for token estimation.
    */
   markContextSmartCalled() {
     this.contextSmartCalled = true;
+    this.conversationTurns++;
   }
 
   /**
    * Get current session token count for context pressure calculation.
+   *
+   * This returns an ESTIMATED count based on:
+   * 1. Tokens tracked through ContextStream tools (actual)
+   * 2. Estimated tokens per conversation turn (heuristic)
+   *
+   * Note: MCP servers cannot see actual AI token usage (responses, thinking,
+   * system prompts). This estimate helps provide a more realistic context
+   * pressure signal.
    */
   getSessionTokens(): number {
+    // Combine tracked tokens with turn-based estimation
+    const turnEstimate = this.conversationTurns * SessionManager.TOKENS_PER_TURN_ESTIMATE;
+    return this.sessionTokens + turnEstimate;
+  }
+
+  /**
+   * Get the raw tracked tokens (without turn-based estimation).
+   */
+  getRawTrackedTokens(): number {
     return this.sessionTokens;
+  }
+
+  /**
+   * Get the current conversation turn count.
+   */
+  getConversationTurns(): number {
+    return this.conversationTurns;
   }
 
   /**
@@ -149,6 +181,7 @@ export class SessionManager {
    */
   resetTokenCount() {
     this.sessionTokens = 0;
+    this.conversationTurns = 0;
   }
 
   /**

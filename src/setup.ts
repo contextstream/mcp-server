@@ -1241,7 +1241,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     console.log("  1) Global");
     console.log("  2) Project");
     console.log("  3) Both");
-    const scopeChoice = normalizeInput(await rl.question("Choose [1/2/3] (default 3): ")) || "3";
+    const scopeChoice = normalizeInput(await rl.question("Choose [1/2/3] (default 2): ")) || "2";
     const scope: InstallScope =
       scopeChoice === "1" ? "global" : scopeChoice === "2" ? "project" : "both";
 

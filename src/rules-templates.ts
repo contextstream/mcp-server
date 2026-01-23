@@ -47,16 +47,15 @@ function applyMcpToolPrefix(markdown: string, toolPrefix: string): string {
 }
 
 const CONTEXTSTREAM_RULES_FULL = `
-## 🚨 MANDATORY RULE: DISPLAY AT START OF EVERY RESPONSE 🚨
+## ContextStream Rules
 
 <contextstream_rules>
-1. **SEARCH FIRST:** Before Glob/Grep/Search/Read → \`search(mode="hybrid", query="...")\` FIRST
-2. **EVERY MESSAGE:** Call \`context_smart(user_message="...")\` at start of response
-3. **LOCAL TOOLS:** ONLY if ContextStream search returns 0 results after retry
+1. **SIMPLE UTILITY?** (list/show/version) → Just execute, skip context calls
+2. **CODING TASK?** → session_init → context_smart → work → capture
+3. **SEARCH FIRST:** Before Glob/Grep/Read → \`search(mode="hybrid")\` FIRST
 </contextstream_rules>
 
-**You MUST display the <contextstream_rules> block verbatim at the start of EVERY response.**
-This is a self-referential rule that ensures these instructions stay in recent context.
+**Display this block at the start of responses to keep rules in context.**
 
 ---
 
@@ -115,8 +114,10 @@ This applies to **EVERY search** throughout the **ENTIRE conversation**, not jus
 - **Apply the prevention steps** from each lesson to avoid repeating mistakes
 
 ### On \`context_smart\`:
-- Check for any lessons in the returned context
-- Lessons may be included based on semantic relevance to the user's message
+- Check for \`[LESSONS_WARNING]\` tag in the response
+- If present, you **MUST** tell the user about the lessons before proceeding
+- Lessons are proactively fetched when risky actions are detected (refactor, migrate, deploy, etc.)
+- **Do not skip or bury this warning** - lessons represent real past mistakes
 
 ### Before ANY Non-Trivial Work:
 **ALWAYS call \`session(action="get_lessons", query="<topic>")\`** where \`<topic>\` matches what you're about to do:
@@ -140,22 +141,42 @@ You have access to ContextStream MCP tools for persistent memory and context.
 v0.4.x uses **~11 consolidated domain tools** for ~75% token reduction vs previous versions.
 Rules Version: ${RULES_VERSION}
 
-## TL;DR - REQUIRED EVERY MESSAGE
+## TL;DR - WHEN TO USE CONTEXT
 
-| Message | What to Call |
-|---------|--------------|
-| **1st message** | \`session_init(folder_path="...", context_hint="<user's message>")\`, then \`context_smart(...)\` |
-| **⚠️ After session_init** | **CHECK \`lessons\` field** - if present, read and apply them BEFORE any work |
-| **2nd+ messages** | \`context_smart(user_message="<user's message>", format="minified", max_tokens=400)\` |
-| **🔍 ANY code search** | \`search(mode="hybrid", query="...")\` — ALWAYS before Glob/Grep/Search/Read |
-| **⚠️ Before ANY risky work** | \`session(action="get_lessons", query="<topic>")\` — **MANDATORY, not optional** |
-| **After completing task** | \`session(action="capture", event_type="decision", ...)\` - MUST capture |
-| **User frustration/correction** | \`session(action="capture_lesson", ...)\` - MUST capture lessons |
-| **Command/tool error + fix** | \`session(action="capture_lesson", ...)\` - MUST capture lessons |
+| Request Type | What to Do |
+|--------------|------------|
+| **🚀 Simple utility** (list workspaces, show version) | **Just execute directly** - skip session_init, context_smart, capture |
+| **💻 Coding task** (edit, create, refactor) | Full context: session_init → context_smart → work → capture |
+| **🔍 Code search/discovery** | session_init → context_smart → search() |
+| **⚠️ Risky work** (deploy, migrate, refactor) | Check lessons first: \`session(action="get_lessons")\` |
+| **User frustration/correction** | Capture lesson: \`session(action="capture_lesson", ...)\` |
 
-**NO EXCEPTIONS.** Do not skip even if you think you have enough context.
+### Simple Utility Operations - FAST PATH
 
-**First message rule:** After \`session_init\`:
+**For simple queries, just execute and respond:**
+- "list workspaces" → \`workspace(action="list")\` → done
+- "list projects" → \`project(action="list")\` → done
+- "show version" → \`help(action="version")\` → done
+- "what reminders do I have" → \`reminder(action="list")\` → done
+
+**No session_init. No context_smart. No capture.** These add noise, not value.
+
+### Coding Tasks - FULL CONTEXT
+
+| Step | What to Call |
+|------|--------------|
+| **1st message** | \`session_init(folder_path="...", context_hint="<msg>")\`, then \`context_smart(...)\` |
+| **2nd+ messages** | \`context_smart(user_message="<msg>", format="minified", max_tokens=400)\` |
+| **Code search** | \`search(mode="hybrid", query="...")\` — BEFORE Glob/Grep/Read |
+| **After significant work** | \`session(action="capture", event_type="decision", ...)\` |
+| **User correction** | \`session(action="capture_lesson", ...)\` |
+
+**How to detect simple utility operations:**
+- Single-word commands: "list", "show", "version", "help"
+- Data retrieval with no context dependency: "list my workspaces", "what projects do I have"
+- Status checks: "am I authenticated?", "what's the server version?"
+
+**First message rule (for coding tasks):** After \`session_init\`:
 1. Check for \`lessons\` in response - if present, READ and SUMMARIZE them to user
 2. Then call \`context_smart\` before any other tool or response
 
@@ -169,9 +190,9 @@ Rules Version: ${RULES_VERSION}
 
 v0.4.x consolidates ~58 individual tools into ~11 domain tools with action/mode dispatch:
 
-### Standalone Tools (Always Call)
-- **\`session_init\`** - Initialize session with workspace detection + context
-- **\`context_smart\`** - Semantic search for relevant context (CALL EVERY MESSAGE, including immediately after \`session_init\`)
+### Standalone Tools
+- **\`session_init\`** - Initialize session with workspace detection + context (skip for simple utility operations)
+- **\`context_smart\`** - Semantic search for relevant context (skip for simple utility operations)
 
 ### Domain Tools (Use action/mode parameter)
 
@@ -218,10 +239,21 @@ If context still feels missing, use \`session(action="recall", query="...")\` fo
 
 ---
 
-### Rules Update Notices
+### Rules, Version & Lessons Notices
 
-- If you see **\[RULES_NOTICE]**, update rules via \`generate_rules()\` (or rerun setup).
-- If you see **\[VERSION_NOTICE]**, tell the user to update MCP using the provided command.
+**[RULES_NOTICE]** - Update rules via \`generate_rules()\` (or rerun setup).
+
+**[VERSION_NOTICE]** - You **MUST IMMEDIATELY** tell the user:
+  1. A new MCP server version is available
+  2. The exact update command to run
+  3. That they need to restart their AI tool after updating
+  **Do not skip this** - users often miss stderr warnings.
+
+**[LESSONS_WARNING]** - You **MUST** before proceeding:
+  1. Read all lessons listed
+  2. Tell the user about relevant lessons
+  3. Explain how you will avoid each past mistake
+  **This is critical** - ignoring lessons leads to repeated failures.
 
 ---
 
@@ -352,16 +384,24 @@ If ContextStream returns results, stop and use them. NEVER use local Search/Expl
 
 ---
 
-### When to Capture (MANDATORY)
+### When to Capture
 
 | When | Call | Example |
 |------|------|---------|
 | User makes decision | \`session(action="capture", event_type="decision", ...)\` | "Let's use PostgreSQL" |
 | User states preference | \`session(action="capture", event_type="preference", ...)\` | "I prefer TypeScript" |
-| You complete a task | \`session(action="capture", event_type="task", ...)\` | Capture what was done |
+| Complete significant task | \`session(action="capture", event_type="task", ...)\` | Capture what was done |
 | Need past context | \`session(action="recall", query="...")\` | "What did we decide about X?" |
 
-**You MUST capture after completing any significant task.** This ensures future sessions have context.
+**DO NOT capture utility operations:**
+- ❌ "Listed workspaces" - not meaningful context
+- ❌ "Showed version" - not a decision
+- ❌ "Listed projects" - just data retrieval
+
+**DO capture meaningful work:**
+- ✅ Decisions, preferences, completed features
+- ✅ Lessons from mistakes
+- ✅ Insights about architecture or patterns
 
 ---
 
@@ -442,16 +482,15 @@ See full documentation: https://contextstream.io/docs/mcp/tools
 `.trim();
 
 const CONTEXTSTREAM_RULES_MINIMAL = `
-## 🚨 MANDATORY RULE: DISPLAY AT START OF EVERY RESPONSE 🚨
+## ContextStream Rules
 
 <contextstream_rules>
-1. **SEARCH FIRST:** Before Glob/Grep/Search/Read → \`search(mode="hybrid", query="...")\` FIRST
-2. **EVERY MESSAGE:** Call \`context_smart(user_message="...")\` at start of response
-3. **LOCAL TOOLS:** ONLY if ContextStream search returns 0 results after retry
+1. **SIMPLE UTILITY?** (list/show/version) → Just execute, skip context calls
+2. **CODING TASK?** → session_init → context_smart → work → capture
+3. **SEARCH FIRST:** Before Glob/Grep/Read → \`search(mode="hybrid")\` FIRST
 </contextstream_rules>
 
-**You MUST display the <contextstream_rules> block verbatim at the start of EVERY response.**
-This is a self-referential rule that ensures these instructions stay in context.
+**Display this block at the start of responses to keep rules in context.**
 
 ---
 
@@ -460,7 +499,7 @@ This is a self-referential rule that ensures these instructions stay in context.
 Rules Version: ${RULES_VERSION}
 **Note:** PreToolUse hooks block Glob/Grep/Search when ContextStream is available.
 
-### Required Every Message
+### For Coding Tasks
 
 | Action | Tool Call |
 |--------|-----------|
@@ -494,6 +533,33 @@ ContextStream search is **indexed** and returns semantic matches + context in ON
 | \`memory\` | \`memory(action="list_events", limit=10)\` |
 | \`graph\` | \`graph(action="dependencies", file_path="...")\` |
 
+### 🚀 FAST PATH: Simple Utility Operations
+
+**For simple utility commands, SKIP the ceremony and just execute directly:**
+
+| Command Type | Just Call | Skip |
+|--------------|-----------|------|
+| List workspaces | \`workspace(action="list")\` | session_init, context_smart, capture |
+| List projects | \`project(action="list")\` | session_init, context_smart, capture |
+| Show version | \`help(action="version")\` | session_init, context_smart, capture |
+| List reminders | \`reminder(action="list")\` | session_init, context_smart, capture |
+| Check auth | \`help(action="auth")\` | session_init, context_smart, capture |
+
+**Detect simple operations by these patterns:**
+- "list ...", "show ...", "what are my ...", "get ..."
+- Single-action queries with no context dependency
+- User just wants data, not analysis or coding help
+
+**DO NOT add overhead for utility operations:**
+- ❌ Don't call session_init just to list workspaces
+- ❌ Don't call context_smart for simple queries
+- ❌ Don't capture "listed workspaces" as an event (that's noise)
+
+**Use full context ceremony ONLY for:**
+- Coding tasks (edit, create, refactor, debug)
+- Search/discovery (finding code, understanding architecture)
+- Tasks where past decisions or lessons matter
+
 ### Lessons (Past Mistakes)
 
 - After \`session_init\`: Check for \`lessons\` field and apply before work
@@ -502,8 +568,27 @@ ContextStream search is **indexed** and returns semantic matches + context in ON
 
 ### Context Pressure & Compaction
 
-- If \`context_smart\` returns high/critical \`context_pressure\`: call \`session_capture_smart(...)\` to save state
-- After compaction (context lost): call \`session_init(..., is_post_compact=true)\` or \`session_restore_context()\`
+- If \`context_smart\` returns high/critical \`context_pressure\`: call \`session(action="capture", ...)\` to save state
+- PreCompact hooks automatically save snapshots before compaction (if installed)
+
+### Automatic Context Restoration
+
+**Context restoration is now enabled by default.** Every \`session_init\` call automatically:
+- Restores context from recent snapshots (if available)
+- Returns \`restored_context\` field with snapshot data
+- Sets \`is_post_compact=true\` in response when restoration occurs
+
+**No special handling needed after compaction** - just call \`session_init\` normally.
+
+To disable automatic restoration:
+- Pass \`is_post_compact=false\` in the API call
+- Or set \`CONTEXTSTREAM_RESTORE_CONTEXT=false\` environment variable
+
+### Notices - MUST HANDLE IMMEDIATELY
+
+- **[VERSION_NOTICE]**: Tell the user about the update and command to run
+- **[RULES_NOTICE]**: Run \`generate_rules(overwrite_existing=true)\` to update
+- **[LESSONS_WARNING]**: Read lessons, tell user about them, explain how you'll avoid past mistakes
 
 ### Plans & Tasks
 

@@ -53,11 +53,50 @@ Local tools ONLY if ContextStream returns 0 results after retry.
 /**
  * Lessons reminder injected when there are active lessons.
  * This ensures AI doesn't repeat past mistakes.
+ * Uses [LESSONS_WARNING] tag for rules-based handling.
  */
 const LESSONS_REMINDER_PREFIX = `
-⚠️ [LESSONS - REVIEW BEFORE CHANGES]
-Past mistakes found that may be relevant. STOP and review before proceeding:
+🚨 [LESSONS_WARNING] Past Mistakes Found - READ BEFORE PROCEEDING!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ IMPORTANT: You MUST review these lessons and tell the user about relevant ones.
+These are mistakes from past sessions that you should NOT repeat.
 `.trim();
+
+/**
+ * Keywords that indicate risky operations where lessons should be checked.
+ * When these appear in user messages, we proactively fetch relevant lessons.
+ */
+const RISKY_ACTION_KEYWORDS = [
+  // Code changes
+  "refactor", "rewrite", "restructure", "reorganize", "migrate",
+  "delete", "remove", "drop", "deprecate",
+  // Database
+  "database", "migration", "schema", "sql",
+  // Deployment
+  "deploy", "release", "production", "prod",
+  // API changes
+  "api", "endpoint", "breaking change",
+  // Architecture
+  "architecture", "design", "pattern",
+  // Testing
+  "test", "testing",
+  // Security
+  "auth", "security", "permission", "credential", "access", "token", "secret",
+  // Version control
+  "git", "commit", "merge", "rebase", "push", "force",
+  // Infrastructure
+  "config", "environment", "env", "docker", "kubernetes", "k8s",
+  // Performance
+  "performance", "optimize", "cache", "memory",
+];
+
+/**
+ * Detect if user message contains risky action keywords.
+ */
+function detectRiskyActions(userMessage: string): string[] {
+  const messageLower = userMessage.toLowerCase();
+  return RISKY_ACTION_KEYWORDS.filter(keyword => messageLower.includes(keyword));
+}
 
 /**
  * Generate a lessons reminder block if lessons are present in the result.
@@ -81,7 +120,7 @@ function generateLessonsReminder(result: Record<string, unknown>): string {
     return `${i + 1}. ${severity} ${title}${prevention ? `: ${prevention.slice(0, 100)}` : ""}`;
   });
 
-  return `\n\n${LESSONS_REMINDER_PREFIX}\n${lessonLines.join("\n")}`;
+  return `\n\n${LESSONS_REMINDER_PREFIX}\n${lessonLines.join("\n")}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
 }
 
 /**
@@ -109,6 +148,7 @@ This is SAFE - only the ContextStream block is updated, your custom rules are pr
 
 /**
  * Generate aggressive MCP version update warning.
+ * Uses [VERSION_NOTICE] tag so rules can instruct AI to surface this to user.
  */
 function generateVersionUpdateWarning(versionNotice: { behind?: boolean; current?: string; latest?: string; upgrade_command?: string } | null): string {
   if (!versionNotice?.behind) {
@@ -116,12 +156,16 @@ function generateVersionUpdateWarning(versionNotice: { behind?: boolean; current
   }
 
   return `
-🚨 [MCP SERVER OUTDATED - UPDATE RECOMMENDED]
-Current: ${versionNotice.current} → Latest: ${versionNotice.latest}
-New version may include critical bug fixes, performance improvements, and new features.
+🚨 [VERSION_NOTICE] MCP Server Update Available!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Version: ${versionNotice.current} → ${versionNotice.latest}
 
-**UPDATE NOW:** Run \`${versionNotice.upgrade_command || "npm update @contextstream/mcp-server"}\`
-Then restart Claude Code to use the new version.
+⚠️ IMPORTANT: You MUST tell the user about this update IMMEDIATELY.
+Do not proceed with other work until you have informed the user.
+
+Update command: \`${versionNotice.upgrade_command || "npm update -g @contextstream/mcp-server"}\`
+After updating, restart the AI tool to use the new version.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 `.trim();
 }
 
@@ -7033,14 +7077,55 @@ This saves ~80% tokens compared to including full chat history.`,
         max_tokens: input.max_tokens,
       });
 
-      // Check if lessons are present in the context (L: prefix in minified, or "lesson" keyword)
-      const hasLessons =
-        result.context.includes("|L:") ||
-        result.context.includes("L:") ||
-        result.context.toLowerCase().includes("lesson");
-      const lessonsWarningLine = hasLessons
-        ? "\n\n⚠️ [LESSONS DETECTED] Review the L: items above - these are past mistakes. STOP and review before making similar changes."
-        : "";
+      // Proactive lesson fetching: detect risky actions and fetch relevant lessons
+      let lessonsWarningLine = "";
+      const riskyKeywords = detectRiskyActions(input.user_message);
+
+      if (riskyKeywords.length > 0 && workspaceId) {
+        // User is doing something risky - proactively fetch lessons
+        try {
+          const lessons = await client.getHighPriorityLessons({
+            workspace_id: workspaceId,
+            project_id: projectId,
+            context_hint: riskyKeywords.join(" "),
+            limit: 5,
+          });
+
+          if (lessons.length > 0) {
+            const lessonLines = lessons.slice(0, 5).map((l, i) => {
+              const severity = l.severity === "critical" ? "🚨" : l.severity === "high" ? "⚠️" : "📝";
+              const title = l.title || "Untitled lesson";
+              const prevention = l.prevention || "";
+              return `${i + 1}. ${severity} ${title}${prevention ? `: ${prevention.slice(0, 100)}` : ""}`;
+            });
+
+            lessonsWarningLine = `
+
+🚨 [LESSONS_WARNING] Relevant Lessons for "${riskyKeywords.slice(0, 3).join(", ")}"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ IMPORTANT: You MUST tell the user about these lessons before proceeding.
+These are past mistakes that may be relevant to the current task.
+
+${lessonLines.join("\n")}
+
+Action: Review each lesson and explain to the user how you will avoid these mistakes.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+          }
+        } catch {
+          // Ignore lesson fetch failures - don't block context_smart
+        }
+      }
+
+      // Also check if lessons are present in the returned context (L: prefix in minified)
+      if (!lessonsWarningLine) {
+        const hasLessonsInContext =
+          result.context.includes("|L:") ||
+          result.context.includes("L:") ||
+          result.context.toLowerCase().includes("lesson");
+        if (hasLessonsInContext) {
+          lessonsWarningLine = "\n\n⚠️ [LESSONS_WARNING] Lessons found in context - review the L: items above before making changes.";
+        }
+      }
 
       // Inject search rules reminder to combat instruction decay
       const searchRulesLine = SEARCH_RULES_REMINDER_ENABLED ? `\n\n${SEARCH_RULES_REMINDER}` : "";

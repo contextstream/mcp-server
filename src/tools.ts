@@ -32,6 +32,104 @@ type ToolTextResult = {
   isError?: boolean;
 };
 
+// =============================================================================
+// CLEAN OUTPUT LOGGING SYSTEM
+// =============================================================================
+// CONTEXTSTREAM_LOG_LEVEL: quiet | normal | verbose (default: normal)
+// - quiet: Minimal output, only errors
+// - normal: Clean, user-friendly output
+// - verbose: Full debug output (legacy behavior)
+
+const LOG_LEVEL = (process.env.CONTEXTSTREAM_LOG_LEVEL || "normal").toLowerCase();
+const LOG_QUIET = LOG_LEVEL === "quiet";
+const LOG_VERBOSE = LOG_LEVEL === "verbose";
+
+// Display-friendly tool names (removes underscores, shortens names)
+const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  session_init: "init",
+  session: "session",
+  context_smart: "context",
+  search: "search",
+  memory: "memory",
+  graph: "graph",
+  ai: "ai",
+  generate_rules: "rules",
+  generate_editor_rules: "rules",
+  help: "help",
+  workspace_bootstrap: "bootstrap",
+  workspace: "workspace",
+  github: "github",
+  slack: "slack",
+  notion: "notion",
+  jira: "jira",
+  ingest: "ingest",
+  // Hide internal tools
+  session_capture_smart: "",
+  session_restore_context: "",
+};
+
+/**
+ * Get clean display name for a tool.
+ * Returns empty string for internal tools that should be hidden.
+ */
+function getToolDisplayName(toolName: string): string {
+  if (toolName in TOOL_DISPLAY_NAMES) {
+    return TOOL_DISPLAY_NAMES[toolName];
+  }
+  // For unknown tools, clean up the name
+  return toolName.replace(/_/g, " ").replace(/^mcp__contextstream__/, "");
+}
+
+/**
+ * Log a tool operation with clean formatting.
+ */
+function logTool(toolName: string, status: "start" | "done" | "error", details?: string): void {
+  if (LOG_QUIET && status !== "error") return;
+
+  const displayName = getToolDisplayName(toolName);
+  if (!displayName) return; // Hide internal tools
+
+  const icon = status === "start" ? "◦" : status === "done" ? "✓" : "✗";
+  const message = details ? `${icon} ${displayName}: ${details}` : `${icon} ${displayName}`;
+
+  console.error(message);
+}
+
+/**
+ * Log a system message (non-tool related).
+ * Only shown in normal or verbose mode.
+ */
+function logSystem(message: string, level: "info" | "warn" | "error" = "info"): void {
+  if (LOG_QUIET && level === "info") return;
+
+  const prefix = level === "error" ? "✗" : level === "warn" ? "!" : "•";
+  console.error(`${prefix} ${message}`);
+}
+
+/**
+ * Log verbose/debug information.
+ * Only shown in verbose mode.
+ */
+function logDebug(message: string): void {
+  if (!LOG_VERBOSE) return;
+  console.error(`[DEBUG] ${message}`);
+}
+
+/**
+ * Format a clean startup banner.
+ */
+function logStartup(version: string, mode: string): void {
+  if (LOG_QUIET) {
+    console.error(`ContextStream v${version}`);
+    return;
+  }
+
+  console.error(`━━━ ContextStream v${version} ━━━`);
+  if (mode) {
+    console.error(`  ${mode}`);
+  }
+}
+
 const LESSON_DEDUP_WINDOW_MS = 2 * 60 * 1000;
 const recentLessonCaptures = new Map<string, number>();
 
@@ -242,7 +340,6 @@ const RULES_PROJECT_FILES: Record<string, string> = {
   codex: "AGENTS.md",
   claude: "CLAUDE.md",
   cursor: ".cursorrules",
-  windsurf: ".windsurfrules",
   cline: ".clinerules",
   kilo: path.join(".kilocode", "rules", "contextstream.md"),
   roo: path.join(".roo", "rules", "contextstream.md"),
@@ -251,7 +348,6 @@ const RULES_PROJECT_FILES: Record<string, string> = {
 
 const RULES_GLOBAL_FILES: Partial<Record<string, string[]>> = {
   codex: [path.join(homedir(), ".codex", "AGENTS.md")],
-  windsurf: [path.join(homedir(), ".codeium", "windsurf", "memories", "global_rules.md")],
   kilo: [path.join(homedir(), ".kilocode", "rules", "contextstream.md")],
   roo: [path.join(homedir(), ".roo", "rules", "contextstream.md")],
 };
@@ -302,7 +398,6 @@ function detectEditorFromClientName(clientName?: string): string | null {
   if (!clientName) return null;
   const normalized = clientName.toLowerCase().trim();
   if (normalized.includes("cursor")) return "cursor";
-  if (normalized.includes("windsurf") || normalized.includes("codeium")) return "windsurf";
   if (normalized.includes("claude")) return "claude";
   if (normalized.includes("cline")) return "cline";
   if (normalized.includes("kilo")) return "kilo";
@@ -482,7 +577,6 @@ const CONTEXTSTREAM_PREAMBLE_PATTERNS: RegExp[] = [
   /^#\s+codex cli instructions$/i,
   /^#\s+claude code instructions$/i,
   /^#\s+cursor rules$/i,
-  /^#\s+windsurf rules$/i,
   /^#\s+cline rules$/i,
   /^#\s+kilo code rules$/i,
   /^#\s+roo code rules$/i,
@@ -1806,9 +1900,7 @@ function resolveToolFilter(): {
   if (allowlistRaw) {
     const allowlist = parseToolList(allowlistRaw);
     if (allowlist.size === 0) {
-      console.error(
-        "[ContextStream] CONTEXTSTREAM_TOOL_ALLOWLIST is empty; using standard toolset."
-      );
+      logDebug("TOOL_ALLOWLIST is empty; using standard toolset");
       return { allowlist: STANDARD_TOOLSET, source: "standard", autoDetected: false };
     }
     return { allowlist, source: "allowlist", autoDetected: false };
@@ -1824,9 +1916,7 @@ function resolveToolFilter(): {
     if (clientDetectedFromEnv && AUTO_TOOLSET_ENABLED) {
       const recommended = getRecommendedToolset(undefined, true);
       if (recommended) {
-        console.error(
-          "[ContextStream] Detected Claude Code via environment. Using light toolset for optimal token usage."
-        );
+        logDebug("Detected Claude Code, using light toolset");
         return { allowlist: recommended, source: "auto-claude", autoDetected: true };
       }
     }
@@ -1839,13 +1929,11 @@ function resolveToolFilter(): {
   if (toolsetRaw.trim().toLowerCase() === "auto") {
     clientDetectedFromEnv = detectClaudeCodeFromEnv();
     if (clientDetectedFromEnv) {
-      console.error("[ContextStream] TOOLSET=auto: Detected Claude Code, using light toolset.");
+      logDebug("TOOLSET=auto: Detected Claude Code, using light toolset");
       return { allowlist: LIGHT_TOOLSET, source: "auto-claude", autoDetected: true };
     }
     // Will be updated when clientInfo is received (Option B)
-    console.error(
-      "[ContextStream] TOOLSET=auto: Will adjust toolset based on MCP client (currently standard)."
-    );
+    logDebug("TOOLSET=auto: Will adjust based on MCP client");
     return { allowlist: STANDARD_TOOLSET, source: "auto-pending", autoDetected: true };
   }
 
@@ -1859,9 +1947,7 @@ function resolveToolFilter(): {
     return { allowlist: resolved, source: key, autoDetected: false };
   }
 
-  console.error(
-    `[ContextStream] Unknown CONTEXTSTREAM_TOOLSET "${toolsetRaw}". Using standard toolset.`
-  );
+  logDebug(`Unknown TOOLSET "${toolsetRaw}"; using standard`);
   return { allowlist: STANDARD_TOOLSET, source: "standard", autoDetected: false };
 }
 
@@ -2012,26 +2098,20 @@ function isDuplicateLessonCapture(signature: string) {
 export function setupClientDetection(server: McpServer): void {
   // Skip if auto-toolset is disabled
   if (!AUTO_TOOLSET_ENABLED) {
-    console.error(
-      "[ContextStream] Auto-toolset: DISABLED (set CONTEXTSTREAM_AUTO_TOOLSET=true to enable)"
-    );
+    logDebug("Auto-toolset: DISABLED");
     return;
   }
 
   // If we already detected from environment, no need for dynamic detection
   if (clientDetectedFromEnv) {
-    console.error(
-      "[ContextStream] Client detection: Already detected Claude Code from environment"
-    );
+    logDebug("Client detection: Already detected from environment");
     return;
   }
 
   // Set up the oninitialized callback on the low-level server
   const lowLevelServer = (server as any).server;
   if (!lowLevelServer) {
-    console.error(
-      "[ContextStream] Warning: Could not access low-level MCP server for client detection"
-    );
+    logDebug("Warning: Could not access low-level MCP server for client detection");
     return;
   }
 
@@ -2043,31 +2123,27 @@ export function setupClientDetection(server: McpServer): void {
         detectedClientInfo = clientVersion;
         const clientName = clientVersion.name || "unknown";
         const clientVer = clientVersion.version || "unknown";
-        console.error(`[ContextStream] MCP Client detected: ${clientName} v${clientVer}`);
+        logDebug(`MCP Client detected: ${clientName} v${clientVer}`);
 
         // Check if we should switch to a lighter toolset
         if (isTokenSensitiveClient(clientName)) {
-          console.error(
-            "[ContextStream] Token-sensitive client detected. Consider using CONTEXTSTREAM_TOOLSET=light for optimal performance."
-          );
+          logDebug("Token-sensitive client detected");
 
           // Emit tools/list_changed notification if the client supports it
-          // Note: This won't actually change the tools (they're already registered),
-          // but it signals to clients that support dynamic updates
           try {
             lowLevelServer.sendToolsListChanged?.();
-            console.error("[ContextStream] Emitted tools/list_changed notification");
+            logDebug("Emitted tools/list_changed notification");
           } catch (error) {
             // Client might not support this notification
           }
         }
       }
     } catch (error) {
-      console.error("[ContextStream] Error in client detection callback:", error);
+      logSystem(`Error in client detection: ${error}`, "error");
     }
   };
 
-  console.error("[ContextStream] Client detection: Callback registered for MCP initialize");
+  logDebug("Client detection callback registered");
 }
 
 export function registerTools(
@@ -2079,93 +2155,48 @@ export function registerTools(
   const toolFilter = resolveToolFilter();
   const toolAllowlist = toolFilter.allowlist;
 
-  // Log toolset selection with auto-detection info
+  // Log toolset selection (only in verbose mode)
   if (toolAllowlist) {
     const source = toolFilter.source;
-    const autoNote = toolFilter.autoDetected ? " (auto-detected)" : "";
-    const hint =
-      source === "light" || source === "auto-claude"
-        ? " Set CONTEXTSTREAM_TOOLSET=standard or complete for more tools."
-        : source === "standard"
-          ? " Set CONTEXTSTREAM_TOOLSET=complete for all tools."
-          : source === "auto-pending"
-            ? " Toolset may be adjusted when MCP client is detected."
-            : "";
-    console.error(
-      `[ContextStream] Toolset: ${source} (${toolAllowlist.size} tools)${autoNote}.${hint}`
-    );
+    logDebug(`Toolset: ${source} (${toolAllowlist.size} tools)`);
   } else {
-    console.error(`[ContextStream] Toolset: complete (all tools).`);
+    logDebug("Toolset: complete (all tools)");
   }
 
-  // Log auto-toolset status (Strategy 3)
+  // Log auto-toolset status (Strategy 3) - verbose only
   if (AUTO_TOOLSET_ENABLED) {
-    if (clientDetectedFromEnv) {
-      console.error("[ContextStream] Auto-toolset: ACTIVE (Claude Code detected from environment)");
-    } else {
-      console.error("[ContextStream] Auto-toolset: ENABLED (will detect MCP client on initialize)");
-    }
+    logDebug(clientDetectedFromEnv ? "Auto-toolset: ACTIVE" : "Auto-toolset: ENABLED");
   }
 
-  // Log integration auto-hide status (Strategy 2)
+  // Log integration auto-hide status (Strategy 2) - verbose only
   if (AUTO_HIDE_INTEGRATIONS) {
-    console.error(
-      `[ContextStream] Integration auto-hide: ENABLED (${ALL_INTEGRATION_TOOLS.size} tools hidden until integrations connected)`
-    );
-    console.error("[ContextStream] Set CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS=false to disable.");
-  } else {
-    console.error("[ContextStream] Integration auto-hide: disabled");
+    logDebug(`Integration auto-hide: ENABLED (${ALL_INTEGRATION_TOOLS.size} tools hidden)`);
   }
 
-  // Log schema mode status (Strategy 4)
+  // Log schema mode status (Strategy 4) - verbose only
   if (COMPACT_SCHEMA_ENABLED) {
-    console.error("[ContextStream] Schema mode: COMPACT (shorter descriptions, minimal params)");
+    logDebug("Schema mode: COMPACT");
   } else {
-    console.error(
-      "[ContextStream] Schema mode: full (set CONTEXTSTREAM_SCHEMA_MODE=compact to reduce token overhead)"
-    );
+    logDebug("Schema mode: full");
   }
 
   // Log progressive disclosure status (Strategy 5)
   if (PROGRESSIVE_MODE) {
     const coreBundle = TOOL_BUNDLES.core;
-    console.error(
-      `[ContextStream] Progressive mode: ENABLED (starting with ${coreBundle.size} core tools)`
-    );
-    console.error(
-      "[ContextStream] Use tools_enable_bundle to unlock additional tool bundles dynamically."
-    );
+    logDebug(`Progressive mode: ENABLED (${coreBundle.size} core tools)`);
   }
 
-  // Log router mode status (Strategy 6)
+  // Log router mode status (Strategy 6) - verbose only
   if (ROUTER_MODE) {
-    console.error(
-      "[ContextStream] Router mode: ENABLED (all operations accessed via contextstream/contextstream_help)"
-    );
-    console.error(
-      "[ContextStream] Only 2 tools registered. Use contextstream_help to see available operations."
-    );
+    logDebug("Router mode: ENABLED");
   }
 
-  // Log output format status (Strategy 7)
-  if (COMPACT_OUTPUT) {
-    console.error(
-      "[ContextStream] Output format: COMPACT (minified JSON, ~30% fewer tokens per response)"
-    );
-  } else {
-    console.error(
-      "[ContextStream] Output format: pretty (set CONTEXTSTREAM_OUTPUT_FORMAT=compact for fewer tokens)"
-    );
-  }
+  // Log output format status (Strategy 7) - verbose only
+  logDebug(COMPACT_OUTPUT ? "Output: COMPACT" : "Output: pretty");
 
-  // Log consolidated mode status (Strategy 8)
+  // Log consolidated mode status (Strategy 8) - verbose only
   if (CONSOLIDATED_MODE) {
-    console.error(
-      `[ContextStream] Consolidated mode: ENABLED (~${CONSOLIDATED_TOOLS.size} domain tools, ~75% token reduction)`
-    );
-    console.error("[ContextStream] Set CONTEXTSTREAM_CONSOLIDATED=false to use individual tools.");
-  } else {
-    console.error("[ContextStream] Consolidated mode: disabled (using individual tools)");
+    logDebug(`Consolidated mode: ENABLED (~${CONSOLIDATED_TOOLS.size} domain tools)`);
   }
 
   // Store server reference for deferred tool registration
@@ -2337,13 +2368,11 @@ export function registerTools(
         workspaceId,
       };
 
-      console.error(
-        `[ContextStream] Integration status: Slack=${slackConnected}, GitHub=${githubConnected}, Notion=${notionConnected}`
-      );
+      logDebug(`Integrations: Slack=${slackConnected}, GitHub=${githubConnected}, Notion=${notionConnected}`);
 
       return { slack: slackConnected, github: githubConnected, notion: notionConnected };
     } catch (error) {
-      console.error("[ContextStream] Failed to check integration status:", error);
+      logDebug(`Failed to check integration status: ${error}`);
       // On error, assume no integrations
       return { slack: false, github: false, notion: false };
     }
@@ -2378,11 +2407,9 @@ export function registerTools(
           // This allows clients that support dynamic tool updates to refresh
           (server as any).server?.sendToolsListChanged?.();
           toolsListChangedNotified = true;
-          console.error(
-            "[ContextStream] Emitted tools/list_changed notification (integrations detected)"
-          );
+          logDebug("Emitted tools/list_changed notification (integrations detected)");
         } catch (error) {
-          console.error("[ContextStream] Failed to emit tools/list_changed:", error);
+          logDebug(`Failed to emit tools/list_changed: ${error}`);
         }
       }
     }
@@ -2585,7 +2612,7 @@ export function registerTools(
    * on the FIRST tool call of any conversation.
    *
    * Benefits:
-   * - Works with ALL MCP clients (Windsurf, Cursor, Claude Desktop, VS Code, etc.)
+   * - Works with ALL MCP clients (Cursor, Claude Desktop, VS Code, etc.)
    * - No client-side changes required
    * - Context is loaded regardless of which tool the AI calls first
    * - Only runs once per session (efficient)
@@ -2780,7 +2807,7 @@ export function registerTools(
       // Client might not support this notification
     }
 
-    console.error(`[ContextStream] Bundle '${bundleName}' enabled with ${toolsEnabled} tools.`);
+    logSystem(`bundle '${bundleName}' enabled (${toolsEnabled} tools)`);
     return {
       success: true,
       message: `Enabled bundle '${bundleName}' with ${toolsEnabled} tools.`,
@@ -2928,9 +2955,7 @@ export function registerTools(
         if (options.preflight) {
           const fileCheck = await countIndexableFiles(resolvedPath, { maxFiles: 1 });
           if (fileCheck.count === 0) {
-            console.error(
-              `[ContextStream] No indexable files found in ${resolvedPath}. Skipping ingest.`
-            );
+            logDebug(`No indexable files in ${resolvedPath}`);
             return;
           }
         }
@@ -2938,9 +2963,7 @@ export function registerTools(
         let totalIndexed = 0;
         let batchCount = 0;
 
-        console.error(
-          `[ContextStream] Starting background ingestion for project ${projectId} from ${resolvedPath}`
-        );
+        logTool("ingest", "start", `indexing ${resolvedPath}`);
 
         for await (const batch of readAllFilesInBatches(resolvedPath, { batchSize: 50 })) {
           const result = (await client.ingestFiles(projectId, batch, ingestOptions)) as {
@@ -2950,19 +2973,17 @@ export function registerTools(
           batchCount++;
         }
 
-        console.error(
-          `[ContextStream] Completed background ingestion: ${totalIndexed} files in ${batchCount} batches`
-        );
+        logTool("ingest", "done", `${totalIndexed} files`);
 
         // Mark project as indexed so hooks know to enforce ContextStream-first behavior
         try {
           await markProjectIndexed(resolvedPath, { project_id: projectId });
-          console.error(`[ContextStream] Marked project as indexed: ${resolvedPath}`);
+          logDebug(`Marked project as indexed: ${resolvedPath}`);
         } catch (markError) {
-          console.error(`[ContextStream] Failed to mark project as indexed:`, markError);
+          logDebug(`Failed to mark project as indexed: ${markError}`);
         }
       } catch (error) {
-        console.error(`[ContextStream] Ingestion failed:`, error);
+        logTool("ingest", "error", `${error}`);
       }
     })();
   }
@@ -3232,9 +3253,7 @@ Examples:
       }
     );
 
-    console.error(
-      `[ContextStream] Router mode: Registered 2 meta-tools, ${operationsRegistry.size} operations available via dispatcher.`
-    );
+    logDebug(`Router mode: 2 meta-tools, ${operationsRegistry.size} operations`);
   }
 
   // Workspaces
@@ -3435,7 +3454,7 @@ Access: Free`,
           }
         } catch (err: unknown) {
           // Log but don't fail - project was created successfully
-          console.error("[ContextStream] Failed to write project config:", err);
+          logDebug(`Failed to write project config: ${err}`);
         }
       }
 
@@ -4039,10 +4058,7 @@ Access: Free`,
         const stats = await client.projectStatistics(projectId);
         estimate = estimateGraphIngestMinutes(stats);
       } catch (error) {
-        console.error(
-          "[ContextStream] Failed to fetch project statistics for graph ingest estimate:",
-          error
-        );
+        logDebug(`Failed to fetch project statistics for graph estimate: ${error}`);
       }
 
       const result = await client.graphIngest({ project_id: projectId, wait });
@@ -4966,7 +4982,7 @@ This does semantic search on the first message. You only need context_smart on s
                 "Post-compaction session started, but no snapshots found. Use context_smart to retrieve relevant context.";
             }
           } catch (err) {
-            console.error("[ContextStream] Failed to restore post-compact context:", err);
+            logDebug(`Failed to restore post-compact context: ${err}`);
             (result as any).is_post_compact = true;
             (result as any).post_compact_hint =
               "Post-compaction session started. Snapshot restoration failed, use context_smart for context.";
@@ -5025,10 +5041,7 @@ This does semantic search on the first message. You only need context_smart on s
                 : "Connect integrations at https://contextstream.io/settings/integrations to enable Slack/GitHub tools.",
           };
         } catch (error) {
-          console.error(
-            "[ContextStream] Failed to check integration status in session_init:",
-            error
-          );
+          logDebug(`Failed to check integration status: ${error}`);
         }
       }
 
@@ -5174,7 +5187,7 @@ This does semantic search on the first message. You only need context_smart on s
         const projectId = typeof result.project_id === "string" ? result.project_id : undefined;
         const projectName = typeof result.project_name === "string" ? result.project_name : undefined;
         markProjectIndexed(folderPathForRules, { project_id: projectId, project_name: projectName }).catch(
-          (err) => console.error("[ContextStream] Failed to mark project as indexed:", err)
+          (err) => logDebug(`Failed to mark project as indexed: ${err}`)
         );
       }
 
@@ -5315,7 +5328,7 @@ Optionally generates AI editor rules for automatic ContextStream usage.`,
           .boolean()
           .optional()
           .describe(
-            "Generate AI editor rules for Windsurf, Cursor, Cline, Kilo Code, Roo Code, Claude Code, and Aider"
+            "Generate AI editor rules for Cursor, Cline, Kilo Code, Roo Code, Claude Code, and Aider"
           ),
         overwrite_existing: z
           .boolean()
@@ -6329,7 +6342,7 @@ Example: "What were the auth decisions?" or "What are my TypeScript preferences?
     "generate_rules",
     {
       title: "Generate ContextStream rules",
-      description: `Generate AI rule files for editors (Windsurf, Cursor, Cline, Kilo Code, Roo Code, Claude Code, Aider).
+      description: `Generate AI rule files for editors (Cursor, Cline, Kilo Code, Roo Code, Claude Code, Aider).
 Defaults to the current project folder; no folder_path required when run from a project.
 Supported editors: ${getAvailableEditors().join(", ")}`,
       inputSchema: z.object({
@@ -6341,7 +6354,6 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
           .array(
             z.enum([
               "codex",
-              "windsurf",
               "cursor",
               "cline",
               "kilo",
@@ -6478,7 +6490,6 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
         roo: "roo",
         kilo: "kilo",
         cursor: "cursor",
-        windsurf: "windsurf",
       };
       const hookSupportedEditors = editors.filter((e) => e in editorHookMap) as SupportedEditor[];
       const shouldInstallHooks = hookSupportedEditors.length > 0 && input.install_hooks !== false;
@@ -6517,12 +6528,6 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
                   { editor, file: "~/.cursor/hooks/contextstream-pretooluse.py", status: "dry run - would create" },
                   { editor, file: "~/.cursor/hooks/contextstream-beforesubmit.py", status: "dry run - would create" },
                   { editor, file: "~/.cursor/hooks.json", status: "dry run - would update" }
-                );
-              } else if (editor === "windsurf") {
-                hooksResults.push(
-                  { editor, file: "~/.codeium/windsurf/hooks/contextstream-pretooluse.py", status: "dry run - would create" },
-                  { editor, file: "~/.codeium/windsurf/hooks/contextstream-reminder.py", status: "dry run - would create" },
-                  { editor, file: "~/.codeium/windsurf/hooks.json", status: "dry run - would update" }
                 );
               }
             }
@@ -6568,7 +6573,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
     "generate_editor_rules",
     {
       title: "Generate editor AI rules",
-      description: `Generate AI rule files for editors (Windsurf, Cursor, Cline, Kilo Code, Roo Code, Claude Code, Aider).
+      description: `Generate AI rule files for editors (Cursor, Cline, Kilo Code, Roo Code, Claude Code, Aider).
 These rules instruct the AI to automatically use ContextStream for memory and context.
 Supported editors: ${getAvailableEditors().join(", ")}`,
       inputSchema: z.object({
@@ -6580,7 +6585,6 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
           .array(
             z.enum([
               "codex",
-              "windsurf",
               "cursor",
               "cline",
               "kilo",
@@ -7084,10 +7088,10 @@ This saves ~80% tokens compared to including full chat history.`,
             postCompactRestored = true;
             sessionManager.markPostCompactRestoreCompleted();
 
-            console.error("[ContextStream] Post-compaction context restored automatically");
+            logSystem("context restored");
           }
         } catch (err) {
-          console.error("[ContextStream] Failed to restore post-compact context:", err);
+          logDebug(`Failed to restore post-compact context: ${err}`);
         }
       }
 
@@ -10991,9 +10995,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       }
     );
 
-    console.error(
-      `[ContextStream] Consolidated mode: Registered ${CONSOLIDATED_TOOLS.size} domain tools.`
-    );
+    logDebug(`Consolidated mode: ${CONSOLIDATED_TOOLS.size} domain tools`);
   }
 
   // =============================================================================
@@ -11038,5 +11040,5 @@ After setup, restart your editor to enable all ContextStream tools.`,
     }
   );
 
-  console.error("[ContextStream] Limited mode: Registered setup helper tool only.");
+  logSystem("limited mode (run setup)");
 }

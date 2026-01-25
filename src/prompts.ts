@@ -699,7 +699,7 @@ export function registerPrompts(server: McpServer) {
               "First:",
               "- If you can infer the project folder path from the environment/IDE roots, use it.",
               "- Otherwise ask me for an absolute folder path.",
-              "- Ask which editor(s) (codex,windsurf,cursor,cline,kilo,roo,claude,aider,antigravity) or default to all.",
+              "- Ask which editor(s) (codex,cursor,cline,kilo,roo,claude,aider,antigravity) or default to all.",
               "",
               "Then call `generate_rules` and confirm which files were created/updated.",
               "Ask if the user also wants to apply rules globally (pass apply_global: true).",

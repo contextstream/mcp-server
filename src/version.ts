@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
-const UPGRADE_COMMAND = "npm update -g @contextstream/mcp-server";
+const UPGRADE_COMMAND = "npm install -g @contextstream/mcp-server@latest";
 const NPM_LATEST_URL = "https://registry.npmjs.org/@contextstream/mcp-server/latest";
 
 export function getVersion(): string {

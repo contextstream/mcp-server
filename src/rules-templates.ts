@@ -618,14 +618,6 @@ ${rules}
 `,
   },
 
-  windsurf: {
-    filename: ".windsurfrules",
-    description: "Windsurf AI rules",
-    build: (rules) => `# Windsurf Rules
-${rules}
-`,
-  },
-
   cursor: {
     filename: ".cursorrules",
     description: "Cursor AI rules",

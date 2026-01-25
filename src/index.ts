@@ -208,17 +208,26 @@ async function main() {
     registerPrompts(server);
   }
 
-  // Log startup info (to stderr to not interfere with stdio protocol)
-  console.error(`ContextStream MCP server v${VERSION} starting...`);
-  console.error(`API URL: ${config.apiUrl}`);
-  console.error(`Auth: ${config.apiKey ? "API Key" : config.jwt ? "JWT" : "None"}`);
-  console.error(`Auto-Context: ENABLED (context loads on first tool call)`);
+  // Log startup info (respects CONTEXTSTREAM_LOG_LEVEL)
+  const logLevel = (process.env.CONTEXTSTREAM_LOG_LEVEL || "normal").toLowerCase();
+  const logQuiet = logLevel === "quiet";
+  const logVerbose = logLevel === "verbose";
+
+  if (!logQuiet) {
+    console.error(`━━━ ContextStream v${VERSION} ━━━`);
+  }
+  if (logVerbose) {
+    console.error(`  API: ${config.apiUrl}`);
+    console.error(`  Auth: ${config.apiKey ? "API Key" : config.jwt ? "JWT" : "None"}`);
+  }
 
   // Start stdio transport (works with Claude Code, Cursor, VS Code MCP config, Inspector)
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  console.error("ContextStream MCP server connected and ready");
+  if (!logQuiet) {
+    console.error("✓ ready");
+  }
 
   // Show first-run star message (only once per install)
   showFirstRunMessage();

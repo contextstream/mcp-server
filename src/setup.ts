@@ -8,7 +8,7 @@ import { ContextStreamClient } from "./client.js";
 import type { Config } from "./config.js";
 import { HttpError } from "./http.js";
 import { generateRuleContent } from "./rules-templates.js";
-import { VERSION } from "./version.js";
+import { VERSION, getUpdateNotice } from "./version.js";
 import {
   credentialsFilePath,
   normalizeApiUrl,
@@ -27,13 +27,12 @@ type Toolset = "consolidated" | "router";
 type InstallScope = "global" | "project" | "both";
 type McpScope = InstallScope | "skip";
 
-type EditorKey = "codex" | "claude" | "cursor" | "windsurf" | "cline" | "kilo" | "roo" | "aider" | "antigravity";
+type EditorKey = "codex" | "claude" | "cursor" | "cline" | "kilo" | "roo" | "aider" | "antigravity";
 
 const EDITOR_LABELS: Record<EditorKey, string> = {
   codex: "Codex CLI",
   claude: "Claude Code",
   cursor: "Cursor / VS Code",
-  windsurf: "Windsurf",
   cline: "Cline",
   kilo: "Kilo Code",
   roo: "Roo Code",
@@ -118,7 +117,6 @@ const CONTEXTSTREAM_PREAMBLE_PATTERNS: RegExp[] = [
   /^#\s+codex cli instructions$/i,
   /^#\s+claude code instructions$/i,
   /^#\s+cursor rules$/i,
-  /^#\s+windsurf rules$/i,
   /^#\s+cline rules$/i,
   /^#\s+kilo code rules$/i,
   /^#\s+roo code rules$/i,
@@ -291,8 +289,6 @@ function globalRulesPathForEditor(editor: EditorKey): string | null {
       return path.join(home, ".codex", "AGENTS.md");
     case "claude":
       return path.join(home, ".claude", "CLAUDE.md");
-    case "windsurf":
-      return path.join(home, ".codeium", "windsurf", "memories", "global_rules.md");
     case "cline":
       return path.join(home, "Documents", "Cline", "Rules", "contextstream.md");
     case "kilo":
@@ -341,28 +337,6 @@ async function isClaudeInstalled(): Promise<boolean> {
   } else if (process.platform === "win32") {
     const appData = process.env.APPDATA;
     if (appData) candidates.push(path.join(appData, "Claude"));
-  }
-
-  return anyPathExists(candidates);
-}
-
-async function isWindsurfInstalled(): Promise<boolean> {
-  const home = homedir();
-  const candidates = [
-    path.join(home, ".codeium"),
-    path.join(home, ".codeium", "windsurf"),
-    path.join(home, ".config", "codeium"),
-  ];
-
-  if (process.platform === "darwin") {
-    candidates.push(path.join(home, "Library", "Application Support", "Windsurf"));
-    candidates.push(path.join(home, "Library", "Application Support", "Codeium"));
-  } else if (process.platform === "win32") {
-    const appData = process.env.APPDATA;
-    if (appData) {
-      candidates.push(path.join(appData, "Windsurf"));
-      candidates.push(path.join(appData, "Codeium"));
-    }
   }
 
   return anyPathExists(candidates);
@@ -457,8 +431,6 @@ async function isEditorInstalled(editor: EditorKey): Promise<boolean> {
       return isClaudeInstalled();
     case "cursor":
       return isCursorInstalled();
-    case "windsurf":
-      return isWindsurfInstalled();
     case "cline":
       return isClineInstalled();
     case "kilo":
@@ -863,6 +835,28 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     if (dryRun) console.log("DRY RUN: no files will be written.\n");
     else console.log("");
 
+    // Check for newer version and warn if running outdated cached version
+    const versionNotice = await getUpdateNotice();
+    if (versionNotice?.behind) {
+      console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      console.log(`⚠️  You're running an outdated version (v${versionNotice.current})`);
+      console.log(`   Latest version is v${versionNotice.latest}`);
+      console.log("");
+      console.log("   To use the latest version, exit and run:");
+      console.log("   npx -y @contextstream/mcp-server@latest setup");
+      console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      console.log("");
+      const continueAnyway = normalizeInput(
+        await rl.question("Continue with current version anyway? [y/N]: ")
+      ).toLowerCase();
+      if (continueAnyway !== "y" && continueAnyway !== "yes") {
+        console.log("\nExiting. Run the command above to use the latest version.");
+        rl.close();
+        return;
+      }
+      console.log("");
+    }
+
     const savedCreds = await readSavedCredentials();
     const apiUrlDefault = normalizeApiUrl(
       process.env.CONTEXTSTREAM_API_URL || savedCreds?.api_url || "https://api.contextstream.io"
@@ -1121,12 +1115,8 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       }
     }
 
-    // Rules mode + editors
-    console.log("Rules detail level (in the generated rules file):\n");
-    console.log("  1) Standard (recommended) — concise, high-signal (lower token overhead)");
-    console.log("  2) Enhanced — more guidance + examples (higher token overhead)");
-    const modeChoice = normalizeInput(await rl.question("Choose [1/2] (default 1): ")) || "1";
-    const mode: RuleMode = modeChoice === "2" ? "full" : "minimal";
+    // Rules mode - always use enhanced (full) mode
+    const mode: RuleMode = "full";
 
     const detectedPlanName = await client.getPlanName();
     const detectedGraphTier = await client.getGraphTier();
@@ -1188,7 +1178,6 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       "codex",
       "claude",
       "cursor",
-      "windsurf",
       "cline",
       "kilo",
       "roo",
@@ -1261,7 +1250,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       }
     }
 
-    const mcpChoiceDefault = hasCodex && !hasProjectMcpEditors ? "1" : "3";
+    const mcpChoiceDefault = hasCodex && !hasProjectMcpEditors ? "1" : "2";
     const mcpChoice =
       normalizeInput(
         await rl.question(
@@ -1323,19 +1312,6 @@ export async function runSetupWizard(args: string[]): Promise<void> {
               showTiming,
               restoreContextEnabled,
             });
-            writeActions.push({ kind: "mcp-config", target: filePath, status });
-            console.log(`- ${EDITOR_LABELS[editor]}: ${status} ${filePath}`);
-            continue;
-          }
-
-          if (editor === "windsurf") {
-            const filePath = path.join(homedir(), ".codeium", "windsurf", "mcp_config.json");
-            if (dryRun) {
-              writeActions.push({ kind: "mcp-config", target: filePath, status: "dry-run" });
-              console.log(`- ${EDITOR_LABELS[editor]}: would update ${filePath}`);
-              continue;
-            }
-            const status = await upsertJsonMcpConfig(filePath, mcpServer);
             writeActions.push({ kind: "mcp-config", target: filePath, status });
             console.log(`- ${EDITOR_LABELS[editor]}: ${status} ${filePath}`);
             continue;
@@ -1418,7 +1394,6 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     const HOOKS_SUPPORTED_EDITORS: Record<EditorKey, SupportedEditor | null> = {
       claude: "claude",
       cursor: "cursor",
-      windsurf: "windsurf",
       cline: "cline",
       roo: "roo",
       kilo: "kilo",

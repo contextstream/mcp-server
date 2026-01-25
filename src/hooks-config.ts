@@ -1413,267 +1413,10 @@ export async function installCursorHookScripts(options: {
 }
 
 // =============================================================================
-// WINDSURF HOOKS
-// =============================================================================
-
-/**
- * Windsurf pre_mcp_tool_use hook script.
- * Blocks discovery tools and redirects to ContextStream search.
- * Uses exit codes: 0=allow, 2=block
- */
-export const WINDSURF_PRE_MCP_TOOL_USE_SCRIPT = `#!/usr/bin/env python3
-"""
-ContextStream pre_mcp_tool_use Hook for Windsurf
-Blocks discovery tools and redirects to ContextStream search.
-
-Exit codes:
-- 0: Allow action to proceed
-- 2: Block action (message to stderr)
-"""
-
-import json
-import sys
-import os
-
-ENABLED = os.environ.get("CONTEXTSTREAM_HOOK_ENABLED", "true").lower() == "true"
-
-# Tools to redirect
-DISCOVERY_TOOLS = {
-    "read_file": "Use mcp__contextstream__search(mode=\\"hybrid\\") for discovery",
-    "search_files": "Use mcp__contextstream__search(mode=\\"hybrid\\")",
-    "list_files": "Use mcp__contextstream__search(mode=\\"pattern\\")",
-    "codebase_search": "Use mcp__contextstream__search(mode=\\"hybrid\\")",
-    "grep_search": "Use mcp__contextstream__search(mode=\\"keyword\\")",
-}
-
-def is_project_indexed(workspace_roots):
-    """Check if any workspace has a .contextstream/index marker."""
-    for root in workspace_roots:
-        marker = os.path.join(root, ".contextstream", "index.json")
-        if os.path.exists(marker):
-            return True, root
-    return False, None
-
-def main():
-    if not ENABLED:
-        sys.exit(0)
-
-    try:
-        data = json.load(sys.stdin)
-    except:
-        sys.exit(0)
-
-    tool_info = data.get("tool_info", {})
-    tool_name = tool_info.get("tool_name", "")
-
-    # For MCP tools, check the server and tool
-    mcp_server = tool_info.get("mcp_server", "")
-
-    # Get workspace roots from the data
-    workspace_roots = []
-    if "working_directory" in data:
-        workspace_roots.append(data["working_directory"])
-
-    # Check if project is indexed
-    is_indexed, _ = is_project_indexed(workspace_roots)
-    if not is_indexed:
-        sys.exit(0)
-
-    # Check if this is a discovery tool we should redirect
-    if tool_name in DISCOVERY_TOOLS:
-        message = DISCOVERY_TOOLS[tool_name]
-        print(message, file=sys.stderr)
-        sys.exit(2)
-
-    sys.exit(0)
-
-if __name__ == "__main__":
-    main()
-`;
-
-/**
- * Windsurf pre_user_prompt hook script.
- * Injects reminder about ContextStream rules.
- */
-export const WINDSURF_PRE_USER_PROMPT_SCRIPT = `#!/usr/bin/env python3
-"""
-ContextStream pre_user_prompt Hook for Windsurf
-Injects reminder about ContextStream rules.
-
-Note: This hook runs before prompt processing but cannot modify the prompt.
-It primarily serves for logging and validation purposes.
-"""
-
-import json
-import sys
-import os
-
-ENABLED = os.environ.get("CONTEXTSTREAM_REMINDER_ENABLED", "true").lower() == "true"
-
-def main():
-    if not ENABLED:
-        sys.exit(0)
-
-    try:
-        json.load(sys.stdin)
-    except:
-        sys.exit(0)
-
-    # Allow the prompt to proceed
-    sys.exit(0)
-
-if __name__ == "__main__":
-    main()
-`;
-
-/**
- * Windsurf hooks.json configuration structure.
- */
-export interface WindsurfHooksConfig {
-  hooks: {
-    pre_mcp_tool_use?: Array<{
-      command: string;
-      show_output?: boolean;
-      working_directory?: string;
-    }>;
-    pre_user_prompt?: Array<{
-      command: string;
-      show_output?: boolean;
-    }>;
-    [key: string]: unknown;
-  };
-}
-
-/**
- * Get Windsurf hooks config path.
- */
-export function getWindsurfHooksConfigPath(
-  scope: "global" | "project",
-  projectPath?: string
-): string {
-  if (scope === "project" && projectPath) {
-    return path.join(projectPath, ".windsurf", "hooks.json");
-  }
-  return path.join(homedir(), ".codeium", "windsurf", "hooks.json");
-}
-
-/**
- * Get Windsurf hooks directory.
- */
-export function getWindsurfHooksDir(
-  scope: "global" | "project",
-  projectPath?: string
-): string {
-  if (scope === "project" && projectPath) {
-    return path.join(projectPath, ".windsurf", "hooks");
-  }
-  return path.join(homedir(), ".codeium", "windsurf", "hooks");
-}
-
-/**
- * Read Windsurf hooks config.
- */
-export async function readWindsurfHooksConfig(
-  scope: "global" | "project",
-  projectPath?: string
-): Promise<WindsurfHooksConfig> {
-  const configPath = getWindsurfHooksConfigPath(scope, projectPath);
-  try {
-    const content = await fs.promises.readFile(configPath, "utf-8");
-    return JSON.parse(content);
-  } catch {
-    return { hooks: {} };
-  }
-}
-
-/**
- * Write Windsurf hooks config.
- */
-export async function writeWindsurfHooksConfig(
-  config: WindsurfHooksConfig,
-  scope: "global" | "project",
-  projectPath?: string
-): Promise<void> {
-  const configPath = getWindsurfHooksConfigPath(scope, projectPath);
-  const configDir = path.dirname(configPath);
-  await fs.promises.mkdir(configDir, { recursive: true });
-  await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2));
-}
-
-/**
- * Filter out existing ContextStream hooks from Windsurf config.
- */
-function filterWindsurfContextStreamHooks(
-  hooks: Array<{ command: string; [key: string]: unknown }> | undefined
-): Array<{ command: string; [key: string]: unknown }> {
-  if (!hooks) return [];
-  return hooks.filter((h) => !h.command?.includes("contextstream"));
-}
-
-/**
- * Install Windsurf hooks.
- */
-export async function installWindsurfHookScripts(options: {
-  scope?: "global" | "project";
-  projectPath?: string;
-}): Promise<{ preMcpToolUse: string; preUserPrompt: string; config: string }> {
-  const scope = options.scope || "global";
-  const hooksDir = getWindsurfHooksDir(scope, options.projectPath);
-
-  // Create hooks directory
-  await fs.promises.mkdir(hooksDir, { recursive: true });
-
-  // Write hook scripts
-  const preMcpToolUsePath = path.join(hooksDir, "contextstream-pretooluse.py");
-  const preUserPromptPath = path.join(hooksDir, "contextstream-reminder.py");
-
-  await fs.promises.writeFile(preMcpToolUsePath, WINDSURF_PRE_MCP_TOOL_USE_SCRIPT);
-  await fs.promises.writeFile(preUserPromptPath, WINDSURF_PRE_USER_PROMPT_SCRIPT);
-
-  // Make executable on Unix
-  if (process.platform !== "win32") {
-    await fs.promises.chmod(preMcpToolUsePath, 0o755);
-    await fs.promises.chmod(preUserPromptPath, 0o755);
-  }
-
-  // Read existing config and merge
-  const existingConfig = await readWindsurfHooksConfig(scope, options.projectPath);
-
-  const config: WindsurfHooksConfig = {
-    hooks: {
-      ...existingConfig.hooks,
-      pre_mcp_tool_use: [
-        ...filterWindsurfContextStreamHooks(existingConfig.hooks.pre_mcp_tool_use as any[]),
-        {
-          command: `python3 "${preMcpToolUsePath}"`,
-          show_output: true,
-        },
-      ],
-      pre_user_prompt: [
-        ...filterWindsurfContextStreamHooks(existingConfig.hooks.pre_user_prompt as any[]),
-        {
-          command: `python3 "${preUserPromptPath}"`,
-          show_output: false,
-        },
-      ],
-    },
-  };
-
-  await writeWindsurfHooksConfig(config, scope, options.projectPath);
-  const configPath = getWindsurfHooksConfigPath(scope, options.projectPath);
-
-  return {
-    preMcpToolUse: preMcpToolUsePath,
-    preUserPrompt: preUserPromptPath,
-    config: configPath,
-  };
-}
-
-// =============================================================================
 // UNIFIED EDITOR HOOKS INSTALLATION
 // =============================================================================
 
-export type SupportedEditor = "claude" | "cline" | "roo" | "kilo" | "cursor" | "windsurf";
+export type SupportedEditor = "claude" | "cline" | "roo" | "kilo" | "cursor";
 
 export interface EditorHooksResult {
   editor: SupportedEditor;
@@ -1752,15 +1495,6 @@ export async function installEditorHooks(options: {
       };
     }
 
-    case "windsurf": {
-      const scripts = await installWindsurfHookScripts({ scope, projectPath });
-      return {
-        editor: "windsurf",
-        installed: [scripts.preMcpToolUse, scripts.preUserPrompt],
-        hooksDir: getWindsurfHooksDir(scope, projectPath),
-      };
-    }
-
     default:
       throw new Error(`Unsupported editor: ${editor}`);
   }
@@ -1775,7 +1509,7 @@ export async function installAllEditorHooks(options: {
   includePreCompact?: boolean;
   editors?: SupportedEditor[];
 }): Promise<EditorHooksResult[]> {
-  const editors = options.editors || ["claude", "cline", "roo", "kilo", "cursor", "windsurf"];
+  const editors = options.editors || ["claude", "cline", "roo", "kilo", "cursor"];
   const results: EditorHooksResult[] = [];
 
   for (const editor of editors) {
@@ -1811,7 +1545,6 @@ ContextStream can install hooks for multiple AI code editors to enforce ContextS
 |--------|---------------|------------|
 | **Claude Code** | \`~/.claude/hooks/\` | PreToolUse, UserPromptSubmit, PreCompact |
 | **Cursor** | \`~/.cursor/hooks/\` | preToolUse, beforeSubmit |
-| **Windsurf** | \`~/.codeium/windsurf/hooks/\` | pre_mcp_tool_use, pre_user_prompt |
 | **Cline** | \`~/Documents/Cline/Rules/Hooks/\` | PreToolUse, UserPromptSubmit |
 | **Roo Code** | \`~/.roo/hooks/\` | PreToolUse, UserPromptSubmit |
 | **Kilo Code** | \`~/.kilocode/hooks/\` | PreToolUse, UserPromptSubmit |
@@ -1854,7 +1587,7 @@ Hooks are executable scripts named after the hook type (no extension).
 
 ### Installation
 
-Use \`generate_rules(install_hooks=true, editors=["claude", "cursor", "windsurf", "cline", "roo", "kilo"])\` to install hooks for specific editors, or omit \`editors\` to install for all.
+Use \`generate_rules(install_hooks=true, editors=["claude", "cursor", "cline", "roo", "kilo"])\` to install hooks for specific editors, or omit \`editors\` to install for all.
 
 ### Disabling Hooks
 

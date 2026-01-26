@@ -7221,9 +7221,17 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
         }
       }
 
+      // Use server-provided warnings from Enhanced Context filtering (lessons, risky actions)
+      // The server now does intelligent filtering and provides warnings via the warnings field
+      const serverWarnings = result.warnings || [];
+      const serverWarningsLine = serverWarnings.length > 0
+        ? "\n\n" + serverWarnings.map(w => `⚠️ ${w}`).join("\n")
+        : "";
+
       // Combine all warnings (only add non-empty ones with proper spacing)
+      // Server warnings take precedence, but we keep client-side detection as fallback
       const allWarnings = [
-        lessonsWarningLine,
+        serverWarningsLine || lessonsWarningLine,  // Server warnings OR client-side lesson detection
         rulesWarningLine ? `\n\n${rulesWarningLine}` : "",
         versionWarningLine ? `\n\n${versionWarningLine}` : "",
         contextPressureWarning,

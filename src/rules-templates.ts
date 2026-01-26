@@ -170,6 +170,7 @@ Rules Version: ${RULES_VERSION}
 | **Code search** | \`search(mode="hybrid", query="...")\` — BEFORE Glob/Grep/Read |
 | **After significant work** | \`session(action="capture", event_type="decision", ...)\` |
 | **User correction** | \`session(action="capture_lesson", ...)\` |
+| **⚠️ When warnings received** | **STOP**, acknowledge, explain mitigation, then proceed |
 
 **How to detect simple utility operations:**
 - Single-word commands: "list", "show", "version", "help"
@@ -312,6 +313,24 @@ session(action="capture", event_type="session_snapshot", title="Pre-compaction s
 **Graph data:** If graph queries (\`dependencies\`, \`impact\`) return empty, run \`graph(action="ingest")\` once.
 
 **NEVER fall back to local tools (Glob/Grep/Read) just because search returned 0 results on first try.** Retry first.
+
+### Enhanced Context (Server-Side Warnings)
+
+\`context_smart\` now includes **intelligent server-side filtering** that proactively surfaces relevant warnings:
+
+**Response fields:**
+- \`warnings\`: Array of warning strings (displayed with ⚠️ prefix)
+
+**What triggers warnings:**
+- **Lessons**: Past mistakes relevant to the current query (via semantic matching)
+- **Risky actions**: Detected high-risk operations (deployments, migrations, destructive commands)
+- **Breaking changes**: When modifications may impact other parts of the codebase
+
+**When you receive warnings:**
+1. **STOP** and read each warning carefully
+2. **Acknowledge** the warning to the user
+3. **Explain** how you will avoid the issue
+4. Only proceed after addressing the warnings
 
 ### Search & Code Intelligence (ContextStream-first)
 
@@ -570,6 +589,11 @@ ContextStream search is **indexed** and returns semantic matches + context in ON
 
 - If \`context_smart\` returns high/critical \`context_pressure\`: call \`session(action="capture", ...)\` to save state
 - PreCompact hooks automatically save snapshots before compaction (if installed)
+
+### Enhanced Context (Warnings)
+
+\`context_smart\` returns server-side \`warnings\` for lessons, risky actions, and breaking changes.
+When warnings are present: **STOP**, acknowledge them, explain mitigation, then proceed.
 
 ### Automatic Context Restoration
 

@@ -3074,6 +3074,7 @@ export class ContextStreamClient {
     workspace_id?: string;
     project_id?: string;
     errors?: string[];
+    warnings?: string[];  // Server-side enhanced context warnings (lessons, risky actions)
     version_notice?: VersionNotice;
     index_status?: "refreshing" | "fresh" | "stale";
     /** Context pressure indicator for compaction awareness */
@@ -3208,6 +3209,7 @@ export class ContextStreamClient {
         project_id: withDefaults.project_id,
         ...(versionNotice ? { version_notice: versionNotice } : {}),
         ...(Array.isArray(data?.errors) ? { errors: data.errors } : {}),
+        ...(Array.isArray(data?.warnings) && data.warnings.length > 0 ? { warnings: data.warnings } : {}),
         ...(this.indexRefreshInProgress ? { index_status: "refreshing" as const } : {}),
         ...(data?.context_pressure ? { context_pressure: data.context_pressure } : {}),
       };

@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.4.45
+
+**Content management, team features, and real-time indexing.**
+
+### Content Management
+
+New lightweight content tools for quick capture without heavyweight plans:
+
+- **Todos** — Simple task tracking via `memory` tool. Actions: `create_todo`, `list_todos`, `get_todo`, `update_todo`, `complete_todo`, `delete_todo`. Supports priority levels and due dates.
+
+- **Diagrams** — Mermaid diagram storage via `memory` tool. Actions: `create_diagram`, `list_diagrams`, `get_diagram`, `update_diagram`, `delete_diagram`. Supports flowchart, sequence, class, ER, gantt, mindmap, and pie charts.
+
+- **Docs** — Markdown documents via `memory` tool. Actions: `create_doc`, `list_docs`, `get_doc`, `update_doc`, `delete_doc`, `create_roadmap`. Includes roadmap templates with milestones.
+
+### Team Features
+
+New team-wide tools:
+
+- `help(action="team_status")` — Team overview with seats and members
+- `session(action="team_decisions")` — Aggregate decisions across team workspaces
+- `session(action="team_lessons")` — Aggregate lessons across team workspaces
+- `workspace(action="team_members")` — List team members with access
+- `project(action="team_projects")` — List all team projects
+- `integration(action="team_activity")` — Aggregated activity from Notion, Slack, GitHub
+- `search(mode="team")` — Cross-project search across team workspaces
+
+### Other Improvements
+
+- **Real-time file indexing** — Files indexed automatically during AI sessions via PostToolUse hook
+- **All hooks converted for better compatibility** — Hooks now use Node.js instead of Python
+- **Renamed tools** — `session_init` → `init`, `context_smart` → `context`
+- **Cleaner output** — Reduced verbosity for rules and search reminders
+
+```bash
+npm install -g @contextstream/mcp-server@latest
+```
+
+---
+
 ## 0.4.44
 
 **Media tool for AI-powered video editing.**

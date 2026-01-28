@@ -22,8 +22,8 @@ export const RULES_VERSION = VERSION === "unknown" ? "0.0.0" : VERSION;
  */
 const CONTEXTSTREAM_TOOL_NAMES = [
   // Standalone tools (always present)
-  "session_init",
-  "context_smart",
+  "init", // Renamed from session_init - initialize conversation session
+  "context", // Renamed from context_smart - get relevant context every message
   "context_feedback",
   "generate_rules",
 
@@ -47,24 +47,24 @@ function applyMcpToolPrefix(markdown: string, toolPrefix: string): string {
 }
 
 /**
- * Dynamic rules - minimal file that relies on context_smart for dynamic rule delivery.
+ * Dynamic rules - minimal file that relies on context for dynamic rule delivery.
  * This is the recommended mode for efficiency and better results.
  */
 const CONTEXTSTREAM_RULES_DYNAMIC = `
 ## ContextStream Dynamic Rules (Powered by our SmartRouter)
 
-All rules are served dynamically via \`context_smart\`. This file is minimal by design.
+All rules are served dynamically via \`context\`. This file is minimal by design.
 
 ### Every Message Protocol
 
 | Message | What to Call |
 |---------|--------------|
-| **1st message** | \`session_init(folder_path="<cwd>", context_hint="<msg>")\` then \`context_smart(user_message="<msg>")\` |
-| **2nd+ messages** | \`context_smart(user_message="<msg>")\` |
+| **1st message** | \`init(folder_path="<cwd>", context_hint="<msg>")\` then \`context(user_message="<msg>")\` |
+| **2nd+ messages** | \`context(user_message="<msg>")\` |
 
 ### Follow the Instructions Field
 
-The \`context_smart\` response includes an \`instructions\` field with context-aware guidance.
+The \`context\` response includes an \`instructions\` field with context-aware guidance.
 **Follow these instructions.** They are dynamically matched to your query and include:
 - Search guidance (when/how to search)
 - Git workflow rules (commit, PR, safety)
@@ -75,7 +75,7 @@ The \`context_smart\` response includes an \`instructions\` field with context-a
 
 ### Notices
 
-Handle notices from \`context_smart\` response:
+Handle notices from \`context\` response:
 - **[VERSION_NOTICE]**: Tell user to update MCP
 - **[RULES_NOTICE]**: Run \`generate_rules()\`
 - **[LESSONS_WARNING]**: Apply lessons immediately
@@ -88,7 +88,7 @@ const CONTEXTSTREAM_RULES_FULL = `
 
 <contextstream_rules>
 1. **SIMPLE UTILITY?** (list/show/version) → Just execute, skip context calls
-2. **CODING TASK?** → session_init → context_smart → work → capture
+2. **CODING TASK?** → init → context → work → capture
 3. **SEARCH FIRST:** Before Glob/Grep/Read → \`search(mode="hybrid")\` FIRST
 </contextstream_rules>
 
@@ -104,7 +104,7 @@ STOP → Call search(mode="hybrid", query="...") FIRST
 \`\`\`
 
 **Note:** PreToolUse hooks block these tools when ContextStream is available.
-**Claude Code users:** Your tool names are \`mcp__contextstream__search\`, \`mcp__contextstream__session_init\`, etc.
+**Claude Code users:** Your tool names are \`mcp__contextstream__search\`, \`mcp__contextstream__init\`, etc.
 
 ❌ **NEVER DO THIS:**
 - \`Glob("**/*.ts")\` → Use \`search(mode="pattern", query="*.ts")\` instead
@@ -123,19 +123,19 @@ This applies to **EVERY search** throughout the **ENTIRE conversation**, not jus
 
 ## 🚨 CRITICAL RULE #2 - AUTO-INDEXING 🚨
 
-**ContextStream auto-indexes your project on \`session_init\`.** You do NOT need to:
+**ContextStream auto-indexes your project on \`init\`.** You do NOT need to:
 - Ask the user to index
 - Manually trigger ingestion
 - Check index_status before every search
 
-**When \`session_init\` returns \`indexing_status: "started"\` or \`"refreshing"\`:**
+**When \`init\` returns \`indexing_status: "started"\` or \`"refreshing"\`:**
 - Background indexing is running automatically
 - Search results will be available within seconds to minutes
 - **DO NOT fall back to local tools** - wait for ContextStream search to work
 - If search returns 0 results initially, try again after a moment
 
 **Only manually trigger indexing if:**
-- \`session_init\` returned \`ingest_recommendation.recommended: true\` (rare edge case)
+- \`init\` returned \`ingest_recommendation.recommended: true\` (rare edge case)
 - User explicitly asks to re-index
 
 ---
@@ -144,13 +144,13 @@ This applies to **EVERY search** throughout the **ENTIRE conversation**, not jus
 
 **Lessons are past mistakes that MUST inform your work.** Ignoring lessons leads to repeated failures.
 
-### On \`session_init\`:
+### On \`init\`:
 - Check for \`lessons\` and \`lessons_warning\` in the response
 - If present, **READ THEM IMMEDIATELY** before doing any work
 - These are high-priority lessons (critical/high severity) relevant to your context
 - **Apply the prevention steps** from each lesson to avoid repeating mistakes
 
-### On \`context_smart\`:
+### On \`context\`:
 - Check for \`[LESSONS_WARNING]\` tag in the response
 - If present, you **MUST** tell the user about the lessons before proceeding
 - Lessons are proactively fetched when risky actions are detected (refactor, migrate, deploy, etc.)
@@ -182,9 +182,9 @@ Rules Version: ${RULES_VERSION}
 
 | Request Type | What to Do |
 |--------------|------------|
-| **🚀 Simple utility** (list workspaces, show version) | **Just execute directly** - skip session_init, context_smart, capture |
-| **💻 Coding task** (edit, create, refactor) | Full context: session_init → context_smart → work → capture |
-| **🔍 Code search/discovery** | session_init → context_smart → search() |
+| **🚀 Simple utility** (list workspaces, show version) | **Just execute directly** - skip init, context, capture |
+| **💻 Coding task** (edit, create, refactor) | Full context: init → context → work → capture |
+| **🔍 Code search/discovery** | init → context → search() |
 | **⚠️ Risky work** (deploy, migrate, refactor) | Check lessons first: \`session(action="get_lessons")\` |
 | **User frustration/correction** | Capture lesson: \`session(action="capture_lesson", ...)\` |
 
@@ -196,14 +196,14 @@ Rules Version: ${RULES_VERSION}
 - "show version" → \`help(action="version")\` → done
 - "what reminders do I have" → \`reminder(action="list")\` → done
 
-**No session_init. No context_smart. No capture.** These add noise, not value.
+**No init. No context. No capture.** These add noise, not value.
 
 ### Coding Tasks - FULL CONTEXT
 
 | Step | What to Call |
 |------|--------------|
-| **1st message** | \`session_init(folder_path="...", context_hint="<msg>")\`, then \`context_smart(...)\` |
-| **2nd+ messages** | \`context_smart(user_message="<msg>", format="minified", max_tokens=400)\` |
+| **1st message** | \`init(folder_path="...", context_hint="<msg>")\`, then \`context(...)\` |
+| **2nd+ messages** | \`context(user_message="<msg>", format="minified", max_tokens=400)\` |
 | **Code search** | \`search(mode="hybrid", query="...")\` — BEFORE Glob/Grep/Read |
 | **After significant work** | \`session(action="capture", event_type="decision", ...)\` |
 | **User correction** | \`session(action="capture_lesson", ...)\` |
@@ -214,11 +214,11 @@ Rules Version: ${RULES_VERSION}
 - Data retrieval with no context dependency: "list my workspaces", "what projects do I have"
 - Status checks: "am I authenticated?", "what's the server version?"
 
-**First message rule (for coding tasks):** After \`session_init\`:
+**First message rule (for coding tasks):** After \`init\`:
 1. Check for \`lessons\` in response - if present, READ and SUMMARIZE them to user
-2. Then call \`context_smart\` before any other tool or response
+2. Then call \`context\` before any other tool or response
 
-**Context Pack (Pro+):** If enabled, use \`context_smart(..., mode="pack", distill=true)\` for code/file queries. If unavailable or disabled, omit \`mode\` and proceed with standard \`context_smart\` (the API will fall back).
+**Context Pack (Pro+):** If enabled, use \`context(..., mode="pack", distill=true)\` for code/file queries. If unavailable or disabled, omit \`mode\` and proceed with standard \`context\` (the API will fall back).
 
 **Tool naming:** Use the exact tool names exposed by your MCP client. Claude Code typically uses \`mcp__<server>__<tool>\` where \`<server>\` matches your MCP config (often \`contextstream\`). If a tool call fails with "No such tool available", refresh rules and match the tool list.
 
@@ -229,8 +229,8 @@ Rules Version: ${RULES_VERSION}
 v0.4.x consolidates ~58 individual tools into ~11 domain tools with action/mode dispatch:
 
 ### Standalone Tools
-- **\`session_init\`** - Initialize session with workspace detection + context (skip for simple utility operations)
-- **\`context_smart\`** - Semantic search for relevant context (skip for simple utility operations)
+- **\`init\`** - Initialize session with workspace detection + context (skip for simple utility operations)
+- **\`context\`** - Semantic search for relevant context (skip for simple utility operations)
 
 ### Domain Tools (Use action/mode parameter)
 
@@ -248,29 +248,29 @@ v0.4.x consolidates ~58 individual tools into ~11 domain tools with action/mode 
 
 ---
 
-### Why context_smart is Required (Even After session_init)
+### Why context is Required (Even After init)
 
-**Common mistake:** "session_init already gave me context, I don't need context_smart"
+**Common mistake:** "init already gave me context, I don't need context"
 
 **This is WRONG. Here's why:**
-- \`session_init\` returns the last ~10 items **BY TIME** (chronological)
-- \`context_smart\` **SEARCHES** for items **RELEVANT to THIS message** (semantic)
+- \`init\` returns the last ~10 items **BY TIME** (chronological)
+- \`context\` **SEARCHES** for items **RELEVANT to THIS message** (semantic)
 
 **Example failure:**
 - User asks: "how should I implement authentication?"
 - Auth decisions were made 20 conversations ago
-- \`session_init\` won't have it (too old, not in recent 10)
-- \`context_smart\` FINDS it via semantic search
+- \`init\` won't have it (too old, not in recent 10)
+- \`context\` FINDS it via semantic search
 
-**Without context_smart, you WILL miss relevant older context.**
+**Without context, you WILL miss relevant older context.**
 
 ---
 
 ### Recommended Token Budgets
 
-- For trivial/local edits: \`context_smart(..., max_tokens=200)\`
-- Default: \`context_smart(..., max_tokens=400)\`
-- Deep debugging/architecture: \`context_smart(..., max_tokens=800)\`
+- For trivial/local edits: \`context(..., max_tokens=200)\`
+- Default: \`context(..., max_tokens=400)\`
+- Deep debugging/architecture: \`context(..., max_tokens=800)\`
 - Keep \`format="minified"\` (default) unless debugging
 
 If context still feels missing, use \`session(action="recall", query="...")\` for focused deep lookup.
@@ -307,9 +307,9 @@ If context still feels missing, use \`session(action="recall", query="...")\` fo
 
 ContextStream tracks context pressure to help you stay ahead of conversation compaction:
 
-**Automatic tracking:** Token usage is tracked automatically. \`context_smart\` returns \`context_pressure\` when usage is high.
+**Automatic tracking:** Token usage is tracked automatically. \`context\` returns \`context_pressure\` when usage is high.
 
-**When \`context_smart\` returns \`context_pressure\` with high/critical level:**
+**When \`context\` returns \`context_pressure\` with high/critical level:**
 1. Review the \`suggested_action\` field:
    - \`prepare_save\`: Start thinking about saving important state
    - \`save_now\`: Immediately call \`session(action="capture", event_type="session_snapshot")\` to preserve state
@@ -329,7 +329,7 @@ session(action="capture", event_type="session_snapshot", title="Pre-compaction s
 \`\`\`
 
 **After compaction (when context seems lost):**
-1. Call \`session_init(folder_path="...", is_post_compact=true)\` - this auto-restores the most recent snapshot
+1. Call \`init(folder_path="...", is_post_compact=true)\` - this auto-restores the most recent snapshot
 2. Or call \`session_restore_context()\` directly to get the saved state
 3. Review the \`restored_context\` to understand prior work
 4. Acknowledge to the user what was restored and continue
@@ -338,12 +338,12 @@ session(action="capture", event_type="session_snapshot", title="Pre-compaction s
 
 ### Index Status (Auto-Managed)
 
-**Indexing is automatic.** After \`session_init\`, the project is auto-indexed in the background.
+**Indexing is automatic.** After \`init\`, the project is auto-indexed in the background.
 
 **You do NOT need to manually check index_status before every search.** Just use \`search()\`.
 
 **If search returns 0 results and you expected matches:**
-1. Check if \`session_init\` returned \`indexing_status: "started"\` - indexing may still be in progress
+1. Check if \`init\` returned \`indexing_status: "started"\` - indexing may still be in progress
 2. Wait a moment and retry \`search()\`
 3. Only as a last resort: \`project(action="index_status")\` to check
 
@@ -353,7 +353,7 @@ session(action="capture", event_type="session_snapshot", title="Pre-compaction s
 
 ### Enhanced Context (Server-Side Warnings)
 
-\`context_smart\` now includes **intelligent server-side filtering** that proactively surfaces relevant warnings:
+\`context\` now includes **intelligent server-side filtering** that proactively surfaces relevant warnings:
 
 **Response fields:**
 - \`warnings\`: Array of warning strings (displayed with ⚠️ prefix)
@@ -542,7 +542,7 @@ const CONTEXTSTREAM_RULES_MINIMAL = `
 
 <contextstream_rules>
 1. **SIMPLE UTILITY?** (list/show/version) → Just execute, skip context calls
-2. **CODING TASK?** → session_init → context_smart → work → capture
+2. **CODING TASK?** → init → context → work → capture
 3. **SEARCH FIRST:** Before Glob/Grep/Read → \`search(mode="hybrid")\` FIRST
 </contextstream_rules>
 
@@ -559,8 +559,8 @@ Rules Version: ${RULES_VERSION}
 
 | Action | Tool Call |
 |--------|-----------|
-| **1st message** | \`session_init(folder_path="<cwd>", context_hint="<msg>")\` then \`context_smart(...)\` |
-| **2nd+ messages** | \`context_smart(user_message="<msg>", format="minified", max_tokens=400)\` |
+| **1st message** | \`init(folder_path="<cwd>", context_hint="<msg>")\` then \`context(...)\` |
+| **2nd+ messages** | \`context(user_message="<msg>", format="minified", max_tokens=400)\` |
 | **Code search** | \`search(mode="hybrid", query="...")\` — BEFORE any local tools |
 | **Save decisions** | \`session(action="capture", event_type="decision", ...)\` |
 
@@ -595,11 +595,11 @@ ContextStream search is **indexed** and returns semantic matches + context in ON
 
 | Command Type | Just Call | Skip |
 |--------------|-----------|------|
-| List workspaces | \`workspace(action="list")\` | session_init, context_smart, capture |
-| List projects | \`project(action="list")\` | session_init, context_smart, capture |
-| Show version | \`help(action="version")\` | session_init, context_smart, capture |
-| List reminders | \`reminder(action="list")\` | session_init, context_smart, capture |
-| Check auth | \`help(action="auth")\` | session_init, context_smart, capture |
+| List workspaces | \`workspace(action="list")\` | init, context, capture |
+| List projects | \`project(action="list")\` | init, context, capture |
+| Show version | \`help(action="version")\` | init, context, capture |
+| List reminders | \`reminder(action="list")\` | init, context, capture |
+| Check auth | \`help(action="auth")\` | init, context, capture |
 
 **Detect simple operations by these patterns:**
 - "list ...", "show ...", "what are my ...", "get ..."
@@ -607,8 +607,8 @@ ContextStream search is **indexed** and returns semantic matches + context in ON
 - User just wants data, not analysis or coding help
 
 **DO NOT add overhead for utility operations:**
-- ❌ Don't call session_init just to list workspaces
-- ❌ Don't call context_smart for simple queries
+- ❌ Don't call init just to list workspaces
+- ❌ Don't call context for simple queries
 - ❌ Don't capture "listed workspaces" as an event (that's noise)
 
 **Use full context ceremony ONLY for:**
@@ -618,28 +618,28 @@ ContextStream search is **indexed** and returns semantic matches + context in ON
 
 ### Lessons (Past Mistakes)
 
-- After \`session_init\`: Check for \`lessons\` field and apply before work
+- After \`init\`: Check for \`lessons\` field and apply before work
 - Before risky work: \`session(action="get_lessons", query="<topic>")\`
 - On mistakes: \`session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...")\`
 
 ### Context Pressure & Compaction
 
-- If \`context_smart\` returns high/critical \`context_pressure\`: call \`session(action="capture", ...)\` to save state
+- If \`context\` returns high/critical \`context_pressure\`: call \`session(action="capture", ...)\` to save state
 - PreCompact hooks automatically save snapshots before compaction (if installed)
 
 ### Enhanced Context (Warnings)
 
-\`context_smart\` returns server-side \`warnings\` for lessons, risky actions, and breaking changes.
+\`context\` returns server-side \`warnings\` for lessons, risky actions, and breaking changes.
 When warnings are present: **STOP**, acknowledge them, explain mitigation, then proceed.
 
 ### Automatic Context Restoration
 
-**Context restoration is now enabled by default.** Every \`session_init\` call automatically:
+**Context restoration is now enabled by default.** Every \`init\` call automatically:
 - Restores context from recent snapshots (if available)
 - Returns \`restored_context\` field with snapshot data
 - Sets \`is_post_compact=true\` in response when restoration occurs
 
-**No special handling needed after compaction** - just call \`session_init\` normally.
+**No special handling needed after compaction** - just call \`init\` normally.
 
 To disable automatic restoration:
 - Pass \`is_post_compact=false\` in the API call
@@ -661,7 +661,7 @@ When user asks for a plan, use ContextStream (not EnterPlanMode):
 
 If working in a parent folder containing multiple projects:
 \`\`\`
-session_init(folder_path="...", skip_project_creation=true)
+init(folder_path="...", skip_project_creation=true)
 \`\`\`
 
 This enables workspace-level memory and context without project-specific indexing.

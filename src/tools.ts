@@ -46,9 +46,11 @@ const LOG_VERBOSE = LOG_LEVEL === "verbose";
 
 // Display-friendly tool names (removes underscores, shortens names)
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
-  session_init: "init",
+  init: "init", // Renamed from session_init
+  session_init: "init", // Backward compatibility alias
   session: "session",
-  context_smart: "context",
+  context: "context", // Renamed from context_smart
+  context_smart: "context", // Backward compatibility alias
   search: "search",
   memory: "memory",
   graph: "graph",
@@ -1711,7 +1713,7 @@ const operationsRegistry = new Map<string, OperationConfig>();
 
 // Category mapping for operations
 function inferOperationCategory(name: string): string {
-  if (name.startsWith("session_") || name.startsWith("context_")) return "Session";
+  if (name === "init" || name === "context" || name.startsWith("session_") || name.startsWith("context_")) return "Session";
   if (name.startsWith("memory_")) return "Memory";
   if (name.startsWith("search_")) return "Search";
   if (name.startsWith("graph_")) return "Graph";
@@ -1857,8 +1859,8 @@ const CONSOLIDATED_MODE = process.env.CONTEXTSTREAM_CONSOLIDATED !== "false";
 
 // Consolidated tools list - these are the only tools registered in consolidated mode
 const CONSOLIDATED_TOOLS = new Set<string>([
-  "session_init", // Standalone - complex initialization
-  "context_smart", // Standalone - called every message
+  "init", // Standalone - complex initialization (renamed from session_init)
+  "context", // Standalone - called every message (renamed from context_smart)
   "generate_rules", // Standalone - rule generation helper
   "search", // Consolidates search_semantic, search_hybrid, search_keyword, search_pattern
   "session", // Consolidates session_capture, session_recall, etc.
@@ -2642,8 +2644,8 @@ export function registerTools(
       const authOverride = resolveAuthOverride(extra);
 
       return runWithAuthOverride(authOverride, async () => {
-        // Skip auto-init for session_init itself
-        const skipAutoInit = toolName === "session_init";
+        // Skip auto-init for init (formerly session_init) itself
+        const skipAutoInit = toolName === "init" || toolName === "session_init";
 
         let contextPrefix = "";
 
@@ -4789,7 +4791,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
   // ============================================
 
   registerTool(
-    "session_init",
+    "init",
     {
       title: "Initialize conversation session",
       description: `Initialize a new conversation session and automatically retrieve relevant context.
@@ -4802,9 +4804,9 @@ The ingest_recommendation field indicates if the project needs indexing for code
 - If user agrees, run: project(action="ingest_local", path="<project_path>")
 
 IMPORTANT: Pass the user's FIRST MESSAGE as context_hint to get semantically relevant context!
-Example: session_init(folder_path="/path/to/project", context_hint="how do I implement auth?")
+Example: init(folder_path="/path/to/project", context_hint="how do I implement auth?")
 
-This does semantic search on the first message. You only need context_smart on subsequent messages.`,
+This does semantic search on the first message. You only need context on subsequent messages.`,
       inputSchema: z.object({
         folder_path: z
           .string()
@@ -6959,7 +6961,7 @@ Use case: AI can track what's new since last session_init.`,
   );
 
   registerTool(
-    "context_smart",
+    "context",
     {
       title: "Get smart context for user query",
       description: `**CALL THIS BEFORE EVERY AI RESPONSE** to get relevant context.
@@ -6981,7 +6983,7 @@ Context Pack:
 
 Example usage:
 1. User asks "how should I implement auth?"
-2. AI calls context_smart(user_message="how should I implement auth?")
+2. AI calls context(user_message="how should I implement auth?")
 3. Gets: "W:Maker|P:contextstream|D:Use JWT for auth|D:No session cookies|M:Auth API at /auth/..."
 4. AI responds with relevant context already loaded
 

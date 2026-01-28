@@ -349,6 +349,73 @@ export class ContextStreamClient {
     }
   }
 
+  /**
+   * Check if the user has a team subscription plan.
+   * Team plans include: team, enterprise, business.
+   * This is used to gate team-specific MCP tool actions.
+   */
+  async isTeamPlan(): Promise<boolean> {
+    try {
+      const planName = await this.getPlanName();
+      if (!planName) return false;
+      return (
+        planName.includes("team") ||
+        planName.includes("enterprise") ||
+        planName.includes("business")
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Get team overview (seats, members, settings).
+   * Only available for team plan users.
+   */
+  async getTeamOverview(): Promise<any> {
+    const result = await request(this.config, "/team/overview", { method: "GET" });
+    return unwrapApiResponse(result);
+  }
+
+  /**
+   * List team members.
+   * Only available for team plan users.
+   */
+  async listTeamMembers(params?: { page?: number; page_size?: number }): Promise<any> {
+    const query = new URLSearchParams();
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.page_size) query.set("page_size", String(params.page_size));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const result = await request(this.config, `/team/members${suffix}`, { method: "GET" });
+    return unwrapApiResponse(result);
+  }
+
+  /**
+   * List all workspaces across the team.
+   * Only available for team plan users.
+   */
+  async listTeamWorkspaces(params?: { page?: number; page_size?: number }): Promise<any> {
+    const query = new URLSearchParams();
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.page_size) query.set("page_size", String(params.page_size));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const result = await request(this.config, `/team/workspaces${suffix}`, { method: "GET" });
+    return unwrapApiResponse(result);
+  }
+
+  /**
+   * List all projects across the team.
+   * Only available for team plan users.
+   */
+  async listTeamProjects(params?: { page?: number; page_size?: number }): Promise<any> {
+    const query = new URLSearchParams();
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.page_size) query.set("page_size", String(params.page_size));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const result = await request(this.config, `/team/projects${suffix}`, { method: "GET" });
+    return unwrapApiResponse(result);
+  }
+
   // Workspaces & Projects
   listWorkspaces(params?: { page?: number; page_size?: number }) {
     const query = new URLSearchParams();

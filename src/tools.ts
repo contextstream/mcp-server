@@ -2330,6 +2330,51 @@ export function registerTools(
   }
 
   // ============================================
+  // TEAM STATUS TRACKING (for team tool filtering)
+  // ============================================
+
+  // Track team plan status - updated when session_init is called
+  let teamStatus: {
+    checked: boolean;
+    isTeamPlan: boolean;
+  } = { checked: false, isTeamPlan: false };
+
+  /**
+   * Check if user has a team plan. Caches result to avoid repeated API calls.
+   */
+  async function checkTeamStatus(): Promise<boolean> {
+    if (teamStatus.checked) {
+      return teamStatus.isTeamPlan;
+    }
+
+    try {
+      const isTeam = await client.isTeamPlan();
+      teamStatus = { checked: true, isTeamPlan: isTeam };
+      logDebug(`Team plan status: ${isTeam}`);
+      return isTeam;
+    } catch (error) {
+      logDebug(`Failed to check team status: ${error}`);
+      teamStatus = { checked: true, isTeamPlan: false };
+      return false;
+    }
+  }
+
+  /**
+   * Update team status (called from session_init).
+   */
+  function updateTeamStatus(isTeam: boolean) {
+    teamStatus = { checked: true, isTeamPlan: isTeam };
+  }
+
+  /**
+   * Get whether team tools should be visible in descriptions.
+   * Returns cached value if available, otherwise assumes false (hide team tools).
+   */
+  function isTeamPlanCached(): boolean {
+    return teamStatus.checked ? teamStatus.isTeamPlan : false;
+  }
+
+  // ============================================
   // INTEGRATION STATUS TRACKING (Strategy 2)
   // ============================================
 
@@ -2509,14 +2554,14 @@ export function registerTools(
     }
 
     // Gate cross-integration tools (require at least one integration)
-    if (requiresCrossIntegration && !status.slack && !status.github) {
+    if (requiresCrossIntegration && !status.slack && !status.github && !status.notion) {
       return errorResult(
         [
-          `Integration not connected: \`${toolName}\` requires at least one integration (Slack or GitHub).`,
+          `Integration not connected: \`${toolName}\` requires at least one integration (Slack, GitHub, or Notion).`,
           "",
           "To use cross-integration tools:",
           "1. Go to https://contextstream.io/settings/integrations",
-          "2. Connect Slack and/or GitHub",
+          "2. Connect Slack, GitHub, or Notion",
           "3. Try this command again",
         ].join("\n")
       );
@@ -5069,6 +5114,11 @@ This does semantic search on the first message. You only need context on subsequ
           logDebug(`Failed to check integration status: ${error}`);
         }
       }
+
+      // Check team plan status and update tracking
+      const isTeamPlan = await checkTeamStatus();
+      updateTeamStatus(isTeamPlan);
+      (result as any).is_team_plan = isTeamPlan;
 
       // Add mode/status block for AI visibility (v0.4.x)
       (result as any).modes = {
@@ -8494,12 +8544,12 @@ Use this to remove a reminder that is no longer relevant.`,
       "search",
       {
         title: "Search",
-        description: `Search workspace memory and knowledge. Modes: semantic (meaning-based), hybrid (semantic + keyword), keyword (exact match), pattern (regex), exhaustive (all matches like grep), refactor (word-boundary matching for symbol renaming).
+        description: `Search workspace memory and knowledge. Modes: semantic (meaning-based), hybrid (semantic + keyword), keyword (exact match), pattern (regex), exhaustive (all matches like grep), refactor (word-boundary matching for symbol renaming), team (cross-project team search - team plans only).
 
 Output formats: full (default, includes content), paths (file paths only - 80% token savings), minimal (compact - 60% savings), count (match counts only - 90% savings).`,
         inputSchema: z.object({
           mode: z
-            .enum(["semantic", "hybrid", "keyword", "pattern", "exhaustive", "refactor"])
+            .enum(["semantic", "hybrid", "keyword", "pattern", "exhaustive", "refactor", "team"])
             .describe("Search mode"),
           query: z.string().describe("Search query"),
           workspace_id: z.string().uuid().optional(),
@@ -8564,6 +8614,61 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             result = await client.searchRefactor(params);
             toolType = "search_refactor";
             break;
+          case "team": {
+            // Check if user has a team plan
+            const isTeamPlanForSearch = await client.isTeamPlan();
+            if (!isTeamPlanForSearch) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team search requires a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            // Search across all team workspaces
+            const teamWorkspacesForSearch = await client.listTeamWorkspaces({ page_size: 100 });
+            const workspacesForSearch = teamWorkspacesForSearch?.items || teamWorkspacesForSearch?.data?.items || [];
+
+            const allSearchResults: any[] = [];
+            const perWorkspaceLimit = input.limit ? Math.ceil(input.limit / Math.min(workspacesForSearch.length, 10)) : 5;
+
+            for (const ws of workspacesForSearch.slice(0, 10)) { // Limit to first 10 workspaces
+              try {
+                const wsSearchResult = await client.searchHybrid({
+                  ...params,
+                  workspace_id: ws.id,
+                  limit: perWorkspaceLimit,
+                });
+                const wsResults = wsSearchResult?.data?.results || wsSearchResult?.results || [];
+                allSearchResults.push(
+                  ...wsResults.map((r: any) => ({
+                    ...r,
+                    workspace_name: ws.name,
+                    workspace_id: ws.id,
+                  }))
+                );
+              } catch {
+                // Skip workspaces we can't access
+              }
+            }
+
+            // Sort by score descending
+            allSearchResults.sort((a, b) => (b.score || 0) - (a.score || 0));
+            const limitedResults = allSearchResults.slice(0, input.limit || 20);
+
+            result = {
+              data: {
+                results: limitedResults,
+                total: limitedResults.length,
+                workspaces_searched: workspacesForSearch.length,
+              },
+            };
+            toolType = "search_hybrid";
+            break;
+          }
           default:
             toolType = "search_hybrid";
         }
@@ -8627,7 +8732,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "session",
       {
         title: "Session",
-        description: `Session management operations. Actions: capture (save decision/insight), capture_lesson (save lesson from mistake), get_lessons (retrieve lessons), recall (natural language recall), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (context-enriched search), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan (save implementation plan), get_plan (retrieve plan with tasks), update_plan (modify plan), list_plans (list all plans).`,
+        description: `Session management operations. Actions: capture (save decision/insight), capture_lesson (save lesson from mistake), get_lessons (retrieve lessons), recall (natural language recall), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (context-enriched search), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan (save implementation plan), get_plan (retrieve plan with tasks), update_plan (modify plan), list_plans (list all plans). Team actions (team plans only): team_decisions (team-wide decisions), team_lessons (team-wide lessons).`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -8649,6 +8754,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "list_plans",
               // Context restore
               "restore_context",
+              // Team actions (team plans only)
+              "team_decisions",
+              "team_lessons",
             ])
             .describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
@@ -9272,6 +9380,115 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             return {
               content: [{ type: "text" as const, text: formatContent(response) }],
               
+            };
+          }
+
+          // Team actions (team plans only)
+          case "team_decisions": {
+            // Check if user has a team plan
+            const isTeamPlan = await client.isTeamPlan();
+            if (!isTeamPlan) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team features require a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            // Get team-wide decisions (across all team workspaces)
+            // For now, we aggregate decisions from team workspaces
+            const teamWorkspaces = await client.listTeamWorkspaces({ page_size: 100 });
+            const workspaces = teamWorkspaces?.items || teamWorkspaces?.data?.items || [];
+
+            const allDecisions: any[] = [];
+            for (const ws of workspaces.slice(0, 10)) { // Limit to first 10 workspaces
+              try {
+                const decisions = await client.memoryDecisions({
+                  workspace_id: ws.id,
+                  category: input.category,
+                  limit: input.limit ? Math.ceil(input.limit / workspaces.length) : 5,
+                });
+                const items = decisions?.data?.events || decisions?.events || [];
+                allDecisions.push(...items.map((d: any) => ({ ...d, workspace_name: ws.name })));
+              } catch {
+                // Skip workspaces we can't access
+              }
+            }
+
+            // Sort by created_at descending and limit
+            allDecisions.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+            const limitedDecisions = allDecisions.slice(0, input.limit || 20);
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatContent({
+                    team_decisions: limitedDecisions,
+                    total: limitedDecisions.length,
+                    workspaces_searched: workspaces.length,
+                  }),
+                },
+              ],
+            };
+          }
+
+          case "team_lessons": {
+            // Check if user has a team plan
+            const isTeamForLessons = await client.isTeamPlan();
+            if (!isTeamForLessons) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team features require a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            // Get team-wide lessons (across all team workspaces)
+            const teamWorkspacesForLessons = await client.listTeamWorkspaces({ page_size: 100 });
+            const workspacesForLessons = teamWorkspacesForLessons?.items || teamWorkspacesForLessons?.data?.items || [];
+
+            const allLessons: any[] = [];
+            for (const ws of workspacesForLessons.slice(0, 10)) { // Limit to first 10 workspaces
+              try {
+                const lessons = await client.getHighPriorityLessons({
+                  workspace_id: ws.id,
+                  context_hint: input.query,
+                  limit: input.limit ? Math.ceil(input.limit / workspacesForLessons.length) : 5,
+                });
+                const items = lessons?.data?.lessons || lessons?.lessons || [];
+                allLessons.push(...items.map((l: any) => ({ ...l, workspace_name: ws.name })));
+              } catch {
+                // Skip workspaces we can't access
+              }
+            }
+
+            // Sort by severity (critical > high > medium > low) then by created_at
+            const severityOrder: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+            allLessons.sort((a, b) => {
+              const sevDiff = (severityOrder[b.severity] || 0) - (severityOrder[a.severity] || 0);
+              if (sevDiff !== 0) return sevDiff;
+              return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+            });
+            const limitedLessons = allLessons.slice(0, input.limit || 20);
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatContent({
+                    team_lessons: limitedLessons,
+                    total: limitedLessons.length,
+                    workspaces_searched: workspacesForLessons.length,
+                  }),
+                },
+              ],
             };
           }
 
@@ -10061,7 +10278,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "project",
       {
         title: "Project",
-        description: `Project management. Actions: list, get, create, update, index (trigger indexing), overview, statistics, files, index_status, ingest_local (index local folder).`,
+        description: `Project management. Actions: list, get, create, update, index (trigger indexing), overview, statistics, files, index_status, ingest_local (index local folder), team_projects (list all team projects - team plans only).`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -10075,6 +10292,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "files",
               "index_status",
               "ingest_local",
+              "team_projects",
             ])
             .describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
@@ -10237,7 +10455,32 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   text: `Ingestion started in background for directory: ${validPath.resolvedPath}. Use 'project' with action 'index_status' to monitor progress.`,
                 },
               ],
-              
+
+            };
+          }
+
+          case "team_projects": {
+            // Check if user has a team plan
+            const isTeamPlanForProj = await client.isTeamPlan();
+            if (!isTeamPlanForProj) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team features require a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            // List all projects across the team
+            const teamProjectsResult = await client.listTeamProjects({
+              page: input.page,
+              page_size: input.page_size,
+            });
+
+            return {
+              content: [{ type: "text" as const, text: formatContent(teamProjectsResult) }],
             };
           }
 
@@ -10254,9 +10497,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "workspace",
       {
         title: "Workspace",
-        description: `Workspace management. Actions: list, get, associate (link folder to workspace), bootstrap (create workspace and initialize).`,
+        description: `Workspace management. Actions: list, get, associate (link folder to workspace), bootstrap (create workspace and initialize), team_members (list members with access - team plans only).`,
         inputSchema: z.object({
-          action: z.enum(["list", "get", "associate", "bootstrap"]).describe("Action to perform"),
+          action: z.enum(["list", "get", "associate", "bootstrap", "team_members"]).describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
           // Associate/bootstrap params
           folder_path: z.string().optional(),
@@ -10338,7 +10581,55 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             }
             return {
               content: [{ type: "text" as const, text: formatContent(wsResult) }],
-              
+
+            };
+          }
+
+          case "team_members": {
+            // Check if user has a team plan
+            const isTeamPlanForWs = await client.isTeamPlan();
+            if (!isTeamPlanForWs) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team features require a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            // List team members with access to this workspace (or all team members if no workspace specified)
+            const teamMembers = await client.listTeamMembers({
+              page: input.page,
+              page_size: input.page_size,
+            });
+
+            // If workspace_id is provided, filter to members with access to this workspace
+            if (input.workspace_id) {
+              // Get workspaces for the team to find members with access
+              const teamWorkspaces = await client.listTeamWorkspaces({ page_size: 100 });
+              const workspaces = teamWorkspaces?.items || teamWorkspaces?.data?.items || [];
+              const targetWorkspace = workspaces.find((ws: any) => ws.id === input.workspace_id);
+
+              if (targetWorkspace) {
+                return {
+                  content: [
+                    {
+                      type: "text" as const,
+                      text: formatContent({
+                        workspace: { id: targetWorkspace.id, name: targetWorkspace.name },
+                        members: teamMembers?.items || teamMembers?.data?.items || [],
+                        hint: "All team members have access to team workspaces by default. Use team admin to manage specific access.",
+                      }),
+                    },
+                  ],
+                };
+              }
+            }
+
+            return {
+              content: [{ type: "text" as const, text: formatContent(teamMembers) }],
             };
           }
 
@@ -10483,7 +10774,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "integration",
       {
         title: "Integration",
-        description: `Integration operations for Slack, GitHub, and Notion. Provider: slack, github, notion, all. Actions: status, search, stats, activity, contributors, knowledge, summary, channels (slack), discussions (slack), repos (github), issues (github), create_page (notion), create_database (notion), list_databases (notion), search_pages (notion with smart type detection - filter by event_type, status, priority, has_due_date, tags), get_page (notion), query_database (notion), update_page (notion).`,
+        description: `Integration operations for Slack, GitHub, and Notion. Provider: slack, github, notion, all. Actions: status, search, stats, activity, contributors, knowledge, summary, channels (slack), discussions (slack), repos (github), issues (github), create_page (notion), create_database (notion), list_databases (notion), search_pages (notion with smart type detection - filter by event_type, status, priority, has_due_date, tags), get_page (notion), query_database (notion), update_page (notion), team_activity (aggregated team activity - team plans only).`,
         inputSchema: z.object({
           provider: z.enum(["slack", "github", "notion", "all"]).describe("Integration provider"),
           action: z
@@ -10508,6 +10799,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "get_page",
               "query_database",
               "update_page",
+              // Team actions (team plans only)
+              "team_activity",
             ])
             .describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
@@ -10985,7 +11278,170 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   text: `Page updated successfully!\n\nTitle: ${updatedPage.title}\nURL: ${updatedPage.url}\nID: ${updatedPage.id}\nLast edited: ${updatedPage.last_edited_time}`,
                 },
               ],
-              
+
+            };
+          }
+
+          // Team actions (team plans only)
+          case "team_activity": {
+            // Check if user has a team plan
+            const isTeamPlanForActivity = await client.isTeamPlan();
+            if (!isTeamPlanForActivity) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team features require a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            // Aggregate activity across all team workspaces
+            const teamWorkspacesForActivity = await client.listTeamWorkspaces({ page_size: 100 });
+            const workspacesForActivity = teamWorkspacesForActivity?.items || teamWorkspacesForActivity?.data?.items || [];
+
+            const allActivity: any[] = [];
+            const days = input.days || 7;
+            const integrationsSummary = { notion: 0, slack: 0, github: 0, memory: 0 };
+
+            for (const ws of workspacesForActivity.slice(0, 10)) { // Limit to first 10 workspaces
+              const perSourceLimit = input.limit ? Math.ceil(input.limit / (workspacesForActivity.length * 4)) : 5;
+
+              // Get memory events (decisions, insights, etc.)
+              try {
+                const events = await client.listMemoryEvents({
+                  workspace_id: ws.id,
+                  limit: perSourceLimit,
+                });
+                const items = events?.data?.events || events?.events || events?.data?.items || events?.items || [];
+                const mappedItems = items.map((e: any) => ({
+                  source: "memory",
+                  type: e.event_type || "memory_event",
+                  workspace_name: ws.name,
+                  workspace_id: ws.id,
+                  title: e.title,
+                  content_preview: e.content?.slice(0, 200),
+                  created_at: e.created_at || e.occurred_at,
+                  ...e,
+                }));
+                allActivity.push(...mappedItems);
+                integrationsSummary.memory += mappedItems.length;
+              } catch {
+                // Skip on error
+              }
+
+              // Get Notion activity
+              try {
+                const notionActivity = await client.notionActivity({
+                  workspace_id: ws.id,
+                  days,
+                  limit: perSourceLimit,
+                });
+                const notionItems = notionActivity?.data || notionActivity || [];
+                if (Array.isArray(notionItems)) {
+                  const mappedItems = notionItems.map((n: any) => ({
+                    source: "notion",
+                    type: "notion_page",
+                    workspace_name: ws.name,
+                    workspace_id: ws.id,
+                    title: n.title,
+                    content_preview: n.content_preview?.slice(0, 200),
+                    url: n.url,
+                    created_at: n.occurred_at || n.created_at,
+                    database_name: n.database_name,
+                  }));
+                  allActivity.push(...mappedItems);
+                  integrationsSummary.notion += mappedItems.length;
+                }
+              } catch {
+                // Notion not connected or error - skip
+              }
+
+              // Get Slack activity
+              try {
+                const slackActivity = await client.slackActivity({
+                  workspace_id: ws.id,
+                  days,
+                  limit: perSourceLimit,
+                });
+                const slackItems = slackActivity?.data || slackActivity || [];
+                if (Array.isArray(slackItems)) {
+                  const mappedItems = slackItems.map((s: any) => ({
+                    source: "slack",
+                    type: "slack_message",
+                    workspace_name: ws.name,
+                    workspace_id: ws.id,
+                    title: s.channel_name || s.title,
+                    content_preview: s.content_preview?.slice(0, 200) || s.text?.slice(0, 200),
+                    url: s.permalink || s.url,
+                    created_at: s.occurred_at || s.ts || s.created_at,
+                    channel: s.channel_name,
+                  }));
+                  allActivity.push(...mappedItems);
+                  integrationsSummary.slack += mappedItems.length;
+                }
+              } catch {
+                // Slack not connected or error - skip
+              }
+
+              // Get GitHub activity
+              try {
+                const githubActivity = await client.githubActivity({
+                  workspace_id: ws.id,
+                  days,
+                  limit: perSourceLimit,
+                });
+                const githubItems = githubActivity?.data || githubActivity || [];
+                if (Array.isArray(githubItems)) {
+                  const mappedItems = githubItems.map((g: any) => ({
+                    source: "github",
+                    type: g.type || "github_event",
+                    workspace_name: ws.name,
+                    workspace_id: ws.id,
+                    title: g.title || g.repo,
+                    content_preview: g.content_preview?.slice(0, 200) || g.body?.slice(0, 200),
+                    url: g.url || g.html_url,
+                    created_at: g.occurred_at || g.created_at,
+                    repo: g.repo,
+                  }));
+                  allActivity.push(...mappedItems);
+                  integrationsSummary.github += mappedItems.length;
+                }
+              } catch {
+                // GitHub not connected or error - skip
+              }
+            }
+
+            // Sort by created_at descending
+            allActivity.sort((a, b) => {
+              const dateA = new Date(a.created_at || 0).getTime();
+              const dateB = new Date(b.created_at || 0).getTime();
+              return dateB - dateA;
+            });
+
+            // Filter to items within the date range
+            const cutoffDate = new Date();
+            cutoffDate.setDate(cutoffDate.getDate() - days);
+            const recentActivity = allActivity.filter(
+              (a) => new Date(a.created_at || 0) >= cutoffDate
+            );
+
+            const limitedActivity = recentActivity.slice(0, input.limit || 50);
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatContent({
+                    team_activity: limitedActivity,
+                    total: limitedActivity.length,
+                    days,
+                    workspaces_searched: workspacesForActivity.length,
+                    sources: integrationsSummary,
+                  }),
+                },
+              ],
             };
           }
 
@@ -11469,10 +11925,10 @@ Example workflow:
       "help",
       {
         title: "Help",
-        description: `Utility and help. Actions: tools (list available tools), auth (current user), version (server version), editor_rules (generate AI editor rules and install hooks for real-time file indexing), enable_bundle (enable tool bundle in progressive mode).`,
+        description: `Utility and help. Actions: tools (list available tools), auth (current user), version (server version), editor_rules (generate AI editor rules and install hooks for real-time file indexing), enable_bundle (enable tool bundle in progressive mode), team_status (team subscription info - team plans only).`,
         inputSchema: z.object({
           action: z
-            .enum(["tools", "auth", "version", "editor_rules", "enable_bundle"])
+            .enum(["tools", "auth", "version", "editor_rules", "enable_bundle", "team_status"])
             .describe("Action to perform"),
           // For tools
           format: z.enum(["grouped", "minimal", "full"]).optional(),
@@ -11639,6 +12095,27 @@ Example workflow:
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
               
+            };
+          }
+
+          case "team_status": {
+            // Check if user has a team plan
+            const isTeam = await client.isTeamPlan();
+            if (!isTeam) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team features require a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            // Get team overview for team plan users
+            const teamOverview = await client.getTeamOverview();
+            return {
+              content: [{ type: "text" as const, text: formatContent(teamOverview) }],
             };
           }
 

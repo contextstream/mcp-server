@@ -21,13 +21,13 @@
 
 ---
 
-<h3 align="center">
+<div align="center">
 
 ```bash
 npx @contextstream/mcp-server@latest setup
 ```
 
-</h3>
+</div>
 
 <p align="center">
   <img src="compare1.gif" alt="ContextStream in action" width="700" />
@@ -164,8 +164,6 @@ claude mcp update contextstream -e CONTEXTSTREAM_API_KEY=your_key
 **Website:** https://contextstream.io
 
 **Docs:** https://contextstream.io/docs
-
-**Get API Key:** https://contextstream.io/settings/api
 
 ---
 

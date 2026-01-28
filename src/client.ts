@@ -192,6 +192,8 @@ export class ContextStreamClient {
   private sessionRootPath?: string;
   private lastRefreshCheckTime?: number;
   private indexRefreshInProgress = false;
+  private lastIndexCheckTime?: number;
+  private lastIndexedTime?: Date;
 
   constructor(private config: Config) { }
 
@@ -1305,6 +1307,100 @@ export class ContextStreamClient {
         ...(options?.overwrite !== undefined && { overwrite: options.overwrite }),
       },
     });
+  }
+
+  /**
+   * Check for changed files since last index and queue them for indexing.
+   * This is used as a fallback for editors that don't support PostToolUse hooks.
+   *
+   * Throttled to run at most every 10 seconds and caps at 20 files per check.
+   * Runs in fire-and-forget mode to avoid blocking tool responses.
+   *
+   * Call this from tool handlers like contextSmart() and search() to enable
+   * real-time indexing for editors without hook support (Aider, Codex CLI).
+   */
+  public async checkAndIndexChangedFiles(): Promise<void> {
+    // Skip if no session context
+    if (!this.sessionProjectId || !this.sessionRootPath) {
+      return;
+    }
+
+    // Throttle: check at most every 10 seconds
+    const now = Date.now();
+    if (this.lastIndexCheckTime && now - this.lastIndexCheckTime < 10_000) {
+      return;
+    }
+    this.lastIndexCheckTime = now;
+
+    // Get last indexed time if we don't have it cached
+    if (!this.lastIndexedTime) {
+      try {
+        const status = (await this.projectIndexStatus(this.sessionProjectId)) as {
+          data?: { last_updated?: string };
+          last_updated?: string;
+        };
+        const lastUpdated = status.data?.last_updated || status.last_updated;
+        if (lastUpdated) {
+          this.lastIndexedTime = new Date(lastUpdated);
+        } else {
+          // If no last_updated, use session start time as fallback
+          this.lastIndexedTime = this.sessionStartTime
+            ? new Date(this.sessionStartTime)
+            : new Date(Date.now() - 60_000); // 1 minute ago as fallback
+        }
+      } catch {
+        // Use session start time if status check fails
+        this.lastIndexedTime = this.sessionStartTime
+          ? new Date(this.sessionStartTime)
+          : new Date(Date.now() - 60_000);
+      }
+    }
+
+    // Find changed files (fire and forget)
+    this.indexChangedFilesAsync().catch(() => {
+      // Silently ignore errors - this is best-effort
+    });
+  }
+
+  /**
+   * Internal async method to find and index changed files.
+   * Called by checkAndIndexChangedFiles in fire-and-forget mode.
+   */
+  private async indexChangedFilesAsync(): Promise<void> {
+    if (!this.sessionProjectId || !this.sessionRootPath || !this.lastIndexedTime) {
+      return;
+    }
+
+    const MAX_FILES = 20;
+    const filesToIndex: Array<{ path: string; content: string; language?: string }> = [];
+
+    try {
+      // Use readChangedFilesInBatches to find modified files
+      for await (const batch of readChangedFilesInBatches(
+        this.sessionRootPath,
+        this.lastIndexedTime,
+        { maxFilesPerBatch: MAX_FILES, batchSize: MAX_FILES }
+      )) {
+        for (const file of batch) {
+          if (filesToIndex.length >= MAX_FILES) break;
+          filesToIndex.push(file);
+        }
+        // Only process first batch to stay under cap
+        break;
+      }
+
+      if (filesToIndex.length === 0) {
+        return;
+      }
+
+      // Index the files
+      await this.ingestFiles(this.sessionProjectId, filesToIndex);
+
+      // Update last indexed time to now
+      this.lastIndexedTime = new Date();
+    } catch {
+      // Silently ignore errors - this is best-effort background indexing
+    }
   }
 
   // Workspace extended operations (with caching)

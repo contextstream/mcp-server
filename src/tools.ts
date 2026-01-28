@@ -6327,6 +6327,9 @@ Example: "What were the auth decisions?" or "What are my TypeScript preferences?
       }),
     },
     async (input) => {
+      // Check and index changed files (fire and forget) - fallback for editors without hooks
+      client.checkAndIndexChangedFiles().catch(() => {});
+
       // Get workspace_id from session context if not provided
       let workspaceId = input.workspace_id;
       let projectId = input.project_id;
@@ -7012,6 +7015,9 @@ This saves ~80% tokens compared to including full chat history.`,
     },
     async (input) => {
       const startTime = Date.now();
+
+      // Check and index changed files (fire and forget) - fallback for editors without hooks
+      client.checkAndIndexChangedFiles().catch(() => {});
 
       // Mark that context_smart has been called in this session
       if (sessionManager) {
@@ -8443,6 +8449,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         }),
       },
       async (input) => {
+        // Check and index changed files (fire and forget) - fallback for editors without hooks
+        client.checkAndIndexChangedFiles().catch(() => {});
+
         const params = normalizeSearchParams(input);
         const startTime = Date.now();
 
@@ -11343,7 +11352,7 @@ Example workflow:
       "help",
       {
         title: "Help",
-        description: `Utility and help. Actions: tools (list available tools), auth (current user), version (server version), editor_rules (generate AI editor rules), enable_bundle (enable tool bundle in progressive mode).`,
+        description: `Utility and help. Actions: tools (list available tools), auth (current user), version (server version), editor_rules (generate AI editor rules and install hooks for real-time file indexing), enable_bundle (enable tool bundle in progressive mode).`,
         inputSchema: z.object({
           action: z
             .enum(["tools", "auth", "version", "editor_rules", "enable_bundle"])
@@ -11360,6 +11369,18 @@ Example workflow:
           workspace_name: z.string().optional(),
           project_name: z.string().optional(),
           additional_rules: z.string().optional(),
+          install_hooks: z
+            .boolean()
+            .optional()
+            .describe("Install Claude Code hooks (PreToolUse, UserPromptSubmit, PostToolUse). Default: true for Claude users."),
+          include_pre_compact: z
+            .boolean()
+            .optional()
+            .describe("Include PreCompact hook for auto-saving state before compaction. Default: false."),
+          include_post_write: z
+            .boolean()
+            .optional()
+            .describe("Include PostToolUse hook for real-time file indexing after Edit/Write operations. Default: true."),
           // For enable_bundle
           bundle: z
             .enum([
@@ -11416,13 +11437,42 @@ Example workflow:
 
           case "editor_rules": {
             // Generate rule files content for all supported editors
-            const result = generateAllRuleFiles({
+            const rulesResult = generateAllRuleFiles({
               workspaceId: input.workspace_id,
               workspaceName: input.workspace_name,
               projectName: input.project_name,
               additionalRules: input.additional_rules,
               mode: input.mode as "minimal" | "full" | undefined,
             });
+
+            // Install hooks if requested (default: true for Claude Code users)
+            let hooksResult: { scripts: string[]; settings: string[] } | undefined;
+            if (input.install_hooks !== false) {
+              try {
+                hooksResult = await installClaudeCodeHooks({
+                  scope: input.folder_path ? "both" : "user",
+                  projectPath: input.folder_path,
+                  dryRun: input.dry_run,
+                  includePreCompact: input.include_pre_compact,
+                  includePostWrite: input.include_post_write,
+                });
+              } catch (err) {
+                // Log but don't fail if hook installation fails
+                const errMsg = err instanceof Error ? err.message : String(err);
+                (rulesResult as any).hooks_error = errMsg;
+              }
+            }
+
+            const result = {
+              ...rulesResult,
+              hooks_installed: hooksResult ? true : false,
+              hooks_scripts: hooksResult?.scripts,
+              hooks_settings: hooksResult?.settings,
+              real_time_indexing: input.include_post_write !== false
+                ? "Enabled - files will be indexed immediately after Edit/Write operations"
+                : "Disabled",
+            };
+
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
               structuredContent: toStructured(result),

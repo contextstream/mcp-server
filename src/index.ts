@@ -66,10 +66,12 @@ Usage:
   contextstream-mcp
   contextstream-mcp setup
   contextstream-mcp http
+  contextstream-mcp hook <hook-name>
 
 Commands:
-  setup   Interactive onboarding wizard (rules + workspace mapping)
-  http    Run HTTP MCP gateway (streamable HTTP transport)
+  setup              Interactive onboarding wizard (rules + workspace mapping)
+  http               Run HTTP MCP gateway (streamable HTTP transport)
+  hook post-write    PostToolUse hook for real-time file indexing
 
 Environment variables:
   CONTEXTSTREAM_API_URL   Base API URL (e.g. https://api.contextstream.io)
@@ -162,6 +164,20 @@ async function main() {
     }
     await runHttpGateway();
     return;
+  }
+
+  // Hook command: runs editor hooks for real-time indexing
+  if (args[0] === "hook") {
+    const hookName = args[1];
+    if (hookName === "post-write") {
+      // Dynamically import to avoid loading hook code in normal MCP mode
+      const { runPostWriteHook } = await import("./hooks/post-write.js");
+      await runPostWriteHook();
+      return;
+    }
+    console.error(`Unknown hook: ${hookName}`);
+    console.error("Available hooks: post-write");
+    process.exit(1);
   }
 
   // Try to load saved credentials if env vars not set

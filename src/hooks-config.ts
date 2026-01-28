@@ -547,6 +547,7 @@ export function getHooksDir(): string {
 export function buildHooksConfig(options?: {
   includePreCompact?: boolean;
   includeMediaAware?: boolean;
+  includePostWrite?: boolean;
 }): ClaudeHooksConfig["hooks"] {
   const hooksDir = getHooksDir();
   const preToolUsePath = path.join(hooksDir, "contextstream-redirect.py");
@@ -608,6 +609,23 @@ export function buildHooksConfig(options?: {
           {
             type: "command",
             command: `python3 "${preCompactPath}"`,
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+  }
+
+  // Add PostToolUse hook for real-time file indexing (default ON)
+  // This indexes files immediately after Edit/Write/NotebookEdit operations
+  if (options?.includePostWrite !== false) {
+    config.PostToolUse = [
+      {
+        matcher: "Edit|Write|NotebookEdit",
+        hooks: [
+          {
+            type: "command",
+            command: "npx @contextstream/mcp-server hook post-write",
             timeout: 10,
           },
         ],
@@ -725,6 +743,7 @@ export async function installClaudeCodeHooks(options: {
   dryRun?: boolean;
   includePreCompact?: boolean;
   includeMediaAware?: boolean;
+  includePostWrite?: boolean;
 }): Promise<{ scripts: string[]; settings: string[] }> {
   const result = { scripts: [] as string[], settings: [] as string[] };
 
@@ -757,7 +776,8 @@ export async function installClaudeCodeHooks(options: {
 
   const hooksConfig = buildHooksConfig({
     includePreCompact: options.includePreCompact,
-    includeMediaAware: options.includeMediaAware
+    includeMediaAware: options.includeMediaAware,
+    includePostWrite: options.includePostWrite,
   });
 
   // Update user settings
@@ -1121,6 +1141,28 @@ if __name__ == "__main__":
 `;
 
 /**
+ * Cline/Roo/Kilo PostToolUse hook script for real-time file indexing.
+ * This script calls the MCP server hook to index files after Edit/Write/NotebookEdit.
+ */
+export const CLINE_POSTTOOLUSE_HOOK_SCRIPT = `#!/bin/bash
+# ContextStream PostToolUse Hook for Cline/Roo/Kilo Code
+# Indexes files after Edit/Write/NotebookEdit operations for real-time search updates.
+#
+# The hook receives JSON on stdin with tool_name and toolParameters.
+# Only runs for write operations (write_to_file, edit_file).
+
+TOOL_NAME=$(cat | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('toolName', d.get('tool_name', '')))" 2>/dev/null)
+
+case "$TOOL_NAME" in
+  write_to_file|edit_file|Write|Edit|NotebookEdit)
+    npx @contextstream/mcp-server hook post-write
+    ;;
+esac
+
+exit 0
+`;
+
+/**
  * Get the path to Cline's global hooks directory.
  */
 export function getClineHooksDir(scope: "global" | "project", projectPath?: string): string {
@@ -1140,21 +1182,31 @@ export function getClineHooksDir(scope: "global" | "project", projectPath?: stri
 export async function installClineHookScripts(options: {
   scope: "global" | "project";
   projectPath?: string;
-}): Promise<{ preToolUse: string; userPromptSubmit: string }> {
+  includePostWrite?: boolean;
+}): Promise<{ preToolUse: string; userPromptSubmit: string; postToolUse?: string }> {
   const hooksDir = getClineHooksDir(options.scope, options.projectPath);
   await fs.mkdir(hooksDir, { recursive: true });
 
   // Cline hooks are named after the hook type (no file extension)
   const preToolUsePath = path.join(hooksDir, "PreToolUse");
   const userPromptPath = path.join(hooksDir, "UserPromptSubmit");
+  const postToolUsePath = path.join(hooksDir, "PostToolUse");
 
   await fs.writeFile(preToolUsePath, CLINE_PRETOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
   await fs.writeFile(userPromptPath, CLINE_USER_PROMPT_HOOK_SCRIPT, { mode: 0o755 });
 
-  return {
+  const result: { preToolUse: string; userPromptSubmit: string; postToolUse?: string } = {
     preToolUse: preToolUsePath,
     userPromptSubmit: userPromptPath,
   };
+
+  // Install PostToolUse hook for real-time indexing (default ON)
+  if (options.includePostWrite !== false) {
+    await fs.writeFile(postToolUsePath, CLINE_POSTTOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
+    result.postToolUse = postToolUsePath;
+  }
+
+  return result;
 }
 
 // =============================================================================
@@ -1182,20 +1234,30 @@ export function getRooCodeHooksDir(scope: "global" | "project", projectPath?: st
 export async function installRooCodeHookScripts(options: {
   scope: "global" | "project";
   projectPath?: string;
-}): Promise<{ preToolUse: string; userPromptSubmit: string }> {
+  includePostWrite?: boolean;
+}): Promise<{ preToolUse: string; userPromptSubmit: string; postToolUse?: string }> {
   const hooksDir = getRooCodeHooksDir(options.scope, options.projectPath);
   await fs.mkdir(hooksDir, { recursive: true });
 
   const preToolUsePath = path.join(hooksDir, "PreToolUse");
   const userPromptPath = path.join(hooksDir, "UserPromptSubmit");
+  const postToolUsePath = path.join(hooksDir, "PostToolUse");
 
   await fs.writeFile(preToolUsePath, CLINE_PRETOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
   await fs.writeFile(userPromptPath, CLINE_USER_PROMPT_HOOK_SCRIPT, { mode: 0o755 });
 
-  return {
+  const result: { preToolUse: string; userPromptSubmit: string; postToolUse?: string } = {
     preToolUse: preToolUsePath,
     userPromptSubmit: userPromptPath,
   };
+
+  // Install PostToolUse hook for real-time indexing (default ON)
+  if (options.includePostWrite !== false) {
+    await fs.writeFile(postToolUsePath, CLINE_POSTTOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
+    result.postToolUse = postToolUsePath;
+  }
+
+  return result;
 }
 
 // =============================================================================
@@ -1222,20 +1284,30 @@ export function getKiloCodeHooksDir(scope: "global" | "project", projectPath?: s
 export async function installKiloCodeHookScripts(options: {
   scope: "global" | "project";
   projectPath?: string;
-}): Promise<{ preToolUse: string; userPromptSubmit: string }> {
+  includePostWrite?: boolean;
+}): Promise<{ preToolUse: string; userPromptSubmit: string; postToolUse?: string }> {
   const hooksDir = getKiloCodeHooksDir(options.scope, options.projectPath);
   await fs.mkdir(hooksDir, { recursive: true });
 
   const preToolUsePath = path.join(hooksDir, "PreToolUse");
   const userPromptPath = path.join(hooksDir, "UserPromptSubmit");
+  const postToolUsePath = path.join(hooksDir, "PostToolUse");
 
   await fs.writeFile(preToolUsePath, CLINE_PRETOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
   await fs.writeFile(userPromptPath, CLINE_USER_PROMPT_HOOK_SCRIPT, { mode: 0o755 });
 
-  return {
+  const result: { preToolUse: string; userPromptSubmit: string; postToolUse?: string } = {
     preToolUse: preToolUsePath,
     userPromptSubmit: userPromptPath,
   };
+
+  // Install PostToolUse hook for real-time indexing (default ON)
+  if (options.includePostWrite !== false) {
+    await fs.writeFile(postToolUsePath, CLINE_POSTTOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
+    result.postToolUse = postToolUsePath;
+  }
+
+  return result;
 }
 
 // =============================================================================
@@ -1566,8 +1638,9 @@ export async function installEditorHooks(options: {
   scope: "global" | "project";
   projectPath?: string;
   includePreCompact?: boolean;
+  includePostWrite?: boolean;
 }): Promise<EditorHooksResult> {
-  const { editor, scope, projectPath, includePreCompact } = options;
+  const { editor, scope, projectPath, includePreCompact, includePostWrite } = options;
 
   switch (editor) {
     case "claude": {
@@ -1575,7 +1648,7 @@ export async function installEditorHooks(options: {
         throw new Error("projectPath required for project scope");
       }
       const scripts = await installHookScripts({ includePreCompact });
-      const hooksConfig = buildHooksConfig({ includePreCompact });
+      const hooksConfig = buildHooksConfig({ includePreCompact, includePostWrite });
 
       // Update Claude Code settings
       const settingsScope = scope === "global" ? "user" : "project";
@@ -1594,28 +1667,34 @@ export async function installEditorHooks(options: {
     }
 
     case "cline": {
-      const scripts = await installClineHookScripts({ scope, projectPath });
+      const scripts = await installClineHookScripts({ scope, projectPath, includePostWrite });
+      const installed = [scripts.preToolUse, scripts.userPromptSubmit];
+      if (scripts.postToolUse) installed.push(scripts.postToolUse);
       return {
         editor: "cline",
-        installed: [scripts.preToolUse, scripts.userPromptSubmit],
+        installed,
         hooksDir: getClineHooksDir(scope, projectPath),
       };
     }
 
     case "roo": {
-      const scripts = await installRooCodeHookScripts({ scope, projectPath });
+      const scripts = await installRooCodeHookScripts({ scope, projectPath, includePostWrite });
+      const installed = [scripts.preToolUse, scripts.userPromptSubmit];
+      if (scripts.postToolUse) installed.push(scripts.postToolUse);
       return {
         editor: "roo",
-        installed: [scripts.preToolUse, scripts.userPromptSubmit],
+        installed,
         hooksDir: getRooCodeHooksDir(scope, projectPath),
       };
     }
 
     case "kilo": {
-      const scripts = await installKiloCodeHookScripts({ scope, projectPath });
+      const scripts = await installKiloCodeHookScripts({ scope, projectPath, includePostWrite });
+      const installed = [scripts.preToolUse, scripts.userPromptSubmit];
+      if (scripts.postToolUse) installed.push(scripts.postToolUse);
       return {
         editor: "kilo",
-        installed: [scripts.preToolUse, scripts.userPromptSubmit],
+        installed,
         hooksDir: getKiloCodeHooksDir(scope, projectPath),
       };
     }
@@ -1641,6 +1720,7 @@ export async function installAllEditorHooks(options: {
   scope: "global" | "project";
   projectPath?: string;
   includePreCompact?: boolean;
+  includePostWrite?: boolean;
   editors?: SupportedEditor[];
 }): Promise<EditorHooksResult[]> {
   const editors = options.editors || ["claude", "cline", "roo", "kilo", "cursor"];
@@ -1653,6 +1733,7 @@ export async function installAllEditorHooks(options: {
         scope: options.scope,
         projectPath: options.projectPath,
         includePreCompact: options.includePreCompact,
+        includePostWrite: options.includePostWrite,
       });
       results.push(result);
     } catch (error) {

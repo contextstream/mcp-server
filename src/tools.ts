@@ -144,12 +144,7 @@ const recentLessonCaptures = new Map<string, number>();
 const SEARCH_RULES_REMINDER_ENABLED =
   process.env.CONTEXTSTREAM_SEARCH_REMINDER?.toLowerCase() !== "false";
 
-const SEARCH_RULES_REMINDER = `
-⚠️ [SEARCH RULES - READ EVERY TIME]
-BEFORE using Glob/Grep/Read/Search/Explore → call mcp__contextstream__search(mode="hybrid", query="...") FIRST
-BEFORE using EnterPlanMode/Task(Plan) → call mcp__contextstream__session(action="capture_plan", ...) instead
-Local tools ONLY if ContextStream returns 0 results after retry.
-`.trim();
+const SEARCH_RULES_REMINDER = `[SEARCH] Use search(mode="hybrid") before Glob/Grep/Read. Local tools only if 0 results.`;
 
 /**
  * Lessons reminder injected when there are active lessons.
@@ -225,8 +220,8 @@ function generateLessonsReminder(result: Record<string, unknown>): string {
 }
 
 /**
- * Generate aggressive rules update warning when rules are outdated.
- * This nudges AI to update rules while preserving custom content.
+ * Generate rules update warning when rules are outdated.
+ * Skips warning if highest version found matches latest (some files may be stale but main one is current).
  */
 function generateRulesUpdateWarning(rulesNotice: RulesNotice | null): string {
   if (!rulesNotice || (rulesNotice.status !== "behind" && rulesNotice.status !== "missing")) {
@@ -237,14 +232,16 @@ function generateRulesUpdateWarning(rulesNotice: RulesNotice | null): string {
   const current = rulesNotice.current ?? "none";
   const latest = rulesNotice.latest;
 
-  return `
-🚨 [RULES ${isMissing ? "MISSING" : "OUTDATED"} - ACTION REQUIRED]
-${isMissing ? "ContextStream rules are NOT installed." : `Rules version ${current} → ${latest} available.`}
-${isMissing ? "AI behavior may be suboptimal without proper rules." : "New rules include important improvements for better AI behavior."}
+  // Don't warn if highest version matches latest (user is current, some secondary files may be stale)
+  if (!isMissing && current === latest) {
+    return "";
+  }
 
-**UPDATE NOW:** Run \`mcp__contextstream__generate_rules(overwrite_existing=true)\`
-This is SAFE - only the ContextStream block is updated, your custom rules are preserved.
-`.trim();
+  // Compact warning - avoid verbose output
+  if (isMissing) {
+    return `[RULES_NOTICE] Rules missing. Run generate_rules() to install.`;
+  }
+  return `[RULES_NOTICE] Rules ${current} → ${latest}. Run generate_rules(overwrite_existing=true) to update.`;
 }
 
 /**

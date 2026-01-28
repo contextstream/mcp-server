@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://contextstream.io/logo.svg" alt="ContextStream" width="80" />
+  <img src="https://contextstream.io/400logo.png" alt="ContextStream" width="80" />
 </p>
 
 <h1 align="center">ContextStream MCP Server</h1>
@@ -16,15 +16,18 @@
 
 <p align="center">
   <a href="https://contextstream.io/docs">Documentation</a> •
-  <a href="https://contextstream.io/pricing">Pricing</a> •
-  <a href="https://discord.gg/contextstream">Discord</a>
+  <a href="https://contextstream.io/pricing">Pricing</a>
 </p>
 
 ---
 
+<h3 align="center">
+
 ```bash
-npx @contextstream/mcp-server setup
+npx @contextstream/mcp-server@latest setup
 ```
+
+</h3>
 
 <p align="center">
   <img src="compare1.gif" alt="ContextStream in action" width="700" />
@@ -76,7 +79,7 @@ Long conversation? ContextStream tracks token usage, auto-saves critical state, 
 ## Setup Takes 30 Seconds
 
 ```bash
-npx @contextstream/mcp-server setup
+npx @contextstream/mcp-server@latest setup
 ```
 
 The wizard handles everything: authentication, configuration, editor integration, and optional hooks that supercharge your workflow.
@@ -88,13 +91,15 @@ The wizard handles everything: authentication, configuration, editor integration
 ## The Tools Your AI Gets
 
 ```
-init()           → Loads your workspace context instantly
-context()        → Delivers relevant context every single message
-search()         → Semantic, hybrid, keyword—find anything by meaning
-session()        → Captures decisions, preferences, lessons automatically
-memory()         → Builds a knowledge graph of your project
-graph()          → Maps dependencies and analyzes impact
-integration()    → Queries GitHub, Slack, Notion directly
+init            → Loads your workspace context instantly
+context         → Delivers relevant context every single message
+search          → Semantic, hybrid, keyword—find anything by meaning
+session         → Captures decisions, preferences, lessons automatically
+memory          → Builds a knowledge graph of your project
+graph           → Maps dependencies and analyzes impact
+project         → Indexes your codebase for semantic understanding
+media           → Index and search video, audio, images (great for Remotion)
+integration     → Queries GitHub, Slack, Notion directly
 ```
 
 Your AI uses these automatically. You just code.
@@ -116,7 +121,7 @@ claude mcp update contextstream -e CONTEXTSTREAM_API_KEY=your_key
 </details>
 
 <details>
-<summary><b>Cursor / Windsurf / Claude Desktop</b></summary>
+<summary><b>Cursor / Claude Desktop</b></summary>
 
 ```json
 {
@@ -130,7 +135,7 @@ claude mcp update contextstream -e CONTEXTSTREAM_API_KEY=your_key
 }
 ```
 
-**Locations:** `~/.cursor/mcp.json` • `~/.codeium/windsurf/mcp_config.json` • `~/Library/Application Support/Claude/claude_desktop_config.json`
+**Locations:** `~/.cursor/mcp.json` • `~/Library/Application Support/Claude/claude_desktop_config.json`
 
 </details>
 
@@ -157,7 +162,9 @@ claude mcp update contextstream -e CONTEXTSTREAM_API_KEY=your_key
 ## Links
 
 **Website:** https://contextstream.io
+
 **Docs:** https://contextstream.io/docs
+
 **Get API Key:** https://contextstream.io/settings/api
 
 ---

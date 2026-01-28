@@ -5555,4 +5555,266 @@ export class ContextStreamClient {
     );
     return unwrapApiResponse(result);
   }
+
+  // ============================================
+  // Todo Methods (Simple Todos)
+  // ============================================
+
+  /**
+   * List todos for a workspace/project
+   */
+  async todosList(params?: {
+    workspace_id?: string;
+    project_id?: string;
+    status?: "pending" | "completed";
+    priority?: "low" | "medium" | "high" | "urgent";
+    page?: number;
+    per_page?: number;
+  }) {
+    const withDefaults = this.withDefaults(params || {});
+    const query = new URLSearchParams();
+    if (withDefaults.workspace_id) query.set("workspace_id", withDefaults.workspace_id);
+    if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
+    if (params?.status) query.set("status", params.status);
+    if (params?.priority) query.set("priority", params.priority);
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.per_page) query.set("per_page", String(params.per_page));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request(this.config, `/todos${suffix}`, { method: "GET" });
+  }
+
+  /**
+   * Create a new todo
+   */
+  async todosCreate(params: {
+    workspace_id?: string;
+    project_id?: string;
+    title: string;
+    description?: string;
+    priority?: "low" | "medium" | "high" | "urgent";
+    due_at?: string;
+  }) {
+    const withDefaults = this.withDefaults(params);
+    if (!withDefaults.workspace_id) {
+      throw new Error("workspace_id is required for creating todos");
+    }
+    return request(this.config, "/todos", { body: withDefaults });
+  }
+
+  /**
+   * Get a specific todo
+   */
+  async todosGet(params: { todo_id: string }) {
+    uuidSchema.parse(params.todo_id);
+    return request(this.config, `/todos/${params.todo_id}`, { method: "GET" });
+  }
+
+  /**
+   * Update a todo
+   */
+  async todosUpdate(params: {
+    todo_id: string;
+    title?: string;
+    description?: string;
+    priority?: "low" | "medium" | "high" | "urgent";
+    due_at?: string;
+    completed?: boolean;
+  }) {
+    uuidSchema.parse(params.todo_id);
+    const { todo_id, ...updates } = params;
+    return request(this.config, `/todos/${todo_id}`, { method: "PATCH", body: updates });
+  }
+
+  /**
+   * Delete a todo
+   */
+  async todosDelete(params: { todo_id: string }) {
+    uuidSchema.parse(params.todo_id);
+    return request(this.config, `/todos/${params.todo_id}`, { method: "DELETE" });
+  }
+
+  /**
+   * Mark a todo as completed
+   */
+  async todosComplete(params: { todo_id: string }) {
+    uuidSchema.parse(params.todo_id);
+    return this.todosUpdate({ todo_id: params.todo_id, completed: true });
+  }
+
+  /**
+   * Mark a todo as incomplete
+   */
+  async todosIncomplete(params: { todo_id: string }) {
+    uuidSchema.parse(params.todo_id);
+    return this.todosUpdate({ todo_id: params.todo_id, completed: false });
+  }
+
+  // ============================================
+  // Diagram Methods (Mermaid Diagrams)
+  // ============================================
+
+  /**
+   * List diagrams for a workspace/project
+   */
+  async diagramsList(params?: {
+    workspace_id?: string;
+    project_id?: string;
+    diagram_type?: "flowchart" | "sequence" | "class" | "er" | "gantt" | "mindmap" | "pie" | "other";
+    page?: number;
+    per_page?: number;
+  }) {
+    const withDefaults = this.withDefaults(params || {});
+    const query = new URLSearchParams();
+    if (withDefaults.workspace_id) query.set("workspace_id", withDefaults.workspace_id);
+    if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
+    if (params?.diagram_type) query.set("diagram_type", params.diagram_type);
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.per_page) query.set("per_page", String(params.per_page));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request(this.config, `/diagrams${suffix}`, { method: "GET" });
+  }
+
+  /**
+   * Create a new diagram
+   */
+  async diagramsCreate(params: {
+    workspace_id?: string;
+    project_id?: string;
+    title: string;
+    diagram_type?: "flowchart" | "sequence" | "class" | "er" | "gantt" | "mindmap" | "pie" | "other";
+    content: string;
+    metadata?: Record<string, unknown>;
+  }) {
+    const withDefaults = this.withDefaults(params);
+    if (!withDefaults.workspace_id) {
+      throw new Error("workspace_id is required for creating diagrams");
+    }
+    return request(this.config, "/diagrams", { body: withDefaults });
+  }
+
+  /**
+   * Get a specific diagram
+   */
+  async diagramsGet(params: { diagram_id: string }) {
+    uuidSchema.parse(params.diagram_id);
+    return request(this.config, `/diagrams/${params.diagram_id}`, { method: "GET" });
+  }
+
+  /**
+   * Update a diagram
+   */
+  async diagramsUpdate(params: {
+    diagram_id: string;
+    title?: string;
+    diagram_type?: "flowchart" | "sequence" | "class" | "er" | "gantt" | "mindmap" | "pie" | "other";
+    content?: string;
+    metadata?: Record<string, unknown>;
+  }) {
+    uuidSchema.parse(params.diagram_id);
+    const { diagram_id, ...updates } = params;
+    return request(this.config, `/diagrams/${diagram_id}`, { method: "PATCH", body: updates });
+  }
+
+  /**
+   * Delete a diagram
+   */
+  async diagramsDelete(params: { diagram_id: string }) {
+    uuidSchema.parse(params.diagram_id);
+    return request(this.config, `/diagrams/${params.diagram_id}`, { method: "DELETE" });
+  }
+
+  // ============================================
+  // Doc Methods (Markdown Documents)
+  // ============================================
+
+  /**
+   * List docs for a workspace/project
+   */
+  async docsList(params?: {
+    workspace_id?: string;
+    project_id?: string;
+    doc_type?: "roadmap" | "spec" | "general";
+    page?: number;
+    per_page?: number;
+  }) {
+    const withDefaults = this.withDefaults(params || {});
+    const query = new URLSearchParams();
+    if (withDefaults.workspace_id) query.set("workspace_id", withDefaults.workspace_id);
+    if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
+    if (params?.doc_type) query.set("doc_type", params.doc_type);
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.per_page) query.set("per_page", String(params.per_page));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request(this.config, `/docs${suffix}`, { method: "GET" });
+  }
+
+  /**
+   * Create a new doc
+   */
+  async docsCreate(params: {
+    workspace_id?: string;
+    project_id?: string;
+    title: string;
+    content: string;
+    doc_type?: "roadmap" | "spec" | "general";
+    metadata?: Record<string, unknown>;
+  }) {
+    const withDefaults = this.withDefaults(params);
+    if (!withDefaults.workspace_id) {
+      throw new Error("workspace_id is required for creating docs");
+    }
+    return request(this.config, "/docs", { body: withDefaults });
+  }
+
+  /**
+   * Create a roadmap doc with template
+   */
+  async docsCreateRoadmap(params: {
+    workspace_id?: string;
+    project_id?: string;
+    title: string;
+    milestones?: Array<{
+      title: string;
+      description?: string;
+      target_date?: string;
+      status?: string;
+    }>;
+  }) {
+    const withDefaults = this.withDefaults(params);
+    if (!withDefaults.workspace_id) {
+      throw new Error("workspace_id is required for creating roadmap docs");
+    }
+    return request(this.config, "/docs/roadmap", { body: withDefaults });
+  }
+
+  /**
+   * Get a specific doc
+   */
+  async docsGet(params: { doc_id: string }) {
+    uuidSchema.parse(params.doc_id);
+    return request(this.config, `/docs/${params.doc_id}`, { method: "GET" });
+  }
+
+  /**
+   * Update a doc
+   */
+  async docsUpdate(params: {
+    doc_id: string;
+    title?: string;
+    content?: string;
+    doc_type?: "roadmap" | "spec" | "general";
+    metadata?: Record<string, unknown>;
+  }) {
+    uuidSchema.parse(params.doc_id);
+    const { doc_id, ...updates } = params;
+    return request(this.config, `/docs/${doc_id}`, { method: "PATCH", body: updates });
+  }
+
+  /**
+   * Delete a doc
+   */
+  async docsDelete(params: { doc_id: string }) {
+    uuidSchema.parse(params.doc_id);
+    return request(this.config, `/docs/${params.doc_id}`, { method: "DELETE" });
+  }
 }

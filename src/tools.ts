@@ -9505,7 +9505,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "memory",
       {
         title: "Memory",
-        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks.`,
+        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap.`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -9534,6 +9534,26 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "delete_task",
               "list_tasks",
               "reorder_tasks",
+              // Todo actions
+              "create_todo",
+              "list_todos",
+              "get_todo",
+              "update_todo",
+              "delete_todo",
+              "complete_todo",
+              // Diagram actions
+              "create_diagram",
+              "list_diagrams",
+              "get_diagram",
+              "update_diagram",
+              "delete_diagram",
+              // Doc actions
+              "create_doc",
+              "list_docs",
+              "get_doc",
+              "update_doc",
+              "delete_doc",
+              "create_roadmap",
             ])
             .describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
@@ -9643,6 +9663,40 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             )
             .optional()
             .describe("Array of events for import_batch action"),
+          // Todo params
+          todo_id: z.string().uuid().optional().describe("Todo ID for get_todo/update_todo/delete_todo"),
+          todo_priority: z
+            .enum(["low", "medium", "high", "urgent"])
+            .optional()
+            .describe("Todo priority"),
+          todo_status: z
+            .enum(["pending", "completed"])
+            .optional()
+            .describe("Todo status filter for list_todos"),
+          due_at: z.string().optional().describe("Due date (ISO 8601) for todo"),
+          // Diagram params
+          diagram_id: z.string().uuid().optional().describe("Diagram ID for get_diagram/update_diagram/delete_diagram"),
+          diagram_type: z
+            .enum(["flowchart", "sequence", "class", "er", "gantt", "mindmap", "pie", "other"])
+            .optional()
+            .describe("Mermaid diagram type"),
+          // Doc params
+          doc_id: z.string().uuid().optional().describe("Doc ID for get_doc/update_doc/delete_doc"),
+          doc_type: z
+            .enum(["roadmap", "spec", "general"])
+            .optional()
+            .describe("Document type"),
+          milestones: z
+            .array(
+              z.object({
+                title: z.string(),
+                description: z.string().optional(),
+                target_date: z.string().optional(),
+                status: z.string().optional(),
+              })
+            )
+            .optional()
+            .describe("Milestones for create_roadmap action"),
         }),
       },
       async (input) => {
@@ -10024,7 +10078,249 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
+
+            };
+          }
+
+          // Todo actions
+          case "create_todo": {
+            if (!input.title) {
+              return errorResult("create_todo requires: title");
+            }
+            if (!workspaceId) {
+              return errorResult("create_todo requires workspace_id. Call session_init first.");
+            }
+            const todoResult = await client.todosCreate({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              title: input.title,
+              description: input.description,
+              priority: input.todo_priority,
+              due_at: input.due_at,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(todoResult) }],
+            };
+          }
+
+          case "list_todos": {
+            if (!workspaceId) {
+              return errorResult("list_todos requires workspace_id. Call session_init first.");
+            }
+            const todosResult = await client.todosList({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              status: input.todo_status,
+              priority: input.todo_priority,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(todosResult) }],
+            };
+          }
+
+          case "get_todo": {
+            if (!input.todo_id) {
+              return errorResult("get_todo requires: todo_id");
+            }
+            const getTodoResult = await client.todosGet({ todo_id: input.todo_id });
+            return {
+              content: [{ type: "text" as const, text: formatContent(getTodoResult) }],
+            };
+          }
+
+          case "update_todo": {
+            if (!input.todo_id) {
+              return errorResult("update_todo requires: todo_id");
+            }
+            const updateTodoResult = await client.todosUpdate({
+              todo_id: input.todo_id,
+              title: input.title,
+              description: input.description,
+              priority: input.todo_priority,
+              due_at: input.due_at,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(updateTodoResult) }],
+            };
+          }
+
+          case "delete_todo": {
+            if (!input.todo_id) {
+              return errorResult("delete_todo requires: todo_id");
+            }
+            const deleteTodoResult = await client.todosDelete({ todo_id: input.todo_id });
+            return {
+              content: [{ type: "text" as const, text: formatContent(deleteTodoResult) }],
+            };
+          }
+
+          case "complete_todo": {
+            if (!input.todo_id) {
+              return errorResult("complete_todo requires: todo_id");
+            }
+            const completeTodoResult = await client.todosComplete({ todo_id: input.todo_id });
+            return {
+              content: [{ type: "text" as const, text: `✅ Todo marked as completed` }],
+            };
+          }
+
+          // Diagram actions
+          case "create_diagram": {
+            if (!input.title || !input.content) {
+              return errorResult("create_diagram requires: title, content");
+            }
+            if (!workspaceId) {
+              return errorResult("create_diagram requires workspace_id. Call session_init first.");
+            }
+            const diagramResult = await client.diagramsCreate({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              title: input.title,
+              content: input.content,
+              diagram_type: input.diagram_type,
+              metadata: input.metadata,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(diagramResult) }],
+            };
+          }
+
+          case "list_diagrams": {
+            if (!workspaceId) {
+              return errorResult("list_diagrams requires workspace_id. Call session_init first.");
+            }
+            const diagramsResult = await client.diagramsList({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              diagram_type: input.diagram_type,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(diagramsResult) }],
+            };
+          }
+
+          case "get_diagram": {
+            if (!input.diagram_id) {
+              return errorResult("get_diagram requires: diagram_id");
+            }
+            const getDiagramResult = await client.diagramsGet({ diagram_id: input.diagram_id });
+            return {
+              content: [{ type: "text" as const, text: formatContent(getDiagramResult) }],
+            };
+          }
+
+          case "update_diagram": {
+            if (!input.diagram_id) {
+              return errorResult("update_diagram requires: diagram_id");
+            }
+            const updateDiagramResult = await client.diagramsUpdate({
+              diagram_id: input.diagram_id,
+              title: input.title,
+              content: input.content,
+              diagram_type: input.diagram_type,
+              metadata: input.metadata,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(updateDiagramResult) }],
+            };
+          }
+
+          case "delete_diagram": {
+            if (!input.diagram_id) {
+              return errorResult("delete_diagram requires: diagram_id");
+            }
+            const deleteDiagramResult = await client.diagramsDelete({ diagram_id: input.diagram_id });
+            return {
+              content: [{ type: "text" as const, text: formatContent(deleteDiagramResult) }],
+            };
+          }
+
+          // Doc actions
+          case "create_doc": {
+            if (!input.title || !input.content) {
+              return errorResult("create_doc requires: title, content");
+            }
+            if (!workspaceId) {
+              return errorResult("create_doc requires workspace_id. Call session_init first.");
+            }
+            const docResult = await client.docsCreate({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              title: input.title,
+              content: input.content,
+              doc_type: input.doc_type,
+              metadata: input.metadata,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(docResult) }],
+            };
+          }
+
+          case "list_docs": {
+            if (!workspaceId) {
+              return errorResult("list_docs requires workspace_id. Call session_init first.");
+            }
+            const docsResult = await client.docsList({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              doc_type: input.doc_type,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(docsResult) }],
+            };
+          }
+
+          case "get_doc": {
+            if (!input.doc_id) {
+              return errorResult("get_doc requires: doc_id");
+            }
+            const getDocResult = await client.docsGet({ doc_id: input.doc_id });
+            return {
+              content: [{ type: "text" as const, text: formatContent(getDocResult) }],
+            };
+          }
+
+          case "update_doc": {
+            if (!input.doc_id) {
+              return errorResult("update_doc requires: doc_id");
+            }
+            const updateDocResult = await client.docsUpdate({
+              doc_id: input.doc_id,
+              title: input.title,
+              content: input.content,
+              doc_type: input.doc_type,
+              metadata: input.metadata,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(updateDocResult) }],
+            };
+          }
+
+          case "delete_doc": {
+            if (!input.doc_id) {
+              return errorResult("delete_doc requires: doc_id");
+            }
+            const deleteDocResult = await client.docsDelete({ doc_id: input.doc_id });
+            return {
+              content: [{ type: "text" as const, text: formatContent(deleteDocResult) }],
+            };
+          }
+
+          case "create_roadmap": {
+            if (!input.title) {
+              return errorResult("create_roadmap requires: title");
+            }
+            if (!workspaceId) {
+              return errorResult("create_roadmap requires workspace_id. Call session_init first.");
+            }
+            const roadmapResult = await client.docsCreateRoadmap({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              title: input.title,
+              milestones: input.milestones,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(roadmapResult) }],
             };
           }
 

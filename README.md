@@ -1,172 +1,122 @@
-# ContextStream MCP Server
+<p align="center">
+  <img src="https://contextstream.io/logo.svg" alt="ContextStream" width="80" />
+</p>
 
-**Your AI coding assistant finally has a memory.**
+<h1 align="center">ContextStream MCP Server</h1>
 
-ContextStream gives your AI tools persistent context across sessions, semantic code search, and team knowledge sharing. Every decision, preference, and lesson learned is captured and surfaced when relevant.
+<p align="center">
+  <strong>Give your AI coding assistant brilliant memory, deep context, and superpowers it never had.</strong>
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/@contextstream/mcp-server"><img src="https://img.shields.io/npm/v/@contextstream/mcp-server.svg" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/@contextstream/mcp-server"><img src="https://img.shields.io/npm/dm/@contextstream/mcp-server.svg" alt="downloads" /></a>
+  <a href="https://github.com/contextstream/mcp-server/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/@contextstream/mcp-server.svg" alt="license" /></a>
+</p>
+
+<p align="center">
+  <a href="https://contextstream.io/docs">Documentation</a> •
+  <a href="https://contextstream.io/pricing">Pricing</a> •
+  <a href="https://discord.gg/contextstream">Discord</a>
+</p>
+
+---
 
 ```bash
-npx -y @contextstream/mcp-server setup
+npx @contextstream/mcp-server setup
 ```
 
-Works with Cursor, Antigravity, Claude Code, Windsurf, VS Code, Claude Desktop, Codex CLI, and more.
+<p align="center">
+  <img src="compare1.gif" alt="ContextStream in action" width="700" />
+</p>
 
 ---
 
-## The Problem
+## This Isn't Just Memory. This Is Intelligence.
 
-Without ContextStream, every AI conversation starts from scratch:
+Other tools give your AI a notepad. **ContextStream gives it a brain.**
 
-- "We decided to use PostgreSQL" — forgotten next session
-- "Don't use that deprecated API" — your AI suggests it anyway
-- "Here's how our auth flow works" — explained for the 10th time
-- Team decisions live in Slack threads no one can find
+Your AI doesn't just remember things—it *understands* your entire codebase, learns from every conversation, pulls knowledge from your team's GitHub, Slack, and Notion, and delivers exactly the right context at exactly the right moment.
 
-## The Solution
-
-ContextStream creates a shared brain for your AI assistant:
-
-| What you get | How it works |
-|--------------|--------------|
-| **Persistent Memory** | Decisions, preferences, and notes survive across sessions |
-| **Semantic Code Search** | Find code by meaning, not just keywords |
-| **Team Knowledge** | Share context across your team's AI tools |
-| **Integration Sync** | Pull context from GitHub, Slack, and Notion automatically |
-| **Smart Context** | Your AI gets relevant context for every message |
+**One setup. Instant transformation.**
 
 ---
 
-## See It In Action
+## What Changes When You Install This
 
-**You say...** → **ContextStream does...**
-
-| Prompt | What happens |
-|--------|--------------|
-| "What did we decide about auth?" | Finds the decision from 3 weeks ago |
-| "Remember we're using PostgreSQL" | Captured for all future sessions |
-| "Search for payment handling code" | Semantic search across your codebase |
-| "What depends on UserService?" | Analyzes dependency graph and impact |
-| "Show me recent GitHub activity" | Surfaces issues, PRs, and discussions |
-| "What's in our API docs on Notion?" | Searches your Notion knowledge base |
-
-No special commands needed. Just describe what you want.
-
-![ContextStream in action](compare1.gif)
+| Before | After |
+|--------|-------|
+| AI searches files one-by-one, burning tokens | **Semantic search** finds code by meaning in milliseconds |
+| Context lost when conversations get long | **Smart compression** preserves what matters before compaction |
+| Team knowledge scattered across tools | **Unified intelligence** from GitHub, Slack, Notion—automatically |
+| Same mistakes repeated across sessions | **Lessons system** ensures your AI learns from every failure |
+| Generic responses, no project awareness | **Deep context** about your architecture, decisions, patterns |
 
 ---
 
-## Quick Setup (30 seconds)
+## The Power Under the Hood
 
-The setup wizard handles everything:
+### Semantic Code Intelligence
+Ask "where do we handle authentication?" and get the answer instantly. No grep chains. No reading 10 files. Your AI understands your code at a conceptual level.
+
+### SmartRouter Context Delivery
+Every message is analyzed. Risky refactor? Relevant lessons surface automatically. Making a decision? Your AI knows to capture it. The right context, every time, without you asking.
+
+### Team Knowledge Fusion
+Connect GitHub, Slack, and Notion. Discussions from months ago? Surfaced when relevant. That architecture decision buried in a PR comment? Your AI knows about it.
+
+### Code Graph Analysis
+"What depends on UserService?" "What's the impact of changing this function?" Your AI sees the connections across your entire codebase.
+
+### Context Pressure Awareness
+Long conversation? ContextStream tracks token usage, auto-saves critical state, and ensures nothing important is lost when context compacts.
+
+---
+
+## Setup Takes 30 Seconds
 
 ```bash
-npx -y @contextstream/mcp-server setup
+npx @contextstream/mcp-server setup
 ```
 
-This will:
-1. Authenticate your account (opens browser)
-2. Create and store your API key
-3. Install editor rules for best results
-4. Configure your AI tools automatically
-5. Install Claude Code hooks (optional, recommended)
+The wizard handles everything: authentication, configuration, editor integration, and optional hooks that supercharge your workflow.
 
-That's it. Start a conversation and your AI now has memory.
+**Works with:** Claude Code • Cursor • VS Code • Claude Desktop • Codex CLI • Antigravity
 
 ---
 
-## What Gets Captured
+## The Tools Your AI Gets
 
-ContextStream automatically tracks:
+```
+init()           → Loads your workspace context instantly
+context()        → Delivers relevant context every single message
+search()         → Semantic, hybrid, keyword—find anything by meaning
+session()        → Captures decisions, preferences, lessons automatically
+memory()         → Builds a knowledge graph of your project
+graph()          → Maps dependencies and analyzes impact
+integration()    → Queries GitHub, Slack, Notion directly
+```
 
-| Type | Examples |
-|------|----------|
-| **Decisions** | "We chose JWT over sessions", "Using Tailwind for styling" |
-| **Preferences** | "I prefer functional components", "Always use TypeScript" |
-| **Lessons** | "That approach caused a memory leak", "This pattern works well" |
-| **Tasks** | Implementation plans, TODOs, follow-ups |
-| **Code Context** | File relationships, dependencies, patterns |
-
-Everything is searchable by meaning, not just keywords.
-
----
-
-## Integrations
-
-Connect your team's tools to enrich AI context automatically:
-
-### GitHub
-- Issues, PRs, releases, and comments synced as searchable memory
-- "What's the status of the auth refactor?" finds the relevant PR
-- Decisions from issue discussions surface when relevant
-
-### Slack
-- Channel discussions become searchable knowledge
-- Team decisions captured from conversations
-- "What did we discuss about the API?" finds the thread
-
-### Notion
-- Documentation and wikis become AI context
-- Smart type detection for tasks, meetings, bugs, features
-- "How does our deployment process work?" finds the runbook
-
----
-
-## Team Features
-
-ContextStream shines for teams:
-
-- **Shared workspace memory** — decisions made by anyone benefit everyone
-- **Onboarding acceleration** — new team members get full context from day one
-- **Knowledge preservation** — context survives when people leave
-- **Consistent AI behavior** — everyone's AI knows the same preferences
-
----
-
-## Smarter Context, Fewer Tokens
-
-AI tools typically gather context by reading entire files, running grep searches, and iterating until they find what they need. This burns through your token budget fast.
-
-ContextStream takes a different approach:
-
-**Bounded retrieval** — `context_smart` returns only the context relevant to your current message, within a strict token budget. Instead of reading 10 files to find one decision, you get exactly what matters.
-
-**Semantic search** — Find code by meaning in a single query. No more `grep "auth" → read file → grep "middleware" → read another file` loops. One search, relevant results.
-
-**Smart output formats** — Choose the verbosity you need:
-- Need file locations? Use `paths` format (80% smaller responses)
-- Just checking if something exists? Use `count` format (90% smaller)
-- Need full context? Use `full` format
-
-**AI-powered compression** — For complex queries, Context Pack distills large code contexts into compact, high-signal summaries that preserve file paths, line numbers, and essential snippets.
-
-The result: your AI gets better context while using fewer tokens. Faster responses, lower costs, and more room in the context window for actual work.
-
----
-
-## Core Tools
-
-Your AI uses these automatically:
-
-| Tool | Purpose |
-|------|---------|
-| `session_init` | Load workspace/project context at conversation start |
-| `context_smart` | Get relevant context for each message |
-| `search` | Semantic, hybrid, or keyword search across everything |
-| `session` | Capture and recall decisions, preferences, lessons |
-| `memory` | Create and manage knowledge nodes |
-| `graph` | Analyze code dependencies and impact |
-| `integration` | Query GitHub, Slack, Notion directly |
-
-**Full tool reference:** https://contextstream.io/docs/mcp/tools
+Your AI uses these automatically. You just code.
 
 ---
 
 ## Manual Configuration
 
-> Skip this if you used the setup wizard.
+> Skip this if you ran the setup wizard.
 
-### Cursor / Windsurf / Claude Desktop
+<details>
+<summary><b>Claude Code</b></summary>
 
-Add to your MCP config:
+```bash
+claude mcp add contextstream -- npx @contextstream/mcp-server
+claude mcp update contextstream -e CONTEXTSTREAM_API_KEY=your_key
+```
+
+</details>
+
+<details>
+<summary><b>Cursor / Windsurf / Claude Desktop</b></summary>
 
 ```json
 {
@@ -174,46 +124,18 @@ Add to your MCP config:
     "contextstream": {
       "command": "npx",
       "args": ["-y", "@contextstream/mcp-server"],
-      "env": {
-        "CONTEXTSTREAM_API_KEY": "YOUR_API_KEY"
-      }
+      "env": { "CONTEXTSTREAM_API_KEY": "your_key" }
     }
   }
 }
 ```
 
-Config locations:
-- **Cursor:** `~/.cursor/mcp.json`
-- **Windsurf:** `~/.codeium/windsurf/mcp_config.json`
-- **Claude Desktop (macOS):** `~/Library/Application Support/Claude/claude_desktop_config.json`
+**Locations:** `~/.cursor/mcp.json` • `~/.codeium/windsurf/mcp_config.json` • `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-### Claude Code (CLI)
+</details>
 
-```bash
-claude mcp add --transport stdio contextstream --scope user \
-  --env CONTEXTSTREAM_API_KEY=YOUR_KEY \
-  -- npx -y @contextstream/mcp-server
-```
-
-#### Claude Code Hooks (Recommended)
-
-ContextStream can install hooks that enforce best practices:
-
-- **PreToolUse hook** — Redirects Glob/Grep/Search to ContextStream semantic search
-- **UserPromptSubmit hook** — Injects context reminders every message
-
-Install hooks automatically when generating rules:
-
-```bash
-npx -y @contextstream/mcp-server setup
-# Or: mcp__contextstream__generate_rules(editors=["claude"])
-```
-
-Hooks are installed to `~/.claude/hooks/` and configured in `~/.claude/settings.json`. Your custom rules are preserved — only ContextStream blocks are updated.
-
-### VS Code
-
-Add to `.vscode/mcp.json`:
+<details>
+<summary><b>VS Code</b></summary>
 
 ```json
 {
@@ -222,71 +144,25 @@ Add to `.vscode/mcp.json`:
       "type": "stdio",
       "command": "npx",
       "args": ["-y", "@contextstream/mcp-server"],
-      "env": {
-        "CONTEXTSTREAM_API_KEY": "${input:contextstreamApiKey}"
-      }
+      "env": { "CONTEXTSTREAM_API_KEY": "your_key" }
     }
-  },
-  "inputs": [
-    {
-      "id": "contextstreamApiKey",
-      "type": "promptString",
-      "description": "ContextStream API Key",
-      "password": true
-    }
-  ]
+  }
 }
 ```
 
-### Codex CLI
-
-Add to `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.contextstream]
-command = "npx"
-args = ["-y", "@contextstream/mcp-server"]
-
-[mcp_servers.contextstream.env]
-CONTEXTSTREAM_API_KEY = "YOUR_API_KEY"
-```
-
----
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `CONTEXTSTREAM_API_KEY` | Your API key (required) |
-| `CONTEXTSTREAM_API_URL` | API endpoint (default: `https://api.contextstream.io`) |
-| `CONTEXTSTREAM_WORKSPACE_ID` | Default workspace |
-| `CONTEXTSTREAM_PROJECT_ID` | Default project |
-| `CONTEXTSTREAM_SEARCH_REMINDER` | Set to `false` to disable search-first reminders |
-| `CONTEXTSTREAM_HOOK_ENABLED` | Set to `false` to disable hooks without uninstalling |
-
----
-
-## Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| Tools not appearing | Restart your editor after config changes |
-| 401 Unauthorized | Check your API key is correct |
-| Wrong workspace | Run `session_init` or re-run the setup wizard |
+</details>
 
 ---
 
 ## Links
 
-| Resource | URL |
-|----------|-----|
-| **Website** | https://contextstream.io |
-| **Documentation** | https://contextstream.io/docs |
-| **Tool Reference** | https://contextstream.io/docs/mcp/tools |
-| **Pricing** | https://contextstream.io/pricing |
+**Website:** https://contextstream.io
+**Docs:** https://contextstream.io/docs
+**Get API Key:** https://contextstream.io/settings/api
 
 ---
 
-## License
-
-MIT
+<p align="center">
+  <strong>Stop teaching your AI the same things over and over.</strong><br/>
+  <sub>ContextStream makes it brilliant from the first message.</sub>
+</p>

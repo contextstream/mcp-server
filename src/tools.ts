@@ -137,6 +137,17 @@ const LESSON_DEDUP_WINDOW_MS = 2 * 60 * 1000;
 const recentLessonCaptures = new Map<string, number>();
 
 /**
+ * Auto-save tracking for periodic session state saves.
+ * Triggers on medium+ context pressure to ensure state is preserved before compaction.
+ * Uses multiple criteria: pressure level changes, call count, and time as fallback.
+ */
+const AUTO_SAVE_MIN_INTERVAL_MS = 2 * 60 * 1000; // Minimum 2 minutes between saves (spam prevention)
+const AUTO_SAVE_CALL_INTERVAL = 10; // Save every 10 context calls at medium+ pressure
+let lastAutoSaveTime = 0;
+let lastAutoSavePressureLevel = "";
+let contextCallsSinceLastSave = 0;
+
+/**
  * Search rules reminder injected into session_init and context_smart responses.
  * This keeps the critical instruction in recent context to combat instruction decay.
  * Can be disabled via CONTEXTSTREAM_SEARCH_REMINDER=false environment variable.
@@ -3009,7 +3020,7 @@ export function registerTools(
       const result = { name: "contextstream-mcp", version: VERSION };
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3025,7 +3036,7 @@ export function registerTools(
       const result = await client.me();
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3080,7 +3091,7 @@ Example: Enable memory tools before using memory_create_event.`,
         };
         return {
           content: [{ type: "text" as const, text: formatContent(result) }],
-          structuredContent: toStructured(result),
+          
         };
       }
 
@@ -3093,7 +3104,7 @@ Example: Enable memory tools before using memory_create_event.`,
         };
         return {
           content: [{ type: "text" as const, text: formatContent(result) }],
-          structuredContent: toStructured(result),
+          
         };
       }
 
@@ -3110,7 +3121,7 @@ Example: Enable memory tools before using memory_create_event.`,
       };
       return {
         content: [{ type: "text" as const, text: formatContent(response) }],
-        structuredContent: toStructured(response),
+        
       };
     }
   );
@@ -3257,7 +3268,7 @@ Examples:
         };
         return {
           content: [{ type: "text" as const, text: formatContent(result) }],
-          structuredContent: toStructured(result),
+          
         };
       }
     );
@@ -3278,7 +3289,7 @@ Examples:
       const result = await client.listWorkspaces(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3298,7 +3309,7 @@ Examples:
       const result = await client.createWorkspace(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3320,7 +3331,7 @@ Examples:
       const result = await client.updateWorkspace(workspace_id, updates);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3346,7 +3357,7 @@ Examples:
       };
       return {
         content: [{ type: "text" as const, text: formatContent(normalized) }],
-        structuredContent: toStructured(normalized),
+        
       };
     }
   );
@@ -3368,7 +3379,7 @@ Examples:
       const result = await client.listProjects(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3477,7 +3488,7 @@ Access: Free`,
 
       return {
         content: [{ type: "text" as const, text: formatContent(response) }],
-        structuredContent: toStructured(response),
+        
       };
     }
   );
@@ -3498,7 +3509,7 @@ Access: Free`,
       const result = await client.updateProject(project_id, updates);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3524,7 +3535,7 @@ Access: Free`,
       };
       return {
         content: [{ type: "text" as const, text: formatContent(normalized) }],
-        structuredContent: toStructured(normalized),
+        
       };
     }
   );
@@ -3547,7 +3558,7 @@ Access: Free`,
       const result = await client.indexProject(projectId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3614,7 +3625,7 @@ Access: Free`,
       const result = await client.searchSemantic(normalizeSearchParams(input));
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3630,7 +3641,7 @@ Access: Free`,
       const result = await client.searchHybrid(normalizeSearchParams(input));
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3642,7 +3653,7 @@ Access: Free`,
       const result = await client.searchKeyword(normalizeSearchParams(input));
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3654,7 +3665,7 @@ Access: Free`,
       const result = await client.searchPattern(normalizeSearchParams(input));
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3697,7 +3708,7 @@ Access: Free`,
       const result = await client.createMemoryEvent(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3717,7 +3728,7 @@ Access: Free`,
       const result = await client.bulkIngestEvents(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3737,7 +3748,7 @@ Access: Free`,
       const result = await client.listMemoryEvents(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3767,7 +3778,7 @@ Access: Free`,
       const result = await client.createKnowledgeNode(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3787,7 +3798,7 @@ Access: Free`,
       const result = await client.listKnowledgeNodes(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3808,7 +3819,7 @@ Access: Free`,
       const result = await client.memorySearch(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3834,7 +3845,7 @@ Access: Free`,
       const result = await client.memoryDecisions(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3859,7 +3870,7 @@ Access: Free`,
       const result = await client.decisionTrace(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3883,7 +3894,7 @@ Access: Free`,
       const result = await client.graphRelated(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3906,7 +3917,7 @@ Access: Free`,
       const result = await client.graphPath(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3928,7 +3939,7 @@ Access: Free`,
       const result = await client.graphDecisions(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3961,7 +3972,7 @@ Access: Free`,
       const result = await client.graphDependencies(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -3997,7 +4008,7 @@ Access: Free`,
       const result = await client.graphCallPath(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4029,7 +4040,7 @@ Access: Free`,
       const result = await client.graphImpact(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4132,7 +4143,7 @@ Access: Free`,
       const result = await client.aiContext(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4148,7 +4159,7 @@ Access: Free`,
       const result = await client.aiEmbeddings(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4168,7 +4179,7 @@ Access: Free`,
       const result = await client.aiPlan(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4189,7 +4200,7 @@ Access: Free`,
       const result = await client.aiTasks(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4213,7 +4224,7 @@ Access: Free`,
       const result = await client.aiEnhancedContext(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4237,7 +4248,7 @@ Access: Free`,
       const result = await client.getProject(projectId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4260,7 +4271,7 @@ Access: Free`,
       const result = await client.projectOverview(projectId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4283,7 +4294,7 @@ Access: Free`,
       const result = await client.projectStatistics(projectId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4306,7 +4317,7 @@ Access: Free`,
       const result = await client.projectFiles(projectId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4329,7 +4340,7 @@ Access: Free`,
       const result = await client.projectIndexStatus(projectId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4399,7 +4410,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
             text: `Ingestion started in background for directory: ${input.path}. Use 'projects_index_status' to monitor progress.`,
           },
         ],
-        structuredContent: toStructured(summary),
+        
       };
     }
   );
@@ -4423,7 +4434,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.getWorkspace(workspaceId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4446,7 +4457,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.workspaceOverview(workspaceId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4469,7 +4480,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.workspaceAnalytics(workspaceId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4493,7 +4504,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.workspaceContent(workspaceId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4513,7 +4524,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.getMemoryEvent(input.event_id);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4535,7 +4546,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.updateMemoryEvent(event_id, body);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4551,7 +4562,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.deleteMemoryEvent(input.event_id);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4567,7 +4578,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.distillMemoryEvent(input.event_id);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4583,7 +4594,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.getKnowledgeNode(input.node_id);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4605,7 +4616,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.updateKnowledgeNode(node_id, body);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4621,7 +4632,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.deleteKnowledgeNode(input.node_id);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4642,7 +4653,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.supersedeKnowledgeNode(node_id, body);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4665,7 +4676,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.memoryTimeline(workspaceId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4688,7 +4699,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.memorySummary(workspaceId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4714,7 +4725,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.findCircularDependencies(projectId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4739,7 +4750,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.findUnusedCode(projectId);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4757,7 +4768,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.findContradictions(input.node_id);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -4778,7 +4789,7 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       const result = await client.searchSuggestions(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -5226,9 +5237,9 @@ This does semantic search on the first message. You only need context on subsequ
         text = `✓ session initialized in ${roundTripMs}ms\n\n${text}`;
       }
 
+      // Return clean text output - no verbose JSON structuredContent
       return {
         content: [{ type: "text" as const, text }],
-        structuredContent: toStructured(result),
       };
     }
   );
@@ -5288,12 +5299,6 @@ Memory: events(crud) nodes(knowledge) search(find) decisions(choices)`,
 
       return {
         content: [{ type: "text" as const, text: catalog + bundleInfo }],
-        structuredContent: {
-          format,
-          catalog,
-          progressive_mode: PROGRESSIVE_MODE,
-          bundles: PROGRESSIVE_MODE ? getBundleInfo() : undefined,
-        },
       };
     }
   );
@@ -5316,7 +5321,7 @@ Use this to understand how the user likes to work and adapt your responses accor
       const result = await client.getUserContext({ workspace_id: workspaceId });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -5382,7 +5387,7 @@ Optionally generates AI editor rules for automatic ContextStream usage.`,
 
       return {
         content: [{ type: "text" as const, text: formatContent(response) }],
-        structuredContent: toStructured(response),
+        
       };
     }
   );
@@ -5545,7 +5550,7 @@ Behavior:
 
       return {
         content: [{ type: "text" as const, text: formatContent(response) }],
-        structuredContent: toStructured(response),
+        
       };
     }
   );
@@ -5642,7 +5647,7 @@ Use this to persist decisions, insights, preferences, or important information.`
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -5781,7 +5786,7 @@ The snapshot is automatically prioritized during post-compaction session_init.`,
 
       return {
         content: [{ type: "text" as const, text: formatContent(response) }],
-        structuredContent: toStructured(response),
+        
       };
     }
   );
@@ -5866,7 +5871,7 @@ Use this in combination with session_init(is_post_compact=true) for seamless con
 
           return {
             content: [{ type: "text" as const, text: formatContent(response) }],
-            structuredContent: toStructured(response),
+            
           };
         }
 
@@ -5927,7 +5932,7 @@ Use this in combination with session_init(is_post_compact=true) for seamless con
 
         return {
           content: [{ type: "text" as const, text: formatContent(response) }],
-          structuredContent: toStructured(response),
+          
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -6037,10 +6042,6 @@ The lesson will be tagged with 'lesson' and stored with structured metadata for 
               text: `ℹ️ Duplicate lesson capture ignored: "${input.title}" was already recorded recently.`,
             },
           ],
-          structuredContent: {
-            deduped: true,
-            title: input.title,
-          },
         };
       }
 
@@ -6081,7 +6082,7 @@ The lesson will be tagged with 'lesson' and stored with structured metadata for 
             text: `✅ Lesson captured: "${input.title}"\n\nThis lesson will be surfaced in future sessions when relevant context is detected.`,
           },
         ],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -6166,7 +6167,7 @@ Returns lessons filtered by:
       if (lessons.length === 0) {
         return {
           content: [{ type: "text" as const, text: "No lessons found matching your criteria." }],
-          structuredContent: toStructured({ lessons: [], count: 0 }),
+          
         };
       }
 
@@ -6208,7 +6209,7 @@ Returns lessons filtered by:
             text: `📚 Found ${lessons.length} lesson(s):\n\n${formattedLessons}`,
           },
         ],
-        structuredContent: toStructured({ lessons, count: lessons.length }),
+        
       };
     }
   );
@@ -6250,7 +6251,7 @@ Returns memory matches, relevant code, and related decisions in one call.`,
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -6308,7 +6309,7 @@ Example: "Remember that I prefer TypeScript strict mode" or "Remember we decided
       });
       return {
         content: [{ type: "text" as const, text: `Remembered: ${input.content.slice(0, 100)}...` }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -6349,7 +6350,7 @@ Example: "What were the auth decisions?" or "What are my TypeScript preferences?
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -6581,7 +6582,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
 
       return {
         content: [{ type: "text" as const, text: formatContent(summary) }],
-        structuredContent: toStructured(summary),
+        
       };
     }
   );
@@ -6699,7 +6700,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
 
       return {
         content: [{ type: "text" as const, text: formatContent(summary) }],
-        structuredContent: toStructured(summary),
+        
       };
     }
   );
@@ -6745,7 +6746,7 @@ For specific details, use session_recall or session_smart_search.`,
       // Return the summary as plain text for easy inclusion in prompts
       return {
         content: [{ type: "text" as const, text: result.summary }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -6825,7 +6826,7 @@ After compression, the AI can use session_recall to retrieve this context in fut
 
       return {
         content: [{ type: "text" as const, text: summary }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -6893,7 +6894,7 @@ Example: ai_context_budget(query="authentication", max_tokens=1000)`,
 
       return {
         content: [{ type: "text" as const, text: result.context + footer }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -6952,7 +6953,7 @@ Use case: AI can track what's new since last session_init.`,
 
       return {
         content: [{ type: "text" as const, text: summary }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7152,12 +7153,6 @@ This saves ~80% tokens compared to including full chat history.`,
       const rulesWarningLine = generateRulesUpdateWarning(rulesNotice);
       const versionWarningLine = generateVersionUpdateWarning(versionNotice ?? null);
 
-      const enrichedResult = {
-        ...result,
-        ...(rulesNotice ? { rules_notice: rulesNotice } : {}),
-        ...(versionNotice ? { version_notice: versionNotice } : {}),
-      };
-
       // Track token savings (fire-and-forget)
       // context_smart is the most frequently called tool, so tracking is important
       trackToolTokenSavings(client, "context_smart", result.context, {
@@ -7239,6 +7234,55 @@ The conversation may compact soon. Save important decisions, insights, and progr
           contextPressureWarning = `\n\n⚠️ [CONTEXT PRESSURE: HIGH] ${cp.usage_percent}% of context used (${cp.session_tokens}/${cp.threshold} tokens)
 Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important decisions and conversation state soon." : cp.suggested_action}`;
         }
+
+        // Auto-save on medium+ pressure with smart triggers
+        if ((cp.level === "medium" || cp.level === "high" || cp.level === "critical") && workspaceId) {
+          contextCallsSinceLastSave++;
+          const now = Date.now();
+          const timeSinceLastSave = now - lastAutoSaveTime;
+          const pressureLevelIncreased =
+            (lastAutoSavePressureLevel === "" && cp.level !== "low") ||
+            (lastAutoSavePressureLevel === "medium" && (cp.level === "high" || cp.level === "critical")) ||
+            (lastAutoSavePressureLevel === "high" && cp.level === "critical");
+
+          // Save if: pressure level increased, OR enough calls since last save, OR enough time passed
+          const shouldSave =
+            (pressureLevelIncreased && timeSinceLastSave > AUTO_SAVE_MIN_INTERVAL_MS) ||
+            (contextCallsSinceLastSave >= AUTO_SAVE_CALL_INTERVAL) ||
+            (timeSinceLastSave > AUTO_SAVE_MIN_INTERVAL_MS * 2.5); // 5 min fallback
+
+          if (shouldSave) {
+            const trigger = pressureLevelIncreased ? "pressure_increase" :
+                           (contextCallsSinceLastSave >= AUTO_SAVE_CALL_INTERVAL ? "call_count" : "time_interval");
+
+            lastAutoSaveTime = now;
+            lastAutoSavePressureLevel = cp.level;
+            contextCallsSinceLastSave = 0;
+
+            // Fire-and-forget background save
+            client.captureMemoryEvent({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              event_type: "session_snapshot",
+              title: `Auto-save at ${cp.usage_percent}% context (${trigger})`,
+              content: JSON.stringify({
+                captured_at: new Date().toISOString(),
+                trigger,
+                context_pressure: cp,
+                session_tokens: cp.session_tokens,
+                calls_since_last_save: contextCallsSinceLastSave,
+                user_message_preview: input.user_message.slice(0, 100),
+              }),
+              tags: ["auto_save", "session_snapshot"],
+            }).catch((err) => logDebug(`Auto-save failed: ${err}`));
+            logDebug(`Auto-save triggered: ${trigger} at ${cp.usage_percent}%`);
+          }
+        } else {
+          // Reset tracking when pressure is low
+          if (cp.level === "low") {
+            contextCallsSinceLastSave = 0;
+          }
+        }
       }
 
       // Use server-provided warnings from Enhanced Context filtering (lessons, risky actions)
@@ -7248,6 +7292,35 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
         ? "\n\n" + serverWarnings.map(w => `⚠️ ${w}`).join("\n")
         : "";
 
+      // Generate semantic intent hints for AI (risk, decision capture suggestions)
+      let semanticHints = "";
+      if (result.semantic_intent) {
+        const si = result.semantic_intent;
+        const hints: string[] = [];
+
+        // Risk level warning
+        if (si.risk_level === "high" || si.risk_level === "critical") {
+          hints.push(`[RISK:${si.risk_level.toUpperCase()}] ${si.explanation || "Proceed with caution"}`);
+        }
+
+        // Decision/capture suggestions
+        if (si.decision_detected && si.capture_worthy) {
+          const captureType = si.suggested_capture_type || "decision";
+          const title = si.suggested_capture_title || "";
+          hints.push(`[CAPTURE] Decision detected - consider session(action="capture", event_type="${captureType}"${title ? `, title="${title}"` : ""})`);
+        } else if (si.capture_worthy) {
+          const captureType = si.suggested_capture_type || "insight";
+          hints.push(`[CAPTURE] Consider capturing this as ${captureType}`);
+        }
+
+        if (hints.length > 0) {
+          semanticHints = "\n\n" + hints.join("\n");
+        }
+      }
+
+      // Include dynamic instructions from SmartRouter if present
+      const instructionsLine = result.instructions ? `\n\n[INSTRUCTIONS] ${result.instructions}` : "";
+
       // Combine all warnings (only add non-empty ones with proper spacing)
       // Server warnings take precedence, but we keep client-side detection as fallback
       const allWarnings = [
@@ -7255,23 +7328,33 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
         rulesWarningLine ? `\n\n${rulesWarningLine}` : "",
         versionWarningLine ? `\n\n${versionWarningLine}` : "",
         contextPressureWarning,
+        semanticHints,
+        instructionsLine,
         searchRulesLine,
       ].filter(Boolean).join("");
 
       // Include post-compact context if restored
       const finalContext = postCompactContext + result.context;
-      const enrichedResultWithRestore = postCompactRestored
-        ? { ...enrichedResult, post_compact_restored: true }
-        : enrichedResult;
+
+      // Build complete output with clean summary + full data (no value lost)
+      const textParts = [
+        finalContext,
+        footer,
+        allWarnings,
+      ];
+
+      // Include full result data to ensure no value is lost
+      // This includes: workspace_id, project_id, items, semantic_intent details, context_pressure details
+      const fullDataSection = `\n\n--- Full Response Data ---\n${formatContent(result)}`;
+      textParts.push(fullDataSection);
 
       return {
         content: [
           {
             type: "text" as const,
-            text: finalContext + footer + allWarnings,
+            text: textParts.join(""),
           },
         ],
-        structuredContent: toStructured(enrichedResultWithRestore),
       };
     }
   );
@@ -7312,7 +7395,7 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
 
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7344,7 +7427,7 @@ Use this to understand Slack activity and engagement patterns.`,
       const result = await client.slackStats({ workspace_id: workspaceId, days: input.days });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7370,7 +7453,7 @@ Returns: channel names, message counts, thread counts, and last activity timesta
       const result = await client.slackChannels({ workspace_id: workspaceId });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7400,7 +7483,7 @@ Returns: user profiles with message counts, sorted by activity level.`,
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7435,7 +7518,7 @@ Can filter by channel.`,
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7466,7 +7549,7 @@ Useful for finding important conversations and decisions.`,
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7499,7 +7582,7 @@ Use this to find specific conversations or topics.`,
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7531,7 +7614,7 @@ Also auto-maps Slack users to ContextStream users by email.`,
             text: `✅ Synced ${result.synced_users} Slack users, auto-mapped ${result.auto_mapped} by email.`,
           },
         ],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7562,7 +7645,7 @@ Use this to understand GitHub activity and engagement patterns across synced rep
       const result = await client.githubStats({ workspace_id: workspaceId });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7588,7 +7671,7 @@ Returns: repository names with issue, PR, release, and comment counts, plus last
       const result = await client.githubRepos({ workspace_id: workspaceId });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7618,7 +7701,7 @@ Returns: usernames with contribution counts, sorted by activity level.`,
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7658,7 +7741,7 @@ Can filter by repository or type (issue, pull_request, release, comment).`,
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7695,7 +7778,7 @@ Can filter by state (open/closed) or repository.`,
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7728,7 +7811,7 @@ Use this to find specific issues, PRs, or discussions.`,
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7779,7 +7862,7 @@ Example queries:
       }
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7830,7 +7913,7 @@ Example queries:
       }
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7868,7 +7951,7 @@ Example prompts:
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7906,7 +7989,7 @@ Example prompts:
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -7963,7 +8046,7 @@ Example prompts:
             text: `Page created successfully!\n\nTitle: ${result.title}\nURL: ${result.url}\nID: ${result.id}\nCreated: ${result.created_time}`,
           },
         ],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -8014,7 +8097,7 @@ Example prompts:
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -8050,7 +8133,7 @@ Example prompts:
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -8095,7 +8178,7 @@ Example prompts:
       });
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -8160,7 +8243,7 @@ Use this to verify integrations are healthy and syncing properly.`,
 
       return {
         content: [{ type: "text" as const, text: formatted }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -8205,7 +8288,7 @@ Use this to see what reminders you have set.`,
       }
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -8262,7 +8345,7 @@ Use this to see what reminders need attention now.`,
 
       return {
         content: [{ type: "text" as const, text: header + formatted }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -8317,7 +8400,7 @@ Example: Create a reminder to "Review PR #123" for tomorrow at 10am with high pr
             text: `✅ Reminder created: "${result.title}"\nDue: ${due}\nPriority: ${result.priority}\nID: ${result.id}`,
           },
         ],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -8348,7 +8431,7 @@ Common snooze durations:
       const snoozedUntil = new Date(result.snoozed_until).toLocaleString();
       return {
         content: [{ type: "text" as const, text: `😴 Reminder snoozed until ${snoozedUntil}` }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -8370,7 +8453,7 @@ Use this when the task or action associated with the reminder is done.`,
 
       return {
         content: [{ type: "text" as const, text: `✅ Reminder completed!` }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -8392,7 +8475,7 @@ Use this to remove a reminder that is no longer relevant.`,
 
       return {
         content: [{ type: "text" as const, text: `🗑️ Reminder dismissed.` }],
-        structuredContent: toStructured(result),
+        
       };
     }
   );
@@ -8486,8 +8569,44 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         }
 
         const roundTripMs = Date.now() - startTime;
-        const timingSummary = formatTimingSummary(roundTripMs, getResultCount(result));
-        const outputText = timingSummary + formatContent(result);
+
+        // Build clean summary + full data (no value lost)
+        const data = (result as any)?.data || result;
+        const results = data?.results || [];
+        const total = data?.total ?? results.length;
+
+        const lines: string[] = [];
+
+        // Clean summary header
+        if (SHOW_TIMING) {
+          lines.push(`✓ ${total} results in ${roundTripMs}ms`);
+        } else {
+          lines.push(`🔍 ${total} results for "${input.query}"`);
+        }
+
+        // Quick reference list
+        if (results.length > 0) {
+          lines.push("");
+          results.forEach((r: any, i: number) => {
+            const filePath = r.file_path || "";
+            const startLine = r.start_line || r.metadata?.start_line || "";
+            const location = startLine ? `${filePath}:${startLine}` : (r.location || filePath || r.breadcrumb || "");
+            const language = r.language || r.metadata?.language || "";
+            const score = r.score ? `${(r.score * 100).toFixed(0)}%` : "";
+            const langTag = language ? `[${language}]` : "";
+            lines.push(`${i + 1}. ${location} ${langTag} ${score}`.trim());
+          });
+        } else {
+          lines.push("");
+          lines.push("No results found. Try a different query or search mode.");
+        }
+
+        // Full data preserved below summary (no value lost)
+        lines.push("");
+        lines.push("--- Full Results ---");
+        lines.push(formatContent(result));
+
+        const outputText = lines.join("\n");
 
         // Track token savings (fire-and-forget)
         trackToolTokenSavings(client, toolType, outputText, {
@@ -8497,7 +8616,6 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
         return {
           content: [{ type: "text" as const, text: outputText }],
-          structuredContent: toStructured(result),
         };
       }
     );
@@ -8656,7 +8774,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8723,7 +8841,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8739,7 +8857,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8762,7 +8880,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8781,7 +8899,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8794,7 +8912,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8813,7 +8931,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8828,7 +8946,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8844,7 +8962,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8867,7 +8985,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8884,7 +9002,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8911,7 +9029,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8925,7 +9043,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8946,7 +9064,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -8962,7 +9080,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9037,7 +9155,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
               return {
                 content: [{ type: "text" as const, text: formatContent(response) }],
-                structuredContent: toStructured(response),
+                
               };
             }
 
@@ -9153,7 +9271,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
             return {
               content: [{ type: "text" as const, text: formatContent(response) }],
-              structuredContent: toStructured(response),
+              
             };
           }
 
@@ -9331,7 +9449,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9342,7 +9460,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.getMemoryEvent(input.event_id);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9357,7 +9475,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9368,7 +9486,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.deleteMemoryEvent(input.event_id);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9380,7 +9498,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9410,7 +9528,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   text: `✅ Imported ${count} event(s) successfully.\n\n${formatContent(result)}`,
                 },
               ],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9421,7 +9539,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.distillMemoryEvent(input.event_id);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9439,7 +9557,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9450,7 +9568,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.getKnowledgeNode(input.node_id);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9464,7 +9582,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9475,7 +9593,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.deleteKnowledgeNode(input.node_id);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9487,7 +9605,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9501,7 +9619,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9523,7 +9641,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9542,7 +9660,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9558,7 +9676,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9574,7 +9692,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9602,7 +9720,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9615,7 +9733,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9639,7 +9757,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9652,7 +9770,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9670,7 +9788,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9689,7 +9807,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9788,7 +9906,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9808,7 +9926,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9829,7 +9947,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9851,7 +9969,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9867,7 +9985,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9879,7 +9997,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9893,7 +10011,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9904,7 +10022,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.findCircularDependencies(projectId);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9915,7 +10033,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.findUnusedCode(projectId);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9926,7 +10044,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.findContradictions(input.node_id);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9988,7 +10106,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -9999,7 +10117,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.getProject(projectId);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10014,7 +10132,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10028,7 +10146,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10039,7 +10157,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.indexProject(projectId);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10050,7 +10168,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.projectOverview(projectId);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10061,7 +10179,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.projectStatistics(projectId);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10072,7 +10190,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.projectFiles(projectId);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10083,7 +10201,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.projectIndexStatus(projectId);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10119,7 +10237,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   text: `Ingestion started in background for directory: ${validPath.resolvedPath}. Use 'project' with action 'index_status' to monitor progress.`,
                 },
               ],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10164,7 +10282,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10175,7 +10293,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.getWorkspace(input.workspace_id);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10191,7 +10309,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10220,7 +10338,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             }
             return {
               content: [{ type: "text" as const, text: formatContent(wsResult) }],
-              structuredContent: toStructured(wsResult),
+              
             };
           }
 
@@ -10275,7 +10393,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10288,7 +10406,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10308,7 +10426,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10322,7 +10440,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10335,7 +10453,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10348,7 +10466,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10452,7 +10570,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.integrationsStatus(params);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10468,7 +10586,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               });
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else if (input.provider === "github") {
               const result = await client.githubSearch({
@@ -10478,7 +10596,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               });
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else {
               const result = await client.integrationsSearch({
@@ -10488,7 +10606,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               });
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             }
           }
@@ -10498,13 +10616,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               const result = await client.slackStats(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else if (input.provider === "github") {
               const result = await client.githubStats(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else if (input.provider === "notion") {
               const result = await client.notionStats({
@@ -10513,7 +10631,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               });
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             }
             return errorResult("stats requires provider: slack, github, or notion");
@@ -10524,13 +10642,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               const result = await client.slackActivity(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else if (input.provider === "github") {
               const result = await client.githubActivity(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else if (input.provider === "notion") {
               const result = await client.notionActivity({
@@ -10540,7 +10658,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               });
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             }
             return errorResult("activity requires provider: slack, github, or notion");
@@ -10551,13 +10669,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               const result = await client.slackContributors(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else if (input.provider === "github") {
               const result = await client.githubContributors(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             }
             return errorResult("contributors requires provider: slack or github");
@@ -10568,13 +10686,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               const result = await client.slackKnowledge(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else if (input.provider === "github") {
               const result = await client.githubKnowledge(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else if (input.provider === "notion") {
               const result = await client.notionKnowledge({
@@ -10584,13 +10702,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               });
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else {
               const result = await client.integrationsKnowledge(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             }
           }
@@ -10600,13 +10718,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               const result = await client.slackSummary(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else if (input.provider === "github") {
               const result = await client.githubSummary(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else if (input.provider === "notion") {
               const result = await client.notionSummary({
@@ -10616,13 +10734,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               });
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             } else {
               const result = await client.integrationsSummary(params);
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             }
           }
@@ -10634,7 +10752,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.slackChannels(params);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10645,7 +10763,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.slackDiscussions(params);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10656,7 +10774,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.slackSyncUsers(params);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10667,7 +10785,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.githubRepos(params);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10678,7 +10796,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.githubIssues(params);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10709,7 +10827,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   text: `Page created successfully!\n\nTitle: ${result.title}\nURL: ${result.url}\nID: ${result.id}\nCreated: ${result.created_time}`,
                 },
               ],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -10741,7 +10859,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   text: `Created database "${newDatabase.title}"\nID: ${newDatabase.id}\nURL: ${newDatabase.url}`,
                 },
               ],
-              structuredContent: toStructured(newDatabase),
+              
             };
           }
 
@@ -10759,7 +10877,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(databases) }],
-              structuredContent: toStructured(databases),
+              
             };
           }
 
@@ -10785,7 +10903,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(pages) }],
-              structuredContent: toStructured(pages),
+              
             };
           }
 
@@ -10812,7 +10930,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   text: `# ${page.title}\n\nID: ${page.id}\nURL: ${page.url}\nCreated: ${page.created_time}\nLast edited: ${page.last_edited_time}\n\n---\n\n${page.content}`,
                 },
               ],
-              structuredContent: toStructured(page),
+              
             };
           }
 
@@ -10837,7 +10955,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(queryResult) }],
-              structuredContent: toStructured(queryResult),
+              
             };
           }
 
@@ -10867,7 +10985,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   text: `Page updated successfully!\n\nTitle: ${updatedPage.title}\nURL: ${updatedPage.url}\nID: ${updatedPage.id}\nLast edited: ${updatedPage.last_edited_time}`,
                 },
               ],
-              structuredContent: toStructured(updatedPage),
+              
             };
           }
 
@@ -11064,7 +11182,7 @@ Example workflow:
                       text: `✅ Media uploaded successfully!\n\nContent ID: ${uploadInit.content_id}\nFilename: ${filename}\nType: ${contentType}\nSize: ${(fileStats.size / 1024 / 1024).toFixed(2)} MB\n\nIndexing has been triggered. Use media(action='status', content_id='${uploadInit.content_id}') to check progress.`,
                     },
                   ],
-                  structuredContent: toStructured(result),
+                  
                 };
               } catch (err) {
                 const errMsg = err instanceof Error ? err.message : String(err);
@@ -11083,7 +11201,7 @@ Example workflow:
             };
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -11123,7 +11241,7 @@ Example workflow:
                     text: `${statusEmoji} ${content.filename}\n\nStatus: ${statusMessage}\nContent ID: ${content.id}\nType: ${content.content_type}\nSize: ${(content.size_bytes / 1024 / 1024).toFixed(2)} MB\nCreated: ${content.created_at}`,
                   },
                 ],
-                structuredContent: toStructured(content),
+                
               };
             } catch (err) {
               const errMsg = err instanceof Error ? err.message : String(err);
@@ -11156,7 +11274,7 @@ Example workflow:
                       text: `No results found for: "${input.query}"\n\nTry a different query or check that you have indexed media content.`,
                     },
                   ],
-                  structuredContent: toStructured(searchResult),
+                  
                 };
               }
 
@@ -11186,7 +11304,7 @@ Example workflow:
                     text: `Found ${searchResult.total} result(s) for: "${input.query}"\n\n${resultsText}`,
                   },
                 ],
-                structuredContent: toStructured(searchResult),
+                
               };
             } catch (err) {
               const errMsg = err instanceof Error ? err.message : String(err);
@@ -11249,7 +11367,7 @@ Example workflow:
 
               return {
                 content: [{ type: "text" as const, text: outputText }],
-                structuredContent: toStructured(clipResult),
+                
               };
             } catch (err) {
               const errMsg = err instanceof Error ? err.message : String(err);
@@ -11278,7 +11396,7 @@ Example workflow:
                       text: "No media content found.\n\nUse media(action='index', file_path='...') to index media files.",
                     },
                   ],
-                  structuredContent: toStructured(listResult),
+                  
                 };
               }
 
@@ -11298,7 +11416,7 @@ Example workflow:
                     text: `📚 Media Library (${listResult.total} items)\n\n${itemsText}`,
                   },
                 ],
-                structuredContent: toStructured(listResult),
+                
               };
             } catch (err) {
               const errMsg = err instanceof Error ? err.message : String(err);
@@ -11330,7 +11448,7 @@ Example workflow:
                       : `⚠️ Content may not have been deleted.\n\nContent ID: ${input.content_id}`,
                   },
                 ],
-                structuredContent: toStructured(deleteResult),
+                
               };
             } catch (err) {
               const errMsg = err instanceof Error ? err.message : String(err);
@@ -11409,12 +11527,6 @@ Example workflow:
 
             return {
               content: [{ type: "text" as const, text: catalog + consolidatedInfo }],
-              structuredContent: {
-                format,
-                catalog,
-                consolidated_mode: CONSOLIDATED_MODE,
-                domain_tools: CONSOLIDATED_MODE ? Array.from(CONSOLIDATED_TOOLS) : undefined,
-              },
             };
           }
 
@@ -11422,7 +11534,7 @@ Example workflow:
             const result = await client.me();
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -11430,7 +11542,7 @@ Example workflow:
             const result = { name: "contextstream-mcp", version: VERSION };
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -11474,7 +11586,7 @@ Example workflow:
 
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 
@@ -11493,7 +11605,7 @@ Example workflow:
               };
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-                structuredContent: toStructured(result),
+                
               };
             }
 
@@ -11526,7 +11638,7 @@ Example workflow:
             const result = enableBundle(input.bundle);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              structuredContent: toStructured(result),
+              
             };
           }
 

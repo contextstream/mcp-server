@@ -448,7 +448,7 @@ export class SessionManager {
     const parts: string[] = [];
 
     parts.push("═══════════════════════════════════════════");
-    parts.push("🧠 AUTO-CONTEXT LOADED (ContextStream)");
+    parts.push("⬡ SMART CONTEXT (ContextStream)");
     parts.push("═══════════════════════════════════════════");
 
     // Status
@@ -542,7 +542,7 @@ export class SessionManager {
       | undefined;
     if (memory?.items && memory.items.length > 0) {
       parts.push("");
-      parts.push("🧠 Recent Context:");
+      parts.push("📋 Recent Context:");
       memory.items.slice(0, 3).forEach((m) => {
         const title = m.title || "Note";
         const type = m.event_type || "";

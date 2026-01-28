@@ -59,8 +59,10 @@ All rules are served dynamically via \`context\`. This file is minimal by design
 
 | Message | What to Call |
 |---------|--------------|
-| **1st message** | \`init(folder_path="<cwd>", context_hint="<msg>")\` then \`context(user_message="<msg>")\` |
+| **1st message** | \`init()\` then \`context(user_message="<msg>")\` |
 | **2nd+ messages** | \`context(user_message="<msg>")\` |
+
+Note: \`init()\` auto-detects folder from IDE. Only pass \`folder_path\` if auto-detection fails.
 
 ### Follow the Instructions Field
 

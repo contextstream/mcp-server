@@ -69,9 +69,13 @@ Usage:
   contextstream-mcp hook <hook-name>
 
 Commands:
-  setup              Interactive onboarding wizard (rules + workspace mapping)
-  http               Run HTTP MCP gateway (streamable HTTP transport)
-  hook post-write    PostToolUse hook for real-time file indexing
+  setup                      Interactive onboarding wizard (rules + workspace mapping)
+  http                       Run HTTP MCP gateway (streamable HTTP transport)
+  hook pre-tool-use          PreToolUse hook - blocks discovery tools, redirects to ContextStream
+  hook user-prompt-submit    UserPromptSubmit hook - injects ContextStream rules reminder
+  hook media-aware           Media-aware hook - detects media prompts, injects media tool guidance
+  hook pre-compact           PreCompact hook - saves conversation state before compaction
+  hook post-write            PostToolUse hook - real-time file indexing after Edit/Write
 
 Environment variables:
   CONTEXTSTREAM_API_URL   Base API URL (e.g. https://api.contextstream.io)
@@ -166,18 +170,40 @@ async function main() {
     return;
   }
 
-  // Hook command: runs editor hooks for real-time indexing
+  // Hook command: runs editor hooks (Node.js-based, no Python dependency)
   if (args[0] === "hook") {
     const hookName = args[1];
-    if (hookName === "post-write") {
-      // Dynamically import to avoid loading hook code in normal MCP mode
-      const { runPostWriteHook } = await import("./hooks/post-write.js");
-      await runPostWriteHook();
-      return;
+    switch (hookName) {
+      case "post-write": {
+        const { runPostWriteHook } = await import("./hooks/post-write.js");
+        await runPostWriteHook();
+        return;
+      }
+      case "pre-tool-use": {
+        const { runPreToolUseHook } = await import("./hooks/pre-tool-use.js");
+        await runPreToolUseHook();
+        return;
+      }
+      case "user-prompt-submit": {
+        const { runUserPromptSubmitHook } = await import("./hooks/user-prompt-submit.js");
+        await runUserPromptSubmitHook();
+        return;
+      }
+      case "media-aware": {
+        const { runMediaAwareHook } = await import("./hooks/media-aware.js");
+        await runMediaAwareHook();
+        return;
+      }
+      case "pre-compact": {
+        const { runPreCompactHook } = await import("./hooks/pre-compact.js");
+        await runPreCompactHook();
+        return;
+      }
+      default:
+        console.error(`Unknown hook: ${hookName}`);
+        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-write");
+        process.exit(1);
     }
-    console.error(`Unknown hook: ${hookName}`);
-    console.error("Available hooks: post-write");
-    process.exit(1);
   }
 
   // Try to load saved credentials if env vars not set

@@ -543,18 +543,13 @@ export function getHooksDir(): string {
 
 /**
  * Build the hooks configuration for Claude Code settings.
+ * All hooks now run via Node.js (npx) - no Python dependency required.
  */
 export function buildHooksConfig(options?: {
   includePreCompact?: boolean;
   includeMediaAware?: boolean;
   includePostWrite?: boolean;
 }): ClaudeHooksConfig["hooks"] {
-  const hooksDir = getHooksDir();
-  const preToolUsePath = path.join(hooksDir, "contextstream-redirect.py");
-  const userPromptPath = path.join(hooksDir, "contextstream-reminder.py");
-  const preCompactPath = path.join(hooksDir, "contextstream-precompact.py");
-  const mediaAwarePath = path.join(hooksDir, "contextstream-media-aware.py");
-
   // Build UserPromptSubmit hooks array - always include reminder
   const userPromptHooks: ClaudeHookMatcher[] = [
     {
@@ -562,7 +557,7 @@ export function buildHooksConfig(options?: {
       hooks: [
         {
           type: "command",
-          command: `python3 "${userPromptPath}"`,
+          command: "npx @contextstream/mcp-server hook user-prompt-submit",
           timeout: 5,
         },
       ],
@@ -576,7 +571,7 @@ export function buildHooksConfig(options?: {
       hooks: [
         {
           type: "command",
-          command: `python3 "${mediaAwarePath}"`,
+          command: "npx @contextstream/mcp-server hook media-aware",
           timeout: 5,
         },
       ],
@@ -590,7 +585,7 @@ export function buildHooksConfig(options?: {
         hooks: [
           {
             type: "command",
-            command: `python3 "${preToolUsePath}"`,
+            command: "npx @contextstream/mcp-server hook pre-tool-use",
             timeout: 5,
           },
         ],
@@ -608,7 +603,7 @@ export function buildHooksConfig(options?: {
         hooks: [
           {
             type: "command",
-            command: `python3 "${preCompactPath}"`,
+            command: "npx @contextstream/mcp-server hook pre-compact",
             timeout: 10,
           },
         ],
@@ -638,37 +633,33 @@ export function buildHooksConfig(options?: {
 
 /**
  * Install hook scripts to ~/.claude/hooks/
+ *
+ * NOTE: As of v0.4.46+, all hooks run via npx @contextstream/mcp-server hook <name>
+ * so no Python scripts need to be written to disk. This function is kept for
+ * backwards compatibility but now only ensures the hooks directory exists.
+ *
+ * @deprecated Hooks no longer require script files - they run via npx
  */
 export async function installHookScripts(options?: {
   includePreCompact?: boolean;
   includeMediaAware?: boolean;
 }): Promise<{ preToolUse: string; userPrompt: string; preCompact?: string; mediaAware?: string }> {
+  // Ensure hooks directory exists (for any legacy scripts)
   const hooksDir = getHooksDir();
   await fs.mkdir(hooksDir, { recursive: true });
 
-  const preToolUsePath = path.join(hooksDir, "contextstream-redirect.py");
-  const userPromptPath = path.join(hooksDir, "contextstream-reminder.py");
-  const preCompactPath = path.join(hooksDir, "contextstream-precompact.py");
-  const mediaAwarePath = path.join(hooksDir, "contextstream-media-aware.py");
-
-  await fs.writeFile(preToolUsePath, PRETOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
-  await fs.writeFile(userPromptPath, USER_PROMPT_HOOK_SCRIPT, { mode: 0o755 });
-
+  // Return placeholder paths - actual hooks run via npx commands
   const result: { preToolUse: string; userPrompt: string; preCompact?: string; mediaAware?: string } = {
-    preToolUse: preToolUsePath,
-    userPrompt: userPromptPath,
+    preToolUse: "npx @contextstream/mcp-server hook pre-tool-use",
+    userPrompt: "npx @contextstream/mcp-server hook user-prompt-submit",
   };
 
-  // Install PreCompact hook script if requested
   if (options?.includePreCompact) {
-    await fs.writeFile(preCompactPath, PRECOMPACT_HOOK_SCRIPT, { mode: 0o755 });
-    result.preCompact = preCompactPath;
+    result.preCompact = "npx @contextstream/mcp-server hook pre-compact";
   }
 
-  // Install Media-Aware hook script (enabled by default for creative workflows)
   if (options?.includeMediaAware !== false) {
-    await fs.writeFile(mediaAwarePath, MEDIA_AWARE_HOOK_SCRIPT, { mode: 0o755 });
-    result.mediaAware = mediaAwarePath;
+    result.mediaAware = "npx @contextstream/mcp-server hook media-aware";
   }
 
   return result;
@@ -735,7 +726,8 @@ export function mergeHooksIntoSettings(
 
 /**
  * Install ContextStream hooks for Claude Code.
- * This installs the hook scripts and updates settings.
+ * All hooks now run via npx @contextstream/mcp-server hook <name> - no Python required.
+ * This function updates settings.json with the hook configuration.
  */
 export async function installClaudeCodeHooks(options: {
   scope: "user" | "project" | "both";
@@ -747,31 +739,19 @@ export async function installClaudeCodeHooks(options: {
 }): Promise<{ scripts: string[]; settings: string[] }> {
   const result = { scripts: [] as string[], settings: [] as string[] };
 
-  // Install hook scripts
-  if (!options.dryRun) {
-    const scripts = await installHookScripts({
-      includePreCompact: options.includePreCompact,
-      includeMediaAware: options.includeMediaAware
-    });
-    result.scripts.push(scripts.preToolUse, scripts.userPrompt);
-    if (scripts.preCompact) {
-      result.scripts.push(scripts.preCompact);
-    }
-    if (scripts.mediaAware) {
-      result.scripts.push(scripts.mediaAware);
-    }
-  } else {
-    const hooksDir = getHooksDir();
-    result.scripts.push(
-      path.join(hooksDir, "contextstream-redirect.py"),
-      path.join(hooksDir, "contextstream-reminder.py")
-    );
-    if (options.includePreCompact) {
-      result.scripts.push(path.join(hooksDir, "contextstream-precompact.py"));
-    }
-    if (options.includeMediaAware !== false) {
-      result.scripts.push(path.join(hooksDir, "contextstream-media-aware.py"));
-    }
+  // All hooks run via npx - list the commands that will be configured
+  result.scripts.push(
+    "npx @contextstream/mcp-server hook pre-tool-use",
+    "npx @contextstream/mcp-server hook user-prompt-submit"
+  );
+  if (options.includePreCompact) {
+    result.scripts.push("npx @contextstream/mcp-server hook pre-compact");
+  }
+  if (options.includeMediaAware !== false) {
+    result.scripts.push("npx @contextstream/mcp-server hook media-aware");
+  }
+  if (options.includePostWrite !== false) {
+    result.scripts.push("npx @contextstream/mcp-server hook post-write");
   }
 
   const hooksConfig = buildHooksConfig({
@@ -812,21 +792,22 @@ export function generateHooksDocumentation(): string {
   return `
 ## Claude Code Hooks (ContextStream)
 
-ContextStream installs hooks to help enforce ContextStream-first behavior:
+ContextStream installs hooks to enforce ContextStream-first behavior.
+All hooks run via Node.js - no Python dependency required.
 
 ### PreToolUse Hook
-- **File:** \`~/.claude/hooks/contextstream-redirect.py\`
+- **Command:** \`npx @contextstream/mcp-server hook pre-tool-use\`
 - **Purpose:** Blocks Glob/Grep/Search/EnterPlanMode and redirects to ContextStream
 - **Blocked tools:** Glob, Grep, Search, Task(Explore), Task(Plan), EnterPlanMode
 - **Disable:** Set \`CONTEXTSTREAM_HOOK_ENABLED=false\` environment variable
 
 ### UserPromptSubmit Hook
-- **File:** \`~/.claude/hooks/contextstream-reminder.py\`
+- **Command:** \`npx @contextstream/mcp-server hook user-prompt-submit\`
 - **Purpose:** Injects a reminder about ContextStream rules on every message
 - **Disable:** Set \`CONTEXTSTREAM_REMINDER_ENABLED=false\` environment variable
 
 ### Media-Aware Hook
-- **File:** \`~/.claude/hooks/contextstream-media-aware.py\`
+- **Command:** \`npx @contextstream/mcp-server hook media-aware\`
 - **Purpose:** Detects media-related prompts and injects media tool guidance
 - **Triggers:** Patterns like video, clips, Remotion, image, audio, creative assets
 - **Disable:** Set \`CONTEXTSTREAM_MEDIA_HOOK_ENABLED=false\` environment variable
@@ -837,15 +818,22 @@ When Media-Aware hook detects media patterns, it injects context about:
 - How to index new media files
 
 ### PreCompact Hook (Optional)
-- **File:** \`~/.claude/hooks/contextstream-precompact.py\`
+- **Command:** \`npx @contextstream/mcp-server hook pre-compact\`
 - **Purpose:** Saves conversation state before context compaction
 - **Triggers:** Both manual (/compact) and automatic compaction
 - **Disable:** Set \`CONTEXTSTREAM_PRECOMPACT_ENABLED=false\` environment variable
-- **Note:** Enable with \`generate_rules(install_hooks=true)\` to activate
+- **Note:** Enable with \`generate_rules(include_pre_compact=true)\` to activate
 
-When PreCompact runs, it injects instructions for the AI to:
-1. Save a session_snapshot with conversation summary, active goals, and decisions
-2. Use \`session_init(is_post_compact=true)\` after compaction to restore context
+When PreCompact runs, it:
+1. Parses the transcript for active files and tool calls
+2. Saves a session_snapshot to ContextStream API
+3. Injects context about using \`session_init(is_post_compact=true)\` after compaction
+
+### PostToolUse Hook (Real-time Indexing)
+- **Command:** \`npx @contextstream/mcp-server hook post-write\`
+- **Purpose:** Indexes files immediately after Edit/Write/NotebookEdit operations
+- **Matcher:** Edit|Write|NotebookEdit
+- **Disable:** Set \`CONTEXTSTREAM_POSTWRITE_ENABLED=false\` environment variable
 
 ### Why Hooks?
 Claude Code has strong built-in behaviors to use its default tools (Grep, Glob, Read)
@@ -856,6 +844,7 @@ Hooks provide:
 3. **Better UX** - Faster searches via indexed ContextStream
 4. **Persistent plans** - ContextStream plans survive across sessions
 5. **Compaction awareness** - Save state before context is compacted
+6. **Real-time indexing** - Files indexed immediately after writes
 
 ### Manual Configuration
 If you prefer to configure manually, add to \`~/.claude/settings.json\`:
@@ -864,21 +853,25 @@ If you prefer to configure manually, add to \`~/.claude/settings.json\`:
   "hooks": {
     "PreToolUse": [{
       "matcher": "Glob|Grep|Search|Task|EnterPlanMode",
-      "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/contextstream-redirect.py"}]
+      "hooks": [{"type": "command", "command": "npx @contextstream/mcp-server hook pre-tool-use"}]
     }],
     "UserPromptSubmit": [
       {
         "matcher": "*",
-        "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/contextstream-reminder.py"}]
+        "hooks": [{"type": "command", "command": "npx @contextstream/mcp-server hook user-prompt-submit"}]
       },
       {
         "matcher": "*",
-        "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/contextstream-media-aware.py"}]
+        "hooks": [{"type": "command", "command": "npx @contextstream/mcp-server hook media-aware"}]
       }
     ],
     "PreCompact": [{
       "matcher": "*",
-      "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/contextstream-precompact.py", "timeout": 10}]
+      "hooks": [{"type": "command", "command": "npx @contextstream/mcp-server hook pre-compact", "timeout": 10}]
+    }],
+    "PostToolUse": [{
+      "matcher": "Edit|Write|NotebookEdit",
+      "hooks": [{"type": "command", "command": "npx @contextstream/mcp-server hook post-write", "timeout": 10}]
     }]
   }
 }
@@ -1176,8 +1169,19 @@ export function getClineHooksDir(scope: "global" | "project", projectPath?: stri
 }
 
 /**
+ * Cline hook wrapper script that calls the Node.js hook via npx.
+ * Cline expects executable scripts with specific names.
+ */
+const CLINE_HOOK_WRAPPER = (hookName: string) => `#!/bin/bash
+# ContextStream ${hookName} Hook Wrapper for Cline/Roo/Kilo Code
+# Calls the Node.js hook via npx
+exec npx @contextstream/mcp-server hook ${hookName}
+`;
+
+/**
  * Install Cline hook scripts.
  * Cline hooks are named after the hook type (no extension).
+ * Scripts are thin wrappers that call the Node.js hooks via npx.
  */
 export async function installClineHookScripts(options: {
   scope: "global" | "project";
@@ -1192,8 +1196,9 @@ export async function installClineHookScripts(options: {
   const userPromptPath = path.join(hooksDir, "UserPromptSubmit");
   const postToolUsePath = path.join(hooksDir, "PostToolUse");
 
-  await fs.writeFile(preToolUsePath, CLINE_PRETOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
-  await fs.writeFile(userPromptPath, CLINE_USER_PROMPT_HOOK_SCRIPT, { mode: 0o755 });
+  // Write thin wrapper scripts that call Node.js hooks via npx
+  await fs.writeFile(preToolUsePath, CLINE_HOOK_WRAPPER("pre-tool-use"), { mode: 0o755 });
+  await fs.writeFile(userPromptPath, CLINE_HOOK_WRAPPER("user-prompt-submit"), { mode: 0o755 });
 
   const result: { preToolUse: string; userPromptSubmit: string; postToolUse?: string } = {
     preToolUse: preToolUsePath,
@@ -1202,7 +1207,7 @@ export async function installClineHookScripts(options: {
 
   // Install PostToolUse hook for real-time indexing (default ON)
   if (options.includePostWrite !== false) {
-    await fs.writeFile(postToolUsePath, CLINE_POSTTOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
+    await fs.writeFile(postToolUsePath, CLINE_HOOK_WRAPPER("post-write"), { mode: 0o755 });
     result.postToolUse = postToolUsePath;
   }
 
@@ -1229,7 +1234,8 @@ export function getRooCodeHooksDir(scope: "global" | "project", projectPath?: st
 }
 
 /**
- * Install Roo Code hook scripts (uses same scripts as Cline).
+ * Install Roo Code hook scripts.
+ * Uses thin wrapper scripts that call Node.js hooks via npx.
  */
 export async function installRooCodeHookScripts(options: {
   scope: "global" | "project";
@@ -1243,8 +1249,9 @@ export async function installRooCodeHookScripts(options: {
   const userPromptPath = path.join(hooksDir, "UserPromptSubmit");
   const postToolUsePath = path.join(hooksDir, "PostToolUse");
 
-  await fs.writeFile(preToolUsePath, CLINE_PRETOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
-  await fs.writeFile(userPromptPath, CLINE_USER_PROMPT_HOOK_SCRIPT, { mode: 0o755 });
+  // Write thin wrapper scripts that call Node.js hooks via npx
+  await fs.writeFile(preToolUsePath, CLINE_HOOK_WRAPPER("pre-tool-use"), { mode: 0o755 });
+  await fs.writeFile(userPromptPath, CLINE_HOOK_WRAPPER("user-prompt-submit"), { mode: 0o755 });
 
   const result: { preToolUse: string; userPromptSubmit: string; postToolUse?: string } = {
     preToolUse: preToolUsePath,
@@ -1253,7 +1260,7 @@ export async function installRooCodeHookScripts(options: {
 
   // Install PostToolUse hook for real-time indexing (default ON)
   if (options.includePostWrite !== false) {
-    await fs.writeFile(postToolUsePath, CLINE_POSTTOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
+    await fs.writeFile(postToolUsePath, CLINE_HOOK_WRAPPER("post-write"), { mode: 0o755 });
     result.postToolUse = postToolUsePath;
   }
 
@@ -1279,7 +1286,8 @@ export function getKiloCodeHooksDir(scope: "global" | "project", projectPath?: s
 }
 
 /**
- * Install Kilo Code hook scripts (uses same scripts as Cline).
+ * Install Kilo Code hook scripts.
+ * Uses thin wrapper scripts that call Node.js hooks via npx.
  */
 export async function installKiloCodeHookScripts(options: {
   scope: "global" | "project";
@@ -1293,8 +1301,9 @@ export async function installKiloCodeHookScripts(options: {
   const userPromptPath = path.join(hooksDir, "UserPromptSubmit");
   const postToolUsePath = path.join(hooksDir, "PostToolUse");
 
-  await fs.writeFile(preToolUsePath, CLINE_PRETOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
-  await fs.writeFile(userPromptPath, CLINE_USER_PROMPT_HOOK_SCRIPT, { mode: 0o755 });
+  // Write thin wrapper scripts that call Node.js hooks via npx
+  await fs.writeFile(preToolUsePath, CLINE_HOOK_WRAPPER("pre-tool-use"), { mode: 0o755 });
+  await fs.writeFile(userPromptPath, CLINE_HOOK_WRAPPER("user-prompt-submit"), { mode: 0o755 });
 
   const result: { preToolUse: string; userPromptSubmit: string; postToolUse?: string } = {
     preToolUse: preToolUsePath,
@@ -1303,7 +1312,7 @@ export async function installKiloCodeHookScripts(options: {
 
   // Install PostToolUse hook for real-time indexing (default ON)
   if (options.includePostWrite !== false) {
-    await fs.writeFile(postToolUsePath, CLINE_POSTTOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
+    await fs.writeFile(postToolUsePath, CLINE_HOOK_WRAPPER("post-write"), { mode: 0o755 });
     result.postToolUse = postToolUsePath;
   }
 
@@ -1561,47 +1570,58 @@ export async function writeCursorHooksConfig(
 
 /**
  * Install Cursor hook scripts and update hooks.json config.
+ * Cursor hooks now use Node.js via npx - no Python files needed.
  */
 export async function installCursorHookScripts(options: {
   scope: "global" | "project";
   projectPath?: string;
 }): Promise<{ preToolUse: string; beforeSubmitPrompt: string; config: string }> {
+  // Ensure hooks directory exists
   const hooksDir = getCursorHooksDir(options.scope, options.projectPath);
   await fs.mkdir(hooksDir, { recursive: true });
 
-  const preToolUsePath = path.join(hooksDir, "contextstream-pretooluse.py");
-  const beforeSubmitPath = path.join(hooksDir, "contextstream-beforesubmit.py");
-
-  await fs.writeFile(preToolUsePath, CURSOR_PRETOOLUSE_HOOK_SCRIPT, { mode: 0o755 });
-  await fs.writeFile(beforeSubmitPath, CURSOR_BEFORE_SUBMIT_HOOK_SCRIPT, { mode: 0o755 });
-
-  // Update hooks.json config
+  // Update hooks.json config to use npx commands directly
   const existingConfig = await readCursorHooksConfig(options.scope, options.projectPath);
 
   // Remove any existing ContextStream hooks
-  const filterContextStreamHooks = (hooks: any[] | undefined): any[] => {
+  const filterContextStreamHooks = (hooks: unknown[] | undefined): unknown[] => {
     if (!hooks) return [];
-    return hooks.filter((h) => !h.command?.includes("contextstream"));
+    return hooks.filter((h) => {
+      const hook = h as { command?: string };
+      return !hook.command?.includes("contextstream");
+    });
   };
+
+  const filteredPreToolUse = filterContextStreamHooks(existingConfig.hooks.preToolUse) as Array<{
+    command: string;
+    type?: "command";
+    timeout?: number;
+    matcher?: { tool_name?: string };
+  }>;
+  const filteredBeforeSubmit = filterContextStreamHooks(existingConfig.hooks.beforeSubmitPrompt) as Array<{
+    command: string;
+    type?: "command";
+    timeout?: number;
+  }>;
 
   const config: CursorHooksConfig = {
     version: 1,
     hooks: {
       ...existingConfig.hooks,
       preToolUse: [
-        ...filterContextStreamHooks(existingConfig.hooks.preToolUse as any[]),
+        ...filteredPreToolUse,
         {
-          command: `python3 "${preToolUsePath}"`,
-          type: "command",
+          command: "npx @contextstream/mcp-server hook pre-tool-use",
+          type: "command" as const,
           timeout: 5,
           matcher: { tool_name: "Glob|Grep|search_files|list_files|ripgrep" },
         },
       ],
       beforeSubmitPrompt: [
-        ...filterContextStreamHooks(existingConfig.hooks.beforeSubmitPrompt as any[]),
+        ...filteredBeforeSubmit,
         {
-          command: `python3 "${beforeSubmitPath}"`,
-          type: "command",
+          command: "npx @contextstream/mcp-server hook user-prompt-submit",
+          type: "command" as const,
           timeout: 5,
         },
       ],
@@ -1612,8 +1632,8 @@ export async function installCursorHookScripts(options: {
   const configPath = getCursorHooksConfigPath(options.scope, options.projectPath);
 
   return {
-    preToolUse: preToolUsePath,
-    beforeSubmitPrompt: beforeSubmitPath,
+    preToolUse: "npx @contextstream/mcp-server hook pre-tool-use",
+    beforeSubmitPrompt: "npx @contextstream/mcp-server hook user-prompt-submit",
     config: configPath,
   };
 }
@@ -1700,11 +1720,11 @@ export async function installEditorHooks(options: {
     }
 
     case "cursor": {
-      const scripts = await installCursorHookScripts();
+      const scripts = await installCursorHookScripts({ scope, projectPath });
       return {
         editor: "cursor",
-        installed: [scripts.preToolUse, scripts.beforeSubmit],
-        hooksDir: getCursorHooksDir(),
+        installed: [scripts.preToolUse, scripts.beforeSubmitPrompt],
+        hooksDir: getCursorHooksDir(scope, projectPath),
       };
     }
 

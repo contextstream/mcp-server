@@ -549,6 +549,7 @@ export function buildHooksConfig(options?: {
   includePreCompact?: boolean;
   includeMediaAware?: boolean;
   includePostWrite?: boolean;
+  includeAutoRules?: boolean;
 }): ClaudeHooksConfig["hooks"] {
   // Build UserPromptSubmit hooks array - always include reminder
   const userPromptHooks: ClaudeHookMatcher[] = [
@@ -611,21 +612,39 @@ export function buildHooksConfig(options?: {
     ];
   }
 
-  // Add PostToolUse hook for real-time file indexing (default ON)
-  // This indexes files immediately after Edit/Write/NotebookEdit operations
+  // Add PostToolUse hooks
+  const postToolUseHooks: ClaudeHookMatcher[] = [];
+
+  // Real-time file indexing (default ON)
   if (options?.includePostWrite !== false) {
-    config.PostToolUse = [
-      {
-        matcher: "Edit|Write|NotebookEdit",
-        hooks: [
-          {
-            type: "command",
-            command: "npx @contextstream/mcp-server hook post-write",
-            timeout: 10,
-          },
-        ],
-      },
-    ];
+    postToolUseHooks.push({
+      matcher: "Edit|Write|NotebookEdit",
+      hooks: [
+        {
+          type: "command",
+          command: "npx @contextstream/mcp-server hook post-write",
+          timeout: 10,
+        },
+      ],
+    });
+  }
+
+  // Auto-rules update when rules are behind (default ON)
+  if (options?.includeAutoRules !== false) {
+    postToolUseHooks.push({
+      matcher: "mcp__contextstream__init|mcp__contextstream__context",
+      hooks: [
+        {
+          type: "command",
+          command: "npx @contextstream/mcp-server hook auto-rules",
+          timeout: 15,
+        },
+      ],
+    });
+  }
+
+  if (postToolUseHooks.length > 0) {
+    config.PostToolUse = postToolUseHooks;
   }
 
   return config;
@@ -643,13 +662,14 @@ export function buildHooksConfig(options?: {
 export async function installHookScripts(options?: {
   includePreCompact?: boolean;
   includeMediaAware?: boolean;
-}): Promise<{ preToolUse: string; userPrompt: string; preCompact?: string; mediaAware?: string }> {
+  includeAutoRules?: boolean;
+}): Promise<{ preToolUse: string; userPrompt: string; preCompact?: string; mediaAware?: string; autoRules?: string }> {
   // Ensure hooks directory exists (for any legacy scripts)
   const hooksDir = getHooksDir();
   await fs.mkdir(hooksDir, { recursive: true });
 
   // Return placeholder paths - actual hooks run via npx commands
-  const result: { preToolUse: string; userPrompt: string; preCompact?: string; mediaAware?: string } = {
+  const result: { preToolUse: string; userPrompt: string; preCompact?: string; mediaAware?: string; autoRules?: string } = {
     preToolUse: "npx @contextstream/mcp-server hook pre-tool-use",
     userPrompt: "npx @contextstream/mcp-server hook user-prompt-submit",
   };
@@ -660,6 +680,10 @@ export async function installHookScripts(options?: {
 
   if (options?.includeMediaAware !== false) {
     result.mediaAware = "npx @contextstream/mcp-server hook media-aware";
+  }
+
+  if (options?.includeAutoRules !== false) {
+    result.autoRules = "npx @contextstream/mcp-server hook auto-rules";
   }
 
   return result;
@@ -736,6 +760,7 @@ export async function installClaudeCodeHooks(options: {
   includePreCompact?: boolean;
   includeMediaAware?: boolean;
   includePostWrite?: boolean;
+  includeAutoRules?: boolean;
 }): Promise<{ scripts: string[]; settings: string[] }> {
   const result = { scripts: [] as string[], settings: [] as string[] };
 
@@ -753,11 +778,15 @@ export async function installClaudeCodeHooks(options: {
   if (options.includePostWrite !== false) {
     result.scripts.push("npx @contextstream/mcp-server hook post-write");
   }
+  if (options.includeAutoRules !== false) {
+    result.scripts.push("npx @contextstream/mcp-server hook auto-rules");
+  }
 
   const hooksConfig = buildHooksConfig({
     includePreCompact: options.includePreCompact,
     includeMediaAware: options.includeMediaAware,
     includePostWrite: options.includePostWrite,
+    includeAutoRules: options.includeAutoRules,
   });
 
   // Update user settings

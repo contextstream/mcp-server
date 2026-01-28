@@ -76,6 +76,7 @@ Commands:
   hook media-aware           Media-aware hook - detects media prompts, injects media tool guidance
   hook pre-compact           PreCompact hook - saves conversation state before compaction
   hook post-write            PostToolUse hook - real-time file indexing after Edit/Write
+  hook auto-rules            PostToolUse hook - auto-updates rules when behind (silent)
 
 Environment variables:
   CONTEXTSTREAM_API_URL   Base API URL (e.g. https://api.contextstream.io)
@@ -199,9 +200,14 @@ async function main() {
         await runPreCompactHook();
         return;
       }
+      case "auto-rules": {
+        const { runAutoRulesHook } = await import("./hooks/auto-rules.js");
+        await runAutoRulesHook();
+        return;
+      }
       default:
         console.error(`Unknown hook: ${hookName}`);
-        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-write");
+        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-write, auto-rules");
         process.exit(1);
     }
   }

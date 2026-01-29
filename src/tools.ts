@@ -8732,7 +8732,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "session",
       {
         title: "Session",
-        description: `Session management operations. Actions: capture (save decision/insight), capture_lesson (save lesson from mistake), get_lessons (retrieve lessons), recall (natural language recall), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (context-enriched search), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan (save implementation plan), get_plan (retrieve plan with tasks), update_plan (modify plan), list_plans (list all plans). Team actions (team plans only): team_decisions (team-wide decisions), team_lessons (team-wide lessons).`,
+        description: `Session management operations. Actions: capture (save decision/insight), capture_lesson (save lesson from mistake), get_lessons (retrieve lessons), recall (natural language recall), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (context-enriched search), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan (save implementation plan), get_plan (retrieve plan with tasks), update_plan (modify plan), list_plans (list all plans). Team actions (team plans only): team_decisions (team-wide decisions), team_lessons (team-wide lessons), team_plans (plans across team workspaces).`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -8757,6 +8757,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               // Team actions (team plans only)
               "team_decisions",
               "team_lessons",
+              "team_plans",
             ])
             .describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
@@ -9492,6 +9493,57 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             };
           }
 
+          case "team_plans": {
+            // Check if user has a team plan
+            const isTeamForPlans = await client.isTeamPlan();
+            if (!isTeamForPlans) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team features require a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            // Get team-wide plans (across all team workspaces)
+            const teamWorkspacesForPlans = await client.listTeamWorkspaces({ page_size: 100 });
+            const workspacesForPlans = teamWorkspacesForPlans?.items || teamWorkspacesForPlans?.data?.items || [];
+
+            const allPlans: any[] = [];
+            for (const ws of workspacesForPlans.slice(0, 10)) {
+              try {
+                const plans = await client.listPlans({
+                  workspace_id: ws.id,
+                  status: input.status as any,
+                  limit: input.limit ? Math.ceil(input.limit / workspacesForPlans.length) : 5,
+                });
+                const items = plans?.data?.plans || plans?.plans || plans?.data?.items || plans?.items || [];
+                allPlans.push(...items.map((p: any) => ({ ...p, workspace_name: ws.name })));
+              } catch {
+                // Skip workspaces we can't access
+              }
+            }
+
+            // Sort by updated_at descending
+            allPlans.sort((a, b) => new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime());
+            const limitedPlans = allPlans.slice(0, input.limit || 20);
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatContent({
+                    team_plans: limitedPlans,
+                    total: limitedPlans.length,
+                    workspaces_searched: workspacesForPlans.length,
+                  }),
+                },
+              ],
+            };
+          }
+
           default:
             return errorResult(`Unknown action: ${input.action}`);
         }
@@ -9505,7 +9557,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "memory",
       {
         title: "Memory",
-        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap.`,
+        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap. Team actions (team plans only): team_tasks, team_todos, team_diagrams, team_docs.`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -9554,6 +9606,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "update_doc",
               "delete_doc",
               "create_roadmap",
+              // Team actions
+              "team_tasks",
+              "team_todos",
+              "team_diagrams",
+              "team_docs",
             ])
             .describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
@@ -10321,6 +10378,209 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(roadmapResult) }],
+            };
+          }
+
+          case "team_tasks": {
+            const isTeamForTasks = await client.isTeamPlan();
+            if (!isTeamForTasks) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team features require a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            const teamWorkspacesForTasks = await client.listTeamWorkspaces({ page_size: 100 });
+            const workspacesForTasks = teamWorkspacesForTasks?.items || teamWorkspacesForTasks?.data?.items || [];
+
+            const allTasks: any[] = [];
+            for (const ws of workspacesForTasks.slice(0, 10)) {
+              try {
+                const tasks = await client.listTasks({
+                  workspace_id: ws.id,
+                  status: input.task_status as any,
+                  limit: input.limit ? Math.ceil(input.limit / workspacesForTasks.length) : 10,
+                });
+                const items = tasks?.data?.tasks || tasks?.tasks || tasks?.data?.items || tasks?.items || [];
+                allTasks.push(...items.map((t: any) => ({ ...t, workspace_name: ws.name })));
+              } catch {
+                // Skip workspaces we can't access
+              }
+            }
+
+            allTasks.sort((a, b) => new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime());
+            const limitedTasks = allTasks.slice(0, input.limit || 20);
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatContent({
+                    team_tasks: limitedTasks,
+                    total: limitedTasks.length,
+                    workspaces_searched: workspacesForTasks.length,
+                  }),
+                },
+              ],
+            };
+          }
+
+          case "team_todos": {
+            const isTeamForTodos = await client.isTeamPlan();
+            if (!isTeamForTodos) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team features require a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            const teamWorkspacesForTodos = await client.listTeamWorkspaces({ page_size: 100 });
+            const workspacesForTodos = teamWorkspacesForTodos?.items || teamWorkspacesForTodos?.data?.items || [];
+
+            const allTodos: any[] = [];
+            for (const ws of workspacesForTodos.slice(0, 10)) {
+              try {
+                const todos = await client.todosList({
+                  workspace_id: ws.id,
+                  status: input.todo_status as any,
+                  priority: input.todo_priority as any,
+                  limit: input.limit ? Math.ceil(input.limit / workspacesForTodos.length) : 10,
+                });
+                const items = todos?.data?.items || todos?.items || [];
+                allTodos.push(...items.map((t: any) => ({ ...t, workspace_name: ws.name })));
+              } catch {
+                // Skip workspaces we can't access
+              }
+            }
+
+            // Sort by priority (urgent > high > medium > low) then by due_at
+            const priorityOrder: Record<string, number> = { urgent: 4, high: 3, medium: 2, low: 1 };
+            allTodos.sort((a, b) => {
+              const priDiff = (priorityOrder[b.priority] || 0) - (priorityOrder[a.priority] || 0);
+              if (priDiff !== 0) return priDiff;
+              // Then by due_at (earliest first), nulls last
+              if (a.due_at && b.due_at) return new Date(a.due_at).getTime() - new Date(b.due_at).getTime();
+              if (a.due_at) return -1;
+              if (b.due_at) return 1;
+              return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+            });
+            const limitedTodos = allTodos.slice(0, input.limit || 20);
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatContent({
+                    team_todos: limitedTodos,
+                    total: limitedTodos.length,
+                    workspaces_searched: workspacesForTodos.length,
+                  }),
+                },
+              ],
+            };
+          }
+
+          case "team_diagrams": {
+            const isTeamForDiagrams = await client.isTeamPlan();
+            if (!isTeamForDiagrams) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team features require a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            const teamWorkspacesForDiagrams = await client.listTeamWorkspaces({ page_size: 100 });
+            const workspacesForDiagrams = teamWorkspacesForDiagrams?.items || teamWorkspacesForDiagrams?.data?.items || [];
+
+            const allDiagrams: any[] = [];
+            for (const ws of workspacesForDiagrams.slice(0, 10)) {
+              try {
+                const diagrams = await client.diagramsList({
+                  workspace_id: ws.id,
+                  diagram_type: input.diagram_type as any,
+                  limit: input.limit ? Math.ceil(input.limit / workspacesForDiagrams.length) : 10,
+                });
+                const items = diagrams?.data?.items || diagrams?.items || [];
+                allDiagrams.push(...items.map((d: any) => ({ ...d, workspace_name: ws.name })));
+              } catch {
+                // Skip workspaces we can't access
+              }
+            }
+
+            allDiagrams.sort((a, b) => new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime());
+            const limitedDiagrams = allDiagrams.slice(0, input.limit || 20);
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatContent({
+                    team_diagrams: limitedDiagrams,
+                    total: limitedDiagrams.length,
+                    workspaces_searched: workspacesForDiagrams.length,
+                  }),
+                },
+              ],
+            };
+          }
+
+          case "team_docs": {
+            const isTeamForDocs = await client.isTeamPlan();
+            if (!isTeamForDocs) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Team features require a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
+                  },
+                ],
+              };
+            }
+
+            const teamWorkspacesForDocs = await client.listTeamWorkspaces({ page_size: 100 });
+            const workspacesForDocs = teamWorkspacesForDocs?.items || teamWorkspacesForDocs?.data?.items || [];
+
+            const allDocs: any[] = [];
+            for (const ws of workspacesForDocs.slice(0, 10)) {
+              try {
+                const docs = await client.docsList({
+                  workspace_id: ws.id,
+                  doc_type: input.doc_type as any,
+                  limit: input.limit ? Math.ceil(input.limit / workspacesForDocs.length) : 10,
+                });
+                const items = docs?.data?.items || docs?.items || [];
+                allDocs.push(...items.map((d: any) => ({ ...d, workspace_name: ws.name })));
+              } catch {
+                // Skip workspaces we can't access
+              }
+            }
+
+            allDocs.sort((a, b) => new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime());
+            const limitedDocs = allDocs.slice(0, input.limit || 20);
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatContent({
+                    team_docs: limitedDocs,
+                    total: limitedDocs.length,
+                    workspaces_searched: workspacesForDocs.length,
+                  }),
+                },
+              ],
             };
           }
 

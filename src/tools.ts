@@ -8847,6 +8847,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           due_at: z.string().optional().describe("Due date for plan (ISO timestamp)"),
           source_tool: z.string().optional().describe("Tool that generated this plan"),
           include_tasks: z.boolean().optional().describe("Include tasks when getting plan"),
+          is_personal: z
+            .boolean()
+            .optional()
+            .describe("Mark plan as personal (only visible to creator). For capture_plan/list_plans."),
           // Restore context params
           snapshot_id: z
             .string()
@@ -9135,6 +9139,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               tags: input.tags,
               due_at: input.due_at,
               source_tool: input.source_tool || "mcp",
+              is_personal: input.is_personal,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -9186,10 +9191,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               project_id: projectId,
               status: input.status,
               limit: input.limit,
+              is_personal: input.is_personal,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
+
             };
           }
 
@@ -10050,6 +10056,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               order: input.order,
               code_refs: input.code_refs,
               tags: input.tags,
+              is_personal: input.is_personal,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -10118,10 +10125,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               status: input.task_status,
               priority: input.priority,
               limit: input.limit,
+              is_personal: input.is_personal,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
+
             };
           }
 

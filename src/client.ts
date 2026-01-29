@@ -5091,6 +5091,7 @@ export class ContextStreamClient {
     tags?: string[];
     due_at?: string;
     source_tool?: string;
+    is_personal?: boolean;
   }) {
     const withDefaults = this.withDefaults(params);
     if (!withDefaults.workspace_id) {
@@ -5106,6 +5107,7 @@ export class ContextStreamClient {
     workspace_id?: string;
     project_id?: string;
     status?: string;
+    is_personal?: boolean;
     limit?: number;
     offset?: number;
   }) {
@@ -5114,6 +5116,7 @@ export class ContextStreamClient {
     if (withDefaults.workspace_id) query.set("workspace_id", withDefaults.workspace_id);
     if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
     if (params?.status) query.set("status", params.status);
+    if (params?.is_personal !== undefined) query.set("is_personal", String(params.is_personal));
     if (params?.limit) query.set("limit", String(params.limit));
     if (params?.offset) query.set("offset", String(params.offset));
     const suffix = query.toString() ? `?${query.toString()}` : "";
@@ -5219,6 +5222,7 @@ export class ContextStreamClient {
     order?: number;
     code_refs?: Array<{ file_path: string; symbol_name?: string; line_range?: [number, number] }>;
     tags?: string[];
+    is_personal?: boolean;
   }) {
     const withDefaults = this.withDefaults(params);
     if (!withDefaults.workspace_id) {
@@ -5236,6 +5240,7 @@ export class ContextStreamClient {
     plan_id?: string;
     status?: string;
     priority?: string;
+    is_personal?: boolean;
     limit?: number;
     offset?: number;
   }) {
@@ -5246,6 +5251,7 @@ export class ContextStreamClient {
     if (params?.plan_id) query.set("plan_id", params.plan_id);
     if (params?.status) query.set("status", params.status);
     if (params?.priority) query.set("priority", params.priority);
+    if (params?.is_personal !== undefined) query.set("is_personal", String(params.is_personal));
     if (params?.limit) query.set("limit", String(params.limit));
     if (params?.offset) query.set("offset", String(params.offset));
     const suffix = query.toString() ? `?${query.toString()}` : "";

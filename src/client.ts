@@ -5568,6 +5568,7 @@ export class ContextStreamClient {
     project_id?: string;
     status?: "pending" | "completed";
     priority?: "low" | "medium" | "high" | "urgent";
+    is_personal?: boolean;
     page?: number;
     per_page?: number;
   }) {
@@ -5577,6 +5578,7 @@ export class ContextStreamClient {
     if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
     if (params?.status) query.set("status", params.status);
     if (params?.priority) query.set("priority", params.priority);
+    if (params?.is_personal !== undefined) query.set("is_personal", String(params.is_personal));
     if (params?.page) query.set("page", String(params.page));
     if (params?.per_page) query.set("per_page", String(params.per_page));
     const suffix = query.toString() ? `?${query.toString()}` : "";
@@ -5593,6 +5595,7 @@ export class ContextStreamClient {
     description?: string;
     priority?: "low" | "medium" | "high" | "urgent";
     due_at?: string;
+    is_personal?: boolean;
   }) {
     const withDefaults = this.withDefaults(params);
     if (!withDefaults.workspace_id) {
@@ -5660,6 +5663,7 @@ export class ContextStreamClient {
     workspace_id?: string;
     project_id?: string;
     diagram_type?: "flowchart" | "sequence" | "class" | "er" | "gantt" | "mindmap" | "pie" | "other";
+    is_personal?: boolean;
     page?: number;
     per_page?: number;
   }) {
@@ -5668,6 +5672,7 @@ export class ContextStreamClient {
     if (withDefaults.workspace_id) query.set("workspace_id", withDefaults.workspace_id);
     if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
     if (params?.diagram_type) query.set("diagram_type", params.diagram_type);
+    if (params?.is_personal !== undefined) query.set("is_personal", String(params.is_personal));
     if (params?.page) query.set("page", String(params.page));
     if (params?.per_page) query.set("per_page", String(params.per_page));
     const suffix = query.toString() ? `?${query.toString()}` : "";
@@ -5684,6 +5689,7 @@ export class ContextStreamClient {
     diagram_type?: "flowchart" | "sequence" | "class" | "er" | "gantt" | "mindmap" | "pie" | "other";
     content: string;
     metadata?: Record<string, unknown>;
+    is_personal?: boolean;
   }) {
     const withDefaults = this.withDefaults(params);
     if (!withDefaults.workspace_id) {
@@ -5734,6 +5740,7 @@ export class ContextStreamClient {
     workspace_id?: string;
     project_id?: string;
     doc_type?: "roadmap" | "spec" | "general";
+    is_personal?: boolean;
     page?: number;
     per_page?: number;
   }) {
@@ -5742,6 +5749,7 @@ export class ContextStreamClient {
     if (withDefaults.workspace_id) query.set("workspace_id", withDefaults.workspace_id);
     if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
     if (params?.doc_type) query.set("doc_type", params.doc_type);
+    if (params?.is_personal !== undefined) query.set("is_personal", String(params.is_personal));
     if (params?.page) query.set("page", String(params.page));
     if (params?.per_page) query.set("per_page", String(params.per_page));
     const suffix = query.toString() ? `?${query.toString()}` : "";
@@ -5758,6 +5766,7 @@ export class ContextStreamClient {
     content: string;
     doc_type?: "roadmap" | "spec" | "general";
     metadata?: Record<string, unknown>;
+    is_personal?: boolean;
   }) {
     const withDefaults = this.withDefaults(params);
     if (!withDefaults.workspace_id) {
@@ -5779,6 +5788,7 @@ export class ContextStreamClient {
       target_date?: string;
       status?: string;
     }>;
+    is_personal?: boolean;
   }) {
     const withDefaults = this.withDefaults(params);
     if (!withDefaults.workspace_id) {

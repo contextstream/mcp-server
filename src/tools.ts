@@ -9754,6 +9754,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             )
             .optional()
             .describe("Milestones for create_roadmap action"),
+          // Personal items param
+          is_personal: z
+            .boolean()
+            .optional()
+            .describe("Mark as personal (only visible to creator). For create/list actions on todos, diagrams, docs."),
         }),
       },
       async (input) => {
@@ -10154,6 +10159,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               description: input.description,
               priority: input.todo_priority,
               due_at: input.due_at,
+              is_personal: input.is_personal,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(todoResult) }],
@@ -10169,6 +10175,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               project_id: projectId,
               status: input.todo_status,
               priority: input.todo_priority,
+              is_personal: input.is_personal,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(todosResult) }],
@@ -10236,6 +10243,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               content: input.content,
               diagram_type: input.diagram_type,
               metadata: input.metadata,
+              is_personal: input.is_personal,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(diagramResult) }],
@@ -10250,6 +10258,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               workspace_id: workspaceId,
               project_id: projectId,
               diagram_type: input.diagram_type,
+              is_personal: input.is_personal,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(diagramsResult) }],
@@ -10307,6 +10316,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               content: input.content,
               doc_type: input.doc_type,
               metadata: input.metadata,
+              is_personal: input.is_personal,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(docResult) }],
@@ -10321,6 +10331,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               workspace_id: workspaceId,
               project_id: projectId,
               doc_type: input.doc_type,
+              is_personal: input.is_personal,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(docsResult) }],
@@ -10375,6 +10386,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               project_id: projectId,
               title: input.title,
               milestones: input.milestones,
+              is_personal: input.is_personal,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(roadmapResult) }],

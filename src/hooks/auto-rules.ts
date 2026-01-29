@@ -3,6 +3,7 @@
  *
  * Called after init/context tools complete to check if rules are outdated.
  * If rules_notice.status === "behind", silently runs generate_rules.
+ * Also detects and upgrades legacy Python hooks to Node.js hooks.
  *
  * Usage:
  *   npx @contextstream/mcp-server hook auto-rules
@@ -192,19 +193,70 @@ function extractCwd(input: HookInput): string {
 }
 
 /**
- * Write rules files using the rules-templates module
- * This imports and calls the actual rule generation logic
+ * Check if a settings.json file contains legacy Python hooks
  */
-async function generateRulesForFolder(folderPath: string): Promise<void> {
-  // Import the rules generation utilities
-  // We do this dynamically to avoid loading heavy deps at startup
-  const { generateAllRuleFiles } = await import("../rules-templates.js");
+function hasPythonHooks(settingsPath: string): boolean {
+  try {
+    if (!fs.existsSync(settingsPath)) return false;
+    const content = fs.readFileSync(settingsPath, "utf-8");
+    const settings = JSON.parse(content);
+    const hooks = settings.hooks;
+    if (!hooks) return false;
 
-  await generateAllRuleFiles({
-    folderPath,
-    editors: ["cursor", "cline", "kilo", "roo", "claude", "aider", "codex"],
-    overwriteExisting: true,
-    mode: "minimal", // Use minimal mode for auto-updates
+    // Check all hook types for Python commands
+    for (const hookType of Object.keys(hooks)) {
+      const matchers = hooks[hookType];
+      if (!Array.isArray(matchers)) continue;
+
+      for (const matcher of matchers) {
+        const hookList = matcher.hooks;
+        if (!Array.isArray(hookList)) continue;
+
+        for (const hook of hookList) {
+          const cmd = hook.command || "";
+          // Detect Python hooks for contextstream
+          if (cmd.includes("python3") && cmd.includes("contextstream")) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check for Python hooks in both global and project settings.
+ * Returns the folder path that needs updating, or null if no Python hooks found.
+ */
+function detectPythonHooks(cwd: string): { global: boolean; project: boolean } {
+  const globalSettingsPath = path.join(homedir(), ".claude", "settings.json");
+  const projectSettingsPath = path.join(cwd, ".claude", "settings.json");
+
+  return {
+    global: hasPythonHooks(globalSettingsPath),
+    project: hasPythonHooks(projectSettingsPath),
+  };
+}
+
+/**
+ * Upgrade hooks for a given folder.
+ * Updates both global and project-level Claude Code hooks to Node.js versions.
+ */
+async function upgradeHooksForFolder(folderPath: string): Promise<void> {
+  // Import the hooks config utilities dynamically to avoid loading heavy deps at startup
+  const { installClaudeCodeHooks } = await import("../hooks-config.js");
+
+  // Update both global (user) and project-level hooks
+  await installClaudeCodeHooks({
+    scope: "both",
+    projectPath: folderPath,
+    includePreCompact: true,
+    includeMediaAware: true,
+    includePostWrite: true,
+    includeAutoRules: true,
   });
 }
 
@@ -250,18 +302,26 @@ export async function runAutoRulesHook(): Promise<void> {
     process.exit(0);
   }
 
+  const cwd = extractCwd(input);
+
+  // Check for legacy Python hooks (upgrade regardless of rules status)
+  const pythonHooks = detectPythonHooks(cwd);
+  const hasPythonHooksToUpgrade = pythonHooks.global || pythonHooks.project;
+
   // Extract rules_notice
   const rulesNotice = extractRulesNotice(input);
-  if (!rulesNotice || rulesNotice.status === "current") {
+  const rulesNeedUpdate = rulesNotice && rulesNotice.status !== "current";
+
+  // Exit if nothing needs updating
+  if (!hasPythonHooksToUpgrade && !rulesNeedUpdate) {
     process.exit(0);
   }
 
-  // Rules are behind or missing - auto-update
-  const cwd = extractCwd(input);
-  const folderPath = rulesNotice.update_args?.folder_path || cwd;
+  // Determine folder path for updates
+  const folderPath = rulesNotice?.update_args?.folder_path || cwd;
 
   try {
-    await generateRulesForFolder(folderPath);
+    await upgradeHooksForFolder(folderPath);
     markAsRan();
   } catch {
     // Silently fail - don't block the editor

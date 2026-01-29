@@ -231,6 +231,38 @@ function generateLessonsReminder(result: Record<string, unknown>): string {
 }
 
 /**
+ * Remember items reminder prefix - user-flagged important preferences.
+ */
+const REMEMBER_REMINDER_PREFIX = `
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📌 USER PREFERENCES - MUST FOLLOW
+These are user-specified preferences that MUST be checked and followed.
+⚠️ IMPORTANT: Always verify your actions align with these preferences.
+`;
+
+/**
+ * Generate a remember items reminder block if remember items are present.
+ */
+function generateRememberReminder(result: Record<string, unknown>): string {
+  const rememberItems = result.remember_items as Array<{
+    content?: string;
+    importance?: string;
+  }> | undefined;
+
+  if (!rememberItems || rememberItems.length === 0) {
+    return "";
+  }
+
+  const itemLines = rememberItems.slice(0, 5).map((item, i) => {
+    const importance = item.importance === "critical" ? "🚨" : "📌";
+    const content = item.content || "";
+    return `${i + 1}. ${importance} ${content.slice(0, 150)}`;
+  });
+
+  return `\n\n${REMEMBER_REMINDER_PREFIX}\n${itemLines.join("\n")}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+}
+
+/**
  * Generate rules update warning when rules are outdated.
  * Skips warning if highest version found matches latest (some files may be stale but main one is current).
  */
@@ -5274,6 +5306,12 @@ This does semantic search on the first message. You only need context on subsequ
       const lessonsReminder = generateLessonsReminder(result);
       if (lessonsReminder) {
         text = `${text}${lessonsReminder}`;
+      }
+
+      // Inject remember items reminder if there are user-flagged preferences
+      const rememberReminder = generateRememberReminder(result);
+      if (rememberReminder) {
+        text = `${text}${rememberReminder}`;
       }
 
       // Inject search rules reminder to combat instruction decay

@@ -2122,6 +2122,22 @@ export class ContextStreamClient {
         } catch {
           /* optional */
         }
+
+        // Load high-priority remember items (user-flagged important preferences)
+        try {
+          const rememberItems = await this.getHighPriorityRememberItems({
+            workspace_id: workspaceId,
+            project_id: projectId,
+            context_hint: params.context_hint,
+            limit: 5,
+          });
+          if (rememberItems.length > 0) {
+            context.remember_items = rememberItems;
+            context.remember_warning = `📌 ${rememberItems.length} user preference(s) to remember. ALWAYS check these before making changes.`;
+          }
+        } catch {
+          /* optional */
+        }
       } catch (e) {
         // Fallback to individual calls if batched endpoint fails
         console.error(
@@ -3548,6 +3564,29 @@ export class ContextStreamClient {
       errors.push(`lessons: ${(e as Error)?.message || "fetch failed"}`);
     }
 
+    // 5. Get user remember items (HIGHEST priority - user-flagged important preferences)
+    try {
+      const rememberItems = await this.getHighPriorityRememberItems({
+        workspace_id: withDefaults.workspace_id,
+        project_id: withDefaults.project_id,
+        context_hint: params.user_message,
+        limit: 5,
+      });
+
+      for (const item of rememberItems) {
+        // Use R for Remember type with pin emoji - highest priority
+        const prefix = item.importance === "critical" ? "🚨 " : "📌 ";
+        items.push({
+          type: "R",
+          key: "remember",
+          value: `${prefix}${item.content.slice(0, 150)}`,
+          relevance: 1.0, // Remember items are ALWAYS highest priority
+        });
+      }
+    } catch (e) {
+      errors.push(`remember: ${(e as Error)?.message || "fetch failed"}`);
+    }
+
     // Log errors for debugging if any occurred
     if (errors.length > 0) {
       console.error("[ContextStream] context_smart errors:", errors.join(", "));
@@ -3751,6 +3790,68 @@ export class ContextStreamClient {
         });
 
       return lessons;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Get high-priority remember items that should be surfaced proactively.
+   * These are user-flagged important items that should always be checked.
+   */
+  async getHighPriorityRememberItems(params: {
+    workspace_id: string;
+    project_id?: string;
+    context_hint?: string;
+    limit?: number;
+  }): Promise<
+    Array<{
+      content: string;
+      importance: string;
+      created_at?: string;
+    }>
+  > {
+    const limit = params.limit || 5;
+
+    try {
+      // Search for remember items with user_remember tag
+      const searchQuery = params.context_hint
+        ? `${params.context_hint} user preference remember important`
+        : "user preference remember important always_surface";
+
+      const searchResult = (await this.memorySearch({
+        query: searchQuery,
+        workspace_id: params.workspace_id,
+        project_id: params.project_id,
+        limit: limit * 2, // Fetch more to filter
+      })) as {
+        results?: Array<{
+          title?: string;
+          content?: string;
+          occurred_at?: string;
+          metadata?: { tags?: string[]; importance?: string };
+        }>;
+      };
+
+      if (!searchResult?.results) return [];
+
+      // Filter for remember items (preference type with user_remember tag)
+      const rememberItems = searchResult.results
+        .filter((item) => {
+          const tags = item.metadata?.tags || [];
+          return tags.includes("user_remember") || tags.includes("always_surface");
+        })
+        .slice(0, limit)
+        .map((item) => {
+          const importance = item.metadata?.importance || "high";
+          return {
+            content: item.content || item.title || "",
+            importance,
+            created_at: item.occurred_at,
+          };
+        });
+
+      return rememberItems;
     } catch {
       return [];
     }

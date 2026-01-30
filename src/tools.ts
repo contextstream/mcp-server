@@ -7120,6 +7120,18 @@ This saves ~80% tokens compared to including full chat history.`,
           .number()
           .optional()
           .describe("Custom context window threshold (defaults to 70k)"),
+        save_exchange: z
+          .boolean()
+          .optional()
+          .describe("Save this exchange to the transcript for later search (background task)"),
+        session_id: z
+          .string()
+          .optional()
+          .describe("Session ID for transcript association (required if save_exchange is true)"),
+        client_name: z
+          .string()
+          .optional()
+          .describe("Client name for transcript metadata (e.g., 'claude', 'cursor')"),
       }),
     },
     async (input) => {
@@ -7225,6 +7237,18 @@ This saves ~80% tokens compared to including full chat history.`,
         }
       }
 
+      // Get session_id from input or generate from SessionManager
+      let sessionId = input.session_id;
+      if (!sessionId && sessionManager && input.save_exchange) {
+        sessionId = sessionManager.getSessionId();
+      }
+
+      // Get client_name from input or detect from environment
+      let clientName = input.client_name;
+      if (!clientName && detectedClientInfo) {
+        clientName = detectedClientInfo.name;
+      }
+
       const result = await client.getSmartContext({
         user_message: input.user_message,
         workspace_id: workspaceId,
@@ -7235,6 +7259,9 @@ This saves ~80% tokens compared to including full chat history.`,
         distill: input.distill,
         session_tokens: sessionTokens,
         context_threshold: contextThreshold,
+        save_exchange: input.save_exchange,
+        session_id: sessionId,
+        client_name: clientName,
       });
 
       // Track response tokens in SessionManager for context pressure calculation
@@ -9654,7 +9681,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "memory",
       {
         title: "Memory",
-        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap. Team actions (team plans only): team_tasks, team_todos, team_diagrams, team_docs.`,
+        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap. Transcript actions: list_transcripts (list saved conversations), get_transcript (get full transcript by ID), search_transcripts (semantic search across conversations), delete_transcript. Team actions (team plans only): team_tasks, team_todos, team_diagrams, team_docs.`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -9703,6 +9730,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "update_doc",
               "delete_doc",
               "create_roadmap",
+              // Transcript actions
+              "list_transcripts",
+              "get_transcript",
+              "search_transcripts",
+              "delete_transcript",
               // Team actions
               "team_tasks",
               "team_todos",
@@ -9856,6 +9888,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .boolean()
             .optional()
             .describe("Mark as personal (only visible to creator). For create/list actions on todos, diagrams, docs."),
+          // Transcript params
+          transcript_id: z.string().uuid().optional().describe("Transcript ID for get_transcript/delete_transcript"),
+          session_id: z.string().optional().describe("Session ID filter for list_transcripts"),
+          client_name: z.string().optional().describe("Client name filter for list_transcripts (e.g., 'claude', 'cursor')"),
+          started_after: z.string().optional().describe("ISO timestamp - filter transcripts started after this time"),
+          started_before: z.string().optional().describe("ISO timestamp - filter transcripts started before this time"),
         }),
       },
       async (input) => {
@@ -10739,6 +10777,60 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   }),
                 },
               ],
+            };
+          }
+
+          // Transcript actions
+          case "list_transcripts": {
+            const result = await client.listTranscripts({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              session_id: input.session_id,
+              client_name: input.client_name,
+              started_after: input.started_after,
+              started_before: input.started_before,
+              limit: input.limit,
+            });
+            const transcripts = (result as any)?.data?.items || (result as any)?.items || (result as any)?.data || [];
+            const resultWithHint = (Array.isArray(transcripts) && transcripts.length === 0)
+              ? { ...(result as object), hint: "No transcripts found. Enable save_exchange in context() calls to save conversations." }
+              : result;
+            return {
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
+            };
+          }
+
+          case "get_transcript": {
+            if (!input.transcript_id) {
+              return errorResult("get_transcript requires: transcript_id");
+            }
+            const result = await client.getTranscript(input.transcript_id);
+            return {
+              content: [{ type: "text" as const, text: formatContent(result) }],
+            };
+          }
+
+          case "search_transcripts": {
+            if (!input.query) {
+              return errorResult("search_transcripts requires: query");
+            }
+            const result = await client.searchTranscripts({
+              workspace_id: workspaceId,
+              query: input.query,
+              limit: input.limit,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(result) }],
+            };
+          }
+
+          case "delete_transcript": {
+            if (!input.transcript_id) {
+              return errorResult("delete_transcript requires: transcript_id");
+            }
+            const result = await client.deleteTranscript(input.transcript_id);
+            return {
+              content: [{ type: "text" as const, text: formatContent(result) }],
             };
           }
 

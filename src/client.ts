@@ -3269,6 +3269,12 @@ export class ContextStreamClient {
     session_tokens?: number;
     /** Custom context window threshold (defaults to 70k) */
     context_threshold?: number;
+    /** Save this exchange to the transcript for later search (background task) */
+    save_exchange?: boolean;
+    /** Session ID for transcript association (required if save_exchange is true) */
+    session_id?: string;
+    /** Client name for transcript metadata (e.g., 'claude', 'cursor') */
+    client_name?: string;
   }): Promise<{
     context: string;
     token_estimate: number;
@@ -3392,6 +3398,10 @@ export class ContextStreamClient {
           // Session token tracking for context pressure
           ...(params.session_tokens !== undefined && { session_tokens: params.session_tokens }),
           ...(params.context_threshold !== undefined && { context_threshold: params.context_threshold }),
+          // Transcript save parameters
+          ...(params.save_exchange !== undefined && { save_exchange: params.save_exchange }),
+          ...(params.session_id !== undefined && { session_id: params.session_id }),
+          ...(params.client_name !== undefined && { client_name: params.client_name }),
         },
       });
       const data = unwrapApiResponse<any>(apiResult);
@@ -5933,5 +5943,70 @@ export class ContextStreamClient {
   async docsDelete(params: { doc_id: string }) {
     uuidSchema.parse(params.doc_id);
     return request(this.config, `/docs/${params.doc_id}`, { method: "DELETE" });
+  }
+
+  // -------------------------------------------------------------------------
+  // Transcript methods (conversation session storage)
+  // -------------------------------------------------------------------------
+
+  /**
+   * List transcripts for a workspace/project
+   */
+  async listTranscripts(params?: {
+    workspace_id?: string;
+    project_id?: string;
+    session_id?: string;
+    client_name?: string;
+    started_after?: string;
+    started_before?: string;
+    limit?: number;
+    page?: number;
+    per_page?: number;
+  }) {
+    const withDefaults = this.withDefaults(params || {});
+    const query = new URLSearchParams();
+    if (withDefaults.workspace_id) query.set("workspace_id", withDefaults.workspace_id);
+    if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
+    if (params?.session_id) query.set("session_id", params.session_id);
+    if (params?.client_name) query.set("client_name", params.client_name);
+    if (params?.started_after) query.set("started_after", params.started_after);
+    if (params?.started_before) query.set("started_before", params.started_before);
+    if (params?.limit) query.set("per_page", String(params.limit));
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.per_page) query.set("per_page", String(params.per_page));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request(this.config, `/transcripts${suffix}`, { method: "GET" });
+  }
+
+  /**
+   * Get a specific transcript by ID
+   */
+  async getTranscript(transcript_id: string) {
+    uuidSchema.parse(transcript_id);
+    return request(this.config, `/transcripts/${transcript_id}`, { method: "GET" });
+  }
+
+  /**
+   * Search transcripts by content
+   */
+  async searchTranscripts(params: {
+    workspace_id?: string;
+    query: string;
+    limit?: number;
+  }) {
+    const withDefaults = this.withDefaults(params);
+    const queryParams = new URLSearchParams();
+    if (withDefaults.workspace_id) queryParams.set("workspace_id", withDefaults.workspace_id);
+    queryParams.set("q", params.query);
+    if (params.limit) queryParams.set("limit", String(params.limit));
+    return request(this.config, `/transcripts/search?${queryParams.toString()}`, { method: "GET" });
+  }
+
+  /**
+   * Delete a transcript
+   */
+  async deleteTranscript(transcript_id: string) {
+    uuidSchema.parse(transcript_id);
+    return request(this.config, `/transcripts/${transcript_id}`, { method: "DELETE" });
   }
 }

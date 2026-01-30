@@ -62,6 +62,16 @@ interface TranscriptData {
   toolCallCount: number;
   messageCount: number;
   lastTools: string[];
+  messages: TranscriptMessage[];
+  startedAt: string;
+}
+
+interface TranscriptMessage {
+  role: string;
+  content: string;
+  timestamp: string;
+  tool_calls?: unknown;
+  tool_results?: unknown;
 }
 
 function loadConfigFromMcpJson(cwd: string): void {
@@ -134,6 +144,9 @@ function parseTranscript(transcriptPath: string): TranscriptData {
   const activeFiles = new Set<string>();
   const recentMessages: string[] = [];
   const toolCalls: Array<{ name: string; input: Record<string, unknown> }> = [];
+  const messages: TranscriptMessage[] = [];
+  let startedAt = new Date().toISOString();
+  let firstTimestamp = true;
 
   try {
     const content = fs.readFileSync(transcriptPath, "utf-8");
@@ -143,8 +156,15 @@ function parseTranscript(transcriptPath: string): TranscriptData {
       if (!line.trim()) continue;
 
       try {
-        const entry = JSON.parse(line) as TranscriptEntry;
+        const entry = JSON.parse(line) as TranscriptEntry & { timestamp?: string };
         const msgType = entry.type || "";
+        const timestamp = entry.timestamp || new Date().toISOString();
+
+        // Track first timestamp as started_at
+        if (firstTimestamp && entry.timestamp) {
+          startedAt = entry.timestamp;
+          firstTimestamp = false;
+        }
 
         // Extract files from tool calls
         if (msgType === "tool_use") {
@@ -165,13 +185,45 @@ function parseTranscript(transcriptPath: string): TranscriptData {
               activeFiles.add(`[glob:${pattern}]`);
             }
           }
-        }
 
-        // Collect recent assistant messages for summary
-        if (msgType === "assistant" && entry.content) {
-          const content = entry.content;
-          if (typeof content === "string" && content.length > 50) {
-            recentMessages.push(content.slice(0, 500));
+          // Add tool call as message
+          messages.push({
+            role: "assistant",
+            content: `[Tool: ${toolName}]`,
+            timestamp,
+            tool_calls: { name: toolName, input: toolInput },
+          });
+        } else if (msgType === "tool_result") {
+          // Add tool result as message (truncated for storage)
+          const resultContent = typeof entry.content === "string"
+            ? entry.content.slice(0, 2000)
+            : JSON.stringify(entry.content || {}).slice(0, 2000);
+          messages.push({
+            role: "tool",
+            content: resultContent,
+            timestamp,
+            tool_results: { name: entry.name },
+          });
+        } else if (msgType === "user" || entry.role === "user") {
+          const userContent = typeof entry.content === "string" ? entry.content : "";
+          if (userContent) {
+            messages.push({
+              role: "user",
+              content: userContent,
+              timestamp,
+            });
+          }
+        } else if (msgType === "assistant" || entry.role === "assistant") {
+          const assistantContent = typeof entry.content === "string" ? entry.content : "";
+          if (assistantContent) {
+            messages.push({
+              role: "assistant",
+              content: assistantContent,
+              timestamp,
+            });
+            if (assistantContent.length > 50) {
+              recentMessages.push(assistantContent.slice(0, 500));
+            }
           }
         }
       } catch {
@@ -185,9 +237,68 @@ function parseTranscript(transcriptPath: string): TranscriptData {
   return {
     activeFiles: Array.from(activeFiles).slice(-20), // Last 20 files
     toolCallCount: toolCalls.length,
-    messageCount: recentMessages.length,
+    messageCount: messages.length,
     lastTools: toolCalls.slice(-10).map((t) => t.name), // Last 10 tool names
+    messages,
+    startedAt,
   };
+}
+
+async function saveFullTranscript(
+  sessionId: string,
+  transcriptData: TranscriptData,
+  trigger: string
+): Promise<{ success: boolean; message: string }> {
+  if (!API_KEY) {
+    return { success: false, message: "No API key configured" };
+  }
+
+  if (transcriptData.messages.length === 0) {
+    return { success: false, message: "No messages to save" };
+  }
+
+  const payload: Record<string, unknown> = {
+    session_id: sessionId,
+    messages: transcriptData.messages,
+    started_at: transcriptData.startedAt,
+    source_type: "pre_compact",
+    title: `Pre-compaction save (${trigger})`,
+    metadata: {
+      trigger,
+      active_files: transcriptData.activeFiles,
+      tool_call_count: transcriptData.toolCallCount,
+    },
+    tags: ["pre_compaction", trigger],
+  };
+
+  // Add workspace_id if available
+  if (WORKSPACE_ID) {
+    payload.workspace_id = WORKSPACE_ID;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s for larger payload
+
+    const response = await fetch(`${API_URL}/api/v1/transcripts`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": API_KEY,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      return { success: true, message: `Transcript saved (${transcriptData.messages.length} messages)` };
+    }
+    return { success: false, message: `API error: ${response.status}` };
+  } catch (error) {
+    return { success: false, message: String(error) };
+  }
 }
 
 async function saveSnapshot(
@@ -291,14 +402,21 @@ export async function runPreCompactHook(): Promise<void> {
     transcriptData = parseTranscript(transcriptPath);
   }
 
-  // Auto-save snapshot if enabled
+  // Auto-save full transcript and snapshot if enabled
   let autoSaveStatus = "";
   if (AUTO_SAVE && API_KEY) {
-    const { success, message } = await saveSnapshot(sessionId, transcriptData, trigger);
-    if (success) {
-      autoSaveStatus = `\n[ContextStream: Auto-saved snapshot with ${transcriptData.activeFiles.length} active files]`;
+    // Save full transcript first
+    const transcriptResult = await saveFullTranscript(sessionId, transcriptData, trigger);
+    if (transcriptResult.success) {
+      autoSaveStatus = `\n[ContextStream: ${transcriptResult.message}]`;
     } else {
-      autoSaveStatus = `\n[ContextStream: Auto-save failed - ${message}]`;
+      // Fall back to snapshot if transcript save fails
+      const { success, message } = await saveSnapshot(sessionId, transcriptData, trigger);
+      if (success) {
+        autoSaveStatus = `\n[ContextStream: Auto-saved snapshot with ${transcriptData.activeFiles.length} active files (transcript save failed: ${transcriptResult.message})]`;
+      } else {
+        autoSaveStatus = `\n[ContextStream: Auto-save failed - ${message}]`;
+      }
     }
   }
 

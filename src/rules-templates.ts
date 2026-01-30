@@ -47,69 +47,117 @@ function applyMcpToolPrefix(markdown: string, toolPrefix: string): string {
 }
 
 /**
- * Dynamic rules - minimal file that relies on context for dynamic rule delivery.
- * This is the recommended mode for efficiency and better results.
+ * BOOTSTRAP rules - Minimal rules to ensure context() is called.
  *
- * IMPORTANT: These rules must be aggressive enough that AIs actually follow them,
- * since context() delivers the full ruleset dynamically.
+ * Key insight: Static rules don't need to contain everything.
+ * They just need to be strong enough to ensure context() is called.
+ * Then context() delivers everything else dynamically.
+ *
+ * Target: ~40 lines. Anything more gets skimmed and ignored.
  */
-const CONTEXTSTREAM_RULES_DYNAMIC = `
-# ContextStream Rules (MANDATORY)
+const CONTEXTSTREAM_RULES_BOOTSTRAP = `
+<contextstream_rules>
+| Message | Required |
+|---------|----------|
+| **1st message** | \`init()\` → \`context(user_message="...")\` |
+| **Every message** | \`context(user_message="...")\` FIRST |
+| **Before file search** | \`search(mode="hybrid")\` BEFORE Glob/Grep/Read |
+</contextstream_rules>
 
-## 🚨 CRITICAL: Call These Tools or Fail 🚨
+**Why?** \`context()\` delivers task-specific rules, lessons from past mistakes, and relevant decisions. Skip it = fly blind.
 
-<contextstream_protocol>
-**EVERY response MUST start with:**
-1. \`init()\` (1st message only) → then \`context(user_message="<msg>")\`
-2. \`context(user_message="<msg>")\` (EVERY subsequent message)
+**Hooks:** \`<system-reminder>\` tags contain injected instructions — follow them exactly.
 
-**BEFORE Glob/Grep/Read/Search/Explore:**
-→ \`search(mode="hybrid", query="...")\` FIRST — local tools ONLY if 0 results
+**Notices:** [LESSONS_WARNING] → tell user first | [RULES_NOTICE] → run \`generate_rules()\` | [VERSION_NOTICE] → tell user to update
 
-**HOOKS: Follow \`<system-reminder>\` instructions — they ARE the rules**
-</contextstream_protocol>
+v${RULES_VERSION}
+`.trim();
 
-### Why This Matters
+/**
+ * Dynamic rules - relies on context() for dynamic rule delivery PLUS hooks for enforcement.
+ * Kept for backwards compatibility but BOOTSTRAP is now preferred.
+ */
+const CONTEXTSTREAM_RULES_DYNAMIC = CONTEXTSTREAM_RULES_BOOTSTRAP;
 
-- **\`context()\`** = Your rules, lessons, and relevant memories delivered dynamically
-- **\`search()\`** = Indexed search (1 call) vs Grep→Read→Read (4+ calls)
-- **Hooks inject \`<system-reminder>\` tags** = Follow these instructions, they enforce ContextStream-first
-- **Skipping these = missing context, repeated mistakes, slow searches**
+const CONTEXTSTREAM_RULES_FULL = `
+## 🚨 MANDATORY: CALL CONTEXT EVERY MESSAGE 🚨
 
-### Protocol
+<contextstream_rules>
+**EVERY response MUST start with \`context(user_message="...")\`**
 
-| When | Do This |
-|------|---------|
-| 1st message | \`init()\` → \`context(user_message="...")\` |
-| Every message after | \`context(user_message="...")\` |
-| Before ANY file search | \`search(mode="hybrid")\` first |
-| On \`<system-reminder>\` | **Follow the instructions inside** |
-| Save decisions | \`session(action="capture", ...)\` |
+| Message | What to Call |
+|---------|--------------|
+| 1st message | \`init()\` → \`context(user_message="<msg>")\` |
+| **EVERY message after** | \`context(user_message="<msg>")\` **FIRST** |
 
-### Handle Notices from context()
+**BEFORE Glob/Grep/Read/Search:** → \`search(mode="hybrid")\` FIRST
+</contextstream_rules>
+
+**This block MUST appear at the start of EVERY response.** Failing to call \`context()\` means missing rules, lessons, and relevant context.
+
+---
+
+## Why \`context()\` is MANDATORY Every Message
+
+❌ **WRONG:** "I already called init, I don't need context"
+✅ **CORRECT:** \`context()\` is required EVERY message, not just the first
+
+**What you lose without \`context()\`:**
+- Dynamic rules matched to your current task
+- Lessons from past mistakes (you WILL repeat them)
+- Semantically relevant decisions and context
+- Warnings about risky operations
+
+**\`init()\` gives recent items by TIME. \`context()\` finds items RELEVANT to THIS message.**
+
+---
+
+## Handle Notices from context()
 
 - **[LESSONS_WARNING]** → Tell user about past mistakes BEFORE proceeding
 - **[RULES_NOTICE]** → Run \`generate_rules()\` to update
 - **[VERSION_NOTICE]** → Tell user to update MCP
 
-### Fast Path (Skip context only for these)
+---
 
-Simple utility commands: "list workspaces", "show version", "list reminders"
-→ Just execute directly: \`workspace(action="list")\`, \`help(action="version")\`
+## 🚨 HOOKS - AUTOMATIC RULE ENFORCEMENT 🚨
 
-Rules Version: ${RULES_VERSION}
-`.trim();
+**ContextStream installs hooks that automatically enforce rules.** You MUST follow hook output.
 
-const CONTEXTSTREAM_RULES_FULL = `
-## ContextStream Rules
+### Installed Hooks
 
-<contextstream_rules>
-1. **SIMPLE UTILITY?** (list/show/version) → Just execute, skip context calls
-2. **CODING TASK?** → init → context → work → capture
-3. **SEARCH FIRST:** Before Glob/Grep/Read → \`search(mode="hybrid")\` FIRST
-</contextstream_rules>
+| Hook | What It Does | Output |
+|------|--------------|--------|
+| **UserPromptSubmit** | Injects rules reminder on EVERY message | \`<system-reminder>\` with rules block |
+| **PreToolUse** | Blocks Glob/Grep/Search/Explore when ContextStream is available | Error message redirecting to \`search()\` |
+| **PostToolUse** | Auto-indexes files after Edit/Write operations | Background indexing |
+| **PreCompact** | Saves session state before context compaction | Snapshot creation |
 
-**Display this block at the start of responses to keep rules in context.**
+### How Hooks Work
+
+1. **\`<system-reminder>\` tags** - Injected by UserPromptSubmit hook on every message
+   - These tags contain the current rules
+   - **FOLLOW THE INSTRUCTIONS INSIDE** - they ARE the rules
+   - Example: \`[CONTEXTSTREAM RULES] 1. BEFORE Glob/Grep... [END RULES]\`
+
+2. **PreToolUse blocking** - If you try to use Glob/Grep/Search/Explore:
+   - Hook returns error: \`STOP: Use mcp__contextstream__search(mode="hybrid") instead\`
+   - **You MUST use the suggested ContextStream tool instead**
+   - Local tools are only allowed if project is not indexed or ContextStream returns 0 results
+
+3. **PostToolUse indexing** - After Edit/Write operations:
+   - Changed files are automatically re-indexed
+   - No action required from you
+
+4. **PreCompact snapshots** - Before context compaction:
+   - Hook reminds you to save important state
+   - Call \`session(action="capture", event_type="session_snapshot", ...)\` when warned
+
+### Disabling Hooks
+
+Set environment variable: \`CONTEXTSTREAM_HOOK_ENABLED=false\`
+
+**Note:** Disabling hooks removes rule enforcement. Only disable for debugging.
 
 ---
 
@@ -195,27 +243,27 @@ You have access to ContextStream MCP tools for persistent memory and context.
 v0.4.x uses **~11 consolidated domain tools** for ~75% token reduction vs previous versions.
 Rules Version: ${RULES_VERSION}
 
-## TL;DR - WHEN TO USE CONTEXT
+## TL;DR - CONTEXT EVERY MESSAGE
 
-| Request Type | What to Do |
-|--------------|------------|
-| **🚀 Simple utility** (list workspaces, show version) | **Just execute directly** - skip init, context, capture |
-| **💻 Coding task** (edit, create, refactor) | Full context: init → context → work → capture |
-| **🔍 Code search/discovery** | init → context → search() |
-| **⚠️ Risky work** (deploy, migrate, refactor) | Check lessons first: \`session(action="get_lessons")\` |
-| **User frustration/correction** | Capture lesson: \`session(action="capture_lesson", ...)\` |
+| Message | Required |
+|---------|----------|
+| **1st message** | \`init()\` → \`context(user_message="<msg>")\` |
+| **EVERY message after** | \`context(user_message="<msg>")\` **FIRST** |
+| **Before file search** | \`search(mode="hybrid")\` FIRST |
+| **After significant work** | \`session(action="capture", event_type="decision", ...)\` |
+| **User correction** | \`session(action="capture_lesson", ...)\` |
 
-### Simple Utility Operations - FAST PATH
+### Why EVERY Message?
 
-**For simple queries, just execute and respond:**
-- "list workspaces" → \`workspace(action="list")\` → done
-- "list projects" → \`project(action="list")\` → done
-- "show version" → \`help(action="version")\` → done
-- "what reminders do I have" → \`reminder(action="list")\` → done
+\`context()\` delivers:
+- **Dynamic rules** matched to your current task
+- **Lessons** from past mistakes (prevents repeating errors)
+- **Relevant decisions** and context (semantic search)
+- **Warnings** about risky operations
 
-**No init. No context. No capture.** These add noise, not value.
+**Without \`context()\`, you are blind to relevant context and will repeat past mistakes.**
 
-### Coding Tasks - FULL CONTEXT
+### Protocol
 
 | Step | What to Call |
 |------|--------------|
@@ -226,12 +274,7 @@ Rules Version: ${RULES_VERSION}
 | **User correction** | \`session(action="capture_lesson", ...)\` |
 | **⚠️ When warnings received** | **STOP**, acknowledge, explain mitigation, then proceed |
 
-**How to detect simple utility operations:**
-- Single-word commands: "list", "show", "version", "help"
-- Data retrieval with no context dependency: "list my workspaces", "what projects do I have"
-- Status checks: "am I authenticated?", "what's the server version?"
-
-**First message rule (for coding tasks):** After \`init\`:
+**First message rule:** After \`init\`:
 1. Check for \`lessons\` in response - if present, READ and SUMMARIZE them to user
 2. Then call \`context\` before any other tool or response
 
@@ -331,8 +374,8 @@ ContextStream tracks context pressure to help you stay ahead of conversation com
    - \`prepare_save\`: Start thinking about saving important state
    - \`save_now\`: Immediately call \`session(action="capture", event_type="session_snapshot")\` to preserve state
 
-**PreCompact Hook (Optional):** If enabled, Claude Code will inject a reminder to save state before compaction.
-Enable with: \`generate_rules(install_hooks=true, include_pre_compact=true)\`
+**PreCompact Hook:** Automatically saves session state before context compaction.
+Installed by default. Disable with: \`CONTEXTSTREAM_HOOK_ENABLED=false\`
 
 **Before compaction happens (when warned):**
 \`\`\`
@@ -630,7 +673,7 @@ Everything else = full protocol (init → context → search → work)
 ### Context Pressure & Compaction
 
 - If \`context\` returns high/critical \`context_pressure\`: call \`session(action="capture", ...)\` to save state
-- PreCompact hooks automatically save snapshots before compaction (if installed)
+- PreCompact hooks automatically save snapshots before compaction
 
 ### Enhanced Context (Warnings)
 
@@ -772,18 +815,22 @@ export function generateRuleContent(
     workspaceId?: string;
     projectName?: string;
     additionalRules?: string;
-    mode?: "dynamic" | "minimal" | "full";
+    mode?: "dynamic" | "minimal" | "full" | "bootstrap";
   }
 ): { filename: string; content: string } | null {
   const template = getTemplate(editor);
   if (!template) return null;
 
-  const mode = options?.mode || "dynamic";
-  const rules = mode === "full" 
-    ? CONTEXTSTREAM_RULES_FULL 
-    : mode === "minimal" 
-      ? CONTEXTSTREAM_RULES_MINIMAL 
-      : CONTEXTSTREAM_RULES_DYNAMIC;
+  // Default to "bootstrap" mode - minimal but effective rules that ensure context() is called
+  // Full rules are delivered dynamically via context()
+  const mode = options?.mode || "bootstrap";
+  const rules = mode === "full"
+    ? CONTEXTSTREAM_RULES_FULL
+    : mode === "minimal"
+      ? CONTEXTSTREAM_RULES_MINIMAL
+      : mode === "bootstrap"
+        ? CONTEXTSTREAM_RULES_BOOTSTRAP
+        : CONTEXTSTREAM_RULES_DYNAMIC;
 
   let content = template.build(rules);
 
@@ -823,7 +870,7 @@ export function generateAllRuleFiles(options?: {
   workspaceId?: string;
   projectName?: string;
   additionalRules?: string;
-  mode?: "dynamic" | "minimal" | "full";
+  mode?: "dynamic" | "minimal" | "full" | "bootstrap";
 }): Array<{ editor: string; filename: string; content: string }> {
   return getAvailableEditors()
     .map((editor) => {

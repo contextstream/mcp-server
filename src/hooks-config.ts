@@ -595,8 +595,8 @@ export function buildHooksConfig(options?: {
     UserPromptSubmit: userPromptHooks,
   };
 
-  // Add PreCompact hook for context compaction awareness (opt-in)
-  if (options?.includePreCompact) {
+  // Add PreCompact hook for context compaction awareness (default ON)
+  if (options?.includePreCompact !== false) {
     config.PreCompact = [
       {
         // Match both manual (/compact) and automatic compaction
@@ -674,7 +674,7 @@ export async function installHookScripts(options?: {
     userPrompt: "npx @contextstream/mcp-server hook user-prompt-submit",
   };
 
-  if (options?.includePreCompact) {
+  if (options?.includePreCompact !== false) {
     result.preCompact = "npx @contextstream/mcp-server hook pre-compact";
   }
 
@@ -769,7 +769,7 @@ export async function installClaudeCodeHooks(options: {
     "npx @contextstream/mcp-server hook pre-tool-use",
     "npx @contextstream/mcp-server hook user-prompt-submit"
   );
-  if (options.includePreCompact) {
+  if (options.includePreCompact !== false) {
     result.scripts.push("npx @contextstream/mcp-server hook pre-compact");
   }
   if (options.includeMediaAware !== false) {
@@ -846,12 +846,11 @@ When Media-Aware hook detects media patterns, it injects context about:
 - How to get clips for Remotion (with frame-based props)
 - How to index new media files
 
-### PreCompact Hook (Optional)
+### PreCompact Hook
 - **Command:** \`npx @contextstream/mcp-server hook pre-compact\`
 - **Purpose:** Saves conversation state before context compaction
 - **Triggers:** Both manual (/compact) and automatic compaction
-- **Disable:** Set \`CONTEXTSTREAM_PRECOMPACT_ENABLED=false\` environment variable
-- **Note:** Enable with \`generate_rules(include_pre_compact=true)\` to activate
+- **Installed:** By default (disable with \`CONTEXTSTREAM_HOOK_ENABLED=false\`)
 
 When PreCompact runs, it:
 1. Parses the transcript for active files and tool calls

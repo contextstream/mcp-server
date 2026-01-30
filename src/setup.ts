@@ -1116,8 +1116,8 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       }
     }
 
-    // Rules mode: always dynamic (most efficient)
-    const mode: RuleMode = "dynamic";
+    // Rules mode: full (comprehensive rules with strong protocol enforcement)
+    const mode: RuleMode = "full";
 
     const detectedPlanName = await client.getPlanName();
     const detectedGraphTier = await client.getGraphTier();

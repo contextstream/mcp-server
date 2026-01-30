@@ -14,11 +14,16 @@
 
 const ENABLED = process.env.CONTEXTSTREAM_REMINDER_ENABLED !== "false";
 
-const REMINDER = `[CONTEXTSTREAM RULES]
-1. BEFORE Glob/Grep/Read/Search: mcp__contextstream__search(mode="hybrid") FIRST
-2. Call context_smart at start of EVERY response
-3. Local tools ONLY if ContextStream returns 0 results
-[END RULES]`;
+const REMINDER = `[CONTEXTSTREAM - DO THIS FIRST]
+mcp__contextstream__context(user_message="<user's message>") - CALL THIS BEFORE ANY OTHER TOOL
+
+Why: Delivers task-specific rules, lessons from past mistakes, and relevant context.
+Skip it = repeat past mistakes, miss relevant decisions, fly blind.
+
+BEFORE Glob/Grep/Read/Search/Explore:
+mcp__contextstream__search(mode="hybrid", query="...") FIRST
+Local tools ONLY if search returns 0 results.
+[END]`;
 
 interface HookInput {
   // Claude Code format

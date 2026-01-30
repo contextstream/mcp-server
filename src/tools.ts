@@ -24,6 +24,17 @@ import {
   type SupportedEditor,
 } from "./hooks-config.js";
 import { trackToolTokenSavings, type TokenSavingsToolType } from "./token-savings.js";
+import {
+  getSessionInitTip,
+  getCaptureHint,
+  getEmptyStateHint,
+  getPlanStatusHint,
+  POST_COMPACT_HINTS,
+  INTEGRATION_HINTS,
+  TASK_HINTS,
+  WORKSPACE_HINTS,
+  PROJECT_HINTS,
+} from "./educational-microcopy.js";
 
 type StructuredContent = { [x: string]: unknown } | undefined;
 type ToolTextResult = {
@@ -156,6 +167,12 @@ const SEARCH_RULES_REMINDER_ENABLED =
   process.env.CONTEXTSTREAM_SEARCH_REMINDER?.toLowerCase() !== "false";
 
 const SEARCH_RULES_REMINDER = `[SEARCH] Use search(mode="hybrid") before Glob/Grep/Read. Local tools only if 0 results.`;
+
+/**
+ * Context call reminder - reinforces that context() must be called EVERY message.
+ * This combats instruction decay and ensures AI follows the protocol.
+ */
+const CONTEXT_CALL_REMINDER = `[CONTEXT] Call context(user_message="...") at start of EVERY response. This is MANDATORY.`;
 
 /**
  * Lessons reminder injected when there are active lessons.
@@ -369,7 +386,7 @@ type RulesNotice = {
   update_args: {
     folder_path?: string;
     editors?: string[];
-    mode?: "minimal" | "full";
+    mode?: "minimal" | "full" | "bootstrap";
   };
   update_command: string;
 };
@@ -795,7 +812,7 @@ async function writeEditorRules(options: {
   workspaceId?: string;
   projectName?: string;
   additionalRules?: string;
-  mode?: "minimal" | "full";
+  mode?: "minimal" | "full" | "bootstrap";
   overwriteExisting?: boolean;
 }): Promise<Array<{ editor: string; filename: string; status: string }>> {
   const editors =
@@ -861,7 +878,7 @@ function listGlobalRuleTargets(editors: string[]): Array<{ editor: string; fileP
 
 async function writeGlobalRules(options: {
   editors: string[];
-  mode?: "minimal" | "full";
+  mode?: "minimal" | "full" | "bootstrap";
   overwriteExisting?: boolean;
 }): Promise<Array<RuleWriteResult & { scope: "global" }>> {
   const results: Array<RuleWriteResult & { scope: "global" }> = [];
@@ -4974,6 +4991,10 @@ This does semantic search on the first message. You only need context on subsequ
       // Add compact tool reference to help AI know available tools
       result.tools_hint = getCoreToolsHint();
 
+      // Add educational tip to teach users about persistent context value
+      const sessionId = typeof result.session_id === "string" ? result.session_id : undefined;
+      result.educational_tip = getSessionInitTip(sessionId);
+
       // Handle context restoration - always try to restore from recent snapshots by default
       // Can be disabled via CONTEXTSTREAM_RESTORE_CONTEXT=false or input.is_post_compact=false
       const shouldRestoreContext = input.is_post_compact ?? RESTORE_CONTEXT_DEFAULT;
@@ -5076,18 +5097,16 @@ This does semantic search on the first message. You only need context on subsequ
               };
               (result as any).is_post_compact = true;
               (result as any).post_compact_hint = prevSessionId
-                ? `Session restored from session ${prevSessionId}. Review 'restored_context' to continue where you left off.`
-                : "Session restored from pre-compaction snapshot. Review the 'restored_context' to continue where you left off.";
+                ? POST_COMPACT_HINTS.restored_with_session(prevSessionId as string)
+                : POST_COMPACT_HINTS.restored;
             } else {
               (result as any).is_post_compact = true;
-              (result as any).post_compact_hint =
-                "Post-compaction session started, but no snapshots found. Use context_smart to retrieve relevant context.";
+              (result as any).post_compact_hint = POST_COMPACT_HINTS.no_snapshot;
             }
           } catch (err) {
             logDebug(`Failed to restore post-compact context: ${err}`);
             (result as any).is_post_compact = true;
-            (result as any).post_compact_hint =
-              "Post-compaction session started. Snapshot restoration failed, use context_smart for context.";
+            (result as any).post_compact_hint = POST_COMPACT_HINTS.failed;
           }
         }
       }
@@ -5140,7 +5159,7 @@ This does semantic search on the first message. You only need context on subsequ
             hint:
               intStatus.slack || intStatus.github
                 ? "Integration tools are now available in the tool list."
-                : "Connect integrations at https://contextstream.io/settings/integrations to enable Slack/GitHub tools.",
+                : INTEGRATION_HINTS.not_connected + " https://contextstream.io/settings/integrations",
           };
         } catch (error) {
           logDebug(`Failed to check integration status: ${error}`);
@@ -6479,13 +6498,15 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
           .optional()
           .describe("Additional project-specific rules to append"),
         mode: z
-          .enum(["minimal", "full"])
+          .enum(["minimal", "full", "bootstrap"])
           .optional()
-          .describe("Rule verbosity mode (default: minimal)"),
+          .default("bootstrap")
+          .describe("Rule verbosity: bootstrap (~15 lines, recommended), minimal (~80 lines), full (~600 lines)"),
         overwrite_existing: z
           .boolean()
           .optional()
-          .describe("Allow overwriting existing rule files (ContextStream block only)"),
+          .default(true)
+          .describe("Overwrite ContextStream block in existing rule files (default: true). User content outside the block is preserved."),
         apply_global: z
           .boolean()
           .optional()
@@ -6497,7 +6518,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
         include_pre_compact: z
           .boolean()
           .optional()
-          .describe("Include PreCompact hook for automatic state saving before context compaction. Defaults to false."),
+          .describe("Include PreCompact hook for automatic state saving before context compaction. Defaults to true."),
         dry_run: z.boolean().optional().describe("If true, return content without writing files"),
       }),
     },
@@ -6611,7 +6632,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
                   { editor, file: "~/.claude/hooks/contextstream-reminder.py", status: "dry run - would create" },
                   { editor, file: "~/.claude/settings.json", status: "dry run - would update" }
                 );
-                if (input.include_pre_compact) {
+                if (input.include_pre_compact !== false) {
                   hooksResults.push({ editor, file: "~/.claude/hooks/contextstream-precompact.py", status: "dry run - would create" });
                 }
               } else if (editor === "cline") {
@@ -6642,7 +6663,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
             const allHookResults = await installAllEditorHooks({
               scope: "global",
               editors: hookSupportedEditors,
-              includePreCompact: input.include_pre_compact,
+              includePreCompact: input.include_pre_compact !== false,
             });
             for (const result of allHookResults) {
               for (const file of result.installed) {
@@ -7411,6 +7432,7 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
 
       // Combine all warnings (only add non-empty ones with proper spacing)
       // Server warnings take precedence, but we keep client-side detection as fallback
+      const contextRulesLine = `\n\n${CONTEXT_CALL_REMINDER}`;
       const allWarnings = [
         serverWarningsLine || lessonsWarningLine,  // Server warnings OR client-side lesson detection
         rulesWarningLine ? `\n\n${rulesWarningLine}` : "",
@@ -7418,6 +7440,7 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
         contextPressureWarning,
         semanticHints,
         instructionsLine,
+        contextRulesLine,  // Reinforce context() must be called every message
         searchRulesLine,
       ].filter(Boolean).join("");
 
@@ -8923,9 +8946,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               code_refs: input.code_refs,
               provenance: input.provenance,
             });
+            // Add educational hint based on event type
+            const captureHint = getCaptureHint(input.event_type);
+            const resultWithHint = { ...(result as object), hint: captureHint };
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
+
             };
           }
 
@@ -8990,9 +9016,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                     : "medium",
               tags: input.keywords || [],
             });
+            // Add educational hint for lessons
+            const lessonHint = getCaptureHint("lesson");
+            const resultWithHint = { ...(result as object), hint: lessonHint };
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
+
             };
           }
 
@@ -9006,9 +9035,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               context_hint: input.query,
               limit: input.limit,
             });
+            // Add empty state hint if no lessons found
+            const lessons = (result as any)?.data?.lessons || (result as any)?.lessons || [];
+            const resultWithHint = (Array.isArray(lessons) && lessons.length === 0)
+              ? { ...(result as object), hint: getEmptyStateHint("get_lessons") }
+              : result;
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
+
             };
           }
 
@@ -9023,7 +9057,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               include_related: input.include_related,
               include_decisions: input.include_decisions,
             });
-            const outputText = formatContent(result);
+            // Add empty state hint if no results found
+            const recallResults = (result as any)?.data?.results || (result as any)?.results || [];
+            const recallWithHint = (Array.isArray(recallResults) && recallResults.length === 0)
+              ? { ...(result as object), hint: getEmptyStateHint("recall") }
+              : result;
+            const outputText = formatContent(recallWithHint);
             // Track token savings
             trackToolTokenSavings(client, "session_recall", outputText, {
               workspace_id: workspaceId,
@@ -9031,7 +9070,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: outputText }],
-              
+
             };
           }
 
@@ -9048,9 +9087,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               content: input.content,
               importance,
             });
+            // Add educational hint for remember
+            const rememberHint = getCaptureHint("preference");
+            const resultWithHint = { ...(result as object), hint: rememberHint };
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
+
             };
           }
 
@@ -9179,9 +9221,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               source_tool: input.source_tool || "mcp",
               is_personal: input.is_personal,
             });
+            // Add plan lifecycle hint
+            const planHint = getPlanStatusHint(input.status || "draft");
+            const resultWithHint = { ...(result as object), hint: planHint };
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
+
             };
           }
 
@@ -9214,9 +9259,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               tags: input.tags,
               due_at: input.due_at,
             });
+            // Add plan lifecycle hint based on status change
+            const planUpdateHint = input.status ? getPlanStatusHint(input.status) : "Plan updated. Changes are preserved.";
+            const resultWithHint = { ...(result as object), hint: planUpdateHint };
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
+
             };
           }
 
@@ -9231,8 +9279,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               limit: input.limit,
               is_personal: input.is_personal,
             });
+            // Add empty state hint if no plans found
+            const plans = (result as any)?.data?.plans || (result as any)?.plans || (result as any)?.data?.items || (result as any)?.items || [];
+            const resultWithHint = plans.length === 0
+              ? { ...(result as object), hint: getEmptyStateHint("list_plans") }
+              : result;
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
 
             };
           }
@@ -9873,9 +9926,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               project_id: projectId,
               limit: input.limit,
             });
+            // Add empty state hint if no events found
+            const events = (result as any)?.data?.items || (result as any)?.items || (result as any)?.data || [];
+            const resultWithHint = (Array.isArray(events) && events.length === 0)
+              ? { ...(result as object), hint: getEmptyStateHint("list_events") }
+              : result;
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
+
             };
           }
 
@@ -10096,9 +10154,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               tags: input.tags,
               is_personal: input.is_personal,
             });
+            // Add task lifecycle hint
+            const taskCreateHint = TASK_HINTS.created;
+            const resultWithHint = { ...(result as object), hint: taskCreateHint };
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
+
             };
           }
 
@@ -10133,9 +10194,19 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               tags: input.tags,
               blocked_reason: input.blocked_reason,
             });
+            // Add task lifecycle hint based on status
+            let taskUpdateHint = "Task updated.";
+            if (input.task_status === "completed") {
+              taskUpdateHint = TASK_HINTS.completed;
+            } else if (input.task_status === "blocked") {
+              taskUpdateHint = TASK_HINTS.blocked;
+            } else if (input.task_status === "cancelled") {
+              taskUpdateHint = TASK_HINTS.cancelled;
+            }
+            const resultWithHint = { ...(result as object), hint: taskUpdateHint };
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
+
             };
           }
 
@@ -10165,8 +10236,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               limit: input.limit,
               is_personal: input.is_personal,
             });
+            // Add empty state hint if no tasks found
+            const tasks = (result as any)?.data?.tasks || (result as any)?.tasks || (result as any)?.data?.items || (result as any)?.items || [];
+            const resultWithHint = (Array.isArray(tasks) && tasks.length === 0)
+              ? { ...(result as object), hint: getEmptyStateHint("list_tasks") }
+              : result;
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+              content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
 
             };
           }
@@ -10223,8 +10299,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               priority: input.todo_priority,
               is_personal: input.is_personal,
             });
+            // Add empty state hint if no todos found
+            const todos = (todosResult as any)?.data?.todos || (todosResult as any)?.todos || (todosResult as any)?.data?.items || (todosResult as any)?.items || [];
+            const todosWithHint = (Array.isArray(todos) && todos.length === 0)
+              ? { ...(todosResult as object), hint: getEmptyStateHint("list_todos") }
+              : todosResult;
             return {
-              content: [{ type: "text" as const, text: formatContent(todosResult) }],
+              content: [{ type: "text" as const, text: formatContent(todosWithHint) }],
             };
           }
 
@@ -10306,8 +10387,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               diagram_type: input.diagram_type,
               is_personal: input.is_personal,
             });
+            // Add empty state hint if no diagrams found
+            const diagrams = (diagramsResult as any)?.data?.diagrams || (diagramsResult as any)?.diagrams || (diagramsResult as any)?.data?.items || (diagramsResult as any)?.items || [];
+            const diagramsWithHint = (Array.isArray(diagrams) && diagrams.length === 0)
+              ? { ...(diagramsResult as object), hint: getEmptyStateHint("list_diagrams") }
+              : diagramsResult;
             return {
-              content: [{ type: "text" as const, text: formatContent(diagramsResult) }],
+              content: [{ type: "text" as const, text: formatContent(diagramsWithHint) }],
             };
           }
 
@@ -10388,8 +10474,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               doc_type: input.doc_type,
               is_personal: input.is_personal,
             });
+            // Add empty state hint if no docs found
+            const docs = (docsResult as any)?.data?.docs || (docsResult as any)?.docs || (docsResult as any)?.data?.items || (docsResult as any)?.items || [];
+            const docsWithHint = (Array.isArray(docs) && docs.length === 0)
+              ? { ...(docsResult as object), hint: getEmptyStateHint("list_docs") }
+              : docsResult;
             return {
-              content: [{ type: "text" as const, text: formatContent(docsResult) }],
+              content: [{ type: "text" as const, text: formatContent(docsWithHint) }],
             };
           }
 
@@ -12559,7 +12650,7 @@ Example workflow:
           // For editor_rules
           folder_path: z.string().optional(),
           editors: z.array(z.string()).optional(),
-          mode: z.enum(["minimal", "full"]).optional(),
+          mode: z.enum(["minimal", "full", "bootstrap"]).optional(),
           dry_run: z.boolean().optional(),
           workspace_id: z.string().uuid().optional(),
           workspace_name: z.string().optional(),
@@ -12572,7 +12663,7 @@ Example workflow:
           include_pre_compact: z
             .boolean()
             .optional()
-            .describe("Include PreCompact hook for auto-saving state before compaction. Default: false."),
+            .describe("Include PreCompact hook for auto-saving state before compaction. Default: true."),
           include_post_write: z
             .boolean()
             .optional()
@@ -12632,7 +12723,7 @@ Example workflow:
               workspaceName: input.workspace_name,
               projectName: input.project_name,
               additionalRules: input.additional_rules,
-              mode: input.mode as "minimal" | "full" | undefined,
+              mode: input.mode as "minimal" | "full" | "bootstrap" | undefined,
             });
 
             // Install hooks if requested (default: true for Claude Code users)
@@ -12643,7 +12734,7 @@ Example workflow:
                   scope: input.folder_path ? "both" : "user",
                   projectPath: input.folder_path,
                   dryRun: input.dry_run,
-                  includePreCompact: input.include_pre_compact,
+                  includePreCompact: input.include_pre_compact !== false,
                   includePostWrite: input.include_post_write,
                 });
               } catch (err) {

@@ -20,6 +20,7 @@ export class SessionManager {
   private folderPath: string | null = null;
   private contextSmartCalled = false;
   private warningShown = false;
+  private sessionId: string;
 
   // Token tracking for context pressure calculation
   // Note: MCP servers cannot see actual token usage (AI responses, thinking, system prompts).
@@ -49,7 +50,18 @@ export class SessionManager {
   constructor(
     private server: McpServer,
     private client: ContextStreamClient
-  ) {}
+  ) {
+    // Generate a unique session ID for this MCP connection
+    this.sessionId = `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+  }
+
+  /**
+   * Get the unique session ID for this MCP connection.
+   * Used for transcript saving and session association.
+   */
+  getSessionId(): string {
+    return this.sessionId;
+  }
 
   /**
    * Check if session has been auto-initialized

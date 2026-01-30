@@ -5997,7 +5997,7 @@ export class ContextStreamClient {
     const withDefaults = this.withDefaults(params);
     const queryParams = new URLSearchParams();
     if (withDefaults.workspace_id) queryParams.set("workspace_id", withDefaults.workspace_id);
-    queryParams.set("q", params.query);
+    queryParams.set("query", params.query);
     if (params.limit) queryParams.set("limit", String(params.limit));
     return request(this.config, `/transcripts/search?${queryParams.toString()}`, { method: "GET" });
   }

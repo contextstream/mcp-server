@@ -49,38 +49,53 @@ function applyMcpToolPrefix(markdown: string, toolPrefix: string): string {
 /**
  * Dynamic rules - minimal file that relies on context for dynamic rule delivery.
  * This is the recommended mode for efficiency and better results.
+ *
+ * IMPORTANT: These rules must be aggressive enough that AIs actually follow them,
+ * since context() delivers the full ruleset dynamically.
  */
 const CONTEXTSTREAM_RULES_DYNAMIC = `
-## ContextStream Dynamic Rules (Powered by our SmartRouter)
+# ContextStream Rules (MANDATORY)
 
-All rules are served dynamically via \`context\`. This file is minimal by design.
+## 🚨 CRITICAL: Call These Tools or Fail 🚨
 
-### Every Message Protocol
+<contextstream_protocol>
+**EVERY response MUST start with:**
+1. \`init()\` (1st message only) → then \`context(user_message="<msg>")\`
+2. \`context(user_message="<msg>")\` (EVERY subsequent message)
 
-| Message | What to Call |
-|---------|--------------|
-| **1st message** | \`init()\` then \`context(user_message="<msg>")\` |
-| **2nd+ messages** | \`context(user_message="<msg>")\` |
+**BEFORE Glob/Grep/Read/Search/Explore:**
+→ \`search(mode="hybrid", query="...")\` FIRST — local tools ONLY if 0 results
 
-Note: \`init()\` auto-detects folder from IDE. Only pass \`folder_path\` if auto-detection fails.
+**HOOKS: Follow \`<system-reminder>\` instructions — they ARE the rules**
+</contextstream_protocol>
 
-### Follow the Instructions Field
+### Why This Matters
 
-The \`context\` response includes an \`instructions\` field with context-aware guidance.
-**Follow these instructions.** They are dynamically matched to your query and include:
-- Search guidance (when/how to search)
-- Git workflow rules (commit, PR, safety)
-- Planning rules (use ContextStream plans, not file-based)
-- Media/code analysis guidance
-- Lessons from past mistakes
-- And more...
+- **\`context()\`** = Your rules, lessons, and relevant memories delivered dynamically
+- **\`search()\`** = Indexed search (1 call) vs Grep→Read→Read (4+ calls)
+- **Hooks inject \`<system-reminder>\` tags** = Follow these instructions, they enforce ContextStream-first
+- **Skipping these = missing context, repeated mistakes, slow searches**
 
-### Notices
+### Protocol
 
-Handle notices from \`context\` response:
-- **[VERSION_NOTICE]**: Tell user to update MCP
-- **[RULES_NOTICE]**: Run \`generate_rules()\`
-- **[LESSONS_WARNING]**: Apply lessons immediately
+| When | Do This |
+|------|---------|
+| 1st message | \`init()\` → \`context(user_message="...")\` |
+| Every message after | \`context(user_message="...")\` |
+| Before ANY file search | \`search(mode="hybrid")\` first |
+| On \`<system-reminder>\` | **Follow the instructions inside** |
+| Save decisions | \`session(action="capture", ...)\` |
+
+### Handle Notices from context()
+
+- **[LESSONS_WARNING]** → Tell user about past mistakes BEFORE proceeding
+- **[RULES_NOTICE]** → Run \`generate_rules()\` to update
+- **[VERSION_NOTICE]** → Tell user to update MCP
+
+### Fast Path (Skip context only for these)
+
+Simple utility commands: "list workspaces", "show version", "list reminders"
+→ Just execute directly: \`workspace(action="list")\`, \`help(action="version")\`
 
 Rules Version: ${RULES_VERSION}
 `.trim();
@@ -540,83 +555,71 @@ See full documentation: https://contextstream.io/docs/mcp/tools
 `.trim();
 
 const CONTEXTSTREAM_RULES_MINIMAL = `
-## ContextStream Rules
+# ContextStream Rules (MANDATORY)
 
-<contextstream_rules>
-1. **SIMPLE UTILITY?** (list/show/version) → Just execute, skip context calls
-2. **CODING TASK?** → init → context → work → capture
-3. **SEARCH FIRST:** Before Glob/Grep/Read → \`search(mode="hybrid")\` FIRST
-</contextstream_rules>
+## 🚨 CRITICAL: These Rules Are Non-Negotiable 🚨
 
-**Display this block at the start of responses to keep rules in context.**
+<contextstream_protocol>
+**EVERY coding response MUST start with:**
+1. \`init()\` (1st message only) → then \`context(user_message="<msg>")\`
+2. \`context(user_message="<msg>")\` (EVERY subsequent message)
+
+**BEFORE Glob/Grep/Read/Search/Explore:**
+→ \`search(mode="hybrid", query="...")\` FIRST — local tools ONLY if 0 results
+
+**HOOKS: \`<system-reminder>\` tags contain instructions — FOLLOW THEM**
+</contextstream_protocol>
+
+Rules Version: ${RULES_VERSION}
 
 ---
 
-## ContextStream v0.4.x (Hooks Enforced)
+## Why ContextStream First?
 
-Rules Version: ${RULES_VERSION}
-**Note:** PreToolUse hooks block Glob/Grep/Search when ContextStream is available.
+| ❌ WRONG | ✅ CORRECT |
+|----------|-----------|
+| \`Grep → Read → Read → Read\` (4+ calls) | \`search(mode="hybrid")\` (1 call) |
+| Missing past decisions & lessons | \`context()\` = rules + lessons + memory |
+| Ignoring \`<system-reminder>\` hooks | Hooks enforce ContextStream-first |
 
-### For Coding Tasks
+**\`context()\` delivers: rules, lessons from past mistakes, relevant decisions, semantic matches**
+**\`search()\` is indexed: faster, returns context, one call vs many**
+**Hooks inject \`<system-reminder>\` tags: these ARE the rules, follow them**
 
-| Action | Tool Call |
-|--------|-----------|
-| **1st message** | \`init(folder_path="<cwd>", context_hint="<msg>")\` then \`context(...)\` |
-| **2nd+ messages** | \`context(user_message="<msg>", format="minified", max_tokens=400)\` |
-| **Code search** | \`search(mode="hybrid", query="...")\` — BEFORE any local tools |
-| **Save decisions** | \`session(action="capture", event_type="decision", ...)\` |
+---
 
-### Search Modes
+## Protocol
 
-| Mode | Use Case |
-|------|----------|
-| \`hybrid\` | General code search (default) |
-| \`keyword\` | Exact symbol/string match |
-| \`exhaustive\` | Find ALL matches (grep-like) |
+| When | Call |
+|------|------|
+| 1st message | \`init()\` → \`context(user_message="...")\` |
+| Every message after | \`context(user_message="...")\` |
+| Before ANY file discovery | \`search(mode="hybrid", query="...")\` |
+| On \`<system-reminder>\` | **Follow instructions inside** |
+| Save important decisions | \`session(action="capture", event_type="decision", ...)\` |
+| Check past mistakes | \`session(action="get_lessons", query="...")\` |
+
+## Search Modes
+
+| Mode | When |
+|------|------|
+| \`hybrid\` | Default — semantic + keyword |
+| \`keyword\` | Exact symbol match |
+| \`exhaustive\` | Find ALL occurrences |
 | \`semantic\` | Conceptual questions |
 
-### Why ContextStream First?
+## Handle Notices from context()
 
-❌ **WRONG:** \`Grep → Read → Read → Read\` (4+ tool calls, slow)
-✅ **CORRECT:** \`search(mode="hybrid")\` (1 call, returns context)
+- **[LESSONS_WARNING]** → Tell user about past mistakes BEFORE proceeding
+- **[RULES_NOTICE]** → Run \`generate_rules()\`
+- **[VERSION_NOTICE]** → Tell user to update MCP
 
-ContextStream search is **indexed** and returns semantic matches + context in ONE call.
+## Fast Path (Simple Utilities Only)
 
-### Quick Reference
+Skip init/context ONLY for: "list workspaces", "show version", "list reminders"
+→ Just call: \`workspace(action="list")\`, \`help(action="version")\`, etc.
 
-| Tool | Example |
-|------|---------|
-| \`search\` | \`search(mode="hybrid", query="auth", limit=3)\` |
-| \`session\` | \`session(action="capture", event_type="decision", title="...", content="...")\` |
-| \`memory\` | \`memory(action="list_events", limit=10)\` |
-| \`graph\` | \`graph(action="dependencies", file_path="...")\` |
-
-### 🚀 FAST PATH: Simple Utility Operations
-
-**For simple utility commands, SKIP the ceremony and just execute directly:**
-
-| Command Type | Just Call | Skip |
-|--------------|-----------|------|
-| List workspaces | \`workspace(action="list")\` | init, context, capture |
-| List projects | \`project(action="list")\` | init, context, capture |
-| Show version | \`help(action="version")\` | init, context, capture |
-| List reminders | \`reminder(action="list")\` | init, context, capture |
-| Check auth | \`help(action="auth")\` | init, context, capture |
-
-**Detect simple operations by these patterns:**
-- "list ...", "show ...", "what are my ...", "get ..."
-- Single-action queries with no context dependency
-- User just wants data, not analysis or coding help
-
-**DO NOT add overhead for utility operations:**
-- ❌ Don't call init just to list workspaces
-- ❌ Don't call context for simple queries
-- ❌ Don't capture "listed workspaces" as an event (that's noise)
-
-**Use full context ceremony ONLY for:**
-- Coding tasks (edit, create, refactor, debug)
-- Search/discovery (finding code, understanding architecture)
-- Tasks where past decisions or lessons matter
+Everything else = full protocol (init → context → search → work)
 
 ### Lessons (Past Mistakes)
 

@@ -483,13 +483,13 @@ function buildContextStreamMcpServer(params: {
   if (IS_WINDOWS) {
     return {
       command: "cmd",
-      args: ["/c", "npx", "-y", "@contextstream/mcp-server"],
+      args: ["/c", "npx", "--prefer-online", "-y", "@contextstream/mcp-server@latest"],
       env,
     };
   }
   return {
     command: "npx",
-    args: ["-y", "@contextstream/mcp-server"],
+    args: ["--prefer-online", "-y", "@contextstream/mcp-server@latest"],
     env,
   };
 }
@@ -531,14 +531,14 @@ function buildContextStreamVsCodeServer(params: {
     return {
       type: "stdio",
       command: "cmd",
-      args: ["/c", "npx", "-y", "@contextstream/mcp-server"],
+      args: ["/c", "npx", "--prefer-online", "-y", "@contextstream/mcp-server@latest"],
       env,
     };
   }
   return {
     type: "stdio",
     command: "npx",
-    args: ["-y", "@contextstream/mcp-server"],
+    args: ["--prefer-online", "-y", "@contextstream/mcp-server@latest"],
     env,
   };
 }
@@ -665,8 +665,8 @@ async function upsertCodexTomlConfig(
   const showTimingLine = params.showTiming ? `CONTEXTSTREAM_SHOW_TIMING = "true"\n` : "";
   // Windows requires cmd /c wrapper to execute npx
   const commandLine = IS_WINDOWS
-    ? `command = "cmd"\nargs = ["/c", "npx", "-y", "@contextstream/mcp-server"]\n`
-    : `command = "npx"\nargs = ["-y", "@contextstream/mcp-server"]\n`;
+    ? `command = "cmd"\nargs = ["/c", "npx", "--prefer-online", "-y", "@contextstream/mcp-server@latest"]\n`
+    : `command = "npx"\nargs = ["--prefer-online", "-y", "@contextstream/mcp-server@latest"]\n`;
   const block =
     `\n\n# ContextStream MCP server\n` +
     `[mcp_servers.contextstream]\n` +
@@ -844,7 +844,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       console.log(`   Latest version is v${versionNotice.latest}`);
       console.log("");
       console.log("   To use the latest version, exit and run:");
-      console.log("   npx -y @contextstream/mcp-server@latest setup");
+      console.log("   npx --prefer-online -y @contextstream/mcp-server@latest setup");
       console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
       console.log("");
       const continueAnyway = normalizeInput(
@@ -1315,10 +1315,10 @@ export async function runSetupWizard(args: string[]): Promise<void> {
                 ? " --env CONTEXTSTREAM_CONTEXT_PACK=false"
                 : " --env CONTEXTSTREAM_CONTEXT_PACK=true";
             console.log(
-              `  macOS/Linux: claude mcp add --transport stdio contextstream --scope user --env CONTEXTSTREAM_API_URL=... --env CONTEXTSTREAM_API_KEY=...${envHint}${packHint} -- npx -y @contextstream/mcp-server`
+              `  macOS/Linux: claude mcp add --transport stdio contextstream --scope user --env CONTEXTSTREAM_API_URL=... --env CONTEXTSTREAM_API_KEY=...${envHint}${packHint} -- npx --prefer-online -y @contextstream/mcp-server@latest`
             );
             console.log(
-              "  Windows (native): use `cmd /c npx -y @contextstream/mcp-server` after `--` if `npx` is not found."
+              "  Windows (native): use `cmd /c npx --prefer-online -y @contextstream/mcp-server@latest` after `--` if `npx` is not found."
             );
             continue;
           }

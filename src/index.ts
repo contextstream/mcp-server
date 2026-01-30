@@ -62,7 +62,7 @@ function printHelp() {
   console.log(`ContextStream MCP Server (contextstream-mcp) v${VERSION}
 
 Usage:
-  npx -y @contextstream/mcp-server
+  npx --prefer-online -y @contextstream/mcp-server@latest
   contextstream-mcp
   contextstream-mcp setup
   contextstream-mcp http
@@ -109,10 +109,10 @@ Environment variables:
 Examples:
   CONTEXTSTREAM_API_URL="https://api.contextstream.io" \\
   CONTEXTSTREAM_API_KEY="your_api_key" \\
-  npx -y @contextstream/mcp-server
+  npx --prefer-online -y @contextstream/mcp-server@latest
 
 Setup wizard:
-  npx -y @contextstream/mcp-server setup
+  npx --prefer-online -y @contextstream/mcp-server@latest setup
 
 Notes:
   - When used from an MCP client (e.g. Codex, Cursor, VS Code),
@@ -133,7 +133,7 @@ async function runLimitedModeServer(): Promise<void> {
   registerLimitedTools(server);
 
   console.error(`ContextStream MCP server v${VERSION} (limited mode)`);
-  console.error('Run "npx -y @contextstream/mcp-server setup" to enable all tools.');
+  console.error('Run "npx --prefer-online -y @contextstream/mcp-server@latest setup" to enable all tools.');
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

@@ -10355,13 +10355,22 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!workspaceId) {
               return errorResult("create_doc requires workspace_id. Call session_init first.");
             }
+            // Auto-inject AI metadata based on detected editor
+            const detectedEditor = getDetectedClientName();
+            const aiMetadata = detectedEditor
+              ? {
+                  created_by_ai: true,
+                  ai_editor: detectedEditor,
+                  ...(input.metadata || {}),
+                }
+              : input.metadata;
             const docResult = await client.docsCreate({
               workspace_id: workspaceId,
               project_id: projectId,
               title: input.title,
               content: input.content,
               doc_type: input.doc_type,
-              metadata: input.metadata,
+              metadata: aiMetadata,
               is_personal: input.is_personal,
             });
             return {
@@ -12767,7 +12776,7 @@ export function registerLimitedTools(server: McpServer): void {
             text: `ContextStream: API key not configured.
 
 To set up (creates key + configures your editor):
-  npx -y @contextstream/mcp-server setup
+  npx --prefer-online -y @contextstream/mcp-server@latest setup
 
 This will:
 - Start a 5-day Pro trial
@@ -12775,7 +12784,7 @@ This will:
 - Write rules files for better AI assistance
 
 Preview first:
-  npx -y @contextstream/mcp-server setup --dry-run
+  npx --prefer-online -y @contextstream/mcp-server@latest setup --dry-run
 
 After setup, restart your editor to enable all ContextStream tools.`,
           },

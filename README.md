@@ -157,6 +157,33 @@ claude mcp update contextstream -e CONTEXTSTREAM_API_KEY=your_key
 
 </details>
 
+<details>
+<summary><b>GitHub Copilot CLI</b></summary>
+
+Use the Copilot CLI to interactively add the MCP server:
+
+```bash
+/mcp add
+```
+
+Or add to `~/.copilot/mcp-config.json`:
+
+```json
+{
+  "mcpServers": {
+    "contextstream": {
+      "command": "npx",
+      "args": ["-y", "@contextstream/mcp-server"],
+      "env": { "CONTEXTSTREAM_API_KEY": "your_key" }
+    }
+  }
+}
+```
+
+For more information, see the [GitHub Copilot CLI documentation](https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli).
+
+</details>
+
 ---
 
 ## Links

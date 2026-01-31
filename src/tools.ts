@@ -34,7 +34,7 @@ import {
   TASK_HINTS,
   WORKSPACE_HINTS,
   PROJECT_HINTS,
-} from "./educational-microcopy.js";
+} from "./microcopy.js";
 
 type StructuredContent = { [x: string]: unknown } | undefined;
 type ToolTextResult = {
@@ -2305,6 +2305,9 @@ export function registerTools(
     "notion_activity",
     "notion_knowledge",
     "notion_summary",
+    // Media operations (credit-metered)
+    "media_index",
+    "media_search",
   ]);
 
   const proTools = (() => {
@@ -12327,6 +12330,10 @@ Example workflow:
 
         switch (input.action) {
           case "index": {
+            // Gate media indexing for Pro+ users
+            const indexGate = await gateIfProTool("media_index");
+            if (indexGate) return indexGate;
+
             if (!input.file_path && !input.external_url) {
               return errorResult("index requires: file_path or external_url");
             }
@@ -12512,6 +12519,10 @@ Example workflow:
           }
 
           case "search": {
+            // Gate media search for Pro+ users
+            const searchGate = await gateIfProTool("media_search");
+            if (searchGate) return searchGate;
+
             if (!input.query) {
               return errorResult("search requires: query");
             }

@@ -70,6 +70,7 @@ Usage:
 
 Commands:
   setup                      Interactive onboarding wizard (rules + workspace mapping)
+  update-hooks               Update hooks for all editors (Claude, Cursor, Cline, Roo, Kilo)
   http                       Run HTTP MCP gateway (streamable HTTP transport)
   hook pre-tool-use          PreToolUse hook - blocks discovery tools, redirects to ContextStream
   hook user-prompt-submit    UserPromptSubmit hook - injects ContextStream rules reminder
@@ -210,6 +211,23 @@ async function main() {
         console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-write, auto-rules");
         process.exit(1);
     }
+  }
+
+  // Update hooks command: non-interactive hook installation for all editors
+  if (args[0] === "update-hooks") {
+    const { installAllEditorHooks } = await import("./hooks-config.js");
+    console.error("Updating hooks for all editors...");
+    try {
+      const results = await installAllEditorHooks({ scope: "global" });
+      for (const result of results) {
+        console.error(`✓ ${result.editor}: ${result.installed.length} hooks installed`);
+      }
+      console.error("✓ Hooks updated successfully");
+    } catch (error) {
+      console.error("Failed to update hooks:", error);
+      process.exit(1);
+    }
+    return;
   }
 
   // Try to load saved credentials if env vars not set

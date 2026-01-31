@@ -20,7 +20,7 @@ jobs:
           - os: macos-latest
             target: darwin-arm64
             artifact: contextstream-mcp-darwin-arm64
-          - os: macos-13
+          - os: macos-latest
             target: darwin-x64
             artifact: contextstream-mcp-darwin-x64
           - os: ubuntu-latest

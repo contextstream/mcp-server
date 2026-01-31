@@ -70,7 +70,11 @@ Usage:
 
 Commands:
   setup                      Interactive onboarding wizard (rules + workspace mapping)
-  update-hooks               Update hooks for all editors (Claude, Cursor, Cline, Roo, Kilo)
+  verify-key [--json]        Verify API key and show account info
+  update-hooks [flags]       Update hooks for all editors (Claude, Cursor, Cline, Roo, Kilo)
+    --scope=global           Install hooks globally (default)
+    --scope=project, -p      Install hooks for current project only
+    --path=/path             Specify project path (implies --scope=project)
   http                       Run HTTP MCP gateway (streamable HTTP transport)
   hook pre-tool-use          PreToolUse hook - blocks discovery tools, redirects to ContextStream
   hook user-prompt-submit    UserPromptSubmit hook - injects ContextStream rules reminder
@@ -261,12 +265,44 @@ async function main() {
     }
   }
 
+  // Verify API key command: validate key and show account info
+  // Usage: contextstream-mcp verify-key [--json]
+  if (args[0] === "verify-key") {
+    const { runVerifyKey } = await import("./verify-key.js");
+    const outputJson = args.includes("--json");
+    const result = await runVerifyKey(outputJson);
+    process.exit(result.valid ? 0 : 1);
+  }
+
   // Update hooks command: non-interactive hook installation for all editors
+  // Usage: contextstream-mcp update-hooks [--scope=global|project] [--path=/project/path]
   if (args[0] === "update-hooks") {
     const { installAllEditorHooks } = await import("./hooks-config.js");
-    console.error("Updating hooks for all editors...");
+
+    // Parse flags
+    let scope: "global" | "project" = "global";
+    let projectPath: string | undefined;
+
+    for (const arg of args.slice(1)) {
+      if (arg === "--scope=project" || arg === "-p") {
+        scope = "project";
+        projectPath = projectPath || process.cwd();
+      } else if (arg === "--scope=global" || arg === "-g") {
+        scope = "global";
+      } else if (arg.startsWith("--path=")) {
+        projectPath = arg.replace("--path=", "");
+        scope = "project";
+      }
+    }
+
+    const scopeLabel = scope === "project" ? `project (${projectPath || process.cwd()})` : "global";
+    console.error(`Updating hooks for all editors (${scopeLabel})...`);
+
     try {
-      const results = await installAllEditorHooks({ scope: "global" });
+      const results = await installAllEditorHooks({
+        scope,
+        projectPath: scope === "project" ? (projectPath || process.cwd()) : undefined
+      });
       for (const result of results) {
         console.error(`✓ ${result.editor}: ${result.installed.length} hooks installed`);
       }

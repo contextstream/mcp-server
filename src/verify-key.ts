@@ -21,14 +21,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
 
+interface McpServerConfig {
+  env?: {
+    CONTEXTSTREAM_API_KEY?: string;
+    CONTEXTSTREAM_API_URL?: string;
+  };
+}
+
 interface McpConfig {
   mcpServers?: {
-    contextstream?: {
-      env?: {
-        CONTEXTSTREAM_API_KEY?: string;
-        CONTEXTSTREAM_API_URL?: string;
-      };
-    };
+    [key: string]: McpServerConfig | undefined;
   };
 }
 
@@ -52,6 +54,52 @@ function maskApiKey(key: string): string {
   const prefix = key.slice(0, 6);
   const suffix = key.slice(-4);
   return `${prefix}...${suffix}`;
+}
+
+/**
+ * Extract ContextStream API key from an MCP config object.
+ * Handles various server name variations and searches all servers.
+ */
+function extractFromMcpConfig(config: McpConfig): { apiKey?: string; apiUrl?: string } {
+  if (!config.mcpServers) return {};
+
+  // First try common server name variations
+  const priorityNames = ["contextstream", "ContextStream", "context-stream"];
+  for (const name of priorityNames) {
+    const server = config.mcpServers[name];
+    if (server?.env?.CONTEXTSTREAM_API_KEY) {
+      return {
+        apiKey: server.env.CONTEXTSTREAM_API_KEY,
+        apiUrl: server.env.CONTEXTSTREAM_API_URL,
+      };
+    }
+  }
+
+  // Then search all servers for CONTEXTSTREAM_API_KEY
+  for (const [, server] of Object.entries(config.mcpServers)) {
+    if (server?.env?.CONTEXTSTREAM_API_KEY) {
+      return {
+        apiKey: server.env.CONTEXTSTREAM_API_KEY,
+        apiUrl: server.env.CONTEXTSTREAM_API_URL,
+      };
+    }
+  }
+
+  return {};
+}
+
+/**
+ * Get platform-specific Claude Desktop config path.
+ */
+function getClaudeDesktopConfigPath(): string {
+  const platform = process.platform;
+  if (platform === "darwin") {
+    return path.join(homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json");
+  } else if (platform === "win32") {
+    return path.join(process.env.APPDATA || "", "Claude", "claude_desktop_config.json");
+  } else {
+    return path.join(homedir(), ".config", "Claude", "claude_desktop_config.json");
+  }
 }
 
 function loadApiKey(): { apiKey: string | null; apiUrl: string; source: string } {
@@ -88,27 +136,7 @@ function loadApiKey(): { apiKey: string | null; apiUrl: string; source: string }
     }
   }
 
-  // Priority 3: ~/.mcp.json (global)
-  const globalMcpPath = path.join(homedir(), ".mcp.json");
-  if (fs.existsSync(globalMcpPath)) {
-    try {
-      const content = fs.readFileSync(globalMcpPath, "utf-8");
-      const config = JSON.parse(content) as McpConfig;
-      const csEnv = config.mcpServers?.contextstream?.env;
-      if (csEnv?.CONTEXTSTREAM_API_KEY) {
-        apiKey = csEnv.CONTEXTSTREAM_API_KEY;
-        source = "~/.mcp.json (global)";
-        if (csEnv.CONTEXTSTREAM_API_URL) {
-          apiUrl = csEnv.CONTEXTSTREAM_API_URL;
-        }
-        return { apiKey, apiUrl, source };
-      }
-    } catch {
-      // Continue to next source
-    }
-  }
-
-  // Priority 4: .mcp.json (project - check cwd and parents)
+  // Priority 3: Project .mcp.json (check cwd and parents first - most specific)
   let searchDir = process.cwd();
   for (let i = 0; i < 5; i++) {
     const projectMcpPath = path.join(searchDir, ".mcp.json");
@@ -116,12 +144,12 @@ function loadApiKey(): { apiKey: string | null; apiUrl: string; source: string }
       try {
         const content = fs.readFileSync(projectMcpPath, "utf-8");
         const config = JSON.parse(content) as McpConfig;
-        const csEnv = config.mcpServers?.contextstream?.env;
-        if (csEnv?.CONTEXTSTREAM_API_KEY) {
-          apiKey = csEnv.CONTEXTSTREAM_API_KEY;
-          source = `${projectMcpPath} (project)`;
-          if (csEnv.CONTEXTSTREAM_API_URL) {
-            apiUrl = csEnv.CONTEXTSTREAM_API_URL;
+        const extracted = extractFromMcpConfig(config);
+        if (extracted.apiKey) {
+          apiKey = extracted.apiKey;
+          source = `${projectMcpPath}`;
+          if (extracted.apiUrl) {
+            apiUrl = extracted.apiUrl;
           }
           return { apiKey, apiUrl, source };
         }
@@ -132,6 +160,97 @@ function loadApiKey(): { apiKey: string | null; apiUrl: string; source: string }
     const parentDir = path.dirname(searchDir);
     if (parentDir === searchDir) break;
     searchDir = parentDir;
+  }
+
+  // Priority 4: ~/.mcp.json (Claude Code global)
+  const globalMcpPath = path.join(homedir(), ".mcp.json");
+  if (fs.existsSync(globalMcpPath)) {
+    try {
+      const content = fs.readFileSync(globalMcpPath, "utf-8");
+      const config = JSON.parse(content) as McpConfig;
+      const extracted = extractFromMcpConfig(config);
+      if (extracted.apiKey) {
+        apiKey = extracted.apiKey;
+        source = "~/.mcp.json";
+        if (extracted.apiUrl) {
+          apiUrl = extracted.apiUrl;
+        }
+        return { apiKey, apiUrl, source };
+      }
+    } catch {
+      // Continue to next source
+    }
+  }
+
+  // Priority 5: Cursor config locations
+  const cursorPaths = [
+    path.join(process.cwd(), ".cursor", "mcp.json"),
+    path.join(homedir(), ".cursor", "mcp.json"),
+  ];
+  for (const cursorPath of cursorPaths) {
+    if (fs.existsSync(cursorPath)) {
+      try {
+        const content = fs.readFileSync(cursorPath, "utf-8");
+        const config = JSON.parse(content) as McpConfig;
+        const extracted = extractFromMcpConfig(config);
+        if (extracted.apiKey) {
+          apiKey = extracted.apiKey;
+          source = cursorPath;
+          if (extracted.apiUrl) {
+            apiUrl = extracted.apiUrl;
+          }
+          return { apiKey, apiUrl, source };
+        }
+      } catch {
+        // Continue
+      }
+    }
+  }
+
+  // Priority 6: Claude Desktop config
+  const claudeDesktopPath = getClaudeDesktopConfigPath();
+  if (fs.existsSync(claudeDesktopPath)) {
+    try {
+      const content = fs.readFileSync(claudeDesktopPath, "utf-8");
+      const config = JSON.parse(content) as McpConfig;
+      const extracted = extractFromMcpConfig(config);
+      if (extracted.apiKey) {
+        apiKey = extracted.apiKey;
+        source = claudeDesktopPath;
+        if (extracted.apiUrl) {
+          apiUrl = extracted.apiUrl;
+        }
+        return { apiKey, apiUrl, source };
+      }
+    } catch {
+      // Continue
+    }
+  }
+
+  // Priority 7: VS Code / Windsurf / Cline settings
+  const vscodePaths = [
+    path.join(homedir(), ".vscode", "mcp.json"),
+    path.join(homedir(), ".codeium", "windsurf", "mcp_config.json"),
+    path.join(homedir(), ".continue", "config.json"),
+  ];
+  for (const vsPath of vscodePaths) {
+    if (fs.existsSync(vsPath)) {
+      try {
+        const content = fs.readFileSync(vsPath, "utf-8");
+        const config = JSON.parse(content) as McpConfig;
+        const extracted = extractFromMcpConfig(config);
+        if (extracted.apiKey) {
+          apiKey = extracted.apiKey;
+          source = vsPath;
+          if (extracted.apiUrl) {
+            apiUrl = extracted.apiUrl;
+          }
+          return { apiKey, apiUrl, source };
+        }
+      } catch {
+        // Continue
+      }
+    }
   }
 
   return { apiKey, apiUrl, source };
@@ -156,7 +275,9 @@ async function validateApiKey(apiKey: string, apiUrl: string): Promise<AccountIn
       const data = (await response.json()) as {
         email?: string;
         name?: string;
+        full_name?: string;
         plan?: string;
+        plan_name?: string;
         workspace?: { name?: string };
       };
 
@@ -164,8 +285,8 @@ async function validateApiKey(apiKey: string, apiUrl: string): Promise<AccountIn
         valid: true,
         masked_key: maskApiKey(apiKey),
         email: data.email,
-        name: data.name,
-        plan: data.plan || "free",
+        name: data.name || data.full_name,
+        plan: data.plan_name || data.plan || "free",
         workspace_name: data.workspace?.name,
       };
     } else if (response.status === 401) {

@@ -85,6 +85,7 @@ Commands:
   hook on-web                PostToolUse hook - captures web research (WebFetch/WebSearch)
   hook session-init          SessionStart hook - full context injection on session start
   hook session-end           Stop hook - finalizes session, saves state
+  hook on-save-intent        UserPromptSubmit hook - redirects doc saves to ContextStream
 
 Environment variables:
   CONTEXTSTREAM_API_URL   Base API URL (e.g. https://api.contextstream.io)
@@ -248,9 +249,14 @@ async function main() {
         await runSessionEndHook();
         return;
       }
+      case "on-save-intent": {
+        const { runOnSaveIntentHook } = await import("./hooks/on-save-intent.js");
+        await runOnSaveIntentHook();
+        return;
+      }
       default:
         console.error(`Unknown hook: ${hookName}`);
-        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-compact, post-write, auto-rules, on-bash, on-task, on-read, on-web, session-init, session-end");
+        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-compact, post-write, auto-rules, on-bash, on-task, on-read, on-web, session-init, session-end, on-save-intent");
         process.exit(1);
     }
   }

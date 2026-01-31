@@ -590,6 +590,7 @@ export function buildHooksConfig(options?: {
   includeOnWeb?: boolean;
   includeSessionInit?: boolean;
   includeSessionEnd?: boolean;
+  includeOnSaveIntent?: boolean;
 }): ClaudeHooksConfig["hooks"] {
   // Build UserPromptSubmit hooks array - always include reminder
   const userPromptHooks: ClaudeHookMatcher[] = [
@@ -604,6 +605,20 @@ export function buildHooksConfig(options?: {
       ],
     },
   ];
+
+  // Add on-save-intent hook to redirect doc saves to ContextStream (default ON)
+  if (options?.includeOnSaveIntent !== false) {
+    userPromptHooks.push({
+      matcher: "*",
+      hooks: [
+        {
+          type: "command",
+          command: getHookCommand("on-save-intent"),
+          timeout: 5,
+        },
+      ],
+    });
+  }
 
   // Add media-aware hook (enabled by default for creative workflows)
   if (options?.includeMediaAware !== false) {

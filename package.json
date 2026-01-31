@@ -9,14 +9,16 @@
   "files": [
     "dist",
     "dist/hooks",
+    "scripts",
     "README.md"
   ],
   "bin": {
-    "contextstream-mcp": "dist/index.js"
+    "contextstream-mcp": "dist/index.js",
+    "contextstream-hook": "dist/hooks/runner.js"
   },
   "scripts": {
     "dev": "tsx src/index.ts",
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --outfile=dist/index.js --format=esm --external:@modelcontextprotocol/sdk --banner:js=\"#!/usr/bin/env node\" && esbuild src/test-server.ts --bundle --platform=node --target=node18 --outfile=dist/test-server.js --format=esm --external:@modelcontextprotocol/sdk && esbuild src/hooks/post-write.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/post-write.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/pre-tool-use.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/pre-tool-use.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/user-prompt-submit.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/user-prompt-submit.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/media-aware.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/media-aware.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/pre-compact.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/pre-compact.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/auto-rules.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/auto-rules.js --format=esm --banner:js=\"#!/usr/bin/env node\"",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --outfile=dist/index.js --format=esm --external:@modelcontextprotocol/sdk --banner:js=\"#!/usr/bin/env node\" && esbuild src/test-server.ts --bundle --platform=node --target=node18 --outfile=dist/test-server.js --format=esm --external:@modelcontextprotocol/sdk && esbuild src/hooks/runner.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/runner.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/post-write.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/post-write.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/pre-tool-use.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/pre-tool-use.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/user-prompt-submit.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/user-prompt-submit.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/media-aware.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/media-aware.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/pre-compact.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/pre-compact.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/auto-rules.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/auto-rules.js --format=esm --banner:js=\"#!/usr/bin/env node\"",
     "start": "node dist/index.js",
     "test-server": "tsx src/test-server.ts",
     "test-server:start": "node dist/test-server.js",
@@ -27,7 +29,8 @@
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write src/",
     "format:check": "prettier --check src/",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "postinstall": "node scripts/postinstall.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",

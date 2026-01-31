@@ -2431,13 +2431,16 @@ export function registerTools(
   // ============================================
 
   // Track integration status - updated when session_init or integrations_status is called
+  // Cache TTL: 5 minutes to handle status changes (e.g., error -> connected after sync)
+  const INTEGRATION_CACHE_TTL_MS = 5 * 60 * 1000;
   let integrationStatus: {
     checked: boolean;
+    checkedAt: number;
     slack: boolean;
     github: boolean;
     notion: boolean;
     workspaceId?: string;
-  } = { checked: false, slack: false, github: false, notion: false };
+  } = { checked: false, checkedAt: 0, slack: false, github: false, notion: false };
 
   // Track if we've already notified about tools list change
   let toolsListChangedNotified = false;
@@ -2449,8 +2452,9 @@ export function registerTools(
   async function checkIntegrationStatus(
     workspaceId?: string
   ): Promise<{ slack: boolean; github: boolean; notion: boolean }> {
-    // If we already checked for this workspace, return cached result
-    if (integrationStatus.checked && integrationStatus.workspaceId === workspaceId) {
+    // If we already checked for this workspace within TTL, return cached result
+    const cacheAge = Date.now() - integrationStatus.checkedAt;
+    if (integrationStatus.checked && integrationStatus.workspaceId === workspaceId && cacheAge < INTEGRATION_CACHE_TTL_MS) {
       return { slack: integrationStatus.slack, github: integrationStatus.github, notion: integrationStatus.notion };
     }
 
@@ -2461,24 +2465,27 @@ export function registerTools(
 
     try {
       const status = await client.integrationsStatus({ workspace_id: workspaceId });
+      // "connected" or "syncing" both mean the integration is working
+      const isConnectedStatus = (s: string) => s === "connected" || s === "syncing";
       const slackConnected =
         status?.some(
           (s: { provider: string; status: string }) =>
-            s.provider === "slack" && s.status === "connected"
+            s.provider === "slack" && isConnectedStatus(s.status)
         ) ?? false;
       const githubConnected =
         status?.some(
           (s: { provider: string; status: string }) =>
-            s.provider === "github" && s.status === "connected"
+            s.provider === "github" && isConnectedStatus(s.status)
         ) ?? false;
       const notionConnected =
         status?.some(
           (s: { provider: string; status: string }) =>
-            s.provider === "notion" && s.status === "connected"
+            s.provider === "notion" && isConnectedStatus(s.status)
         ) ?? false;
 
       integrationStatus = {
         checked: true,
+        checkedAt: Date.now(),
         slack: slackConnected,
         github: githubConnected,
         notion: notionConnected,
@@ -2509,6 +2516,7 @@ export function registerTools(
 
     integrationStatus = {
       checked: true,
+      checkedAt: Date.now(),
       slack: status.slack,
       github: status.github,
       notion: status.notion,
@@ -8347,20 +8355,22 @@ Use this to verify integrations are healthy and syncing properly.`,
 
       // Update integration status tracking (Strategy 2)
       if (AUTO_HIDE_INTEGRATIONS) {
+        // "connected" or "syncing" both mean the integration is working
+        const isConnectedStatus = (s: string) => s === "connected" || s === "syncing";
         const slackConnected =
           result?.some(
             (s: { provider: string; status: string }) =>
-              s.provider === "slack" && s.status === "connected"
+              s.provider === "slack" && isConnectedStatus(s.status)
           ) ?? false;
         const githubConnected =
           result?.some(
             (s: { provider: string; status: string }) =>
-              s.provider === "github" && s.status === "connected"
+              s.provider === "github" && isConnectedStatus(s.status)
           ) ?? false;
         const notionConnected =
           result?.some(
             (s: { provider: string; status: string }) =>
-              s.provider === "notion" && s.status === "connected"
+              s.provider === "notion" && isConnectedStatus(s.status)
           ) ?? false;
         updateIntegrationStatus({ slack: slackConnected, github: githubConnected, notion: notionConnected }, workspaceId);
       }

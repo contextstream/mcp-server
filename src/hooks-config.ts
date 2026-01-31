@@ -54,9 +54,12 @@ export interface ClaudeHookMatcher {
 export interface ClaudeHooksConfig {
   hooks?: {
     PreToolUse?: ClaudeHookMatcher[];
-    UserPromptSubmit?: ClaudeHookMatcher[];
     PostToolUse?: ClaudeHookMatcher[];
+    UserPromptSubmit?: ClaudeHookMatcher[];
+    PreCompact?: ClaudeHookMatcher[];
+    PostCompact?: ClaudeHookMatcher[];
     SessionStart?: ClaudeHookMatcher[];
+    Stop?: ClaudeHookMatcher[];
     [key: string]: ClaudeHookMatcher[] | undefined;
   };
 }
@@ -577,9 +580,16 @@ export function getHooksDir(): string {
  */
 export function buildHooksConfig(options?: {
   includePreCompact?: boolean;
+  includePostCompact?: boolean;
   includeMediaAware?: boolean;
   includePostWrite?: boolean;
   includeAutoRules?: boolean;
+  includeOnBash?: boolean;
+  includeOnTask?: boolean;
+  includeOnRead?: boolean;
+  includeOnWeb?: boolean;
+  includeSessionInit?: boolean;
+  includeSessionEnd?: boolean;
 }): ClaudeHooksConfig["hooks"] {
   // Build UserPromptSubmit hooks array - always include reminder
   const userPromptHooks: ClaudeHookMatcher[] = [
@@ -629,12 +639,59 @@ export function buildHooksConfig(options?: {
   if (options?.includePreCompact !== false) {
     config.PreCompact = [
       {
-        // Match both manual (/compact) and automatic compaction
         matcher: "*",
         hooks: [
           {
             type: "command",
             command: getHookCommand("pre-compact"),
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+  }
+
+  // Add PostCompact hook for context restoration (default ON)
+  if (options?.includePostCompact !== false) {
+    config.PostCompact = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("post-compact"),
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+  }
+
+  // Add SessionStart hook for full context injection (default ON)
+  if (options?.includeSessionInit !== false) {
+    config.SessionStart = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("session-init"),
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+  }
+
+  // Add Stop hook for session finalization (default ON)
+  if (options?.includeSessionEnd !== false) {
+    config.Stop = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("session-end"),
             timeout: 10,
           },
         ],
@@ -668,6 +725,62 @@ export function buildHooksConfig(options?: {
           type: "command",
           command: getHookCommand("auto-rules"),
           timeout: 15,
+        },
+      ],
+    });
+  }
+
+  // Bash command tracking (default ON)
+  if (options?.includeOnBash !== false) {
+    postToolUseHooks.push({
+      matcher: "Bash",
+      hooks: [
+        {
+          type: "command",
+          command: getHookCommand("on-bash"),
+          timeout: 5,
+        },
+      ],
+    });
+  }
+
+  // Task agent tracking (default ON)
+  if (options?.includeOnTask !== false) {
+    postToolUseHooks.push({
+      matcher: "Task",
+      hooks: [
+        {
+          type: "command",
+          command: getHookCommand("on-task"),
+          timeout: 5,
+        },
+      ],
+    });
+  }
+
+  // File exploration tracking (default ON)
+  if (options?.includeOnRead !== false) {
+    postToolUseHooks.push({
+      matcher: "Read|Glob|Grep",
+      hooks: [
+        {
+          type: "command",
+          command: getHookCommand("on-read"),
+          timeout: 5,
+        },
+      ],
+    });
+  }
+
+  // Web research tracking (default ON)
+  if (options?.includeOnWeb !== false) {
+    postToolUseHooks.push({
+      matcher: "WebFetch|WebSearch",
+      hooks: [
+        {
+          type: "command",
+          command: getHookCommand("on-web"),
+          timeout: 5,
         },
       ],
     });

@@ -76,8 +76,15 @@ Commands:
   hook user-prompt-submit    UserPromptSubmit hook - injects ContextStream rules reminder
   hook media-aware           Media-aware hook - detects media prompts, injects media tool guidance
   hook pre-compact           PreCompact hook - saves conversation state before compaction
+  hook post-compact          PostCompact hook - restores context after compaction
   hook post-write            PostToolUse hook - real-time file indexing after Edit/Write
   hook auto-rules            PostToolUse hook - auto-updates rules when behind (silent)
+  hook on-bash               PostToolUse hook - captures bash commands, learns from errors
+  hook on-task               PostToolUse hook - tracks Task agent work
+  hook on-read               PostToolUse hook - tracks file exploration (Read/Glob/Grep)
+  hook on-web                PostToolUse hook - captures web research (WebFetch/WebSearch)
+  hook session-init          SessionStart hook - full context injection on session start
+  hook session-end           Stop hook - finalizes session, saves state
 
 Environment variables:
   CONTEXTSTREAM_API_URL   Base API URL (e.g. https://api.contextstream.io)
@@ -206,9 +213,44 @@ async function main() {
         await runAutoRulesHook();
         return;
       }
+      case "post-compact": {
+        const { runPostCompactHook } = await import("./hooks/post-compact.js");
+        await runPostCompactHook();
+        return;
+      }
+      case "on-bash": {
+        const { runOnBashHook } = await import("./hooks/on-bash.js");
+        await runOnBashHook();
+        return;
+      }
+      case "on-task": {
+        const { runOnTaskHook } = await import("./hooks/on-task.js");
+        await runOnTaskHook();
+        return;
+      }
+      case "on-read": {
+        const { runOnReadHook } = await import("./hooks/on-read.js");
+        await runOnReadHook();
+        return;
+      }
+      case "on-web": {
+        const { runOnWebHook } = await import("./hooks/on-web.js");
+        await runOnWebHook();
+        return;
+      }
+      case "session-init": {
+        const { runSessionInitHook } = await import("./hooks/session-init.js");
+        await runSessionInitHook();
+        return;
+      }
+      case "session-end": {
+        const { runSessionEndHook } = await import("./hooks/session-end.js");
+        await runSessionEndHook();
+        return;
+      }
       default:
         console.error(`Unknown hook: ${hookName}`);
-        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-write, auto-rules");
+        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-compact, post-write, auto-rules, on-bash, on-task, on-read, on-web, session-init, session-end");
         process.exit(1);
     }
   }

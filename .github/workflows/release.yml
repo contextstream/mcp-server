@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., 0.4.50)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: darwin-arm64
+            artifact: contextstream-mcp-darwin-arm64
+          - os: macos-13
+            target: darwin-x64
+            artifact: contextstream-mcp-darwin-x64
+          - os: ubuntu-latest
+            target: linux-x64
+            artifact: contextstream-mcp-linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            artifact: contextstream-mcp-linux-arm64
+          - os: windows-latest
+            target: win-x64
+            artifact: contextstream-mcp-win-x64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build binary
+        run: |
+          bun build src/index.ts --compile --outfile=${{ matrix.artifact }} --target=bun-${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}
+
+  build-hooks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build hook binaries
+        run: |
+          mkdir -p hooks-bin
+          bun build src/hooks/runner.ts --compile --outfile=hooks-bin/contextstream-hook-linux-x64 --target=bun-linux-x64
+          bun build src/hooks/runner.ts --compile --outfile=hooks-bin/contextstream-hook-darwin-arm64 --target=bun-darwin-arm64
+          bun build src/hooks/runner.ts --compile --outfile=hooks-bin/contextstream-hook-darwin-x64 --target=bun-darwin-x64
+          bun build src/hooks/runner.ts --compile --outfile=hooks-bin/contextstream-hook-win-x64.exe --target=bun-windows-x64
+
+      - name: Upload hook artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hooks-bin
+          path: hooks-bin/
+
+      - name: Upload hooks to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: hooks-bin/*
+
+  update-checksums:
+    needs: [build-binaries, build-hooks]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -type f -name "contextstream-*" -exec sha256sum {} \; > checksums.txt
+          cat checksums.txt
+
+      - name: Upload checksums
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/checksums.txt

@@ -22,7 +22,7 @@ import {
   type SupportedEditor,
 } from "./hooks-config.js";
 
-type RuleMode = "dynamic" | "minimal" | "full";
+type RuleMode = "dynamic" | "minimal" | "full" | "bootstrap";
 type Toolset = "consolidated" | "router";
 type InstallScope = "global" | "project" | "both";
 type McpScope = InstallScope | "skip";
@@ -1116,8 +1116,10 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       }
     }
 
-    // Rules mode: full (comprehensive rules with strong protocol enforcement)
-    const mode: RuleMode = "full";
+    // Editors without hooks need full rules; others get bootstrap (hooks deliver the rest)
+    const NO_HOOKS_EDITORS: EditorKey[] = ["codex", "aider", "antigravity"];
+    const getModeForEditor = (editor: EditorKey): RuleMode =>
+      NO_HOOKS_EDITORS.includes(editor) ? "full" : "bootstrap";
 
     const detectedPlanName = await client.getPlanName();
     const detectedGraphTier = await client.getGraphTier();
@@ -1426,7 +1428,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
         const rule = generateRuleContent(editor, {
           workspaceName,
           workspaceId: workspaceId && workspaceId !== "dry-run" ? workspaceId : undefined,
-          mode,
+          mode: getModeForEditor(editor),
         });
         if (!rule) continue;
 
@@ -1615,7 +1617,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
           workspaceName,
           workspaceId: workspaceId && workspaceId !== "dry-run" ? workspaceId : undefined,
           projectName: path.basename(projectPath),
-          mode,
+          mode: getModeForEditor(editor),
         });
         if (!rule) continue;
 

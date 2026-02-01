@@ -17,8 +17,8 @@ import * as path from "path";
 import * as os from "os";
 import { execSync } from "child_process";
 
-// Path to the hook script
-const HOOK_SCRIPT_PATH = path.join(os.homedir(), ".claude", "hooks", "contextstream-redirect.py");
+// Path to the hook script - now uses Node.js via the built dist
+const HOOK_SCRIPT_PATH = path.join(__dirname, "..", "dist", "index.js");
 const INDEX_STATUS_FILE = path.join(os.homedir(), ".contextstream", "indexed-projects.json");
 
 describe("Hook Loop Prevention Scenarios", () => {
@@ -274,7 +274,7 @@ function runHookScriptRaw(inputJson: string): HookResult {
   }
 
   try {
-    execSync(`echo '${inputJson.replace(/'/g, "'\\''")}' | python3 "${HOOK_SCRIPT_PATH}"`, {
+    execSync(`echo '${inputJson.replace(/'/g, "'\\''")}' | node "${HOOK_SCRIPT_PATH}" hook pre-tool-use`, {
       encoding: "utf-8",
       timeout: 5000,
       stdio: ["pipe", "pipe", "pipe"],

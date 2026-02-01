@@ -34,7 +34,7 @@ import {
   TASK_HINTS,
   WORKSPACE_HINTS,
   PROJECT_HINTS,
-} from "./educational-microcopy.js";
+} from "./microcopy.js";
 
 type StructuredContent = { [x: string]: unknown } | undefined;
 type ToolTextResult = {
@@ -2305,6 +2305,9 @@ export function registerTools(
     "notion_activity",
     "notion_knowledge",
     "notion_summary",
+    // Media operations (credit-metered)
+    "media_index",
+    "media_search",
   ]);
 
   const proTools = (() => {
@@ -2428,13 +2431,16 @@ export function registerTools(
   // ============================================
 
   // Track integration status - updated when session_init or integrations_status is called
+  // Cache TTL: 5 minutes to handle status changes (e.g., error -> connected after sync)
+  const INTEGRATION_CACHE_TTL_MS = 5 * 60 * 1000;
   let integrationStatus: {
     checked: boolean;
+    checkedAt: number;
     slack: boolean;
     github: boolean;
     notion: boolean;
     workspaceId?: string;
-  } = { checked: false, slack: false, github: false, notion: false };
+  } = { checked: false, checkedAt: 0, slack: false, github: false, notion: false };
 
   // Track if we've already notified about tools list change
   let toolsListChangedNotified = false;
@@ -2446,8 +2452,9 @@ export function registerTools(
   async function checkIntegrationStatus(
     workspaceId?: string
   ): Promise<{ slack: boolean; github: boolean; notion: boolean }> {
-    // If we already checked for this workspace, return cached result
-    if (integrationStatus.checked && integrationStatus.workspaceId === workspaceId) {
+    // If we already checked for this workspace within TTL, return cached result
+    const cacheAge = Date.now() - integrationStatus.checkedAt;
+    if (integrationStatus.checked && integrationStatus.workspaceId === workspaceId && cacheAge < INTEGRATION_CACHE_TTL_MS) {
       return { slack: integrationStatus.slack, github: integrationStatus.github, notion: integrationStatus.notion };
     }
 
@@ -2458,24 +2465,27 @@ export function registerTools(
 
     try {
       const status = await client.integrationsStatus({ workspace_id: workspaceId });
+      // "connected" or "syncing" both mean the integration is working
+      const isConnectedStatus = (s: string) => s === "connected" || s === "syncing";
       const slackConnected =
         status?.some(
           (s: { provider: string; status: string }) =>
-            s.provider === "slack" && s.status === "connected"
+            s.provider === "slack" && isConnectedStatus(s.status)
         ) ?? false;
       const githubConnected =
         status?.some(
           (s: { provider: string; status: string }) =>
-            s.provider === "github" && s.status === "connected"
+            s.provider === "github" && isConnectedStatus(s.status)
         ) ?? false;
       const notionConnected =
         status?.some(
           (s: { provider: string; status: string }) =>
-            s.provider === "notion" && s.status === "connected"
+            s.provider === "notion" && isConnectedStatus(s.status)
         ) ?? false;
 
       integrationStatus = {
         checked: true,
+        checkedAt: Date.now(),
         slack: slackConnected,
         github: githubConnected,
         notion: notionConnected,
@@ -2506,6 +2516,7 @@ export function registerTools(
 
     integrationStatus = {
       checked: true,
+      checkedAt: Date.now(),
       slack: status.slack,
       github: status.github,
       notion: status.notion,
@@ -8344,20 +8355,22 @@ Use this to verify integrations are healthy and syncing properly.`,
 
       // Update integration status tracking (Strategy 2)
       if (AUTO_HIDE_INTEGRATIONS) {
+        // "connected" or "syncing" both mean the integration is working
+        const isConnectedStatus = (s: string) => s === "connected" || s === "syncing";
         const slackConnected =
           result?.some(
             (s: { provider: string; status: string }) =>
-              s.provider === "slack" && s.status === "connected"
+              s.provider === "slack" && isConnectedStatus(s.status)
           ) ?? false;
         const githubConnected =
           result?.some(
             (s: { provider: string; status: string }) =>
-              s.provider === "github" && s.status === "connected"
+              s.provider === "github" && isConnectedStatus(s.status)
           ) ?? false;
         const notionConnected =
           result?.some(
             (s: { provider: string; status: string }) =>
-              s.provider === "notion" && s.status === "connected"
+              s.provider === "notion" && isConnectedStatus(s.status)
           ) ?? false;
         updateIntegrationStatus({ slack: slackConnected, github: githubConnected, notion: notionConnected }, workspaceId);
       }
@@ -8820,7 +8833,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "session",
       {
         title: "Session",
-        description: `Session management operations. Actions: capture (save decision/insight), capture_lesson (save lesson from mistake), get_lessons (retrieve lessons), recall (natural language recall), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (context-enriched search), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan (save implementation plan), get_plan (retrieve plan with tasks), update_plan (modify plan), list_plans (list all plans). Team actions (team plans only): team_decisions (team-wide decisions), team_lessons (team-wide lessons), team_plans (plans across team workspaces).`,
+        description: `Session management operations. Actions: capture (save decision/insight), capture_lesson (save lesson from mistake), get_lessons (retrieve lessons), recall (natural language recall), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (context-enriched search), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan (save implementation plan), get_plan (retrieve plan with tasks), update_plan (modify plan), list_plans (list all plans). Suggested rules actions: list_suggested_rules (view ML-generated rule suggestions), suggested_rule_action (accept/reject/modify a suggestion), suggested_rules_stats (view ML accuracy stats). Team actions (team plans only): team_decisions (team-wide decisions), team_lessons (team-wide lessons), team_plans (plans across team workspaces).`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -8846,6 +8859,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "team_decisions",
               "team_lessons",
               "team_plans",
+              // Suggested rules actions (ML-generated)
+              "list_suggested_rules",
+              "suggested_rule_action",
+              "suggested_rules_stats",
             ])
             .describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
@@ -8950,6 +8967,15 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .optional()
             .default(1)
             .describe("Number of recent snapshots to consider (default: 1)"),
+          // Suggested rules params
+          rule_id: z.string().uuid().optional().describe("Suggested rule ID for actions"),
+          rule_action: z
+            .enum(["accept", "reject", "modify"])
+            .optional()
+            .describe("Action to perform on suggested rule"),
+          modified_keywords: z.array(z.string()).optional().describe("Modified keywords when action is modify"),
+          modified_instruction: z.string().optional().describe("Modified instruction when action is modify"),
+          min_confidence: z.number().optional().describe("Minimum confidence threshold for listing rules"),
         }),
       },
       async (input) => {
@@ -9662,6 +9688,88 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                     team_plans: limitedPlans,
                     total: limitedPlans.length,
                     workspaces_searched: workspacesForPlans.length,
+                  }),
+                },
+              ],
+            };
+          }
+
+          case "list_suggested_rules": {
+            const result = await client.listSuggestedRules({
+              workspace_id: workspaceId,
+              status: input.status as any,
+              min_confidence: input.min_confidence,
+              limit: input.limit,
+            });
+            const rules = result?.data?.items || result?.items || [];
+            if (rules.length === 0) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: formatContent({
+                      suggested_rules: [],
+                      hint: "No pending rule suggestions. The ML system learns from your lessons and will suggest rules when patterns are detected.",
+                    }),
+                  },
+                ],
+              };
+            }
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatContent({
+                    suggested_rules: rules,
+                    total: result?.data?.total || rules.length,
+                    hint: "Use suggested_rule_action to accept, reject, or modify these suggestions.",
+                  }),
+                },
+              ],
+            };
+          }
+
+          case "suggested_rule_action": {
+            if (!input.rule_id || !input.rule_action) {
+              return errorResult("suggested_rule_action requires: rule_id, rule_action (accept/reject/modify)");
+            }
+            const result = await client.suggestedRuleAction({
+              rule_id: input.rule_id,
+              action: input.rule_action,
+              modified_keywords: input.modified_keywords,
+              modified_instruction: input.modified_instruction,
+            });
+            const actionVerb = input.rule_action === "accept" ? "accepted" : input.rule_action === "reject" ? "rejected" : "modified";
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatContent({
+                    success: true,
+                    message: `Rule ${actionVerb} successfully`,
+                    rule: result?.data || result,
+                    hint: input.rule_action === "accept"
+                      ? "This rule will now be applied to future context() calls."
+                      : input.rule_action === "reject"
+                      ? "This pattern will have reduced confidence for future suggestions."
+                      : "The modified rule will be applied to future context() calls.",
+                  }),
+                },
+              ],
+            };
+          }
+
+          case "suggested_rules_stats": {
+            const result = await client.getSuggestedRulesStats({
+              workspace_id: workspaceId,
+            });
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatContent({
+                    stats: result?.data || result,
+                    hint: "These stats show ML vs Grok accuracy. The blend weight auto-adjusts based on these metrics.",
                   }),
                 },
               ],
@@ -12327,6 +12435,10 @@ Example workflow:
 
         switch (input.action) {
           case "index": {
+            // Gate media indexing for Pro+ users
+            const indexGate = await gateIfProTool("media_index");
+            if (indexGate) return indexGate;
+
             if (!input.file_path && !input.external_url) {
               return errorResult("index requires: file_path or external_url");
             }
@@ -12512,6 +12624,10 @@ Example workflow:
           }
 
           case "search": {
+            // Gate media search for Pro+ users
+            const searchGate = await gateIfProTool("media_search");
+            if (searchGate) return searchGate;
+
             if (!input.query) {
               return errorResult("search requires: query");
             }

@@ -2531,6 +2531,50 @@ export class ContextStreamClient {
         source: "mcp_auto_capture",
       },
     });
+
+  }
+
+
+  /**
+   * Capture a memory event with a direct event_type.
+   * Used for auto-save session snapshots and other system events.
+   */
+  async captureMemoryEvent(params: {
+    workspace_id?: string;
+    project_id?: string;
+    event_type: string;
+    title: string;
+    content: string;
+    tags?: string[];
+    metadata?: Record<string, unknown>;
+    provenance?: Record<string, unknown>;
+    code_refs?: Array<{ file_path: string; symbol_id?: string; symbol_name?: string }>;
+  }) {
+    const withDefaults = this.withDefaults(params);
+
+    const metadata: Record<string, unknown> = {
+      ...(params.metadata || {}),
+    };
+    if (params.tags && params.tags.length > 0) {
+      metadata.tags = params.tags;
+    }
+    if (!metadata.captured_at) {
+      metadata.captured_at = new Date().toISOString();
+    }
+    if (!metadata.source) {
+      metadata.source = "mcp_auto_capture";
+    }
+
+    return this.createMemoryEvent({
+      workspace_id: withDefaults.workspace_id,
+      project_id: withDefaults.project_id,
+      event_type: params.event_type,
+      title: params.title,
+      content: params.content,
+      provenance: params.provenance,
+      code_refs: params.code_refs,
+      metadata,
+    });
   }
 
   submitContextFeedback(body: {
@@ -6008,5 +6052,65 @@ export class ContextStreamClient {
   async deleteTranscript(transcript_id: string) {
     uuidSchema.parse(transcript_id);
     return request(this.config, `/transcripts/${transcript_id}`, { method: "DELETE" });
+  }
+
+  // -------------------------------------------------------------------------
+  // Suggested Rules methods (ML-generated rule suggestions)
+  // -------------------------------------------------------------------------
+
+  /**
+   * List suggested rules
+   */
+  async listSuggestedRules(params?: {
+    workspace_id?: string;
+    status?: "pending" | "accepted" | "rejected" | "modified";
+    source_type?: "global" | "user" | "pattern";
+    min_confidence?: number;
+    limit?: number;
+    offset?: number;
+  }) {
+    const withDefaults = this.withDefaults(params || {});
+    const queryParams = new URLSearchParams();
+    if (withDefaults.workspace_id) queryParams.set("workspace_id", withDefaults.workspace_id);
+    if (params?.status) queryParams.set("status", params.status);
+    if (params?.source_type) queryParams.set("source_type", params.source_type);
+    if (params?.min_confidence) queryParams.set("min_confidence", String(params.min_confidence));
+    if (params?.limit) queryParams.set("limit", String(params.limit));
+    if (params?.offset) queryParams.set("offset", String(params.offset));
+    return request(this.config, `/suggested-rules?${queryParams.toString()}`, { method: "GET" });
+  }
+
+  /**
+   * Get pending suggested rules count
+   */
+  async getSuggestedRulesPendingCount(params?: { workspace_id?: string }) {
+    const withDefaults = this.withDefaults(params || {});
+    const queryParams = new URLSearchParams();
+    if (withDefaults.workspace_id) queryParams.set("workspace_id", withDefaults.workspace_id);
+    return request(this.config, `/suggested-rules/pending-count?${queryParams.toString()}`, { method: "GET" });
+  }
+
+  /**
+   * Get suggested rules feedback stats
+   */
+  async getSuggestedRulesStats(params?: { workspace_id?: string }) {
+    const withDefaults = this.withDefaults(params || {});
+    const queryParams = new URLSearchParams();
+    if (withDefaults.workspace_id) queryParams.set("workspace_id", withDefaults.workspace_id);
+    return request(this.config, `/suggested-rules/stats?${queryParams.toString()}`, { method: "GET" });
+  }
+
+  /**
+   * Perform action on suggested rule (accept/reject/modify)
+   */
+  async suggestedRuleAction(params: {
+    rule_id: string;
+    action: "accept" | "reject" | "modify";
+    modified_keywords?: string[];
+    modified_instruction?: string;
+  }) {
+    uuidSchema.parse(params.rule_id);
+    const { rule_id, ...body } = params;
+    return request(this.config, `/suggested-rules/${rule_id}/action`, { method: "POST", body });
   }
 }

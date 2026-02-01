@@ -6,7 +6,16 @@ import { join } from "path";
 const UPGRADE_COMMAND = "npm install -g @contextstream/mcp-server@latest";
 const NPM_LATEST_URL = "https://registry.npmjs.org/@contextstream/mcp-server/latest";
 
+// This gets replaced at build time by Bun's --define flag for binary builds
+declare const __CONTEXTSTREAM_VERSION__: string | undefined;
+
 export function getVersion(): string {
+  // First check if version was embedded at build time (for binary builds)
+  if (typeof __CONTEXTSTREAM_VERSION__ !== "undefined" && __CONTEXTSTREAM_VERSION__) {
+    return __CONTEXTSTREAM_VERSION__;
+  }
+
+  // Fallback to reading from package.json (for npm installs)
   try {
     const require = createRequire(import.meta.url);
     const pkg = require("../package.json") as { version?: string } | undefined;

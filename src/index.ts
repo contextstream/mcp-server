@@ -70,13 +70,26 @@ Usage:
 
 Commands:
   setup                      Interactive onboarding wizard (rules + workspace mapping)
+  verify-key [--json]        Verify API key and show account info
+  update-hooks [flags]       Update hooks for all editors (Claude, Cursor, Cline, Roo, Kilo)
+    --scope=global           Install hooks globally (default)
+    --scope=project, -p      Install hooks for current project only
+    --path=/path             Specify project path (implies --scope=project)
   http                       Run HTTP MCP gateway (streamable HTTP transport)
   hook pre-tool-use          PreToolUse hook - blocks discovery tools, redirects to ContextStream
   hook user-prompt-submit    UserPromptSubmit hook - injects ContextStream rules reminder
   hook media-aware           Media-aware hook - detects media prompts, injects media tool guidance
   hook pre-compact           PreCompact hook - saves conversation state before compaction
+  hook post-compact          PostCompact hook - restores context after compaction
   hook post-write            PostToolUse hook - real-time file indexing after Edit/Write
   hook auto-rules            PostToolUse hook - auto-updates rules when behind (silent)
+  hook on-bash               PostToolUse hook - captures bash commands, learns from errors
+  hook on-task               PostToolUse hook - tracks Task agent work
+  hook on-read               PostToolUse hook - tracks file exploration (Read/Glob/Grep)
+  hook on-web                PostToolUse hook - captures web research (WebFetch/WebSearch)
+  hook session-init          SessionStart hook - full context injection on session start
+  hook session-end           Stop hook - finalizes session, saves state
+  hook on-save-intent        UserPromptSubmit hook - redirects doc saves to ContextStream
 
 Environment variables:
   CONTEXTSTREAM_API_URL   Base API URL (e.g. https://api.contextstream.io)
@@ -205,11 +218,100 @@ async function main() {
         await runAutoRulesHook();
         return;
       }
+      case "post-compact": {
+        const { runPostCompactHook } = await import("./hooks/post-compact.js");
+        await runPostCompactHook();
+        return;
+      }
+      case "on-bash": {
+        const { runOnBashHook } = await import("./hooks/on-bash.js");
+        await runOnBashHook();
+        return;
+      }
+      case "on-task": {
+        const { runOnTaskHook } = await import("./hooks/on-task.js");
+        await runOnTaskHook();
+        return;
+      }
+      case "on-read": {
+        const { runOnReadHook } = await import("./hooks/on-read.js");
+        await runOnReadHook();
+        return;
+      }
+      case "on-web": {
+        const { runOnWebHook } = await import("./hooks/on-web.js");
+        await runOnWebHook();
+        return;
+      }
+      case "session-init": {
+        const { runSessionInitHook } = await import("./hooks/session-init.js");
+        await runSessionInitHook();
+        return;
+      }
+      case "session-end": {
+        const { runSessionEndHook } = await import("./hooks/session-end.js");
+        await runSessionEndHook();
+        return;
+      }
+      case "on-save-intent": {
+        const { runOnSaveIntentHook } = await import("./hooks/on-save-intent.js");
+        await runOnSaveIntentHook();
+        return;
+      }
       default:
         console.error(`Unknown hook: ${hookName}`);
-        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-write, auto-rules");
+        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-compact, post-write, auto-rules, on-bash, on-task, on-read, on-web, session-init, session-end, on-save-intent");
         process.exit(1);
     }
+  }
+
+  // Verify API key command: validate key and show account info
+  // Usage: contextstream-mcp verify-key [--json]
+  if (args[0] === "verify-key") {
+    const { runVerifyKey } = await import("./verify-key.js");
+    const outputJson = args.includes("--json");
+    const result = await runVerifyKey(outputJson);
+    process.exit(result.valid ? 0 : 1);
+  }
+
+  // Update hooks command: non-interactive hook installation for all editors
+  // Usage: contextstream-mcp update-hooks [--scope=global|project] [--path=/project/path]
+  if (args[0] === "update-hooks") {
+    const { installAllEditorHooks } = await import("./hooks-config.js");
+
+    // Parse flags
+    let scope: "global" | "project" = "global";
+    let projectPath: string | undefined;
+
+    for (const arg of args.slice(1)) {
+      if (arg === "--scope=project" || arg === "-p") {
+        scope = "project";
+        projectPath = projectPath || process.cwd();
+      } else if (arg === "--scope=global" || arg === "-g") {
+        scope = "global";
+      } else if (arg.startsWith("--path=")) {
+        projectPath = arg.replace("--path=", "");
+        scope = "project";
+      }
+    }
+
+    const scopeLabel = scope === "project" ? `project (${projectPath || process.cwd()})` : "global";
+    console.error(`Updating hooks for all editors (${scopeLabel})...`);
+
+    try {
+      const results = await installAllEditorHooks({
+        scope,
+        projectPath: scope === "project" ? (projectPath || process.cwd()) : undefined
+      });
+      for (const result of results) {
+        console.error(`✓ ${result.editor}: ${result.installed.length} hooks installed`);
+      }
+      console.error("✓ Hooks updated successfully");
+    } catch (error) {
+      console.error("Failed to update hooks:", error);
+      process.exit(1);
+    }
+    return;
   }
 
   // Try to load saved credentials if env vars not set

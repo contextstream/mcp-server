@@ -8,8 +8,8 @@
  *   npx @contextstream/mcp-server hook pre-tool-use
  *
  * Input (stdin): JSON with tool_name, tool_input, cwd
- * Output (stderr for blocking): Error message
- * Exit: 0 = allow, 2 = block
+ * Output (stdout): JSON with hookSpecificOutput.permissionDecision
+ * Exit: 0 always (decision is in JSON response)
  */
 
 import * as fs from "node:fs";
@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 
 const ENABLED = process.env.CONTEXTSTREAM_HOOK_ENABLED !== "false";
 const INDEX_STATUS_FILE = path.join(homedir(), ".contextstream", "indexed-projects.json");
+const DEBUG_FILE = "/tmp/pretooluse-hook-debug.log";
 const STALE_THRESHOLD_DAYS = 7;
 
 const DISCOVERY_PATTERNS = ["**/*", "**/", "src/**", "lib/**", "app/**", "components/**"];
@@ -154,11 +155,22 @@ function extractToolInput(input: HookInput): HookInput["tool_input"] {
 }
 
 /**
- * Output for Claude Code format (exit code based)
+ * Output for Claude Code format (JSON decision based)
+ * Must use exit 0 with JSON containing hookSpecificOutput.permissionDecision
  */
 function blockClaudeCode(message: string): never {
-  console.error(message);
-  process.exit(2);
+  // Use additionalContext approach - inject guidance without hard blocking
+  // This avoids the ugly "blocking error" display while still guiding Claude
+  const response = {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      // Use additionalContext instead of deny - tool runs but Claude sees the message
+      additionalContext: `[CONTEXTSTREAM] ${message}`,
+    },
+  };
+  fs.appendFileSync(DEBUG_FILE, `[PreToolUse] REDIRECT (additionalContext): ${JSON.stringify(response)}\n`);
+  console.log(JSON.stringify(response));
+  process.exit(0);
 }
 
 /**
@@ -195,20 +207,29 @@ function outputCursorAllow(): never {
 }
 
 function detectEditorFormat(input: HookInput): "claude" | "cline" | "cursor" {
-  // Cline/Roo/Kilo format
+  // Cline/Roo/Kilo format uses camelCase (hookName, toolName)
   if (input.hookName !== undefined || input.toolName !== undefined) {
     return "cline";
   }
-  // Cursor format
-  if (input.hook_event_name !== undefined) {
-    return "cursor";
+  // Claude Code uses snake_case (hook_event_name, tool_name) with specific structure
+  // Cursor also uses hook_event_name but has different response expectations
+  // For now, default to Claude Code format when hook_event_name is present
+  // This ensures proper hookSpecificOutput.permissionDecision format
+  if (input.hook_event_name !== undefined || input.tool_name !== undefined) {
+    return "claude";
   }
   // Default to Claude Code format
   return "claude";
 }
 
 export async function runPreToolUseHook(): Promise<void> {
+  // Debug: write to file to prove hook was invoked
+    fs.appendFileSync(DEBUG_FILE, `[PreToolUse] Hook invoked at ${new Date().toISOString()}\n`);
+  console.error("[PreToolUse] Hook invoked at", new Date().toISOString());
+
   if (!ENABLED) {
+    fs.appendFileSync(DEBUG_FILE, "[PreToolUse] Hook disabled, exiting\n");
+    console.error("[PreToolUse] Hook disabled, exiting");
     process.exit(0);
   }
 
@@ -234,10 +255,14 @@ export async function runPreToolUseHook(): Promise<void> {
   const tool = extractToolName(input);
   const toolInput = extractToolInput(input);
 
+  fs.appendFileSync(DEBUG_FILE, `[PreToolUse] tool=${tool}, cwd=${cwd}, editorFormat=${editorFormat}\n`);
+
   // Check if project is indexed
   const { isIndexed } = isProjectIndexed(cwd);
+  fs.appendFileSync(DEBUG_FILE, `[PreToolUse] isIndexed=${isIndexed}\n`);
   if (!isIndexed) {
     // Project not indexed - allow local tools
+    fs.appendFileSync(DEBUG_FILE, `[PreToolUse] Project not indexed, allowing\n`);
     if (editorFormat === "cline") {
       outputClineAllow();
     } else if (editorFormat === "cursor") {
@@ -249,8 +274,11 @@ export async function runPreToolUseHook(): Promise<void> {
   // Check tool and block if needed
   if (tool === "Glob") {
     const pattern = toolInput?.pattern || "";
+    fs.appendFileSync(DEBUG_FILE, `[PreToolUse] Glob pattern=${pattern}, isDiscovery=${isDiscoveryGlob(pattern)}\n`);
+    // Only intercept broad discovery patterns (e.g., **/*.ts, src/**)
     if (isDiscoveryGlob(pattern)) {
       const msg = `STOP: Use mcp__contextstream__search(mode="hybrid", query="${pattern}") instead of Glob.`;
+      fs.appendFileSync(DEBUG_FILE, `[PreToolUse] Intercepting discovery glob: ${msg}\n`);
       if (editorFormat === "cline") {
         outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream search for code discovery.");
       } else if (editorFormat === "cursor") {

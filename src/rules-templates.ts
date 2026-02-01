@@ -718,6 +718,156 @@ Use for monorepos or folders with multiple independent projects.
 Full docs: https://contextstream.io/docs/mcp/tools
 `.trim();
 
+/**
+ * NO-HOOKS SUPPLEMENT - Additional guidance for editors without hooks support.
+ *
+ * Editors like Codex, Aider, and Antigravity don't have hooks to enforce behavior,
+ * so the rules file must contain explicit guidance for everything hooks would do:
+ * - Session initialization (SessionStart hook)
+ * - File indexing after changes (PostToolUse hook)
+ * - Context compaction awareness (PreCompact hook)
+ * - Search-first enforcement (PreToolUse hook)
+ */
+const NO_HOOKS_SUPPLEMENT = `
+
+---
+## ⚠️ IMPORTANT: No Hooks Available ⚠️
+
+**This editor does NOT have hooks to enforce ContextStream behavior.**
+You MUST follow these rules manually - there is no automatic enforcement.
+
+---
+
+## 🚀 SESSION START PROTOCOL
+
+**On EVERY new session, you MUST:**
+
+1. **Call \`init(folder_path="<project_path>")\`** FIRST
+   - This triggers project indexing
+   - Check response for \`indexing_status\`
+   - If \`"started"\` or \`"refreshing"\`: wait before searching
+
+2. **Call \`context(user_message="<first_message>")\`** SECOND
+   - Gets task-specific rules and lessons
+   - Check for [LESSONS_WARNING] - past mistakes to avoid
+   - Check for [RULES_NOTICE] - update rules if needed
+
+3. **NEVER skip init/context** - you will miss critical context
+
+---
+
+## 📁 FILE INDEXING (CRITICAL)
+
+**There is NO automatic file indexing in this editor.**
+You MUST manage indexing manually:
+
+### After Creating/Editing Files:
+\`\`\`
+project(action="index")  # Re-index entire project
+\`\`\`
+
+### For Single File Updates:
+\`\`\`
+project(action="ingest_local", path="<file_path>")
+\`\`\`
+
+### Signs You Need to Re-index:
+- Search doesn't find code you just wrote
+- Search returns old versions of functions
+- New files don't appear in search results
+
+### Best Practice:
+After completing a feature or making multiple file changes, ALWAYS run:
+\`\`\`
+project(action="index")
+\`\`\`
+
+---
+
+## 🔍 SEARCH-FIRST (No PreToolUse Hook)
+
+**There is NO hook to block local tools.** You MUST self-enforce:
+
+### Before ANY Search, Check Index Status:
+\`\`\`
+project(action="index_status")
+\`\`\`
+
+This tells you:
+- \`indexed\`: true/false - is project indexed?
+- \`last_indexed_at\`: timestamp - when was it last indexed?
+- \`file_count\`: number - how many files indexed?
+
+### Search Protocol:
+
+**IF project is indexed and fresh:**
+\`\`\`
+search(mode="hybrid", query="what you're looking for")
+\`\`\`
+
+**IF project is NOT indexed or very stale (>7 days):**
+→ Use local tools (Glob/Grep/Read) directly
+→ OR run \`project(action="index")\` first, then search
+
+**IF ContextStream search returns 0 results or errors:**
+→ Use local tools (Glob/Grep/Read) as fallback
+
+### When Local Tools Are OK:
+✅ Project is not indexed
+✅ Index is stale/outdated (>7 days old)
+✅ ContextStream search returns 0 results
+✅ ContextStream returns errors
+✅ User explicitly requests local tools
+
+### When to Use ContextStream Search:
+✅ Project is indexed and fresh
+✅ Looking for code by meaning/concept
+✅ Need semantic understanding
+
+---
+
+## 💾 CONTEXT COMPACTION (No PreCompact Hook)
+
+**There is NO automatic state saving before compaction.**
+You MUST save state manually when the conversation gets long:
+
+### When to Save State:
+- After completing a major task
+- Before the conversation might be compacted
+- If \`context()\` returns \`context_pressure.level: "high"\`
+
+### How to Save State:
+\`\`\`
+session(action="capture", event_type="session_snapshot",
+  title="Session checkpoint",
+  content="{ \\"summary\\": \\"what we did\\", \\"active_files\\": [...], \\"next_steps\\": [...] }")
+\`\`\`
+
+### After Compaction (if context seems lost):
+\`\`\`
+init(folder_path="...", is_post_compact=true)
+\`\`\`
+This restores the most recent snapshot.
+
+---
+
+## 📋 PLANS & TASKS (No EnterPlanMode)
+
+**Always use ContextStream for planning:**
+
+\`\`\`
+session(action="capture_plan", title="...", steps=[...])
+memory(action="create_task", title="...", plan_id="...")
+\`\`\`
+
+❌ DO NOT use built-in plan mode or write plans to markdown files.
+
+---
+`;
+
+// Editors that don't have hooks support and need enhanced rules
+const NO_HOOKS_EDITORS = ["codex", "aider", "antigravity"];
+
 export const TEMPLATES: Record<string, RuleTemplate> = {
   codex: {
     filename: "AGENTS.md",
@@ -843,6 +993,12 @@ ${options.workspaceId ? `# Workspace ID: ${options.workspaceId}` : ""}
 
 `;
     content = header + content;
+  }
+
+  // Add NO_HOOKS_SUPPLEMENT for editors without hooks support
+  // These editors need explicit guidance since there's no enforcement mechanism
+  if (NO_HOOKS_EDITORS.includes(editor.toLowerCase())) {
+    content += NO_HOOKS_SUPPLEMENT;
   }
 
   // Append additional rules if provided

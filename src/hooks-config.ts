@@ -9,6 +9,42 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+
+/**
+ * Get the optimal command to run a hook.
+ * Prefers direct node execution over npx for better performance.
+ *
+ * Priority:
+ * 1. Direct path to installed package (fastest)
+ * 2. npx fallback (slower but always works)
+ */
+export function getHookCommand(hookName: string): string {
+  const fs = require("node:fs");
+
+  // Priority 1: Check for binary install at /usr/local/bin (fastest, no Node overhead)
+  const binaryPath = "/usr/local/bin/contextstream-mcp";
+  if (fs.existsSync(binaryPath)) {
+    return `${binaryPath} hook ${hookName}`;
+  }
+
+  // Priority 2: Try to find the installed package path
+  try {
+    // When running from the installed package, __dirname points to dist/
+    const __dirname = path.dirname(fileURLToPath(import.meta.url));
+    const indexPath = path.join(__dirname, "index.js");
+
+    // Check if the index.js exists (we're running from the installed package)
+    if (fs.existsSync(indexPath)) {
+      return `node ${indexPath} hook ${hookName}`;
+    }
+  } catch {
+    // Fallback to npx if we can't determine the path
+  }
+
+  // Fallback to npx (works but slower)
+  return `npx @contextstream/mcp-server hook ${hookName}`;
+}
 
 export interface ClaudeHook {
   type: "command";
@@ -24,9 +60,11 @@ export interface ClaudeHookMatcher {
 export interface ClaudeHooksConfig {
   hooks?: {
     PreToolUse?: ClaudeHookMatcher[];
-    UserPromptSubmit?: ClaudeHookMatcher[];
     PostToolUse?: ClaudeHookMatcher[];
+    UserPromptSubmit?: ClaudeHookMatcher[];
+    PreCompact?: ClaudeHookMatcher[];
     SessionStart?: ClaudeHookMatcher[];
+    Stop?: ClaudeHookMatcher[];
     [key: string]: ClaudeHookMatcher[] | undefined;
   };
 }
@@ -550,6 +588,13 @@ export function buildHooksConfig(options?: {
   includeMediaAware?: boolean;
   includePostWrite?: boolean;
   includeAutoRules?: boolean;
+  includeOnBash?: boolean;
+  includeOnTask?: boolean;
+  includeOnRead?: boolean;
+  includeOnWeb?: boolean;
+  includeSessionInit?: boolean;
+  includeSessionEnd?: boolean;
+  includeOnSaveIntent?: boolean;
 }): ClaudeHooksConfig["hooks"] {
   // Build UserPromptSubmit hooks array - always include reminder
   const userPromptHooks: ClaudeHookMatcher[] = [
@@ -558,12 +603,26 @@ export function buildHooksConfig(options?: {
       hooks: [
         {
           type: "command",
-          command: "npx @contextstream/mcp-server hook user-prompt-submit",
+          command: getHookCommand("user-prompt-submit"),
           timeout: 5,
         },
       ],
     },
   ];
+
+  // Add on-save-intent hook to redirect doc saves to ContextStream (default ON)
+  if (options?.includeOnSaveIntent !== false) {
+    userPromptHooks.push({
+      matcher: "*",
+      hooks: [
+        {
+          type: "command",
+          command: getHookCommand("on-save-intent"),
+          timeout: 5,
+        },
+      ],
+    });
+  }
 
   // Add media-aware hook (enabled by default for creative workflows)
   if (options?.includeMediaAware !== false) {
@@ -572,7 +631,7 @@ export function buildHooksConfig(options?: {
       hooks: [
         {
           type: "command",
-          command: "npx @contextstream/mcp-server hook media-aware",
+          command: getHookCommand("media-aware"),
           timeout: 5,
         },
       ],
@@ -586,7 +645,7 @@ export function buildHooksConfig(options?: {
         hooks: [
           {
             type: "command",
-            command: "npx @contextstream/mcp-server hook pre-tool-use",
+            command: getHookCommand("pre-tool-use"),
             timeout: 5,
           },
         ],
@@ -599,12 +658,43 @@ export function buildHooksConfig(options?: {
   if (options?.includePreCompact !== false) {
     config.PreCompact = [
       {
-        // Match both manual (/compact) and automatic compaction
         matcher: "*",
         hooks: [
           {
             type: "command",
-            command: "npx @contextstream/mcp-server hook pre-compact",
+            command: getHookCommand("pre-compact"),
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+  }
+
+  // Add SessionStart hook for full context injection (default ON)
+  if (options?.includeSessionInit !== false) {
+    config.SessionStart = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("session-init"),
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+  }
+
+  // Add Stop hook for session finalization (default ON)
+  if (options?.includeSessionEnd !== false) {
+    config.Stop = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("session-end"),
             timeout: 10,
           },
         ],
@@ -622,7 +712,7 @@ export function buildHooksConfig(options?: {
       hooks: [
         {
           type: "command",
-          command: "npx @contextstream/mcp-server hook post-write",
+          command: getHookCommand("post-write"),
           timeout: 10,
         },
       ],
@@ -636,8 +726,64 @@ export function buildHooksConfig(options?: {
       hooks: [
         {
           type: "command",
-          command: "npx @contextstream/mcp-server hook auto-rules",
+          command: getHookCommand("auto-rules"),
           timeout: 15,
+        },
+      ],
+    });
+  }
+
+  // Bash command tracking (default ON)
+  if (options?.includeOnBash !== false) {
+    postToolUseHooks.push({
+      matcher: "Bash",
+      hooks: [
+        {
+          type: "command",
+          command: getHookCommand("on-bash"),
+          timeout: 5,
+        },
+      ],
+    });
+  }
+
+  // Task agent tracking (default ON)
+  if (options?.includeOnTask !== false) {
+    postToolUseHooks.push({
+      matcher: "Task",
+      hooks: [
+        {
+          type: "command",
+          command: getHookCommand("on-task"),
+          timeout: 5,
+        },
+      ],
+    });
+  }
+
+  // File exploration tracking (default ON)
+  if (options?.includeOnRead !== false) {
+    postToolUseHooks.push({
+      matcher: "Read|Glob|Grep",
+      hooks: [
+        {
+          type: "command",
+          command: getHookCommand("on-read"),
+          timeout: 5,
+        },
+      ],
+    });
+  }
+
+  // Web research tracking (default ON)
+  if (options?.includeOnWeb !== false) {
+    postToolUseHooks.push({
+      matcher: "WebFetch|WebSearch",
+      hooks: [
+        {
+          type: "command",
+          command: getHookCommand("on-web"),
+          timeout: 5,
         },
       ],
     });
@@ -668,22 +814,22 @@ export async function installHookScripts(options?: {
   const hooksDir = getHooksDir();
   await fs.mkdir(hooksDir, { recursive: true });
 
-  // Return placeholder paths - actual hooks run via npx commands
+  // Return hook commands - uses direct path when available, falls back to npx
   const result: { preToolUse: string; userPrompt: string; preCompact?: string; mediaAware?: string; autoRules?: string } = {
-    preToolUse: "npx @contextstream/mcp-server hook pre-tool-use",
-    userPrompt: "npx @contextstream/mcp-server hook user-prompt-submit",
+    preToolUse: getHookCommand("pre-tool-use"),
+    userPrompt: getHookCommand("user-prompt-submit"),
   };
 
   if (options?.includePreCompact !== false) {
-    result.preCompact = "npx @contextstream/mcp-server hook pre-compact";
+    result.preCompact = getHookCommand("pre-compact");
   }
 
   if (options?.includeMediaAware !== false) {
-    result.mediaAware = "npx @contextstream/mcp-server hook media-aware";
+    result.mediaAware = getHookCommand("media-aware");
   }
 
   if (options?.includeAutoRules !== false) {
-    result.autoRules = "npx @contextstream/mcp-server hook auto-rules";
+    result.autoRules = getHookCommand("auto-rules");
   }
 
   return result;
@@ -764,22 +910,22 @@ export async function installClaudeCodeHooks(options: {
 }): Promise<{ scripts: string[]; settings: string[] }> {
   const result = { scripts: [] as string[], settings: [] as string[] };
 
-  // All hooks run via npx - list the commands that will be configured
+  // List the hook commands that will be configured (uses direct path when available)
   result.scripts.push(
-    "npx @contextstream/mcp-server hook pre-tool-use",
-    "npx @contextstream/mcp-server hook user-prompt-submit"
+    getHookCommand("pre-tool-use"),
+    getHookCommand("user-prompt-submit")
   );
   if (options.includePreCompact !== false) {
-    result.scripts.push("npx @contextstream/mcp-server hook pre-compact");
+    result.scripts.push(getHookCommand("pre-compact"));
   }
   if (options.includeMediaAware !== false) {
-    result.scripts.push("npx @contextstream/mcp-server hook media-aware");
+    result.scripts.push(getHookCommand("media-aware"));
   }
   if (options.includePostWrite !== false) {
-    result.scripts.push("npx @contextstream/mcp-server hook post-write");
+    result.scripts.push(getHookCommand("post-write"));
   }
   if (options.includeAutoRules !== false) {
-    result.scripts.push("npx @contextstream/mcp-server hook auto-rules");
+    result.scripts.push(getHookCommand("auto-rules"));
   }
 
   const hooksConfig = buildHooksConfig({
@@ -1197,14 +1343,17 @@ export function getClineHooksDir(scope: "global" | "project", projectPath?: stri
 }
 
 /**
- * Cline hook wrapper script that calls the Node.js hook via npx.
+ * Cline hook wrapper script that calls the Node.js hook.
  * Cline expects executable scripts with specific names.
+ * Uses direct node execution for better performance.
  */
-const CLINE_HOOK_WRAPPER = (hookName: string) => `#!/bin/bash
+const CLINE_HOOK_WRAPPER = (hookName: string) => {
+  const command = getHookCommand(hookName);
+  return `#!/bin/bash
 # ContextStream ${hookName} Hook Wrapper for Cline/Roo/Kilo Code
-# Calls the Node.js hook via npx
-exec npx @contextstream/mcp-server hook ${hookName}
+exec ${command}
 `;
+};
 
 /**
  * Install Cline hook scripts.
@@ -1632,6 +1781,9 @@ export async function installCursorHookScripts(options: {
     timeout?: number;
   }>;
 
+  const preToolUseCommand = getHookCommand("pre-tool-use");
+  const userPromptCommand = getHookCommand("user-prompt-submit");
+
   const config: CursorHooksConfig = {
     version: 1,
     hooks: {
@@ -1639,7 +1791,7 @@ export async function installCursorHookScripts(options: {
       preToolUse: [
         ...filteredPreToolUse,
         {
-          command: "npx @contextstream/mcp-server hook pre-tool-use",
+          command: preToolUseCommand,
           type: "command" as const,
           timeout: 5,
           matcher: { tool_name: "Glob|Grep|search_files|list_files|ripgrep" },
@@ -1648,7 +1800,7 @@ export async function installCursorHookScripts(options: {
       beforeSubmitPrompt: [
         ...filteredBeforeSubmit,
         {
-          command: "npx @contextstream/mcp-server hook user-prompt-submit",
+          command: userPromptCommand,
           type: "command" as const,
           timeout: 5,
         },
@@ -1660,8 +1812,8 @@ export async function installCursorHookScripts(options: {
   const configPath = getCursorHooksConfigPath(options.scope, options.projectPath);
 
   return {
-    preToolUse: "npx @contextstream/mcp-server hook pre-tool-use",
-    beforeSubmitPrompt: "npx @contextstream/mcp-server hook user-prompt-submit",
+    preToolUse: preToolUseCommand,
+    beforeSubmitPrompt: userPromptCommand,
     config: configPath,
   };
 }

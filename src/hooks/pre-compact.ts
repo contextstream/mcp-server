@@ -396,6 +396,8 @@ export async function runPreCompactHook(): Promise<void> {
     toolCallCount: 0,
     messageCount: 0,
     lastTools: [],
+    messages: [],
+    startedAt: new Date().toISOString(),
   };
 
   if (transcriptPath && fs.existsSync(transcriptPath)) {

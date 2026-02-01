@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ContextStreamClient } from "./client.js";
 
@@ -52,7 +53,7 @@ export class SessionManager {
     private client: ContextStreamClient
   ) {
     // Generate a unique session ID for this MCP connection
-    this.sessionId = `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+    this.sessionId = `mcp-${randomUUID()}`;
   }
 
   /**

@@ -107,7 +107,7 @@ function loadApiKey(): { apiKey: string | null; apiUrl: string; source: string }
   let apiUrl = "https://api.contextstream.io";
   let source = "none";
 
-  // Priority 1: Environment variables
+  // Priority 1: Environment variables (explicit override)
   if (process.env.CONTEXTSTREAM_API_KEY) {
     apiKey = process.env.CONTEXTSTREAM_API_KEY;
     source = "environment";
@@ -117,26 +117,7 @@ function loadApiKey(): { apiKey: string | null; apiUrl: string; source: string }
     return { apiKey, apiUrl, source };
   }
 
-  // Priority 2: ~/.contextstream/credentials.json
-  const credentialsPath = path.join(homedir(), ".contextstream", "credentials.json");
-  if (fs.existsSync(credentialsPath)) {
-    try {
-      const content = fs.readFileSync(credentialsPath, "utf-8");
-      const creds = JSON.parse(content) as CredentialsFile;
-      if (creds.api_key) {
-        apiKey = creds.api_key;
-        source = "~/.contextstream/credentials.json";
-        if (creds.api_url) {
-          apiUrl = creds.api_url;
-        }
-        return { apiKey, apiUrl, source };
-      }
-    } catch {
-      // Continue to next source
-    }
-  }
-
-  // Priority 3: Project .mcp.json (check cwd and parents first - most specific)
+  // Priority 2: Project .mcp.json (check cwd and parents - what editors actually use)
   let searchDir = process.cwd();
   for (let i = 0; i < 5; i++) {
     const projectMcpPath = path.join(searchDir, ".mcp.json");
@@ -162,7 +143,7 @@ function loadApiKey(): { apiKey: string | null; apiUrl: string; source: string }
     searchDir = parentDir;
   }
 
-  // Priority 4: ~/.mcp.json (Claude Code global)
+  // Priority 3: ~/.mcp.json (Claude Code global)
   const globalMcpPath = path.join(homedir(), ".mcp.json");
   if (fs.existsSync(globalMcpPath)) {
     try {
@@ -182,7 +163,7 @@ function loadApiKey(): { apiKey: string | null; apiUrl: string; source: string }
     }
   }
 
-  // Priority 5: Cursor config locations
+  // Priority 4: Cursor config locations
   const cursorPaths = [
     path.join(process.cwd(), ".cursor", "mcp.json"),
     path.join(homedir(), ".cursor", "mcp.json"),
@@ -207,7 +188,7 @@ function loadApiKey(): { apiKey: string | null; apiUrl: string; source: string }
     }
   }
 
-  // Priority 6: Claude Desktop config
+  // Priority 5: Claude Desktop config
   const claudeDesktopPath = getClaudeDesktopConfigPath();
   if (fs.existsSync(claudeDesktopPath)) {
     try {
@@ -227,7 +208,7 @@ function loadApiKey(): { apiKey: string | null; apiUrl: string; source: string }
     }
   }
 
-  // Priority 7: VS Code / Windsurf / Cline settings
+  // Priority 6: VS Code / Windsurf / Cline settings
   const vscodePaths = [
     path.join(homedir(), ".vscode", "mcp.json"),
     path.join(homedir(), ".codeium", "windsurf", "mcp_config.json"),
@@ -250,6 +231,25 @@ function loadApiKey(): { apiKey: string | null; apiUrl: string; source: string }
       } catch {
         // Continue
       }
+    }
+  }
+
+  // Priority 7: ~/.contextstream/credentials.json (fallback from setup wizard)
+  const credentialsPath = path.join(homedir(), ".contextstream", "credentials.json");
+  if (fs.existsSync(credentialsPath)) {
+    try {
+      const content = fs.readFileSync(credentialsPath, "utf-8");
+      const creds = JSON.parse(content) as CredentialsFile;
+      if (creds.api_key) {
+        apiKey = creds.api_key;
+        source = "~/.contextstream/credentials.json";
+        if (creds.api_url) {
+          apiUrl = creds.api_url;
+        }
+        return { apiKey, apiUrl, source };
+      }
+    } catch {
+      // Continue
     }
   }
 

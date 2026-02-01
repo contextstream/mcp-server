@@ -20,15 +20,21 @@ import { fileURLToPath } from "node:url";
  * 2. npx fallback (slower but always works)
  */
 export function getHookCommand(hookName: string): string {
-  // Try to find the installed package path
+  const fs = require("node:fs");
+
+  // Priority 1: Check for binary install at /usr/local/bin (fastest, no Node overhead)
+  const binaryPath = "/usr/local/bin/contextstream-mcp";
+  if (fs.existsSync(binaryPath)) {
+    return `${binaryPath} hook ${hookName}`;
+  }
+
+  // Priority 2: Try to find the installed package path
   try {
     // When running from the installed package, __dirname points to dist/
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
     const indexPath = path.join(__dirname, "index.js");
 
     // Check if the index.js exists (we're running from the installed package)
-    // Use sync check since this is called during config generation
-    const fs = require("node:fs");
     if (fs.existsSync(indexPath)) {
       return `node ${indexPath} hook ${hookName}`;
     }
@@ -57,7 +63,6 @@ export interface ClaudeHooksConfig {
     PostToolUse?: ClaudeHookMatcher[];
     UserPromptSubmit?: ClaudeHookMatcher[];
     PreCompact?: ClaudeHookMatcher[];
-    PostCompact?: ClaudeHookMatcher[];
     SessionStart?: ClaudeHookMatcher[];
     Stop?: ClaudeHookMatcher[];
     [key: string]: ClaudeHookMatcher[] | undefined;
@@ -580,7 +585,6 @@ export function getHooksDir(): string {
  */
 export function buildHooksConfig(options?: {
   includePreCompact?: boolean;
-  includePostCompact?: boolean;
   includeMediaAware?: boolean;
   includePostWrite?: boolean;
   includeAutoRules?: boolean;
@@ -659,22 +663,6 @@ export function buildHooksConfig(options?: {
           {
             type: "command",
             command: getHookCommand("pre-compact"),
-            timeout: 10,
-          },
-        ],
-      },
-    ];
-  }
-
-  // Add PostCompact hook for context restoration (default ON)
-  if (options?.includePostCompact !== false) {
-    config.PostCompact = [
-      {
-        matcher: "*",
-        hooks: [
-          {
-            type: "command",
-            command: getHookCommand("post-compact"),
             timeout: 10,
           },
         ],

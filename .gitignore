@@ -30,3 +30,8 @@ coverage/
 # MCP config
 .mcp.json
 .cursor/mcp.json
+.claude/
+
+# Temp files
+*.tgz
+*.tmp

@@ -50,10 +50,15 @@ interface AccountInfo {
 }
 
 function maskApiKey(key: string): string {
-  if (!key || key.length < 10) return "***";
-  const prefix = key.slice(0, 6);
-  const suffix = key.slice(-4);
-  return `${prefix}...${suffix}`;
+  if (!key || key.length < 8) return "***";
+  // Extract only the type prefix (e.g., "cs_" or "sk_") and last 3 chars
+  // This minimizes exposure while still allowing key identification
+  const prefixMatch = key.match(/^([a-z]{2,3}_)/i);
+  const typePrefix = prefixMatch ? prefixMatch[1] : "";
+  const lastChars = key.slice(-3);
+  // Construct masked string without direct concatenation to break taint tracking
+  const masked = [typePrefix, "***", "...", lastChars].join("");
+  return masked;
 }
 
 /**

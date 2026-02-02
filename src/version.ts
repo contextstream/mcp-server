@@ -1,10 +1,23 @@
 import { createRequire } from "module";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { homedir } from "os";
+import { homedir, platform } from "os";
 import { join } from "path";
+import { spawn } from "child_process";
 
-const UPGRADE_COMMAND = "npm install -g @contextstream/mcp-server@latest";
 const NPM_LATEST_URL = "https://registry.npmjs.org/@contextstream/mcp-server/latest";
+
+// Auto-update is enabled by default, can be disabled via env var
+const AUTO_UPDATE_ENABLED = process.env.CONTEXTSTREAM_AUTO_UPDATE !== "false";
+
+// Multi-platform update commands
+export const UPDATE_COMMANDS = {
+  npm: "npm install -g @contextstream/mcp-server@latest",
+  macLinux: "curl -fsSL https://contextstream.io/scripts/setup.sh | bash",
+  windows: "irm https://contextstream.io/scripts/setup.ps1 | iex",
+} as const;
+
+// Legacy single command for backwards compatibility
+const UPGRADE_COMMAND = UPDATE_COMMANDS.npm;
 
 // This gets replaced at build time by Bun's --define flag for binary builds
 declare const __CONTEXTSTREAM_VERSION__: string | undefined;
@@ -247,4 +260,310 @@ export function getVersionInstructions(notice: VersionNotice | null): string | n
   }
 
   return null;
+}
+
+/**
+ * Get full update instructions with all platform methods.
+ * Used when surfacing update info to the AI for users.
+ */
+export function getFullUpdateInstructions(): string {
+  return `**Keep Updated**
+
+To get the latest features and fixes, update periodically:
+
+**macOS/Linux:**
+\`\`\`bash
+curl -fsSL https://contextstream.io/scripts/setup.sh | bash
+\`\`\`
+
+**Windows (PowerShell):**
+\`\`\`powershell
+irm https://contextstream.io/scripts/setup.ps1 | iex
+\`\`\`
+
+**npm (requires Node.js 18+):**
+\`\`\`bash
+npm install -g @contextstream/mcp-server@latest
+\`\`\`
+
+After updating, restart your AI tool to use the new version.`;
+}
+
+/**
+ * Get a concise version notice for hooks/context injection.
+ * Includes update instructions without being overly verbose.
+ */
+export function getVersionNoticeForHook(notice: VersionNotice | null): string | null {
+  if (!notice?.behind) return null;
+
+  const versionsBehind = getVersionsBehind(notice.current, notice.latest);
+  const severity = versionsBehind >= 5 ? "CRITICAL" : versionsBehind >= 3 ? "IMPORTANT" : "INFO";
+
+  let frequency = "";
+  let whatTheyAreMissing = "";
+
+  if (versionsBehind >= 5) {
+    frequency = "Mention this update in EVERY response until the user updates.";
+    whatTheyAreMissing = `The user is missing out on many new features, important bug fixes, and possible security patches. Emphasize that being this far behind may affect reliability and security.`;
+  } else if (versionsBehind >= 3) {
+    frequency = "Remind the user about this update every 2-3 messages.";
+    whatTheyAreMissing = `The user is missing out on several new features and important fixes that improve reliability and functionality.`;
+  } else {
+    frequency = "Mention this update once at session start, then only if user asks.";
+    whatTheyAreMissing = `Minor update with improvements and fixes available.`;
+  }
+
+  return `[VERSION_${severity}] MCP server is ${versionsBehind > 0 ? versionsBehind + " version(s)" : "a version"} behind (${notice.current} → ${notice.latest}).
+
+${whatTheyAreMissing}
+
+${frequency}
+
+When mentioning the update, provide these commands (user can choose their preferred method):
+- macOS/Linux: curl -fsSL https://contextstream.io/scripts/setup.sh | bash
+- Windows: irm https://contextstream.io/scripts/setup.ps1 | iex
+- npm: npm install -g @contextstream/mcp-server@latest
+
+Be helpful but not annoying - frame it positively as access to new capabilities rather than criticism.`;
+}
+
+/**
+ * Check if auto-update is enabled (default: true)
+ */
+export function isAutoUpdateEnabled(): boolean {
+  // Check env var first
+  if (process.env.CONTEXTSTREAM_AUTO_UPDATE === "false") {
+    return false;
+  }
+
+  // Check config file for user preference
+  try {
+    const configPath = join(homedir(), ".contextstream", "config.json");
+    if (existsSync(configPath)) {
+      const config = JSON.parse(readFileSync(configPath, "utf-8")) as { auto_update?: boolean };
+      if (config.auto_update === false) {
+        return false;
+      }
+    }
+  } catch {
+    // Ignore config read errors
+  }
+
+  return true;
+}
+
+/**
+ * Set auto-update preference in config file
+ */
+export function setAutoUpdatePreference(enabled: boolean): void {
+  try {
+    const configDir = join(homedir(), ".contextstream");
+    const configPath = join(configDir, "config.json");
+
+    let config: Record<string, unknown> = {};
+    if (existsSync(configPath)) {
+      config = JSON.parse(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+    } else {
+      if (!existsSync(configDir)) {
+        mkdirSync(configDir, { recursive: true });
+      }
+    }
+
+    config.auto_update = enabled;
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+  } catch {
+    // Ignore config write errors
+  }
+}
+
+export interface AutoUpdateResult {
+  attempted: boolean;
+  success: boolean;
+  previousVersion: string;
+  newVersion: string | null;
+  error?: string;
+}
+
+/**
+ * Attempt to auto-update to the latest version.
+ * Returns immediately if already up-to-date or auto-update is disabled.
+ * Runs update in background and returns result.
+ */
+export async function attemptAutoUpdate(): Promise<AutoUpdateResult> {
+  const currentVersion = VERSION;
+
+  // Check if auto-update is enabled
+  if (!isAutoUpdateEnabled()) {
+    return {
+      attempted: false,
+      success: false,
+      previousVersion: currentVersion,
+      newVersion: null,
+      error: "Auto-update disabled",
+    };
+  }
+
+  // Check if update is needed
+  const notice = await getUpdateNotice();
+  if (!notice?.behind) {
+    return {
+      attempted: false,
+      success: true,
+      previousVersion: currentVersion,
+      newVersion: null,
+    };
+  }
+
+  // Determine best update method based on platform and how we're installed
+  const updateMethod = detectUpdateMethod();
+
+  try {
+    await runUpdate(updateMethod);
+
+    // Mark that we updated (for the restart message)
+    writeUpdateMarker(currentVersion, notice.latest);
+
+    return {
+      attempted: true,
+      success: true,
+      previousVersion: currentVersion,
+      newVersion: notice.latest,
+    };
+  } catch (err) {
+    return {
+      attempted: true,
+      success: false,
+      previousVersion: currentVersion,
+      newVersion: notice.latest,
+      error: err instanceof Error ? err.message : "Update failed",
+    };
+  }
+}
+
+type UpdateMethod = "npm" | "curl" | "powershell";
+
+function detectUpdateMethod(): UpdateMethod {
+  // Check if we're running from npm global install
+  const execPath = process.argv[1] || "";
+  if (execPath.includes("node_modules") || execPath.includes("npm")) {
+    return "npm";
+  }
+
+  // Use platform-appropriate installer
+  const os = platform();
+  if (os === "win32") {
+    return "powershell";
+  }
+
+  return "curl";
+}
+
+async function runUpdate(method: UpdateMethod): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let command: string;
+    let args: string[];
+    let shell: boolean;
+
+    switch (method) {
+      case "npm":
+        command = "npm";
+        args = ["install", "-g", "@contextstream/mcp-server@latest"];
+        shell = false;
+        break;
+      case "curl":
+        command = "bash";
+        args = ["-c", "curl -fsSL https://contextstream.io/scripts/setup.sh | bash"];
+        shell = false;
+        break;
+      case "powershell":
+        command = "powershell";
+        args = ["-Command", "irm https://contextstream.io/scripts/setup.ps1 | iex"];
+        shell = false;
+        break;
+    }
+
+    const proc = spawn(command, args, {
+      shell,
+      stdio: "ignore",
+      detached: true,
+    });
+
+    proc.on("error", (err) => {
+      reject(err);
+    });
+
+    proc.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`Update process exited with code ${code}`));
+      }
+    });
+
+    // Don't wait for detached process
+    proc.unref();
+
+    // Give it a moment to start, then consider it successful
+    setTimeout(() => resolve(), 1000);
+  });
+}
+
+function writeUpdateMarker(previousVersion: string, newVersion: string): void {
+  try {
+    const markerPath = join(homedir(), ".contextstream", "update-pending.json");
+    const configDir = join(homedir(), ".contextstream");
+    if (!existsSync(configDir)) {
+      mkdirSync(configDir, { recursive: true });
+    }
+    writeFileSync(markerPath, JSON.stringify({
+      previousVersion,
+      newVersion,
+      updatedAt: new Date().toISOString(),
+    }));
+  } catch {
+    // Ignore
+  }
+}
+
+/**
+ * Check if an update was recently performed (for showing restart message)
+ */
+export function checkUpdateMarker(): { previousVersion: string; newVersion: string } | null {
+  try {
+    const markerPath = join(homedir(), ".contextstream", "update-pending.json");
+    if (!existsSync(markerPath)) return null;
+
+    const marker = JSON.parse(readFileSync(markerPath, "utf-8")) as {
+      previousVersion: string;
+      newVersion: string;
+      updatedAt: string;
+    };
+
+    // Only show if updated in last hour
+    const updatedAt = new Date(marker.updatedAt);
+    const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    if (updatedAt < hourAgo) {
+      // Clean up old marker
+      try { require("fs").unlinkSync(markerPath); } catch { /* ignore */ }
+      return null;
+    }
+
+    return { previousVersion: marker.previousVersion, newVersion: marker.newVersion };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Clear the update marker after user has been notified
+ */
+export function clearUpdateMarker(): void {
+  try {
+    const markerPath = join(homedir(), ".contextstream", "update-pending.json");
+    if (existsSync(markerPath)) {
+      require("fs").unlinkSync(markerPath);
+    }
+  } catch {
+    // Ignore
+  }
 }

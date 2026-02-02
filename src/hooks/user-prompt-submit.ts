@@ -1,8 +1,14 @@
 /**
- * ContextStream UserPromptSubmit Hook - Injects rules reminder
+ * ContextStream UserPromptSubmit Hook - Injects rules reminder + captures transcripts
  *
  * Injects a reminder about ContextStream rules on every message.
  * Supports multiple editor formats: Claude Code, Cursor, Cline/Roo/Kilo.
+ *
+ * TRANSCRIPT CAPTURE (Lagging):
+ * - Extracts the previous user+assistant exchange from session history
+ * - Saves that exchange to ContextStream when the next user message arrives
+ * - Works for Claude Code (session.messages) and Cursor (history)
+ * - The final exchange is captured by the session-end hook
  *
  * For non-Claude editors (Cursor, Cline, Roo, Kilo), this hook does more work
  * to compensate for missing hooks (SessionStart, PostToolUse, PreCompact, Stop):
@@ -21,6 +27,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import { VERSION, getUpdateNotice, getVersionNoticeForHook, type VersionNotice } from "../version.js";
+
 
 const ENABLED = process.env.CONTEXTSTREAM_REMINDER_ENABLED !== "false";
 
@@ -31,9 +39,11 @@ let PROJECT_ID: string | null = null;
 
 const REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
 
-1. FIRST: Call mcp__contextstream__context(user_message="...") before ANY other tool
+1. FIRST: Call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") before ANY other tool
    - Returns: dynamic rules, lessons from past mistakes, relevant context
    - Check response for: [LESSONS_WARNING], [RULES_NOTICE], preferences
+   - save_exchange=true saves each conversation turn for later retrieval
+   - Use a consistent session_id for the entire conversation (generate once on first message)
 
 2. FOR CODE SEARCH: Check index status, then search appropriately
    ⚠️ BEFORE searching: mcp__contextstream__project(action="index_status")
@@ -62,7 +72,7 @@ const REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
 [END]`;
 
 // Enhanced reminder for non-Claude editors (compensates for missing hooks)
-const ENHANCED_REMINDER_HEADER = `[CONTEXTSTREAM - ENHANCED CONTEXT]
+const ENHANCED_REMINDER_HEADER = `⬡ ContextStream — Smart Context & Memory
 
 `;
 
@@ -89,6 +99,19 @@ interface ContextResponse {
   active_plans?: Array<{ title: string; status: string }>;
   pending_tasks?: Array<{ title: string; status: string }>;
   reminders?: Array<{ title: string; content: string }>;
+  preferences?: Array<{ title: string; content: string; importance: string }>;
+}
+
+interface TranscriptMessage {
+  role: string;
+  content: string;
+  timestamp: string;
+}
+
+interface LastExchange {
+  userMessage: TranscriptMessage;
+  assistantMessage: TranscriptMessage;
+  sessionId?: string;
 }
 
 function loadConfigFromMcpJson(cwd: string): void {
@@ -161,6 +184,230 @@ function loadConfigFromMcpJson(cwd: string): void {
   }
 }
 
+/**
+ * Read messages from Claude Code's JSONL transcript file.
+ * Each line is a JSON object with {type, message, ...}
+ */
+function readTranscriptFile(transcriptPath: string): Array<{ role: string; content: string }> {
+  try {
+    const content = fs.readFileSync(transcriptPath, "utf-8");
+    const lines = content.trim().split("\n");
+    const messages: Array<{ role: string; content: string }> = [];
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        // Only include user and assistant messages (skip progress, summary, etc.)
+        if (entry.type === "user" || entry.type === "assistant") {
+          const msg = entry.message;
+          if (msg?.role && msg?.content) {
+            // Extract text content from array format
+            let textContent = "";
+            if (typeof msg.content === "string") {
+              textContent = msg.content;
+            } else if (Array.isArray(msg.content)) {
+              textContent = msg.content
+                .filter((c: { type: string; text?: string }) => c.type === "text" && c.text)
+                .map((c: { text: string }) => c.text)
+                .join("\n");
+            }
+            if (textContent) {
+              messages.push({ role: msg.role, content: textContent });
+            }
+          }
+        }
+      } catch {
+        // Skip malformed lines
+      }
+    }
+    return messages;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Extract the last complete exchange (user message + assistant response) from session history.
+ * This enables "lagging" transcript capture - we save the previous exchange when the next user message arrives.
+ */
+function extractLastExchange(input: HookInput, editorFormat: string): LastExchange | null {
+  try {
+    // Claude Code with transcript_path (newer format)
+    if (editorFormat === "claude" && input.transcript_path) {
+      const messages = readTranscriptFile(input.transcript_path);
+      if (messages.length < 2) return null;
+
+      // Find the last assistant message and its preceding user message
+      let lastAssistantIdx = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === "assistant") {
+          lastAssistantIdx = i;
+          break;
+        }
+      }
+
+      if (lastAssistantIdx < 1) return null;
+
+      let lastUserIdx = -1;
+      for (let i = lastAssistantIdx - 1; i >= 0; i--) {
+        if (messages[i].role === "user") {
+          lastUserIdx = i;
+          break;
+        }
+      }
+
+      if (lastUserIdx < 0) return null;
+
+      const now = new Date().toISOString();
+      return {
+        userMessage: { role: "user", content: messages[lastUserIdx].content, timestamp: now },
+        assistantMessage: { role: "assistant", content: messages[lastAssistantIdx].content, timestamp: now },
+        sessionId: input.session_id,
+      };
+    }
+
+    // Claude Code with session.messages (older format, kept for compatibility)
+    if (editorFormat === "claude" && input.session?.messages) {
+      const messages = input.session.messages;
+      if (messages.length < 2) return null;
+
+      // Find the last assistant message and its preceding user message
+      let lastAssistantIdx = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === "assistant") {
+          lastAssistantIdx = i;
+          break;
+        }
+      }
+
+      if (lastAssistantIdx < 1) return null;
+
+      // Find the user message before this assistant message
+      let lastUserIdx = -1;
+      for (let i = lastAssistantIdx - 1; i >= 0; i--) {
+        if (messages[i].role === "user") {
+          lastUserIdx = i;
+          break;
+        }
+      }
+
+      if (lastUserIdx < 0) return null;
+
+      const userMsg = messages[lastUserIdx];
+      const assistantMsg = messages[lastAssistantIdx];
+
+      // Extract text content (handles both string and array formats)
+      const extractContent = (content: string | Array<{ type: string; text?: string }>): string => {
+        if (typeof content === "string") return content;
+        if (Array.isArray(content)) {
+          return content
+            .filter((c) => c.type === "text" && c.text)
+            .map((c) => c.text)
+            .join("\n");
+        }
+        return "";
+      };
+
+      const userContent = extractContent(userMsg.content);
+      const assistantContent = extractContent(assistantMsg.content);
+
+      if (!userContent || !assistantContent) return null;
+
+      const now = new Date().toISOString();
+      return {
+        userMessage: { role: "user", content: userContent, timestamp: now },
+        assistantMessage: { role: "assistant", content: assistantContent, timestamp: now },
+        sessionId: input.session_id,
+      };
+    }
+
+    if ((editorFormat === "cursor" || editorFormat === "antigravity") && input.history) {
+      const history = input.history;
+      if (history.length < 2) return null;
+
+      // Find the last assistant message and its preceding user message
+      let lastAssistantIdx = -1;
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].role === "assistant") {
+          lastAssistantIdx = i;
+          break;
+        }
+      }
+
+      if (lastAssistantIdx < 1) return null;
+
+      let lastUserIdx = -1;
+      for (let i = lastAssistantIdx - 1; i >= 0; i--) {
+        if (history[i].role === "user") {
+          lastUserIdx = i;
+          break;
+        }
+      }
+
+      if (lastUserIdx < 0) return null;
+
+      const now = new Date().toISOString();
+      return {
+        userMessage: { role: "user", content: history[lastUserIdx].content, timestamp: now },
+        assistantMessage: { role: "assistant", content: history[lastAssistantIdx].content, timestamp: now },
+        sessionId: input.conversationId || input.session_id,
+      };
+    }
+
+    // Cline/Roo/Kilo - check if they provide history in a different format
+    // For now, return null - can be extended when we discover their format
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Save the last exchange to ContextStream transcripts API.
+ * Uses the simplified /exchange endpoint - backend handles all transcript logic.
+ * This runs asynchronously and doesn't block the hook response.
+ */
+async function saveLastExchange(exchange: LastExchange, cwd: string, clientName?: string): Promise<void> {
+  if (!API_KEY) return;
+
+  // Generate a session ID based on cwd if not provided
+  const sessionId = exchange.sessionId || `hook-${Buffer.from(cwd).toString("base64").slice(0, 16)}`;
+
+  // Simple payload - backend handles find-or-create, appending, etc.
+  const payload: Record<string, unknown> = {
+    session_id: sessionId,
+    user_message: exchange.userMessage.content,
+    assistant_message: exchange.assistantMessage.content,
+    client_name: clientName,
+  };
+
+  if (WORKSPACE_ID) {
+    payload.workspace_id = WORKSPACE_ID;
+  }
+  if (PROJECT_ID) {
+    payload.project_id = PROJECT_ID;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    await fetch(`${API_URL}/api/v1/transcripts/exchange`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": API_KEY,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+  } catch {
+    // Silently ignore errors - don't block the hook
+  }
+}
+
 async function fetchSessionContext(): Promise<ContextResponse | null> {
   if (!API_KEY) return null;
 
@@ -168,27 +415,33 @@ async function fetchSessionContext(): Promise<ContextResponse | null> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 3000);
 
-    const url = new URL(`${API_URL}/api/v1/context`);
-    if (WORKSPACE_ID) url.searchParams.set("workspace_id", WORKSPACE_ID);
-    if (PROJECT_ID) url.searchParams.set("project_id", PROJECT_ID);
-    url.searchParams.set("include_lessons", "true");
-    url.searchParams.set("include_decisions", "true");
-    url.searchParams.set("include_plans", "true");
-    url.searchParams.set("include_reminders", "true");
-    url.searchParams.set("limit", "3");
+    // Use POST /context/smart which is the main context endpoint
+    const url = `${API_URL}/api/v1/context/smart`;
+    const body: Record<string, unknown> = {
+      user_message: "hook context fetch",
+      max_tokens: 200,
+      format: "readable",
+    };
+    if (WORKSPACE_ID) body.workspace_id = WORKSPACE_ID;
+    if (PROJECT_ID) body.project_id = PROJECT_ID;
 
-    const response = await fetch(url.toString(), {
-      method: "GET",
+    const response = await fetch(url, {
+      method: "POST",
       headers: {
         "X-API-Key": API_KEY,
+        "Content-Type": "application/json",
       },
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
 
     clearTimeout(timeoutId);
 
     if (response.ok) {
-      return (await response.json()) as ContextResponse;
+      const data = await response.json();
+      // Transform smart context response to our ContextResponse format
+      // The context string may contain encoded preferences, lessons etc.
+      return transformSmartContextResponse(data);
     }
     return null;
   } catch {
@@ -196,21 +449,144 @@ async function fetchSessionContext(): Promise<ContextResponse | null> {
   }
 }
 
+/**
+ * Transform the smart context API response into our ContextResponse format.
+ * The smart context endpoint returns a minified context string and metadata.
+ */
+function transformSmartContextResponse(data: unknown): ContextResponse | null {
+  try {
+    const response = data as {
+      data?: {
+        warnings?: string[];
+        context?: string;
+        items?: Array<{
+          item_type: string;
+          title: string;
+          content: string;
+          metadata?: { importance?: string };
+        }>;
+      };
+    };
+
+    const result: ContextResponse = {};
+
+    // Extract lessons from warnings
+    if (response.data?.warnings && response.data.warnings.length > 0) {
+      result.lessons = response.data.warnings.map((w) => ({
+        title: "Lesson",
+        trigger: "",
+        prevention: w.replace(/^\[LESSONS_WARNING\]\s*/, ""),
+      }));
+    }
+
+    // Extract items by type (if available in response)
+    if (response.data?.items) {
+      for (const item of response.data.items) {
+        if (item.item_type === "preference") {
+          if (!result.preferences) result.preferences = [];
+          result.preferences.push({
+            title: item.title,
+            content: item.content,
+            importance: item.metadata?.importance || "medium",
+          });
+        } else if (item.item_type === "plan") {
+          if (!result.active_plans) result.active_plans = [];
+          result.active_plans.push({
+            title: item.title,
+            status: "active",
+          });
+        } else if (item.item_type === "task") {
+          if (!result.pending_tasks) result.pending_tasks = [];
+          result.pending_tasks.push({
+            title: item.title,
+            status: "pending",
+          });
+        } else if (item.item_type === "reminder") {
+          if (!result.reminders) result.reminders = [];
+          result.reminders.push({
+            title: item.title,
+            content: item.content,
+          });
+        }
+      }
+    }
+
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build Claude Code reminder with optional preferences
+ * This is lighter than the enhanced reminder (other hooks handle lessons/plans)
+ * but includes high-importance preferences that should always surface.
+ */
+function buildClaudeReminder(ctx: ContextResponse | null, versionNotice?: VersionNotice | null): string {
+  const parts: string[] = [];
+
+  // Add version notice if outdated (important for users to know about updates)
+  if (versionNotice?.behind) {
+    const versionInfo = getVersionNoticeForHook(versionNotice);
+    if (versionInfo) {
+      parts.push(versionInfo);
+      parts.push("");
+    }
+  }
+
+  // Add high-importance preferences (the main new feature)
+  const highImportancePrefs = ctx?.preferences?.filter(p => p.importance === "high") || [];
+  if (highImportancePrefs.length > 0) {
+    parts.push(`[USER PREFERENCES - Always respect these]`);
+    for (const pref of highImportancePrefs.slice(0, 5)) {
+      parts.push(`• ${pref.title}: ${pref.content}`);
+    }
+    parts.push("");
+  }
+
+  // Add the standard rules
+  parts.push(REMINDER);
+
+  return parts.join("\n");
+}
+
 function buildEnhancedReminder(
   ctx: ContextResponse | null,
-  isNewSession: boolean
+  isNewSession: boolean,
+  versionNotice?: VersionNotice | null
 ): string {
   const parts: string[] = [ENHANCED_REMINDER_HEADER];
+
+  // Add version notice prominently if outdated
+  if (versionNotice?.behind) {
+    const versionInfo = getVersionNoticeForHook(versionNotice);
+    if (versionInfo) {
+      parts.push(`## 🔄 UPDATE AVAILABLE\n`);
+      parts.push(versionInfo);
+      parts.push("");
+    }
+  }
 
   // Session init guidance for new sessions
   if (isNewSession) {
     parts.push(`## 🚀 NEW SESSION DETECTED
 1. Call \`init(folder_path="...")\` - this triggers project indexing
 2. Wait for indexing: if \`init\` returns \`indexing_status: "started"\`, files are being indexed
-3. Then call \`context(user_message="...")\` for task-specific context
-4. Use \`search(mode="hybrid")\` for code discovery (not Glob/Grep/Read)
+3. Generate a unique session_id (e.g., "session-" + timestamp or UUID) - use this for ALL context() calls
+4. Call \`context(user_message="...", save_exchange=true, session_id="<your-session-id>")\` for task-specific context
+5. Use \`search(mode="hybrid")\` for code discovery (not Glob/Grep/Read)
 
 `);
+  }
+
+  // High-importance preferences (always respect these)
+  const highImportancePrefs = ctx?.preferences?.filter(p => p.importance === "high") || [];
+  if (highImportancePrefs.length > 0) {
+    parts.push(`## ⚙️ USER PREFERENCES - Always respect these`);
+    for (const pref of highImportancePrefs.slice(0, 5)) {
+      parts.push(`- **${pref.title}**: ${pref.content}`);
+    }
+    parts.push("");
   }
 
   // Lessons (most important - mimics what SessionStart would show)
@@ -305,6 +681,8 @@ interface HookInput {
   hook_event_name?: string;
   prompt?: string;
   cwd?: string;
+  session_id?: string;
+  transcript_path?: string; // Path to JSONL transcript file
   session?: {
     messages?: Array<{ role: string; content: string | Array<{ type: string; text?: string }> }>;
   };
@@ -314,6 +692,9 @@ interface HookInput {
 
   // Cursor format
   history?: Array<{ role: string; content: string }>;
+
+  // Common session tracking
+  conversationId?: string; // Cursor/Cline may use this
 }
 
 function detectEditorFormat(input: HookInput): "claude" | "cline" | "cursor" | "antigravity" {
@@ -380,23 +761,38 @@ export async function runUserPromptSubmitHook(): Promise<void> {
   const editorFormat = detectEditorFormat(input);
   const cwd = input.cwd || process.cwd();
 
+  // Load config early so we have API_KEY for transcript saving
+  loadConfigFromMcpJson(cwd);
+
+  // Check for version updates (runs in parallel with other async operations)
+  const versionNoticePromise = getUpdateNotice();
+
+  // Extract and save last exchange (lagging transcript capture)
+  // This runs in parallel and doesn't block the hook response
+  const lastExchange = extractLastExchange(input, editorFormat);
+  const clientName = editorFormat === "claude" ? "claude-code" : editorFormat;
+  const saveExchangePromise = lastExchange ? saveLastExchange(lastExchange, cwd, clientName) : Promise.resolve();
+
   // Output format depends on editor
   if (editorFormat === "claude") {
-    // Claude Code format - simple reminder (other hooks handle the rest)
+    // Claude Code format - fetch preferences and include them with rules
+    // Other hooks (SessionStart, PostToolUse) handle lessons/plans/tasks
+    const [ctx, versionNotice] = await Promise.all([fetchSessionContext(), versionNoticePromise, saveExchangePromise]);
+    const claudeReminder = buildClaudeReminder(ctx, versionNotice);
+
     console.log(
       JSON.stringify({
         hookSpecificOutput: {
           hookEventName: "UserPromptSubmit",
-          additionalContext: REMINDER,
+          additionalContext: claudeReminder,
         },
       })
     );
   } else if (editorFormat === "cline") {
     // Cline/Roo/Kilo format - ENHANCED (compensates for missing hooks)
-    loadConfigFromMcpJson(cwd);
     const newSession = isNewSession(input, editorFormat);
-    const ctx = await fetchSessionContext();
-    const enhancedReminder = buildEnhancedReminder(ctx, newSession);
+    const [ctx, versionNotice] = await Promise.all([fetchSessionContext(), versionNoticePromise, saveExchangePromise]);
+    const enhancedReminder = buildEnhancedReminder(ctx, newSession, versionNotice);
 
     console.log(
       JSON.stringify({
@@ -406,14 +802,18 @@ export async function runUserPromptSubmitHook(): Promise<void> {
     );
   } else if (editorFormat === "cursor") {
     // Cursor format - ENHANCED (compensates for missing hooks)
-    loadConfigFromMcpJson(cwd);
     const newSession = isNewSession(input, editorFormat);
-    const ctx = await fetchSessionContext();
+    const [ctx, versionNotice] = await Promise.all([fetchSessionContext(), versionNoticePromise, saveExchangePromise]);
 
     // Cursor has limited injection capability, so we use a shorter version
-    const cursorReminder = ctx?.lessons?.length
-      ? `[CONTEXTSTREAM] ⚠️ ${ctx.lessons.length} lessons from past mistakes. Use search(mode="hybrid") before Glob/Grep. Call context() first. After file edits: project(action="index") to re-index.`
-      : `[CONTEXTSTREAM] Use search(mode="hybrid") before Glob/Grep/Read. Call context() first. After file edits: project(action="index") to re-index.`;
+    let cursorReminder = ctx?.lessons?.length
+      ? `[CONTEXTSTREAM] ⚠️ ${ctx.lessons.length} lessons from past mistakes. Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="hybrid") before Glob/Grep. After file edits: project(action="index").`
+      : `[CONTEXTSTREAM] Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="hybrid") before Glob/Grep/Read. After file edits: project(action="index").`;
+
+    // Add version notice if outdated
+    if (versionNotice?.behind) {
+      cursorReminder += ` [UPDATE v${versionNotice.current}→${versionNotice.latest}]`;
+    }
 
     console.log(
       JSON.stringify({
@@ -423,10 +823,9 @@ export async function runUserPromptSubmitHook(): Promise<void> {
     );
   } else if (editorFormat === "antigravity") {
     // Antigravity/Gemini format - ENHANCED (compensates for missing hooks)
-    loadConfigFromMcpJson(cwd);
     const newSession = isNewSession(input, editorFormat);
-    const ctx = await fetchSessionContext();
-    const enhancedReminder = buildEnhancedReminder(ctx, newSession);
+    const [ctx, versionNotice] = await Promise.all([fetchSessionContext(), versionNoticePromise, saveExchangePromise]);
+    const enhancedReminder = buildEnhancedReminder(ctx, newSession, versionNotice);
 
     // Antigravity uses similar format to Cline
     console.log(

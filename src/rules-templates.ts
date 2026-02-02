@@ -68,7 +68,7 @@ const CONTEXTSTREAM_RULES_BOOTSTRAP = `
 
 **Hooks:** \`<system-reminder>\` tags contain injected instructions — follow them exactly.
 
-**Notices:** [LESSONS_WARNING] → tell user first | [RULES_NOTICE] → run \`generate_rules()\` | [VERSION_NOTICE] → tell user to update
+**Notices:** [LESSONS_WARNING] → tell user first | [RULES_NOTICE] → run \`generate_rules()\` | [VERSION_NOTICE/CRITICAL] → tell user about update (curl/irm/npm options)
 
 v${RULES_VERSION}
 `.trim();
@@ -341,11 +341,14 @@ If context still feels missing, use \`session(action="recall", query="...")\` fo
 
 **[RULES_NOTICE]** - Update rules via \`generate_rules()\` (or rerun setup).
 
-**[VERSION_NOTICE]** - You **MUST IMMEDIATELY** tell the user:
-  1. A new MCP server version is available
-  2. The exact update command to run
-  3. That they need to restart their AI tool after updating
-  **Do not skip this** - users often miss stderr warnings.
+**[VERSION_NOTICE]** or **[VERSION_CRITICAL]** - You **MUST** tell the user (be helpful, not annoying):
+  1. A new MCP server version is available with improvements
+  2. Provide update commands (user chooses preferred method):
+     - macOS/Linux: \`curl -fsSL https://contextstream.io/scripts/setup.sh | bash\`
+     - Windows: \`irm https://contextstream.io/scripts/setup.ps1 | iex\`
+     - npm: \`npm install -g @contextstream/mcp-server@latest\`
+  3. Restart AI tool after updating
+  **Mention once** - don't nag. Users often miss stderr warnings so this helps.
 
 **[LESSONS_WARNING]** - You **MUST** before proceeding:
   1. Read all lessons listed
@@ -695,7 +698,10 @@ To disable automatic restoration:
 
 ### Notices - MUST HANDLE IMMEDIATELY
 
-- **[VERSION_NOTICE]**: Tell the user about the update and command to run
+- **[VERSION_NOTICE]** or **[VERSION_CRITICAL]**: Tell user about the update in a helpful, non-annoying way. Provide update commands:
+  - macOS/Linux: \`curl -fsSL https://contextstream.io/scripts/setup.sh | bash\`
+  - Windows: \`irm https://contextstream.io/scripts/setup.ps1 | iex\`
+  - npm: \`npm install -g @contextstream/mcp-server@latest\`
 - **[RULES_NOTICE]**: Run \`generate_rules(overwrite_existing=true)\` to update
 - **[LESSONS_WARNING]**: Read lessons, tell user about them, explain how you'll avoid past mistakes
 
@@ -747,12 +753,41 @@ You MUST follow these rules manually - there is no automatic enforcement.
    - Check response for \`indexing_status\`
    - If \`"started"\` or \`"refreshing"\`: wait before searching
 
-2. **Call \`context(user_message="<first_message>")\`** SECOND
+2. **Generate a unique session_id** (e.g., \`"session-" + timestamp\` or a UUID)
+   - Use this SAME session_id for ALL context() calls in this conversation
+   - This groups all turns together in the transcript
+
+3. **Call \`context(user_message="<first_message>", save_exchange=true, session_id="<your-session-id>")\`**
    - Gets task-specific rules and lessons
    - Check for [LESSONS_WARNING] - past mistakes to avoid
    - Check for [RULES_NOTICE] - update rules if needed
+   - **save_exchange=true** saves each conversation turn for later retrieval
 
-3. **NEVER skip init/context** - you will miss critical context
+4. **NEVER skip init/context** - you will miss critical context
+
+---
+
+## 💾 AUTOMATIC TRANSCRIPT SAVING (CRITICAL)
+
+**This editor does NOT have hooks to auto-save transcripts.**
+You MUST save each conversation turn manually:
+
+### On EVERY message (including the first):
+\`\`\`
+context(user_message="<user's message>", save_exchange=true, session_id="<session-id>")
+\`\`\`
+
+### Why save_exchange matters:
+- Transcripts enable searching past conversations
+- Allows context restoration after compaction
+- Provides conversation history for debugging
+- Required for the Transcripts page in the dashboard
+
+### Session ID Guidelines:
+- Generate ONCE at the start of the conversation
+- Use a unique identifier: \`"session-" + Date.now()\` or a UUID
+- Keep the SAME session_id for ALL context() calls in this session
+- Different sessions = different transcripts
 
 ---
 
@@ -861,6 +896,39 @@ memory(action="create_task", title="...", plan_id="...")
 \`\`\`
 
 ❌ DO NOT use built-in plan mode or write plans to markdown files.
+
+---
+
+## 🔄 VERSION UPDATES (Check Periodically)
+
+**This editor does NOT have hooks to check for updates automatically.**
+You should check for updates using \`help(action="version")\` periodically (e.g., at session start).
+
+### If the response includes [VERSION_NOTICE] or [VERSION_CRITICAL]:
+
+**Tell the user** about the available update in a helpful, non-annoying way:
+- Frame it as "new features and improvements available"
+- Provide the update commands (user can choose their preferred method)
+- Don't nag repeatedly - mention once, then only if user asks
+
+### Update Commands (provide all options):
+
+**macOS/Linux:**
+\`\`\`bash
+curl -fsSL https://contextstream.io/scripts/setup.sh | bash
+\`\`\`
+
+**Windows (PowerShell):**
+\`\`\`powershell
+irm https://contextstream.io/scripts/setup.ps1 | iex
+\`\`\`
+
+**npm (requires Node.js 18+):**
+\`\`\`bash
+npm install -g @contextstream/mcp-server@latest
+\`\`\`
+
+After updating, user should restart their AI tool.
 
 ---
 `;

@@ -8,7 +8,7 @@ import { ContextStreamClient } from "./client.js";
 import type { Config } from "./config.js";
 import { HttpError } from "./http.js";
 import { generateRuleContent } from "./rules-templates.js";
-import { VERSION, getUpdateNotice } from "./version.js";
+import { VERSION, getUpdateNotice, setAutoUpdatePreference, isAutoUpdateEnabled } from "./version.js";
 import {
   credentialsFilePath,
   normalizeApiUrl,
@@ -121,6 +121,7 @@ const CONTEXTSTREAM_PREAMBLE_PATTERNS: RegExp[] = [
   /^#\s+kilo code rules$/i,
   /^#\s+roo code rules$/i,
   /^#\s+aider configuration$/i,
+  /^#\s+antigravity agent rules$/i,
 ];
 
 function wrapWithMarkers(content: string): string {
@@ -1144,6 +1145,26 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     // Context Restoration: enabled by default
     const restoreContextEnabled = true;
+
+    // Auto-Update: enabled by default, ask user if they want to disable
+    console.log("\nAuto-Update:");
+    console.log("  When enabled, ContextStream will automatically update to the latest version");
+    console.log("  on new sessions (checks daily). You can disable this if you prefer manual updates.");
+    const currentAutoUpdate = isAutoUpdateEnabled();
+    const autoUpdateChoice = normalizeInput(
+      await rl.question(`Enable auto-update? [${currentAutoUpdate ? "Y/n" : "y/N"}]: `)
+    ).toLowerCase();
+    const autoUpdateEnabled = autoUpdateChoice === ""
+      ? currentAutoUpdate  // Keep current setting if blank
+      : autoUpdateChoice === "y" || autoUpdateChoice === "yes";
+
+    // Save the preference
+    setAutoUpdatePreference(autoUpdateEnabled);
+    if (autoUpdateEnabled) {
+      console.log("  ✓ Auto-update enabled (disable anytime with CONTEXTSTREAM_AUTO_UPDATE=false)");
+    } else {
+      console.log("  ✗ Auto-update disabled");
+    }
 
     const editors: EditorKey[] = [
       "codex",

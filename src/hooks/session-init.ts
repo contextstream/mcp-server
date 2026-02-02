@@ -15,6 +15,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import {
+  attemptAutoUpdate,
+  checkUpdateMarker,
+  clearUpdateMarker,
+  getUpdateNotice,
+  getVersionNoticeForHook,
+  isAutoUpdateEnabled,
+  type AutoUpdateResult,
+} from "../version.js";
 
 const ENABLED = process.env.CONTEXTSTREAM_SESSION_INIT_ENABLED !== "false";
 
@@ -159,14 +168,54 @@ async function fetchSessionContext(): Promise<ContextResponse | null> {
   }
 }
 
-function formatContext(ctx: ContextResponse | null): string {
-  if (!ctx) {
-    return `[ContextStream Session Start]
+interface FormatOptions {
+  autoUpdateResult?: AutoUpdateResult | null;
+  versionNotice?: { current: string; latest: string; behind: true; upgrade_command: string } | null;
+  updateMarker?: { previousVersion: string; newVersion: string } | null;
+}
 
-No stored context found. Call \`mcp__contextstream__context(user_message="starting new session")\` to initialize.`;
+function formatContext(ctx: ContextResponse | null, options: FormatOptions = {}): string {
+  const parts: string[] = ["⬡ ContextStream — Smart Context & Memory", ""];
+
+  // Show restart message if update was performed
+  if (options.updateMarker) {
+    parts.push(`\n## 🎉 UPDATE COMPLETE - RESTART CHAT SESSION`);
+    parts.push(`ContextStream was auto-updated from v${options.updateMarker.previousVersion} to v${options.updateMarker.newVersion}.`);
+    parts.push(`**Tell the user:** "ContextStream has been updated! Please start a new chat session (or restart your AI tool) to use the new version with the latest features and fixes."`);
+    parts.push("");
+  }
+  // Show auto-update result if update was just attempted
+  else if (options.autoUpdateResult?.attempted) {
+    if (options.autoUpdateResult.success) {
+      parts.push(`\n## 🔄 AUTO-UPDATE INITIATED`);
+      parts.push(`ContextStream is updating from v${options.autoUpdateResult.previousVersion} to v${options.autoUpdateResult.newVersion}.`);
+      parts.push(`**Tell the user:** "ContextStream is updating in the background. Please start a new chat session (or restart your AI tool) in a moment to use the new version."`);
+      parts.push("");
+    } else if (options.autoUpdateResult.error) {
+      // Update failed - show manual instructions
+      parts.push(`\n## ⚠️ AUTO-UPDATE FAILED`);
+      parts.push(`Automatic update failed: ${options.autoUpdateResult.error}`);
+      const versionInfo = getVersionNoticeForHook(options.versionNotice || null);
+      if (versionInfo) {
+        parts.push(versionInfo);
+      }
+      parts.push("");
+    }
+  }
+  // Show version notice if behind and auto-update is disabled
+  else if (options.versionNotice?.behind && !isAutoUpdateEnabled()) {
+    const versionInfo = getVersionNoticeForHook(options.versionNotice);
+    if (versionInfo) {
+      parts.push(`\n## 🔄 UPDATE AVAILABLE (auto-update disabled)`);
+      parts.push(versionInfo);
+      parts.push("");
+    }
   }
 
-  const parts: string[] = ["[ContextStream Session Start]"];
+  if (!ctx) {
+    parts.push("\nNo stored context found. Call `mcp__contextstream__context(user_message=\"starting new session\")` to initialize.");
+    return parts.join("\n");
+  }
 
   // Lessons (most important)
   if (ctx.lessons && ctx.lessons.length > 0) {
@@ -231,9 +280,24 @@ export async function runSessionInitHook(): Promise<void> {
   const cwd = input.cwd || process.cwd();
   loadConfigFromMcpJson(cwd);
 
-  // Fetch context from ContextStream
-  const context = await fetchSessionContext();
-  const formattedContext = formatContext(context);
+  // Check for pending update marker (update completed, needs restart)
+  const updateMarker = checkUpdateMarker();
+  if (updateMarker) {
+    clearUpdateMarker(); // Clear so we only show once
+  }
+
+  // Attempt auto-update if enabled and behind (runs in parallel with context fetch)
+  const [context, autoUpdateResult, versionNotice] = await Promise.all([
+    fetchSessionContext(),
+    updateMarker ? Promise.resolve(null) : attemptAutoUpdate(), // Skip if already updated
+    getUpdateNotice(),
+  ]);
+
+  const formattedContext = formatContext(context, {
+    autoUpdateResult,
+    versionNotice,
+    updateMarker,
+  });
 
   // Output Claude Code format
   console.log(

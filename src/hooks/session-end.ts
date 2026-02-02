@@ -1,7 +1,7 @@
 /**
  * ContextStream session-end Hook - Finalize session on stop
  *
- * Stop hook that finalizes the session, saving any pending state
+ * Stop hook that finalizes the session, saving the full transcript
  * and marking the session as complete in ContextStream.
  *
  * Usage:
@@ -17,10 +17,12 @@ import * as path from "node:path";
 import { homedir } from "node:os";
 
 const ENABLED = process.env.CONTEXTSTREAM_SESSION_END_ENABLED !== "false";
+const SAVE_TRANSCRIPT = process.env.CONTEXTSTREAM_SESSION_END_SAVE_TRANSCRIPT !== "false";
 
 let API_URL = process.env.CONTEXTSTREAM_API_URL || "https://api.contextstream.io";
 let API_KEY = process.env.CONTEXTSTREAM_API_KEY || "";
 let WORKSPACE_ID: string | null = null;
+let PROJECT_ID: string | null = null;
 
 interface HookInput {
   session_id?: string;
@@ -43,6 +45,15 @@ interface McpConfig {
 
 interface LocalConfig {
   workspace_id?: string;
+  project_id?: string;
+}
+
+interface TranscriptMessage {
+  role: string;
+  content: string;
+  timestamp: string;
+  tool_calls?: unknown;
+  tool_results?: unknown;
 }
 
 interface TranscriptStats {
@@ -50,6 +61,8 @@ interface TranscriptStats {
   toolCallCount: number;
   duration: number; // seconds
   filesModified: string[];
+  messages: TranscriptMessage[];
+  startedAt: string;
 }
 
 function loadConfigFromMcpJson(cwd: string): void {
@@ -75,14 +88,17 @@ function loadConfigFromMcpJson(cwd: string): void {
       }
     }
 
-    if (!WORKSPACE_ID) {
+    if (!WORKSPACE_ID || !PROJECT_ID) {
       const csConfigPath = path.join(searchDir, ".contextstream", "config.json");
       if (fs.existsSync(csConfigPath)) {
         try {
           const content = fs.readFileSync(csConfigPath, "utf-8");
           const csConfig = JSON.parse(content) as LocalConfig;
-          if (csConfig.workspace_id) {
+          if (csConfig.workspace_id && !WORKSPACE_ID) {
             WORKSPACE_ID = csConfig.workspace_id;
+          }
+          if (csConfig.project_id && !PROJECT_ID) {
+            PROJECT_ID = csConfig.project_id;
           }
         } catch {
           // Continue
@@ -122,6 +138,8 @@ function parseTranscriptStats(transcriptPath: string): TranscriptStats {
     toolCallCount: 0,
     duration: 0,
     filesModified: [],
+    messages: [],
+    startedAt: new Date().toISOString(),
   };
 
   if (!transcriptPath || !fs.existsSync(transcriptPath)) {
@@ -141,35 +159,80 @@ function parseTranscriptStats(transcriptPath: string): TranscriptStats {
       try {
         const entry = JSON.parse(line) as {
           type?: string;
+          role?: string;
           name?: string;
-          input?: { file_path?: string };
+          content?: string;
+          input?: { file_path?: string; notebook_path?: string };
           timestamp?: string;
         };
 
-        // Count messages and tool calls
-        if (entry.type === "user" || entry.type === "assistant") {
-          stats.messageCount++;
-        } else if (entry.type === "tool_use") {
-          stats.toolCallCount++;
-
-          // Track file modifications
-          if (["Write", "Edit", "NotebookEdit"].includes(entry.name || "")) {
-            const filePath = entry.input?.file_path;
-            if (filePath) {
-              modifiedFiles.add(filePath);
-            }
-          }
-        }
+        const msgType = entry.type || "";
+        const timestamp = entry.timestamp || new Date().toISOString();
 
         // Track timestamps
         if (entry.timestamp) {
           const ts = new Date(entry.timestamp);
           if (!firstTimestamp || ts < firstTimestamp) {
             firstTimestamp = ts;
+            stats.startedAt = entry.timestamp;
           }
           if (!lastTimestamp || ts > lastTimestamp) {
             lastTimestamp = ts;
           }
+        }
+
+        // Count and capture messages
+        if (msgType === "user" || entry.role === "user") {
+          stats.messageCount++;
+          const userContent = typeof entry.content === "string" ? entry.content : "";
+          if (userContent) {
+            stats.messages.push({
+              role: "user",
+              content: userContent,
+              timestamp,
+            });
+          }
+        } else if (msgType === "assistant" || entry.role === "assistant") {
+          stats.messageCount++;
+          const assistantContent = typeof entry.content === "string" ? entry.content : "";
+          if (assistantContent) {
+            stats.messages.push({
+              role: "assistant",
+              content: assistantContent,
+              timestamp,
+            });
+          }
+        } else if (msgType === "tool_use") {
+          stats.toolCallCount++;
+          const toolName = entry.name || "";
+          const toolInput = entry.input || {};
+
+          // Track file modifications
+          if (["Write", "Edit", "NotebookEdit"].includes(toolName)) {
+            const filePath = toolInput.file_path || toolInput.notebook_path;
+            if (filePath) {
+              modifiedFiles.add(filePath);
+            }
+          }
+
+          // Add tool call as message
+          stats.messages.push({
+            role: "assistant",
+            content: `[Tool: ${toolName}]`,
+            timestamp,
+            tool_calls: { name: toolName, input: toolInput },
+          });
+        } else if (msgType === "tool_result") {
+          // Add tool result as message (truncated for storage)
+          const resultContent = typeof entry.content === "string"
+            ? entry.content.slice(0, 2000)
+            : JSON.stringify(entry.content || {}).slice(0, 2000);
+          stats.messages.push({
+            role: "tool",
+            content: resultContent,
+            timestamp,
+            tool_results: { name: entry.name },
+          });
         }
       } catch {
         continue;
@@ -189,6 +252,66 @@ function parseTranscriptStats(transcriptPath: string): TranscriptStats {
   return stats;
 }
 
+async function saveFullTranscript(
+  sessionId: string,
+  stats: TranscriptStats,
+  reason: string
+): Promise<{ success: boolean; message: string }> {
+  if (!API_KEY) {
+    return { success: false, message: "No API key configured" };
+  }
+
+  if (stats.messages.length === 0) {
+    return { success: false, message: "No messages to save" };
+  }
+
+  const payload: Record<string, unknown> = {
+    session_id: sessionId,
+    messages: stats.messages,
+    started_at: stats.startedAt,
+    source_type: "session_end",
+    title: `Session transcript (${reason})`,
+    metadata: {
+      reason,
+      tool_call_count: stats.toolCallCount,
+      files_modified: stats.filesModified.slice(0, 20),
+      duration_seconds: stats.duration,
+    },
+    tags: ["session_end", reason],
+  };
+
+  if (WORKSPACE_ID) {
+    payload.workspace_id = WORKSPACE_ID;
+  }
+  if (PROJECT_ID) {
+    payload.project_id = PROJECT_ID;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s for larger payload
+
+    const response = await fetch(`${API_URL}/api/v1/transcripts`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": API_KEY,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      return { success: true, message: `Transcript saved (${stats.messages.length} messages)` };
+    }
+    return { success: false, message: `API error: ${response.status}` };
+  } catch (error) {
+    return { success: false, message: String(error) };
+  }
+}
+
 async function finalizeSession(
   sessionId: string,
   stats: TranscriptStats,
@@ -196,8 +319,14 @@ async function finalizeSession(
 ): Promise<void> {
   if (!API_KEY) return;
 
+  // Save full transcript first (if enabled)
+  if (SAVE_TRANSCRIPT && stats.messages.length > 0) {
+    await saveFullTranscript(sessionId, stats, reason);
+  }
+
+  // Then save the summary event
   const payload: Record<string, unknown> = {
-    event_type: "session_end",
+    event_type: "manual_note",
     title: `Session Ended: ${reason}`,
     content: JSON.stringify({
       session_id: sessionId,
@@ -214,7 +343,6 @@ async function finalizeSession(
     importance: "low",
     tags: ["session", "end", reason],
     source_type: "hook",
-    session_id: sessionId,
   };
 
   if (WORKSPACE_ID) {

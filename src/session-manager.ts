@@ -461,7 +461,7 @@ export class SessionManager {
     const parts: string[] = [];
 
     parts.push("═══════════════════════════════════════════");
-    parts.push("⬡ SMART CONTEXT (ContextStream)");
+    parts.push("⬡ ContextStream — Smart Context & Memory");
     parts.push("═══════════════════════════════════════════");
 
     // Status

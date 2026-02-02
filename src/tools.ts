@@ -7143,6 +7143,10 @@ This saves ~80% tokens compared to including full chat history.`,
           .string()
           .optional()
           .describe("Client name for transcript metadata (e.g., 'claude', 'cursor')"),
+        assistant_message: z
+          .string()
+          .optional()
+          .describe("Previous assistant response to save along with user message (for complete exchange capture)"),
       }),
     },
     async (input) => {
@@ -7273,6 +7277,7 @@ This saves ~80% tokens compared to including full chat history.`,
         save_exchange: input.save_exchange,
         session_id: sessionId,
         client_name: clientName,
+        assistant_message: input.assistant_message,
       });
 
       // Track response tokens in SessionManager for context pressure calculation

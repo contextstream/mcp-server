@@ -22,8 +22,10 @@ import {
   getUpdateNotice,
   getVersionNoticeForHook,
   isAutoUpdateEnabled,
+  VERSION,
   type AutoUpdateResult,
 } from "../version.js";
+import { generateRuleContent, getAvailableEditors, RULES_VERSION } from "../rules-templates.js";
 
 const ENABLED = process.env.CONTEXTSTREAM_SESSION_INIT_ENABLED !== "false";
 
@@ -255,6 +257,46 @@ function formatContext(ctx: ContextResponse | null, options: FormatOptions = {})
   return parts.join("\n");
 }
 
+const CONTEXTSTREAM_START_MARKER = "<!-- BEGIN ContextStream -->";
+const CONTEXTSTREAM_END_MARKER = "<!-- END ContextStream -->";
+
+/**
+ * Regenerate rule files in a directory after an auto-update.
+ * Only updates files that already have ContextStream blocks.
+ */
+function regenerateRuleFiles(folderPath: string): number {
+  let updated = 0;
+  const editors = getAvailableEditors();
+
+  for (const editor of editors) {
+    const rule = generateRuleContent(editor, { mode: "bootstrap" });
+    if (!rule) continue;
+
+    const filePath = path.join(folderPath, rule.filename);
+    if (!fs.existsSync(filePath)) continue;
+
+    try {
+      const existing = fs.readFileSync(filePath, "utf8");
+      // Only update files that have ContextStream markers
+      const startIdx = existing.indexOf(CONTEXTSTREAM_START_MARKER);
+      const endIdx = existing.indexOf(CONTEXTSTREAM_END_MARKER);
+      if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) continue;
+
+      // Replace the ContextStream block with new content
+      const before = existing.substring(0, startIdx).trimEnd();
+      const after = existing.substring(endIdx + CONTEXTSTREAM_END_MARKER.length).trimStart();
+      const newBlock = `${CONTEXTSTREAM_START_MARKER}\n${rule.content.trim()}\n${CONTEXTSTREAM_END_MARKER}`;
+      const merged = [before, newBlock, after].filter((p) => p.length > 0).join("\n\n");
+      fs.writeFileSync(filePath, merged.trim() + "\n", "utf8");
+      updated++;
+    } catch {
+      // Ignore individual file errors
+    }
+  }
+
+  return updated;
+}
+
 export async function runSessionInitHook(): Promise<void> {
   if (!ENABLED) {
     process.exit(0);
@@ -283,6 +325,8 @@ export async function runSessionInitHook(): Promise<void> {
   // Check for pending update marker (update completed, needs restart)
   const updateMarker = checkUpdateMarker();
   if (updateMarker) {
+    // Regenerate rule files with new version before clearing marker
+    regenerateRuleFiles(cwd);
     clearUpdateMarker(); // Clear so we only show once
   }
 

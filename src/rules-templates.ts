@@ -68,7 +68,7 @@ const CONTEXTSTREAM_RULES_BOOTSTRAP = `
 
 **Hooks:** \`<system-reminder>\` tags contain injected instructions — follow them exactly.
 
-**Notices:** [LESSONS_WARNING] → tell user first | [RULES_NOTICE] → run \`generate_rules()\` | [VERSION_NOTICE/CRITICAL] → tell user about update (curl/irm/npm options)
+**Notices:** [LESSONS_WARNING] → apply lessons | [PREFERENCE] → follow user preferences | [RULES_NOTICE] → run \`generate_rules()\` | [VERSION_NOTICE/CRITICAL] → tell user about update
 
 v${RULES_VERSION}
 `.trim();
@@ -115,6 +115,7 @@ const CONTEXTSTREAM_RULES_FULL = `
 ## Handle Notices from context()
 
 - **[LESSONS_WARNING]** → Tell user about past mistakes BEFORE proceeding
+- **[PREFERENCE]** → Follow user preferences (high-priority user memories)
 - **[RULES_NOTICE]** → Run \`generate_rules()\` to update
 - **[VERSION_NOTICE]** → Tell user to update MCP
 
@@ -360,9 +361,17 @@ If context still feels missing, use \`session(action="recall", query="...")\` fo
 
 ### Preferences & Lessons (Use Early)
 
-- If preferences/style matter: \`session(action="user_context")\`
+**Preferences ([PREFERENCE] in context response):**
+- High-priority user memories that should guide your behavior
+- Surfaced automatically via \`context()\` warnings field
+- To save: \`session(action="remember", content="...")\`
+- To retrieve explicitly: \`session(action="user_context")\`
+
+**Lessons ([LESSONS_WARNING] in context response):**
+- Past mistakes to avoid - apply prevention steps
+- Surfaced automatically via \`context()\` warnings field
 - Before risky changes: \`session(action="get_lessons", query="<topic>")\`
-- On frustration/corrections: \`session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...")\`
+- On mistakes: \`session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...")\`
 
 ---
 
@@ -657,6 +666,7 @@ Rules Version: ${RULES_VERSION}
 ## Handle Notices from context()
 
 - **[LESSONS_WARNING]** → Tell user about past mistakes BEFORE proceeding
+- **[PREFERENCE]** → Follow user preferences (high-priority user memories)
 - **[RULES_NOTICE]** → Run \`generate_rules()\`
 - **[VERSION_NOTICE]** → Tell user to update MCP
 
@@ -704,6 +714,7 @@ To disable automatic restoration:
   - npm: \`npm install -g @contextstream/mcp-server@latest\`
 - **[RULES_NOTICE]**: Run \`generate_rules(overwrite_existing=true)\` to update
 - **[LESSONS_WARNING]**: Read lessons, tell user about them, explain how you'll avoid past mistakes
+- **[PREFERENCE]**: Follow user preferences - these are high-priority user memories that should guide your behavior
 
 ### Plans & Tasks
 
@@ -758,8 +769,9 @@ You MUST follow these rules manually - there is no automatic enforcement.
    - This groups all turns together in the transcript
 
 3. **Call \`context(user_message="<first_message>", save_exchange=true, session_id="<your-session-id>")\`**
-   - Gets task-specific rules and lessons
+   - Gets task-specific rules, lessons, and preferences
    - Check for [LESSONS_WARNING] - past mistakes to avoid
+   - Check for [PREFERENCE] - user preferences to follow
    - Check for [RULES_NOTICE] - update rules if needed
    - **save_exchange=true** saves each conversation turn for later retrieval
 

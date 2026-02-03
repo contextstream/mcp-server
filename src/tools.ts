@@ -3060,7 +3060,7 @@ export function registerTools(
   function startBackgroundIngest(
     projectId: string,
     resolvedPath: string,
-    ingestOptions: { write_to_disk?: boolean; overwrite?: boolean },
+    ingestOptions: { write_to_disk?: boolean; overwrite?: boolean; force?: boolean },
     options: { preflight?: boolean } = {}
   ): void {
     (async () => {
@@ -11185,7 +11185,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "project",
       {
         title: "Project",
-        description: `Project management. Actions: list, get, create, update, index (trigger indexing), overview, statistics, files, index_status, ingest_local (index local folder), team_projects (list all team projects - team plans only).`,
+        description: `Project management. Actions: list, get, create, update, index (trigger indexing), overview, statistics, files, index_status, index_history (audit trail of indexed files), ingest_local (index local folder), team_projects (list all team projects - team plans only).`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -11198,6 +11198,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "statistics",
               "files",
               "index_status",
+              "index_history",
               "ingest_local",
               "team_projects",
             ])
@@ -11213,6 +11214,15 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           path: z.string().optional().describe("Local path to ingest"),
           overwrite: z.boolean().optional(),
           write_to_disk: z.boolean().optional(),
+          force: z.boolean().optional().describe("Force re-index all files, bypassing version check logic"),
+          // Index history filters
+          machine_id: z.string().optional().describe("Filter by machine ID that indexed the files"),
+          branch: z.string().optional().describe("Filter by git branch"),
+          since: z.string().optional().describe("Filter files indexed after this timestamp (ISO 8601)"),
+          until: z.string().optional().describe("Filter files indexed before this timestamp (ISO 8601)"),
+          path_pattern: z.string().optional().describe("Filter by file path pattern (partial match)"),
+          sort_by: z.enum(["path", "indexed", "size"]).optional().describe("Sort field (default: indexed)"),
+          sort_order: z.enum(["asc", "desc"]).optional().describe("Sort order (default: desc)"),
           // Pagination
           page: z.number().optional(),
           page_size: z.number().optional(),
@@ -11326,7 +11336,28 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.projectIndexStatus(projectId);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
+
+            };
+          }
+
+          case "index_history": {
+            if (!projectId) {
+              return errorResult("index_history requires: project_id");
+            }
+            const result = await client.projectIndexHistory(projectId, {
+              machine_id: input.machine_id,
+              branch: input.branch,
+              since: input.since,
+              until: input.until,
+              path_pattern: input.path_pattern,
+              sort_by: input.sort_by,
+              sort_order: input.sort_order,
+              page: input.page,
+              limit: input.page_size,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(result) }],
+
             };
           }
 
@@ -11344,22 +11375,25 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const ingestOptions = {
               ...(input.write_to_disk !== undefined && { write_to_disk: input.write_to_disk }),
               ...(input.overwrite !== undefined && { overwrite: input.overwrite }),
+              ...(input.force !== undefined && { force: input.force }),
             };
             startBackgroundIngest(projectId, validPath.resolvedPath, ingestOptions);
+            const forceNote = input.force ? " (force mode - version checks bypassed)" : "";
             const result = {
               status: "started",
-              message: "Ingestion running in background",
+              message: `Ingestion running in background${forceNote}`,
               project_id: projectId,
               path: validPath.resolvedPath,
               ...(input.write_to_disk !== undefined && { write_to_disk: input.write_to_disk }),
               ...(input.overwrite !== undefined && { overwrite: input.overwrite }),
+              ...(input.force !== undefined && { force: input.force }),
               note: "Use 'project' with action 'index_status' to monitor progress.",
             };
             return {
               content: [
                 {
                   type: "text" as const,
-                  text: `Ingestion started in background for directory: ${validPath.resolvedPath}. Use 'project' with action 'index_status' to monitor progress.`,
+                  text: `Ingestion started in background${forceNote} for directory: ${validPath.resolvedPath}. Use 'project' with action 'index_status' to monitor progress.`,
                 },
               ],
 
@@ -11404,9 +11438,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "workspace",
       {
         title: "Workspace",
-        description: `Workspace management. Actions: list, get, associate (link folder to workspace), bootstrap (create workspace and initialize), team_members (list members with access - team plans only).`,
+        description: `Workspace management. Actions: list, get, associate (link folder to workspace), bootstrap (create workspace and initialize), team_members (list members with access - team plans only), index_settings (get/update multi-machine sync settings - admin only).`,
         inputSchema: z.object({
-          action: z.enum(["list", "get", "associate", "bootstrap", "team_members"]).describe("Action to perform"),
+          action: z.enum(["list", "get", "associate", "bootstrap", "team_members", "index_settings"]).describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
           // Associate/bootstrap params
           folder_path: z.string().optional(),
@@ -11418,6 +11452,17 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           visibility: z.enum(["private", "public"]).optional(),
           auto_index: z.boolean().optional(),
           context_hint: z.string().optional(),
+          // Index settings params (for update)
+          branch_policy: z.enum(["default_branch_wins", "newest_wins", "feature_branch_wins"]).optional()
+            .describe("Which branch takes priority: default_branch_wins (default), newest_wins, feature_branch_wins"),
+          conflict_resolution: z.enum(["newest_timestamp", "default_branch", "manual"]).optional()
+            .describe("How to resolve conflicts: newest_timestamp (default), default_branch, manual"),
+          allowed_machines: z.array(z.string()).optional()
+            .describe("List of allowed machine IDs (empty = all allowed)"),
+          auto_sync_enabled: z.boolean().optional()
+            .describe("Whether to auto-sync from all machines (default: true)"),
+          max_machines: z.number().optional()
+            .describe("Maximum machines allowed to index (0 = unlimited)"),
           // Pagination
           page: z.number().optional(),
           page_size: z.number().optional(),
@@ -11538,6 +11583,40 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             return {
               content: [{ type: "text" as const, text: formatContent(teamMembers) }],
             };
+          }
+
+          case "index_settings": {
+            if (!input.workspace_id) {
+              return errorResult("index_settings requires: workspace_id");
+            }
+
+            // Check if any update params are provided
+            const hasUpdateParams =
+              input.branch_policy !== undefined ||
+              input.conflict_resolution !== undefined ||
+              input.allowed_machines !== undefined ||
+              input.auto_sync_enabled !== undefined ||
+              input.max_machines !== undefined;
+
+            if (hasUpdateParams) {
+              // Update index settings
+              const result = await client.updateWorkspaceIndexSettings(input.workspace_id, {
+                branch_policy: input.branch_policy,
+                conflict_resolution: input.conflict_resolution,
+                allowed_machines: input.allowed_machines,
+                auto_sync_enabled: input.auto_sync_enabled,
+                max_machines: input.max_machines,
+              });
+              return {
+                content: [{ type: "text" as const, text: formatContent(result) }],
+              };
+            } else {
+              // Get index settings
+              const result = await client.getWorkspaceIndexSettings(input.workspace_id);
+              return {
+                content: [{ type: "text" as const, text: formatContent(result) }],
+              };
+            }
           }
 
           default:

@@ -1238,6 +1238,41 @@ export class ContextStreamClient {
   }
 
   /**
+   * Get index history for audit trail
+   * Shows which files were indexed, when, by which machine, and from which branch
+   */
+  projectIndexHistory(
+    projectId: string,
+    params?: {
+      machine_id?: string;
+      branch?: string;
+      since?: string;
+      until?: string;
+      path_pattern?: string;
+      sort_by?: "path" | "indexed" | "size";
+      sort_order?: "asc" | "desc";
+      page?: number;
+      limit?: number;
+    }
+  ) {
+    uuidSchema.parse(projectId);
+    const queryParams = new URLSearchParams();
+    if (params?.machine_id) queryParams.set("machine_id", params.machine_id);
+    if (params?.branch) queryParams.set("branch", params.branch);
+    if (params?.since) queryParams.set("since", params.since);
+    if (params?.until) queryParams.set("until", params.until);
+    if (params?.path_pattern) queryParams.set("path_pattern", params.path_pattern);
+    if (params?.sort_by) queryParams.set("sort_by", params.sort_by);
+    if (params?.sort_order) queryParams.set("sort_order", params.sort_order);
+    if (params?.page) queryParams.set("page", params.page.toString());
+    if (params?.limit) queryParams.set("limit", params.limit.toString());
+
+    const queryString = queryParams.toString();
+    const url = `/projects/${projectId}/index/history${queryString ? `?${queryString}` : ""}`;
+    return request(this.config, url, { method: "GET" });
+  }
+
+  /**
    * Check if project ingestion is recommended and return a recommendation.
    * This is used by session_init to inform the AI about the project's index status.
    *
@@ -1356,15 +1391,27 @@ export class ContextStreamClient {
    * Ingest files for indexing
    * This uploads files to the API for indexing
    * @param projectId - Project UUID
-   * @param files - Array of files to ingest
+   * @param files - Array of files to ingest (with optional version metadata)
    * @param options - Optional ingest options
    * @param options.write_to_disk - When true, write files to disk under QA_FILE_WRITE_ROOT before indexing
    * @param options.overwrite - Allow overwriting existing files when write_to_disk is enabled
+   * @param options.force - When true, bypass version checking and force re-index all files
    */
   ingestFiles(
     projectId: string,
-    files: Array<{ path: string; content: string; language?: string }>,
-    options?: { write_to_disk?: boolean; overwrite?: boolean }
+    files: Array<{
+      path: string;
+      content: string;
+      language?: string;
+      git_commit_sha?: string;
+      git_commit_timestamp?: string;
+      source_modified_at?: string;
+      machine_id?: string;
+      git_branch?: string;
+      git_default_branch?: string;
+      is_default_branch?: boolean;
+    }>,
+    options?: { write_to_disk?: boolean; overwrite?: boolean; force?: boolean }
   ) {
     uuidSchema.parse(projectId);
     return request(this.config, `/projects/${projectId}/files/ingest`, {
@@ -1372,6 +1419,7 @@ export class ContextStreamClient {
         files,
         ...(options?.write_to_disk !== undefined && { write_to_disk: options.write_to_disk }),
         ...(options?.overwrite !== undefined && { overwrite: options.overwrite }),
+        ...(options?.force !== undefined && { force: options.force }),
       },
     });
   }
@@ -1505,6 +1553,34 @@ export class ContextStreamClient {
   workspaceContent(workspaceId: string) {
     uuidSchema.parse(workspaceId);
     return request(this.config, `/workspaces/${workspaceId}/content`, { method: "GET" });
+  }
+
+  /**
+   * Get workspace index settings for multi-machine sync configuration
+   */
+  getWorkspaceIndexSettings(workspaceId: string) {
+    uuidSchema.parse(workspaceId);
+    return request(this.config, `/workspaces/${workspaceId}/index-settings`, { method: "GET" });
+  }
+
+  /**
+   * Update workspace index settings (admin only)
+   */
+  updateWorkspaceIndexSettings(
+    workspaceId: string,
+    settings: {
+      branch_policy?: "default_branch_wins" | "newest_wins" | "feature_branch_wins";
+      conflict_resolution?: "newest_timestamp" | "default_branch" | "manual";
+      allowed_machines?: string[];
+      auto_sync_enabled?: boolean;
+      max_machines?: number;
+    }
+  ) {
+    uuidSchema.parse(workspaceId);
+    return request(this.config, `/workspaces/${workspaceId}/index-settings`, {
+      method: "PUT",
+      body: settings,
+    });
   }
 
   // Memory extended operations

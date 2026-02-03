@@ -4,12 +4,36 @@
 
 import * as fs from "fs";
 import * as path from "path";
+import { exec } from "child_process";
+import { promisify } from "util";
+import * as os from "os";
+import * as crypto from "crypto";
 import { loadIgnorePatterns, IgnoreInstance } from "./ignore.js";
+
+const execAsync = promisify(exec);
 
 export interface FileToIngest {
   path: string;
   content: string;
   language?: string;
+
+  // === Version metadata (for multi-machine sync) ===
+  /** Git commit SHA where this file was last modified */
+  git_commit_sha?: string;
+  /** Timestamp of the git commit (ISO 8601) */
+  git_commit_timestamp?: string;
+  /** File modification time from the source machine (ISO 8601) */
+  source_modified_at?: string;
+  /** Stable identifier for the machine doing the indexing */
+  machine_id?: string;
+
+  // === Branch metadata ===
+  /** Current git branch name (e.g., "feature-auth") */
+  git_branch?: string;
+  /** Repository's default branch (e.g., "main") */
+  git_default_branch?: string;
+  /** True if indexing from the default branch */
+  is_default_branch?: boolean;
 }
 
 // File extensions to include for indexing
@@ -134,6 +158,194 @@ const LARGE_FILE_THRESHOLD = 2 * 1024 * 1024;
 // Soft limit on files per batch (backup limit if size-based batching allows too many)
 const MAX_FILES_PER_BATCH = 200;
 
+// ============================================================================
+// Git Info Extraction (for multi-machine sync)
+// ============================================================================
+
+/**
+ * Cached git repository info to avoid repeated git commands
+ */
+interface GitRepoContext {
+  isGitRepo: boolean;
+  branch?: string;
+  defaultBranch?: string;
+  isDefaultBranch?: boolean;
+  machineId: string;
+}
+
+// Cache for git repo context per root path
+const gitContextCache = new Map<string, GitRepoContext>();
+
+/**
+ * Generate a stable machine identifier from hostname
+ * Uses first 12 chars of SHA256 hash for privacy
+ */
+function getMachineId(): string {
+  const hostname = os.hostname();
+  const hash = crypto.createHash("sha256").update(hostname).digest("hex");
+  return hash.substring(0, 12);
+}
+
+/**
+ * Check if a directory is inside a git repository
+ */
+async function isGitRepo(rootPath: string): Promise<boolean> {
+  try {
+    await execAsync("git rev-parse --is-inside-work-tree", {
+      cwd: rootPath,
+      timeout: 5000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Get the current git branch name
+ */
+async function getGitBranch(rootPath: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execAsync("git branch --show-current", {
+      cwd: rootPath,
+      timeout: 5000,
+    });
+    const branch = stdout.trim();
+    return branch || undefined; // Empty string = detached HEAD
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Get the default branch name (main, master, etc.)
+ * Tries multiple methods for compatibility
+ */
+async function getGitDefaultBranch(
+  rootPath: string
+): Promise<string | undefined> {
+  // Method 1: Check remote HEAD (most reliable when remote is available)
+  try {
+    const { stdout } = await execAsync(
+      "git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null",
+      { cwd: rootPath, timeout: 5000 }
+    );
+    const match = stdout.trim().match(/refs\/remotes\/origin\/(.+)/);
+    if (match) return match[1];
+  } catch {
+    // Fall through to next method
+  }
+
+  // Method 2: Check git config for init.defaultBranch
+  try {
+    const { stdout } = await execAsync(
+      "git config --get init.defaultBranch 2>/dev/null",
+      { cwd: rootPath, timeout: 5000 }
+    );
+    const branch = stdout.trim();
+    if (branch) return branch;
+  } catch {
+    // Fall through to next method
+  }
+
+  // Method 3: Check if main or master exists
+  try {
+    const { stdout } = await execAsync("git branch --list main master", {
+      cwd: rootPath,
+      timeout: 5000,
+    });
+    const branches = stdout
+      .trim()
+      .split("\n")
+      .map((b) => b.replace(/^\*?\s*/, "").trim())
+      .filter(Boolean);
+    if (branches.includes("main")) return "main";
+    if (branches.includes("master")) return "master";
+  } catch {
+    // Fall through
+  }
+
+  return undefined;
+}
+
+/**
+ * Get git commit info for a specific file
+ * Returns the commit SHA and timestamp where the file was last modified
+ */
+async function getFileGitInfo(
+  rootPath: string,
+  relativePath: string
+): Promise<{ sha: string; timestamp: string } | undefined> {
+  try {
+    // Get commit SHA and Unix timestamp in one command
+    const { stdout } = await execAsync(
+      `git log -1 --format="%H %ct" -- "${relativePath}"`,
+      { cwd: rootPath, timeout: 5000 }
+    );
+    const parts = stdout.trim().split(" ");
+    if (parts.length >= 2) {
+      const sha = parts[0];
+      const unixTimestamp = parseInt(parts[1], 10);
+      if (sha && !isNaN(unixTimestamp)) {
+        // Convert Unix timestamp to ISO 8601
+        const timestamp = new Date(unixTimestamp * 1000).toISOString();
+        return { sha, timestamp };
+      }
+    }
+  } catch {
+    // File might not be tracked by git
+  }
+  return undefined;
+}
+
+/**
+ * Get or create cached git context for a repository
+ * This avoids repeating git commands for each file
+ */
+async function getGitContext(rootPath: string): Promise<GitRepoContext> {
+  // Check cache first
+  const cached = gitContextCache.get(rootPath);
+  if (cached) return cached;
+
+  // Build context
+  const machineId = getMachineId();
+  const isRepo = await isGitRepo(rootPath);
+
+  if (!isRepo) {
+    const context: GitRepoContext = { isGitRepo: false, machineId };
+    gitContextCache.set(rootPath, context);
+    return context;
+  }
+
+  // Get branch info in parallel
+  const [branch, defaultBranch] = await Promise.all([
+    getGitBranch(rootPath),
+    getGitDefaultBranch(rootPath),
+  ]);
+
+  const context: GitRepoContext = {
+    isGitRepo: true,
+    branch,
+    defaultBranch,
+    isDefaultBranch: branch !== undefined && branch === defaultBranch,
+    machineId,
+  };
+
+  gitContextCache.set(rootPath, context);
+  return context;
+}
+
+/**
+ * Clear the git context cache (useful for testing or when switching projects)
+ */
+export function clearGitContextCache(): void {
+  gitContextCache.clear();
+}
+
+// ============================================================================
+// File Reading Functions
+// ============================================================================
+
 /**
  * Read all indexable files from a directory
  */
@@ -151,6 +363,9 @@ export async function readFilesFromDirectory(
 
   // Load ignore patterns (uses .contextstream/ignore + defaults)
   const ig = options.ignoreInstance ?? (await loadIgnorePatterns(rootPath));
+
+  // Get git context once (cached) - repo-level info shared across all files
+  const gitCtx = await getGitContext(rootPath);
 
   async function walkDir(dir: string, relativePath: string = ""): Promise<void> {
     if (files.length >= maxFiles) return;
@@ -190,10 +405,31 @@ export async function readFilesFromDirectory(
 
           // Read file content
           const content = await fs.promises.readFile(fullPath, "utf-8");
-          files.push({
+
+          // Build file with version metadata
+          const file: FileToIngest = {
             path: relPath,
             content,
-          });
+            // Always include machine_id and source_modified_at
+            machine_id: gitCtx.machineId,
+            source_modified_at: stat.mtime.toISOString(),
+          };
+
+          // Add git info if available
+          if (gitCtx.isGitRepo) {
+            file.git_branch = gitCtx.branch;
+            file.git_default_branch = gitCtx.defaultBranch;
+            file.is_default_branch = gitCtx.isDefaultBranch;
+
+            // Get file-specific commit info (silently fails if not tracked)
+            const gitInfo = await getFileGitInfo(rootPath, relPath);
+            if (gitInfo) {
+              file.git_commit_sha = gitInfo.sha;
+              file.git_commit_timestamp = gitInfo.timestamp;
+            }
+          }
+
+          files.push(file);
         } catch {
           // Skip files we can't read
         }
@@ -236,6 +472,9 @@ export async function* readAllFilesInBatches(
   // Load ignore patterns (uses .contextstream/ignore + defaults)
   const ig = options.ignoreInstance ?? (await loadIgnorePatterns(rootPath));
 
+  // Get git context once (cached) - repo-level info shared across all files
+  const gitCtx = await getGitContext(rootPath);
+
   let batch: FileWithSize[] = [];
   let currentBatchBytes = 0;
 
@@ -271,7 +510,32 @@ export async function* readAllFilesInBatches(
           if (stat.size > maxFileSize) continue;
 
           const content = await fs.promises.readFile(fullPath, "utf-8");
-          yield { path: relPath, content, sizeBytes: stat.size };
+
+          // Build file with version metadata
+          const file: FileWithSize = {
+            path: relPath,
+            content,
+            sizeBytes: stat.size,
+            // Always include machine_id and source_modified_at
+            machine_id: gitCtx.machineId,
+            source_modified_at: stat.mtime.toISOString(),
+          };
+
+          // Add git info if available
+          if (gitCtx.isGitRepo) {
+            file.git_branch = gitCtx.branch;
+            file.git_default_branch = gitCtx.defaultBranch;
+            file.is_default_branch = gitCtx.isDefaultBranch;
+
+            // Get file-specific commit info (silently fails if not tracked)
+            const gitInfo = await getFileGitInfo(rootPath, relPath);
+            if (gitInfo) {
+              file.git_commit_sha = gitInfo.sha;
+              file.git_commit_timestamp = gitInfo.timestamp;
+            }
+          }
+
+          yield file;
         } catch {
           // Skip unreadable files
         }
@@ -289,7 +553,8 @@ export async function* readAllFilesInBatches(
         currentBatchBytes = 0;
       }
       // Yield large file as its own batch
-      yield [{ path: file.path, content: file.content }];
+      const { sizeBytes, ...fileData } = file;
+      yield [fileData];
       continue;
     }
 
@@ -342,6 +607,9 @@ export async function* readChangedFilesInBatches(
   // Load ignore patterns (uses .contextstream/ignore + defaults)
   const ig = options.ignoreInstance ?? (await loadIgnorePatterns(rootPath));
 
+  // Get git context once (cached) - repo-level info shared across all files
+  const gitCtx = await getGitContext(rootPath);
+
   let batch: FileWithSize[] = [];
   let currentBatchBytes = 0;
   let filesScanned = 0;
@@ -385,7 +653,32 @@ export async function* readChangedFilesInBatches(
 
           const content = await fs.promises.readFile(fullPath, "utf-8");
           filesChanged++;
-          yield { path: relPath, content, sizeBytes: stat.size };
+
+          // Build file with version metadata
+          const file: FileWithSize = {
+            path: relPath,
+            content,
+            sizeBytes: stat.size,
+            // Always include machine_id and source_modified_at
+            machine_id: gitCtx.machineId,
+            source_modified_at: stat.mtime.toISOString(),
+          };
+
+          // Add git info if available
+          if (gitCtx.isGitRepo) {
+            file.git_branch = gitCtx.branch;
+            file.git_default_branch = gitCtx.defaultBranch;
+            file.is_default_branch = gitCtx.isDefaultBranch;
+
+            // Get file-specific commit info (silently fails if not tracked)
+            const gitInfo = await getFileGitInfo(rootPath, relPath);
+            if (gitInfo) {
+              file.git_commit_sha = gitInfo.sha;
+              file.git_commit_timestamp = gitInfo.timestamp;
+            }
+          }
+
+          yield file;
         } catch {
           // Skip unreadable files
         }
@@ -403,7 +696,8 @@ export async function* readChangedFilesInBatches(
         currentBatchBytes = 0;
       }
       // Yield large file as its own batch
-      yield [{ path: file.path, content: file.content }];
+      const { sizeBytes, ...fileData } = file;
+      yield [fileData];
       continue;
     }
 

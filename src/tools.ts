@@ -13,7 +13,7 @@ import {
   generateAllRuleFiles,
   RULES_VERSION,
 } from "./rules-templates.js";
-import { VERSION, getUpdateNotice } from "./version.js";
+import { VERSION, getUpdateNotice, invalidateCacheIfBehind } from "./version.js";
 import { generateToolCatalog, getCoreToolsHint, type CatalogFormat } from "./tool-catalog.js";
 import { getAuthOverride, runWithAuthOverride, type AuthOverride } from "./auth-context.js";
 import {
@@ -392,7 +392,8 @@ type RulesNotice = {
 };
 
 const RULES_NOTICE_CACHE_TTL_MS = 10 * 60 * 1000;
-const RULES_VERSION_REGEX = /Rules Version:\s*([0-9][0-9A-Za-z.\-]*)/i;
+// Matches both "Rules Version: 0.4.57" and standalone "v0.4.57" formats
+const RULES_VERSION_REGEX = /(?:Rules Version:\s*|^v)([0-9][0-9A-Za-z.\-]*)/im;
 const CONTEXTSTREAM_START_MARKER = "<!-- BEGIN ContextStream -->";
 const CONTEXTSTREAM_END_MARKER = "<!-- END ContextStream -->";
 
@@ -5129,6 +5130,12 @@ This does semantic search on the first message. You only need context on subsequ
         if (rulesNotice) {
           (result as any).rules_notice = rulesNotice;
         }
+      }
+
+      // If rules version is newer than cached npm version, invalidate cache
+      // This ensures we get fresh version info when a new release is detected
+      if (RULES_VERSION && RULES_VERSION !== "0.0.0") {
+        invalidateCacheIfBehind(RULES_VERSION);
       }
 
       let versionNotice: Awaited<ReturnType<typeof getUpdateNotice>> | null = null;

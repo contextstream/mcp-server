@@ -71,7 +71,7 @@ export interface VersionNotice {
   upgrade_command: string;
 }
 
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 let latestVersionPromise: Promise<string | null> | null = null;
 
 function getCacheFilePath(): string {
@@ -108,6 +108,30 @@ function writeCache(latestVersion: string): void {
   } catch {
     // ignore cache write errors
   }
+}
+
+/**
+ * Invalidate the version cache if a known newer version exists.
+ * Called when rules_notice indicates a newer version than the cache.
+ * This ensures we don't serve stale "you're up to date" info.
+ */
+export function invalidateCacheIfBehind(knownNewerVersion: string): boolean {
+  const cached = readCache();
+  if (!cached) return false;
+
+  // If the known version is newer than cached, invalidate
+  if (compareVersions(knownNewerVersion, cached.latestVersion) > 0) {
+    try {
+      const cacheFile = getCacheFilePath();
+      if (existsSync(cacheFile)) {
+        require("fs").unlinkSync(cacheFile);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 async function fetchLatestVersion(): Promise<string | null> {

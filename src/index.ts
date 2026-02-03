@@ -260,7 +260,7 @@ async function main() {
       }
       default:
         console.error(`Unknown hook: ${hookName}`);
-        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-compact, post-write, auto-rules, on-bash, on-task, on-read, on-web, session-init, session-end, on-save-intent");
+        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-write, auto-rules, on-bash, on-task, on-read, on-web, session-init, session-end, on-save-intent");
         process.exit(1);
     }
   }

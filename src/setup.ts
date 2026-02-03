@@ -643,6 +643,9 @@ function claudeDesktopConfigPath(): string | null {
     const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
     return path.join(appData, "Claude", "claude_desktop_config.json");
   }
+  if (process.platform === "linux") {
+    return path.join(home, ".config", "Claude", "claude_desktop_config.json");
+  }
   return null;
 }
 

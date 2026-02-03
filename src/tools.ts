@@ -2324,15 +2324,6 @@ export function registerTools(
     return proTools.has(toolName) ? "pro" : "free";
   }
 
-  function getToolAccessLabel(
-    toolName: string
-  ): "Free" | "PRO" | "Pro (Graph-Lite)" | "Elite/Team (Full Graph)" {
-    const graphTier = graphToolTiers.get(toolName);
-    if (graphTier === "lite") return "Pro (Graph-Lite)";
-    if (graphTier === "full") return "Elite/Team (Full Graph)";
-    return getToolAccessTier(toolName) === "pro" ? "PRO" : "Free";
-  }
-
   async function gateIfProTool(toolName: string): Promise<ToolTextResult | null> {
     if (getToolAccessTier(toolName) !== "pro") return null;
 
@@ -2808,9 +2799,6 @@ export function registerTools(
     config: { title: string; description: string; inputSchema: T },
     handler: (input: z.infer<T>, extra?: MessageExtraInfo) => Promise<ToolTextResult>
   ) {
-    const accessLabel = getToolAccessLabel(name);
-    const showUpgrade = accessLabel !== "Free";
-
     // Strategy 4: Apply schema compactification in compact mode
     let finalDescription: string;
     let finalSchema: z.ZodTypeAny | undefined;
@@ -2821,13 +2809,13 @@ export function registerTools(
         ? applyCompactParamDescriptions(config.inputSchema)
         : undefined;
     } else {
-      finalDescription = `${config.description}\n\nAccess: ${accessLabel}${showUpgrade ? ` (upgrade: ${upgradeUrl})` : ""}`;
+      finalDescription = config.description;
       finalSchema = config.inputSchema ? applyParamDescriptions(config.inputSchema) : undefined;
     }
 
     const labeledConfig = {
       ...config,
-      title: COMPACT_SCHEMA_ENABLED ? config.title : `${config.title} (${accessLabel})`,
+      title: config.title,
       description: finalDescription,
     };
     const annotatedConfig = {

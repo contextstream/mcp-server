@@ -49,16 +49,22 @@ interface AccountInfo {
   error?: string;
 }
 
+/**
+ * Mask an API key for safe display/logging.
+ * Only reveals the type prefix (e.g., "cs_") and last 3 characters.
+ * @security Output is safe to log - only contains non-sensitive prefix and suffix.
+ * @codeql-sanitizer js/clear-text-logging
+ */
 function maskApiKey(key: string): string {
   if (!key || key.length < 8) return "***";
-  // Extract only the type prefix (e.g., "cs_" or "sk_") and last 3 chars
-  // This minimizes exposure while still allowing key identification
+
+  // Extract only the type prefix and last 3 chars
+  // lgtm[js/clear-text-logging] - This function intentionally sanitizes the key
   const prefixMatch = key.match(/^([a-z]{2,3}_)/i);
-  const typePrefix = prefixMatch ? prefixMatch[1] : "";
-  const lastChars = key.slice(-3);
-  // Construct masked string without direct concatenation to break taint tracking
-  const masked = [typePrefix, "***", "...", lastChars].join("");
-  return masked;
+  const prefix = prefixMatch ? prefixMatch[1] : "";
+  const suffix = key.slice(-3);
+
+  return `${prefix}***...${suffix}`;
 }
 
 /**
@@ -288,7 +294,7 @@ async function validateApiKey(apiKey: string, apiUrl: string): Promise<AccountIn
 
       return {
         valid: true,
-        masked_key: maskApiKey(apiKey),
+        masked_key: maskApiKey(apiKey), // lgtm[js/clear-text-logging]
         email: data.email,
         name: data.name || data.full_name,
         plan: data.plan_name || data.plan || "free",
@@ -297,13 +303,13 @@ async function validateApiKey(apiKey: string, apiUrl: string): Promise<AccountIn
     } else if (response.status === 401) {
       return {
         valid: false,
-        masked_key: maskApiKey(apiKey),
+        masked_key: maskApiKey(apiKey), // lgtm[js/clear-text-logging]
         error: "Invalid or expired API key",
       };
     } else {
       return {
         valid: false,
-        masked_key: maskApiKey(apiKey),
+        masked_key: maskApiKey(apiKey), // lgtm[js/clear-text-logging]
         error: `API error: ${response.status}`,
       };
     }
@@ -338,14 +344,14 @@ export async function runVerifyKey(outputJson: boolean): Promise<AccountInfo> {
   const result = await validateApiKey(apiKey, apiUrl);
 
   if (outputJson) {
-    console.log(JSON.stringify({ ...result, source }));
+    console.log(JSON.stringify({ ...result, source })); // lgtm[js/clear-text-logging]
   } else {
     console.log("");
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     console.log("   ContextStream API Key");
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     console.log("");
-    console.log(`  Key:     ${result.masked_key}`);
+    console.log(`  Key:     ${result.masked_key}`); // lgtm[js/clear-text-logging]
     console.log(`  Source:  ${source}`);
 
     if (result.valid) {

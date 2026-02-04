@@ -775,9 +775,18 @@ export async function runUserPromptSubmitHook(): Promise<void> {
 
   // Output format depends on editor
   if (editorFormat === "claude") {
-    // Claude Code format - fetch preferences and include them with rules
-    // Other hooks (SessionStart, PostToolUse) handle lessons/plans/tasks
-    const [ctx, versionNotice] = await Promise.all([fetchSessionContext(), versionNoticePromise, saveExchangePromise]);
+    // Claude Code format - FAST PATH with optional enrichment
+    // SessionStart hook provides full context, but we still want:
+    // 1. High-importance preferences (should surface every message)
+    // 2. Version update notices
+    // 3. Transcript saving (fire-and-forget)
+
+    // Fire-and-forget the transcript save
+    saveExchangePromise.catch(() => {});
+
+    // Fetch context and version notice
+    const [ctx, versionNotice] = await Promise.all([fetchSessionContext(), versionNoticePromise]);
+
     const claudeReminder = buildClaudeReminder(ctx, versionNotice);
 
     console.log(

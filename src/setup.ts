@@ -21,6 +21,8 @@ import {
   generateHooksDocumentation,
   type SupportedEditor,
 } from "./hooks-config.js";
+import { readAllFilesInBatches, countIndexableFiles } from "./files.js";
+import { readLocalConfig, writeLocalConfig } from "./workspace-config.js";
 
 type RuleMode = "dynamic" | "minimal" | "full" | "bootstrap";
 type Toolset = "consolidated" | "router";
@@ -797,6 +799,206 @@ function buildClientConfig(params: { apiUrl: string; apiKey?: string; jwt?: stri
     contextPackEnabled: true,
     showTiming: false,
   };
+}
+
+// ANSI color codes for progress indicator
+const colors = {
+  reset: "\x1b[0m",
+  bright: "\x1b[1m",
+  dim: "\x1b[2m",
+  cyan: "\x1b[36m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+  magenta: "\x1b[35m",
+};
+
+// Animated spinner frames
+const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function createProgressBar(progress: number, width: number = 30): string {
+  const filled = Math.round(progress * width);
+  const empty = width - filled;
+  const filledBar = "█".repeat(filled);
+  const emptyBar = "░".repeat(empty);
+  return `${colors.cyan}${filledBar}${colors.dim}${emptyBar}${colors.reset}`;
+}
+
+async function indexProjectWithProgress(
+  client: ContextStreamClient,
+  projectPath: string,
+  workspaceId?: string
+): Promise<void> {
+  const projectName = path.basename(projectPath);
+  console.log(`\n${colors.bright}Indexing: ${projectName}${colors.reset}`);
+  console.log(`${colors.dim}${projectPath}${colors.reset}\n`);
+
+  // Get or create project
+  let projectId: string | undefined;
+  try {
+    // First check local config for existing project_id
+    const localConfig = readLocalConfig(projectPath);
+    if (localConfig?.project_id) {
+      projectId = localConfig.project_id;
+    } else {
+      // Find or create project by name
+      const projectList = (await client.listProjects({ workspace_id: workspaceId })) as any;
+      const items = projectList?.items ?? projectList?.data?.items ?? [];
+      const projectNameLower = projectName.toLowerCase();
+
+      // Look for exact name match first
+      let existing = items.find((p: any) => p.name?.toLowerCase() === projectNameLower);
+
+      // If no exact match, look for partial match
+      if (!existing) {
+        existing = items.find(
+          (p: any) =>
+            p.name?.toLowerCase().includes(projectNameLower) ||
+            projectNameLower.includes(p.name?.toLowerCase() ?? "")
+        );
+      }
+
+      if (existing?.id) {
+        projectId = existing.id;
+      } else {
+        // Create new project
+        const created = (await client.createProject({
+          name: projectName,
+          description: `Indexed from ${projectPath}`,
+          workspace_id: workspaceId,
+        })) as any;
+        projectId = created?.id ?? created?.data?.id;
+      }
+
+      // Save project ID to local config
+      if (projectId && localConfig) {
+        writeLocalConfig(projectPath, {
+          ...localConfig,
+          project_id: projectId,
+          project_name: projectName,
+        });
+      }
+    }
+
+    if (!projectId) {
+      console.log(`${colors.yellow}! Could not resolve project ID for ${projectName}${colors.reset}`);
+      return;
+    }
+  } catch (err: any) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`${colors.yellow}! Failed to get/create project: ${msg}${colors.reset}`);
+    return;
+  }
+
+  // Count files first (quick check with high limit)
+  let totalFiles = 0;
+  try {
+    const countResult = await countIndexableFiles(projectPath, { maxFiles: 50000 });
+    totalFiles = countResult.count;
+    if (countResult.stopped) {
+      console.log(`${colors.dim}Found 50,000+ indexable files${colors.reset}`);
+    } else if (totalFiles === 0) {
+      console.log(`${colors.dim}No indexable files found${colors.reset}`);
+      return;
+    } else {
+      console.log(`${colors.dim}Found ${totalFiles.toLocaleString()} indexable files${colors.reset}`);
+    }
+  } catch {
+    console.log(`${colors.dim}Scanning files...${colors.reset}`);
+  }
+
+  // Progress tracking
+  let filesIndexed = 0;
+  let bytesIndexed = 0;
+  let batchCount = 0;
+  let spinnerIdx = 0;
+  const startTime = Date.now();
+
+  // Progress update function
+  const updateProgress = () => {
+    const elapsed = (Date.now() - startTime) / 1000;
+    const filesPerSec = elapsed > 0 ? filesIndexed / elapsed : 0;
+    const progress = totalFiles > 0 ? filesIndexed / totalFiles : 0;
+    const spinner = spinnerFrames[spinnerIdx % spinnerFrames.length];
+    spinnerIdx++;
+
+    const progressBar = createProgressBar(progress);
+    const percentage = (progress * 100).toFixed(1);
+    const speed = filesPerSec.toFixed(1);
+    const size = formatBytes(bytesIndexed);
+
+    // Clear line and write progress
+    process.stdout.write(`\r${colors.cyan}${spinner}${colors.reset} ${progressBar} ${colors.bright}${percentage}%${colors.reset} | ${colors.green}${filesIndexed.toLocaleString()}${colors.reset}/${totalFiles.toLocaleString()} files | ${colors.magenta}${size}${colors.reset} | ${colors.blue}${speed} files/s${colors.reset}   `);
+  };
+
+  // Start progress animation
+  const progressInterval = setInterval(updateProgress, 80);
+
+  // Retry helper for transient failures
+  const ingestWithRetry = async (batch: any[], maxRetries = 3): Promise<number> => {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const result = (await client.ingestFiles(projectId, batch)) as { data?: { files_indexed?: number } };
+        return result.data?.files_indexed ?? batch.length;
+      } catch (err: any) {
+        const isTimeout = err.message?.includes("Timeout") || err.message?.includes("timeout");
+        if (attempt < maxRetries && isTimeout) {
+          // Wait before retry (exponential backoff)
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
+          continue;
+        }
+        throw err;
+      }
+    }
+    return batch.length;
+  };
+
+  let failedBatches = 0;
+
+  try {
+    // Index files in smaller batches (25) for better reliability
+    for await (const batch of readAllFilesInBatches(projectPath, { batchSize: 25 })) {
+      try {
+        const indexed = await ingestWithRetry(batch);
+        filesIndexed += indexed;
+        bytesIndexed += batch.reduce((sum, f) => sum + f.content.length, 0);
+        batchCount++;
+      } catch {
+        // Continue on failure - don't stop the whole process
+        failedBatches++;
+        filesIndexed += batch.length; // Count as processed even if failed
+      }
+
+      // Update total if we didn't get accurate count
+      if (filesIndexed > totalFiles) {
+        totalFiles = filesIndexed + 100; // Estimate more to come
+      }
+    }
+
+    // Final progress update
+    clearInterval(progressInterval);
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const finalSize = formatBytes(bytesIndexed);
+
+    // Clear line and print completion
+    process.stdout.write("\r" + " ".repeat(120) + "\r");
+    if (failedBatches > 0) {
+      console.log(`${colors.yellow}✓${colors.reset} Indexed ${colors.bright}${filesIndexed.toLocaleString()}${colors.reset} files (${finalSize}) in ${elapsed}s (${failedBatches} batches had errors)`);
+    } else {
+      console.log(`${colors.green}✓${colors.reset} Indexed ${colors.bright}${filesIndexed.toLocaleString()}${colors.reset} files (${finalSize}) in ${elapsed}s`);
+    }
+  } catch (err: any) {
+    clearInterval(progressInterval);
+    process.stdout.write("\r" + " ".repeat(120) + "\r");
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`${colors.yellow}! Indexing failed: ${msg}${colors.reset}`);
+  }
 }
 
 export async function runSetupWizard(args: string[]): Promise<void> {
@@ -1662,6 +1864,91 @@ export async function runSetupWizard(args: string[]): Promise<void> {
           const message = err instanceof Error ? err.message : String(err);
           writeActions.push({ kind: "rules", target: filePath, status: `error: ${message}` });
         }
+      }
+    }
+
+    // Project indexing (optional but recommended for full-featured context)
+    // Also check for existing projects that need indexing (update scenario)
+    let projectsToIndex: string[] = [...projects];
+
+    if (projects.length === 0 && !dryRun) {
+      // Check if CWD has an existing project that needs indexing
+      const cwdConfig = readLocalConfig(process.cwd());
+      if (cwdConfig?.project_id) {
+        try {
+          const indexStatus = (await client.projectIndexStatus(cwdConfig.project_id)) as any;
+          const filesIndexed = indexStatus?.data?.files_indexed ?? indexStatus?.files_indexed ?? 0;
+          const isStale = indexStatus?.data?.is_stale ?? indexStatus?.is_stale ?? false;
+
+          if (filesIndexed === 0 || isStale) {
+            console.log("\n" + "─".repeat(60));
+            console.log("PROJECT INDEXING");
+            console.log("─".repeat(60));
+            if (filesIndexed === 0) {
+              console.log("Indexing enables semantic code search and AI-powered graph knowledge for rich AI context.");
+            } else {
+              console.log("Your project index is stale and could use a refresh.");
+            }
+            console.log("Powered by our blazing-fast Rust engine, indexing typically takes under a minute,");
+            console.log("though larger projects may take a bit longer.\n");
+            console.log("Your code is private and securely stored.\n");
+
+            const indexChoice = normalizeInput(
+              await rl.question("Perform indexing now? [Y/n]: ")
+            ).toLowerCase();
+
+            const indexingEnabled = indexChoice !== "n" && indexChoice !== "no";
+
+            // Save indexing preference to config
+            writeLocalConfig(process.cwd(), {
+              ...cwdConfig,
+              indexing_enabled: indexingEnabled,
+              updated_at: new Date().toISOString(),
+            });
+
+            if (indexingEnabled) {
+              await indexProjectWithProgress(client, process.cwd(), cwdConfig.workspace_id);
+            } else {
+              console.log("\nSkipping indexing. You can index later with: contextstream-mcp index <path>");
+            }
+          }
+        } catch {
+          // Ignore errors checking index status
+        }
+      }
+    } else if (projects.length > 0 && !dryRun) {
+      console.log("\n" + "─".repeat(60));
+      console.log("PROJECT INDEXING");
+      console.log("─".repeat(60));
+      console.log("Indexing enables semantic code search and AI-powered graph knowledge for rich AI context.");
+      console.log("Powered by our blazing-fast Rust engine, indexing typically takes under a minute,");
+      console.log("though larger projects may take a bit longer.\n");
+      console.log("Your code is private and securely stored.\n");
+
+      const indexChoice = normalizeInput(
+        await rl.question("Perform indexing for full-featured context? [Y/n]: ")
+      ).toLowerCase();
+
+      const indexingEnabled = indexChoice !== "n" && indexChoice !== "no";
+
+      // Save indexing preference to each project config
+      for (const projectPath of projects) {
+        const existingConfig = readLocalConfig(projectPath);
+        if (existingConfig) {
+          writeLocalConfig(projectPath, {
+            ...existingConfig,
+            indexing_enabled: indexingEnabled,
+            updated_at: new Date().toISOString(),
+          });
+        }
+      }
+
+      if (indexingEnabled) {
+        for (const projectPath of projects) {
+          await indexProjectWithProgress(client, projectPath, workspaceId);
+        }
+      } else {
+        console.log("\nSkipping indexing. You can index later with: contextstream-mcp index <path>");
       }
     }
 

@@ -13,6 +13,8 @@ export interface WorkspaceConfig {
   context_pack?: boolean;
   api_url?: string;
   updated_at?: string;
+  // User preference for auto-indexing (set during setup wizard)
+  indexing_enabled?: boolean;
 }
 
 export interface ParentMapping {

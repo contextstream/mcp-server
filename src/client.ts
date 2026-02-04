@@ -190,8 +190,8 @@ export class ContextStreamClient {
   private sessionStartTime?: number;
   private sessionProjectId?: string;
   private sessionRootPath?: string;
-  private lastRefreshCheckTime?: number;
   private indexRefreshInProgress = false;
+  private hasTriggeredAutoIndex = false; // Only trigger auto-index once per session
   private lastIndexCheckTime?: number;
   private lastIndexedTime?: Date;
 
@@ -2043,33 +2043,60 @@ export class ContextStreamClient {
           }
         }
 
-        // Check ingest recommendation and handle based on auto_index setting
+        // Check ingest recommendation and handle based on auto_index setting and user preference
         if (projectId) {
-          const autoIndex = params.auto_index === undefined || params.auto_index === true;
+          // Check user's indexing preference from local config (set during setup wizard)
+          const localConfig = readLocalConfig(rootPath);
+          const userEnabledIndexing = localConfig?.indexing_enabled;
 
-          if (autoIndex) {
-            // Auto-index enabled (default): Start ingestion in background and inform user
-            context.indexing_status = "started";
+          // Only auto-index if:
+          // 1. User explicitly enabled indexing (indexing_enabled === true), OR
+          // 2. No preference set yet AND auto_index param is true/undefined (backwards compat)
+          const autoIndex =
+            userEnabledIndexing === true ||
+            (userEnabledIndexing === undefined &&
+              (params.auto_index === undefined || params.auto_index === true));
+
+          // If user explicitly disabled indexing, never auto-index
+          if (userEnabledIndexing === false) {
+            context.indexing_status = "disabled_by_user";
             context.ingest_recommendation = {
               recommended: false,
-              status: "auto_started",
-              reason:
-                "Background ingestion started automatically. Your codebase will be searchable shortly.",
+              status: "disabled",
+              reason: "Indexing disabled in project settings. Run setup to enable.",
             } as IngestRecommendation;
+          } else if (autoIndex) {
+            // Auto-index enabled: Check if indexing is actually needed first
+            const recommendation = await this.checkIngestRecommendation(projectId, rootPath);
 
-            // Fire-and-forget: start indexing in background
-            const projectIdCopy = projectId;
-            const rootPathCopy = rootPath;
-            (async () => {
-              try {
-                for await (const batch of readAllFilesInBatches(rootPathCopy, { batchSize: 50 })) {
-                  await this.ingestFiles(projectIdCopy, batch);
+            if (recommendation.recommended) {
+              // Project needs indexing (not indexed or stale)
+              context.indexing_status = "started";
+              context.ingest_recommendation = {
+                recommended: false,
+                status: "auto_started",
+                reason:
+                  "Background ingestion started automatically. Your codebase will be searchable shortly.",
+              } as IngestRecommendation;
+
+              // Fire-and-forget: start indexing in background (deferred to next event loop tick)
+              const projectIdCopy = projectId;
+              const rootPathCopy = rootPath;
+              setImmediate(async () => {
+                try {
+                  for await (const batch of readAllFilesInBatches(rootPathCopy, { batchSize: 50 })) {
+                    await this.ingestFiles(projectIdCopy, batch);
+                  }
+                  console.error(`[ContextStream] Background indexing completed for ${rootPathCopy}`);
+                } catch (e) {
+                  console.error(`[ContextStream] Background indexing failed:`, e);
                 }
-                console.error(`[ContextStream] Background indexing completed for ${rootPathCopy}`);
-              } catch (e) {
-                console.error(`[ContextStream] Background indexing failed:`, e);
-              }
-            })();
+              });
+            } else {
+              // Project is already indexed and fresh - no action needed
+              context.indexing_status = "indexed";
+              context.ingest_recommendation = recommendation;
+            }
           } else {
             // Auto-index disabled: Check index status and return recommendation
             // This allows the AI to prompt the user about ingesting
@@ -2227,12 +2254,19 @@ export class ContextStreamClient {
     // ========================================
     // STEP 4: Check Ingest Recommendation for Existing Projects
     // If project was loaded from config (not discovered above), check index status
-    // Auto-index if stale (>1 hour) or never indexed
+    // Auto-index if stale (>1 hour) or never indexed, respecting user preference
     // ========================================
     if (projectId && !context.ingest_recommendation) {
       try {
         const recommendation = await this.checkIngestRecommendation(projectId, rootPath);
-        const autoIndex = params.auto_index !== false;
+
+        // Check user's indexing preference from local config
+        const localConfig = rootPath ? readLocalConfig(rootPath) : null;
+        const userEnabledIndexing = localConfig?.indexing_enabled;
+
+        // Only auto-index if user didn't explicitly disable it
+        // (undefined = old user who never answered, treat as enabled for backwards compat)
+        const autoIndex = userEnabledIndexing !== false && params.auto_index !== false;
 
         // Check if index needs refreshing (>1 hour old OR never indexed)
         const needsRefresh =
@@ -2259,11 +2293,11 @@ export class ContextStreamClient {
               : "Background index refresh started automatically to capture recent changes.",
           } as IngestRecommendation;
 
-          // Fire-and-forget: start re-indexing in background
+          // Fire-and-forget: start re-indexing in background (deferred to next event loop tick)
           const projectIdCopy = projectId;
           const rootPathCopy = rootPath;
           const lastIndexedCopy = recommendation.last_indexed;
-          (async () => {
+          setImmediate(async () => {
             try {
               // Use incremental indexing if we have a last_indexed timestamp
               if (useIncremental && lastIndexedCopy) {
@@ -2285,7 +2319,7 @@ export class ContextStreamClient {
             } catch (e) {
               console.error(`[ContextStream] Background index refresh failed:`, e);
             }
-          })();
+          });
         } else {
           // Not auto-indexing - just return the recommendation
           context.ingest_recommendation = recommendation;
@@ -3435,73 +3469,45 @@ export class ContextStreamClient {
       };
     }
 
-    // ========================================
-    // Long-session re-index check
-    // If session >30 mins AND we haven't checked in 10 mins, check index freshness
-    // ========================================
-    const THIRTY_MINUTES_MS = 30 * 60 * 1000;
-    const TEN_MINUTES_MS = 10 * 60 * 1000;
-    const now = Date.now();
-    const sessionAge = this.sessionStartTime ? now - this.sessionStartTime : 0;
-    const timeSinceLastCheck = this.lastRefreshCheckTime
-      ? now - this.lastRefreshCheckTime
-      : Infinity;
-
+    // Smart auto-indexing: only if project is NOT indexed or barely indexed (< 10 files)
+    // Runs once per session, completely non-blocking via setImmediate
     if (
-      sessionAge > THIRTY_MINUTES_MS &&
-      timeSinceLastCheck > TEN_MINUTES_MS &&
+      !this.hasTriggeredAutoIndex &&
+      !this.indexRefreshInProgress &&
       this.sessionProjectId &&
-      this.sessionRootPath &&
-      !this.indexRefreshInProgress
+      this.sessionRootPath
     ) {
-      this.lastRefreshCheckTime = now;
-
-      // Fire-and-forget: check index and refresh if stale
+      this.hasTriggeredAutoIndex = true; // Only check once per session
       const projectIdCopy = this.sessionProjectId;
       const rootPathCopy = this.sessionRootPath;
-      (async () => {
+
+      // Non-blocking: defer check and indexing to next event loop tick
+      setImmediate(async () => {
         try {
           const recommendation = await this.checkIngestRecommendation(projectIdCopy, rootPathCopy);
-          const needsRefresh =
+          const needsFullIndex =
             recommendation.status === "not_indexed" ||
-            recommendation.status === "stale" ||
-            recommendation.status === "indexed"; // 'indexed' means 1-24 hours old
+            (recommendation.indexed_files !== undefined && recommendation.indexed_files < 10);
 
-          if (needsRefresh && recommendation.status !== "recently_indexed") {
+          if (needsFullIndex) {
             this.indexRefreshInProgress = true;
-            const useIncremental =
-              recommendation.last_indexed && recommendation.status !== "not_indexed";
             console.error(
-              `[ContextStream] Long session re-index: refreshing stale index for project ${projectIdCopy} (session age: ${Math.round(sessionAge / 60000)} mins, ${useIncremental ? "incremental" : "full"})`
+              `[ContextStream] Auto-indexing unindexed project ${projectIdCopy} (${recommendation.indexed_files ?? 0} files currently indexed)`
             );
             try {
-              if (useIncremental && recommendation.last_indexed) {
-                const sinceDate = new Date(recommendation.last_indexed);
-                for await (const batch of readChangedFilesInBatches(rootPathCopy, sinceDate, {
-                  batchSize: 50,
-                })) {
-                  await this.ingestFiles(projectIdCopy, batch);
-                }
-                console.error(
-                  `[ContextStream] Long session incremental re-index completed for ${rootPathCopy}`
-                );
-              } else {
-                for await (const batch of readAllFilesInBatches(rootPathCopy, { batchSize: 50 })) {
-                  await this.ingestFiles(projectIdCopy, batch);
-                }
-                console.error(
-                  `[ContextStream] Long session full re-index completed for ${rootPathCopy}`
-                );
+              for await (const batch of readAllFilesInBatches(rootPathCopy, { batchSize: 50 })) {
+                await this.ingestFiles(projectIdCopy, batch);
               }
+              console.error(`[ContextStream] Auto-indexing completed for ${rootPathCopy}`);
             } finally {
               this.indexRefreshInProgress = false;
             }
           }
         } catch (e) {
-          console.error(`[ContextStream] Long session re-index check failed:`, e);
+          console.error(`[ContextStream] Auto-index check failed:`, e);
           this.indexRefreshInProgress = false;
         }
-      })();
+      });
     }
 
     try {

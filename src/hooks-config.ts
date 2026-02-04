@@ -7,6 +7,7 @@
  */
 
 import * as fs from "node:fs/promises";
+import * as fsSync from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -21,7 +22,6 @@ import { fileURLToPath } from "node:url";
  * 3. npx fallback (slower but always works)
  */
 export function getHookCommand(hookName: string): string {
-  const fs = require("node:fs");
   const isWindows = process.platform === "win32";
 
   // Priority 1: Check for binary install (fastest, no Node overhead)
@@ -30,14 +30,14 @@ export function getHookCommand(hookName: string): string {
     const localAppData = process.env.LOCALAPPDATA;
     if (localAppData) {
       const windowsBinaryPath = path.join(localAppData, "ContextStream", "contextstream-mcp.exe");
-      if (fs.existsSync(windowsBinaryPath)) {
+      if (fsSync.existsSync(windowsBinaryPath)) {
         return `"${windowsBinaryPath}" hook ${hookName}`;
       }
     }
   } else {
     // Unix: Check /usr/local/bin/contextstream-mcp
     const unixBinaryPath = "/usr/local/bin/contextstream-mcp";
-    if (fs.existsSync(unixBinaryPath)) {
+    if (fsSync.existsSync(unixBinaryPath)) {
       return `${unixBinaryPath} hook ${hookName}`;
     }
   }
@@ -49,7 +49,7 @@ export function getHookCommand(hookName: string): string {
     const indexPath = path.join(__dirname, "index.js");
 
     // Check if the index.js exists (we're running from the installed package)
-    if (fs.existsSync(indexPath)) {
+    if (fsSync.existsSync(indexPath)) {
       return `node "${indexPath}" hook ${hookName}`;
     }
   } catch {

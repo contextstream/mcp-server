@@ -16,16 +16,30 @@ import { fileURLToPath } from "node:url";
  * Prefers direct node execution over npx for better performance.
  *
  * Priority:
- * 1. Direct path to installed package (fastest)
- * 2. npx fallback (slower but always works)
+ * 1. Direct path to installed binary (fastest, no Node overhead)
+ * 2. Direct node execution of installed package
+ * 3. npx fallback (slower but always works)
  */
 export function getHookCommand(hookName: string): string {
   const fs = require("node:fs");
+  const isWindows = process.platform === "win32";
 
-  // Priority 1: Check for binary install at /usr/local/bin (fastest, no Node overhead)
-  const binaryPath = "/usr/local/bin/contextstream-mcp";
-  if (fs.existsSync(binaryPath)) {
-    return `${binaryPath} hook ${hookName}`;
+  // Priority 1: Check for binary install (fastest, no Node overhead)
+  if (isWindows) {
+    // Windows: Check %LOCALAPPDATA%\ContextStream\contextstream-mcp.exe
+    const localAppData = process.env.LOCALAPPDATA;
+    if (localAppData) {
+      const windowsBinaryPath = path.join(localAppData, "ContextStream", "contextstream-mcp.exe");
+      if (fs.existsSync(windowsBinaryPath)) {
+        return `"${windowsBinaryPath}" hook ${hookName}`;
+      }
+    }
+  } else {
+    // Unix: Check /usr/local/bin/contextstream-mcp
+    const unixBinaryPath = "/usr/local/bin/contextstream-mcp";
+    if (fs.existsSync(unixBinaryPath)) {
+      return `${unixBinaryPath} hook ${hookName}`;
+    }
   }
 
   // Priority 2: Try to find the installed package path
@@ -36,7 +50,7 @@ export function getHookCommand(hookName: string): string {
 
     // Check if the index.js exists (we're running from the installed package)
     if (fs.existsSync(indexPath)) {
-      return `node ${indexPath} hook ${hookName}`;
+      return `node "${indexPath}" hook ${hookName}`;
     }
   } catch {
     // Fallback to npx if we can't determine the path
@@ -1343,21 +1357,43 @@ export function getClineHooksDir(scope: "global" | "project", projectPath?: stri
 }
 
 /**
+ * Get platform-appropriate hook wrapper script.
+ * Returns bash script for Unix, cmd script for Windows.
+ */
+function getHookWrapperScript(hookName: string): { content: string; extension: string } {
+  const isWindows = process.platform === "win32";
+  const command = getHookCommand(hookName);
+
+  if (isWindows) {
+    // Windows: Use .cmd batch file
+    return {
+      content: `@echo off\r\n${command}\r\n`,
+      extension: ".cmd",
+    };
+  } else {
+    // Unix: Use bash script (no extension)
+    return {
+      content: `#!/bin/bash\n# ContextStream ${hookName} Hook Wrapper for Cline/Roo/Kilo Code\nexec ${command}\n`,
+      extension: "",
+    };
+  }
+}
+
+/**
  * Cline hook wrapper script that calls the Node.js hook.
  * Cline expects executable scripts with specific names.
  * Uses direct node execution for better performance.
+ * @deprecated Use getHookWrapperScript for cross-platform support
  */
 const CLINE_HOOK_WRAPPER = (hookName: string) => {
-  const command = getHookCommand(hookName);
-  return `#!/bin/bash
-# ContextStream ${hookName} Hook Wrapper for Cline/Roo/Kilo Code
-exec ${command}
-`;
+  return getHookWrapperScript(hookName).content;
 };
 
 /**
  * Install Cline hook scripts.
- * Cline hooks are named after the hook type (no extension).
+ * Cline hooks are named after the hook type.
+ * On Unix: no extension, executable bash scripts
+ * On Windows: .cmd extension, batch files
  * Scripts are thin wrappers that call the Node.js hooks via npx.
  */
 export async function installClineHookScripts(options: {
@@ -1368,14 +1404,19 @@ export async function installClineHookScripts(options: {
   const hooksDir = getClineHooksDir(options.scope, options.projectPath);
   await fs.mkdir(hooksDir, { recursive: true });
 
-  // Cline hooks are named after the hook type (no file extension)
-  const preToolUsePath = path.join(hooksDir, "PreToolUse");
-  const userPromptPath = path.join(hooksDir, "UserPromptSubmit");
-  const postToolUsePath = path.join(hooksDir, "PostToolUse");
+  // Get platform-appropriate wrappers
+  const preToolUseWrapper = getHookWrapperScript("pre-tool-use");
+  const userPromptWrapper = getHookWrapperScript("user-prompt-submit");
+  const postWriteWrapper = getHookWrapperScript("post-write");
 
-  // Write thin wrapper scripts that call Node.js hooks via npx
-  await fs.writeFile(preToolUsePath, CLINE_HOOK_WRAPPER("pre-tool-use"), { mode: 0o755 });
-  await fs.writeFile(userPromptPath, CLINE_HOOK_WRAPPER("user-prompt-submit"), { mode: 0o755 });
+  // Cline hooks are named after the hook type (with extension on Windows)
+  const preToolUsePath = path.join(hooksDir, `PreToolUse${preToolUseWrapper.extension}`);
+  const userPromptPath = path.join(hooksDir, `UserPromptSubmit${userPromptWrapper.extension}`);
+  const postToolUsePath = path.join(hooksDir, `PostToolUse${postWriteWrapper.extension}`);
+
+  // Write thin wrapper scripts that call Node.js hooks
+  await fs.writeFile(preToolUsePath, preToolUseWrapper.content, { mode: 0o755 });
+  await fs.writeFile(userPromptPath, userPromptWrapper.content, { mode: 0o755 });
 
   const result: { preToolUse: string; userPromptSubmit: string; postToolUse?: string } = {
     preToolUse: preToolUsePath,
@@ -1384,7 +1425,7 @@ export async function installClineHookScripts(options: {
 
   // Install PostToolUse hook for real-time indexing (default ON)
   if (options.includePostWrite !== false) {
-    await fs.writeFile(postToolUsePath, CLINE_HOOK_WRAPPER("post-write"), { mode: 0o755 });
+    await fs.writeFile(postToolUsePath, postWriteWrapper.content, { mode: 0o755 });
     result.postToolUse = postToolUsePath;
   }
 
@@ -1412,7 +1453,9 @@ export function getRooCodeHooksDir(scope: "global" | "project", projectPath?: st
 
 /**
  * Install Roo Code hook scripts.
- * Uses thin wrapper scripts that call Node.js hooks via npx.
+ * Uses thin wrapper scripts that call Node.js hooks.
+ * On Unix: no extension, executable bash scripts
+ * On Windows: .cmd extension, batch files
  */
 export async function installRooCodeHookScripts(options: {
   scope: "global" | "project";
@@ -1422,13 +1465,18 @@ export async function installRooCodeHookScripts(options: {
   const hooksDir = getRooCodeHooksDir(options.scope, options.projectPath);
   await fs.mkdir(hooksDir, { recursive: true });
 
-  const preToolUsePath = path.join(hooksDir, "PreToolUse");
-  const userPromptPath = path.join(hooksDir, "UserPromptSubmit");
-  const postToolUsePath = path.join(hooksDir, "PostToolUse");
+  // Get platform-appropriate wrappers
+  const preToolUseWrapper = getHookWrapperScript("pre-tool-use");
+  const userPromptWrapper = getHookWrapperScript("user-prompt-submit");
+  const postWriteWrapper = getHookWrapperScript("post-write");
 
-  // Write thin wrapper scripts that call Node.js hooks via npx
-  await fs.writeFile(preToolUsePath, CLINE_HOOK_WRAPPER("pre-tool-use"), { mode: 0o755 });
-  await fs.writeFile(userPromptPath, CLINE_HOOK_WRAPPER("user-prompt-submit"), { mode: 0o755 });
+  const preToolUsePath = path.join(hooksDir, `PreToolUse${preToolUseWrapper.extension}`);
+  const userPromptPath = path.join(hooksDir, `UserPromptSubmit${userPromptWrapper.extension}`);
+  const postToolUsePath = path.join(hooksDir, `PostToolUse${postWriteWrapper.extension}`);
+
+  // Write thin wrapper scripts that call Node.js hooks
+  await fs.writeFile(preToolUsePath, preToolUseWrapper.content, { mode: 0o755 });
+  await fs.writeFile(userPromptPath, userPromptWrapper.content, { mode: 0o755 });
 
   const result: { preToolUse: string; userPromptSubmit: string; postToolUse?: string } = {
     preToolUse: preToolUsePath,
@@ -1437,7 +1485,7 @@ export async function installRooCodeHookScripts(options: {
 
   // Install PostToolUse hook for real-time indexing (default ON)
   if (options.includePostWrite !== false) {
-    await fs.writeFile(postToolUsePath, CLINE_HOOK_WRAPPER("post-write"), { mode: 0o755 });
+    await fs.writeFile(postToolUsePath, postWriteWrapper.content, { mode: 0o755 });
     result.postToolUse = postToolUsePath;
   }
 
@@ -1464,7 +1512,9 @@ export function getKiloCodeHooksDir(scope: "global" | "project", projectPath?: s
 
 /**
  * Install Kilo Code hook scripts.
- * Uses thin wrapper scripts that call Node.js hooks via npx.
+ * Uses thin wrapper scripts that call Node.js hooks.
+ * On Unix: no extension, executable bash scripts
+ * On Windows: .cmd extension, batch files
  */
 export async function installKiloCodeHookScripts(options: {
   scope: "global" | "project";
@@ -1474,13 +1524,18 @@ export async function installKiloCodeHookScripts(options: {
   const hooksDir = getKiloCodeHooksDir(options.scope, options.projectPath);
   await fs.mkdir(hooksDir, { recursive: true });
 
-  const preToolUsePath = path.join(hooksDir, "PreToolUse");
-  const userPromptPath = path.join(hooksDir, "UserPromptSubmit");
-  const postToolUsePath = path.join(hooksDir, "PostToolUse");
+  // Get platform-appropriate wrappers
+  const preToolUseWrapper = getHookWrapperScript("pre-tool-use");
+  const userPromptWrapper = getHookWrapperScript("user-prompt-submit");
+  const postWriteWrapper = getHookWrapperScript("post-write");
 
-  // Write thin wrapper scripts that call Node.js hooks via npx
-  await fs.writeFile(preToolUsePath, CLINE_HOOK_WRAPPER("pre-tool-use"), { mode: 0o755 });
-  await fs.writeFile(userPromptPath, CLINE_HOOK_WRAPPER("user-prompt-submit"), { mode: 0o755 });
+  const preToolUsePath = path.join(hooksDir, `PreToolUse${preToolUseWrapper.extension}`);
+  const userPromptPath = path.join(hooksDir, `UserPromptSubmit${userPromptWrapper.extension}`);
+  const postToolUsePath = path.join(hooksDir, `PostToolUse${postWriteWrapper.extension}`);
+
+  // Write thin wrapper scripts that call Node.js hooks
+  await fs.writeFile(preToolUsePath, preToolUseWrapper.content, { mode: 0o755 });
+  await fs.writeFile(userPromptPath, userPromptWrapper.content, { mode: 0o755 });
 
   const result: { preToolUse: string; userPromptSubmit: string; postToolUse?: string } = {
     preToolUse: preToolUsePath,
@@ -1489,7 +1544,7 @@ export async function installKiloCodeHookScripts(options: {
 
   // Install PostToolUse hook for real-time indexing (default ON)
   if (options.includePostWrite !== false) {
-    await fs.writeFile(postToolUsePath, CLINE_HOOK_WRAPPER("post-write"), { mode: 0o755 });
+    await fs.writeFile(postToolUsePath, postWriteWrapper.content, { mode: 0o755 });
     result.postToolUse = postToolUsePath;
   }
 

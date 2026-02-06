@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import { request, HttpError } from "./http.js";
+import { getAuthOverride } from "./auth-context.js";
 import { readAllFilesInBatches, readChangedFilesInBatches } from "./files.js";
 import {
   resolveWorkspace,
@@ -196,6 +197,13 @@ export class ContextStreamClient {
   private lastIndexedTime?: Date;
 
   constructor(private config: Config) { }
+
+  hasEffectiveAuth(): boolean {
+    const authOverride = getAuthOverride();
+    const apiKey = authOverride?.apiKey ?? this.config.apiKey;
+    const jwt = authOverride?.jwt ?? this.config.jwt;
+    return Boolean(apiKey || jwt);
+  }
 
   /**
    * Update the client's default workspace/project IDs at runtime.
@@ -3754,7 +3762,7 @@ export class ContextStreamClient {
     // Critical rule prefix - MUST appear FIRST before any context data
     // This ensures AI sees the ContextStream-first search requirement prominently
     const CS_FIRST_RULE =
-      "⚠️ STOP: Before Glob/Grep/Read → search(mode=hybrid) FIRST. Local tools ONLY if 0 results.";
+      "⚠️ STOP: Before Glob/Grep/Read → search(mode=auto) FIRST. Local tools ONLY if 0 results.";
     const CS_FIRST_RULE_MINIFIED =
       "R:CS-first|Idx:project.index_status->ingest|NoLocalScanUnlessCSempty";
 

@@ -166,7 +166,7 @@ let contextCallsSinceLastSave = 0;
 const SEARCH_RULES_REMINDER_ENABLED =
   process.env.CONTEXTSTREAM_SEARCH_REMINDER?.toLowerCase() !== "false";
 
-const SEARCH_RULES_REMINDER = `[SEARCH] Use search(mode="hybrid") before Glob/Grep/Read. Local tools only if 0 results.`;
+const SEARCH_RULES_REMINDER = `[SEARCH] Use search(mode="auto") before Glob/Grep/Read. Local tools only if 0 results.`;
 
 /**
  * Context call reminder - reinforces that context() must be called EVERY message.
@@ -1720,7 +1720,7 @@ function getBundleInfo(): Array<{
     core: "Essential session tools (always enabled)",
     session: "Extended session management and utilities",
     memory: "Full memory CRUD operations",
-    search: "Semantic, hybrid, and keyword search",
+    search: "Auto, semantic, hybrid (legacy alias), and keyword search",
     graph: "Code graph analysis and dependencies",
     workspace: "Workspace management",
     project: "Project management and indexing",
@@ -1931,6 +1931,56 @@ const CONSOLIDATED_TOOLS = new Set<string>([
   "media", // Consolidates media indexing, search, and clip retrieval for Remotion/FFmpeg
   "help", // Consolidates session_tools, auth_me, mcp_server_version, etc.
 ]);
+
+function mapToolToConsolidatedDomain(toolName: string): string | null {
+  if (CONSOLIDATED_TOOLS.has(toolName)) return toolName;
+
+  if (toolName === "session_init") return "init";
+  if (toolName === "context_smart") return "context";
+  if (toolName === "generate_rules" || toolName === "generate_editor_rules") return "generate_rules";
+
+  if (toolName.startsWith("search_")) return "search";
+  if (toolName.startsWith("session_") || toolName === "context_feedback") return "session";
+  if (toolName.startsWith("memory_") || toolName === "decision_trace") return "memory";
+  if (toolName.startsWith("graph_")) return "graph";
+  if (toolName.startsWith("projects_")) return "project";
+  if (toolName.startsWith("workspaces_") || toolName.startsWith("workspace_")) return "workspace";
+  if (toolName.startsWith("reminders_")) return "reminder";
+  if (
+    toolName.startsWith("slack_") ||
+    toolName.startsWith("github_") ||
+    toolName.startsWith("integrations_") ||
+    toolName.startsWith("notion_")
+  ) {
+    return "integration";
+  }
+  if (toolName.startsWith("media_")) return "media";
+
+  if (
+    toolName === "session_tools" ||
+    toolName === "auth_me" ||
+    toolName === "mcp_server_version" ||
+    toolName === "tools_enable_bundle"
+  ) {
+    return "help";
+  }
+
+  return null;
+}
+
+function resolveConsolidatedAllowlist(allowlist: Set<string> | null): Set<string> | null {
+  if (!allowlist) return null;
+
+  const mapped = new Set<string>();
+  for (const toolName of allowlist) {
+    const consolidated = mapToolToConsolidatedDomain(toolName);
+    if (consolidated) {
+      mapped.add(consolidated);
+    }
+  }
+
+  return mapped;
+}
 
 // =============================================================================
 // END Strategy 8
@@ -2223,12 +2273,19 @@ export function registerTools(
 ) {
   const upgradeUrl = process.env.CONTEXTSTREAM_UPGRADE_URL || "https://contextstream.io/pricing";
   const toolFilter = resolveToolFilter();
-  const toolAllowlist = toolFilter.allowlist;
+  const rawToolAllowlist = toolFilter.allowlist;
+  const toolAllowlist = CONSOLIDATED_MODE
+    ? resolveConsolidatedAllowlist(rawToolAllowlist)
+    : rawToolAllowlist;
 
   // Log toolset selection (only in verbose mode)
   if (toolAllowlist) {
     const source = toolFilter.source;
-    logDebug(`Toolset: ${source} (${toolAllowlist.size} tools)`);
+    if (CONSOLIDATED_MODE) {
+      logDebug(`Toolset: ${source} (${toolAllowlist.size} consolidated domain tools)`);
+    } else {
+      logDebug(`Toolset: ${source} (${toolAllowlist.size} tools)`);
+    }
   } else {
     logDebug("Toolset: complete (all tools)");
   }
@@ -2953,8 +3010,8 @@ export function registerTools(
       return;
     }
 
-    // Check toolset allowlist first (only applies in non-consolidated mode)
-    if (!CONSOLIDATED_MODE && toolAllowlist && !toolAllowlist.has(name)) {
+    // Check toolset allowlist for both standard and consolidated tool registration.
+    if (toolAllowlist && !toolAllowlist.has(name)) {
       // In router mode, still store in registry even if not in allowlist
       // (the router can access all operations)
       if (ROUTER_MODE && !ROUTER_DIRECT_TOOLS.has(name)) {
@@ -3145,7 +3202,7 @@ export function registerTools(
 Available bundles:
 - session: Extended session management (~6 tools)
 - memory: Full memory CRUD operations (~16 tools)
-- search: Semantic, hybrid, and keyword search (~3 tools)
+- search: Auto, semantic, hybrid (legacy alias), and keyword search (~3 tools)
 - graph: Code graph analysis and dependencies (~9 tools)
 - workspace: Workspace management (~4 tools)
 - project: Project management and indexing (~10 tools)
@@ -3712,10 +3769,19 @@ Access: Free`,
     };
   }
 
+  function getSearchAuthError(): ToolTextResult | null {
+    if (client.hasEffectiveAuth()) return null;
+    return errorResult(
+      "Authentication required for search. Set CONTEXTSTREAM_API_KEY or CONTEXTSTREAM_JWT, or pass auth credentials from your MCP client when CONTEXTSTREAM_ALLOW_HEADER_AUTH=true."
+    );
+  }
+
   registerTool(
     "search_semantic",
     { title: "Semantic search", description: "Semantic vector search", inputSchema: searchSchema },
     async (input) => {
+      const authError = getSearchAuthError();
+      if (authError) return authError;
       const result = await client.searchSemantic(normalizeSearchParams(input));
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
@@ -3732,6 +3798,8 @@ Access: Free`,
       inputSchema: searchSchema,
     },
     async (input) => {
+      const authError = getSearchAuthError();
+      if (authError) return authError;
       const result = await client.searchHybrid(normalizeSearchParams(input));
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
@@ -3744,6 +3812,8 @@ Access: Free`,
     "search_keyword",
     { title: "Keyword search", description: "Keyword search", inputSchema: searchSchema },
     async (input) => {
+      const authError = getSearchAuthError();
+      if (authError) return authError;
       const result = await client.searchKeyword(normalizeSearchParams(input));
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
@@ -3756,6 +3826,8 @@ Access: Free`,
     "search_pattern",
     { title: "Pattern search", description: "Pattern/regex search", inputSchema: searchSchema },
     async (input) => {
+      const authError = getSearchAuthError();
+      if (authError) return authError;
       const result = await client.searchPattern(normalizeSearchParams(input));
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
@@ -5373,7 +5445,7 @@ Format options:
 
 Example output (grouped):
 Session: init(start-conv) smart(each-msg) capture(save) recall(find) remember(quick)
-Search: semantic(meaning) hybrid(combo) keyword(exact)
+Search: auto(default) semantic(meaning) hybrid(alias) keyword(exact)
 Memory: events(crud) nodes(knowledge) search(find) decisions(choices)`,
       inputSchema: z.object({
         format: z
@@ -8645,13 +8717,15 @@ Use this to remove a reminder that is no longer relevant.`,
       "search",
       {
         title: "Search",
-        description: `Search workspace memory and knowledge. Modes: semantic (meaning-based), hybrid (semantic + keyword), keyword (exact match), pattern (regex), exhaustive (all matches like grep), refactor (word-boundary matching for symbol renaming), team (cross-project team search - team plans only).
+        description: `Search workspace memory and knowledge. Modes: auto (recommended), semantic (meaning-based), hybrid (legacy alias for auto), keyword (exact match), pattern (regex), exhaustive (all matches like grep), refactor (word-boundary matching for symbol renaming), team (cross-project team search - team plans only).
 
 Output formats: full (default, includes content), paths (file paths only - 80% token savings), minimal (compact - 60% savings), count (match counts only - 90% savings).`,
         inputSchema: z.object({
           mode: z
-            .enum(["semantic", "hybrid", "keyword", "pattern", "exhaustive", "refactor", "team"])
-            .describe("Search mode"),
+            .enum(["auto", "semantic", "hybrid", "keyword", "pattern", "exhaustive", "refactor", "team"])
+            .optional()
+            .default("auto")
+            .describe("Search mode (auto recommended; hybrid is a backward-compatible alias)"),
           query: z.string().describe("Search query"),
           workspace_id: z.string().uuid().optional(),
           project_id: z.string().uuid().optional(),
@@ -8682,22 +8756,27 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         }),
       },
       async (input) => {
+        const authError = getSearchAuthError();
+        if (authError) return authError;
+
         // Check and index changed files (fire and forget) - fallback for editors without hooks
         client.checkAndIndexChangedFiles().catch(() => {});
 
         const params = normalizeSearchParams(input);
         const startTime = Date.now();
+        const requestedMode = input.mode || "auto";
 
         let result;
         let toolType: TokenSavingsToolType;
-        switch (input.mode) {
-          case "semantic":
-            result = await client.searchSemantic(params);
-            toolType = "search_semantic";
-            break;
+        switch (requestedMode) {
+          case "auto":
           case "hybrid":
             result = await client.searchHybrid(params);
             toolType = "search_hybrid";
+            break;
+          case "semantic":
+            result = await client.searchSemantic(params);
+            toolType = "search_semantic";
             break;
           case "keyword":
             result = await client.searchKeyword(params);
@@ -8771,6 +8850,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             break;
           }
           default:
+            result = await client.searchHybrid(params);
             toolType = "search_hybrid";
         }
 

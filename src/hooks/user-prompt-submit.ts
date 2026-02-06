@@ -38,7 +38,7 @@ let WORKSPACE_ID: string | null = null;
 let PROJECT_ID: string | null = null;
 
 // Compact reminder for Claude Code (full rules already in CLAUDE.md)
-const REMINDER = `[CONTEXTSTREAM] Call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") FIRST before any other tool. Response contains dynamic rules, lessons, preferences. For search: use search(mode="hybrid") if indexed, else local tools.
+const REMINDER = `[CONTEXTSTREAM] Call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") FIRST before any other tool. Response contains dynamic rules, lessons, preferences. For search: use search(mode="auto") if indexed, else local tools.
 [END]`;
 
 // Full reminder for non-Claude editors that don't have CLAUDE.md context
@@ -52,7 +52,7 @@ const FULL_REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
 
 2. FOR CODE SEARCH: Check index status, then search appropriately
    ⚠️ BEFORE searching: mcp__contextstream__project(action="index_status")
-   ✅ IF indexed & fresh: Use mcp__contextstream__search(mode="hybrid", query="...")
+   ✅ IF indexed & fresh: Use mcp__contextstream__search(mode="auto", query="...")
    ✅ IF NOT indexed OR stale: Use local tools (Glob/Grep/Read) directly
    ✅ IF search returns 0 results: Fallback to local tools (Glob/Grep/Read)
 
@@ -584,7 +584,7 @@ function buildEnhancedReminder(
 2. Wait for indexing: if \`init\` returns \`indexing_status: "started"\`, files are being indexed
 3. Generate a unique session_id (e.g., "session-" + timestamp or UUID) - use this for ALL context() calls
 4. Call \`context(user_message="...", save_exchange=true, session_id="<your-session-id>")\` for task-specific context
-5. Use \`search(mode="hybrid")\` for code discovery (not Glob/Grep/Read)
+5. Use \`search(mode="auto")\` for code discovery (not Glob/Grep/Read)
 
 `);
   }
@@ -656,7 +656,7 @@ Returns: \`indexed\` (true/false), \`last_indexed_at\`, \`file_count\`
 ### 🔍 Search Decision Tree:
 
 **IF indexed=true AND last_indexed_at is recent:**
-→ Use \`search(mode="hybrid", query="...")\`
+→ Use \`search(mode="auto", query="...")\`
 
 **IF indexed=false OR last_indexed_at is stale (>7 days):**
 → Use local tools (Glob/Grep/Read) directly
@@ -823,8 +823,8 @@ export async function runUserPromptSubmitHook(): Promise<void> {
     if (editorFormat === "cursor") {
       // Cursor has limited injection capability, so we use a shorter version
       let cursorReminder = ctx?.lessons?.length
-        ? `[CONTEXTSTREAM] ⚠️ ${ctx.lessons.length} lessons from past mistakes. Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="hybrid") before Glob/Grep. After file edits: project(action="index").`
-        : `[CONTEXTSTREAM] Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="hybrid") before Glob/Grep/Read. After file edits: project(action="index").`;
+        ? `[CONTEXTSTREAM] ⚠️ ${ctx.lessons.length} lessons from past mistakes. Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="auto") before Glob/Grep. After file edits: project(action="index").`
+        : `[CONTEXTSTREAM] Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="auto") before Glob/Grep/Read. After file edits: project(action="index").`;
 
       if (versionNotice?.behind) {
         cursorReminder += ` [UPDATE v${versionNotice.current}→${versionNotice.latest}]`;

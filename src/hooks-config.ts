@@ -194,7 +194,7 @@ def main():
     if tool == "Glob":
         pattern = inp.get("pattern", "")
         if is_discovery_glob(pattern):
-            print(f"STOP: Use mcp__contextstream__search(mode=\\"hybrid\\", query=\\"{pattern}\\") instead of Glob.", file=sys.stderr)
+            print(f"STOP: Use mcp__contextstream__search(mode=\\"auto\\", query=\\"{pattern}\\") instead of Glob.", file=sys.stderr)
             sys.exit(2)
 
     elif tool == "Grep" or tool == "Search":
@@ -206,12 +206,12 @@ def main():
                 # Specific file - suggest Read instead
                 print(f"STOP: Use Read(\\"{path}\\") to view file content, or mcp__contextstream__search(mode=\\"keyword\\", query=\\"{pattern}\\") for codebase search.", file=sys.stderr)
             else:
-                print(f"STOP: Use mcp__contextstream__search(mode=\\"hybrid\\", query=\\"{pattern}\\") instead of {tool}.", file=sys.stderr)
+                print(f"STOP: Use mcp__contextstream__search(mode=\\"auto\\", query=\\"{pattern}\\") instead of {tool}.", file=sys.stderr)
             sys.exit(2)
 
     elif tool == "Task":
         if inp.get("subagent_type", "").lower() == "explore":
-            print("STOP: Use mcp__contextstream__search(mode=\\"hybrid\\") instead of Task(Explore).", file=sys.stderr)
+            print("STOP: Use mcp__contextstream__search(mode=\\"auto\\") instead of Task(Explore).", file=sys.stderr)
             sys.exit(2)
         if inp.get("subagent_type", "").lower() == "plan":
             print("STOP: Use mcp__contextstream__session(action=\\"capture_plan\\") for planning. ContextStream plans persist across sessions.", file=sys.stderr)
@@ -242,7 +242,7 @@ import os
 ENABLED = os.environ.get("CONTEXTSTREAM_REMINDER_ENABLED", "true").lower() == "true"
 
 REMINDER = """[CONTEXTSTREAM RULES]
-1. BEFORE Glob/Grep/Read/Search: mcp__contextstream__search(mode="hybrid") FIRST
+1. BEFORE Glob/Grep/Read/Search: mcp__contextstream__search(mode="auto") FIRST
 2. Call context_smart at start of EVERY response
 3. Local tools ONLY if ContextStream returns 0 results
 [END RULES]"""
@@ -1264,7 +1264,7 @@ def main():
         pattern = params.get("path", "") or params.get("regex", "")
         if is_discovery_glob(pattern) or is_discovery_grep(pattern):
             output_block(
-                f"Use mcp__contextstream__search(mode=\\"hybrid\\", query=\\"{pattern}\\") instead of {tool}. "
+                f"Use mcp__contextstream__search(mode=\\"auto\\", query=\\"{pattern}\\") instead of {tool}. "
                 "ContextStream search is indexed and faster. Only use local tools if ContextStream returns 0 results.",
                 "[CONTEXTSTREAM] Use ContextStream search for code discovery."
             )
@@ -1295,7 +1295,7 @@ import os
 ENABLED = os.environ.get("CONTEXTSTREAM_REMINDER_ENABLED", "true").lower() == "true"
 
 REMINDER = """[CONTEXTSTREAM RULES]
-1. BEFORE list_files/search_files/read_file: mcp__contextstream__search(mode="hybrid") FIRST
+1. BEFORE list_files/search_files/read_file: mcp__contextstream__search(mode="auto") FIRST
 2. Call context_smart at start of EVERY response
 3. Local tools ONLY if ContextStream returns 0 results
 [END RULES]"""
@@ -1668,7 +1668,7 @@ def main():
         pattern = params.get("pattern", "") or params.get("path", "")
         if is_discovery_glob(pattern):
             output_deny(
-                f"Use mcp__contextstream__search(mode=\\"hybrid\\", query=\\"{pattern}\\") instead of {tool}. "
+                f"Use mcp__contextstream__search(mode=\\"auto\\", query=\\"{pattern}\\") instead of {tool}. "
                 "ContextStream search is indexed and faster."
             )
 

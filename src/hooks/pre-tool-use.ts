@@ -277,7 +277,7 @@ export async function runPreToolUseHook(): Promise<void> {
     fs.appendFileSync(DEBUG_FILE, `[PreToolUse] Glob pattern=${pattern}, isDiscovery=${isDiscoveryGlob(pattern)}\n`);
     // Only intercept broad discovery patterns (e.g., **/*.ts, src/**)
     if (isDiscoveryGlob(pattern)) {
-      const msg = `STOP: Use mcp__contextstream__search(mode="hybrid", query="${pattern}") instead of Glob.`;
+      const msg = `STOP: Use mcp__contextstream__search(mode="auto", query="${pattern}") instead of Glob.`;
       fs.appendFileSync(DEBUG_FILE, `[PreToolUse] Intercepting discovery glob: ${msg}\n`);
       if (editorFormat === "cline") {
         outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream search for code discovery.");
@@ -300,7 +300,7 @@ export async function runPreToolUseHook(): Promise<void> {
         }
         blockClaudeCode(msg);
       } else {
-        const msg = `STOP: Use mcp__contextstream__search(mode="hybrid", query="${pattern}") instead of ${tool}.`;
+        const msg = `STOP: Use mcp__contextstream__search(mode="auto", query="${pattern}") instead of ${tool}.`;
         if (editorFormat === "cline") {
           outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream search for code discovery.");
         } else if (editorFormat === "cursor") {
@@ -312,7 +312,7 @@ export async function runPreToolUseHook(): Promise<void> {
   } else if (tool === "Task") {
     const subagentType = (toolInput as { subagent_type?: string })?.subagent_type?.toLowerCase() || "";
     if (subagentType === "explore") {
-      const msg = 'STOP: Use mcp__contextstream__search(mode="hybrid") instead of Task(Explore).';
+      const msg = 'STOP: Use mcp__contextstream__search(mode="auto") instead of Task(Explore).';
       if (editorFormat === "cline") {
         outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream search for code discovery.");
       } else if (editorFormat === "cursor") {
@@ -345,7 +345,7 @@ export async function runPreToolUseHook(): Promise<void> {
   if (tool === "list_files" || tool === "search_files") {
     const pattern = toolInput?.path || (toolInput as { regex?: string })?.regex || "";
     if (isDiscoveryGlob(pattern) || isDiscoveryGrep(pattern)) {
-      const msg = `Use mcp__contextstream__search(mode="hybrid", query="${pattern}") instead of ${tool}. ContextStream search is indexed and faster.`;
+      const msg = `Use mcp__contextstream__search(mode="auto", query="${pattern}") instead of ${tool}. ContextStream search is indexed and faster.`;
       if (editorFormat === "cline") {
         outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream search for code discovery.");
       } else if (editorFormat === "cursor") {

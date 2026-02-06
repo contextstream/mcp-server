@@ -35,3 +35,10 @@ coverage/
 # Temp files
 *.tgz
 *.tmp
+
+# Local agent/config docs (keep local, do not commit)
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.contextstream.config.json
+.contextstream/config.json

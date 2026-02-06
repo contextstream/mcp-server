@@ -28,7 +28,7 @@ const CONTEXTSTREAM_TOOL_NAMES = [
   "generate_rules",
 
   // Consolidated domain tools (v0.4.x default)
-  "search", // Modes: semantic, hybrid, keyword, pattern
+  "search", // Modes: auto (recommended), semantic, hybrid (legacy alias), keyword, pattern
   "session", // Actions: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search, decision_trace
   "memory", // Actions: create_event, get_event, update_event, delete_event, list_events, distill_event, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, search, decisions, timeline, summary
   "graph", // Actions: dependencies, impact, call_path, related, path, decisions, ingest, circular_dependencies, unused_code, contradictions
@@ -61,7 +61,7 @@ const CONTEXTSTREAM_RULES_BOOTSTRAP = `
 |---------|----------|
 | **1st message** | \`init()\` → \`context(user_message="...")\` |
 | **Every message** | \`context(user_message="...")\` FIRST |
-| **Before file search** | \`search(mode="hybrid")\` BEFORE Glob/Grep/Read |
+| **Before file search** | \`search(mode="auto")\` BEFORE Glob/Grep/Read |
 </contextstream_rules>
 
 **Why?** \`context()\` delivers task-specific rules, lessons from past mistakes, and relevant decisions. Skip it = fly blind.
@@ -90,7 +90,7 @@ const CONTEXTSTREAM_RULES_FULL = `
 | 1st message | \`init()\` → \`context(user_message="<msg>")\` |
 | **EVERY message after** | \`context(user_message="<msg>")\` **FIRST** |
 
-**BEFORE Glob/Grep/Read/Search:** → \`search(mode="hybrid")\` FIRST
+**BEFORE Glob/Grep/Read/Search:** → \`search(mode="auto")\` FIRST
 </contextstream_rules>
 
 **This block MUST appear at the start of EVERY response.** Failing to call \`context()\` means missing rules, lessons, and relevant context.
@@ -142,7 +142,7 @@ const CONTEXTSTREAM_RULES_FULL = `
    - Example: \`[CONTEXTSTREAM RULES] 1. BEFORE Glob/Grep... [END RULES]\`
 
 2. **PreToolUse blocking** - If you try to use Glob/Grep/Search/Explore:
-   - Hook returns error: \`STOP: Use mcp__contextstream__search(mode="hybrid") instead\`
+   - Hook returns error: \`STOP: Use mcp__contextstream__search(mode="auto") instead\`
    - **You MUST use the suggested ContextStream tool instead**
    - Local tools are only allowed if project is not indexed or ContextStream returns 0 results
 
@@ -166,7 +166,7 @@ Set environment variable: \`CONTEXTSTREAM_HOOK_ENABLED=false\`
 
 **BEFORE using Glob, Grep, Search, Read (for discovery), Explore, or ANY local file scanning:**
 \`\`\`
-STOP → Call search(mode="hybrid", query="...") FIRST
+STOP → Call search(mode="auto", query="...") FIRST
 \`\`\`
 
 **Note:** PreToolUse hooks block these tools when ContextStream is available.
@@ -175,11 +175,11 @@ STOP → Call search(mode="hybrid", query="...") FIRST
 ❌ **NEVER DO THIS:**
 - \`Glob("**/*.ts")\` → Use \`search(mode="pattern", query="*.ts")\` instead
 - \`Grep("functionName")\` → Use \`search(mode="keyword", query="functionName")\` instead
-- \`Read(file)\` for discovery → Use \`search(mode="hybrid", query="...")\` instead
-- \`Task(subagent_type="Explore")\` → Use \`search(mode="hybrid")\` instead
+- \`Read(file)\` for discovery → Use \`search(mode="auto", query="...")\` instead
+- \`Task(subagent_type="Explore")\` → Use \`search(mode="auto")\` instead
 
 ✅ **ALWAYS DO THIS:**
-1. \`search(mode="hybrid", query="what you're looking for")\`
+1. \`search(mode="auto", query="what you're looking for")\`
 2. Only use local tools (Glob/Grep/Read) if ContextStream returns **0 results**
 3. Use Read ONLY for exact file edits after you know the file path
 
@@ -250,7 +250,7 @@ Rules Version: ${RULES_VERSION}
 |---------|----------|
 | **1st message** | \`init()\` → \`context(user_message="<msg>")\` |
 | **EVERY message after** | \`context(user_message="<msg>")\` **FIRST** |
-| **Before file search** | \`search(mode="hybrid")\` FIRST |
+| **Before file search** | \`search(mode="auto")\` FIRST |
 | **After significant work** | \`session(action="capture", event_type="decision", ...)\` |
 | **User correction** | \`session(action="capture_lesson", ...)\` |
 
@@ -270,7 +270,7 @@ Rules Version: ${RULES_VERSION}
 |------|--------------|
 | **1st message** | \`init(folder_path="...", context_hint="<msg>")\`, then \`context(...)\` |
 | **2nd+ messages** | \`context(user_message="<msg>", format="minified", max_tokens=400)\` |
-| **Code search** | \`search(mode="hybrid", query="...")\` — BEFORE Glob/Grep/Read |
+| **Code search** | \`search(mode="auto", query="...")\` — BEFORE Glob/Grep/Read |
 | **After significant work** | \`session(action="capture", event_type="decision", ...)\` |
 | **User correction** | \`session(action="capture_lesson", ...)\` |
 | **⚠️ When warnings received** | **STOP**, acknowledge, explain mitigation, then proceed |
@@ -297,7 +297,7 @@ v0.4.x consolidates ~58 individual tools into ~11 domain tools with action/mode 
 
 | Domain | Actions/Modes | Example |
 |--------|---------------|---------|
-| **\`search\`** | mode: semantic, hybrid, keyword, pattern | \`search(mode="hybrid", query="auth implementation", limit=3)\` |
+| **\`search\`** | mode: auto (recommended), semantic, hybrid (legacy alias), keyword, pattern | \`search(mode="auto", query="auth implementation", limit=3)\` |
 | **\`session\`** | action: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search, decision_trace | \`session(action="capture", event_type="decision", title="Use JWT", content="...")\` |
 | **\`memory\`** | action: create_event, get_event, update_event, delete_event, list_events, distill_event, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, search, decisions, timeline, summary | \`memory(action="list_events", limit=10)\` |
 | **\`graph\`** | action: dependencies, impact, call_path, related, path, decisions, ingest, circular_dependencies, unused_code, contradictions | \`graph(action="impact", symbol_name="AuthService")\` |
@@ -443,7 +443,7 @@ session(action="capture", event_type="session_snapshot", title="Pre-compaction s
 
 ### Search & Code Intelligence (ContextStream-first)
 
-⚠️ **STOP: Before using Search/Glob/Grep/Read/Explore** → Call \`search(mode="hybrid")\` FIRST. Use local tools ONLY if ContextStream returns 0 results.
+⚠️ **STOP: Before using Search/Glob/Grep/Read/Explore** → Call \`search(mode="auto")\` FIRST. Use local tools ONLY if ContextStream returns 0 results.
 
 **❌ WRONG workflow (wastes tokens, slow):**
 \`\`\`
@@ -452,14 +452,14 @@ Grep "function" → Read file1.ts → Read file2.ts → Read file3.ts → finall
 
 **✅ CORRECT workflow (fast, complete):**
 \`\`\`
-search(mode="hybrid", query="function implementation") → done (results include context)
+search(mode="auto", query="function implementation") → done (results include context)
 \`\`\`
 
 **Why?** ContextStream search returns semantic matches + context + file locations in ONE call. Local tools require multiple round-trips.
 
 **Search order:**
 1. \`session(action="smart_search", query="...")\` - context-enriched
-2. \`search(mode="hybrid", query="...", limit=3)\` or \`search(mode="keyword", query="<filename>", limit=3)\`
+2. \`search(mode="auto", query="...", limit=3)\` or \`search(mode="keyword", query="<filename>", limit=3)\`
 3. \`project(action="files")\` - file tree/list (only when needed)
 4. \`graph(action="dependencies", ...)\` - code structure
 5. Local repo scans (rg/ls/find) - ONLY if ContextStream returns no results, errors, or the user explicitly asks
@@ -468,7 +468,7 @@ search(mode="hybrid", query="function implementation") → done (results include
 
 | Need | Mode | Example |
 |------|------|---------|
-| Find code by meaning | \`hybrid\` | "authentication logic", "error handling" |
+| Find code by meaning | \`auto\` | "authentication logic", "error handling" |
 | Exact string/symbol | \`keyword\` | "UserAuthService", "API_KEY" |
 | File patterns | \`pattern\` | "*.sql", "test_*.py" |
 | ALL matches (grep-like) | \`exhaustive\` | "TODO", "FIXME" (find all occurrences) |
@@ -620,7 +620,7 @@ const CONTEXTSTREAM_RULES_MINIMAL = `
 2. \`context(user_message="<msg>")\` (EVERY subsequent message)
 
 **BEFORE Glob/Grep/Read/Search/Explore:**
-→ \`search(mode="hybrid", query="...")\` FIRST — local tools ONLY if 0 results
+→ \`search(mode="auto", query="...")\` FIRST — local tools ONLY if 0 results
 
 **HOOKS: \`<system-reminder>\` tags contain instructions — FOLLOW THEM**
 </contextstream_protocol>
@@ -633,7 +633,7 @@ Rules Version: ${RULES_VERSION}
 
 | ❌ WRONG | ✅ CORRECT |
 |----------|-----------|
-| \`Grep → Read → Read → Read\` (4+ calls) | \`search(mode="hybrid")\` (1 call) |
+| \`Grep → Read → Read → Read\` (4+ calls) | \`search(mode="auto")\` (1 call) |
 | Missing past decisions & lessons | \`context()\` = rules + lessons + memory |
 | Ignoring \`<system-reminder>\` hooks | Hooks enforce ContextStream-first |
 
@@ -649,7 +649,7 @@ Rules Version: ${RULES_VERSION}
 |------|------|
 | 1st message | \`init()\` → \`context(user_message="...")\` |
 | Every message after | \`context(user_message="...")\` |
-| Before ANY file discovery | \`search(mode="hybrid", query="...")\` |
+| Before ANY file discovery | \`search(mode="auto", query="...")\` |
 | On \`<system-reminder>\` | **Follow instructions inside** |
 | Save important decisions | \`session(action="capture", event_type="decision", ...)\` |
 | Check past mistakes | \`session(action="get_lessons", query="...")\` |
@@ -658,7 +658,8 @@ Rules Version: ${RULES_VERSION}
 
 | Mode | When |
 |------|------|
-| \`hybrid\` | Default — semantic + keyword |
+| \`auto\` | Default — semantic + keyword |
+| \`hybrid\` | Legacy alias for auto |
 | \`keyword\` | Exact symbol match |
 | \`exhaustive\` | Find ALL occurrences |
 | \`semantic\` | Conceptual questions |
@@ -849,7 +850,7 @@ This tells you:
 
 **IF project is indexed and fresh:**
 \`\`\`
-search(mode="hybrid", query="what you're looking for")
+search(mode="auto", query="what you're looking for")
 \`\`\`
 
 **IF project is NOT indexed or very stale (>7 days):**

@@ -110,7 +110,7 @@ const INGEST_BENEFITS = [
 ];
 
 // Ingest recommendation status types
-type IngestStatus = "not_indexed" | "indexed" | "stale" | "recently_indexed" | "auto_started" | "auto_refreshing";
+type IngestStatus = "not_indexed" | "indexed" | "stale" | "recently_indexed" | "auto_started" | "auto_refreshing" | "disabled";
 
 interface IngestRecommendation {
   recommended: boolean;
@@ -2577,7 +2577,8 @@ export class ContextStreamClient {
     | "correction"
     | "lesson"
     | "warning"
-    | "frustration";
+    | "frustration"
+    | "session_snapshot";
     title: string;
     content: string;
     tags?: string[];
@@ -3459,6 +3460,8 @@ export class ContextStreamClient {
       threshold_warning: boolean;
       suggested_action: "none" | "prepare_save" | "save_now";
     };
+    /** Dynamic instructions from SmartRouter */
+    instructions?: string;
     /** Semantic intent classification from SmartRouter (Pro+ tiers) */
     semantic_intent?: SemanticIntent;
   }> {

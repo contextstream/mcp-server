@@ -106,6 +106,7 @@ export const TASK_HINTS = {
   created: "Task created. Use update_task() to change status.",
   completed: "Task completed. Well done!",
   blocked: "Task blocked. Add blocked_reason for context.",
+  cancelled: "Task cancelled.",
   linked_to_plan: "Task linked to plan. Progress will be tracked.",
 };
 

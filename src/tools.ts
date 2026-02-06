@@ -5091,7 +5091,7 @@ This does semantic search on the first message. You only need context on subsequ
 
       // Add educational tip to teach users about persistent context value
       const sessionId = typeof result.session_id === "string" ? result.session_id : undefined;
-      result.educational_tip = getSessionInitTip(sessionId);
+      result.educational_tip = getSessionInitTip(sessionId ?? "");
 
       // Handle context restoration - always try to restore from recent snapshots by default
       // Can be disabled via CONTEXTSTREAM_RESTORE_CONTEXT=false or input.is_post_compact=false
@@ -5989,7 +5989,7 @@ The snapshot is automatically prioritized during post-compaction session_init.`,
       });
 
       const response = {
-        ...result,
+        ...(result as Record<string, unknown>),
         snapshot_id: (result as any)?.data?.id || (result as any)?.id,
         message: "Session state captured successfully. This snapshot will be prioritized after compaction.",
         hint: "After compaction, call session_init with is_post_compact=true to restore this context.",
@@ -6055,7 +6055,7 @@ Use this in combination with session_init(is_post_compact=true) for seamless con
       try {
         // If specific snapshot_id provided, fetch that event
         if (input.snapshot_id) {
-          const eventResult = await client.getEvent(input.snapshot_id);
+          const eventResult = await client.getMemoryEvent(input.snapshot_id);
           const event = (eventResult as any)?.data || eventResult;
 
           if (!event || !event.content) {
@@ -7486,7 +7486,7 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
           const now = Date.now();
           const timeSinceLastSave = now - lastAutoSaveTime;
           const pressureLevelIncreased =
-            (lastAutoSavePressureLevel === "" && cp.level !== "low") ||
+            (lastAutoSavePressureLevel === "") ||
             (lastAutoSavePressureLevel === "medium" && (cp.level === "high" || cp.level === "critical")) ||
             (lastAutoSavePressureLevel === "high" && cp.level === "critical");
 
@@ -8847,7 +8847,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   ...params,
                   workspace_id: ws.id,
                   limit: perWorkspaceLimit,
-                });
+                }) as any;
                 const wsResults = wsSearchResult?.data?.results || wsSearchResult?.results || [];
                 allSearchResults.push(
                   ...wsResults.map((r: any) => ({
@@ -9458,7 +9458,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
             // If specific snapshot_id provided, fetch that event
             if (input.snapshot_id) {
-              const eventResult = await client.getEvent(input.snapshot_id);
+              const eventResult = await client.getMemoryEvent(input.snapshot_id);
               const event = (eventResult as any)?.data || eventResult;
 
               if (!event || !event.content) {
@@ -9667,7 +9667,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   workspace_id: ws.id,
                   category: input.category,
                   limit: input.limit ? Math.ceil(input.limit / workspaces.length) : 5,
-                });
+                }) as any;
                 const items = decisions?.data?.events || decisions?.events || [];
                 allDecisions.push(...items.map((d: any) => ({ ...d, workspace_name: ws.name })));
               } catch {
@@ -9718,7 +9718,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   workspace_id: ws.id,
                   context_hint: input.query,
                   limit: input.limit ? Math.ceil(input.limit / workspacesForLessons.length) : 5,
-                });
+                }) as any;
                 const items = lessons?.data?.lessons || lessons?.lessons || [];
                 allLessons.push(...items.map((l: any) => ({ ...l, workspace_name: ws.name })));
               } catch {
@@ -9774,7 +9774,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   workspace_id: ws.id,
                   status: input.status as any,
                   limit: input.limit ? Math.ceil(input.limit / workspacesForPlans.length) : 5,
-                });
+                }) as any;
                 const items = plans?.data?.plans || plans?.plans || plans?.data?.items || plans?.items || [];
                 allPlans.push(...items.map((p: any) => ({ ...p, workspace_name: ws.name })));
               } catch {
@@ -9806,7 +9806,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               status: input.status as any,
               min_confidence: input.min_confidence,
               limit: input.limit,
-            });
+            }) as any;
             const rules = result?.data?.items || result?.items || [];
             if (rules.length === 0) {
               return {
@@ -9844,7 +9844,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               action: input.rule_action,
               modified_keywords: input.modified_keywords,
               modified_instruction: input.modified_instruction,
-            });
+            }) as any;
             const actionVerb = input.rule_action === "accept" ? "accepted" : input.rule_action === "reject" ? "rejected" : "modified";
             return {
               content: [
@@ -9868,7 +9868,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           case "suggested_rules_stats": {
             const result = await client.getSuggestedRulesStats({
               workspace_id: workspaceId,
-            });
+            }) as any;
             return {
               content: [
                 {
@@ -10814,7 +10814,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   workspace_id: ws.id,
                   status: input.task_status as any,
                   limit: input.limit ? Math.ceil(input.limit / workspacesForTasks.length) : 10,
-                });
+                }) as any;
                 const items = tasks?.data?.tasks || tasks?.tasks || tasks?.data?.items || tasks?.items || [];
                 allTasks.push(...items.map((t: any) => ({ ...t, workspace_name: ws.name })));
               } catch {
@@ -10862,8 +10862,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   workspace_id: ws.id,
                   status: input.todo_status as any,
                   priority: input.todo_priority as any,
-                  limit: input.limit ? Math.ceil(input.limit / workspacesForTodos.length) : 10,
-                });
+                  per_page: input.limit ? Math.ceil(input.limit / workspacesForTodos.length) : 10,
+                }) as any;
                 const items = todos?.data?.items || todos?.items || [];
                 allTodos.push(...items.map((t: any) => ({ ...t, workspace_name: ws.name })));
               } catch {
@@ -10920,8 +10920,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 const diagrams = await client.diagramsList({
                   workspace_id: ws.id,
                   diagram_type: input.diagram_type as any,
-                  limit: input.limit ? Math.ceil(input.limit / workspacesForDiagrams.length) : 10,
-                });
+                  per_page: input.limit ? Math.ceil(input.limit / workspacesForDiagrams.length) : 10,
+                }) as any;
                 const items = diagrams?.data?.items || diagrams?.items || [];
                 allDiagrams.push(...items.map((d: any) => ({ ...d, workspace_name: ws.name })));
               } catch {
@@ -10968,8 +10968,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 const docs = await client.docsList({
                   workspace_id: ws.id,
                   doc_type: input.doc_type as any,
-                  limit: input.limit ? Math.ceil(input.limit / workspacesForDocs.length) : 10,
-                });
+                  per_page: input.limit ? Math.ceil(input.limit / workspacesForDocs.length) : 10,
+                }) as any;
                 const items = docs?.data?.items || docs?.items || [];
                 allDocs.push(...items.map((d: any) => ({ ...d, workspace_name: ws.name })));
               } catch {
@@ -12412,7 +12412,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 const events = await client.listMemoryEvents({
                   workspace_id: ws.id,
                   limit: perSourceLimit,
-                });
+                }) as any;
                 const items = events?.data?.events || events?.events || events?.data?.items || events?.items || [];
                 const mappedItems = items.map((e: any) => ({
                   source: "memory",
@@ -12434,9 +12434,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               try {
                 const notionActivity = await client.notionActivity({
                   workspace_id: ws.id,
-                  days,
                   limit: perSourceLimit,
-                });
+                }) as any;
                 const notionItems = notionActivity?.data || notionActivity || [];
                 if (Array.isArray(notionItems)) {
                   const mappedItems = notionItems.map((n: any) => ({
@@ -12461,9 +12460,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               try {
                 const slackActivity = await client.slackActivity({
                   workspace_id: ws.id,
-                  days,
                   limit: perSourceLimit,
-                });
+                }) as any;
                 const slackItems = slackActivity?.data || slackActivity || [];
                 if (Array.isArray(slackItems)) {
                   const mappedItems = slackItems.map((s: any) => ({
@@ -12488,9 +12486,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               try {
                 const githubActivity = await client.githubActivity({
                   workspace_id: ws.id,
-                  days,
                   limit: perSourceLimit,
-                });
+                }) as any;
                 const githubItems = githubActivity?.data || githubActivity || [];
                 if (Array.isArray(githubItems)) {
                   const mappedItems = githubItems.map((g: any) => ({

@@ -25,7 +25,6 @@ import { readAllFilesInBatches, countIndexableFiles } from "./files.js";
 import { readLocalConfig, writeLocalConfig } from "./workspace-config.js";
 
 type RuleMode = "dynamic" | "minimal" | "full" | "bootstrap";
-type Toolset = "consolidated" | "router";
 type InstallScope = "global" | "project" | "both";
 type McpScope = InstallScope | "skip";
 
@@ -460,10 +459,7 @@ const IS_WINDOWS = process.platform === "win32";
 type SetupEnvParams = {
   apiUrl: string;
   apiKey: string;
-  toolset?: Toolset;
   contextPackEnabled?: boolean;
-  showTiming?: boolean;
-  restoreContextEnabled?: boolean;
 };
 
 function escapeTomlString(value: string): string {
@@ -478,38 +474,11 @@ function formatTomlEnvLines(env: Record<string, string>): string {
 
 function buildSetupEnv(params: SetupEnvParams): Record<string, string> {
   const contextPack = params.contextPackEnabled === false ? "false" : "true";
-  const progressive = params.toolset === "router" ? "true" : "false";
-  const restoreContext = params.restoreContextEnabled === false ? "false" : "true";
-  const showTiming = params.showTiming ? "true" : "false";
 
   return {
     CONTEXTSTREAM_API_URL: params.apiUrl,
     CONTEXTSTREAM_API_KEY: params.apiKey,
-    CONTEXTSTREAM_JWT: "",
-    CONTEXTSTREAM_ALLOW_HEADER_AUTH: "false",
-    CONTEXTSTREAM_WORKSPACE_ID: "",
-    CONTEXTSTREAM_PROJECT_ID: "",
-    CONTEXTSTREAM_USER_AGENT: `contextstream-mcp/${VERSION}`,
-    CONTEXTSTREAM_TOOLSET: "standard",
-    CONTEXTSTREAM_TOOL_ALLOWLIST: "",
-    CONTEXTSTREAM_AUTO_TOOLSET: "false",
-    CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS: "true",
-    CONTEXTSTREAM_SCHEMA_MODE: "full",
-    CONTEXTSTREAM_PROGRESSIVE_MODE: progressive,
-    CONTEXTSTREAM_ROUTER_MODE: "false",
-    CONTEXTSTREAM_OUTPUT_FORMAT: "compact",
-    CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT: "true",
-    CONTEXTSTREAM_SEARCH_LIMIT: "3",
-    CONTEXTSTREAM_SEARCH_MAX_CHARS: "400",
-    CONTEXTSTREAM_CONSOLIDATED: "true",
     CONTEXTSTREAM_CONTEXT_PACK: contextPack,
-    CONTEXTSTREAM_CONTEXT_PACK_ENABLED: contextPack,
-    CONTEXTSTREAM_RESTORE_CONTEXT: restoreContext,
-    CONTEXTSTREAM_SHOW_TIMING: showTiming,
-    CONTEXTSTREAM_PRO_TOOLS: "",
-    CONTEXTSTREAM_UPGRADE_URL: "https://contextstream.io/pricing",
-    CONTEXTSTREAM_ENABLE_PROMPTS: "true",
-    CONTEXTSTREAM_LOG_LEVEL: "normal",
   };
 }
 
@@ -1332,18 +1301,8 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     const planLabel = detectedPlanName ?? "unknown";
     console.log(`\nDetected plan: ${planLabel} (graph: ${graphTierLabel})`);
 
-    // Toolset: always consolidated (standard, ~11 tools)
-    const toolset: Toolset = "consolidated";
-
     // Context Pack: auto-enabled for Pro+ plans
-    const isPro = detectedPlanName && ["pro", "team", "enterprise"].some(p => detectedPlanName.toLowerCase().includes(p));
-    const contextPackEnabled = isPro;
-
-    // Response Timing: disabled by default
-    const showTiming = false;
-
-    // Context Restoration: enabled by default
-    const restoreContextEnabled = true;
+    const contextPackEnabled = !!detectedPlanName && ["pro", "team", "enterprise"].some(p => detectedPlanName.toLowerCase().includes(p));
 
     // Auto-Update: enabled by default, ask user if they want to disable
     console.log("\nAuto-Update:");
@@ -1461,23 +1420,9 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     // Build MCP server configs with selected toolset
     // v0.4.x: consolidated (~11 tools) is default, router (~2 tools) uses PROGRESSIVE_MODE
-    const mcpServer = buildContextStreamMcpServer({ apiUrl, apiKey, toolset, contextPackEnabled, showTiming, restoreContextEnabled });
-    const mcpServerClaude = buildContextStreamMcpServer({
-      apiUrl,
-      apiKey,
-      toolset,
-      contextPackEnabled,
-      showTiming,
-      restoreContextEnabled,
-    });
-    const vsCodeServer = buildContextStreamVsCodeServer({
-      apiUrl,
-      apiKey,
-      toolset,
-      contextPackEnabled,
-      showTiming,
-      restoreContextEnabled,
-    });
+    const mcpServer = buildContextStreamMcpServer({ apiUrl, apiKey, contextPackEnabled });
+    const mcpServerClaude = buildContextStreamMcpServer({ apiUrl, apiKey, contextPackEnabled });
+    const vsCodeServer = buildContextStreamVsCodeServer({ apiUrl, apiKey, contextPackEnabled });
 
     // Global MCP config
     const needsGlobalMcpConfig =
@@ -1498,10 +1443,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             const status = await upsertCodexTomlConfig(filePath, {
               apiUrl,
               apiKey,
-              toolset,
               contextPackEnabled,
-              showTiming,
-              restoreContextEnabled,
             });
             writeActions.push({ kind: "mcp-config", target: filePath, status });
             console.log(`- ${EDITOR_LABELS[editor]}: ${status} ${filePath}`);
@@ -1530,14 +1472,12 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             console.log(
               "- Claude Code: global MCP config is best done via `claude mcp add --transport stdio ...` (see docs)."
             );
-            const envHint =
-              toolset === "router" ? " --env CONTEXTSTREAM_PROGRESSIVE_MODE=true" : "";
             const packHint =
               contextPackEnabled === false
                 ? " --env CONTEXTSTREAM_CONTEXT_PACK=false"
                 : " --env CONTEXTSTREAM_CONTEXT_PACK=true";
             console.log(
-              `  macOS/Linux: claude mcp add --transport stdio contextstream --scope user --env CONTEXTSTREAM_API_URL=... --env CONTEXTSTREAM_API_KEY=...${envHint}${packHint} -- npx --prefer-online -y @contextstream/mcp-server@latest`
+              `  macOS/Linux: claude mcp add --transport stdio contextstream --scope user --env CONTEXTSTREAM_API_URL=... --env CONTEXTSTREAM_API_KEY=...${packHint} -- npx --prefer-online -y @contextstream/mcp-server@latest`
             );
             console.log(
               "  Windows (native): use `cmd /c npx --prefer-online -y @contextstream/mcp-server@latest` after `--` if `npx` is not found."

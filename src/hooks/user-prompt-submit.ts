@@ -37,7 +37,12 @@ let API_KEY = process.env.CONTEXTSTREAM_API_KEY || "";
 let WORKSPACE_ID: string | null = null;
 let PROJECT_ID: string | null = null;
 
-const REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
+// Compact reminder for Claude Code (full rules already in CLAUDE.md)
+const REMINDER = `[CONTEXTSTREAM] Call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") FIRST before any other tool. Response contains dynamic rules, lessons, preferences. For search: use search(mode="hybrid") if indexed, else local tools.
+[END]`;
+
+// Full reminder for non-Claude editors that don't have CLAUDE.md context
+const FULL_REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
 
 1. FIRST: Call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") before ANY other tool
    - Returns: dynamic rules, lessons from past mistakes, relevant context
@@ -517,39 +522,6 @@ function transformSmartContextResponse(data: unknown): ContextResponse | null {
   }
 }
 
-/**
- * Build Claude Code reminder with optional preferences
- * This is lighter than the enhanced reminder (other hooks handle lessons/plans)
- * but includes high-importance preferences that should always surface.
- */
-function buildClaudeReminder(ctx: ContextResponse | null, versionNotice?: VersionNotice | null): string {
-  const parts: string[] = [];
-
-  // Add version notice if outdated (important for users to know about updates)
-  if (versionNotice?.behind) {
-    const versionInfo = getVersionNoticeForHook(versionNotice);
-    if (versionInfo) {
-      parts.push(versionInfo);
-      parts.push("");
-    }
-  }
-
-  // Add high-importance preferences (the main new feature)
-  const highImportancePrefs = ctx?.preferences?.filter(p => p.importance === "high") || [];
-  if (highImportancePrefs.length > 0) {
-    parts.push(`[USER PREFERENCES - Always respect these]`);
-    for (const pref of highImportancePrefs.slice(0, 5)) {
-      parts.push(`• ${pref.title}: ${pref.content}`);
-    }
-    parts.push("");
-  }
-
-  // Add the standard rules
-  parts.push(REMINDER);
-
-  return parts.join("\n");
-}
-
 function buildEnhancedReminder(
   ctx: ContextResponse | null,
   isNewSession: boolean,
@@ -625,9 +597,9 @@ function buildEnhancedReminder(
     parts.push("");
   }
 
-  // Add separator and standard rules
+  // Add separator and standard rules (full version for non-Claude editors)
   parts.push("---\n");
-  parts.push(REMINDER);
+  parts.push(FULL_REMINDER);
 
   // Add comprehensive file indexing guidance (critical for non-Claude editors)
   parts.push(`
@@ -761,88 +733,75 @@ export async function runUserPromptSubmitHook(): Promise<void> {
   const editorFormat = detectEditorFormat(input);
   const cwd = input.cwd || process.cwd();
 
-  // Load config early so we have API_KEY for transcript saving
-  loadConfigFromMcpJson(cwd);
-
-  // Check for version updates (runs in parallel with other async operations)
-  const versionNoticePromise = getUpdateNotice();
-
-  // Extract and save last exchange (lagging transcript capture)
-  // This runs in parallel and doesn't block the hook response
-  const lastExchange = extractLastExchange(input, editorFormat);
-  const clientName = editorFormat === "claude" ? "claude-code" : editorFormat;
-  const saveExchangePromise = lastExchange ? saveLastExchange(lastExchange, cwd, clientName) : Promise.resolve();
-
   // Output format depends on editor
   if (editorFormat === "claude") {
-    // Claude Code format - FAST PATH with optional enrichment
-    // SessionStart hook provides full context, but we still want:
-    // 1. High-importance preferences (should surface every message)
-    // 2. Version update notices
-    // 3. Transcript saving (fire-and-forget)
-
-    // Fire-and-forget the transcript save
-    saveExchangePromise.catch(() => {});
-
-    // Fetch context and version notice
-    const [ctx, versionNotice] = await Promise.all([fetchSessionContext(), versionNoticePromise]);
-
-    const claudeReminder = buildClaudeReminder(ctx, versionNotice);
-
+    // ==========================================
+    // CLAUDE CODE: INSTANT PATH (~1ms)
+    // ==========================================
+    // No HTTP calls, no JSONL reading, no blocking operations.
+    // - Transcript saving is handled by context(save_exchange=true) in the MCP tool
+    // - Full rules are already in CLAUDE.md
+    // - Preferences/lessons are delivered by the context() tool response
+    // - Version checks happen in the context() tool
+    //
+    // This eliminates:
+    // - Reading entire JSONL transcript file (was O(n) with conversation length)
+    // - HTTP POST to /transcripts/exchange (was 5s timeout)
+    // - HTTP POST to /context/smart (was 3s timeout)
+    // - HTTP to registry for version check
     console.log(
       JSON.stringify({
         hookSpecificOutput: {
           hookEventName: "UserPromptSubmit",
-          additionalContext: claudeReminder,
+          additionalContext: REMINDER,
         },
       })
     );
-  } else if (editorFormat === "cline") {
-    // Cline/Roo/Kilo format - ENHANCED (compensates for missing hooks)
+  } else {
+    // ==========================================
+    // NON-CLAUDE EDITORS: Keep context fetch
+    // ==========================================
+    // Cursor/Cline/Antigravity/etc. don't have SessionStart or CLAUDE.md,
+    // so they need the full reminder + context from the hook.
+    // But we still skip JSONL reading (not applicable to these editors).
+    loadConfigFromMcpJson(cwd);
+
+    const versionNoticePromise = getUpdateNotice();
+
+    // Save exchanges for editors that provide history in-memory (no JSONL)
+    const lastExchange = extractLastExchange(input, editorFormat);
+    const clientName = editorFormat;
+    const saveExchangePromise = lastExchange ? saveLastExchange(lastExchange, cwd, clientName) : Promise.resolve();
+
     const newSession = isNewSession(input, editorFormat);
     const [ctx, versionNotice] = await Promise.all([fetchSessionContext(), versionNoticePromise, saveExchangePromise]);
-    const enhancedReminder = buildEnhancedReminder(ctx, newSession, versionNotice);
 
-    console.log(
-      JSON.stringify({
-        cancel: false,
-        contextModification: enhancedReminder,
-      })
-    );
-  } else if (editorFormat === "cursor") {
-    // Cursor format - ENHANCED (compensates for missing hooks)
-    const newSession = isNewSession(input, editorFormat);
-    const [ctx, versionNotice] = await Promise.all([fetchSessionContext(), versionNoticePromise, saveExchangePromise]);
+    if (editorFormat === "cursor") {
+      // Cursor has limited injection capability, so we use a shorter version
+      let cursorReminder = ctx?.lessons?.length
+        ? `[CONTEXTSTREAM] ⚠️ ${ctx.lessons.length} lessons from past mistakes. Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="hybrid") before Glob/Grep. After file edits: project(action="index").`
+        : `[CONTEXTSTREAM] Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="hybrid") before Glob/Grep/Read. After file edits: project(action="index").`;
 
-    // Cursor has limited injection capability, so we use a shorter version
-    let cursorReminder = ctx?.lessons?.length
-      ? `[CONTEXTSTREAM] ⚠️ ${ctx.lessons.length} lessons from past mistakes. Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="hybrid") before Glob/Grep. After file edits: project(action="index").`
-      : `[CONTEXTSTREAM] Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="hybrid") before Glob/Grep/Read. After file edits: project(action="index").`;
+      if (versionNotice?.behind) {
+        cursorReminder += ` [UPDATE v${versionNotice.current}→${versionNotice.latest}]`;
+      }
 
-    // Add version notice if outdated
-    if (versionNotice?.behind) {
-      cursorReminder += ` [UPDATE v${versionNotice.current}→${versionNotice.latest}]`;
+      console.log(
+        JSON.stringify({
+          continue: true,
+          user_message: cursorReminder,
+        })
+      );
+    } else {
+      // Cline/Roo/Kilo/Antigravity - full enhanced reminder
+      const enhancedReminder = buildEnhancedReminder(ctx, newSession, versionNotice);
+      console.log(
+        JSON.stringify({
+          cancel: false,
+          contextModification: enhancedReminder,
+        })
+      );
     }
-
-    console.log(
-      JSON.stringify({
-        continue: true,
-        user_message: cursorReminder,
-      })
-    );
-  } else if (editorFormat === "antigravity") {
-    // Antigravity/Gemini format - ENHANCED (compensates for missing hooks)
-    const newSession = isNewSession(input, editorFormat);
-    const [ctx, versionNotice] = await Promise.all([fetchSessionContext(), versionNoticePromise, saveExchangePromise]);
-    const enhancedReminder = buildEnhancedReminder(ctx, newSession, versionNotice);
-
-    // Antigravity uses similar format to Cline
-    console.log(
-      JSON.stringify({
-        cancel: false,
-        contextModification: enhancedReminder,
-      })
-    );
   }
 
   process.exit(0);

@@ -413,6 +413,44 @@ async function saveLastExchange(exchange: LastExchange, cwd: string, clientName?
   }
 }
 
+/**
+ * Fast hook context fetch from /api/v1/context/hook (Redis-cached, ~20-50ms).
+ * Returns compact context string with preferences + lessons + core rules.
+ */
+async function fetchHookContext(): Promise<string | null> {
+  if (!API_KEY) return null;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2000);
+
+    const url = `${API_URL}/api/v1/context/hook`;
+    const body: Record<string, unknown> = {};
+    if (WORKSPACE_ID) body.workspace_id = WORKSPACE_ID;
+    if (PROJECT_ID) body.project_id = PROJECT_ID;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "X-API-Key": API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      const data = (await response.json()) as { success?: boolean; data?: { context?: string } };
+      return data?.data?.context || null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchSessionContext(): Promise<ContextResponse | null> {
   if (!API_KEY) return null;
 
@@ -736,24 +774,30 @@ export async function runUserPromptSubmitHook(): Promise<void> {
   // Output format depends on editor
   if (editorFormat === "claude") {
     // ==========================================
-    // CLAUDE CODE: INSTANT PATH (~1ms)
+    // CLAUDE CODE: FAST PATH (~20-50ms)
     // ==========================================
-    // No HTTP calls, no JSONL reading, no blocking operations.
-    // - Transcript saving is handled by context(save_exchange=true) in the MCP tool
-    // - Full rules are already in CLAUDE.md
-    // - Preferences/lessons are delivered by the context() tool response
-    // - Version checks happen in the context() tool
-    //
-    // This eliminates:
-    // - Reading entire JSONL transcript file (was O(n) with conversation length)
-    // - HTTP POST to /transcripts/exchange (was 5s timeout)
-    // - HTTP POST to /context/smart (was 3s timeout)
-    // - HTTP to registry for version check
+    // Makes a single fast HTTP call to /context/hook (Redis-cached).
+    // Returns preferences + lessons + core rules.
+    // Falls back to static reminder if API is unreachable.
+    loadConfigFromMcpJson(cwd);
+
+    let context = REMINDER;
+    if (API_KEY) {
+      try {
+        const hookContext = await fetchHookContext();
+        if (hookContext) {
+          context = hookContext;
+        }
+      } catch {
+        // Fallback to static reminder on any error
+      }
+    }
+
     console.log(
       JSON.stringify({
         hookSpecificOutput: {
           hookEventName: "UserPromptSubmit",
-          additionalContext: REMINDER,
+          additionalContext: context,
         },
       })
     );

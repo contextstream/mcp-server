@@ -44,16 +44,16 @@ describe("hooks-config", () => {
       expect(matcher).toContain("Task");
     });
 
-    it("should use npx command for hooks", () => {
+    it("should use valid hook commands", () => {
       const config = buildHooksConfig();
 
       for (const hook of config?.PreToolUse?.[0]?.hooks || []) {
-        expect(hook.command).toContain("npx @contextstream/mcp-server hook");
+        expect(hook.command).toContain("hook pre-tool-use");
         expect(hook.type).toBe("command");
       }
 
       for (const hook of config?.UserPromptSubmit?.[0]?.hooks || []) {
-        expect(hook.command).toContain("npx @contextstream/mcp-server hook");
+        expect(hook.command).toContain("hook user-prompt-submit");
         expect(hook.type).toBe("command");
       }
     });

@@ -87,8 +87,21 @@ export async function request<T>(
   const authOverride = getAuthOverride();
   const apiKey = authOverride?.apiKey ?? config.apiKey;
   const jwt = authOverride?.jwt ?? config.jwt;
+
+  const rawPath = path.startsWith("/") ? path : `/${path}`;
   // Ensure path has /api/v1 prefix
-  const apiPath = path.startsWith("/api/") ? path : `/api/v1${path}`;
+  const apiPath = rawPath.startsWith("/api/") ? rawPath : `/api/v1${rawPath}`;
+  const unauthenticatedEndpoints = ["/api/v1/auth/device/start", "/api/v1/auth/device/token"];
+  const isUnauthenticatedEndpoint = unauthenticatedEndpoints.some(
+    (endpoint) => apiPath === endpoint || apiPath.startsWith(`${endpoint}?`)
+  );
+
+  if (!isUnauthenticatedEndpoint && !apiKey && !jwt) {
+    const message = config.allowHeaderAuth
+      ? "Missing authentication: CONTEXTSTREAM_ALLOW_HEADER_AUTH is enabled, but this request did not include auth credentials."
+      : "Missing authentication: set CONTEXTSTREAM_API_KEY or CONTEXTSTREAM_JWT.";
+    throw new HttpError(401, message);
+  }
   const url = `${apiUrl.replace(/\/$/, "")}${apiPath}`;
   const maxRetries = options.retries ?? MAX_RETRIES;
   const baseDelay = options.retryDelay ?? BASE_DELAY;

@@ -125,7 +125,7 @@ describe("Hook Loop Prevention Scenarios", () => {
       expect(result.decision).not.toBe("block");
     });
 
-    it("should block discovery tools for indexed projects", () => {
+    it("should soft-redirect discovery tools for indexed projects", () => {
       setIndexStatus({
         [tempDir]: {
           indexed_at: new Date().toISOString(),
@@ -136,9 +136,8 @@ describe("Hook Loop Prevention Scenarios", () => {
       const hookInput = createHookInput("Glob", { pattern: "**/*.ts" }, tempDir);
       const result = runHookScript(hookInput);
 
-      // Should block and redirect to ContextStream search
-      expect(result.decision).toBe("block");
-      expect(result.reason?.toLowerCase()).toContain("contextstream");
+      // Claude behavior is a soft redirect via additionalContext, not a hard block
+      expect(result.decision).toBe("continue");
     });
 
     it("should NOT block Read tool (needed after ContextStream search)", () => {

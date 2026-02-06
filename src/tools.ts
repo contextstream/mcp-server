@@ -43,6 +43,18 @@ type ToolTextResult = {
   isError?: boolean;
 };
 
+function parseBoolEnvDefault(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined) return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+    return true;
+  }
+  if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+    return false;
+  }
+  return fallback;
+}
+
 // =============================================================================
 // CLEAN OUTPUT LOGGING SYSTEM
 // =============================================================================
@@ -1896,11 +1908,24 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
 const OUTPUT_FORMAT = process.env.CONTEXTSTREAM_OUTPUT_FORMAT || "compact";
 const COMPACT_OUTPUT = OUTPUT_FORMAT === "compact";
 const SHOW_TIMING = process.env.CONTEXTSTREAM_SHOW_TIMING === "true" || process.env.CONTEXTSTREAM_SHOW_TIMING === "1";
+const INCLUDE_STRUCTURED_CONTENT = parseBoolEnvDefault(
+  process.env.CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT,
+  true
+);
 const DEFAULT_SEARCH_LIMIT = parsePositiveInt(process.env.CONTEXTSTREAM_SEARCH_LIMIT, 3);
 const DEFAULT_SEARCH_CONTENT_MAX_CHARS = parsePositiveInt(
   process.env.CONTEXTSTREAM_SEARCH_MAX_CHARS,
   400
 );
+
+function maybeStripStructuredContent(result: ToolTextResult): ToolTextResult {
+  if (INCLUDE_STRUCTURED_CONTENT || !Object.prototype.hasOwnProperty.call(result, "structuredContent")) {
+    return result;
+  }
+
+  const { structuredContent: _structuredContent, ...rest } = result;
+  return rest;
+}
 
 // =============================================================================
 // END Strategy 7
@@ -2894,7 +2919,8 @@ export function registerTools(
         const integrationGated = await gateIfIntegrationTool(name);
         if (integrationGated) return integrationGated;
 
-        return await handler(input, extra);
+        const result = await handler(input, extra);
+        return maybeStripStructuredContent(result);
       } catch (error: any) {
         const errorMessage = error?.message || String(error);
         const errorDetails = error?.body || error?.details || null;
@@ -2919,11 +2945,11 @@ export function registerTools(
           },
         };
         const errorText = `[${errorCode}] ${errorMessage}${upgradeHint}${sessionHint}${errorDetails ? `: ${JSON.stringify(errorDetails)}` : ""}`;
-        return {
+        return maybeStripStructuredContent({
           content: [{ type: "text" as const, text: errorText }],
           structuredContent: errorPayload,
           isError: true,
-        };
+        });
       }
     };
 

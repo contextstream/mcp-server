@@ -457,31 +457,65 @@ type McpServerJson = {
 
 const IS_WINDOWS = process.platform === "win32";
 
-function buildContextStreamMcpServer(params: {
+type SetupEnvParams = {
   apiUrl: string;
   apiKey: string;
   toolset?: Toolset;
   contextPackEnabled?: boolean;
   showTiming?: boolean;
   restoreContextEnabled?: boolean;
-}): McpServerJson {
-  const env: Record<string, string> = {
+};
+
+function escapeTomlString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function formatTomlEnvLines(env: Record<string, string>): string {
+  return Object.entries(env)
+    .map(([key, value]) => `${key} = "${escapeTomlString(value)}"`)
+    .join("\n");
+}
+
+function buildSetupEnv(params: SetupEnvParams): Record<string, string> {
+  const contextPack = params.contextPackEnabled === false ? "false" : "true";
+  const progressive = params.toolset === "router" ? "true" : "false";
+  const restoreContext = params.restoreContextEnabled === false ? "false" : "true";
+  const showTiming = params.showTiming ? "true" : "false";
+
+  return {
     CONTEXTSTREAM_API_URL: params.apiUrl,
     CONTEXTSTREAM_API_KEY: params.apiKey,
+    CONTEXTSTREAM_JWT: "",
+    CONTEXTSTREAM_ALLOW_HEADER_AUTH: "false",
+    CONTEXTSTREAM_WORKSPACE_ID: "",
+    CONTEXTSTREAM_PROJECT_ID: "",
+    CONTEXTSTREAM_USER_AGENT: `contextstream-mcp/${VERSION}`,
+    CONTEXTSTREAM_TOOLSET: "standard",
+    CONTEXTSTREAM_TOOL_ALLOWLIST: "",
+    CONTEXTSTREAM_AUTO_TOOLSET: "false",
+    CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS: "true",
+    CONTEXTSTREAM_SCHEMA_MODE: "full",
+    CONTEXTSTREAM_PROGRESSIVE_MODE: progressive,
+    CONTEXTSTREAM_ROUTER_MODE: "false",
+    CONTEXTSTREAM_OUTPUT_FORMAT: "compact",
+    CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT: "true",
+    CONTEXTSTREAM_SEARCH_LIMIT: "3",
+    CONTEXTSTREAM_SEARCH_MAX_CHARS: "400",
+    CONTEXTSTREAM_CONSOLIDATED: "true",
+    CONTEXTSTREAM_CONTEXT_PACK: contextPack,
+    CONTEXTSTREAM_CONTEXT_PACK_ENABLED: contextPack,
+    CONTEXTSTREAM_RESTORE_CONTEXT: restoreContext,
+    CONTEXTSTREAM_SHOW_TIMING: showTiming,
+    CONTEXTSTREAM_PRO_TOOLS: "",
+    CONTEXTSTREAM_UPGRADE_URL: "https://contextstream.io/pricing",
+    CONTEXTSTREAM_ENABLE_PROMPTS: "true",
+    CONTEXTSTREAM_LOG_LEVEL: "normal",
   };
-  // v0.4.x: consolidated is default (true), router mode uses PROGRESSIVE_MODE
-  if (params.toolset === "router") {
-    env.CONTEXTSTREAM_PROGRESSIVE_MODE = "true";
-  }
-  env.CONTEXTSTREAM_CONTEXT_PACK = params.contextPackEnabled === false ? "false" : "true";
-  // Context restoration is enabled by default; only set env var if explicitly disabled
-  if (params.restoreContextEnabled === false) {
-    env.CONTEXTSTREAM_RESTORE_CONTEXT = "false";
-  }
-  if (params.showTiming) {
-    env.CONTEXTSTREAM_SHOW_TIMING = "true";
-  }
-  // consolidated is the default, no env var needed
+}
+
+function buildContextStreamMcpServer(params: SetupEnvParams): McpServerJson {
+  const env = buildSetupEnv(params);
+
   // Windows requires cmd /c wrapper to execute npx
   if (IS_WINDOWS) {
     return {
@@ -504,31 +538,9 @@ type VsCodeServerJson = {
   env: Record<string, string>;
 };
 
-function buildContextStreamVsCodeServer(params: {
-  apiUrl: string;
-  apiKey: string;
-  toolset?: Toolset;
-  contextPackEnabled?: boolean;
-  showTiming?: boolean;
-  restoreContextEnabled?: boolean;
-}): VsCodeServerJson {
-  const env: Record<string, string> = {
-    CONTEXTSTREAM_API_URL: params.apiUrl,
-    CONTEXTSTREAM_API_KEY: params.apiKey,
-  };
-  // v0.4.x: consolidated is default (true), router mode uses PROGRESSIVE_MODE
-  if (params.toolset === "router") {
-    env.CONTEXTSTREAM_PROGRESSIVE_MODE = "true";
-  }
-  env.CONTEXTSTREAM_CONTEXT_PACK = params.contextPackEnabled === false ? "false" : "true";
-  // Context restoration is enabled by default; only set env var if explicitly disabled
-  if (params.restoreContextEnabled === false) {
-    env.CONTEXTSTREAM_RESTORE_CONTEXT = "false";
-  }
-  if (params.showTiming) {
-    env.CONTEXTSTREAM_SHOW_TIMING = "true";
-  }
-  // consolidated is the default, no env var needed
+function buildContextStreamVsCodeServer(params: SetupEnvParams): VsCodeServerJson {
+  const env = buildSetupEnv(params);
+
   // Windows requires cmd /c wrapper to execute npx
   if (IS_WINDOWS) {
     return {
@@ -653,22 +665,17 @@ function claudeDesktopConfigPath(): string | null {
 
 async function upsertCodexTomlConfig(
   filePath: string,
-  params: { apiUrl: string; apiKey: string; toolset?: Toolset; contextPackEnabled?: boolean; showTiming?: boolean; restoreContextEnabled?: boolean }
+  params: SetupEnvParams
 ): Promise<"created" | "updated" | "skipped"> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const exists = await fileExists(filePath);
   const existing = exists ? await fs.readFile(filePath, "utf8").catch(() => "") : "";
+  const env = buildSetupEnv(params);
+  const envLines = formatTomlEnvLines(env);
 
   const marker = "[mcp_servers.contextstream]";
   const envMarker = "[mcp_servers.contextstream.env]";
 
-  // v0.4.x: consolidated is default, router uses PROGRESSIVE_MODE
-  const toolsetLine =
-    params.toolset === "router" ? `CONTEXTSTREAM_PROGRESSIVE_MODE = "true"\n` : "";
-  const contextPackLine = `CONTEXTSTREAM_CONTEXT_PACK = "${params.contextPackEnabled === false ? "false" : "true"}"\n`;
-  // Context restoration is enabled by default; only set env var if explicitly disabled
-  const restoreContextLine = params.restoreContextEnabled === false ? `CONTEXTSTREAM_RESTORE_CONTEXT = "false"\n` : "";
-  const showTimingLine = params.showTiming ? `CONTEXTSTREAM_SHOW_TIMING = "true"\n` : "";
   // Windows requires cmd /c wrapper to execute npx
   const commandLine = IS_WINDOWS
     ? `command = "cmd"\nargs = ["/c", "npx", "--prefer-online", "-y", "@contextstream/mcp-server@latest"]\n`
@@ -678,12 +685,8 @@ async function upsertCodexTomlConfig(
     `[mcp_servers.contextstream]\n` +
     commandLine +
     `\n[mcp_servers.contextstream.env]\n` +
-    `CONTEXTSTREAM_API_URL = "${params.apiUrl}"\n` +
-    `CONTEXTSTREAM_API_KEY = "${params.apiKey}"\n` +
-    toolsetLine +
-    contextPackLine +
-    restoreContextLine +
-    showTimingLine;
+    envLines +
+    "\n";
 
   if (!exists) {
     await fs.writeFile(filePath, block.trimStart(), "utf8");
@@ -702,10 +705,8 @@ async function upsertCodexTomlConfig(
       "\n\n" +
       envMarker +
       "\n" +
-      `CONTEXTSTREAM_API_URL = "${params.apiUrl}"\n` +
-      `CONTEXTSTREAM_API_KEY = "${params.apiKey}"\n` +
-      toolsetLine +
-      contextPackLine,
+      envLines +
+      "\n",
       "utf8"
     );
     return "updated";
@@ -714,54 +715,47 @@ async function upsertCodexTomlConfig(
   const lines = existing.split(/\r?\n/);
   const out: string[] = [];
   let inEnv = false;
-  let sawUrl = false;
-  let sawKey = false;
-  let sawContextPack = false;
+  const seen = new Set<string>();
+  const managedKeys = new Set(Object.keys(env));
 
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
       if (inEnv && trimmed !== envMarker) {
-        if (!sawUrl) out.push(`CONTEXTSTREAM_API_URL = "${params.apiUrl}"`);
-        if (!sawKey) out.push(`CONTEXTSTREAM_API_KEY = "${params.apiKey}"`);
-        if (!sawContextPack)
-          out.push(
-            `CONTEXTSTREAM_CONTEXT_PACK = "${params.contextPackEnabled === false ? "false" : "true"}"`
-          );
+        for (const [key, value] of Object.entries(env)) {
+          if (!seen.has(key)) {
+            out.push(`${key} = "${escapeTomlString(value)}"`);
+          }
+        }
         inEnv = false;
       }
-      if (trimmed === envMarker) inEnv = true;
+      if (trimmed === envMarker) {
+        inEnv = true;
+        seen.clear();
+      }
       out.push(line);
       continue;
     }
 
-    if (inEnv && /^\s*CONTEXTSTREAM_API_URL\s*=/.test(line)) {
-      out.push(`CONTEXTSTREAM_API_URL = "${params.apiUrl}"`);
-      sawUrl = true;
-      continue;
+    if (inEnv) {
+      const match = line.match(/^\s*([A-Za-z0-9_]+)\s*=/);
+      if (match && managedKeys.has(match[1])) {
+        const key = match[1];
+        out.push(`${key} = "${escapeTomlString(env[key])}"`);
+        seen.add(key);
+        continue;
+      }
     }
-    if (inEnv && /^\s*CONTEXTSTREAM_API_KEY\s*=/.test(line)) {
-      out.push(`CONTEXTSTREAM_API_KEY = "${params.apiKey}"`);
-      sawKey = true;
-      continue;
-    }
-    if (inEnv && /^\s*CONTEXTSTREAM_CONTEXT_PACK\s*=/.test(line)) {
-      out.push(
-        `CONTEXTSTREAM_CONTEXT_PACK = "${params.contextPackEnabled === false ? "false" : "true"}"`
-      );
-      sawContextPack = true;
-      continue;
-    }
+
     out.push(line);
   }
 
   if (inEnv) {
-    if (!sawUrl) out.push(`CONTEXTSTREAM_API_URL = "${params.apiUrl}"`);
-    if (!sawKey) out.push(`CONTEXTSTREAM_API_KEY = "${params.apiKey}"`);
-    if (!sawContextPack)
-      out.push(
-        `CONTEXTSTREAM_CONTEXT_PACK = "${params.contextPackEnabled === false ? "false" : "true"}"`
-      );
+    for (const [key, value] of Object.entries(env)) {
+      if (!seen.has(key)) {
+        out.push(`${key} = "${escapeTomlString(value)}"`);
+      }
+    }
   }
 
   const updated = out.join("\n");

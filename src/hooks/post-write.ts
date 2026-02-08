@@ -370,6 +370,19 @@ async function indexFile(
   if (!response.ok) {
     throw new Error(`API error: ${response.status} ${response.statusText}`);
   }
+
+  // Parse response for cooldown/rate limiting (silently skip — not an error)
+  try {
+    const body = (await response.json()) as { data?: { status?: string } };
+    if (
+      body?.data?.status === "cooldown" ||
+      body?.data?.status === "daily_limit_exceeded"
+    ) {
+      return;
+    }
+  } catch {
+    // Ignore JSON parse failures — response might be empty on success
+  }
 }
 
 /**

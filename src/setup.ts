@@ -907,8 +907,12 @@ async function indexProjectWithProgress(
   const ingestWithRetry = async (batch: any[], maxRetries = 3): Promise<number> => {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const result = (await client.ingestFiles(projectId, batch)) as { data?: { files_indexed?: number } };
-        return result.data?.files_indexed ?? batch.length;
+        const result = (await client.ingestFiles(projectId, batch)) as { data?: { files_indexed?: number; status?: string } };
+        // On cooldown or daily limit, return 0 (not batch.length)
+        if (result.data?.status === "cooldown" || result.data?.status === "daily_limit_exceeded") {
+          return 0;
+        }
+        return result.data?.files_indexed ?? 0;
       } catch (err: any) {
         const isTimeout = err.message?.includes("Timeout") || err.message?.includes("timeout");
         if (attempt < maxRetries && isTimeout) {
@@ -919,7 +923,7 @@ async function indexProjectWithProgress(
         throw err;
       }
     }
-    return batch.length;
+    return 0;
   };
 
   let failedBatches = 0;

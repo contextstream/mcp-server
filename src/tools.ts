@@ -19,6 +19,7 @@ import { getAuthOverride, runWithAuthOverride, type AuthOverride } from "./auth-
 import {
   installClaudeCodeHooks,
   markProjectIndexed,
+  clearProjectIndex,
   installEditorHooks,
   installAllEditorHooks,
   type SupportedEditor,
@@ -3147,40 +3148,42 @@ export function registerTools(
     ingestOptions: { write_to_disk?: boolean; overwrite?: boolean; force?: boolean },
     options: { preflight?: boolean } = {}
   ): void {
+    // Pre-write index status to prevent race conditions
+    markProjectIndexed(resolvedPath, { project_id: projectId }).catch(() => {});
+
     (async () => {
       try {
         if (options.preflight) {
           const fileCheck = await countIndexableFiles(resolvedPath, { maxFiles: 1 });
           if (fileCheck.count === 0) {
             logDebug(`No indexable files in ${resolvedPath}`);
+            await clearProjectIndex(resolvedPath, projectId);
             return;
           }
         }
 
-        let totalIndexed = 0;
-        let batchCount = 0;
-
         logTool("ingest", "start", `indexing ${resolvedPath}`);
 
-        for await (const batch of readAllFilesInBatches(resolvedPath, { batchSize: 50 })) {
-          const result = (await client.ingestFiles(projectId, batch, ingestOptions)) as {
-            data?: { files_indexed: number };
-          };
-          totalIndexed += result.data?.files_indexed ?? batch.length;
-          batchCount++;
-        }
+        const result = await client.ingestLocal({
+          projectId,
+          rootPath: resolvedPath,
+          force: ingestOptions.force,
+          ingestOptions,
+        });
 
-        logTool("ingest", "done", `${totalIndexed} files`);
+        logTool(
+          "ingest",
+          "done",
+          `${result.filesIndexed} indexed, ${result.filesSkipped} unchanged, ${result.apiSkipped} API-deduped`
+        );
 
-        // Mark project as indexed so hooks know to enforce ContextStream-first behavior
-        try {
-          await markProjectIndexed(resolvedPath, { project_id: projectId });
-          logDebug(`Marked project as indexed: ${resolvedPath}`);
-        } catch (markError) {
-          logDebug(`Failed to mark project as indexed: ${markError}`);
+        if (result.abortedEarly) {
+          logDebug(`Ingest stopped early: ${result.status}`);
         }
       } catch (error) {
         logTool("ingest", "error", `${error}`);
+        // Rollback pre-written index status
+        await clearProjectIndex(resolvedPath, projectId).catch(() => {});
       }
     })();
   }

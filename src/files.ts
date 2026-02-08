@@ -838,3 +838,62 @@ export function detectLanguage(filePath: string): string {
   };
   return langMap[ext] ?? "unknown";
 }
+
+// ============================================================================
+// Content Hash Manifest — SHA-256 per file to skip unchanged files on re-index
+// ============================================================================
+
+/**
+ * Compute SHA-256 hex digest of a string.
+ */
+export function sha256Hex(content: string): string {
+  return crypto.createHash("sha256").update(content).digest("hex");
+}
+
+/**
+ * Get path to ~/.contextstream/file-hashes/{projectId}.json
+ */
+function hashManifestPath(projectId: string): string {
+  return path.join(os.homedir(), ".contextstream", "file-hashes", `${projectId}.json`);
+}
+
+/**
+ * Load the hash manifest for a project.
+ * Returns a Map of relative path → sha256 hex.
+ * Best-effort: returns empty map on any error.
+ */
+export function readHashManifest(projectId: string): Map<string, string> {
+  try {
+    const content = fs.readFileSync(hashManifestPath(projectId), "utf-8");
+    const parsed = JSON.parse(content) as Record<string, string>;
+    return new Map(Object.entries(parsed));
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * Write the hash manifest for a project. Best-effort.
+ */
+export function writeHashManifest(projectId: string, hashes: Map<string, string>): void {
+  const filePath = hashManifestPath(projectId);
+  try {
+    const dir = path.dirname(filePath);
+    fs.mkdirSync(dir, { recursive: true });
+    const obj = Object.fromEntries(hashes);
+    fs.writeFileSync(filePath, JSON.stringify(obj, null, 2));
+  } catch {
+    // Best-effort: silently ignore write failures
+  }
+}
+
+/**
+ * Delete the hash manifest for a project. Best-effort.
+ */
+export function deleteHashManifest(projectId: string): void {
+  try {
+    fs.unlinkSync(hashManifestPath(projectId));
+  } catch {
+    // Ignore errors (file may not exist)
+  }
+}

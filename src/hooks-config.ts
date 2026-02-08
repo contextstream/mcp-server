@@ -1140,6 +1140,22 @@ export async function unmarkProjectIndexed(projectPath: string): Promise<void> {
   await writeIndexStatus(status);
 }
 
+/**
+ * Clear index status AND hash manifest for a project.
+ * Used to roll back pre-written index status when background ingest fails,
+ * so a future session can retry the index.
+ */
+export async function clearProjectIndex(
+  projectPath: string,
+  projectId?: string
+): Promise<void> {
+  await unmarkProjectIndexed(projectPath);
+  if (projectId) {
+    const { deleteHashManifest } = await import("./files.js");
+    deleteHashManifest(projectId);
+  }
+}
+
 // =============================================================================
 // CLINE HOOKS SUPPORT
 // =============================================================================

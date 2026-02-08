@@ -4,7 +4,14 @@ import { z } from "zod";
 import type { Config } from "./config.js";
 import { request, HttpError } from "./http.js";
 import { getAuthOverride } from "./auth-context.js";
-import { readAllFilesInBatches, readChangedFilesInBatches } from "./files.js";
+import {
+  readAllFilesInBatches,
+  readChangedFilesInBatches,
+  sha256Hex,
+  readHashManifest,
+  writeHashManifest,
+  type FileToIngest,
+} from "./files.js";
 import {
   resolveWorkspace,
   readLocalConfig,
@@ -12,6 +19,7 @@ import {
   addGlobalMapping,
 } from "./workspace-config.js";
 import { globalCache, CacheKeys, CacheTTL } from "./cache.js";
+import { markProjectIndexed, clearProjectIndex } from "./hooks-config.js";
 import { VERSION, getUpdateNotice, getVersionWarning, getVersionInstructions, type VersionNotice } from "./version.js";
 
 const uuidSchema = z.string().uuid();
@@ -121,6 +129,40 @@ interface IngestRecommendation {
   benefits?: string[];
   command?: string;
 }
+
+/** Parsed API response from /files/ingest */
+interface IngestApiData {
+  files_received?: number;
+  files_indexed?: number;
+  files_skipped?: number;
+  credits_used?: number;
+  status?: "cooldown" | "up_to_date" | "completed" | "partial" | "daily_limit_exceeded";
+  message?: string;
+}
+
+/** Options for the high-level ingestLocal method */
+interface IngestLocalOptions {
+  projectId: string;
+  rootPath: string;
+  force?: boolean;
+  maxFiles?: number;
+  sinceTimestamp?: Date;
+  ingestOptions?: { write_to_disk?: boolean; overwrite?: boolean; force?: boolean };
+}
+
+/** Result from ingestLocal */
+interface IngestLocalResult {
+  totalFiles: number;
+  filesChanged: number;
+  filesIndexed: number;
+  filesSkipped: number;
+  apiSkipped: number;
+  status: "success" | "cooldown" | "daily_limit" | "partial" | "error";
+  abortedEarly: boolean;
+}
+
+// Auto-index file cap (matches Rust client)
+const AUTO_INDEX_FILE_CAP = 2000;
 
 // Project markers that indicate a directory is a standalone project
 const PROJECT_MARKERS = [
@@ -1433,6 +1475,107 @@ export class ContextStreamClient {
   }
 
   /**
+   * High-level local ingest: reads files from disk, applies SHA-256 content
+   * hash filtering, batches, and sends to the API with cooldown/status handling.
+   * Matches the Rust client's `ingest_local()` pattern.
+   */
+  async ingestLocal(opts: IngestLocalOptions): Promise<IngestLocalResult> {
+    const {
+      projectId,
+      rootPath,
+      force = false,
+      maxFiles,
+      sinceTimestamp,
+      ingestOptions,
+    } = opts;
+
+    const oldHashes = force ? new Map<string, string>() : readHashManifest(projectId);
+    const newHashes = new Map<string, string>();
+
+    let totalFiles = 0;
+    let filesSkippedByHash = 0;
+    let filesIndexed = 0;
+    let apiSkipped = 0;
+    let abortedEarly = false;
+    let lastStatus: IngestApiData["status"] = "completed";
+
+    const fileSource = sinceTimestamp
+      ? readChangedFilesInBatches(rootPath, sinceTimestamp, { batchSize: 50 })
+      : readAllFilesInBatches(rootPath, { batchSize: 50 });
+
+    for await (const batch of fileSource) {
+      if (maxFiles !== undefined && totalFiles >= maxFiles) break;
+
+      // Filter batch through content hashing
+      const filteredBatch: FileToIngest[] = [];
+      for (const file of batch) {
+        if (maxFiles !== undefined && totalFiles >= maxFiles) break;
+        totalFiles++;
+
+        const hash = sha256Hex(file.content);
+        newHashes.set(file.path, hash);
+
+        if (!force) {
+          const oldHash = oldHashes.get(file.path);
+          if (oldHash === hash) {
+            filesSkippedByHash++;
+            continue;
+          }
+        }
+
+        filteredBatch.push(file);
+      }
+
+      if (filteredBatch.length === 0) continue;
+
+      // Send filtered batch to API
+      try {
+        const result = (await this.ingestFiles(projectId, filteredBatch, ingestOptions)) as {
+          data?: IngestApiData;
+        };
+
+        const data = result.data;
+        if (data) {
+          filesIndexed += data.files_indexed ?? 0;
+          apiSkipped += data.files_skipped ?? 0;
+          lastStatus = data.status;
+
+          // Stop sending more batches on terminal statuses
+          if (data.status === "cooldown" || data.status === "daily_limit_exceeded") {
+            console.error(
+              `[ContextStream] Ingest ${data.status}: ${data.message ?? ""}. Stopping batch processing.`
+            );
+            abortedEarly = true;
+            break;
+          }
+        }
+      } catch (e) {
+        console.error(`[ContextStream] Batch ingest error:`, e);
+        // Continue with next batch on transient failure
+      }
+    }
+
+    // Write updated hash manifest (hashes are valid even on cooldown)
+    writeHashManifest(projectId, newHashes);
+
+    const status = abortedEarly
+      ? lastStatus === "daily_limit_exceeded"
+        ? "daily_limit" as const
+        : "cooldown" as const
+      : "success" as const;
+
+    return {
+      totalFiles,
+      filesChanged: totalFiles - filesSkippedByHash,
+      filesIndexed,
+      filesSkipped: filesSkippedByHash,
+      apiSkipped,
+      status,
+      abortedEarly,
+    };
+  }
+
+  /**
    * Check for changed files since last index and queue them for indexing.
    * This is used as a fallback for editors that don't support PostToolUse hooks.
    *
@@ -2087,17 +2230,25 @@ export class ContextStreamClient {
                   "Background ingestion started automatically. Your codebase will be searchable shortly.",
               } as IngestRecommendation;
 
-              // Fire-and-forget: start indexing in background (deferred to next event loop tick)
+              // Pre-write index status to prevent race conditions
               const projectIdCopy = projectId;
               const rootPathCopy = rootPath;
+              markProjectIndexed(rootPathCopy, { project_id: projectIdCopy }).catch(() => {});
+
+              // Fire-and-forget: start indexing in background (deferred to next event loop tick)
               setImmediate(async () => {
                 try {
-                  for await (const batch of readAllFilesInBatches(rootPathCopy, { batchSize: 50 })) {
-                    await this.ingestFiles(projectIdCopy, batch);
-                  }
-                  console.error(`[ContextStream] Background indexing completed for ${rootPathCopy}`);
+                  const result = await this.ingestLocal({
+                    projectId: projectIdCopy,
+                    rootPath: rootPathCopy,
+                    maxFiles: AUTO_INDEX_FILE_CAP,
+                  });
+                  console.error(
+                    `[ContextStream] Background indexing completed for ${rootPathCopy}: ${result.filesIndexed} indexed, ${result.filesSkipped} unchanged`
+                  );
                 } catch (e) {
                   console.error(`[ContextStream] Background indexing failed:`, e);
+                  clearProjectIndex(rootPathCopy, projectIdCopy).catch(() => {});
                 }
               });
             } else {
@@ -2307,23 +2458,17 @@ export class ContextStreamClient {
           const lastIndexedCopy = recommendation.last_indexed;
           setImmediate(async () => {
             try {
-              // Use incremental indexing if we have a last_indexed timestamp
-              if (useIncremental && lastIndexedCopy) {
-                const sinceDate = new Date(lastIndexedCopy);
-                for await (const batch of readChangedFilesInBatches(rootPathCopy, sinceDate, {
-                  batchSize: 50,
-                })) {
-                  await this.ingestFiles(projectIdCopy, batch);
-                }
-                console.error(
-                  `[ContextStream] Incremental index refresh completed for ${rootPathCopy}`
-                );
-              } else {
-                for await (const batch of readAllFilesInBatches(rootPathCopy, { batchSize: 50 })) {
-                  await this.ingestFiles(projectIdCopy, batch);
-                }
-                console.error(`[ContextStream] Full index refresh completed for ${rootPathCopy}`);
-              }
+              const sinceDate =
+                useIncremental && lastIndexedCopy ? new Date(lastIndexedCopy) : undefined;
+              const result = await this.ingestLocal({
+                projectId: projectIdCopy,
+                rootPath: rootPathCopy,
+                maxFiles: AUTO_INDEX_FILE_CAP,
+                sinceTimestamp: sinceDate,
+              });
+              console.error(
+                `[ContextStream] ${useIncremental ? "Incremental" : "Full"} index refresh completed for ${rootPathCopy}: ${result.filesIndexed} indexed, ${result.filesSkipped} unchanged`
+              );
             } catch (e) {
               console.error(`[ContextStream] Background index refresh failed:`, e);
             }
@@ -3506,10 +3651,14 @@ export class ContextStreamClient {
               `[ContextStream] Auto-indexing unindexed project ${projectIdCopy} (${recommendation.indexed_files ?? 0} files currently indexed)`
             );
             try {
-              for await (const batch of readAllFilesInBatches(rootPathCopy, { batchSize: 50 })) {
-                await this.ingestFiles(projectIdCopy, batch);
-              }
-              console.error(`[ContextStream] Auto-indexing completed for ${rootPathCopy}`);
+              const result = await this.ingestLocal({
+                projectId: projectIdCopy,
+                rootPath: rootPathCopy,
+                maxFiles: AUTO_INDEX_FILE_CAP,
+              });
+              console.error(
+                `[ContextStream] Auto-indexing completed for ${rootPathCopy}: ${result.filesIndexed} indexed, ${result.filesSkipped} unchanged`
+              );
             } finally {
               this.indexRefreshInProgress = false;
             }

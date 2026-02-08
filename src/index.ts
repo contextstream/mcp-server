@@ -260,9 +260,9 @@ async function main() {
         return;
       }
       default:
-        console.error(`Unknown hook: ${hookName}`);
-        console.error("Available hooks: pre-tool-use, user-prompt-submit, media-aware, pre-compact, post-write, auto-rules, on-bash, on-task, on-read, on-web, session-init, session-end, on-save-intent");
-        process.exit(1);
+        // Unknown hook - exit 0 to avoid "hook error" in editors.
+        // This happens when users have hooks from a newer version but run an older cached binary.
+        process.exit(0);
     }
   }
 

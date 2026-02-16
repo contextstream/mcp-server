@@ -779,6 +779,11 @@ const colors = {
 // Animated spinner frames
 const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+type ProjectSelection = {
+  id: string;
+  name: string;
+};
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -791,6 +796,130 @@ function createProgressBar(progress: number, width: number = 30): string {
   const filledBar = "█".repeat(filled);
   const emptyBar = "░".repeat(empty);
   return `${colors.cyan}${filledBar}${colors.dim}${emptyBar}${colors.reset}`;
+}
+
+async function selectProjectForCurrentDirectory(
+  client: ContextStreamClient,
+  cwd: string,
+  workspaceId: string | undefined,
+  dryRun: boolean,
+  rl: ReturnType<typeof createInterface>
+): Promise<ProjectSelection | undefined> {
+  if (!workspaceId || workspaceId === "dry-run") {
+    return undefined;
+  }
+
+  const folderName = path.basename(cwd) || "project";
+  let projects: Array<{ id?: string; name?: string }> = [];
+  try {
+    const result = (await client.listProjects({
+      workspace_id: workspaceId,
+      page_size: 200,
+    })) as any;
+    projects = Array.isArray(result?.items)
+      ? result.items
+      : Array.isArray(result?.data?.items)
+        ? result.data.items
+        : [];
+  } catch {
+    projects = [];
+  }
+
+  projects = projects
+    .filter((p) => typeof p?.id === "string" && typeof p?.name === "string")
+    .sort((a, b) => (a.name || "").toLowerCase().localeCompare((b.name || "").toLowerCase()));
+
+  const local = readLocalConfig(cwd);
+  const linked = local?.project_id
+    ? projects.find((p) => p.id === local.project_id)
+    : undefined;
+  const folderMatch = projects.find((p) => p.name?.toLowerCase() === folderName.toLowerCase());
+
+  const options: Array<{ label: string; kind: "existing" | "create" | "skip"; project?: { id: string; name: string } }> = [];
+  const seen = new Set<string>();
+
+  if (linked?.id && linked?.name) {
+    seen.add(linked.id);
+    options.push({
+      label: `Use currently linked project: ${linked.name} (${linked.id})`,
+      kind: "existing",
+      project: { id: linked.id, name: linked.name },
+    });
+  }
+
+  if (folderMatch?.id && folderMatch?.name && !seen.has(folderMatch.id)) {
+    seen.add(folderMatch.id);
+    options.push({
+      label: `Use project matching this folder: ${folderMatch.name} (${folderMatch.id})`,
+      kind: "existing",
+      project: { id: folderMatch.id, name: folderMatch.name },
+    });
+  }
+
+  for (const project of projects) {
+    if (!project.id || !project.name || seen.has(project.id)) continue;
+    seen.add(project.id);
+    options.push({
+      label: `Use existing project: ${project.name} (${project.id})`,
+      kind: "existing",
+      project: { id: project.id, name: project.name },
+    });
+  }
+
+  options.push({ label: `Create new project: ${folderName}`, kind: "create" });
+  options.push({ label: "Skip project selection", kind: "skip" });
+
+  if (options.length === 0) {
+    return undefined;
+  }
+
+  console.log("\nProject selection (current directory):");
+  options.forEach((opt, i) => console.log(`  ${i + 1}) ${opt.label}`));
+
+  const choiceRaw = normalizeInput(
+    await rl.question(`Choose [1-${options.length}] (default 1): `)
+  );
+  const choiceNum = Number.parseInt(choiceRaw || "1", 10);
+  const selected = Number.isFinite(choiceNum) ? options[choiceNum - 1] : options[0];
+
+  if (!selected || selected.kind === "skip") {
+    return undefined;
+  }
+
+  if (selected.kind === "existing" && selected.project) {
+    return selected.project;
+  }
+
+  if (selected.kind === "create") {
+    if (dryRun) {
+      return { id: "dry-run-project", name: folderName };
+    }
+
+    const created = (await client.createProject({
+      workspace_id: workspaceId,
+      name: folderName,
+      description: `Project linked from ${cwd}`,
+    })) as any;
+
+    const projectId =
+      typeof created?.id === "string"
+        ? created.id
+        : typeof created?.data?.id === "string"
+          ? created.data.id
+          : undefined;
+    const projectName =
+      typeof created?.name === "string"
+        ? created.name
+        : typeof created?.data?.name === "string"
+          ? created.data.name
+          : folderName;
+
+    if (projectId) {
+      return { id: projectId, name: projectName };
+    }
+  }
+
+  return undefined;
 }
 
 async function indexProjectWithProgress(
@@ -1225,6 +1354,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     // Workspace selection
     let workspaceId: string | undefined;
     let workspaceName: string | undefined;
+    let selectedCurrentProject: ProjectSelection | undefined;
 
     console.log("Workspace setup:");
     console.log("  1) Create a new workspace");
@@ -1290,6 +1420,21 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             workspaceName = selected.name;
           }
         }
+      }
+    }
+
+    if (workspaceId && workspaceId !== "dry-run") {
+      selectedCurrentProject = await selectProjectForCurrentDirectory(
+        client,
+        process.cwd(),
+        workspaceId,
+        dryRun,
+        rl
+      );
+      if (selectedCurrentProject) {
+        console.log(
+          `Selected project: ${selectedCurrentProject.name} (${selectedCurrentProject.id})\n`
+        );
       }
     }
 
@@ -1693,6 +1838,12 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             workspace_id: workspaceId,
             workspace_name: workspaceName,
             create_parent_mapping: createParentMapping,
+            ...(path.resolve(projectPath) === path.resolve(process.cwd()) && selectedCurrentProject
+              ? {
+                  project_id: selectedCurrentProject.id,
+                  project_name: selectedCurrentProject.name,
+                }
+              : {}),
             // Include version and config info for desktop app compatibility
             version: VERSION,
             configured_editors: configuredEditors,

@@ -2712,23 +2712,41 @@ export class ContextStreamClient {
     workspace_id: string;
     workspace_name?: string;
     create_parent_mapping?: boolean; // Also create a parent folder mapping
+    project_id?: string;
+    project_name?: string;
     // Additional config fields for version tracking
     version?: string;
     configured_editors?: string[];
     context_pack?: boolean;
     api_url?: string;
   }) {
-    const { folder_path, workspace_id, workspace_name, create_parent_mapping, version, configured_editors, context_pack, api_url } = params;
+    const {
+      folder_path,
+      workspace_id,
+      workspace_name,
+      create_parent_mapping,
+      project_id,
+      project_name,
+      version,
+      configured_editors,
+      context_pack,
+      api_url,
+    } = params;
+
+    const existing = readLocalConfig(folder_path);
 
     // Save local config
     const saved = writeLocalConfig(folder_path, {
       workspace_id,
       workspace_name,
+      project_id: project_id ?? existing?.project_id,
+      project_name: project_name ?? existing?.project_name,
       associated_at: new Date().toISOString(),
       version,
       configured_editors,
       context_pack,
       api_url,
+      indexing_enabled: existing?.indexing_enabled,
       updated_at: new Date().toISOString(),
     });
 

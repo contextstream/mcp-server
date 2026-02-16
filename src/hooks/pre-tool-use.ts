@@ -15,11 +15,21 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import {
+  cleanupStale,
+  clearContextRequired,
+  clearInitRequired,
+  isContextFreshAndClean,
+  isContextRequired,
+  isInitRequired,
+  markStateChanged,
+} from "./prompt-state.js";
 
 const ENABLED = process.env.CONTEXTSTREAM_HOOK_ENABLED !== "false";
 const INDEX_STATUS_FILE = path.join(homedir(), ".contextstream", "indexed-projects.json");
 const DEBUG_FILE = "/tmp/pretooluse-hook-debug.log";
 const STALE_THRESHOLD_DAYS = 7;
+const CONTEXT_FRESHNESS_SECONDS = 120;
 
 const DISCOVERY_PATTERNS = ["**/*", "**/", "src/**", "lib/**", "app/**", "components/**"];
 
@@ -154,6 +164,127 @@ function extractToolInput(input: HookInput): HookInput["tool_input"] {
   return input.tool_input || input.parameters || input.toolParameters || {};
 }
 
+function normalizeContextstreamToolName(toolName: string): string | null {
+  const trimmed = toolName.trim();
+  if (!trimmed) return null;
+  const lower = trimmed.toLowerCase();
+
+  const prefixed = "mcp__contextstream__";
+  if (lower.startsWith(prefixed)) {
+    return lower.slice(prefixed.length);
+  }
+  if (lower.startsWith("contextstream__")) {
+    return lower.slice("contextstream__".length);
+  }
+  if (lower === "init" || lower === "context") {
+    return lower;
+  }
+  return null;
+}
+
+function actionFromToolInput(toolInput: HookInput["tool_input"]): string {
+  const maybeAction = (toolInput as any)?.action;
+  return typeof maybeAction === "string" ? maybeAction.trim().toLowerCase() : "";
+}
+
+function isContextstreamReadOnlyOperation(
+  toolName: string,
+  toolInput: HookInput["tool_input"]
+): boolean {
+  const action = actionFromToolInput(toolInput);
+  switch (toolName) {
+    case "workspace":
+      return action === "list" || action === "get";
+    case "memory":
+      return (
+        action === "list_docs" ||
+        action === "list_events" ||
+        action === "list_todos" ||
+        action === "list_tasks" ||
+        action === "list_transcripts" ||
+        action === "list_nodes" ||
+        action === "decisions" ||
+        action === "get_doc" ||
+        action === "get_event" ||
+        action === "get_task" ||
+        action === "get_todo" ||
+        action === "get_transcript"
+      );
+    case "session":
+      return action === "get_lessons" || action === "get_plan" || action === "list_plans" || action === "recall";
+    case "help":
+      return action === "version" || action === "tools" || action === "auth";
+    case "project":
+      return action === "list" || action === "get" || action === "index_status";
+    case "reminder":
+      return action === "list" || action === "active";
+    case "context":
+    case "init":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function isLikelyStateChangingTool(
+  toolLower: string,
+  toolInput: HookInput["tool_input"],
+  isContextstreamCall: boolean,
+  normalizedContextstreamTool: string | null
+): boolean {
+  if (isContextstreamCall && normalizedContextstreamTool) {
+    return !isContextstreamReadOnlyOperation(normalizedContextstreamTool, toolInput);
+  }
+
+  if (
+    [
+      "read",
+      "read_file",
+      "grep",
+      "glob",
+      "search",
+      "grep_search",
+      "code_search",
+      "semanticsearch",
+      "codebase_search",
+      "list_files",
+      "search_files",
+      "search_files_content",
+      "find_files",
+      "find_by_name",
+      "ls",
+      "cat",
+      "view",
+    ].includes(toolLower)
+  ) {
+    return false;
+  }
+
+  const writeMarkers = [
+    "write",
+    "edit",
+    "create",
+    "delete",
+    "remove",
+    "rename",
+    "move",
+    "patch",
+    "apply",
+    "insert",
+    "append",
+    "replace",
+    "update",
+    "commit",
+    "push",
+    "install",
+    "exec",
+    "run",
+    "bash",
+    "shell",
+  ];
+  return writeMarkers.some((marker) => toolLower.includes(marker));
+}
+
 /**
  * Output for Claude Code format (JSON decision based)
  * Must use exit 0 with JSON containing hookSpecificOutput.permissionDecision
@@ -206,6 +337,31 @@ function outputCursorAllow(): never {
   process.exit(0);
 }
 
+function blockWithMessage(editorFormat: "claude" | "cline" | "cursor", message: string): never {
+  if (editorFormat === "cline") {
+    outputClineBlock(message, "[CONTEXTSTREAM] Follow ContextStream startup requirements.");
+  } else if (editorFormat === "cursor") {
+    outputCursorBlock(message);
+  }
+  blockClaudeCode(message);
+}
+
+function allowTool(
+  editorFormat: "claude" | "cline" | "cursor",
+  cwd: string,
+  recordStateChange: boolean
+): never {
+  if (recordStateChange) {
+    markStateChanged(cwd);
+  }
+  if (editorFormat === "cline") {
+    outputClineAllow();
+  } else if (editorFormat === "cursor") {
+    outputCursorAllow();
+  }
+  process.exit(0);
+}
+
 function detectEditorFormat(input: HookInput): "claude" | "cline" | "cursor" {
   // Cline/Roo/Kilo format uses camelCase (hookName, toolName)
   if (input.hookName !== undefined || input.toolName !== undefined) {
@@ -254,8 +410,48 @@ export async function runPreToolUseHook(): Promise<void> {
   const cwd = extractCwd(input);
   const tool = extractToolName(input);
   const toolInput = extractToolInput(input);
+  const toolLower = tool.toLowerCase();
+  const normalizedContextstreamTool = normalizeContextstreamToolName(tool);
+  const isContextstreamCall = normalizedContextstreamTool !== null;
+  const recordStateChange = isLikelyStateChangingTool(
+    toolLower,
+    toolInput,
+    isContextstreamCall,
+    normalizedContextstreamTool
+  );
 
   fs.appendFileSync(DEBUG_FILE, `[PreToolUse] tool=${tool}, cwd=${cwd}, editorFormat=${editorFormat}\n`);
+
+  cleanupStale(180);
+
+  if (isInitRequired(cwd)) {
+    if (isContextstreamCall && normalizedContextstreamTool === "init") {
+      clearInitRequired(cwd);
+    } else {
+      const required = "mcp__contextstream__init(...)";
+      const msg = `First call required for this session: ${required}. Run it before any other MCP tool. Then call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>").`;
+      blockWithMessage(editorFormat, msg);
+    }
+  }
+
+  if (isContextRequired(cwd)) {
+    if (isContextstreamCall && normalizedContextstreamTool === "context") {
+      clearContextRequired(cwd);
+    } else if (isContextstreamCall && normalizedContextstreamTool === "init") {
+      // Allow init before context on the first message in a session.
+    } else if (
+      isContextstreamCall &&
+      normalizedContextstreamTool &&
+      isContextstreamReadOnlyOperation(normalizedContextstreamTool, toolInput) &&
+      isContextFreshAndClean(cwd, CONTEXT_FRESHNESS_SECONDS)
+    ) {
+      // Narrow bypass: immediate read-only calls are allowed if context is fresh and unchanged.
+    } else {
+      const msg =
+        'First call required for this prompt: mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>"). Run it before any other MCP tool.';
+      blockWithMessage(editorFormat, msg);
+    }
+  }
 
   // Check if project is indexed
   const { isIndexed } = isProjectIndexed(cwd);
@@ -263,12 +459,7 @@ export async function runPreToolUseHook(): Promise<void> {
   if (!isIndexed) {
     // Project not indexed - allow local tools
     fs.appendFileSync(DEBUG_FILE, `[PreToolUse] Project not indexed, allowing\n`);
-    if (editorFormat === "cline") {
-      outputClineAllow();
-    } else if (editorFormat === "cursor") {
-      outputCursorAllow();
-    }
-    process.exit(0);
+    allowTool(editorFormat, cwd, recordStateChange);
   }
 
   // Check tool and block if needed
@@ -277,7 +468,7 @@ export async function runPreToolUseHook(): Promise<void> {
     fs.appendFileSync(DEBUG_FILE, `[PreToolUse] Glob pattern=${pattern}, isDiscovery=${isDiscoveryGlob(pattern)}\n`);
     // Only intercept broad discovery patterns (e.g., **/*.ts, src/**)
     if (isDiscoveryGlob(pattern)) {
-      const msg = `STOP: Use mcp__contextstream__search(mode="auto", query="${pattern}") instead of Glob.`;
+      const msg = `This project index is current. Use mcp__contextstream__search(mode="auto", query="${pattern}") instead of Glob for faster, richer code results.`;
       fs.appendFileSync(DEBUG_FILE, `[PreToolUse] Intercepting discovery glob: ${msg}\n`);
       if (editorFormat === "cline") {
         outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream search for code discovery.");
@@ -300,7 +491,7 @@ export async function runPreToolUseHook(): Promise<void> {
         }
         blockClaudeCode(msg);
       } else {
-        const msg = `STOP: Use mcp__contextstream__search(mode="auto", query="${pattern}") instead of ${tool}.`;
+        const msg = `This project index is current. Use mcp__contextstream__search(mode="auto", query="${pattern}") instead of ${tool} for faster, richer code results.`;
         if (editorFormat === "cline") {
           outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream search for code discovery.");
         } else if (editorFormat === "cursor") {
@@ -312,7 +503,7 @@ export async function runPreToolUseHook(): Promise<void> {
   } else if (tool === "Task") {
     const subagentType = (toolInput as { subagent_type?: string })?.subagent_type?.toLowerCase() || "";
     if (subagentType === "explore") {
-      const msg = 'STOP: Use mcp__contextstream__search(mode="auto") instead of Task(Explore).';
+      const msg = 'Project index is current. Use mcp__contextstream__search(mode="auto") instead of Task(Explore) for broad discovery.';
       if (editorFormat === "cline") {
         outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream search for code discovery.");
       } else if (editorFormat === "cursor") {
@@ -322,7 +513,7 @@ export async function runPreToolUseHook(): Promise<void> {
     }
     if (subagentType === "plan") {
       const msg =
-        'STOP: Use mcp__contextstream__session(action="capture_plan") for planning. ContextStream plans persist across sessions.';
+        'After your plan is ready, save it with mcp__contextstream__session(action="capture_plan"). Then create tasks with mcp__contextstream__memory(action="create_task", title="...", plan_id="...").';
       if (editorFormat === "cline") {
         outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream plans for persistence.");
       } else if (editorFormat === "cursor") {
@@ -332,7 +523,7 @@ export async function runPreToolUseHook(): Promise<void> {
     }
   } else if (tool === "EnterPlanMode") {
     const msg =
-      'STOP: Use mcp__contextstream__session(action="capture_plan", title="...", steps=[...]) instead of EnterPlanMode. ContextStream plans persist across sessions and are searchable.';
+      'After finalizing your plan, save it to ContextStream (not a local markdown file): mcp__contextstream__session(action="capture_plan", title="...", steps=[...]). Then create tasks with mcp__contextstream__memory(action="create_task", title="...", plan_id="...").';
     if (editorFormat === "cline") {
       outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream plans for persistence.");
     } else if (editorFormat === "cursor") {
@@ -345,22 +536,18 @@ export async function runPreToolUseHook(): Promise<void> {
   if (tool === "list_files" || tool === "search_files") {
     const pattern = toolInput?.path || (toolInput as { regex?: string })?.regex || "";
     if (isDiscoveryGlob(pattern) || isDiscoveryGrep(pattern)) {
-      const msg = `Use mcp__contextstream__search(mode="auto", query="${pattern}") instead of ${tool}. ContextStream search is indexed and faster.`;
+      const msg = `Project index is current. Use mcp__contextstream__search(mode="auto", query="${pattern}") instead of ${tool} for faster, richer code results.`;
       if (editorFormat === "cline") {
         outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream search for code discovery.");
       } else if (editorFormat === "cursor") {
         outputCursorBlock(msg);
       }
+      blockClaudeCode(msg);
     }
   }
 
   // Allow the tool
-  if (editorFormat === "cline") {
-    outputClineAllow();
-  } else if (editorFormat === "cursor") {
-    outputCursorAllow();
-  }
-  process.exit(0);
+  allowTool(editorFormat, cwd, recordStateChange);
 }
 
 // Auto-run if executed directly

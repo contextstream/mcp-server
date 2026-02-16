@@ -60,7 +60,7 @@ const CONTEXTSTREAM_RULES_BOOTSTRAP = `
 | Message | Required |
 |---------|----------|
 | **1st message** | \`init()\` → \`context(user_message="...")\` |
-| **Every message** | \`context(user_message="...")\` FIRST |
+| **Subsequent messages (default)** | \`context(user_message="...")\` FIRST (narrow read-only bypass when context is fresh and no state-changing tool has run) |
 | **Before file search** | \`search(mode="auto")\` BEFORE Glob/Grep/Read |
 </contextstream_rules>
 
@@ -80,27 +80,25 @@ v${RULES_VERSION}
 const CONTEXTSTREAM_RULES_DYNAMIC = CONTEXTSTREAM_RULES_BOOTSTRAP;
 
 const CONTEXTSTREAM_RULES_FULL = `
-## 🚨 MANDATORY: CALL CONTEXT EVERY MESSAGE 🚨
+## 🚨 MANDATORY STARTUP: CONTEXT-FIRST FLOW 🚨
 
 <contextstream_rules>
-**EVERY response MUST start with \`context(user_message="...")\`**
-
 | Message | What to Call |
 |---------|--------------|
-| 1st message | \`init()\` → \`context(user_message="<msg>")\` |
-| **EVERY message after** | \`context(user_message="<msg>")\` **FIRST** |
-
-**BEFORE Glob/Grep/Read/Search:** → \`search(mode="auto")\` FIRST
+| **First message in session** | \`init()\` → \`context(user_message="<msg>")\` BEFORE any other tool |
+| **Subsequent messages (default)** | \`context(user_message="<msg>")\` FIRST, then other tools |
+| **Narrow bypass** | Immediate read-only ContextStream calls are allowed only when prior context is fresh and no state-changing tool has run |
+| **Before Glob/Grep/Read/Search** | \`search(mode="auto", query="...")\` FIRST |
 </contextstream_rules>
 
-**This block MUST appear at the start of EVERY response.** Failing to call \`context()\` means missing rules, lessons, and relevant context.
+Use \`context()\` by default to get task-specific rules, lessons from past mistakes, and relevant decisions.
 
 ---
 
-## Why \`context()\` is MANDATORY Every Message
+## Why Default Context-First
 
-❌ **WRONG:** "I already called init, I don't need context"
-✅ **CORRECT:** \`context()\` is required EVERY message, not just the first
+❌ **Wrong:** "I already called init, so I can skip context for everything"
+✅ **Correct:** \`context()\` is the default first call for subsequent messages, with a narrow read-only bypass when context is still fresh and state is unchanged
 
 **What you lose without \`context()\`:**
 - Dynamic rules matched to your current task
@@ -108,7 +106,7 @@ const CONTEXTSTREAM_RULES_FULL = `
 - Semantically relevant decisions and context
 - Warnings about risky operations
 
-**\`init()\` gives recent items by TIME. \`context()\` finds items RELEVANT to THIS message.**
+**\`init()\` returns recent items by time. \`context()\` finds items semantically relevant to this message.**
 
 ---
 
@@ -615,9 +613,10 @@ const CONTEXTSTREAM_RULES_MINIMAL = `
 ## 🚨 CRITICAL: These Rules Are Non-Negotiable 🚨
 
 <contextstream_protocol>
-**EVERY coding response MUST start with:**
-1. \`init()\` (1st message only) → then \`context(user_message="<msg>")\`
-2. \`context(user_message="<msg>")\` (EVERY subsequent message)
+**MANDATORY STARTUP:**
+1. First message in session: \`init()\` → then \`context(user_message="<msg>")\`
+2. Subsequent messages (default): \`context(user_message="<msg>")\` FIRST
+3. Narrow bypass: immediate read-only ContextStream calls are allowed only when prior context is fresh and no state-changing tool has run
 
 **BEFORE Glob/Grep/Read/Search/Explore:**
 → \`search(mode="auto", query="...")\` FIRST — local tools ONLY if 0 results
@@ -647,8 +646,9 @@ Rules Version: ${RULES_VERSION}
 
 | When | Call |
 |------|------|
-| 1st message | \`init()\` → \`context(user_message="...")\` |
-| Every message after | \`context(user_message="...")\` |
+| 1st message in session | \`init()\` → \`context(user_message="...")\` |
+| Subsequent messages (default) | \`context(user_message="...")\` first |
+| Narrow bypass | Immediate read-only ContextStream calls when context is fresh and no state-changing tool has run |
 | Before ANY file discovery | \`search(mode="auto", query="...")\` |
 | On \`<system-reminder>\` | **Follow instructions inside** |
 | Save important decisions | \`session(action="capture", event_type="decision", ...)\` |
@@ -671,12 +671,10 @@ Rules Version: ${RULES_VERSION}
 - **[RULES_NOTICE]** → Run \`generate_rules()\`
 - **[VERSION_NOTICE]** → Tell user to update MCP
 
-## Fast Path (Simple Utilities Only)
+## Read-Only Examples
 
-Skip init/context ONLY for: "list workspaces", "show version", "list reminders"
-→ Just call: \`workspace(action="list")\`, \`help(action="version")\`, etc.
-
-Everything else = full protocol (init → context → search → work)
+Default behavior is context-first. Narrow bypass applies only for immediate read-only ContextStream calls when context is fresh and state is unchanged.
+Examples: \`workspace(action="list"|"get")\`, \`help(action="version"|"tools"|"auth")\`, \`project(action="index_status")\`.
 
 ### Lessons (Past Mistakes)
 
@@ -776,7 +774,7 @@ You MUST follow these rules manually - there is no automatic enforcement.
    - Check for [RULES_NOTICE] - update rules if needed
    - **save_exchange=true** saves each conversation turn for later retrieval
 
-4. **NEVER skip init/context** - you will miss critical context
+4. **Default behavior:** call \`context(...)\` first on each message. Narrow bypass is allowed only for immediate read-only ContextStream calls when previous context is still fresh and no state-changing tool has run.
 
 ---
 
@@ -785,7 +783,7 @@ You MUST follow these rules manually - there is no automatic enforcement.
 **This editor does NOT have hooks to auto-save transcripts.**
 You MUST save each conversation turn manually:
 
-### On EVERY message (including the first):
+### On MOST messages (including the first):
 \`\`\`
 context(user_message="<user's message>", save_exchange=true, session_id="<session-id>")
 \`\`\`
@@ -859,6 +857,28 @@ search(mode="auto", query="what you're looking for")
 
 **IF ContextStream search returns 0 results or errors:**
 → Use local tools (Glob/Grep/Read) as fallback
+
+### Choose Search Mode Intelligently:
+- \`auto\` (recommended): query-aware mode selection
+- \`hybrid\`: mixed semantic + keyword retrieval for broad discovery
+- \`semantic\`: conceptual questions ("how does X work?")
+- \`keyword\`: exact text / quoted string
+- \`pattern\`: glob or regex (\`*.ts\`, \`foo\\s+bar\`)
+- \`refactor\`: symbol usage / rename-safe lookup
+- \`exhaustive\`: all occurrences / complete match coverage
+- \`team\`: cross-project team search
+
+### Output Format Hints:
+- Use \`output_format="paths"\` for file listings and rename targets
+- Use \`output_format="count"\` for "how many" queries
+
+### Two-Phase Search Pattern (for precision):
+- Pass 1 (discovery): \`search(mode="auto", query="<concept + module>", output_format="paths", limit=10)\`
+- Pass 2 (precision): use one of:
+  - exact text/symbol: \`search(mode="keyword", query="\\"exact_text\\"", include_content=true)\`
+  - symbol usage: \`search(mode="refactor", query="SymbolName", output_format="paths")\`
+  - all occurrences: \`search(mode="exhaustive", query="symbol_or_text")\`
+- Then use local Read/Grep only on paths returned by ContextStream.
 
 ### When Local Tools Are OK:
 ✅ Project is not indexed

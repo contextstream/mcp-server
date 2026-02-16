@@ -799,7 +799,7 @@ async function indexProjectWithProgress(
   workspaceId?: string
 ): Promise<void> {
   const projectName = path.basename(projectPath);
-  console.log(`\n${colors.bright}Indexing: ${projectName}${colors.reset}`);
+  console.log(`\n${colors.bright}Updating index for '${projectName}'...${colors.reset}`);
   console.log(`${colors.dim}${projectPath}${colors.reset}\n`);
 
   // Get or create project
@@ -865,12 +865,12 @@ async function indexProjectWithProgress(
     const countResult = await countIndexableFiles(projectPath, { maxFiles: 50000 });
     totalFiles = countResult.count;
     if (countResult.stopped) {
-      console.log(`${colors.dim}Found 50,000+ indexable files${colors.reset}`);
+      console.log(`${colors.dim}Found 50,000+ files for indexing${colors.reset}`);
     } else if (totalFiles === 0) {
       console.log(`${colors.dim}No indexable files found${colors.reset}`);
       return;
     } else {
-      console.log(`${colors.dim}Found ${totalFiles.toLocaleString()} indexable files${colors.reset}`);
+      console.log(`${colors.dim}Found ${totalFiles.toLocaleString()} files for indexing${colors.reset}`);
     }
   } catch {
     console.log(`${colors.dim}Scanning files...${colors.reset}`);
@@ -956,15 +956,19 @@ async function indexProjectWithProgress(
     // Clear line and print completion
     process.stdout.write("\r" + " ".repeat(120) + "\r");
     if (failedBatches > 0) {
-      console.log(`${colors.yellow}✓${colors.reset} Indexed ${colors.bright}${filesIndexed.toLocaleString()}${colors.reset} files (${finalSize}) in ${elapsed}s (${failedBatches} batches had errors)`);
+      console.log(
+        `${colors.yellow}✓${colors.reset} Index update complete: ${colors.bright}${filesIndexed.toLocaleString()}${colors.reset} files indexed (${finalSize}) in ${elapsed}s (${failedBatches} batches had errors)`
+      );
     } else {
-      console.log(`${colors.green}✓${colors.reset} Indexed ${colors.bright}${filesIndexed.toLocaleString()}${colors.reset} files (${finalSize}) in ${elapsed}s`);
+      console.log(
+        `${colors.green}✓${colors.reset} Index update complete: ${colors.bright}${filesIndexed.toLocaleString()}${colors.reset} files indexed (${finalSize}) in ${elapsed}s`
+      );
     }
   } catch (err: any) {
     clearInterval(progressInterval);
     process.stdout.write("\r" + " ".repeat(120) + "\r");
     const msg = err instanceof Error ? err.message : String(err);
-    console.log(`${colors.yellow}! Indexing failed: ${msg}${colors.reset}`);
+    console.log(`${colors.yellow}! Index update failed: ${msg}${colors.reset}`);
   }
 }
 
@@ -1847,7 +1851,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             if (indexingEnabled) {
               await indexProjectWithProgress(client, process.cwd(), cwdConfig.workspace_id);
             } else {
-              console.log("\nSkipping indexing. You can index later with: contextstream-mcp index <path>");
+              console.log("\nIndexing skipped for now. You can start it later with: contextstream-mcp index <path>");
             }
           }
         } catch {
@@ -1864,7 +1868,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       console.log("Your code is private and securely stored.\n");
 
       const indexChoice = normalizeInput(
-        await rl.question("Perform indexing for full-featured context? [Y/n]: ")
+        await rl.question("Update index for full-featured context now? [Y/n]: ")
       ).toLowerCase();
 
       const indexingEnabled = indexChoice !== "n" && indexChoice !== "no";
@@ -1886,7 +1890,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
           await indexProjectWithProgress(client, projectPath, workspaceId);
         }
       } else {
-        console.log("\nSkipping indexing. You can index later with: contextstream-mcp index <path>");
+        console.log("\nIndexing skipped for now. You can start it later with: contextstream-mcp index <path>");
       }
     }
 

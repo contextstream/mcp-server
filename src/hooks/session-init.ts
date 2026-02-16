@@ -26,6 +26,7 @@ import {
   type AutoUpdateResult,
 } from "../version.js";
 import { generateRuleContent, getAvailableEditors, RULES_VERSION } from "../rules-templates.js";
+import { cleanupStale, markInitRequired } from "./prompt-state.js";
 
 const ENABLED = process.env.CONTEXTSTREAM_SESSION_INIT_ENABLED !== "false";
 
@@ -215,7 +216,9 @@ function formatContext(ctx: ContextResponse | null, options: FormatOptions = {})
   }
 
   if (!ctx) {
-    parts.push("\nNo stored context found. Call `mcp__contextstream__context(user_message=\"starting new session\")` to initialize.");
+    parts.push(
+      "\nNo saved context found yet. On the first message in this session call `mcp__contextstream__init(...)` then `mcp__contextstream__context(user_message=\"starting new session\")`."
+    );
     return parts.join("\n");
   }
 
@@ -252,7 +255,9 @@ function formatContext(ctx: ContextResponse | null, options: FormatOptions = {})
   }
 
   parts.push("\n---");
-  parts.push("Call `mcp__contextstream__context(user_message=\"...\")` for task-specific context.");
+  parts.push(
+    "On the first message in a new session call `mcp__contextstream__init(...)` then `mcp__contextstream__context(user_message=\"...\")`. After that, call `mcp__contextstream__context(user_message=\"...\")` on every message."
+  );
 
   return parts.join("\n");
 }
@@ -320,6 +325,8 @@ export async function runSessionInitHook(): Promise<void> {
   }
 
   const cwd = input.cwd || process.cwd();
+  cleanupStale(360);
+  markInitRequired(cwd);
   loadConfigFromMcpJson(cwd);
 
   // Check for pending update marker (update completed, needs restart)

@@ -28,6 +28,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
 import { VERSION, getUpdateNotice, getVersionNoticeForHook, type VersionNotice } from "../version.js";
+import { cleanupStale, markContextRequired, markInitRequired } from "./prompt-state.js";
 
 
 const ENABLED = process.env.CONTEXTSTREAM_REMINDER_ENABLED !== "false";
@@ -38,18 +39,19 @@ let WORKSPACE_ID: string | null = null;
 let PROJECT_ID: string | null = null;
 
 // Compact reminder for Claude Code (full rules already in CLAUDE.md)
-const REMINDER = `[CONTEXTSTREAM] Call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") FIRST before any other tool. Response contains dynamic rules, lessons, preferences. For search: use search(mode="auto") if indexed, else local tools.
+const REMINDER = `[CONTEXTSTREAM] On the first message in every session call mcp__contextstream__init(...), then call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") FIRST before any other tool. On subsequent messages, default to context first. Narrow bypass is allowed only for immediate read-only ContextStream calls when prior context is fresh and no state-changing tool has run. Response contains dynamic rules, lessons, preferences.
 COMMON MEMORY CALLS: list docs via memory(action="list_docs"), list lessons via session(action="get_lessons"), list plans via session(action="list_plans"), list tasks/todos via memory(action="list_tasks"|"list_todos").
 [END]`;
 
 // Full reminder for non-Claude editors that don't have CLAUDE.md context
 const FULL_REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
 
-1. FIRST: Call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") before ANY other tool
+1. FIRST MESSAGE IN SESSION: Call mcp__contextstream__init(...) then mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>")
    - Returns: dynamic rules, lessons from past mistakes, relevant context
    - Check response for: [LESSONS_WARNING], [RULES_NOTICE], preferences
    - save_exchange=true saves each conversation turn for later retrieval
    - Use a consistent session_id for the entire conversation (generate once on first message)
+   - On subsequent messages, default to context() first. Narrow bypass: immediate read-only ContextStream calls when context is fresh and no state-changing tool has run.
 
 2. FOR CODE SEARCH: Check index status, then search appropriately
    ⚠️ BEFORE searching: mcp__contextstream__project(action="index_status")
@@ -771,6 +773,11 @@ export async function runUserPromptSubmitHook(): Promise<void> {
 
   const editorFormat = detectEditorFormat(input);
   const cwd = input.cwd || process.cwd();
+  cleanupStale(180);
+  markContextRequired(cwd);
+  if (isNewSession(input, editorFormat)) {
+    markInitRequired(cwd);
+  }
 
   // Output format depends on editor
   if (editorFormat === "claude") {

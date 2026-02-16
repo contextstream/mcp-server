@@ -19,7 +19,7 @@ import {
   addGlobalMapping,
 } from "./workspace-config.js";
 import { globalCache, CacheKeys, CacheTTL } from "./cache.js";
-import { markProjectIndexed, clearProjectIndex } from "./hooks-config.js";
+import { markProjectIndexed, clearProjectIndex, readIndexStatus } from "./hooks-config.js";
 import { VERSION, getUpdateNotice, getVersionWarning, getVersionInstructions, type VersionNotice } from "./version.js";
 
 const uuidSchema = z.string().uuid();
@@ -162,7 +162,7 @@ interface IngestLocalResult {
 }
 
 // Auto-index file cap (matches Rust client)
-const AUTO_INDEX_FILE_CAP = 2000;
+const AUTO_INDEX_FILE_CAP = 10000;
 
 // Project markers that indicate a directory is a standalone project
 const PROJECT_MARKERS = [
@@ -1579,7 +1579,7 @@ export class ContextStreamClient {
    * Check for changed files since last index and queue them for indexing.
    * This is used as a fallback for editors that don't support PostToolUse hooks.
    *
-   * Throttled to run at most every 10 seconds and caps at 20 files per check.
+   * Throttled to run at most every 10 seconds and caps at 100 files per check.
    * Runs in fire-and-forget mode to avoid blocking tool responses.
    *
    * Call this from tool handlers like contextSmart() and search() to enable
@@ -1588,6 +1588,12 @@ export class ContextStreamClient {
   public async checkAndIndexChangedFiles(): Promise<void> {
     // Skip if no session context
     if (!this.sessionProjectId || !this.sessionRootPath) {
+      return;
+    }
+
+    // Incremental indexing should only run after a baseline index exists.
+    // Otherwise a small capped ingest can make indexing appear incomplete.
+    if (!(await this.hasBaselineIndex(this.sessionRootPath))) {
       return;
     }
 
@@ -1637,7 +1643,7 @@ export class ContextStreamClient {
       return;
     }
 
-    const MAX_FILES = 20;
+    const MAX_FILES = 100;
     const filesToIndex: Array<{ path: string; content: string; language?: string }> = [];
 
     try {
@@ -1667,6 +1673,29 @@ export class ContextStreamClient {
     } catch {
       // Silently ignore errors - this is best-effort background indexing
     }
+  }
+
+  /**
+   * Check local index-status tracking to confirm a baseline index exists.
+   */
+  private async hasBaselineIndex(rootPath: string): Promise<boolean> {
+    try {
+      const status = await readIndexStatus();
+      const resolvedRoot = path.resolve(rootPath);
+      for (const indexedPath of Object.keys(status.projects ?? {})) {
+        const resolvedIndexed = path.resolve(indexedPath);
+        if (
+          resolvedRoot === resolvedIndexed ||
+          resolvedRoot.startsWith(`${resolvedIndexed}${path.sep}`) ||
+          resolvedIndexed.startsWith(`${resolvedRoot}${path.sep}`)
+        ) {
+          return true;
+        }
+      }
+    } catch {
+      // Best-effort guard; fallback is to skip incremental indexing.
+    }
+    return false;
   }
 
   // Workspace extended operations (with caching)

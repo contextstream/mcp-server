@@ -45,8 +45,8 @@ const INDEXABLE_EXTENSIONS = new Set([
   ".prisma", ".proto",
 ]);
 
-// Max file size to index (1MB)
-const MAX_FILE_SIZE = 1024 * 1024;
+// Max file size to index (5MB)
+const MAX_FILE_SIZE = 5 * 1024 * 1024;
 
 interface HookInput {
   // Claude Code format

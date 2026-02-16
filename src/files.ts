@@ -145,8 +145,8 @@ const IGNORE_FILES = new Set([
   "composer.lock",
 ]);
 
-// Max file size to index (1MB)
-const MAX_FILE_SIZE = 1024 * 1024;
+// Max file size to index (5MB)
+const MAX_FILE_SIZE = 5 * 1024 * 1024;
 
 // Size-based batching configuration (matching API's BatchConfig::for_api())
 // Max total bytes per batch (10MB)

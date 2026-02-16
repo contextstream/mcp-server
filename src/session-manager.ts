@@ -111,6 +111,54 @@ export class SessionManager {
   }
 
   /**
+   * Update active workspace/project scope without resetting session identity.
+   * Used when tools auto-resolve stale scope from folder/local index context.
+   */
+  updateScope(input: { workspace_id?: string; project_id?: string; folder_path?: string }) {
+    const nextWorkspaceId =
+      typeof input.workspace_id === "string" && input.workspace_id.trim()
+        ? input.workspace_id
+        : undefined;
+    const nextProjectId =
+      typeof input.project_id === "string" && input.project_id.trim()
+        ? input.project_id
+        : undefined;
+    const nextFolderPath =
+      typeof input.folder_path === "string" && input.folder_path.trim()
+        ? input.folder_path
+        : undefined;
+
+    if (!this.context) {
+      this.context = {};
+    }
+
+    if (nextWorkspaceId) {
+      this.context.workspace_id = nextWorkspaceId;
+    }
+    if (nextProjectId) {
+      this.context.project_id = nextProjectId;
+    }
+    if (nextFolderPath) {
+      this.context.folder_path = nextFolderPath;
+      this.folderPath = nextFolderPath;
+    }
+
+    if (nextWorkspaceId || nextProjectId) {
+      this.initialized = true;
+      this.client.setDefaults({
+        workspace_id:
+          typeof this.context.workspace_id === "string"
+            ? (this.context.workspace_id as string)
+            : undefined,
+        project_id:
+          typeof this.context.project_id === "string"
+            ? (this.context.project_id as string)
+            : undefined,
+      });
+    }
+  }
+
+  /**
    * Set the folder path hint (can be passed from tools that know the workspace path)
    */
   setFolderPath(path: string) {

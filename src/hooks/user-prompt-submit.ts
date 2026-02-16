@@ -39,6 +39,7 @@ let PROJECT_ID: string | null = null;
 
 // Compact reminder for Claude Code (full rules already in CLAUDE.md)
 const REMINDER = `[CONTEXTSTREAM] Call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") FIRST before any other tool. Response contains dynamic rules, lessons, preferences. For search: use search(mode="auto") if indexed, else local tools.
+COMMON MEMORY CALLS: list docs via memory(action="list_docs"), list lessons via session(action="get_lessons"), list plans via session(action="list_plans"), list tasks/todos via memory(action="list_tasks"|"list_todos").
 [END]`;
 
 // Full reminder for non-Claude editors that don't have CLAUDE.md context

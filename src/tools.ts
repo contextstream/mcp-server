@@ -20,10 +20,13 @@ import {
   installClaudeCodeHooks,
   markProjectIndexed,
   clearProjectIndex,
+  readIndexStatus,
   installEditorHooks,
   installAllEditorHooks,
   type SupportedEditor,
 } from "./hooks-config.js";
+import { HttpError } from "./http.js";
+import { resolveWorkspace } from "./workspace-config.js";
 import { trackToolTokenSavings, type TokenSavingsToolType } from "./token-savings.js";
 import {
   getSessionInitTip,
@@ -3107,6 +3110,373 @@ export function registerTools(
     return normalizeUuid(
       typeof ctx?.project_id === "string" ? (ctx.project_id as string) : undefined
     );
+  }
+
+  function isNotFoundError(error: unknown): boolean {
+    return error instanceof HttpError && error.status === 404;
+  }
+
+  function isRequiresIngestEndpointError(error: unknown): boolean {
+    if (!(error instanceof HttpError)) return false;
+    if (error.status !== 400) return false;
+    const message = String(error.message || "").toLowerCase();
+    return message.includes("requires using the ingest endpoint");
+  }
+
+  function appendNote(existing: string | undefined, extra: string): string {
+    return existing ? `${existing} ${extra}` : extra;
+  }
+
+  function extractSearchEnvelope(result: any): { results: any[]; total: number } {
+    const data = result?.data ?? result ?? {};
+    const results = Array.isArray(data?.results) ? data.results : [];
+    const total = typeof data?.total === "number" ? data.total : results.length;
+    return { results, total };
+  }
+
+  function maxResultScore(result: any): number {
+    const { results } = extractSearchEnvelope(result);
+    let max = 0;
+    for (const entry of results) {
+      const score = typeof entry?.score === "number" ? entry.score : 0;
+      if (score > max) max = score;
+    }
+    return max;
+  }
+
+  function extractQuotedLiteral(query: string): string | undefined {
+    const trimmed = query.trim();
+    if (trimmed.length < 2) return undefined;
+    const isDoubleQuoted = trimmed.startsWith("\"") && trimmed.endsWith("\"");
+    const isSingleQuoted = trimmed.startsWith("'") && trimmed.endsWith("'");
+    if (!isDoubleQuoted && !isSingleQuoted) return undefined;
+    const literal = trimmed.slice(1, -1).trim();
+    return literal || undefined;
+  }
+
+  function escapeRegexLiteral(input: string): string {
+    return input.replace(/[\\.+*?()[\]{}|^$]/g, "\\$&");
+  }
+
+  const COUNT_QUERY_PREFIXES = ["how many ", "count ", "count of ", "number of ", "total "];
+  const ALL_MATCH_KEYWORDS = [
+    "all occurrences",
+    "all matches",
+    "find all",
+    "every usage",
+    "every occurrence",
+    "all usages",
+  ];
+  const TEAM_QUERY_KEYWORDS = [
+    "team-wide",
+    "teamwide",
+    "cross-project",
+    "cross project",
+    "across projects",
+    "all workspaces",
+    "all projects",
+  ];
+  const DOC_QUERY_KEYWORDS = ["doc", "docs", "document", "documents", "spec", "specification", "plan", "roadmap"];
+  const DOC_LOOKUP_VERBS = ["list", "show", "find", "open", "read", "lookup", "look up", "get"];
+  const QUESTION_WORDS = ["how", "what", "where", "why", "when", "which", "who", "does", "is", "can", "should"];
+  const HYBRID_LOW_CONFIDENCE_SCORE = 0.35;
+  const SEMANTIC_SWITCH_MIN_IMPROVEMENT = 0.08;
+
+  function isIdentifierQuery(query: string): boolean {
+    const trimmed = query.trim();
+    if (!trimmed || trimmed.length < 2 || trimmed.includes(" ")) return false;
+    if (!/^[A-Za-z0-9_:]+$/.test(trimmed)) return false;
+    const hasMixedCase = /[a-z]/.test(trimmed) && /[A-Z]/.test(trimmed);
+    const hasUnderscore = trimmed.includes("_");
+    const isAllCaps = trimmed.length >= 3 && /^[A-Z0-9_]+$/.test(trimmed);
+    return hasMixedCase || hasUnderscore || isAllCaps;
+  }
+
+  function hasRegexCharacters(query: string): boolean {
+    const trimmed = query.trim();
+    if (/[\^$+{}[\]|()\\]/.test(trimmed)) return true;
+    if (!trimmed.includes("?")) return false;
+    const trailingOnly = trimmed.endsWith("?") && !trimmed.slice(0, -1).includes("?");
+    return !trailingOnly;
+  }
+
+  function isGlobLike(query: string): boolean {
+    const trimmed = query.trim();
+    return trimmed.includes("*") || (trimmed.includes("?") && !trimmed.endsWith("?"));
+  }
+
+  function isCountQuery(queryLower: string): boolean {
+    return (
+      COUNT_QUERY_PREFIXES.some((prefix) => queryLower.startsWith(prefix)) ||
+      (queryLower.includes("how many") && queryLower.includes("are there"))
+    );
+  }
+
+  function isAllMatchesQuery(queryLower: string): boolean {
+    return ALL_MATCH_KEYWORDS.some((keyword) => queryLower.includes(keyword));
+  }
+
+  function isTeamQuery(queryLower: string): boolean {
+    return TEAM_QUERY_KEYWORDS.some((keyword) => queryLower.includes(keyword));
+  }
+
+  function isDocLookupQuery(query: string): boolean {
+    const lower = query.trim().toLowerCase();
+    if (!lower) return false;
+
+    if (
+      lower.includes(".rs") ||
+      lower.includes(".ts") ||
+      lower.includes(".js") ||
+      lower.includes("src/") ||
+      lower.includes("crates/") ||
+      lower.includes("function ") ||
+      lower.includes("class ")
+    ) {
+      return false;
+    }
+
+    const hasDocTerm = DOC_QUERY_KEYWORDS.some((keyword) => lower.includes(keyword));
+    if (!hasDocTerm) return false;
+
+    const hasLookupVerb = DOC_LOOKUP_VERBS.some((keyword) => lower.includes(keyword));
+    return hasLookupVerb || lower.startsWith("docs ") || lower.startsWith("doc ");
+  }
+
+  function recommendSearchMode(query: string): {
+    mode: "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor" | "team";
+    reason: string;
+  } {
+    const trimmed = query.trim();
+    if (!trimmed) {
+      return { mode: "hybrid", reason: "Defaulted to hybrid for broad discovery." };
+    }
+
+    const lower = trimmed.toLowerCase();
+    const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
+
+    if (isTeamQuery(lower)) {
+      return { mode: "team", reason: "Detected team/cross-project intent." };
+    }
+    if (isAllMatchesQuery(lower)) {
+      return {
+        mode: "exhaustive",
+        reason: "Detected all-occurrences intent; exhaustive mode is complete.",
+      };
+    }
+    if (extractQuotedLiteral(trimmed)) {
+      return { mode: "keyword", reason: "Detected quoted exact-match query." };
+    }
+    if (isGlobLike(trimmed) || hasRegexCharacters(trimmed)) {
+      return { mode: "pattern", reason: "Detected glob/regex pattern." };
+    }
+    if (isIdentifierQuery(trimmed)) {
+      return {
+        mode: "refactor",
+        reason: "Detected identifier-like query; refactor mode is more precise.",
+      };
+    }
+    if (QUESTION_WORDS.some((w) => lower.startsWith(w)) || trimmed.endsWith("?") || wordCount >= 3) {
+      return {
+        mode: "semantic",
+        reason: "Detected natural-language query; semantic mode is a better fit.",
+      };
+    }
+    return { mode: "hybrid", reason: "Hybrid mode provides balanced coverage." };
+  }
+
+  function suggestOutputFormat(
+    query: string,
+    mode: "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor" | "team"
+  ): "count" | "paths" | "minimal" | undefined {
+    const lower = query.trim().toLowerCase();
+    if (isCountQuery(lower)) {
+      return "count";
+    }
+
+    if (isIdentifierQuery(query)) {
+      if (mode === "refactor" || mode === "exhaustive") return "paths";
+      return "minimal";
+    }
+
+    return undefined;
+  }
+
+  function shouldRetrySemanticFallback(
+    query: string,
+    mode: "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor" | "team",
+    result: any
+  ): boolean {
+    if (mode !== "hybrid") return false;
+    if (recommendSearchMode(query).mode !== "semantic") return false;
+    const { results } = extractSearchEnvelope(result);
+    return results.length === 0 || maxResultScore(result) < HYBRID_LOW_CONFIDENCE_SCORE;
+  }
+
+  function shouldPreferSemanticResults(hybridResult: any, semanticResult: any): boolean {
+    const hybrid = extractSearchEnvelope(hybridResult);
+    const semantic = extractSearchEnvelope(semanticResult);
+    if (semantic.results.length === 0) return false;
+    if (hybrid.results.length === 0) return true;
+    const hybridTop = maxResultScore(hybridResult);
+    const semanticTop = maxResultScore(semanticResult);
+    return semanticTop > hybridTop + SEMANTIC_SWITCH_MIN_IMPROVEMENT;
+  }
+
+  function shouldRetryKeywordWithSemantic(query: string): boolean {
+    return recommendSearchMode(query).mode === "semantic";
+  }
+
+  function shouldRetryKeywordWithSymbolModes(query: string): boolean {
+    return isIdentifierQuery(query);
+  }
+
+  function extractCollectionArray(value: any): any[] | undefined {
+    if (Array.isArray(value)) return value;
+    if (!value || typeof value !== "object") return undefined;
+
+    for (const key of ["items", "results", "docs"]) {
+      if (Array.isArray(value[key])) return value[key];
+    }
+    if ("data" in value) return extractCollectionArray(value.data);
+    return undefined;
+  }
+
+  function tokenizeForDocMatch(query: string): string[] {
+    const stopWords = new Set([
+      "the",
+      "and",
+      "for",
+      "with",
+      "from",
+      "that",
+      "this",
+      "docs",
+      "doc",
+      "document",
+      "list",
+      "show",
+      "find",
+      "plan",
+      "phase",
+      "phases",
+    ]);
+    return query
+      .split(/[^A-Za-z0-9]+/)
+      .map((term) => term.trim().toLowerCase())
+      .filter((term) => term.length >= 3 && !stopWords.has(term));
+  }
+
+  function scoreDocMatch(doc: any, terms: string[]): number {
+    const title = String(doc?.title ?? doc?.name ?? doc?.summary ?? "").toLowerCase();
+    const content = String(doc?.content ?? "").toLowerCase();
+    const haystack = `${title} ${content}`;
+    return terms.reduce((score, term) => (haystack.includes(term) ? score + 1 : score), 0);
+  }
+
+  function rankDocsForQuery(docs: any[], query: string, limit: number): any[] {
+    const terms = tokenizeForDocMatch(query);
+    if (terms.length === 0) return docs.slice(0, limit);
+
+    const scored = docs.map((doc, idx) => ({ idx, score: scoreDocMatch(doc, terms) }));
+    scored.sort((a, b) => b.score - a.score || a.idx - b.idx);
+    const matched = scored
+      .filter((entry) => entry.score > 0)
+      .slice(0, limit)
+      .map((entry) => docs[entry.idx]);
+    return matched.length > 0 ? matched : docs.slice(0, limit);
+  }
+
+  async function findDocsFallback(
+    workspaceId: string | undefined,
+    candidateProjectIds: Array<string | undefined>,
+    query: string,
+    limit?: number
+  ): Promise<{ docs: any[]; project_id?: string } | undefined> {
+    const uniqueCandidates: Array<string | undefined> = [];
+    for (const candidate of candidateProjectIds) {
+      if (!uniqueCandidates.includes(candidate)) {
+        uniqueCandidates.push(candidate);
+      }
+    }
+
+    const maxDocs = Math.max(1, Math.min(limit ?? 20, 50));
+    for (const candidate of uniqueCandidates) {
+      try {
+        const docsResponse = await client.docsList({
+          workspace_id: workspaceId,
+          project_id: candidate,
+          per_page: maxDocs,
+        });
+        const items = extractCollectionArray(docsResponse);
+        if (!items || items.length === 0) continue;
+        const ranked = rankDocsForQuery(items, query, maxDocs);
+        if (ranked.length > 0) {
+          return { docs: ranked, project_id: candidate };
+        }
+      } catch {
+        // Ignore docs fallback failures per candidate.
+      }
+    }
+    return undefined;
+  }
+
+  async function indexedProjectIdForFolder(folderPath: string): Promise<string | undefined> {
+    const status = await readIndexStatus();
+    const projects = status.projects ?? {};
+    const resolvedFolder = path.resolve(folderPath);
+    let bestMatch: { projectId: string; matchLen: number } | undefined;
+
+    for (const [projectPath, info] of Object.entries(projects)) {
+      const resolvedProjectPath = path.resolve(projectPath);
+      const matches =
+        resolvedFolder === resolvedProjectPath ||
+        resolvedFolder.startsWith(`${resolvedProjectPath}${path.sep}`) ||
+        resolvedProjectPath.startsWith(`${resolvedFolder}${path.sep}`);
+      if (!matches) continue;
+      if (!info?.indexed_at) continue;
+
+      const indexedAt = new Date(info.indexed_at);
+      if (!Number.isNaN(indexedAt.getTime())) {
+        const diffDays = (Date.now() - indexedAt.getTime()) / (1000 * 60 * 60 * 24);
+        if (diffDays > 7) continue;
+      }
+
+      const projectId =
+        typeof info.project_id === "string" && info.project_id.trim()
+          ? info.project_id.trim()
+          : undefined;
+      if (!projectId) continue;
+
+      const matchLen = resolvedProjectPath.length;
+      if (!bestMatch || matchLen > bestMatch.matchLen) {
+        bestMatch = { projectId, matchLen };
+      }
+    }
+
+    return bestMatch?.projectId;
+  }
+
+  async function executeSearchMode(
+    mode: "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor",
+    params: ReturnType<typeof normalizeSearchParams>
+  ): Promise<any> {
+    switch (mode) {
+      case "hybrid":
+        return client.searchHybrid(params);
+      case "semantic":
+        return client.searchSemantic(params);
+      case "keyword":
+        return client.searchKeyword(params);
+      case "pattern":
+        return client.searchPattern(params);
+      case "exhaustive":
+        return client.searchExhaustive(params);
+      case "refactor":
+        return client.searchRefactor(params);
+      default:
+        return client.searchHybrid(params);
+    }
   }
 
   async function validateReadableDirectory(
@@ -8791,121 +9161,493 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         // Check and index changed files (fire and forget) - fallback for editors without hooks
         client.checkAndIndexChangedFiles().catch(() => {});
 
-        const params = normalizeSearchParams(input);
         const startTime = Date.now();
-        const requestedMode = input.mode || "auto";
+        const modeInput = input.mode || "auto";
+        const modeRecommendation = recommendSearchMode(input.query);
+        const modeAutoSelected = modeInput === "auto";
+        const requestedMode:
+          | "semantic"
+          | "hybrid"
+          | "keyword"
+          | "pattern"
+          | "exhaustive"
+          | "refactor"
+          | "team" = modeAutoSelected
+            ? modeRecommendation.mode
+            : modeInput === "auto"
+              ? "hybrid"
+              : modeInput;
 
-        let result;
-        let toolType: TokenSavingsToolType;
-        switch (requestedMode) {
-          case "auto":
-          case "hybrid":
-            result = await client.searchHybrid(params);
-            toolType = "search_hybrid";
-            break;
-          case "semantic":
-            result = await client.searchSemantic(params);
-            toolType = "search_semantic";
-            break;
-          case "keyword":
-            result = await client.searchKeyword(params);
-            toolType = "search_keyword";
-            break;
-          case "pattern":
-            result = await client.searchPattern(params);
-            toolType = "search_pattern";
-            break;
-          case "exhaustive":
-            result = await client.searchExhaustive(params);
-            toolType = "search_exhaustive";
-            break;
-          case "refactor":
-            result = await client.searchRefactor(params);
-            toolType = "search_refactor";
-            break;
-          case "team": {
-            // Check if user has a team plan
+        let workspaceId = resolveWorkspaceId(input.workspace_id);
+        const sessionProjectId = resolveProjectId(undefined);
+        const requestedExplicitProjectId = normalizeUuid(input.project_id);
+        let explicitProjectId = requestedExplicitProjectId;
+        let explicitProjectScopeNote: string | undefined;
+        const folderPath = resolveFolderPath(undefined, sessionManager);
+
+        let resolvedFolderProjectId: string | undefined;
+        if (folderPath) {
+          const mapping = resolveWorkspace(folderPath);
+          const mappedWorkspaceId = normalizeUuid(mapping.config?.workspace_id);
+          if (!workspaceId && mappedWorkspaceId) {
+            workspaceId = mappedWorkspaceId;
+          }
+          resolvedFolderProjectId = normalizeUuid(mapping.config?.project_id);
+        }
+
+        const localIndexProjectId = folderPath
+          ? await indexedProjectIdForFolder(folderPath)
+          : undefined;
+
+        if (explicitProjectId) {
+          try {
+            const project = (await client.getProject(explicitProjectId)) as any;
+            const projectWorkspaceId = normalizeUuid(project?.workspace_id || project?.workspaceId);
+            if (workspaceId && projectWorkspaceId && projectWorkspaceId !== workspaceId) {
+              explicitProjectScopeNote = `Explicit project_id ${explicitProjectId} belongs to workspace ${projectWorkspaceId}; auto-corrected to current workspace ${workspaceId}.`;
+              explicitProjectId = undefined;
+            }
+          } catch (error) {
+            if (isNotFoundError(error)) {
+              explicitProjectScopeNote = `Explicit project_id ${explicitProjectId} was not found; auto-corrected using folder/index project mapping.`;
+              explicitProjectId = undefined;
+            } else {
+              throw error;
+            }
+          }
+        }
+
+        const candidateProjectIds: Array<string | undefined> = [];
+        const pushCandidateProjectId = (candidate?: string) => {
+          if (!candidateProjectIds.includes(candidate)) {
+            candidateProjectIds.push(candidate);
+          }
+        };
+
+        if (explicitProjectId) {
+          pushCandidateProjectId(explicitProjectId);
+          pushCandidateProjectId(resolvedFolderProjectId);
+          pushCandidateProjectId(localIndexProjectId);
+          pushCandidateProjectId(sessionProjectId);
+        } else {
+          pushCandidateProjectId(resolvedFolderProjectId);
+          pushCandidateProjectId(localIndexProjectId);
+          pushCandidateProjectId(sessionProjectId);
+          if (candidateProjectIds.length === 0) {
+            pushCandidateProjectId(undefined);
+          }
+        }
+        pushCandidateProjectId(undefined);
+
+        const modeToToolType: Record<string, TokenSavingsToolType> = {
+          hybrid: "search_hybrid",
+          semantic: "search_semantic",
+          keyword: "search_keyword",
+          pattern: "search_pattern",
+          exhaustive: "search_exhaustive",
+          refactor: "search_refactor",
+          team: "search_hybrid",
+        };
+
+        const runSearchForMode = async (
+          mode:
+            | "semantic"
+            | "hybrid"
+            | "keyword"
+            | "pattern"
+            | "exhaustive"
+            | "refactor"
+            | "team",
+          baseParams: ReturnType<typeof normalizeSearchParams>
+        ): Promise<{ result: any; executedMode: typeof mode; fallbackNote?: string }> => {
+          if (mode === "team") {
             const isTeamPlanForSearch = await client.isTeamPlan();
             if (!isTeamPlanForSearch) {
-              return {
-                content: [
-                  {
-                    type: "text" as const,
-                    text: "Team search requires a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing",
-                  },
-                ],
-              };
+              throw new Error(
+                "Team search requires a Team subscription. Your current plan does not include team features.\n\nUpgrade at: https://contextstream.io/pricing"
+              );
             }
 
-            // Search across all team workspaces
             const teamWorkspacesForSearch = await client.listTeamWorkspaces({ page_size: 100 });
-            const workspacesForSearch = teamWorkspacesForSearch?.items || teamWorkspacesForSearch?.data?.items || [];
-
+            const workspacesForSearch =
+              teamWorkspacesForSearch?.items || teamWorkspacesForSearch?.data?.items || [];
             const allSearchResults: any[] = [];
-            const perWorkspaceLimit = input.limit ? Math.ceil(input.limit / Math.min(workspacesForSearch.length, 10)) : 5;
+            const perWorkspaceLimit = input.limit
+              ? Math.ceil(input.limit / Math.min(workspacesForSearch.length, 10))
+              : 5;
 
-            for (const ws of workspacesForSearch.slice(0, 10)) { // Limit to first 10 workspaces
+            for (const ws of workspacesForSearch.slice(0, 10)) {
               try {
-                const wsSearchResult = await client.searchHybrid({
-                  ...params,
+                const wsSearchResult = (await client.searchHybrid({
+                  ...baseParams,
                   workspace_id: ws.id,
+                  project_id: undefined,
                   limit: perWorkspaceLimit,
-                }) as any;
-                const wsResults = wsSearchResult?.data?.results || wsSearchResult?.results || [];
+                })) as any;
+                const wsResults = extractSearchEnvelope(wsSearchResult).results;
                 allSearchResults.push(
-                  ...wsResults.map((r: any) => ({
-                    ...r,
+                  ...wsResults.map((entry: any) => ({
+                    ...entry,
                     workspace_name: ws.name,
                     workspace_id: ws.id,
                   }))
                 );
               } catch {
-                // Skip workspaces we can't access
+                // Skip workspaces we can't access.
               }
             }
 
-            // Sort by score descending
-            allSearchResults.sort((a, b) => (b.score || 0) - (a.score || 0));
+            allSearchResults.sort((a, b) => (b?.score || 0) - (a?.score || 0));
             const limitedResults = allSearchResults.slice(0, input.limit || 20);
 
-            result = {
-              data: {
-                results: limitedResults,
-                total: limitedResults.length,
-                workspaces_searched: workspacesForSearch.length,
+            return {
+              result: {
+                data: {
+                  results: limitedResults,
+                  total: limitedResults.length,
+                  workspaces_searched: workspacesForSearch.length,
+                },
               },
+              executedMode: "team",
             };
-            toolType = "search_hybrid";
-            break;
           }
-          default:
-            result = await client.searchHybrid(params);
-            toolType = "search_hybrid";
+
+          const dispatchMode = mode === "hybrid" ? "hybrid" : mode;
+          let result = await executeSearchMode(dispatchMode, baseParams);
+          let executedMode: "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor" =
+            dispatchMode;
+          let fallbackNote: string | undefined;
+
+          if (shouldRetrySemanticFallback(input.query, dispatchMode, result)) {
+            try {
+              const semanticResult = await executeSearchMode("semantic", baseParams);
+              if (shouldPreferSemanticResults(result, semanticResult)) {
+                result = semanticResult;
+                executedMode = "semantic";
+                fallbackNote = appendNote(
+                  fallbackNote,
+                  "Hybrid results looked low-confidence for this natural-language query; retried with semantic and used semantic results."
+                );
+              }
+            } catch {
+              // Ignore fallback failure and keep original result.
+            }
+          }
+
+          const currentResults = () => extractSearchEnvelope(result).results;
+
+          if (dispatchMode === "keyword" && currentResults().length === 0) {
+            const literal = extractQuotedLiteral(input.query);
+            if (literal) {
+              if (literal !== baseParams.query) {
+                try {
+                  const keywordUnquoted = await executeSearchMode("keyword", {
+                    ...baseParams,
+                    query: literal,
+                  });
+                  if (extractSearchEnvelope(keywordUnquoted).results.length > 0) {
+                    result = keywordUnquoted;
+                    executedMode = "keyword";
+                    fallbackNote = appendNote(
+                      fallbackNote,
+                      "Quoted keyword search returned no results; retried keyword search without quotes."
+                    );
+                  }
+                } catch {
+                  // Keep existing results.
+                }
+              }
+
+              if (currentResults().length === 0) {
+                try {
+                  const patternResult = await executeSearchMode("pattern", {
+                    ...baseParams,
+                    query: escapeRegexLiteral(literal),
+                  });
+                  if (extractSearchEnvelope(patternResult).results.length > 0) {
+                    result = patternResult;
+                    executedMode = "pattern";
+                    fallbackNote = appendNote(
+                      fallbackNote,
+                      "Quoted keyword search returned no results; retried literal pattern search."
+                    );
+                  }
+                } catch {
+                  // Keep existing results.
+                }
+              }
+
+              if (currentResults().length === 0) {
+                try {
+                  const exhaustiveResult = await executeSearchMode("exhaustive", {
+                    ...baseParams,
+                    query: literal,
+                  });
+                  if (extractSearchEnvelope(exhaustiveResult).results.length > 0) {
+                    result = exhaustiveResult;
+                    executedMode = "exhaustive";
+                    fallbackNote = appendNote(
+                      fallbackNote,
+                      "Quoted keyword search returned no results; retried exhaustive search for complete literal coverage."
+                    );
+                  }
+                } catch {
+                  // Keep existing results.
+                }
+              }
+            }
+          }
+
+          if ((dispatchMode === "refactor" || dispatchMode === "exhaustive") && currentResults().length === 0) {
+            try {
+              const keywordResult = await executeSearchMode("keyword", baseParams);
+              if (extractSearchEnvelope(keywordResult).results.length > 0) {
+                result = keywordResult;
+                executedMode = "keyword";
+                fallbackNote = appendNote(
+                  fallbackNote,
+                  "Requested mode returned no results; retried keyword search and found matches."
+                );
+              }
+            } catch {
+              // Keep existing results.
+            }
+          }
+
+          if (dispatchMode === "keyword" && currentResults().length === 0) {
+            if (shouldRetryKeywordWithSymbolModes(input.query)) {
+              try {
+                const refactorResult = await executeSearchMode("refactor", baseParams);
+                if (extractSearchEnvelope(refactorResult).results.length > 0) {
+                  result = refactorResult;
+                  executedMode = "refactor";
+                  fallbackNote = appendNote(
+                    fallbackNote,
+                    "Keyword search returned no results; retried refactor search for identifier matching."
+                  );
+                }
+              } catch {
+                // Keep existing results.
+              }
+
+              if (currentResults().length === 0) {
+                try {
+                  const exhaustiveResult = await executeSearchMode("exhaustive", baseParams);
+                  if (extractSearchEnvelope(exhaustiveResult).results.length > 0) {
+                    result = exhaustiveResult;
+                    executedMode = "exhaustive";
+                    fallbackNote = appendNote(
+                      fallbackNote,
+                      "Keyword search returned no results; retried exhaustive search for complete identifier coverage."
+                    );
+                  }
+                } catch {
+                  // Keep existing results.
+                }
+              }
+            }
+
+            if (currentResults().length === 0 && shouldRetryKeywordWithSemantic(input.query)) {
+              try {
+                const semanticResult = await executeSearchMode("semantic", baseParams);
+                if (extractSearchEnvelope(semanticResult).results.length > 0) {
+                  result = semanticResult;
+                  executedMode = "semantic";
+                  fallbackNote = appendNote(
+                    fallbackNote,
+                    "Keyword search returned no results; retried semantic search for natural-language intent."
+                  );
+                }
+              } catch {
+                // Keep existing results.
+              }
+            }
+
+            if (currentResults().length === 0) {
+              try {
+                const hybridResult = await executeSearchMode("hybrid", baseParams);
+                if (extractSearchEnvelope(hybridResult).results.length > 0) {
+                  result = hybridResult;
+                  executedMode = "hybrid";
+                  fallbackNote = appendNote(
+                    fallbackNote,
+                    "Keyword search returned no results; retried hybrid search as a broad fallback."
+                  );
+                }
+              } catch {
+                // Keep existing results.
+              }
+            }
+          }
+
+          return { result, executedMode: executedMode as typeof mode, fallbackNote };
+        };
+
+        type SelectedSearch = {
+          index: number;
+          project_id?: string;
+          result: any;
+          executedMode:
+            | "semantic"
+            | "hybrid"
+            | "keyword"
+            | "pattern"
+            | "exhaustive"
+            | "refactor"
+            | "team";
+          fallbackNote?: string;
+        };
+
+        let selected: SelectedSearch | undefined;
+        let explicitScopeHadNoResults = false;
+
+        const baseParams = normalizeSearchParams({
+          ...input,
+          workspace_id: workspaceId,
+          project_id: undefined,
+          output_format:
+            input.output_format || suggestOutputFormat(input.query, requestedMode === "team" ? "hybrid" : requestedMode),
+        });
+
+        if (requestedMode === "team") {
+          try {
+            const teamResult = await runSearchForMode("team", {
+              ...baseParams,
+              project_id: undefined,
+            });
+            selected = {
+              index: 0,
+              project_id: undefined,
+              result: teamResult.result,
+              executedMode: "team",
+              fallbackNote: teamResult.fallbackNote,
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return errorResult(message);
+          }
+        } else {
+          for (const [index, candidateProjectId] of candidateProjectIds.entries()) {
+            const paramsForCandidate = {
+              ...baseParams,
+              workspace_id: workspaceId,
+              project_id: candidateProjectId,
+            };
+
+            try {
+              const modeResult = await runSearchForMode(requestedMode, paramsForCandidate);
+              const envelope = extractSearchEnvelope(modeResult.result);
+              if (explicitProjectId && index === 0 && envelope.results.length === 0) {
+                explicitScopeHadNoResults = true;
+              }
+
+              if (envelope.results.length > 0) {
+                selected = {
+                  index,
+                  project_id: candidateProjectId,
+                  result: modeResult.result,
+                  executedMode: modeResult.executedMode,
+                  fallbackNote: modeResult.fallbackNote,
+                };
+                break;
+              }
+
+              if (!selected) {
+                selected = {
+                  index,
+                  project_id: candidateProjectId,
+                  result: modeResult.result,
+                  executedMode: modeResult.executedMode,
+                  fallbackNote: modeResult.fallbackNote,
+                };
+              }
+            } catch (error) {
+              if (isNotFoundError(error)) {
+                continue;
+              }
+              throw error;
+            }
+          }
         }
 
+        if (!selected) {
+          const baseMessage =
+            "Project not found for current context. Call init(...) in this folder or pass a valid project_id explicitly.";
+          return errorResult(
+            explicitProjectScopeNote ? `${explicitProjectScopeNote} ${baseMessage}` : baseMessage
+          );
+        }
+
+        let modeFallbackNote = selected.fallbackNote;
+        if (explicitProjectScopeNote) {
+          modeFallbackNote = appendNote(modeFallbackNote, explicitProjectScopeNote);
+        }
+        if (explicitScopeHadNoResults && selected.index > 0) {
+          modeFallbackNote = appendNote(
+            modeFallbackNote,
+            "Explicit project_id returned no results; retried folder/local project mapping."
+          );
+        }
+        if (!selected.project_id && selected.index > 0) {
+          modeFallbackNote = appendNote(
+            modeFallbackNote,
+            "Project-scoped search returned no results; retried workspace-wide scope."
+          );
+        }
+        if (folderPath && localIndexProjectId && selected.project_id !== localIndexProjectId) {
+          const resolvedScope = selected.project_id || "workspace-wide scope";
+          modeFallbackNote = appendNote(
+            modeFallbackNote,
+            `Local index mapping for this folder points to project_id ${localIndexProjectId}; search resolved ${resolvedScope}. If results look stale, run project(action="ingest_local", path="${folderPath}").`
+          );
+        }
+
+        if (
+          requestedMode !== "team" &&
+          !explicitProjectId &&
+          sessionManager &&
+          folderPath &&
+          (selected.project_id !== sessionProjectId || workspaceId !== resolveWorkspaceId(undefined))
+        ) {
+          sessionManager.updateScope({
+            workspace_id: workspaceId,
+            project_id: selected.project_id || sessionProjectId,
+            folder_path: folderPath,
+          });
+        }
+
+        const docsFallback =
+          requestedMode !== "team" &&
+          isDocLookupQuery(input.query) &&
+          extractSearchEnvelope(selected.result).results.length === 0
+            ? await findDocsFallback(workspaceId, candidateProjectIds, input.query, input.limit)
+            : undefined;
+
         const roundTripMs = Date.now() - startTime;
-
-        // Build clean summary + full data (no value lost)
-        const data = (result as any)?.data || result;
-        const results = data?.results || [];
-        const total = data?.total ?? results.length;
-
+        const { results, total } = extractSearchEnvelope(selected.result);
         const lines: string[] = [];
 
-        // Clean summary header
         if (SHOW_TIMING) {
           lines.push(`✓ ${total} results in ${roundTripMs}ms`);
         } else {
           lines.push(`🔍 ${total} results for "${input.query}"`);
         }
 
-        // Quick reference list
+        if (modeAutoSelected) {
+          lines.push(`Mode auto-selected: \`${requestedMode}\`. ${modeRecommendation.reason}`);
+        }
+        if (modeFallbackNote) {
+          lines.push(modeFallbackNote);
+        }
+
         if (results.length > 0) {
           lines.push("");
           results.forEach((r: any, i: number) => {
             const filePath = r.file_path || "";
             const startLine = r.start_line || r.metadata?.start_line || "";
-            const location = startLine ? `${filePath}:${startLine}` : (r.location || filePath || r.breadcrumb || "");
+            const location = startLine
+              ? `${filePath}:${startLine}`
+              : r.location || filePath || r.breadcrumb || "";
             const language = r.language || r.metadata?.language || "";
             const score = r.score ? `${(r.score * 100).toFixed(0)}%` : "";
             const langTag = language ? `[${language}]` : "";
@@ -8913,20 +9655,77 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           });
         } else {
           lines.push("");
-          lines.push("No results found. Try a different query or search mode.");
+          if (docsFallback?.docs?.length) {
+            const docsScope = docsFallback.project_id
+              ? ` (project_id: ${docsFallback.project_id})`
+              : "";
+            lines.push(
+              `No codebase results found. This query looks like a docs lookup; found ${docsFallback.docs.length} docs in ContextStream memory${docsScope}:`
+            );
+            lines.push("");
+            docsFallback.docs.slice(0, 10).forEach((doc: any, i: number) => {
+              const title = doc?.title || doc?.name || doc?.summary || "Untitled";
+              const id = doc?.id || "unknown";
+              const docType = doc?.doc_type || "doc";
+              lines.push(`${i + 1}. ${title} (id: ${id}) [${docType}]`);
+            });
+            lines.push("");
+            lines.push(
+              `Use memory(action="get_doc", doc_id="...") to open a specific doc or memory(action="list_docs") to browse more.`
+            );
+          } else {
+            lines.push("No results found. Try a different query or search mode.");
+            if (isDocLookupQuery(input.query)) {
+              lines.push(
+                `This query appears to target saved docs. Try memory(action="list_docs") and then memory(action="get_doc", doc_id="...").`
+              );
+            }
+            if (folderPath) {
+              lines.push(
+                `If results seem stale after recent edits, refresh local index with project(action="ingest_local", path="${folderPath}").`
+              );
+            }
+          }
         }
 
-        // Full data preserved below summary (no value lost)
+        const rawData = (selected.result as any)?.data;
+        const structuredData =
+          rawData && typeof rawData === "object" ? { ...rawData } : { ...(selected.result as any) };
+        if (requestedMode !== "team") {
+          if (requestedExplicitProjectId) {
+            (structuredData as any).requested_explicit_project_id = requestedExplicitProjectId;
+            (structuredData as any).effective_explicit_project_id = explicitProjectId;
+            (structuredData as any).explicit_project_autocorrected =
+              requestedExplicitProjectId !== explicitProjectId;
+          }
+          if (selected.project_id !== sessionProjectId) {
+            (structuredData as any).original_project_id = sessionProjectId;
+          }
+          (structuredData as any).resolved_project_id = selected.project_id;
+          (structuredData as any).resolution_rank = selected.index;
+        }
+        if (docsFallback?.docs?.length) {
+          (structuredData as any).memory_docs_fallback = {
+            project_id: docsFallback.project_id,
+            docs: docsFallback.docs,
+            count: docsFallback.docs.length,
+          };
+        }
+        const resultWithMeta = {
+          ...(selected.result as any),
+          data: structuredData,
+        };
+
         lines.push("");
         lines.push("--- Full Results ---");
-        lines.push(formatContent(result));
+        lines.push(formatContent(resultWithMeta));
 
         const outputText = lines.join("\n");
+        const toolType = modeToToolType[selected.executedMode] || "search_hybrid";
 
-        // Track token savings (fire-and-forget)
         trackToolTokenSavings(client, toolType, outputText, {
-          workspace_id: params.workspace_id,
-          project_id: params.project_id,
+          workspace_id: workspaceId,
+          project_id: selected.project_id,
         });
 
         return {
@@ -9088,8 +9887,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         }),
       },
       async (input) => {
-        const workspaceId = resolveWorkspaceId(input.workspace_id);
-        const projectId = resolveProjectId(input.project_id);
+        let workspaceId = resolveWorkspaceId(input.workspace_id);
+        const explicitProjectId = normalizeUuid(input.project_id);
+        let projectId = explicitProjectId || resolveProjectId(undefined);
+        const folderPath =
+          input.folder_path || input.path || resolveFolderPath(undefined, sessionManager) || undefined;
 
         switch (input.action) {
           case "capture": {
@@ -10114,8 +10916,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         }),
       },
       async (input) => {
-        const workspaceId = resolveWorkspaceId(input.workspace_id);
-        const projectId = resolveProjectId(input.project_id);
+        let workspaceId = resolveWorkspaceId(input.workspace_id);
+        const explicitProjectId = normalizeUuid(input.project_id);
+        let projectId = explicitProjectId || resolveProjectId(undefined);
+        const folderPath =
+          input.folder_path || input.path || resolveFolderPath(undefined, sessionManager) || undefined;
 
         switch (input.action) {
           case "create_event": {
@@ -11345,8 +12150,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         }),
       },
       async (input) => {
-        const workspaceId = resolveWorkspaceId(input.workspace_id);
-        const projectId = resolveProjectId(input.project_id);
+        let workspaceId = resolveWorkspaceId(input.workspace_id);
+        const explicitProjectId = normalizeUuid(input.project_id);
+        let projectId = explicitProjectId || resolveProjectId(undefined);
+        const folderPath =
+          input.folder_path || input.path || resolveFolderPath(undefined, sessionManager) || undefined;
 
         switch (input.action) {
           case "list": {
@@ -11405,11 +12213,57 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!projectId) {
               return errorResult("index requires: project_id");
             }
-            const result = await client.indexProject(projectId);
-            return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
-            };
+            try {
+              const result = await client.indexProject(projectId);
+              return {
+                content: [{ type: "text" as const, text: formatContent(result) }],
+
+              };
+            } catch (error) {
+              if (!isRequiresIngestEndpointError(error)) {
+                throw error;
+              }
+
+              if (!folderPath) {
+                return errorResult(
+                  "Index endpoint is unavailable for this local project type and no folder context is set. Run project(action=\"ingest_local\", path=\"<folder>\")."
+                );
+              }
+
+              const validPath = await validateReadableDirectory(folderPath);
+              if (!validPath.ok) {
+                return errorResult(
+                  `Index endpoint is unavailable for this project type and folder context path is invalid: ${folderPath}. ${validPath.error}`
+                );
+              }
+
+              const ingestOptions = {
+                ...(input.write_to_disk !== undefined && { write_to_disk: input.write_to_disk }),
+                ...(input.overwrite !== undefined && { overwrite: input.overwrite }),
+                ...(input.force !== undefined && { force: input.force }),
+              };
+              startBackgroundIngest(projectId, validPath.resolvedPath, ingestOptions);
+
+              const response = {
+                status: "started",
+                message:
+                  "Index endpoint unavailable for this project type; started ingest_local fallback in background",
+                project_id: projectId,
+                path: validPath.resolvedPath,
+                fallback_action: "ingest_local",
+                note: "Use 'project' with action 'index_status' to monitor progress.",
+              };
+
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Index endpoint is unavailable for this local project type. Started ingest_local in background for directory: ${validPath.resolvedPath}. Use 'project' with action 'index_status' to monitor progress.`,
+                  },
+                ],
+                structuredContent: response,
+              };
+            }
           }
 
           case "overview": {
@@ -11446,13 +12300,121 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
 
           case "index_status": {
-            if (!projectId) {
-              return errorResult("index_status requires: project_id");
+            let resolvedFolderProjectId: string | undefined;
+            if (folderPath) {
+              const mapping = resolveWorkspace(folderPath);
+              const mappedWorkspaceId = normalizeUuid(mapping.config?.workspace_id);
+              if (!workspaceId && mappedWorkspaceId) {
+                workspaceId = mappedWorkspaceId;
+              }
+              resolvedFolderProjectId = normalizeUuid(mapping.config?.project_id);
             }
-            const result = await client.projectIndexStatus(projectId);
-            return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
+            const localIndexProjectId = folderPath
+              ? await indexedProjectIdForFolder(folderPath)
+              : undefined;
 
+            const candidateIds: string[] = [];
+            const pushCandidate = (id?: string) => {
+              if (id && !candidateIds.includes(id)) {
+                candidateIds.push(id);
+              }
+            };
+
+            if (explicitProjectId) {
+              pushCandidate(explicitProjectId);
+              pushCandidate(resolvedFolderProjectId);
+              pushCandidate(localIndexProjectId);
+              pushCandidate(projectId);
+            } else {
+              pushCandidate(resolvedFolderProjectId);
+              pushCandidate(localIndexProjectId);
+              pushCandidate(projectId);
+            }
+
+            if (candidateIds.length === 0) {
+              return errorResult(
+                "index_status requires: project_id. Call init(...) first or pass project_id explicitly."
+              );
+            }
+
+            let selected:
+              | {
+                  index: number;
+                  projectId: string;
+                  result: any;
+                  apiIndexed: boolean;
+                }
+              | undefined;
+
+            for (const [index, candidateId] of candidateIds.entries()) {
+              try {
+                const statusResult = await client.projectIndexStatus(candidateId);
+                const data = (statusResult as any)?.data ?? statusResult;
+                const apiIndexed = Boolean(data?.indexed);
+
+                if (apiIndexed) {
+                  selected = { index, projectId: candidateId, result: statusResult, apiIndexed };
+                  break;
+                }
+                if (!selected) {
+                  selected = { index, projectId: candidateId, result: statusResult, apiIndexed };
+                }
+              } catch (error) {
+                if (isNotFoundError(error)) {
+                  continue;
+                }
+                throw error;
+              }
+            }
+
+            if (!selected) {
+              return errorResult(
+                "Project not found for current context. Call init(...) in this folder or pass a valid project_id explicitly."
+              );
+            }
+
+            const originalProjectId = projectId;
+            if (projectId !== selected.projectId && folderPath) {
+              projectId = selected.projectId;
+              sessionManager?.updateScope({
+                workspace_id: workspaceId,
+                project_id: projectId,
+                folder_path: folderPath,
+              });
+            }
+
+            const locallyIndexed =
+              localIndexProjectId !== undefined
+                ? localIndexProjectId === selected.projectId
+                : Boolean(folderPath && (await indexedProjectIdForFolder(folderPath)));
+            const indexed = selected.apiIndexed || locallyIndexed;
+
+            const response =
+              selected.result && typeof selected.result === "object"
+                ? { ...(selected.result as any) }
+                : {};
+            const responseData =
+              response.data && typeof response.data === "object" ? { ...response.data } : {};
+            responseData.indexed = indexed;
+            if (locallyIndexed && !selected.apiIndexed) {
+              responseData.indexed_source = "local";
+            }
+            if (originalProjectId && originalProjectId !== selected.projectId) {
+              responseData.original_project_id = originalProjectId;
+            }
+            responseData.resolved_project_id = selected.projectId;
+            responseData.resolution_rank = selected.index;
+            response.data = responseData;
+
+            const text = indexed
+              ? locallyIndexed && !selected.apiIndexed
+                ? "Project index is ready (local state). Semantic search is available."
+                : "Project index is ready. Semantic search is available."
+              : "Project index not found. Run project(action=\"ingest_local\", path=\"<folder>\") to start indexing.";
+
+            return {
+              content: [{ type: "text" as const, text: `${text}\n\n${formatContent(response)}` }],
+              structuredContent: response,
             };
           }
 
@@ -11478,13 +12440,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
 
           case "ingest_local": {
-            if (!input.path) {
+            const ingestPath = input.path || input.folder_path;
+            if (!ingestPath) {
               return errorResult("ingest_local requires: path");
             }
             if (!projectId) {
               return errorResult("ingest_local requires: project_id");
             }
-            const validPath = await validateReadableDirectory(input.path);
+            const validPath = await validateReadableDirectory(ingestPath);
             if (!validPath.ok) {
               return errorResult(validPath.error);
             }
@@ -11497,7 +12460,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const forceNote = input.force ? " (force mode - version checks bypassed)" : "";
             const result = {
               status: "started",
-              message: `Ingestion running in background${forceNote}`,
+              message: `Updating index in background${forceNote}`,
               project_id: projectId,
               path: validPath.resolvedPath,
               ...(input.write_to_disk !== undefined && { write_to_disk: input.write_to_disk }),
@@ -11509,7 +12472,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               content: [
                 {
                   type: "text" as const,
-                  text: `Ingestion started in background${forceNote} for directory: ${validPath.resolvedPath}. Use 'project' with action 'index_status' to monitor progress.`,
+                  text: `Updating index in background${forceNote} for directory: ${validPath.resolvedPath}. Use 'project' with action 'index_status' to monitor progress.`,
                 },
               ],
 

@@ -1680,6 +1680,11 @@ export class ContextStreamClient {
    */
   private async hasBaselineIndex(rootPath: string): Promise<boolean> {
     try {
+      const localProjectId = await ContextStreamClient.indexedProjectIdForFolder(rootPath);
+      if (localProjectId) {
+        return true;
+      }
+
       const status = await readIndexStatus();
       const resolvedRoot = path.resolve(rootPath);
       for (const indexedPath of Object.keys(status.projects ?? {})) {
@@ -1696,6 +1701,57 @@ export class ContextStreamClient {
       // Best-effort guard; fallback is to skip incremental indexing.
     }
     return false;
+  }
+
+  /**
+   * Return the locally tracked project_id for a folder from indexed-projects.json.
+   * Uses longest-prefix path matching and ignores stale entries (>7 days old).
+   */
+  static async indexedProjectIdForFolder(folderPath: string): Promise<string | undefined> {
+    const status = await readIndexStatus();
+    const projects = status.projects ?? {};
+    const resolvedFolder = path.resolve(folderPath);
+
+    let bestMatch: { projectId: string; matchLen: number } | null = null;
+    for (const [projectPath, info] of Object.entries(projects)) {
+      const resolvedProjectPath = path.resolve(projectPath);
+      if (
+        !(
+          resolvedFolder === resolvedProjectPath ||
+          resolvedFolder.startsWith(`${resolvedProjectPath}${path.sep}`) ||
+          resolvedProjectPath.startsWith(`${resolvedFolder}${path.sep}`)
+        )
+      ) {
+        continue;
+      }
+
+      if (ContextStreamClient.isStaleIndexEntry(info?.indexed_at)) {
+        continue;
+      }
+
+      const projectId =
+        typeof info?.project_id === "string" && info.project_id.trim()
+          ? info.project_id.trim()
+          : undefined;
+      if (!projectId) {
+        continue;
+      }
+
+      const matchLen = resolvedProjectPath.length;
+      if (!bestMatch || matchLen > bestMatch.matchLen) {
+        bestMatch = { projectId, matchLen };
+      }
+    }
+
+    return bestMatch?.projectId;
+  }
+
+  private static isStaleIndexEntry(indexedAt?: string): boolean {
+    if (!indexedAt) return false;
+    const parsed = new Date(indexedAt);
+    if (Number.isNaN(parsed.getTime())) return false;
+    const diffDays = (Date.now() - parsed.getTime()) / (1000 * 60 * 60 * 24);
+    return diffDays > 7;
   }
 
   // Workspace extended operations (with caching)
@@ -3644,6 +3700,14 @@ export class ContextStreamClient {
     const format = params.format || "minified";
     const usePackDefault = this.config.contextPackEnabled !== false && !!withDefaults.project_id;
     const mode = params.mode || (usePackDefault ? "pack" : "standard");
+    const contextTimeoutSeconds = (() => {
+      const raw = process.env.MCP_CONTEXT_SMART_TIMEOUT_SECS;
+      if (!raw) return 45;
+      const parsed = Number(raw.trim());
+      if (!Number.isFinite(parsed)) return 45;
+      if (parsed < 5 || parsed > 55) return 45;
+      return Math.floor(parsed);
+    })();
 
     if (!withDefaults.workspace_id) {
       return {
@@ -3721,6 +3785,8 @@ export class ContextStreamClient {
           ...(params.client_name !== undefined && { client_name: params.client_name }),
           ...(params.assistant_message !== undefined && { assistant_message: params.assistant_message }),
         },
+        timeoutMs: contextTimeoutSeconds * 1000,
+        retries: 0,
       });
       const data = unwrapApiResponse<any>(apiResult);
 

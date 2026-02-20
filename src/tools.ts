@@ -39,6 +39,14 @@ import {
   WORKSPACE_HINTS,
   PROJECT_HINTS,
 } from "./microcopy.js";
+import {
+  apiResultIsIndexing,
+  apiResultReportsIndexed,
+  classifyIndexConfidence,
+  classifyIndexFreshness,
+  extractIndexTimestamp,
+  indexHistoryEntryCount,
+} from "./project-index-utils.js";
 
 type StructuredContent = { [x: string]: unknown } | undefined;
 type ToolTextResult = {
@@ -12349,8 +12357,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             for (const [index, candidateId] of candidateIds.entries()) {
               try {
                 const statusResult = await client.projectIndexStatus(candidateId);
-                const data = (statusResult as any)?.data ?? statusResult;
-                const apiIndexed = Boolean(data?.indexed);
+                const apiIndexed = apiResultReportsIndexed(statusResult);
 
                 if (apiIndexed) {
                   selected = { index, projectId: candidateId, result: statusResult, apiIndexed };
@@ -12387,7 +12394,20 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               localIndexProjectId !== undefined
                 ? localIndexProjectId === selected.projectId
                 : Boolean(folderPath && (await indexedProjectIdForFolder(folderPath)));
+            const apiIndexing = apiResultIsIndexing(selected.result);
             const indexed = selected.apiIndexed || locallyIndexed;
+            const indexedAt = extractIndexTimestamp(selected.result);
+            const ageHours =
+              indexedAt !== undefined
+                ? Math.floor((Date.now() - indexedAt.getTime()) / (1000 * 60 * 60))
+                : undefined;
+            const freshness = classifyIndexFreshness(indexed, ageHours);
+            const { confidence: confidenceLevel, reason: confidenceReason } = classifyIndexConfidence(
+              indexed,
+              selected.apiIndexed,
+              locallyIndexed,
+              freshness
+            );
 
             const response =
               selected.result && typeof selected.result === "object"
@@ -12404,13 +12424,38 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             }
             responseData.resolved_project_id = selected.projectId;
             responseData.resolution_rank = selected.index;
+            responseData.index_freshness = freshness;
+            responseData.index_age_hours = ageHours ?? null;
+            responseData.index_confidence = confidenceLevel;
+            responseData.index_confidence_reason = confidenceReason;
+            responseData.index_timestamp = indexedAt ? indexedAt.toISOString() : null;
+            responseData.index_in_progress = apiIndexing;
             response.data = responseData;
 
-            const text = indexed
-              ? locallyIndexed && !selected.apiIndexed
-                ? "Project index is ready (local state). Semantic search is available."
-                : "Project index is ready. Semantic search is available."
-              : "Project index not found. Run project(action=\"ingest_local\", path=\"<folder>\") to start indexing.";
+            let text = "";
+            if (apiIndexing) {
+              text = indexed
+                ? "Project indexing is in progress. Search is using the latest committed generation."
+                : "Project indexing is in progress. Semantic search will be available after the first commit.";
+            } else if (indexed) {
+              text =
+                locallyIndexed && !selected.apiIndexed
+                  ? "Project index is ready (local state). Semantic search is available."
+                  : "Project index is ready. Semantic search is available.";
+            } else {
+              text =
+                "Project index not found. Run project(action=\"ingest_local\", path=\"<folder>\") to start indexing.";
+            }
+
+            const ageDisplay = typeof ageHours === "number" ? `${ageHours}h` : "unknown";
+            text += ` Freshness: ${freshness} (${ageDisplay}). Confidence: ${confidenceLevel}.`;
+            if (confidenceLevel !== "high") {
+              text += ` ${confidenceReason}`;
+            }
+            if (freshness === "stale" || freshness === "missing") {
+              const ingestPath = folderPath || "<folder>";
+              text += ` Refresh with project(action=\"ingest_local\", path=\"${ingestPath}\").`;
+            }
 
             return {
               content: [{ type: "text" as const, text: `${text}\n\n${formatContent(response)}` }],
@@ -12433,9 +12478,34 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               page: input.page,
               limit: input.page_size,
             });
+            const count = indexHistoryEntryCount(result);
+            const response =
+              result && typeof result === "object"
+                ? Array.isArray(result)
+                  ? [...result]
+                  : { ...(result as any) }
+                : result;
+            if (response && typeof response === "object" && !Array.isArray(response)) {
+              (response as any).entries_count = count;
+              if ((response as any).data && typeof (response as any).data === "object") {
+                (response as any).data = {
+                  ...((response as any).data as Record<string, unknown>),
+                  entries_count: count,
+                };
+              }
+            }
+            const structuredHistory =
+              response && typeof response === "object" && !Array.isArray(response)
+                ? (response as StructuredContent)
+                : undefined;
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Found ${count} index history entries.\n\n${formatContent(response)}`,
+                },
+              ],
+              ...(structuredHistory ? { structuredContent: structuredHistory } : {}),
             };
           }
 

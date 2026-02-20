@@ -10835,6 +10835,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .enum(["pending", "in_progress", "completed", "blocked", "cancelled"])
             .optional()
             .describe("Task status"),
+          status: z
+            .enum(["pending", "in_progress", "completed", "blocked", "cancelled"])
+            .optional()
+            .describe("Backward-compatible alias for task_status in task actions"),
           priority: z
             .enum(["low", "medium", "high", "urgent"])
             .optional()
@@ -11207,6 +11211,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!workspaceId) {
               return errorResult("create_task requires workspace_id. Call session_init first.");
             }
+            const requestedTaskStatus = input.task_status ?? input.status;
             const result = await client.createTask({
               workspace_id: workspaceId,
               project_id: projectId,
@@ -11215,7 +11220,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               description: input.description,
               plan_id: input.plan_id ?? undefined,
               plan_step_id: input.plan_step_id,
-              status: input.task_status,
+              status: requestedTaskStatus,
               priority: input.priority,
               order: input.order,
               code_refs: input.code_refs,
@@ -11248,12 +11253,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.task_id) {
               return errorResult("update_task requires: task_id");
             }
+            const requestedTaskStatus = input.task_status ?? input.status;
             const result = await client.updateTask({
               task_id: input.task_id,
               title: input.title,
               content: input.content,
               description: input.description,
-              status: input.task_status,
+              status: requestedTaskStatus,
               priority: input.priority,
               order: input.order,
               plan_id: input.plan_id,
@@ -11264,11 +11270,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             // Add task lifecycle hint based on status
             let taskUpdateHint = "Task updated.";
-            if (input.task_status === "completed") {
+            if (requestedTaskStatus === "completed") {
               taskUpdateHint = TASK_HINTS.completed;
-            } else if (input.task_status === "blocked") {
+            } else if (requestedTaskStatus === "blocked") {
               taskUpdateHint = TASK_HINTS.blocked;
-            } else if (input.task_status === "cancelled") {
+            } else if (requestedTaskStatus === "cancelled") {
               taskUpdateHint = TASK_HINTS.cancelled;
             }
             const resultWithHint = { ...(result as object), hint: taskUpdateHint };
@@ -11295,11 +11301,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!workspaceId) {
               return errorResult("list_tasks requires workspace_id. Call session_init first.");
             }
+            const requestedTaskStatus = input.task_status ?? input.status;
             const result = await client.listTasks({
               workspace_id: workspaceId,
               project_id: projectId,
               plan_id: input.plan_id ?? undefined,
-              status: input.task_status,
+              status: requestedTaskStatus,
               priority: input.priority,
               limit: input.limit,
               is_personal: input.is_personal,
@@ -11624,11 +11631,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const workspacesForTasks = teamWorkspacesForTasks?.items || teamWorkspacesForTasks?.data?.items || [];
 
             const allTasks: any[] = [];
+            const requestedTaskStatus = input.task_status ?? input.status;
             for (const ws of workspacesForTasks.slice(0, 10)) {
               try {
                 const tasks = await client.listTasks({
                   workspace_id: ws.id,
-                  status: input.task_status as any,
+                  status: requestedTaskStatus as any,
                   limit: input.limit ? Math.ceil(input.limit / workspacesForTasks.length) : 10,
                 }) as any;
                 const items = tasks?.data?.tasks || tasks?.tasks || tasks?.data?.items || tasks?.items || [];

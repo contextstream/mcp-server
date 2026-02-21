@@ -2,7 +2,7 @@
  * Claude Code hooks configuration for ContextStream.
  *
  * These hooks help enforce ContextStream-first search behavior:
- * 1. PreToolUse: Blocks Grep/Glob/Read/Search and redirects to ContextStream search
+ * 1. PreToolUse: Blocks discovery tools (Glob/Grep/Search/Explore/Task/EnterPlanMode) and redirects to ContextStream search
  * 2. UserPromptSubmit: Injects reminder about ContextStream rules on every message
  */
 
@@ -90,7 +90,7 @@ export interface ClaudeHooksConfig {
 export const PRETOOLUSE_HOOK_SCRIPT = `#!/usr/bin/env python3
 """
 ContextStream PreToolUse Hook for Claude Code
-Blocks Grep/Glob/Search/Task(Explore)/EnterPlanMode and redirects to ContextStream.
+Blocks Grep/Glob/Search/Explore/Task(Explore|Plan)/EnterPlanMode and redirects to ContextStream.
 
 Only blocks if the current project is indexed in ContextStream.
 If not indexed, allows local tools through with a suggestion to index.
@@ -209,12 +209,18 @@ def main():
                 print(f"STOP: Use mcp__contextstream__search(mode=\\"auto\\", query=\\"{pattern}\\") instead of {tool}.", file=sys.stderr)
             sys.exit(2)
 
+    elif tool == "Explore":
+        print("STOP: Use mcp__contextstream__search(mode=\\"auto\\", output_format=\\"paths\\") instead of Explore.", file=sys.stderr)
+        sys.exit(2)
+
     elif tool == "Task":
-        if inp.get("subagent_type", "").lower() == "explore":
+        subagent = inp.get("subagent_type", "") or inp.get("subagentType", "")
+        subagent = subagent.lower()
+        if "explore" in subagent:
             print("STOP: Use mcp__contextstream__search(mode=\\"auto\\") instead of Task(Explore).", file=sys.stderr)
             sys.exit(2)
-        if inp.get("subagent_type", "").lower() == "plan":
-            print("STOP: Use mcp__contextstream__session(action=\\"capture_plan\\") for planning. ContextStream plans persist across sessions.", file=sys.stderr)
+        if "plan" in subagent:
+            print("STOP: For planning, use mcp__contextstream__search(mode=\\"auto\\", output_format=\\"paths\\") for discovery and mcp__contextstream__session(action=\\"capture_plan\\") for persistence.", file=sys.stderr)
             sys.exit(2)
 
     elif tool == "EnterPlanMode":
@@ -655,7 +661,7 @@ export function buildHooksConfig(options?: {
   const config: ClaudeHooksConfig["hooks"] = {
     PreToolUse: [
       {
-        matcher: "Glob|Grep|Search|Task|EnterPlanMode",
+        matcher: "Glob|Grep|Search|Explore|Task|EnterPlanMode",
         hooks: [
           {
             type: "command",
@@ -986,8 +992,8 @@ All hooks run via Node.js - no Python dependency required.
 
 ### PreToolUse Hook
 - **Command:** \`npx @contextstream/mcp-server hook pre-tool-use\`
-- **Purpose:** Blocks Glob/Grep/Search/EnterPlanMode and redirects to ContextStream
-- **Blocked tools:** Glob, Grep, Search, Task(Explore), Task(Plan), EnterPlanMode
+- **Purpose:** Blocks Glob/Grep/Search/Explore/Task/EnterPlanMode and redirects to ContextStream
+- **Blocked tools:** Glob, Grep, Search, Explore, Task(Explore), Task(Plan), EnterPlanMode
 - **Disable:** Set \`CONTEXTSTREAM_HOOK_ENABLED=false\` environment variable
 
 ### UserPromptSubmit Hook
@@ -1040,7 +1046,7 @@ If you prefer to configure manually, add to \`~/.claude/settings.json\`:
 {
   "hooks": {
     "PreToolUse": [{
-      "matcher": "Glob|Grep|Search|Task|EnterPlanMode",
+      "matcher": "Glob|Grep|Search|Explore|Task|EnterPlanMode",
       "hooks": [{"type": "command", "command": "npx @contextstream/mcp-server hook pre-tool-use"}]
     }],
     "UserPromptSubmit": [

@@ -41,7 +41,9 @@ describe("hooks-config", () => {
       expect(matcher).toContain("Glob");
       expect(matcher).toContain("Grep");
       expect(matcher).toContain("Search");
+      expect(matcher).toContain("Explore");
       expect(matcher).toContain("Task");
+      expect(matcher).toContain("EnterPlanMode");
     });
 
     it("should use valid hook commands", () => {

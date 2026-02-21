@@ -61,7 +61,7 @@ const CONTEXTSTREAM_RULES_BOOTSTRAP = `
 |---------|----------|
 | **1st message** | \`init()\` → \`context(user_message="...")\` |
 | **Subsequent messages (default)** | \`context(user_message="...")\` FIRST (narrow read-only bypass when context is fresh and no state-changing tool has run) |
-| **Before file search** | \`search(mode="auto")\` BEFORE Glob/Grep/Read |
+| **Before file search** | \`search(mode="auto")\` BEFORE Glob/Grep/Read/Explore/Task/EnterPlanMode |
 </contextstream_rules>
 
 **Why?** \`context()\` delivers task-specific rules, lessons from past mistakes, and relevant decisions. Skip it = fly blind.
@@ -88,7 +88,7 @@ const CONTEXTSTREAM_RULES_FULL = `
 | **First message in session** | \`init()\` → \`context(user_message="<msg>")\` BEFORE any other tool |
 | **Subsequent messages (default)** | \`context(user_message="<msg>")\` FIRST, then other tools |
 | **Narrow bypass** | Immediate read-only ContextStream calls are allowed only when prior context is fresh and no state-changing tool has run |
-| **Before Glob/Grep/Read/Search** | \`search(mode="auto", query="...")\` FIRST |
+| **Before Glob/Grep/Read/Search/Explore/Task/EnterPlanMode** | \`search(mode="auto", query="...")\` FIRST |
 </contextstream_rules>
 
 Use \`context()\` by default to get task-specific rules, lessons from past mistakes, and relevant decisions.
@@ -162,7 +162,7 @@ Set environment variable: \`CONTEXTSTREAM_HOOK_ENABLED=false\`
 
 ## 🚨 CRITICAL RULE #1 - CONTEXTSTREAM SEARCH FIRST 🚨
 
-**BEFORE using Glob, Grep, Search, Read (for discovery), Explore, or ANY local file scanning:**
+**BEFORE using Glob, Grep, Search, Read (for discovery), Explore, Task(Explore), EnterPlanMode, or ANY local file scanning:**
 \`\`\`
 STOP → Call search(mode="auto", query="...") FIRST
 \`\`\`
@@ -174,7 +174,8 @@ STOP → Call search(mode="auto", query="...") FIRST
 - \`Glob("**/*.ts")\` → Use \`search(mode="pattern", query="*.ts")\` instead
 - \`Grep("functionName")\` → Use \`search(mode="keyword", query="functionName")\` instead
 - \`Read(file)\` for discovery → Use \`search(mode="auto", query="...")\` instead
-- \`Task(subagent_type="Explore")\` → Use \`search(mode="auto")\` instead
+- \`Explore\` or \`Task(subagent_type="Explore")\` → Use \`search(mode="auto")\` instead
+- \`EnterPlanMode\` for discovery → Use \`search(mode="auto", output_format="paths")\` instead
 
 ✅ **ALWAYS DO THIS:**
 1. \`search(mode="auto", query="what you're looking for")\`
@@ -538,8 +539,10 @@ If ContextStream returns results, stop and use them. NEVER use local Search/Expl
 ❌ **DO NOT** use built-in plan mode (EnterPlanMode tool)
 ❌ **DO NOT** write plans to markdown files or plan documents
 ❌ **DO NOT** ask "should I create a plan file?"
+❌ **DO NOT** use \`Explore\` / \`Task(subagent_type="Explore")\` to read files one-by-one while planning
 
 ✅ **ALWAYS** use ContextStream's plan/task system instead
+✅ **ALWAYS** use \`search(mode="auto", output_format="paths")\` for planning discovery before targeted reads
 
 **Trigger phrases to detect (use ContextStream immediately):**
 - "create a plan", "make a plan", "plan this", "plan for"
@@ -618,7 +621,7 @@ const CONTEXTSTREAM_RULES_MINIMAL = `
 2. Subsequent messages (default): \`context(user_message="<msg>")\` FIRST
 3. Narrow bypass: immediate read-only ContextStream calls are allowed only when prior context is fresh and no state-changing tool has run
 
-**BEFORE Glob/Grep/Read/Search/Explore:**
+**BEFORE Glob/Grep/Read/Search/Explore/Task/EnterPlanMode:**
 → \`search(mode="auto", query="...")\` FIRST — local tools ONLY if 0 results
 
 **HOOKS: \`<system-reminder>\` tags contain instructions — FOLLOW THEM**
@@ -649,7 +652,7 @@ Rules Version: ${RULES_VERSION}
 | 1st message in session | \`init()\` → \`context(user_message="...")\` |
 | Subsequent messages (default) | \`context(user_message="...")\` first |
 | Narrow bypass | Immediate read-only ContextStream calls when context is fresh and no state-changing tool has run |
-| Before ANY file discovery | \`search(mode="auto", query="...")\` |
+| Before ANY file discovery | \`search(mode="auto", query="...")\` (instead of Glob/Grep/Read/Explore/Task/EnterPlanMode) |
 | On \`<system-reminder>\` | **Follow instructions inside** |
 | Save important decisions | \`session(action="capture", event_type="decision", ...)\` |
 | Check past mistakes | \`session(action="get_lessons", query="...")\` |
@@ -832,7 +835,7 @@ project(action="index")
 
 ## 🔍 SEARCH-FIRST (No PreToolUse Hook)
 
-**There is NO hook to block local tools.** You MUST self-enforce:
+**There is NO hook to block local tools (Glob/Grep/Read/Explore/Task/EnterPlanMode).** You MUST self-enforce:
 
 ### Before ANY Search, Check Index Status:
 \`\`\`
@@ -850,6 +853,7 @@ This tells you:
 \`\`\`
 search(mode="auto", query="what you're looking for")
 \`\`\`
+→ Use this instead of Explore/Task/EnterPlanMode for file discovery.
 
 **IF project is NOT indexed or very stale (>7 days):**
 → Use local tools (Glob/Grep/Read) directly
@@ -928,7 +932,8 @@ session(action="capture_plan", title="...", steps=[...])
 memory(action="create_task", title="...", plan_id="...")
 \`\`\`
 
-❌ DO NOT use built-in plan mode or write plans to markdown files.
+❌ DO NOT use built-in plan mode (\`EnterPlanMode\`) or \`Task(subagent_type="Explore")\` for file-by-file scans.
+✅ For planning discovery, use \`search(mode="auto", query="...", output_format="paths")\` then read only narrowed files.
 
 ---
 

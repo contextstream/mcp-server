@@ -40,6 +40,7 @@ let PROJECT_ID: string | null = null;
 
 // Compact reminder for Claude Code (full rules already in CLAUDE.md)
 const REMINDER = `[CONTEXTSTREAM] On the first message in every session call mcp__contextstream__init(...), then call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") FIRST before any other tool. On subsequent messages, default to context first. Narrow bypass is allowed only for immediate read-only ContextStream calls when prior context is fresh and no state-changing tool has run. Response contains dynamic rules, lessons, preferences.
+SEARCH-FIRST: Use mcp__contextstream__search(mode="auto") before Glob/Grep/Read/Explore/Task/EnterPlanMode. In planning, never use EnterPlanMode or Task(Explore) for file-by-file discovery.
 COMMON MEMORY CALLS: list docs via memory(action="list_docs"), list lessons via session(action="get_lessons"), list plans via session(action="list_plans"), list tasks/todos via memory(action="list_tasks"|"list_todos").
 [END]`;
 
@@ -55,7 +56,7 @@ const FULL_REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
 
 2. FOR CODE SEARCH: Check index status, then search appropriately
    ⚠️ BEFORE searching: mcp__contextstream__project(action="index_status")
-   ✅ IF indexed & fresh: Use mcp__contextstream__search(mode="auto", query="...")
+   ✅ IF indexed & fresh: Use mcp__contextstream__search(mode="auto", query="...") BEFORE Glob/Grep/Read/Explore/Task/EnterPlanMode
    ✅ IF NOT indexed OR stale: Use local tools (Glob/Grep/Read) directly
    ✅ IF search returns 0 results: Fallback to local tools (Glob/Grep/Read)
 
@@ -68,7 +69,8 @@ const FULL_REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
 4. FOR PLANS & TASKS: Use ContextStream, not file-based plans
    ✅ Plans: mcp__contextstream__session(action="capture_plan", ...)
    ✅ Tasks: mcp__contextstream__memory(action="create_task", ...)
-   ❌ DO NOT use EnterPlanMode or write plans to markdown files
+   ❌ DO NOT use EnterPlanMode or Task(subagent_type="Explore") for file-by-file discovery
+   ✅ For planning discovery: mcp__contextstream__search(mode="auto", query="...", output_format="paths")
 
 5. CHECK THESE from context() response:
    - Lessons: Past mistakes to avoid (shown as warnings)
@@ -587,7 +589,7 @@ function buildEnhancedReminder(
 2. Wait for indexing: if \`init\` returns \`indexing_status: "started"\`, files are being indexed
 3. Generate a unique session_id (e.g., "session-" + timestamp or UUID) - use this for ALL context() calls
 4. Call \`context(user_message="...", save_exchange=true, session_id="<your-session-id>")\` for task-specific context
-5. Use \`search(mode="auto")\` for code discovery (not Glob/Grep/Read)
+5. Use \`search(mode="auto")\` for code discovery (not Glob/Grep/Read/Explore/Task/EnterPlanMode)
 
 `);
   }
@@ -831,8 +833,8 @@ export async function runUserPromptSubmitHook(): Promise<void> {
     if (editorFormat === "cursor") {
       // Cursor has limited injection capability, so we use a shorter version
       let cursorReminder = ctx?.lessons?.length
-        ? `[CONTEXTSTREAM] ⚠️ ${ctx.lessons.length} lessons from past mistakes. Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="auto") before Glob/Grep. After file edits: project(action="index").`
-        : `[CONTEXTSTREAM] Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="auto") before Glob/Grep/Read. After file edits: project(action="index").`;
+        ? `[CONTEXTSTREAM] ⚠️ ${ctx.lessons.length} lessons from past mistakes. Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="auto") before Glob/Grep/Read/Explore/Task/EnterPlanMode. After file edits: project(action="index").`
+        : `[CONTEXTSTREAM] Call context(save_exchange=true, session_id="...") FIRST. Use search(mode="auto") before Glob/Grep/Read/Explore/Task/EnterPlanMode. After file edits: project(action="index").`;
 
       if (versionNotice?.behind) {
         cursorReminder += ` [UPDATE v${versionNotice.current}→${versionNotice.latest}]`;

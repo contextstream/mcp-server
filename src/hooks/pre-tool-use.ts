@@ -1,7 +1,7 @@
 /**
  * ContextStream PreToolUse Hook - Blocks discovery tools
  *
- * Blocks Grep/Glob/Search/Task(Explore)/EnterPlanMode and redirects to ContextStream search.
+ * Blocks Grep/Glob/Search/Explore/Task(Explore|Plan)/EnterPlanMode and redirects to ContextStream search.
  * Only blocks if the current project is indexed in ContextStream.
  *
  * Usage:
@@ -500,9 +500,22 @@ export async function runPreToolUseHook(): Promise<void> {
         blockClaudeCode(msg);
       }
     }
+  } else if (tool === "Explore") {
+    const msg =
+      'Project index is current. Use mcp__contextstream__search(mode="auto", output_format="paths") instead of Explore for broad discovery.';
+    if (editorFormat === "cline") {
+      outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream search for code discovery.");
+    } else if (editorFormat === "cursor") {
+      outputCursorBlock(msg);
+    }
+    blockClaudeCode(msg);
   } else if (tool === "Task") {
-    const subagentType = (toolInput as { subagent_type?: string })?.subagent_type?.toLowerCase() || "";
-    if (subagentType === "explore") {
+    const subagentTypeRaw =
+      (toolInput as { subagent_type?: string; subagentType?: string })?.subagent_type ||
+      (toolInput as { subagent_type?: string; subagentType?: string })?.subagentType ||
+      "";
+    const subagentType = subagentTypeRaw.toLowerCase();
+    if (subagentType.includes("explore")) {
       const msg = 'Project index is current. Use mcp__contextstream__search(mode="auto") instead of Task(Explore) for broad discovery.';
       if (editorFormat === "cline") {
         outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream search for code discovery.");
@@ -511,9 +524,9 @@ export async function runPreToolUseHook(): Promise<void> {
       }
       blockClaudeCode(msg);
     }
-    if (subagentType === "plan") {
+    if (subagentType.includes("plan")) {
       const msg =
-        'After your plan is ready, save it with mcp__contextstream__session(action="capture_plan"). Then create tasks with mcp__contextstream__memory(action="create_task", title="...", plan_id="...").';
+        'For planning, use mcp__contextstream__search(mode="auto", output_format="paths") for discovery, then save your plan with mcp__contextstream__session(action="capture_plan"). Then create tasks with mcp__contextstream__memory(action="create_task", title="...", plan_id="...").';
       if (editorFormat === "cline") {
         outputClineBlock(msg, "[CONTEXTSTREAM] Use ContextStream plans for persistence.");
       } else if (editorFormat === "cursor") {

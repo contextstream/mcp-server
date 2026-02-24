@@ -190,7 +190,9 @@ let contextCallsSinceLastSave = 0;
 const SEARCH_RULES_REMINDER_ENABLED =
   process.env.CONTEXTSTREAM_SEARCH_REMINDER?.toLowerCase() !== "false";
 
-const SEARCH_RULES_REMINDER = `[SEARCH] Use search(mode="auto") before Glob/Grep/Read. Local tools only if 0 results.`;
+const SEARCH_RULES_REMINDER =
+  `[SEARCH] Use search(mode="auto") before Glob/Grep/Read/Explore/Task/EnterPlanMode. ` +
+  `Never use EnterPlanMode or Task(Explore) for file-by-file discovery. Local tools only if 0 results.`;
 
 /**
  * Context call reminder - reinforces that context() must be called EVERY message.

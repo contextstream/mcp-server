@@ -6152,6 +6152,7 @@ export class ContextStreamClient {
     priority?: "low" | "medium" | "high" | "urgent";
     due_at?: string;
     completed?: boolean;
+    status?: "pending" | "completed";
   }) {
     uuidSchema.parse(params.todo_id);
     const { todo_id, ...updates } = params;
@@ -6171,7 +6172,7 @@ export class ContextStreamClient {
    */
   async todosComplete(params: { todo_id: string }) {
     uuidSchema.parse(params.todo_id);
-    return this.todosUpdate({ todo_id: params.todo_id, completed: true });
+    return this.todosUpdate({ todo_id: params.todo_id, completed: true, status: "completed" });
   }
 
   /**
@@ -6179,7 +6180,7 @@ export class ContextStreamClient {
    */
   async todosIncomplete(params: { todo_id: string }) {
     uuidSchema.parse(params.todo_id);
-    return this.todosUpdate({ todo_id: params.todo_id, completed: false });
+    return this.todosUpdate({ todo_id: params.todo_id, completed: false, status: "pending" });
   }
 
   // ============================================

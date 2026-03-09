@@ -59,6 +59,18 @@ function normalizeNodeType(input: string): string {
   }
 }
 
+function normalizeTags(tags?: string[]): string[] | undefined {
+  if (!tags || tags.length === 0) return undefined;
+  const normalized = Array.from(
+    new Set(
+      tags
+        .map((tag) => String(tag ?? "").trim())
+        .filter(Boolean)
+    )
+  );
+  return normalized.length > 0 ? normalized : undefined;
+}
+
 type GraphTier = "none" | "lite" | "full";
 
 /**
@@ -884,6 +896,7 @@ export class ContextStreamClient {
     event_type: string;
     title: string;
     content: string;
+    tags?: string[];
     metadata?: Record<string, unknown>;
     provenance?: Record<string, unknown>;
     code_refs?: Array<{ file_path: string; symbol_id?: string; symbol_name?: string }>;
@@ -902,7 +915,13 @@ export class ContextStreamClient {
       throw new Error("content is required and cannot be empty");
     }
 
-    return request(this.config, "/memory/events", { body: withDefaults });
+    const normalizedTags = normalizeTags(body.tags);
+    const apiBody = {
+      ...withDefaults,
+      ...(normalizedTags ? { tags: normalizedTags } : {}),
+    };
+
+    return request(this.config, "/memory/events", { body: apiBody });
   }
 
   bulkIngestEvents(body: { workspace_id?: string; project_id?: string; events: any[] }) {
@@ -2994,7 +3013,7 @@ export class ContextStreamClient {
 
     // Map high-level types to API EventType
     let apiEventType = "manual_note";
-    const tags = params.tags || [];
+    const tags = [...(params.tags || [])];
 
     switch (params.event_type) {
       case "conversation":
@@ -3041,18 +3060,21 @@ export class ContextStreamClient {
         tags.push(params.event_type);
     }
 
+    const normalizedTags = normalizeTags(tags);
+
     return this.createMemoryEvent({
       workspace_id: withDefaults.workspace_id,
       project_id: withDefaults.project_id,
       event_type: apiEventType,
       title: params.title,
       content: params.content,
+      tags: normalizedTags,
       provenance: params.provenance,
       code_refs: params.code_refs,
       metadata: {
         original_type: params.event_type,
         session_id: params.session_id,
-        tags: tags,
+        ...(normalizedTags ? { tags: normalizedTags } : {}),
         importance: params.importance || "medium",
         captured_at: new Date().toISOString(),
         source: "mcp_auto_capture",
@@ -3082,8 +3104,9 @@ export class ContextStreamClient {
     const metadata: Record<string, unknown> = {
       ...(params.metadata || {}),
     };
-    if (params.tags && params.tags.length > 0) {
-      metadata.tags = params.tags;
+    const normalizedTags = normalizeTags(params.tags);
+    if (normalizedTags) {
+      metadata.tags = normalizedTags;
     }
     if (!metadata.captured_at) {
       metadata.captured_at = new Date().toISOString();
@@ -3098,6 +3121,7 @@ export class ContextStreamClient {
       event_type: params.event_type,
       title: params.title,
       content: params.content,
+      tags: normalizedTags,
       provenance: params.provenance,
       code_refs: params.code_refs,
       metadata,
@@ -3138,8 +3162,10 @@ export class ContextStreamClient {
     project_id?: string;
     importance?: "low" | "medium" | "high";
     await_indexing?: boolean;
+    tags?: string[];
   }) {
     const withDefaults = this.withDefaults(params);
+    const normalizedTags = normalizeTags(params.tags);
 
     if (!withDefaults.workspace_id) {
       throw new Error(
@@ -3154,6 +3180,7 @@ export class ContextStreamClient {
         project_id: withDefaults.project_id,
         importance: params.importance,
         await_indexing: params.await_indexing,
+        ...(normalizedTags ? { tags: normalizedTags } : {}),
       },
     });
   }

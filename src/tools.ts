@@ -11014,6 +11014,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               project_id: projectId,
               content: input.content,
               importance,
+              tags: input.tags,
             });
             // Add educational hint for remember
             const rememberHint = getCaptureHint("preference");
@@ -11802,7 +11803,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           order: z.number().optional().describe("Task order within plan"),
           task_ids: z.array(z.string().uuid()).optional().describe("Task IDs for reorder_tasks"),
           blocked_reason: z.string().optional().describe("Reason when task is blocked"),
-          tags: z.array(z.string()).optional().describe("Tags for task"),
+          tags: z.array(z.string()).optional().describe("Tags for event or task categorization"),
           // Batch import params
           events: z
             .array(
@@ -11903,6 +11904,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               event_type: input.event_type,
               title: input.title,
               content: input.content,
+              tags: input.tags,
               metadata: input.metadata,
               provenance: input.provenance,
               code_refs: input.code_refs,

@@ -26,14 +26,16 @@ describe("ContextStreamClient.captureContext", () => {
       event_type: "decision",
       title: "Use connection pooling",
       content: "Pooling improves throughput for repeated database work.",
+      tags: ["category:testing"],
     });
 
     expect(createMemoryEvent).toHaveBeenCalledWith(
       expect.objectContaining({
         event_type: "decision",
+        tags: expect.arrayContaining(["category:testing", "decision"]),
         metadata: expect.objectContaining({
           original_type: "decision",
-          tags: expect.arrayContaining(["decision"]),
+          tags: expect.arrayContaining(["category:testing", "decision"]),
         }),
       })
     );
@@ -55,6 +57,7 @@ describe("ContextStreamClient.captureContext", () => {
     expect(createMemoryEvent).toHaveBeenCalledWith(
       expect.objectContaining({
         event_type: "manual_note",
+        tags: expect.arrayContaining(["lesson", "lesson_system"]),
         metadata: expect.objectContaining({
           original_type: "lesson",
           tags: expect.arrayContaining(["lesson", "lesson_system"]),

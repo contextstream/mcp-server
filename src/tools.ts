@@ -51,6 +51,7 @@ import {
   extractIndexTimestamp,
   indexHistoryEntryCount,
 } from "./project-index-utils.js";
+import { resolveTodoCompletionUpdate } from "./todo-utils.js";
 
 type StructuredContent = { [x: string]: unknown } | undefined;
 type ToolTextResult = {
@@ -11844,7 +11845,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           todo_status: z
             .enum(["pending", "completed"])
             .optional()
-            .describe("Todo status filter for list_todos"),
+            .describe("Todo status filter for list_todos, or status update value for update_todo"),
+          completed: z
+            .boolean()
+            .optional()
+            .describe("Todo completion flag for update_todo"),
           due_at: z.string().optional().describe("Due date (ISO 8601) for todo"),
           // Diagram params
           diagram_id: z.string().uuid().optional().describe("Diagram ID for get_diagram/update_diagram/delete_diagram"),
@@ -12351,12 +12356,19 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.todo_id) {
               return errorResult("update_todo requires: todo_id");
             }
+            const todoCompletionUpdate = resolveTodoCompletionUpdate({
+              completed: input.completed,
+              todo_status: input.todo_status,
+              status: input.status,
+            });
             const updateTodoResult = await client.todosUpdate({
               todo_id: input.todo_id,
               title: input.title,
               description: input.description,
               priority: input.todo_priority,
               due_at: input.due_at,
+              completed: todoCompletionUpdate.completed,
+              status: todoCompletionUpdate.status,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(updateTodoResult) }],
@@ -12379,7 +12391,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             }
             const completeTodoResult = await client.todosComplete({ todo_id: input.todo_id });
             return {
-              content: [{ type: "text" as const, text: `✅ Todo marked as completed` }],
+              content: [{ type: "text" as const, text: formatContent(completeTodoResult) }],
             };
           }
 

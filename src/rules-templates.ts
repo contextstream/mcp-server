@@ -11,6 +11,14 @@ export interface RuleTemplate {
   build: (rules: string) => string;
 }
 
+export type RuleWriteMode = "contextstream_block" | "full_file";
+
+export interface GeneratedRuleFile {
+  filename: string;
+  content: string;
+  writeMode?: RuleWriteMode;
+}
+
 const DEFAULT_CLAUDE_MCP_SERVER_NAME = "contextstream";
 export const RULES_VERSION = VERSION === "unknown" ? "0.0.0" : VERSION;
 
@@ -974,6 +982,168 @@ After updating, user should restart their AI tool.
 // Editors that don't have hooks support and need enhanced rules
 const NO_HOOKS_EDITORS = ["codex", "aider", "antigravity"];
 
+function buildCopilotSkillContent(): string {
+  return `---
+name: contextstream-workflow
+description: "Manage persistent AI memory across sessions with ContextStream MCP."
+---
+
+# ContextStream Workflow Skill
+
+## Purpose
+
+Use ContextStream to keep plans, tasks, decisions, lessons, and implementation context available across Copilot sessions.
+
+## Session Lifecycle
+
+### 1. Start the session
+
+Always call \`init\` at the beginning of a new session:
+
+\`\`\`
+init(
+  folder_path="<project_path>",
+  context_hint="<user's first message>"
+)
+\`\`\`
+
+Then call \`context\` with the current request:
+
+\`\`\`
+context(
+  user_message="<current user message>"
+)
+\`\`\`
+
+For later messages in the same session, call \`context\` first before doing more work.
+
+### 2. Plan multi-step work
+
+Capture a persistent plan:
+
+\`\`\`
+session(
+  action="capture_plan",
+  title="Implement feature X",
+  steps=[
+    {"id": "1", "title": "Research the current code path", "order": 1},
+    {"id": "2", "title": "Implement the change", "order": 2},
+    {"id": "3", "title": "Add verification", "order": 3}
+  ]
+)
+\`\`\`
+
+Then create linked tasks:
+
+\`\`\`
+memory(
+  action="create_task",
+  title="Implement the change",
+  plan_id="<plan_id>",
+  plan_step_id="2",
+  priority="high"
+)
+\`\`\`
+
+### 3. Track progress while working
+
+Start a task:
+
+\`\`\`
+memory(
+  action="update_task",
+  task_id="<task_id>",
+  status="in_progress"
+)
+\`\`\`
+
+Capture a technical decision:
+
+\`\`\`
+session(
+  action="capture",
+  event_type="decision",
+  title="Use repository pattern for data access",
+  content="Chose a repository layer to isolate persistence logic and simplify testing."
+)
+\`\`\`
+
+Finish a task:
+
+\`\`\`
+memory(
+  action="update_task",
+  task_id="<task_id>",
+  status="completed"
+)
+\`\`\`
+
+### 4. Capture lessons
+
+When a mistake or correction happens, save a lesson immediately:
+
+\`\`\`
+session(
+  action="capture_lesson",
+  title="Check pagination behavior before assuming full results",
+  trigger="Assumed the API returned all records in one response",
+  impact="Only the first page was processed",
+  prevention="Verify pagination semantics before implementing the fetch path",
+  severity="medium"
+)
+\`\`\`
+
+### 5. Finish the work
+
+Update the plan:
+
+\`\`\`
+session(
+  action="update_plan",
+  plan_id="<plan_id>",
+  status="completed"
+)
+\`\`\`
+
+Capture a summary event:
+
+\`\`\`
+memory(
+  action="create_event",
+  event_type="implementation",
+  title="Feature X complete",
+  content="Implemented the change, added tests, and verified the result."
+)
+\`\`\`
+
+## Search-First Workflow
+
+- Before local code discovery, use \`search(mode="auto", query="...")\`
+- Use \`search(mode="keyword")\` for exact symbols or strings
+- Use \`search(mode="pattern")\` for glob or regex-style lookup
+- Use local reads only after search narrows the file set
+
+## Quick Reference
+
+| Need | Tool |
+|------|------|
+| Relevant project context | \`context(user_message="...")\` |
+| Code discovery | \`search(mode="auto", query="...")\` |
+| Persistent plan | \`session(action="capture_plan")\` |
+| Task status | \`memory(action="update_task")\` |
+| Decision capture | \`session(action="capture", event_type="decision")\` |
+| Past context | \`session(action="recall", query="...")\` |
+| Lessons | \`session(action="get_lessons", query="...")\` |
+
+## Anti-Patterns
+
+- Do not store trivial file reads or command output as memory
+- Do not skip \`context(...)\` on later turns
+- Do not use local file scanning before \`search(...)\` unless search returns 0 results
+- Do not use editor-only task lists as the persistent record; mirror important work in ContextStream
+`;
+}
+
 export const TEMPLATES: Record<string, RuleTemplate> = {
   codex: {
     filename: "AGENTS.md",
@@ -1045,6 +1215,25 @@ ${rules
 ${rules}
 `,
   },
+
+  copilot: {
+    filename: ".github/copilot-instructions.md",
+    description: "VS Code GitHub Copilot instructions",
+    build: (rules) => `## ContextStream MCP Integration
+
+This project uses [ContextStream](https://contextstream.io) for persistent AI memory across sessions. Use the \`contextstream-workflow\` skill for detailed examples and reference material.
+
+${rules}
+
+### VS Code Copilot Notes
+
+- Keep this file concise; put detailed workflows in \`.github/skills/contextstream-workflow/SKILL.md\`
+- Use ContextStream plans/tasks as the persistent record of work
+- Before code discovery, use \`search(mode="auto", query="...")\`
+
+Full docs: https://contextstream.io/docs/mcp/tools
+`,
+  },
 };
 
 /**
@@ -1091,7 +1280,10 @@ export function generateRuleContent(
   let content = template.build(rules);
 
   // Add workspace header if provided
-  if (options?.workspaceName || options?.projectName) {
+  if (
+    editor.toLowerCase() !== "copilot" &&
+    (options?.workspaceName || options?.projectName)
+  ) {
     const header = `
 # Workspace: ${options.workspaceName || "Unknown"}
 ${options.projectName ? `# Project: ${options.projectName}` : ""}
@@ -1124,6 +1316,33 @@ ${options.workspaceId ? `# Workspace ID: ${options.workspaceId}` : ""}
   };
 }
 
+export function generateRuleFiles(
+  editor: string,
+  options?: {
+    workspaceName?: string;
+    workspaceId?: string;
+    projectName?: string;
+    additionalRules?: string;
+    mode?: "dynamic" | "minimal" | "full" | "bootstrap";
+  }
+): GeneratedRuleFile[] {
+  const primary = generateRuleContent(editor, options);
+  if (!primary) return [];
+
+  if (editor.toLowerCase() !== "copilot") {
+    return [{ ...primary, writeMode: "contextstream_block" }];
+  }
+
+  return [
+    { ...primary, writeMode: "contextstream_block" },
+    {
+      filename: ".github/skills/contextstream-workflow/SKILL.md",
+      content: buildCopilotSkillContent().trim() + "\n",
+      writeMode: "full_file",
+    },
+  ];
+}
+
 /**
  * Generate all rule files for a project
  */
@@ -1135,10 +1354,12 @@ export function generateAllRuleFiles(options?: {
   mode?: "dynamic" | "minimal" | "full" | "bootstrap";
 }): Array<{ editor: string; filename: string; content: string }> {
   return getAvailableEditors()
-    .map((editor) => {
-      const result = generateRuleContent(editor, options);
-      if (!result) return null;
-      return { editor, ...result };
-    })
+    .flatMap((editor) =>
+      generateRuleFiles(editor, options).map((result) => ({
+        editor,
+        filename: result.filename,
+        content: result.content,
+      }))
+    )
     .filter((r): r is { editor: string; filename: string; content: string } => r !== null);
 }

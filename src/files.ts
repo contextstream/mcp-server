@@ -101,6 +101,8 @@ const CODE_EXTENSIONS = new Set([
   "graphql",
   "proto",
   "dockerfile",
+  // Dart/Flutter
+  "dart",
 ]);
 
 // Directories to ignore
@@ -827,6 +829,7 @@ export function detectLanguage(filePath: string): string {
     swift: "swift",
     scala: "scala",
     sql: "sql",
+    dart: "dart",
     md: "markdown",
     json: "json",
     yaml: "yaml",

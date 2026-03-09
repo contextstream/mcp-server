@@ -3013,6 +3013,10 @@ export class ContextStreamClient {
         tags.push(params.event_type);
         break;
       case "decision":
+        // Decision queries filter on the stored event_type, so preserve it.
+        apiEventType = "decision";
+        tags.push(params.event_type);
+        break;
       case "insight":
       case "preference":
       case "note":

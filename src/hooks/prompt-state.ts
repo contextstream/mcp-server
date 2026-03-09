@@ -198,7 +198,7 @@ export function isContextFreshAndClean(cwd: string, maxAgeSeconds: number): bool
 
   if (entry.last_state_change_at) {
     const changedAt = new Date(entry.last_state_change_at);
-    if (!Number.isNaN(changedAt.getTime()) && changedAt.getTime() > contextAt.getTime()) {
+    if (!Number.isNaN(changedAt.getTime()) && changedAt.getTime() >= contextAt.getTime()) {
       return false;
     }
   }

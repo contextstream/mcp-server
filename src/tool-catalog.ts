@@ -24,7 +24,11 @@ export const TOOL_CATALOG: ToolCategory[] = [
     name: "Session",
     tools: [
       { name: "init", hint: "start-conv" },
-      { name: "smart", hint: "each-msg" },
+      { name: "context", hint: "each-msg" },
+      { name: "instruct", hint: "hot-state" },
+      { name: "flash", hint: "alias" },
+      { name: "ram", hint: "alias" },
+      { name: "mem", hint: "alias" },
       { name: "capture", hint: "save" },
       { name: "recall", hint: "find" },
       { name: "remember", hint: "quick" },
@@ -49,6 +53,10 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: "hybrid", hint: "combo" },
       { name: "keyword", hint: "exact" },
       { name: "pattern", hint: "code" },
+      { name: "exhaustive", hint: "all" },
+      { name: "refactor", hint: "symbol" },
+      { name: "crawl", hint: "deep" },
+      { name: "team", hint: "xproj" },
     ],
   },
   {
@@ -112,6 +120,7 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: "list", hint: "" },
       { name: "get", hint: "" },
       { name: "create", hint: "" },
+      { name: "delete", hint: "" },
       { name: "associate", hint: "link-folder" },
       { name: "bootstrap", hint: "new-ws" },
     ],
@@ -122,9 +131,11 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: "list", hint: "" },
       { name: "get", hint: "" },
       { name: "create", hint: "" },
+      { name: "delete", hint: "" },
       { name: "index", hint: "scan-code" },
       { name: "files", hint: "list-files" },
       { name: "overview", hint: "summary" },
+      { name: "recent_changes", hint: "git-log" },
     ],
   },
   {
@@ -233,5 +244,5 @@ function generateFull(categories: ToolCategory[]): string {
  * Get the core tools that should always be available
  */
 export function getCoreToolsHint(): string {
-  return `Session: init(start) smart(each-msg) capture(save) recall(find) remember(quick)`;
+  return `Session: init(start) context(each-msg) instruct(hot-state) capture(save) recall(find) remember(quick)`;
 }

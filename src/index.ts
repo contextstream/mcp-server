@@ -81,12 +81,22 @@ Commands:
   hook media-aware           Media-aware hook - detects media prompts, injects media tool guidance
   hook pre-compact           PreCompact hook - saves conversation state before compaction
   hook post-compact          PostCompact hook - restores context after compaction
+  hook session-start         SessionStart hook alias for session-init
+  hook stop                  Stop hook alias for session-end
   hook post-write            PostToolUse hook - real-time file indexing after Edit/Write
-  hook auto-rules            PostToolUse hook - auto-updates rules when behind (silent)
-  hook on-bash               PostToolUse hook - captures bash commands, learns from errors
-  hook on-task               PostToolUse hook - tracks Task agent work
-  hook on-read               PostToolUse hook - tracks file exploration (Read/Glob/Grep)
-  hook on-web                PostToolUse hook - captures web research (WebFetch/WebSearch)
+  hook post-tool-use         PostToolUse hook alias for post-write
+  hook post-tool-use-failure PostToolUseFailure hook - captures repeated tool failures
+  hook notification          Notification hook - captures runtime notifications
+  hook permission-request    PermissionRequest hook - captures escalation requests
+  hook subagent-start        SubagentStart hook - injects context for spawned agents
+  hook subagent-stop         SubagentStop hook - captures subagent outcomes
+  hook task-completed        TaskCompleted hook - updates tasks and captures completion
+  hook teammate-idle         TeammateIdle hook - redirects idle teammates to pending tasks
+  hook auto-rules            Legacy no-op hook
+  hook on-bash               Legacy no-op hook
+  hook on-task               Legacy no-op hook
+  hook on-read               Legacy no-op hook
+  hook on-web                Legacy no-op hook
   hook session-init          SessionStart hook - full context injection on session start
   hook session-end           Stop hook - finalizes session, saves state
   hook on-save-intent        UserPromptSubmit hook - redirects doc saves to ContextStream
@@ -99,6 +109,7 @@ Environment variables:
   CONTEXTSTREAM_WORKSPACE_ID  Optional default workspace ID
   CONTEXTSTREAM_PROJECT_ID    Optional default project ID
   CONTEXTSTREAM_TOOLSET       Tool mode: light|standard|complete (default: standard)
+  CONTEXTSTREAM_TOOL_SURFACE_PROFILE Tool surface: default|openai_agentic (default: default)
   CONTEXTSTREAM_TOOL_ALLOWLIST Optional comma-separated tool names to expose (overrides toolset)
   CONTEXTSTREAM_AUTO_TOOLSET  Auto-detect client and adjust toolset (default: false)
   CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS  Auto-hide Slack/GitHub tools when not connected (default: true)
@@ -189,9 +200,49 @@ async function main() {
   if (args[0] === "hook") {
     const hookName = args[1];
     switch (hookName) {
+      case "post-tool-use": {
+        const { runPostWriteHook } = await import("./hooks/post-write.js");
+        await runPostWriteHook();
+        return;
+      }
       case "post-write": {
         const { runPostWriteHook } = await import("./hooks/post-write.js");
         await runPostWriteHook();
+        return;
+      }
+      case "post-tool-use-failure": {
+        const { runPostToolUseFailureHook } = await import("./hooks/post-tool-use-failure.js");
+        await runPostToolUseFailureHook();
+        return;
+      }
+      case "notification": {
+        const { runNotificationHook } = await import("./hooks/notification.js");
+        await runNotificationHook();
+        return;
+      }
+      case "permission-request": {
+        const { runPermissionRequestHook } = await import("./hooks/permission-request.js");
+        await runPermissionRequestHook();
+        return;
+      }
+      case "subagent-start": {
+        const { runSubagentStartHook } = await import("./hooks/subagent-start.js");
+        await runSubagentStartHook();
+        return;
+      }
+      case "subagent-stop": {
+        const { runSubagentStopHook } = await import("./hooks/subagent-stop.js");
+        await runSubagentStopHook();
+        return;
+      }
+      case "task-completed": {
+        const { runTaskCompletedHook } = await import("./hooks/task-completed.js");
+        await runTaskCompletedHook();
+        return;
+      }
+      case "teammate-idle": {
+        const { runTeammateIdleHook } = await import("./hooks/teammate-idle.js");
+        await runTeammateIdleHook();
         return;
       }
       case "pre-tool-use": {
@@ -205,8 +256,8 @@ async function main() {
         return;
       }
       case "media-aware": {
-        const { runMediaAwareHook } = await import("./hooks/media-aware.js");
-        await runMediaAwareHook();
+        const { runNoopHook } = await import("./hooks/noop.js");
+        await runNoopHook();
         return;
       }
       case "pre-compact": {
@@ -215,8 +266,8 @@ async function main() {
         return;
       }
       case "auto-rules": {
-        const { runAutoRulesHook } = await import("./hooks/auto-rules.js");
-        await runAutoRulesHook();
+        const { runNoopHook } = await import("./hooks/noop.js");
+        await runNoopHook();
         return;
       }
       case "post-compact": {
@@ -225,28 +276,34 @@ async function main() {
         return;
       }
       case "on-bash": {
-        const { runOnBashHook } = await import("./hooks/on-bash.js");
-        await runOnBashHook();
+        const { runNoopHook } = await import("./hooks/noop.js");
+        await runNoopHook();
         return;
       }
       case "on-task": {
-        const { runOnTaskHook } = await import("./hooks/on-task.js");
-        await runOnTaskHook();
+        const { runNoopHook } = await import("./hooks/noop.js");
+        await runNoopHook();
         return;
       }
       case "on-read": {
-        const { runOnReadHook } = await import("./hooks/on-read.js");
-        await runOnReadHook();
+        const { runNoopHook } = await import("./hooks/noop.js");
+        await runNoopHook();
         return;
       }
       case "on-web": {
-        const { runOnWebHook } = await import("./hooks/on-web.js");
-        await runOnWebHook();
+        const { runNoopHook } = await import("./hooks/noop.js");
+        await runNoopHook();
         return;
       }
+      case "session-start":
       case "session-init": {
         const { runSessionInitHook } = await import("./hooks/session-init.js");
         await runSessionInitHook();
+        return;
+      }
+      case "stop": {
+        const { runStopHook } = await import("./hooks/stop.js");
+        await runStopHook();
         return;
       }
       case "session-end": {
@@ -353,7 +410,9 @@ async function main() {
   const sessionManager = new SessionManager(server, client);
 
   // Register all MCP components with auto-context enabled
-  registerTools(server, client, sessionManager);
+  registerTools(server, client, sessionManager, {
+    toolSurfaceProfile: config.toolSurfaceProfile,
+  });
   registerResources(server, client, config.apiUrl);
   if (ENABLE_PROMPTS) {
     registerPrompts(server);

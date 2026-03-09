@@ -75,10 +75,18 @@ export interface ClaudeHooksConfig {
   hooks?: {
     PreToolUse?: ClaudeHookMatcher[];
     PostToolUse?: ClaudeHookMatcher[];
+    PostToolUseFailure?: ClaudeHookMatcher[];
     UserPromptSubmit?: ClaudeHookMatcher[];
     PreCompact?: ClaudeHookMatcher[];
     SessionStart?: ClaudeHookMatcher[];
     Stop?: ClaudeHookMatcher[];
+    SessionEnd?: ClaudeHookMatcher[];
+    SubagentStart?: ClaudeHookMatcher[];
+    SubagentStop?: ClaudeHookMatcher[];
+    TaskCompleted?: ClaudeHookMatcher[];
+    TeammateIdle?: ClaudeHookMatcher[];
+    Notification?: ClaudeHookMatcher[];
+    PermissionRequest?: ClaudeHookMatcher[];
     [key: string]: ClaudeHookMatcher[] | undefined;
   };
 }
@@ -644,8 +652,8 @@ export function buildHooksConfig(options?: {
     });
   }
 
-  // Add media-aware hook (enabled by default for creative workflows)
-  if (options?.includeMediaAware !== false) {
+  // Legacy TS-only hook; install only when explicitly requested.
+  if (options?.includeMediaAware === true) {
     userPromptHooks.push({
       matcher: "*",
       hooks: [
@@ -661,7 +669,7 @@ export function buildHooksConfig(options?: {
   const config: ClaudeHooksConfig["hooks"] = {
     PreToolUse: [
       {
-        matcher: "Glob|Grep|Search|Explore|Task|EnterPlanMode",
+        matcher: "*",
         hooks: [
           {
             type: "command",
@@ -694,11 +702,11 @@ export function buildHooksConfig(options?: {
   if (options?.includeSessionInit !== false) {
     config.SessionStart = [
       {
-        matcher: "*",
+        matcher: "startup|resume|compact",
         hooks: [
           {
             type: "command",
-            command: getHookCommand("session-init"),
+            command: getHookCommand("session-start"),
             timeout: 10,
           },
         ],
@@ -709,6 +717,18 @@ export function buildHooksConfig(options?: {
   // Add Stop hook for session finalization (default ON)
   if (options?.includeSessionEnd !== false) {
     config.Stop = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("stop"),
+            timeout: 15,
+          },
+        ],
+      },
+    ];
+    config.SessionEnd = [
       {
         matcher: "*",
         hooks: [
@@ -739,8 +759,8 @@ export function buildHooksConfig(options?: {
     });
   }
 
-  // Auto-rules update when rules are behind (default ON)
-  if (options?.includeAutoRules !== false) {
+  // Legacy TS-only hook; install only when explicitly requested.
+  if (options?.includeAutoRules === true) {
     postToolUseHooks.push({
       matcher: "mcp__contextstream__init|mcp__contextstream__context",
       hooks: [
@@ -753,8 +773,8 @@ export function buildHooksConfig(options?: {
     });
   }
 
-  // Bash command tracking (default ON)
-  if (options?.includeOnBash !== false) {
+  // Legacy TS-only hook; install only when explicitly requested.
+  if (options?.includeOnBash === true) {
     postToolUseHooks.push({
       matcher: "Bash",
       hooks: [
@@ -767,8 +787,8 @@ export function buildHooksConfig(options?: {
     });
   }
 
-  // Task agent tracking (default ON)
-  if (options?.includeOnTask !== false) {
+  // Legacy TS-only hook; install only when explicitly requested.
+  if (options?.includeOnTask === true) {
     postToolUseHooks.push({
       matcher: "Task",
       hooks: [
@@ -781,8 +801,8 @@ export function buildHooksConfig(options?: {
     });
   }
 
-  // File exploration tracking (default ON)
-  if (options?.includeOnRead !== false) {
+  // Legacy TS-only hook; install only when explicitly requested.
+  if (options?.includeOnRead === true) {
     postToolUseHooks.push({
       matcher: "Read|Glob|Grep",
       hooks: [
@@ -795,8 +815,8 @@ export function buildHooksConfig(options?: {
     });
   }
 
-  // Web research tracking (default ON)
-  if (options?.includeOnWeb !== false) {
+  // Legacy TS-only hook; install only when explicitly requested.
+  if (options?.includeOnWeb === true) {
     postToolUseHooks.push({
       matcher: "WebFetch|WebSearch",
       hooks: [
@@ -812,6 +832,49 @@ export function buildHooksConfig(options?: {
   if (postToolUseHooks.length > 0) {
     config.PostToolUse = postToolUseHooks;
   }
+
+  config.PostToolUseFailure = [
+    {
+      matcher: "*",
+      hooks: [{ type: "command", command: getHookCommand("post-tool-use-failure"), timeout: 10 }],
+    },
+  ];
+  config.SubagentStart = [
+    {
+      matcher: "Explore|Plan|general-purpose|custom",
+      hooks: [{ type: "command", command: getHookCommand("subagent-start"), timeout: 10 }],
+    },
+  ];
+  config.SubagentStop = [
+    {
+      matcher: "Plan",
+      hooks: [{ type: "command", command: getHookCommand("subagent-stop"), timeout: 15 }],
+    },
+  ];
+  config.TaskCompleted = [
+    {
+      matcher: "*",
+      hooks: [{ type: "command", command: getHookCommand("task-completed"), timeout: 10 }],
+    },
+  ];
+  config.TeammateIdle = [
+    {
+      matcher: "*",
+      hooks: [{ type: "command", command: getHookCommand("teammate-idle"), timeout: 10 }],
+    },
+  ];
+  config.Notification = [
+    {
+      matcher: "*",
+      hooks: [{ type: "command", command: getHookCommand("notification"), timeout: 10 }],
+    },
+  ];
+  config.PermissionRequest = [
+    {
+      matcher: "*",
+      hooks: [{ type: "command", command: getHookCommand("permission-request"), timeout: 10 }],
+    },
+  ];
 
   return config;
 }
@@ -933,18 +996,29 @@ export async function installClaudeCodeHooks(options: {
   // List the hook commands that will be configured (uses direct path when available)
   result.scripts.push(
     getHookCommand("pre-tool-use"),
-    getHookCommand("user-prompt-submit")
+    getHookCommand("user-prompt-submit"),
+    getHookCommand("on-save-intent"),
+    getHookCommand("session-start"),
+    getHookCommand("stop"),
+    getHookCommand("session-end"),
+    getHookCommand("post-tool-use-failure"),
+    getHookCommand("subagent-start"),
+    getHookCommand("subagent-stop"),
+    getHookCommand("task-completed"),
+    getHookCommand("teammate-idle"),
+    getHookCommand("notification"),
+    getHookCommand("permission-request")
   );
   if (options.includePreCompact !== false) {
     result.scripts.push(getHookCommand("pre-compact"));
   }
-  if (options.includeMediaAware !== false) {
+  if (options.includeMediaAware === true) {
     result.scripts.push(getHookCommand("media-aware"));
   }
   if (options.includePostWrite !== false) {
     result.scripts.push(getHookCommand("post-write"));
   }
-  if (options.includeAutoRules !== false) {
+  if (options.includeAutoRules === true) {
     result.scripts.push(getHookCommand("auto-rules"));
   }
 
@@ -1860,6 +1934,7 @@ export async function installCursorHookScripts(options: {
 
   const preToolUseCommand = getHookCommand("pre-tool-use");
   const userPromptCommand = getHookCommand("user-prompt-submit");
+  const saveIntentCommand = getHookCommand("on-save-intent");
 
   const config: CursorHooksConfig = {
     version: 1,
@@ -1871,13 +1946,17 @@ export async function installCursorHookScripts(options: {
           command: preToolUseCommand,
           type: "command" as const,
           timeout: 5,
-          matcher: { tool_name: "Glob|Grep|search_files|list_files|ripgrep" },
         },
       ],
       beforeSubmitPrompt: [
         ...filteredBeforeSubmit,
         {
           command: userPromptCommand,
+          type: "command" as const,
+          timeout: 5,
+        },
+        {
+          command: saveIntentCommand,
           type: "command" as const,
           timeout: 5,
         },
@@ -1890,7 +1969,7 @@ export async function installCursorHookScripts(options: {
 
   return {
     preToolUse: preToolUseCommand,
-    beforeSubmitPrompt: userPromptCommand,
+    beforeSubmitPrompt: `${userPromptCommand}, ${saveIntentCommand}`,
     config: configPath,
   };
 }

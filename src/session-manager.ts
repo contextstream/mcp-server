@@ -22,6 +22,7 @@ export class SessionManager {
   private contextSmartCalled = false;
   private warningShown = false;
   private sessionId: string;
+  private defaultSearchMode: string | null = null;
 
   // Token tracking for context pressure calculation
   // Note: MCP servers cannot see actual token usage (AI responses, thinking, system prompts).
@@ -86,11 +87,19 @@ export class SessionManager {
   }
 
   /**
+   * Get the session-scoped default search mode, if one was returned by init/context.
+   */
+  getDefaultSearchMode(): string | null {
+    return this.defaultSearchMode;
+  }
+
+  /**
    * Mark session as manually initialized (e.g., when session_init is called explicitly)
    */
   markInitialized(context: Record<string, unknown>) {
     this.initialized = true;
     this.context = context;
+    this.defaultSearchMode = this.extractDefaultSearchMode(context);
 
     // Promote resolved workspace/project to client defaults so subsequent calls
     // (including those without explicit workspace_id in payload/path/query)
@@ -156,6 +165,30 @@ export class SessionManager {
             : undefined,
       });
     }
+  }
+
+  private extractDefaultSearchMode(context: Record<string, unknown>): string | null {
+    const fromWorkspace =
+      context.workspace &&
+      typeof context.workspace === "object" &&
+      typeof (context.workspace as Record<string, unknown>).default_search_mode === "string"
+        ? ((context.workspace as Record<string, unknown>).default_search_mode as string)
+        : undefined;
+    if (fromWorkspace?.trim()) {
+      return fromWorkspace.trim().toLowerCase();
+    }
+
+    const fromProject =
+      context.project &&
+      typeof context.project === "object" &&
+      typeof (context.project as Record<string, unknown>).default_search_mode === "string"
+        ? ((context.project as Record<string, unknown>).default_search_mode as string)
+        : undefined;
+    if (fromProject?.trim()) {
+      return fromProject.trim().toLowerCase();
+    }
+
+    return null;
   }
 
   /**

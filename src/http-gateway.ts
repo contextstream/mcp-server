@@ -215,7 +215,30 @@ function buildServerCard(baseUrl: string): Record<string, unknown> {
   };
 }
 
-async function createSession(): Promise<SessionEntry> {
+function resolveHttpToolSurfaceProfile(
+  req: IncomingMessage | undefined,
+  fallback: "default" | "openai_agentic"
+): "default" | "openai_agentic" {
+  const explicitHeader = req
+    ? normalizeHeaderValue(req.headers["x-contextstream-tool-surface-profile"])
+    : undefined;
+  if (explicitHeader?.trim().toLowerCase() === "openai_agentic") {
+    return "openai_agentic";
+  }
+
+  if (fallback === "openai_agentic") {
+    return fallback;
+  }
+
+  const userAgent = req ? normalizeHeaderValue(req.headers["user-agent"])?.toLowerCase() : undefined;
+  if (userAgent && (userAgent.includes("openai") || userAgent.includes("gpt"))) {
+    return "openai_agentic";
+  }
+
+  return fallback;
+}
+
+async function createSession(req?: IncomingMessage): Promise<SessionEntry> {
   const config = loadConfig();
   const client = new ContextStreamClient(config);
   const server = new McpServer({
@@ -224,7 +247,9 @@ async function createSession(): Promise<SessionEntry> {
   });
 
   const sessionManager = new SessionManager(server, client);
-  registerTools(server, client, sessionManager);
+  registerTools(server, client, sessionManager, {
+    toolSurfaceProfile: resolveHttpToolSurfaceProfile(req, config.toolSurfaceProfile),
+  });
   registerResources(server, client, config.apiUrl);
   if (ENABLE_PROMPTS) {
     registerPrompts(server);
@@ -278,7 +303,7 @@ async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Prom
 
   let entry = existingSession;
   if (!entry) {
-    entry = await createSession();
+    entry = await createSession(req);
   }
 
   entry.lastSeenAt = Date.now();

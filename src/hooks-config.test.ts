@@ -37,13 +37,9 @@ describe("hooks-config", () => {
       const config = buildHooksConfig();
       const matcher = config?.PreToolUse?.[0]?.matcher || "";
 
-      // These tools should be intercepted
-      expect(matcher).toContain("Glob");
-      expect(matcher).toContain("Grep");
-      expect(matcher).toContain("Search");
-      expect(matcher).toContain("Explore");
-      expect(matcher).toContain("Task");
-      expect(matcher).toContain("EnterPlanMode");
+      // Rust parity uses a wildcard matcher so the hook can both allow init/context
+      // and block any non-context-first tool call.
+      expect(matcher).toBe("*");
     });
 
     it("should use valid hook commands", () => {

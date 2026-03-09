@@ -740,6 +740,143 @@ export class ContextStreamClient {
     });
   }
 
+  /**
+   * Crawl search uses deep multi-modal retrieval with a larger candidate pool.
+   */
+  searchCrawl(body: {
+    query: string;
+    workspace_id?: string;
+    project_id?: string;
+    limit?: number;
+    offset?: number;
+    content_max_chars?: number;
+    context_lines?: number;
+    exact_match_boost?: number;
+    output_format?: "full" | "paths" | "minimal" | "count";
+  }) {
+    return request(this.config, "/search/crawl", {
+      body: {
+        ...this.withDefaults(body),
+        search_type: "crawl",
+        output_format: body.output_format,
+        filters: body.workspace_id
+          ? {}
+          : {
+              file_types: [],
+              languages: [],
+              file_paths: [],
+              exclude_paths: [],
+              content_types: [],
+              tags: [],
+            },
+      },
+    });
+  }
+
+  // Flash / instruction cache
+  async flashBootstrap(params: { session_id: string; workspace_id?: string }) {
+    const withDefaults = this.withDefaults(params);
+    return request(this.config, "/flash/bootstrap", {
+      body: {
+        workspace_id: withDefaults.workspace_id,
+        session_id: params.session_id,
+      },
+    });
+  }
+
+  async flashGet(params: { session_id: string; workspace_id?: string; limit?: number }) {
+    const withDefaults = this.withDefaults(params);
+    return request(this.config, "/flash/get", {
+      body: {
+        workspace_id: withDefaults.workspace_id,
+        session_id: params.session_id,
+        limit: params.limit,
+      },
+    });
+  }
+
+  async flashPush(params: {
+    session_id: string;
+    workspace_id?: string;
+    entries?: Array<{
+      text: string;
+      id?: string;
+      source?: string;
+      critical?: boolean;
+      surface?: boolean;
+      metadata?: Record<string, unknown>;
+    }>;
+    increment_turn?: boolean;
+    force_version_bump?: boolean;
+  }) {
+    const withDefaults = this.withDefaults(params);
+    return request(this.config, "/flash/push", {
+      body: {
+        workspace_id: withDefaults.workspace_id,
+        session_id: params.session_id,
+        entries: params.entries || [],
+        increment_turn: params.increment_turn,
+        force_version_bump: params.force_version_bump,
+      },
+    });
+  }
+
+  async flashAck(params: { session_id: string; workspace_id?: string; ids: string[] }) {
+    const withDefaults = this.withDefaults(params);
+    return request(this.config, "/flash/ack", {
+      body: {
+        workspace_id: withDefaults.workspace_id,
+        session_id: params.session_id,
+        ids: params.ids,
+      },
+    });
+  }
+
+  async flashClear(params: { session_id: string; workspace_id?: string }) {
+    const withDefaults = this.withDefaults(params);
+    return request(this.config, "/flash/clear", {
+      body: {
+        workspace_id: withDefaults.workspace_id,
+        session_id: params.session_id,
+      },
+    });
+  }
+
+  async flashStats(params: { session_id: string; workspace_id?: string }) {
+    const withDefaults = this.withDefaults(params);
+    return request(this.config, "/flash/stats", {
+      body: {
+        workspace_id: withDefaults.workspace_id,
+        session_id: params.session_id,
+      },
+    });
+  }
+
+  async flashCheckpoint(params: { session_id: string; workspace_id?: string }) {
+    const withDefaults = this.withDefaults(params);
+    return request(this.config, "/flash/checkpoint", {
+      body: {
+        workspace_id: withDefaults.workspace_id,
+        session_id: params.session_id,
+      },
+    });
+  }
+
+  async flashVerify(params: {
+    session_id: string;
+    workspace_id?: string;
+    expected_version?: number;
+  }) {
+    const withDefaults = this.withDefaults(params);
+    return request(this.config, "/flash/verify", {
+      body: {
+        workspace_id: withDefaults.workspace_id,
+        session_id: params.session_id,
+        expected_version: params.expected_version,
+      },
+    });
+  }
+
   // Memory / Knowledge
   createMemoryEvent(body: {
     workspace_id?: string;
@@ -1930,6 +2067,25 @@ export class ContextStreamClient {
   async findUnusedCode(projectId: string) {
     uuidSchema.parse(projectId);
     return request(this.config, `/graph/unused-code/${projectId}`, { method: "GET" });
+  }
+
+  graphUsages(body: {
+    target_id: string;
+    target_type?: string;
+    project_id?: string;
+    limit?: number;
+  }) {
+    const withDefaults = this.withDefaults(body);
+    if (!withDefaults.project_id) {
+      throw new Error("project_id is required for usages query");
+    }
+    return request(this.config, "/graph/usages", {
+      body: {
+        target_id: body.target_id,
+        target_type: body.target_type || "function",
+        project_id: withDefaults.project_id,
+      },
+    });
   }
 
   findContradictions(nodeId: string) {

@@ -7,6 +7,7 @@ export type TokenSavingsToolType =
   | "search_pattern"
   | "search_exhaustive"
   | "search_refactor"
+  | "search_crawl"
   | "session_recall"
   | "session_smart_search"
   | "session_user_context"
@@ -52,6 +53,7 @@ export const CANDIDATE_MULTIPLIERS: Record<TokenSavingsToolType, number> = {
   search_pattern: 3.0,
   search_exhaustive: 3.5,
   search_refactor: 3.0,
+  search_crawl: 4.5,
 
   // session: Recall/search replaces reading through history
   session_recall: 5.0,
@@ -122,4 +124,3 @@ export function trackToolTokenSavings(
     // Silently ignore any errors in tracking setup
   }
 }
-

@@ -1,7 +1,9 @@
 import { z, type ZodRawShape } from "zod";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
 import { homedir } from "node:os";
+import { promisify } from "node:util";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MessageExtraInfo, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { ContextStreamClient } from "./client.js";
@@ -55,6 +57,8 @@ type ToolTextResult = {
   isError?: boolean;
 };
 
+const execFileAsync = promisify(execFile);
+
 function parseBoolEnvDefault(raw: string | undefined, fallback: boolean): boolean {
   if (raw === undefined) return fallback;
   const normalized = raw.trim().toLowerCase();
@@ -90,6 +94,10 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   memory: "memory",
   graph: "graph",
   media: "media",
+  instruct: "instruct",
+  flash: "flash",
+  ram: "ram",
+  mem: "mem",
   ai: "ai",
   generate_rules: "rules",
   generate_editor_rules: "rules",
@@ -1192,9 +1200,14 @@ const LIGHT_TOOLSET = new Set<string>([
   "session_recall",
   "session_remember",
   "session_get_user_context",
+  "session_decision_trace",
   "session_smart_search",
   "session_compress",
   "session_delta",
+  "capture_plan",
+  "get_plan",
+  "update_plan",
+  "list_plans",
   // Setup and configuration (3)
   "generate_editor_rules",
   "generate_rules",
@@ -1253,6 +1266,8 @@ const STANDARD_TOOLSET = new Set<string>([
   // Workspace management (2)
   "workspaces_list",
   "workspaces_get",
+  "workspaces_create",
+  "workspaces_delete",
   // Project management (6)
   "projects_create",
   "projects_list",
@@ -1260,6 +1275,7 @@ const STANDARD_TOOLSET = new Set<string>([
   "projects_overview",
   "projects_statistics",
   "projects_update",
+  "projects_delete",
   // Project indexing (4)
   "projects_ingest_local",
   "projects_index",
@@ -1299,6 +1315,10 @@ const STANDARD_TOOLSET = new Set<string>([
   "search_semantic",
   "search_hybrid",
   "search_keyword",
+  "flash",
+  "instruct",
+  "ram",
+  "mem",
   // Reminders (6)
   "reminders_list",
   "reminders_active",
@@ -1309,6 +1329,20 @@ const STANDARD_TOOLSET = new Set<string>([
   // Utility (2)
   "auth_me",
   "mcp_server_version",
+]);
+
+type ToolSurfaceProfile = "default" | "openai_agentic";
+
+const OPENAI_AGENTIC_CORE_TOOLSET = new Set<string>([
+  "init",
+  "context",
+  "session",
+  "instruct",
+  "search",
+  "memory",
+  "project",
+  "workspace",
+  "help",
 ]);
 
 // Complete toolset: All tools (resolved as null allowlist)
@@ -1792,6 +1826,7 @@ type OperationConfig = {
   inputSchema: z.ZodType;
   handler: (input: any, extra?: MessageExtraInfo) => Promise<ToolTextResult>;
   category: string;
+  annotations?: ToolAnnotations;
 };
 const operationsRegistry = new Map<string, OperationConfig>();
 
@@ -1959,6 +1994,11 @@ const CONSOLIDATED_TOOLS = new Set<string>([
   "init", // Standalone - complex initialization (renamed from session_init)
   "context", // Standalone - called every message (renamed from context_smart)
   "generate_rules", // Standalone - rule generation helper
+  "generate_editor_rules", // Standalone - editor rules helper
+  "flash", // Compatibility alias for instruct
+  "instruct", // Session-scoped instruction cache
+  "ram", // Compatibility alias for instruct
+  "mem", // Compatibility alias for instruct
   "search", // Consolidates search_semantic, search_hybrid, search_keyword, search_pattern
   "session", // Consolidates session_capture, session_recall, etc.
   "memory", // Consolidates memory_create_event, memory_get_event, etc.
@@ -2050,7 +2090,14 @@ function parseToolList(raw: string): Set<string> {
   );
 }
 
-function resolveToolFilter(): {
+function normalizeToolSurfaceProfile(raw?: string | null): ToolSurfaceProfile {
+  const normalized = raw?.trim().toLowerCase();
+  return normalized === "openai" || normalized === "agentic" || normalized === "openai_agentic"
+    ? "openai_agentic"
+    : "default";
+}
+
+function resolveToolFilter(surfaceProfile: ToolSurfaceProfile = normalizeToolSurfaceProfile(process.env.CONTEXTSTREAM_TOOL_SURFACE_PROFILE)): {
   allowlist: Set<string> | null;
   source: string;
   autoDetected: boolean;
@@ -2063,6 +2110,10 @@ function resolveToolFilter(): {
       return { allowlist: STANDARD_TOOLSET, source: "standard", autoDetected: false };
     }
     return { allowlist, source: "allowlist", autoDetected: false };
+  }
+
+  if (surfaceProfile === "openai_agentic") {
+    return { allowlist: OPENAI_AGENTIC_CORE_TOOLSET, source: "openai_agentic", autoDetected: false };
   }
 
   const toolsetRaw = process.env.CONTEXTSTREAM_TOOLSET;
@@ -2308,14 +2359,20 @@ export function setupClientDetection(server: McpServer): void {
 export function registerTools(
   server: McpServer,
   client: ContextStreamClient,
-  sessionManager?: SessionManager
+  sessionManager?: SessionManager,
+  options?: { toolSurfaceProfile?: ToolSurfaceProfile }
 ) {
   const upgradeUrl = process.env.CONTEXTSTREAM_UPGRADE_URL || "https://contextstream.io/pricing";
-  const toolFilter = resolveToolFilter();
+  const toolSurfaceProfile = normalizeToolSurfaceProfile(
+    options?.toolSurfaceProfile || process.env.CONTEXTSTREAM_TOOL_SURFACE_PROFILE
+  );
+  const openaiAgenticSurface = toolSurfaceProfile === "openai_agentic";
+  const toolFilter = resolveToolFilter(toolSurfaceProfile);
   const rawToolAllowlist = toolFilter.allowlist;
   const toolAllowlist = CONSOLIDATED_MODE
     ? resolveConsolidatedAllowlist(rawToolAllowlist)
     : rawToolAllowlist;
+  const registeredToolHandles = new Map<string, any>();
 
   // Log toolset selection (only in verbose mode)
   if (toolAllowlist) {
@@ -2327,6 +2384,10 @@ export function registerTools(
     }
   } else {
     logDebug("Toolset: complete (all tools)");
+  }
+
+  if (openaiAgenticSurface) {
+    logDebug("Tool surface profile: OPENAI agentic");
   }
 
   // Log auto-toolset status (Strategy 3) - verbose only
@@ -2367,6 +2428,43 @@ export function registerTools(
 
   // Store server reference for deferred tool registration
   const serverRef = server;
+  const lowLevelServer = (serverRef as any).server as
+    | {
+        _oninitialize?: (request: { params?: Record<string, unknown> }) => Promise<unknown>;
+        getClientVersion?: () => { name?: string; version?: string } | undefined;
+        oninitialized?: () => void;
+      }
+    | undefined;
+  let activeSurfaceProfile = toolSurfaceProfile;
+
+  if (lowLevelServer?._oninitialize) {
+    const originalOnInitialize = lowLevelServer._oninitialize.bind(lowLevelServer);
+    lowLevelServer._oninitialize = async (request: { params?: Record<string, unknown> }) => {
+      const detected =
+        detectToolSurfaceProfileFromInitializeParams(request?.params) || toolSurfaceProfile;
+      activeSurfaceProfile = detected;
+      const result = await originalOnInitialize(request);
+      return result;
+    };
+  }
+
+  if (lowLevelServer) {
+    const originalInitialized = lowLevelServer.oninitialized;
+    lowLevelServer.oninitialized = () => {
+      const clientVersion = lowLevelServer.getClientVersion?.();
+      if (
+        activeSurfaceProfile !== "openai_agentic" &&
+        typeof clientVersion?.name === "string" &&
+        detectToolSurfaceProfileFromInitializeParams({
+          clientInfo: { name: clientVersion.name },
+        }) === "openai_agentic"
+      ) {
+        activeSurfaceProfile = "openai_agentic";
+      }
+      applyToolSurfaceProfile(activeSurfaceProfile, true);
+      originalInitialized?.();
+    };
+  }
 
   const defaultProTools = new Set<string>([
     // AI endpoints (typically paid/credit-metered)
@@ -2894,7 +2992,8 @@ export function registerTools(
   function actuallyRegisterTool<T extends z.ZodType>(
     name: string,
     config: { title: string; description: string; inputSchema: T },
-    handler: (input: z.infer<T>, extra?: MessageExtraInfo) => Promise<ToolTextResult>
+    handler: (input: z.infer<T>, extra?: MessageExtraInfo) => Promise<ToolTextResult>,
+    inferredAnnotations?: ToolAnnotations
   ) {
     // Strategy 4: Apply schema compactification in compact mode
     let finalDescription: string;
@@ -2919,7 +3018,7 @@ export function registerTools(
       ...labeledConfig,
       inputSchema: finalSchema,
       annotations: {
-        ...inferToolAnnotations(name),
+        ...(inferredAnnotations || inferToolAnnotations(name)),
         ...(labeledConfig as { annotations?: ToolAnnotations }).annotations,
       },
     };
@@ -2967,7 +3066,8 @@ export function registerTools(
       }
     };
 
-    serverRef.registerTool(name, annotatedConfig, wrapWithAutoContext(name, safeHandler));
+    const registered = serverRef.registerTool(name, annotatedConfig, wrapWithAutoContext(name, safeHandler));
+    registeredToolHandles.set(name, registered);
   }
 
   /**
@@ -3028,42 +3128,39 @@ export function registerTools(
   }
 
   // Meta-tools that should always be registered directly (not routed)
-  const ROUTER_DIRECT_TOOLS = new Set(["contextstream", "contextstream_help"]);
+  const ROUTER_DIRECT_TOOLS = new Set([
+    "contextstream",
+    "contextstream_help",
+    "operations",
+    "execute_operation",
+  ]);
+  const AGENTIC_DIRECT_TOOLS = new Set(["tool_search", "execute_operation", "batch_operations"]);
 
   function registerTool<T extends z.ZodType>(
     name: string,
     config: { title: string; description: string; inputSchema: T },
     handler: (input: z.infer<T>, extra?: MessageExtraInfo) => Promise<ToolTextResult>
   ) {
+    const inferredAnnotations = inferToolAnnotations(name);
+
+    operationsRegistry.set(name, {
+      name,
+      title: config.title,
+      description: config.description,
+      inputSchema: config.inputSchema,
+      handler,
+      category: inferOperationCategory(name),
+      annotations: inferredAnnotations,
+    });
+
     // Strategy 8: Consolidated mode - only register consolidated domain tools
     // Skip individual tools (they're accessed via domain tool dispatch)
-    if (CONSOLIDATED_MODE && !CONSOLIDATED_TOOLS.has(name)) {
-      // Store handler for consolidated tools to dispatch to
-      operationsRegistry.set(name, {
-        name,
-        title: config.title,
-        description: config.description,
-        inputSchema: config.inputSchema,
-        handler,
-        category: inferOperationCategory(name),
-      });
+    if (CONSOLIDATED_MODE && !CONSOLIDATED_TOOLS.has(name) && !AGENTIC_DIRECT_TOOLS.has(name)) {
       return;
     }
 
     // Check toolset allowlist for both standard and consolidated tool registration.
-    if (toolAllowlist && !toolAllowlist.has(name)) {
-      // In router mode, still store in registry even if not in allowlist
-      // (the router can access all operations)
-      if (ROUTER_MODE && !ROUTER_DIRECT_TOOLS.has(name)) {
-        operationsRegistry.set(name, {
-          name,
-          title: config.title,
-          description: config.description,
-          inputSchema: config.inputSchema,
-          handler,
-          category: inferOperationCategory(name),
-        });
-      }
+    if (toolAllowlist && !toolAllowlist.has(name) && !AGENTIC_DIRECT_TOOLS.has(name)) {
       return;
     }
 
@@ -3075,14 +3172,12 @@ export function registerTools(
 
     // Strategy 6: Router mode - store in operations registry instead of registering
     if (ROUTER_MODE && !ROUTER_DIRECT_TOOLS.has(name)) {
-      operationsRegistry.set(name, {
-        name,
-        title: config.title,
-        description: config.description,
-        inputSchema: config.inputSchema,
-        handler,
-        category: inferOperationCategory(name),
-      });
+      return;
+    }
+
+    // OpenAI agentic surface exposes a compact core set directly and routes the long tail
+    // through tool_search/execute_operation.
+    if (openaiAgenticSurface && toolAllowlist && !toolAllowlist.has(name)) {
       return;
     }
 
@@ -3094,7 +3189,7 @@ export function registerTools(
     }
 
     // Register the tool immediately
-    actuallyRegisterTool(name, config, handler);
+    actuallyRegisterTool(name, config, handler, inferredAnnotations);
   }
 
   function errorResult(text: string): ToolTextResult {
@@ -3102,6 +3197,70 @@ export function registerTools(
       content: [{ type: "text" as const, text }],
       isError: true,
     };
+  }
+
+  function detectToolSurfaceProfileFromInitializeParams(
+    params: Record<string, unknown> | undefined
+  ): ToolSurfaceProfile | undefined {
+    if (!params) return undefined;
+
+    const explicit =
+      typeof params.tool_surface_profile === "string"
+        ? normalizeToolSurfaceProfile(params.tool_surface_profile)
+        : undefined;
+    if (explicit === "openai_agentic") {
+      return explicit;
+    }
+
+    const clientInfo =
+      params.clientInfo && typeof params.clientInfo === "object"
+        ? (params.clientInfo as Record<string, unknown>)
+        : undefined;
+    const combined = [
+      typeof params.client_name === "string" ? params.client_name : undefined,
+      typeof params.provider === "string" ? params.provider : undefined,
+      typeof params.model === "string" ? params.model : undefined,
+      typeof clientInfo?.name === "string" ? clientInfo.name : undefined,
+    ]
+      .filter((value): value is string => Boolean(value))
+      .join(" ")
+      .toLowerCase();
+
+    if (
+      combined.includes("openai") ||
+      combined.includes("chatgpt") ||
+      combined.includes("responses") ||
+      combined.includes("gpt-5")
+    ) {
+      return "openai_agentic";
+    }
+
+    return undefined;
+  }
+
+  function applyToolSurfaceProfile(profile: ToolSurfaceProfile, notify = false): void {
+    if (!registeredToolHandles.size) return;
+
+    for (const [name, handle] of registeredToolHandles) {
+      const shouldEnable =
+        profile === "openai_agentic"
+          ? OPENAI_AGENTIC_CORE_TOOLSET.has(name) || AGENTIC_DIRECT_TOOLS.has(name)
+          : !AGENTIC_DIRECT_TOOLS.has(name);
+
+      if (shouldEnable) {
+        handle.enable?.();
+      } else {
+        handle.disable?.();
+      }
+    }
+
+    if (notify) {
+      try {
+        (serverRef as any).server?.sendToolsListChanged?.();
+      } catch {
+        // Best effort only.
+      }
+    }
   }
 
   function resolveWorkspaceId(explicitWorkspaceId?: string): string | undefined {
@@ -3253,13 +3412,45 @@ export function registerTools(
     return hasLookupVerb || lower.startsWith("docs ") || lower.startsWith("doc ");
   }
 
+  function normalizeConfiguredSearchMode(
+    value?: string | null
+  ): "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor" | "team" | "crawl" | undefined {
+    if (!value) return undefined;
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === "semantic" ||
+      normalized === "hybrid" ||
+      normalized === "keyword" ||
+      normalized === "pattern" ||
+      normalized === "exhaustive" ||
+      normalized === "refactor" ||
+      normalized === "team" ||
+      normalized === "crawl"
+    ) {
+      return normalized;
+    }
+    return undefined;
+  }
+
   function recommendSearchMode(query: string): {
-    mode: "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor" | "team";
+    mode:
+      | "semantic"
+      | "hybrid"
+      | "keyword"
+      | "pattern"
+      | "exhaustive"
+      | "refactor"
+      | "team"
+      | "crawl";
     reason: string;
   } {
+    const resolvedDefault = normalizeConfiguredSearchMode(
+      sessionManager?.getDefaultSearchMode() || undefined
+    ) || "hybrid";
+    const crawlIsDefault = resolvedDefault === "crawl";
     const trimmed = query.trim();
     if (!trimmed) {
-      return { mode: "hybrid", reason: "Defaulted to hybrid for broad discovery." };
+      return { mode: resolvedDefault, reason: "Defaulted to fallback mode for broad discovery." };
     }
 
     const lower = trimmed.toLowerCase();
@@ -3280,6 +3471,12 @@ export function registerTools(
     if (isGlobLike(trimmed) || hasRegexCharacters(trimmed)) {
       return { mode: "pattern", reason: "Detected glob/regex pattern." };
     }
+    if (crawlIsDefault) {
+      return {
+        mode: "crawl",
+        reason: "Workspace default_search_mode is crawl; using deep multi-modal search.",
+      };
+    }
     if (isIdentifierQuery(trimmed)) {
       return {
         mode: "refactor",
@@ -3297,7 +3494,15 @@ export function registerTools(
 
   function suggestOutputFormat(
     query: string,
-    mode: "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor" | "team"
+    mode:
+      | "semantic"
+      | "hybrid"
+      | "keyword"
+      | "pattern"
+      | "exhaustive"
+      | "refactor"
+      | "team"
+      | "crawl"
   ): "count" | "paths" | "minimal" | undefined {
     const lower = query.trim().toLowerCase();
     if (isCountQuery(lower)) {
@@ -3314,7 +3519,15 @@ export function registerTools(
 
   function shouldRetrySemanticFallback(
     query: string,
-    mode: "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor" | "team",
+    mode:
+      | "semantic"
+      | "hybrid"
+      | "keyword"
+      | "pattern"
+      | "exhaustive"
+      | "refactor"
+      | "team"
+      | "crawl",
     result: any
   ): boolean {
     if (mode !== "hybrid") return false;
@@ -3468,7 +3681,7 @@ export function registerTools(
   }
 
   async function executeSearchMode(
-    mode: "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor",
+    mode: "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor" | "crawl",
     params: ReturnType<typeof normalizeSearchParams>
   ): Promise<any> {
     switch (mode) {
@@ -3484,6 +3697,8 @@ export function registerTools(
         return client.searchExhaustive(params);
       case "refactor":
         return client.searchRefactor(params);
+      case "crawl":
+        return client.searchCrawl(params);
       default:
         return client.searchHybrid(params);
     }
@@ -3567,6 +3782,326 @@ export function registerTools(
       }
     })();
   }
+
+  function summarizeVideoTextExtraction(metadata: unknown): string | undefined {
+    if (!metadata || typeof metadata !== "object") return undefined;
+    const extraction = (metadata as Record<string, unknown>).video_text_extraction;
+    if (!extraction || typeof extraction !== "object") return undefined;
+
+    const info = extraction as Record<string, unknown>;
+    const parts: string[] = [];
+
+    const pushPart = (label: string, value: unknown) => {
+      if (typeof value === "string" && value.trim()) {
+        parts.push(`${label}=${value.trim()}`);
+      } else if (typeof value === "number" && Number.isFinite(value)) {
+        parts.push(`${label}=${value}`);
+      }
+    };
+
+    pushPart("provider", info.provider);
+    pushPart("status", info.status);
+    pushPart("segments", info.segments_count);
+    pushPart("job_id", info.job_id);
+    pushPart("doc_id", info.doc_id);
+    pushPart("aws_profile", info.aws_profile);
+
+    return parts.length > 0 ? parts.join(", ") : undefined;
+  }
+
+  async function getGitRoot(folderPath: string): Promise<string | undefined> {
+    try {
+      const { stdout } = await execFileAsync("git", ["-C", folderPath, "rev-parse", "--show-toplevel"], {
+        encoding: "utf8",
+      });
+      const gitRoot = stdout.trim();
+      return gitRoot || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function getRecentProjectChanges(
+    folderPath: string,
+    limit: number,
+    since?: string
+  ): Promise<{
+    git_root: string;
+    commits: Array<{
+      hash: string;
+      message: string;
+      author: string;
+      date: string;
+      files_changed: string[];
+    }>;
+    commit_count: number;
+    diff_stat: {
+      files_modified: number;
+      insertions: number;
+      deletions: number;
+      summary: string;
+      files: string[];
+    };
+  }> {
+    const gitRoot = await getGitRoot(folderPath);
+    if (!gitRoot) {
+      throw new Error(`No git repository found at or above: ${folderPath}`);
+    }
+
+    const logArgs = [
+      "-C",
+      gitRoot,
+      "log",
+      `--max-count=${Math.max(1, Math.min(limit, 50))}`,
+      "--date=iso-strict",
+      "--pretty=format:__CS_COMMIT__%n%H%n%an%n%ad%n%s",
+      "--name-only",
+    ];
+    if (since?.trim()) {
+      logArgs.splice(3, 0, `--since=${since.trim()}`);
+    }
+
+    const [{ stdout: logStdout }, { stdout: diffStdout }] = await Promise.all([
+      execFileAsync("git", logArgs, { encoding: "utf8", maxBuffer: 1024 * 1024 * 8 }),
+      execFileAsync("git", ["-C", gitRoot, "diff", "--stat"], {
+        encoding: "utf8",
+        maxBuffer: 1024 * 1024 * 4,
+      }),
+    ]);
+
+    const commits = logStdout
+      .split("__CS_COMMIT__\n")
+      .map((chunk: string) => chunk.trim())
+      .filter(Boolean)
+      .map((chunk: string) => {
+        const lines = chunk.split("\n");
+        const [hash = "", author = "", date = "", message = "", ...rest] = lines;
+        const files_changed = rest.map((line: string) => line.trim()).filter(Boolean);
+        return { hash, author, date, message, files_changed };
+      });
+
+    const diffLines = diffStdout
+      .split("\n")
+      .map((line: string) => line.trimEnd())
+      .filter(Boolean);
+    const summary = diffLines.length > 0 ? diffLines[diffLines.length - 1].trim() : "";
+    const diffFiles = diffLines
+      .slice(0, summary ? -1 : diffLines.length)
+      .map((line: string) => line.trim());
+
+    const filesModifiedMatch = summary.match(/(\d+)\s+files?\s+changed/);
+    const insertionsMatch = summary.match(/(\d+)\s+insertions?\(\+\)/);
+    const deletionsMatch = summary.match(/(\d+)\s+deletions?\(-\)/);
+
+    return {
+      git_root: gitRoot,
+      commits,
+      commit_count: commits.length,
+      diff_stat: {
+        files_modified: filesModifiedMatch ? Number(filesModifiedMatch[1]) : diffFiles.length,
+        insertions: insertionsMatch ? Number(insertionsMatch[1]) : 0,
+        deletions: deletionsMatch ? Number(deletionsMatch[1]) : 0,
+        summary,
+        files: diffFiles,
+      },
+    };
+  }
+
+  const instructionToolSchema = z.object({
+    action: z
+      .enum(["bootstrap", "get", "push", "ack", "clear", "stats", "checkpoint", "verify"])
+      .describe("Action to perform"),
+    workspace_id: z.string().uuid().optional(),
+    session_id: z.string().describe("Session identifier"),
+    limit: z.number().optional().describe("Maximum entries (for get)"),
+    entries: z
+      .array(
+        z.object({
+          id: z.string().optional().describe("Optional entry id"),
+          text: z.string().describe("Instruction text"),
+          source: z.string().optional().describe("Optional source label"),
+          critical: z.boolean().optional().describe("Mark as critical"),
+          surface: z.boolean().optional().describe("Whether to surface in get"),
+          metadata: z.record(z.any()).optional().describe("Optional metadata"),
+        })
+      )
+      .optional()
+      .describe("Entries to push (for push)"),
+    increment_turn: z.boolean().optional().describe("Increment turn counter (for push)"),
+    force_version_bump: z
+      .boolean()
+      .optional()
+      .describe("Force version bump even with no new entries (for push)"),
+    ids: z.array(z.string()).optional().describe("Entry IDs to acknowledge (for ack)"),
+    expected_version: z.number().optional().describe("Expected version for checkpoint verify"),
+  });
+
+  const instructionToolDescription =
+    "Session-scoped instruction cache operations. Actions: bootstrap, get, push, ack, clear, stats, checkpoint, verify.";
+
+  async function executeInstructionTool(input: z.infer<typeof instructionToolSchema>): Promise<ToolTextResult> {
+    switch (input.action) {
+      case "bootstrap": {
+        const result = await client.flashBootstrap({
+          workspace_id: input.workspace_id,
+          session_id: input.session_id,
+        });
+        return {
+          content: [{ type: "text" as const, text: formatContent(result) }],
+          structuredContent:
+            result && typeof result === "object" && !Array.isArray(result)
+              ? (result as StructuredContent)
+              : undefined,
+        };
+      }
+
+      case "get": {
+        const result = await client.flashGet({
+          workspace_id: input.workspace_id,
+          session_id: input.session_id,
+          limit: input.limit,
+        });
+        return {
+          content: [{ type: "text" as const, text: formatContent(result) }],
+          structuredContent:
+            result && typeof result === "object" && !Array.isArray(result)
+              ? (result as StructuredContent)
+              : undefined,
+        };
+      }
+
+      case "push": {
+        const result = await client.flashPush({
+          workspace_id: input.workspace_id,
+          session_id: input.session_id,
+          entries: input.entries,
+          increment_turn: input.increment_turn,
+          force_version_bump: input.force_version_bump,
+        });
+        return {
+          content: [{ type: "text" as const, text: formatContent(result) }],
+          structuredContent:
+            result && typeof result === "object" && !Array.isArray(result)
+              ? (result as StructuredContent)
+              : undefined,
+        };
+      }
+
+      case "ack": {
+        const result = await client.flashAck({
+          workspace_id: input.workspace_id,
+          session_id: input.session_id,
+          ids: input.ids || [],
+        });
+        return {
+          content: [{ type: "text" as const, text: formatContent(result) }],
+          structuredContent:
+            result && typeof result === "object" && !Array.isArray(result)
+              ? (result as StructuredContent)
+              : undefined,
+        };
+      }
+
+      case "clear": {
+        const result = await client.flashClear({
+          workspace_id: input.workspace_id,
+          session_id: input.session_id,
+        });
+        return {
+          content: [{ type: "text" as const, text: formatContent(result) }],
+          structuredContent:
+            result && typeof result === "object" && !Array.isArray(result)
+              ? (result as StructuredContent)
+              : undefined,
+        };
+      }
+
+      case "stats": {
+        const result = await client.flashStats({
+          workspace_id: input.workspace_id,
+          session_id: input.session_id,
+        });
+        return {
+          content: [{ type: "text" as const, text: formatContent(result) }],
+          structuredContent:
+            result && typeof result === "object" && !Array.isArray(result)
+              ? (result as StructuredContent)
+              : undefined,
+        };
+      }
+
+      case "checkpoint": {
+        const result = await client.flashCheckpoint({
+          workspace_id: input.workspace_id,
+          session_id: input.session_id,
+        });
+        return {
+          content: [{ type: "text" as const, text: formatContent(result) }],
+          structuredContent:
+            result && typeof result === "object" && !Array.isArray(result)
+              ? (result as StructuredContent)
+              : undefined,
+        };
+      }
+
+      case "verify": {
+        const result = await client.flashVerify({
+          workspace_id: input.workspace_id,
+          session_id: input.session_id,
+          expected_version: input.expected_version,
+        });
+        return {
+          content: [{ type: "text" as const, text: formatContent(result) }],
+          structuredContent:
+            result && typeof result === "object" && !Array.isArray(result)
+              ? (result as StructuredContent)
+              : undefined,
+        };
+      }
+    }
+
+    return errorResult(`Unknown action: ${input.action}`);
+  }
+
+  registerTool(
+    "flash",
+    {
+      title: "Session instructions (flash alias)",
+      description: `Alias of instruct. ${instructionToolDescription}`,
+      inputSchema: instructionToolSchema,
+    },
+    executeInstructionTool
+  );
+
+  registerTool(
+    "instruct",
+    {
+      title: "Session instructions",
+      description: `${instructionToolDescription} Compatibility aliases: ram, mem.`,
+      inputSchema: instructionToolSchema,
+    },
+    executeInstructionTool
+  );
+
+  registerTool(
+    "ram",
+    {
+      title: "Session instructions (ram alias)",
+      description: `Alias of instruct. ${instructionToolDescription}`,
+      inputSchema: instructionToolSchema,
+    },
+    executeInstructionTool
+  );
+
+  registerTool(
+    "mem",
+    {
+      title: "Session instructions (mem alias)",
+      description: `Alias of instruct. ${instructionToolDescription}`,
+      inputSchema: instructionToolSchema,
+    },
+    executeInstructionTool
+  );
 
   // Auth
   registerTool(
@@ -3688,6 +4223,41 @@ Example: Enable memory tools before using memory_create_event.`,
 
   // Strategy 6: Router meta-tools (only registered when router mode is enabled)
   if (ROUTER_MODE) {
+    const executeOperationByName = async (
+      opName: string,
+      args: Record<string, unknown>
+    ): Promise<ToolTextResult> => {
+      const operation = operationsRegistry.get(opName);
+
+      if (!operation) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Unknown operation: ${opName}\n\nAvailable operations:\n${getOperationCatalog()}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const parsed = operation.inputSchema.safeParse(args);
+      if (!parsed.success) {
+        const schema = getOperationSchema(opName);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Invalid arguments for ${opName}: ${parsed.error.message}\n\nExpected schema:\n${JSON.stringify(schema?.schema || {}, null, 2)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      return operation.handler(parsed.data);
+    };
+
     // Main dispatcher tool
     serverRef.registerTool(
       "contextstream",
@@ -3718,47 +4288,83 @@ All ContextStream functionality is accessible through this dispatcher.`,
         },
       },
       async (input: { op: string; args?: Record<string, unknown> }) => {
-        const opName = input.op;
-        const operation = operationsRegistry.get(opName);
-
-        if (!operation) {
-          const available = getOperationCatalog();
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Unknown operation: ${opName}\n\nAvailable operations:\n${available}\n\nUse contextstream_help({ op: "operation_name" }) for details.`,
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        // Validate args against schema
-        const args = input.args || {};
-        const parsed = operation.inputSchema.safeParse(args);
-        if (!parsed.success) {
-          const schema = getOperationSchema(opName);
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Invalid arguments for ${opName}: ${parsed.error.message}\n\nExpected schema:\n${JSON.stringify(schema?.schema || {}, null, 2)}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        // Execute the operation
         try {
-          return await operation.handler(parsed.data);
+          return await executeOperationByName(input.op, input.args || {});
         } catch (error: any) {
           return {
             content: [
               {
                 type: "text" as const,
-                text: `Error executing ${opName}: ${error?.message || String(error)}`,
+                text: `Error executing ${input.op}: ${error?.message || String(error)}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    serverRef.registerTool(
+      "operations",
+      {
+        title: "Operations",
+        description: "List available operations. Use execute_operation to run them.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            category: { type: "string", description: "Optional category filter" },
+          },
+        },
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async (input: { category?: string }) => {
+        const catalog = getOperationCatalog(input.category);
+        const response = {
+          total_operations: operationsRegistry.size,
+          categories: catalog,
+          usage: 'Use execute_operation({ name: "operation_name", arguments: {...} }) to run one.',
+        };
+        return {
+          content: [{ type: "text" as const, text: formatContent(response) }],
+          structuredContent: response as StructuredContent,
+        };
+      }
+    );
+
+    serverRef.registerTool(
+      "execute_operation",
+      {
+        title: "Execute operation",
+        description: "Execute an operation returned by operations or tool_search.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            name: { type: "string", description: "Operation name" },
+            arguments: { type: "object", description: "Operation arguments" },
+          },
+          required: ["name"],
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      async (input: { name: string; arguments?: Record<string, unknown> }) => {
+        try {
+          return await executeOperationByName(input.name, input.arguments || {});
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Error executing ${input.name}: ${error?.message || String(error)}`,
               },
             ],
             isError: true,
@@ -3833,7 +4439,204 @@ Examples:
       }
     );
 
-    logDebug(`Router mode: 2 meta-tools, ${operationsRegistry.size} operations`);
+    logDebug(`Router mode: 4 meta-tools, ${operationsRegistry.size} operations`);
+  }
+
+  if (!ROUTER_MODE) {
+    const extractToolText = (result: ToolTextResult): string =>
+      result.content
+        .filter((item) => item.type === "text")
+        .map((item) => item.text)
+        .join("\n\n");
+
+    serverRef.registerTool(
+      "tool_search",
+      {
+        title: "Tool search",
+        description:
+          "Search available tools and hidden operations, then call direct tools or use execute_operation for deferred capabilities.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            query: { type: "string", description: "Capability or operation to search for" },
+            category: { type: "string", description: "Optional category filter" },
+            limit: { type: "number", description: "Maximum matches to return (default: 8)" },
+          },
+          required: ["query"],
+        },
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async (input: { query: string; category?: string; limit?: number }) => {
+        const query = input.query.trim().toLowerCase();
+        const limit = Math.max(1, Math.min(input.limit || 8, 25));
+        const categoryFilter = input.category?.trim().toLowerCase();
+        const matches = Array.from(operationsRegistry.values())
+          .filter((op) => !categoryFilter || op.category.toLowerCase() === categoryFilter)
+          .map((op) => {
+            const haystack = `${op.name} ${op.title} ${op.description} ${op.category}`.toLowerCase();
+            const score = haystack.includes(query)
+              ? 3
+              : query
+                  .split(/\s+/)
+                  .filter(Boolean)
+                  .reduce((acc, term) => acc + (haystack.includes(term) ? 1 : 0), 0);
+            return {
+              name: op.name,
+              title: op.title,
+              description: op.description,
+              category: op.category,
+              call_mode: registeredToolHandles.get(op.name)?.enabled ? "direct" : "execute_operation",
+              score,
+            };
+          })
+          .filter((entry) => entry.score > 0)
+          .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+          .slice(0, limit);
+
+        const response = {
+          query: input.query,
+          matches,
+          total: matches.length,
+        };
+
+        return {
+          content: [{ type: "text" as const, text: formatContent(response) }],
+          structuredContent: response as StructuredContent,
+        };
+      }
+    );
+
+    serverRef.registerTool(
+      "execute_operation",
+      {
+        title: "Execute operation",
+        description: "Execute a hidden or deferred capability returned by tool_search.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            name: { type: "string", description: "Operation name returned by tool_search" },
+            arguments: { type: "object", description: "Operation arguments" },
+          },
+          required: ["name"],
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      async (input: { name: string; arguments?: Record<string, unknown> }) => {
+        const operation = operationsRegistry.get(input.name);
+        if (!operation) {
+          return errorResult(`Unknown operation: ${input.name}`);
+        }
+
+        const parsed = operation.inputSchema.safeParse(input.arguments || {});
+        if (!parsed.success) {
+          return errorResult(`Invalid arguments for ${input.name}: ${parsed.error.message}`);
+        }
+
+        return operation.handler(parsed.data);
+      }
+    );
+
+    serverRef.registerTool(
+      "batch_operations",
+      {
+        title: "Batch operations",
+        description: "Execute multiple independent read-only operations in one call. Rejects write or destructive operations.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            operations: {
+              type: "array",
+              description: "Operations to execute",
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string" },
+                  arguments: { type: "object" },
+                },
+                required: ["name"],
+              },
+            },
+          },
+          required: ["operations"],
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      async (input: { operations: Array<{ name: string; arguments?: Record<string, unknown> }> }) => {
+        const results = [];
+        for (const operationInput of input.operations || []) {
+          const operation = operationsRegistry.get(operationInput.name);
+          if (!operation) {
+            results.push({
+              name: operationInput.name,
+              success: false,
+              error: `Unknown operation: ${operationInput.name}`,
+            });
+            continue;
+          }
+
+          const annotations = operation.annotations;
+          if (annotations && (!annotations.readOnlyHint || annotations.destructiveHint)) {
+            return errorResult(
+              `'${operationInput.name}' is not eligible for batch_operations because it is not read-only.`
+            );
+          }
+
+          const parsed = operation.inputSchema.safeParse(operationInput.arguments || {});
+          if (!parsed.success) {
+            results.push({
+              name: operationInput.name,
+              success: false,
+              error: parsed.error.message,
+            });
+            continue;
+          }
+
+          try {
+            const result = await operation.handler(parsed.data);
+            results.push({
+              name: operationInput.name,
+              success: !result.isError,
+              output: extractToolText(result),
+              structured: result.structuredContent,
+            });
+          } catch (error) {
+            results.push({
+              name: operationInput.name,
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+
+        const response = {
+          total: results.length,
+          results,
+        };
+
+        return {
+          content: [{ type: "text" as const, text: formatContent(response) }],
+          structuredContent: response as StructuredContent,
+          isError: results.some((result) => !result.success),
+        };
+      }
+    );
+
+    logDebug(`OpenAI agentic meta-tools registered`);
   }
 
   // Workspaces
@@ -7428,6 +8231,124 @@ After compression, the AI can use session_recall to retrieve this context in fut
   );
 
   registerTool(
+    "capture_plan",
+    {
+      title: "Capture plan",
+      description: "Create a new implementation plan.",
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+        project_id: z.string().uuid().optional(),
+        title: z.string(),
+        description: z.string().optional(),
+        goals: z.array(z.string()).optional(),
+        steps: z
+          .array(
+            z.object({
+              id: z.string(),
+              title: z.string(),
+              description: z.string().optional(),
+              order: z.number(),
+              estimated_effort: z.string().optional(),
+            })
+          )
+          .optional(),
+        status: z.enum(["draft", "active", "completed", "archived", "abandoned"]).optional(),
+        tags: z.array(z.string()).optional(),
+        due_at: z.string().optional(),
+        is_personal: z.boolean().optional(),
+      }),
+    },
+    async (input) => {
+      const result = await client.createPlan(input);
+      return {
+        content: [{ type: "text" as const, text: formatContent(result) }],
+      };
+    }
+  );
+
+  registerTool(
+    "get_plan",
+    {
+      title: "Get plan",
+      description: "Get a plan by ID.",
+      inputSchema: z.object({
+        plan_id: z.string().uuid(),
+        include_tasks: z.boolean().optional(),
+      }),
+    },
+    async (input) => {
+      const result = await client.getPlan(input);
+      return {
+        content: [{ type: "text" as const, text: formatContent(result) }],
+      };
+    }
+  );
+
+  registerTool(
+    "update_plan",
+    {
+      title: "Update plan",
+      description: "Update an implementation plan.",
+      inputSchema: z.object({
+        plan_id: z.string().uuid(),
+        title: z.string().optional(),
+        description: z.string().optional(),
+        goals: z.array(z.string()).optional(),
+        status: z.enum(["draft", "active", "completed", "archived", "abandoned"]).optional(),
+      }),
+    },
+    async (input) => {
+      const result = await client.updatePlan(input);
+      return {
+        content: [{ type: "text" as const, text: formatContent(result) }],
+      };
+    }
+  );
+
+  registerTool(
+    "list_plans",
+    {
+      title: "List plans",
+      description: "List implementation plans.",
+      inputSchema: z.object({
+        workspace_id: z.string().uuid().optional(),
+        project_id: z.string().uuid().optional(),
+        status: z.string().optional(),
+        is_personal: z.boolean().optional(),
+        limit: z.number().optional(),
+        offset: z.number().optional(),
+      }),
+    },
+    async (input) => {
+      const result = await client.listPlans(input);
+      return {
+        content: [{ type: "text" as const, text: formatContent(result) }],
+      };
+    }
+  );
+
+  registerTool(
+    "session_decision_trace",
+    {
+      title: "Decision trace",
+      description: "Trace decision provenance for a query.",
+      inputSchema: z.object({
+        query: z.string(),
+        workspace_id: z.string().uuid().optional(),
+        project_id: z.string().uuid().optional(),
+        limit: z.number().optional(),
+        include_impact: z.boolean().optional(),
+      }),
+    },
+    async (input) => {
+      const result = await client.decisionTrace(input);
+      return {
+        content: [{ type: "text" as const, text: formatContent(result) }],
+      };
+    }
+  );
+
+  registerTool(
     "ai_context_budget",
     {
       title: "Get context within token budget",
@@ -9126,15 +10047,15 @@ Use this to remove a reminder that is no longer relevant.`,
       "search",
       {
         title: "Search",
-        description: `Search workspace memory and knowledge. Modes: auto (recommended), semantic (meaning-based), hybrid (legacy alias for auto), keyword (exact match), pattern (regex), exhaustive (all matches like grep), refactor (word-boundary matching for symbol renaming), team (cross-project team search - team plans only).
+        description: `Search workspace memory and knowledge. Modes: auto (recommended), semantic (meaning-based), hybrid (legacy alias for auto), keyword (exact match), pattern (regex), exhaustive (all matches like grep), refactor (word-boundary matching for symbol renaming), team (cross-project team search - team plans only), crawl (deep multi-modal search).
 
 Output formats: full (default, includes content), paths (file paths only - 80% token savings), minimal (compact - 60% savings), count (match counts only - 90% savings).`,
         inputSchema: z.object({
           mode: z
-            .enum(["auto", "semantic", "hybrid", "keyword", "pattern", "exhaustive", "refactor", "team"])
+            .enum(["auto", "semantic", "hybrid", "keyword", "pattern", "exhaustive", "refactor", "team", "crawl"])
             .optional()
             .default("auto")
-            .describe("Search mode (auto recommended; hybrid is a backward-compatible alias)"),
+            .describe("Search mode (auto recommended; hybrid is a backward-compatible alias; crawl is deep multi-modal search)"),
           query: z.string().describe("Search query"),
           workspace_id: z.string().uuid().optional(),
           project_id: z.string().uuid().optional(),
@@ -9182,11 +10103,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           | "pattern"
           | "exhaustive"
           | "refactor"
-          | "team" = modeAutoSelected
+          | "team"
+          | "crawl" = modeAutoSelected
             ? modeRecommendation.mode
-            : modeInput === "auto"
-              ? "hybrid"
-              : modeInput;
+            : modeInput;
 
         let workspaceId = resolveWorkspaceId(input.workspace_id);
         const sessionProjectId = resolveProjectId(undefined);
@@ -9256,6 +10176,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           pattern: "search_pattern",
           exhaustive: "search_exhaustive",
           refactor: "search_refactor",
+          crawl: "search_crawl",
           team: "search_hybrid",
         };
 
@@ -9267,7 +10188,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             | "pattern"
             | "exhaustive"
             | "refactor"
-            | "team",
+            | "team"
+            | "crawl",
           baseParams: ReturnType<typeof normalizeSearchParams>
         ): Promise<{ result: any; executedMode: typeof mode; fallbackNote?: string }> => {
           if (mode === "team") {
@@ -9324,7 +10246,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           const dispatchMode = mode === "hybrid" ? "hybrid" : mode;
           let result = await executeSearchMode(dispatchMode, baseParams);
-          let executedMode: "semantic" | "hybrid" | "keyword" | "pattern" | "exhaustive" | "refactor" =
+          let executedMode:
+            | "semantic"
+            | "hybrid"
+            | "keyword"
+            | "pattern"
+            | "exhaustive"
+            | "refactor"
+            | "crawl" =
             dispatchMode;
           let fallbackNote: string | undefined;
 
@@ -9504,7 +10433,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             | "pattern"
             | "exhaustive"
             | "refactor"
-            | "team";
+            | "team"
+            | "crawl";
           fallbackNote?: string;
         };
 
@@ -9900,8 +10830,6 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         let workspaceId = resolveWorkspaceId(input.workspace_id);
         const explicitProjectId = normalizeUuid(input.project_id);
         let projectId = explicitProjectId || resolveProjectId(undefined);
-        const folderPath =
-          input.folder_path || input.path || resolveFolderPath(undefined, sessionManager) || undefined;
 
         switch (input.action) {
           case "capture": {
@@ -10933,8 +11861,6 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         let workspaceId = resolveWorkspaceId(input.workspace_id);
         const explicitProjectId = normalizeUuid(input.project_id);
         let projectId = explicitProjectId || resolveProjectId(undefined);
-        const folderPath =
-          input.folder_path || input.path || resolveFolderPath(undefined, sessionManager) || undefined;
 
         switch (input.action) {
           case "create_event": {
@@ -11887,7 +12813,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "graph",
       {
         title: "Graph",
-        description: `Code graph analysis. Actions: dependencies (module deps), impact (change impact), call_path (function call path), related (related nodes), path (path between nodes), decisions (decision history), ingest (build graph), circular_dependencies, unused_code, contradictions.`,
+        description: `Code graph analysis. Actions: dependencies (module deps), impact (change impact), call_path (function call path), related (related nodes), path (path between nodes), decisions (decision history), ingest (build graph), circular_dependencies, unused_code, contradictions, usages (reverse deps).`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -11901,6 +12827,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "circular_dependencies",
               "unused_code",
               "contradictions",
+              "usages",
             ])
             .describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
@@ -11909,6 +12836,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           node_id: z.string().uuid().optional().describe("For related/contradictions"),
           source_id: z.string().uuid().optional().describe("For path"),
           target_id: z.string().uuid().optional().describe("For path"),
+          target_type: z.string().optional().describe("For usages: module|function|type|variable"),
           // Target specification
           target: z
             .object({
@@ -11945,6 +12873,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           "unused_code",
           "ingest",
           "contradictions",
+          "usages",
         ];
         if (gatedActions.includes(input.action)) {
           const gate = await gateIfGraphTool(`graph_${input.action}`, input);
@@ -12111,6 +13040,24 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             };
           }
 
+          case "usages": {
+            if (!input.target_id) {
+              return errorResult("usages requires: target_id");
+            }
+            if (!projectId) {
+              return errorResult("usages requires: project_id");
+            }
+            const result = await client.graphUsages({
+              target_id: input.target_id,
+              target_type: input.target_type,
+              project_id: projectId,
+              limit: input.limit,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(result) }],
+            };
+          }
+
           default:
             return errorResult(`Unknown action: ${input.action}`);
         }
@@ -12124,7 +13071,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "project",
       {
         title: "Project",
-        description: `Project management. Actions: list, get, create, update, index (trigger indexing), overview, statistics, files, index_status, index_history (audit trail of indexed files), ingest_local (index local folder), team_projects (list all team projects - team plans only).`,
+        description: `Project management. Actions: list, get, create, update, delete, index (trigger indexing), overview, statistics, files, index_status, index_history (audit trail of indexed files), ingest_local (index local folder), team_projects (list all team projects - team plans only), recent_changes (git log/diff for recent file changes).`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -12132,6 +13079,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "get",
               "create",
               "update",
+              "delete",
               "index",
               "overview",
               "statistics",
@@ -12140,6 +13088,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "index_history",
               "ingest_local",
               "team_projects",
+              "recent_changes",
             ])
             .describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
@@ -12162,6 +13111,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           path_pattern: z.string().optional().describe("Filter by file path pattern (partial match)"),
           sort_by: z.enum(["path", "indexed", "size"]).optional().describe("Sort field (default: indexed)"),
           sort_order: z.enum(["asc", "desc"]).optional().describe("Sort order (default: desc)"),
+          limit: z.number().optional().describe("Maximum commits to return (for recent_changes, default: 10, max: 50)"),
           // Pagination
           page: z.number().optional(),
           page_size: z.number().optional(),
@@ -12224,6 +13174,29 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
               
+            };
+          }
+
+          case "delete": {
+            if (!projectId) {
+              return errorResult("delete requires: project_id");
+            }
+            const result = await client.deleteProject(projectId);
+            const normalized =
+              result && typeof result === "object"
+                ? result
+                : {
+                    success: true,
+                    data: { id: projectId, deleted: true },
+                    error: null,
+                    metadata: {},
+                  };
+            return {
+              content: [{ type: "text" as const, text: formatContent(normalized) }],
+              structuredContent:
+                normalized && typeof normalized === "object" && !Array.isArray(normalized)
+                  ? (normalized as StructuredContent)
+                  : undefined,
             };
           }
 
@@ -12584,6 +13557,40 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             };
           }
 
+          case "recent_changes": {
+            if (!folderPath) {
+              return errorResult(
+                "recent_changes requires: folder_path (or path). Call init(...) first or pass a repo path explicitly."
+              );
+            }
+
+            try {
+              const changes = await getRecentProjectChanges(folderPath, input.limit ?? 10, input.since);
+              let text = "";
+              if (changes.commits.length === 0) {
+                text = "No recent commits found.";
+              } else {
+                text = `Recent ${changes.commits.length} commits in ${changes.git_root}:\n\n`;
+                for (const commit of changes.commits) {
+                  const shortHash = commit.hash.slice(0, 7);
+                  text += `  ${shortHash} ${commit.message} - ${commit.author} (${commit.date})\n`;
+                  for (const file of commit.files_changed) {
+                    text += `    ${file}\n`;
+                  }
+                }
+              }
+              if (changes.diff_stat.summary) {
+                text += `\nUncommitted changes: ${changes.diff_stat.summary}\n`;
+              }
+              return {
+                content: [{ type: "text" as const, text }],
+                structuredContent: changes as StructuredContent,
+              };
+            } catch (error) {
+              return errorResult(error instanceof Error ? error.message : String(error));
+            }
+          }
+
           default:
             return errorResult(`Unknown action: ${input.action}`);
         }
@@ -12597,10 +13604,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "workspace",
       {
         title: "Workspace",
-        description: `Workspace management. Actions: list, get, associate (link folder to workspace), bootstrap (create workspace and initialize), team_members (list members with access - team plans only), index_settings (get/update multi-machine sync settings - admin only).`,
+        description: `Workspace management. Actions: list, get, create, delete, associate (link folder to workspace), bootstrap (create workspace and initialize), team_members (list members with access - team plans only), index_settings (get/update multi-machine sync settings - admin only).`,
         inputSchema: z.object({
-          action: z.enum(["list", "get", "associate", "bootstrap", "team_members", "index_settings"]).describe("Action to perform"),
+          action: z.enum(["list", "get", "create", "delete", "associate", "bootstrap", "team_members", "index_settings"]).describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
+          name: z.string().optional(),
           // Associate/bootstrap params
           folder_path: z.string().optional(),
           workspace_name: z.string().optional(),
@@ -12648,6 +13656,43 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
               
+            };
+          }
+
+          case "create": {
+            if (!input.name) {
+              return errorResult("create requires: name");
+            }
+            const result = await client.createWorkspace({
+              name: input.name,
+              description: input.description,
+              visibility: input.visibility,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatContent(result) }],
+            };
+          }
+
+          case "delete": {
+            if (!input.workspace_id) {
+              return errorResult("delete requires: workspace_id");
+            }
+            const result = await client.deleteWorkspace(input.workspace_id);
+            const normalized =
+              result && typeof result === "object"
+                ? result
+                : {
+                    success: true,
+                    data: { id: input.workspace_id, deleted: true },
+                    error: null,
+                    metadata: {},
+                  };
+            return {
+              content: [{ type: "text" as const, text: formatContent(normalized) }],
+              structuredContent:
+                normalized && typeof normalized === "object" && !Array.isArray(normalized)
+                  ? (normalized as StructuredContent)
+                  : undefined,
             };
           }
 
@@ -13777,14 +14822,18 @@ Example workflow:
                   mime_type: mimeType,
                   note: "Use media(action='status', content_id='...') to check indexing progress.",
                 };
+                const extractionSummary = summarizeVideoTextExtraction((uploadInit as any)?.metadata);
+                const statusNote = extractionSummary
+                  ? `\nVideo text extraction: ${extractionSummary}`
+                  : "";
                 return {
                   content: [
                     {
                       type: "text" as const,
-                      text: `✅ Media uploaded successfully!\n\nContent ID: ${uploadInit.content_id}\nFilename: ${filename}\nType: ${contentType}\nSize: ${(fileStats.size / 1024 / 1024).toFixed(2)} MB\n\nIndexing has been triggered. Use media(action='status', content_id='${uploadInit.content_id}') to check progress.`,
+                      text: `✅ Media uploaded successfully!\n\nContent ID: ${uploadInit.content_id}\nFilename: ${filename}\nType: ${contentType}\nSize: ${(fileStats.size / 1024 / 1024).toFixed(2)} MB${statusNote}\n\nIndexing has been triggered. Use media(action='status', content_id='${uploadInit.content_id}') to check progress.`,
                     },
                   ],
-                  
+                  structuredContent: result,
                 };
               } catch (err) {
                 const errMsg = err instanceof Error ? err.message : String(err);
@@ -13835,15 +14884,19 @@ Example workflow:
                 statusEmoji = "❌";
                 statusMessage = content.indexing_error || "Indexing failed";
               }
+              const extractionSummary = summarizeVideoTextExtraction(content.metadata);
+              const extractionLine = extractionSummary
+                ? `\nVideo text extraction: ${extractionSummary}`
+                : "";
 
               return {
                 content: [
                   {
                     type: "text" as const,
-                    text: `${statusEmoji} ${content.filename}\n\nStatus: ${statusMessage}\nContent ID: ${content.id}\nType: ${content.content_type}\nSize: ${(content.size_bytes / 1024 / 1024).toFixed(2)} MB\nCreated: ${content.created_at}`,
+                    text: `${statusEmoji} ${content.filename}\n\nStatus: ${statusMessage}\nContent ID: ${content.id}\nType: ${content.content_type}\nSize: ${(content.size_bytes / 1024 / 1024).toFixed(2)} MB\nCreated: ${content.created_at}${extractionLine}`,
                   },
                 ],
-                
+                structuredContent: content as StructuredContent,
               };
             } catch (err) {
               const errMsg = err instanceof Error ? err.message : String(err);
@@ -14277,6 +15330,8 @@ Example workflow:
 
     logDebug(`Consolidated mode: ${CONSOLIDATED_TOOLS.size} domain tools`);
   }
+
+  applyToolSurfaceProfile(activeSurfaceProfile, false);
 
   // =============================================================================
   // END CONSOLIDATED DOMAIN TOOLS

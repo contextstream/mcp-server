@@ -21,6 +21,7 @@ const configSchema = z.object({
   allowHeaderAuth: z.boolean().optional(),
   contextPackEnabled: z.boolean().default(true),
   showTiming: z.boolean().default(false),
+  toolSurfaceProfile: z.enum(["default", "openai_agentic"]).default("default"),
 });
 
 export type Config = z.infer<typeof configSchema>;
@@ -54,6 +55,10 @@ export function loadConfig(): Config {
     allowHeaderAuth,
     contextPackEnabled,
     showTiming,
+    toolSurfaceProfile:
+      process.env.CONTEXTSTREAM_TOOL_SURFACE_PROFILE?.trim().toLowerCase() === "openai_agentic"
+        ? "openai_agentic"
+        : "default",
   });
 
   if (!parsed.success) {

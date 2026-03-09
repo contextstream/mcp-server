@@ -761,6 +761,7 @@ function buildClientConfig(params: { apiUrl: string; apiKey?: string; jwt?: stri
     userAgent: `contextstream-mcp/setup/${VERSION}`,
     contextPackEnabled: true,
     showTiming: false,
+    toolSurfaceProfile: "default",
   };
 }
 

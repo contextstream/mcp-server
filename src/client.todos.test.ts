@@ -22,6 +22,7 @@ describe("ContextStreamClient todos completion", () => {
       userAgent: "contextstream-test",
       contextPackEnabled: true,
       showTiming: false,
+      toolSurfaceProfile: "default",
     };
     client = new ContextStreamClient(config);
   });

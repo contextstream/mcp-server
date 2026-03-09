@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.64
+
+**Decision query fixes, Dart indexing, Copilot rules generation, and todo state compatibility.**
+
+### Fixes and Improvements
+
+- **Decision capture fix** — `session(action="capture", event_type="decision")` now preserves the stored `decision` event type so `memory(action="decisions")` and `session(action="decision_trace")` can find captured decisions correctly.
+
+- **Dart indexing support** — Added `.dart` to the indexed source extensions and language detection so Dart and Flutter projects are included in search and indexing flows.
+
+- **GitHub Copilot rules support** — `generate_rules` and `generate_editor_rules` now support `copilot`, generating `.github/copilot-instructions.md` and `.github/skills/contextstream-workflow/SKILL.md`.
+
+- **Todo completion compatibility** — Todo completion/update flows now map `completed`, `todo_status`, and the status alias consistently so dashboard checkbox actions and MCP todo mutations stay in sync.
+
+```bash
+npm install -g @contextstream/mcp-server@latest
+```
+
+---
+
 ## 0.4.45
 
 **Content management, team features, and real-time indexing.**

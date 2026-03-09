@@ -12,8 +12,10 @@ import { SessionManager } from "./session-manager.js";
 import {
   getAvailableEditors,
   generateRuleContent,
+  generateRuleFiles,
   generateAllRuleFiles,
   RULES_VERSION,
+  type RuleWriteMode,
 } from "./rules-templates.js";
 import { VERSION, getUpdateNotice, invalidateCacheIfBehind } from "./version.js";
 import { generateToolCatalog, getCoreToolsHint, type CatalogFormat } from "./tool-catalog.js";
@@ -434,6 +436,7 @@ const CONTEXTSTREAM_END_MARKER = "<!-- END ContextStream -->";
 const RULES_PROJECT_FILES: Record<string, string> = {
   codex: "AGENTS.md",
   claude: "CLAUDE.md",
+  copilot: path.join(".github", "copilot-instructions.md"),
   cursor: ".cursorrules",
   cline: ".clinerules",
   kilo: path.join(".kilocode", "rules", "contextstream.md"),
@@ -813,9 +816,23 @@ function replaceContextStreamBlock(
 
 async function upsertRuleFile(
   filePath: string,
-  content: string
+  content: string,
+  writeMode: RuleWriteMode = "contextstream_block"
 ): Promise<"created" | "updated" | "appended"> {
   await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+
+  if (writeMode === "full_file") {
+    let existing = "";
+    try {
+      existing = await fs.promises.readFile(filePath, "utf8");
+    } catch {
+      // file does not exist yet
+    }
+
+    await fs.promises.writeFile(filePath, content.trimEnd() + "\n", "utf8");
+    return existing ? "updated" : "created";
+  }
+
   const wrappedContent = wrapWithMarkers(content);
 
   let existing = "";
@@ -856,7 +873,7 @@ async function writeEditorRules(options: {
   const results: Array<{ editor: string; filename: string; status: string }> = [];
 
   for (const editor of editors) {
-    const rule = generateRuleContent(editor, {
+    const ruleFiles = generateRuleFiles(editor, {
       workspaceName: options.workspaceName,
       workspaceId: options.workspaceId,
       projectName: options.projectName,
@@ -864,25 +881,27 @@ async function writeEditorRules(options: {
       mode: options.mode,
     });
 
-    if (!rule) {
+    if (ruleFiles.length === 0) {
       results.push({ editor, filename: "", status: "unknown editor" });
       continue;
     }
 
-    const filePath = path.join(options.folderPath, rule.filename);
-    if (fs.existsSync(filePath) && !options.overwriteExisting) {
-      results.push({ editor, filename: rule.filename, status: "skipped (exists)" });
-      continue;
-    }
-    try {
-      const status = await upsertRuleFile(filePath, rule.content);
-      results.push({ editor, filename: rule.filename, status });
-    } catch (err) {
-      results.push({
-        editor,
-        filename: rule.filename,
-        status: `error: ${(err as Error).message}`,
-      });
+    for (const rule of ruleFiles) {
+      const filePath = path.join(options.folderPath, rule.filename);
+      if (fs.existsSync(filePath) && !options.overwriteExisting) {
+        results.push({ editor, filename: rule.filename, status: "skipped (exists)" });
+        continue;
+      }
+      try {
+        const status = await upsertRuleFile(filePath, rule.content, rule.writeMode);
+        results.push({ editor, filename: rule.filename, status });
+      } catch (err) {
+        results.push({
+          editor,
+          filename: rule.filename,
+          status: `error: ${(err as Error).message}`,
+        });
+      }
     }
   }
 
@@ -7757,7 +7776,7 @@ Example: "What were the auth decisions?" or "What are my TypeScript preferences?
     "generate_rules",
     {
       title: "Generate ContextStream rules",
-      description: `Generate AI rule files for editors (Cursor, Cline, Kilo Code, Roo Code, Claude Code, Aider).
+      description: `Generate AI rule files for editors (Cursor, Cline, Kilo Code, Roo Code, Claude Code, GitHub Copilot, Aider).
 Defaults to the current project folder; no folder_path required when run from a project.
 Supported editors: ${getAvailableEditors().join(", ")}`,
       inputSchema: z.object({
@@ -7769,6 +7788,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
           .array(
             z.enum([
               "codex",
+              "copilot",
               "cursor",
               "cline",
               "kilo",
@@ -7796,7 +7816,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
           .boolean()
           .optional()
           .default(true)
-          .describe("Overwrite ContextStream block in existing rule files (default: true). User content outside the block is preserved."),
+          .describe("Overwrite existing rule files (default: true). User content outside the ContextStream block is preserved when block updates are supported."),
         apply_global: z
           .boolean()
           .optional()
@@ -7829,7 +7849,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
 
       if (input.dry_run) {
         for (const editor of editors) {
-          const rule = generateRuleContent(editor, {
+          const ruleFiles = generateRuleFiles(editor, {
             workspaceName: input.workspace_name,
             workspaceId: input.workspace_id,
             projectName: input.project_name,
@@ -7837,16 +7857,18 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
             mode: input.mode,
           });
 
-          if (!rule) {
+          if (ruleFiles.length === 0) {
             results.push({ editor, filename: "", status: "unknown editor" });
             continue;
           }
 
-          results.push({
-            editor,
-            filename: rule.filename,
-            status: "dry run - would update",
-          });
+          for (const rule of ruleFiles) {
+            results.push({
+              editor,
+              filename: rule.filename,
+              status: "dry run - would update",
+            });
+          }
         }
       } else {
         const writeResults = await writeEditorRules({
@@ -7990,7 +8012,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
     "generate_editor_rules",
     {
       title: "Generate editor AI rules",
-      description: `Generate AI rule files for editors (Cursor, Cline, Kilo Code, Roo Code, Claude Code, Aider).
+      description: `Generate AI rule files for editors (Cursor, Cline, Kilo Code, Roo Code, Claude Code, GitHub Copilot, Aider).
 These rules instruct the AI to automatically use ContextStream for memory and context.
 Supported editors: ${getAvailableEditors().join(", ")}`,
       inputSchema: z.object({
@@ -8002,6 +8024,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
           .array(
             z.enum([
               "codex",
+              "copilot",
               "cursor",
               "cline",
               "kilo",
@@ -8027,7 +8050,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
         overwrite_existing: z
           .boolean()
           .optional()
-          .describe("Allow overwriting existing rule files (ContextStream block only)"),
+          .describe("Allow overwriting existing rule files. ContextStream block updates preserve non-ContextStream content when supported."),
         dry_run: z.boolean().optional().describe("If true, return content without writing files"),
       }),
     },
@@ -8049,7 +8072,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
 
       if (input.dry_run) {
         for (const editor of editors) {
-          const rule = generateRuleContent(editor, {
+          const ruleFiles = generateRuleFiles(editor, {
             workspaceName: input.workspace_name,
             workspaceId: input.workspace_id,
             projectName: input.project_name,
@@ -8057,17 +8080,19 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
             mode: input.mode,
           });
 
-          if (!rule) {
+          if (ruleFiles.length === 0) {
             results.push({ editor, filename: "", status: "unknown editor" });
             continue;
           }
 
-          results.push({
-            editor,
-            filename: rule.filename,
-            status: "dry run - would update",
-            content: rule.content,
-          });
+          for (const rule of ruleFiles) {
+            results.push({
+              editor,
+              filename: rule.filename,
+              status: "dry run - would update",
+              content: rule.content,
+            });
+          }
         }
       } else {
         const writeResults = await writeEditorRules({

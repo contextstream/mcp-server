@@ -364,6 +364,44 @@ After updating, restart the AI tool to use the new version.
 `.trim();
 }
 
+/**
+ * Generate suggested rules notice when the API returns pending AI-generated rule suggestions.
+ */
+function generateSuggestedRulesNotice(result: Record<string, unknown>): string {
+  const suggestedRules = result.suggested_rules as Array<{
+    id?: string;
+    keywords?: string[];
+    instruction?: string;
+    category?: string;
+    confidence?: number;
+    occurrence_count?: number;
+  }> | undefined;
+
+  if (!suggestedRules || suggestedRules.length === 0) {
+    return "";
+  }
+
+  const ruleLines = suggestedRules.slice(0, 3).map((rule, i) => {
+    const cat = rule.category || "general";
+    const confidence = rule.confidence ? `${Math.round(rule.confidence * 100)}%` : "?";
+    const count = rule.occurrence_count || 0;
+    const keywords = (rule.keywords || []).join(", ");
+    return `${i + 1}. [${cat}] ${rule.instruction || ""}  (confidence: ${confidence}, seen ${count}x)\n   Keywords: ${keywords}\n   Rule ID: ${rule.id}`;
+  });
+
+  return `
+
+💡 [SUGGESTED_RULES] ContextStream detected recurring patterns and generated rule suggestions.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Present these to the user. They can accept or reject each one.
+
+${ruleLines.join("\n")}
+
+To accept: session(action="suggested_rule_action", rule_id="<id>", rule_action="accept")
+To reject: session(action="suggested_rule_action", rule_id="<id>", rule_action="reject")
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+}
+
 const DEFAULT_PARAM_DESCRIPTIONS: Record<string, string> = {
   api_key: "ContextStream API key.",
   apiKey: "ContextStream API key.",
@@ -8896,6 +8934,9 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
       // Include dynamic instructions from SmartRouter if present
       const instructionsLine = result.instructions ? `\n\n[INSTRUCTIONS] ${result.instructions}` : "";
 
+      // Generate suggested rules notice if the API returned pending rule suggestions
+      const suggestedRulesLine = generateSuggestedRulesNotice(result);
+
       // Combine all warnings (only add non-empty ones with proper spacing)
       // Server warnings take precedence, but we keep client-side detection as fallback
       const contextRulesLine = `\n\n${CONTEXT_CALL_REMINDER}`;
@@ -8903,6 +8944,7 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
         serverWarningsLine || lessonsWarningLine,  // Server warnings OR client-side lesson detection
         rulesWarningLine ? `\n\n${rulesWarningLine}` : "",
         versionWarningLine ? `\n\n${versionWarningLine}` : "",
+        suggestedRulesLine,
         contextPressureWarning,
         semanticHints,
         instructionsLine,

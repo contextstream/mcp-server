@@ -84,7 +84,7 @@ npx @contextstream/mcp-server@latest setup
 
 The wizard handles everything: authentication, configuration, editor integration, and optional hooks that supercharge your workflow.
 
-**Works with:** Claude Code • Cursor • VS Code • Claude Desktop • Codex CLI • Antigravity
+**Works with:** Claude Code • Cursor • VS Code • Claude Desktop • Codex CLI • OpenCode • Antigravity
 
 ---
 
@@ -136,6 +136,48 @@ claude mcp update contextstream -e CONTEXTSTREAM_API_KEY=your_key
 ```
 
 **Locations:** `~/.cursor/mcp.json` • `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+</details>
+
+<details>
+<summary><b>OpenCode</b></summary>
+
+Local server:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "contextstream": {
+      "type": "local",
+      "command": ["npx", "-y", "contextstream-mcp"],
+      "environment": {
+        "CONTEXTSTREAM_API_KEY": "{env:CONTEXTSTREAM_API_KEY}"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+Remote server:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "contextstream": {
+      "type": "remote",
+      "url": "https://mcp.contextstream.com",
+      "enabled": true
+    }
+  }
+}
+```
+
+For the local variant, export `CONTEXTSTREAM_API_KEY` before launching OpenCode.
+
+**Locations:** `./opencode.json` • `~/.config/opencode/opencode.json`
 
 </details>
 

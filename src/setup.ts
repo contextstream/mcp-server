@@ -8,7 +8,12 @@ import { ContextStreamClient } from "./client.js";
 import type { Config } from "./config.js";
 import { HttpError } from "./http.js";
 import { generateRuleContent } from "./rules-templates.js";
-import { VERSION, getUpdateNotice, setAutoUpdatePreference, isAutoUpdateEnabled } from "./version.js";
+import {
+  VERSION,
+  getUpdateNotice,
+  setAutoUpdatePreference,
+  isAutoUpdateEnabled,
+} from "./version.js";
 import {
   credentialsFilePath,
   normalizeApiUrl,
@@ -28,10 +33,20 @@ type RuleMode = "dynamic" | "minimal" | "full" | "bootstrap";
 type InstallScope = "global" | "project" | "both";
 type McpScope = InstallScope | "skip";
 
-type EditorKey = "codex" | "claude" | "cursor" | "cline" | "kilo" | "roo" | "aider" | "antigravity";
+type EditorKey =
+  | "codex"
+  | "opencode"
+  | "claude"
+  | "cursor"
+  | "cline"
+  | "kilo"
+  | "roo"
+  | "aider"
+  | "antigravity";
 
 const EDITOR_LABELS: Record<EditorKey, string> = {
   codex: "Codex CLI",
+  opencode: "OpenCode",
   claude: "Claude Code",
   cursor: "Cursor / VS Code",
   cline: "Cline",
@@ -42,7 +57,14 @@ const EDITOR_LABELS: Record<EditorKey, string> = {
 };
 
 function supportsProjectMcpConfig(editor: EditorKey): boolean {
-  return editor === "cursor" || editor === "claude" || editor === "kilo" || editor === "roo" || editor === "antigravity";
+  return (
+    editor === "opencode" ||
+    editor === "cursor" ||
+    editor === "claude" ||
+    editor === "kilo" ||
+    editor === "roo" ||
+    editor === "antigravity"
+  );
 }
 
 function normalizeInput(value: string): string {
@@ -328,6 +350,32 @@ async function isCodexInstalled(): Promise<boolean> {
   return anyPathExists(candidates);
 }
 
+function openCodeConfigPath(): string {
+  const home = homedir();
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME;
+
+  if (process.platform === "win32") {
+    const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+    return path.join(appData, "opencode", "opencode.json");
+  }
+
+  const configRoot = xdgConfigHome || path.join(home, ".config");
+  return path.join(configRoot, "opencode", "opencode.json");
+}
+
+async function isOpenCodeInstalled(): Promise<boolean> {
+  const configPath = openCodeConfigPath();
+  const configDir = path.dirname(configPath);
+  const home = homedir();
+  const candidates = [
+    configDir,
+    configPath,
+    path.join(home, ".bun", "bin", "opencode"),
+    path.join(home, ".local", "bin", "opencode"),
+  ];
+  return anyPathExists(candidates);
+}
+
 async function isClaudeInstalled(): Promise<boolean> {
   const home = homedir();
   const candidates = [path.join(home, ".claude"), path.join(home, ".config", "claude")];
@@ -411,10 +459,12 @@ async function isAntigravityInstalled(): Promise<boolean> {
     const localApp = process.env.LOCALAPPDATA;
     const programFiles = process.env.ProgramFiles;
     const programFilesX86 = process.env["ProgramFiles(x86)"];
-    if (localApp) candidates.push(path.join(localApp, "Programs", "Antigravity", "Antigravity.exe"));
+    if (localApp)
+      candidates.push(path.join(localApp, "Programs", "Antigravity", "Antigravity.exe"));
     if (localApp) candidates.push(path.join(localApp, "Antigravity", "Antigravity.exe"));
     if (programFiles) candidates.push(path.join(programFiles, "Antigravity", "Antigravity.exe"));
-    if (programFilesX86) candidates.push(path.join(programFilesX86, "Antigravity", "Antigravity.exe"));
+    if (programFilesX86)
+      candidates.push(path.join(programFilesX86, "Antigravity", "Antigravity.exe"));
   } else {
     candidates.push("/usr/bin/antigravity");
     candidates.push("/usr/local/bin/antigravity");
@@ -429,6 +479,8 @@ async function isEditorInstalled(editor: EditorKey): Promise<boolean> {
   switch (editor) {
     case "codex":
       return isCodexInstalled();
+    case "opencode":
+      return isOpenCodeInstalled();
     case "claude":
       return isClaudeInstalled();
     case "cursor":
@@ -454,7 +506,27 @@ type McpServerJson = {
   env: Record<string, string>;
 };
 
+type OpenCodeEnvironment = Record<string, string>;
+
+type OpenCodeLocalServerJson = {
+  type: "local";
+  command: string[];
+  environment: OpenCodeEnvironment;
+  enabled: true;
+};
+
+type OpenCodeRemoteServerJson = {
+  type: "remote";
+  url: string;
+  enabled: true;
+};
+
+type OpenCodeServerJson = OpenCodeLocalServerJson | OpenCodeRemoteServerJson;
+
 const IS_WINDOWS = process.platform === "win32";
+const DEFAULT_CONTEXTSTREAM_API_URL = "https://api.contextstream.io";
+const OPENCODE_CONFIG_SCHEMA_URL = "https://opencode.ai/config.json";
+const OPENCODE_REMOTE_MCP_URL = "https://mcp.contextstream.com";
 
 type SetupEnvParams = {
   apiUrl: string;
@@ -524,6 +596,38 @@ function buildContextStreamVsCodeServer(params: SetupEnvParams): VsCodeServerJso
     command: "npx",
     args: ["--prefer-online", "-y", "@contextstream/mcp-server@latest"],
     env,
+  };
+}
+
+function buildContextStreamOpenCodeEnvironment(params: SetupEnvParams): OpenCodeEnvironment {
+  const environment: OpenCodeEnvironment = {
+    CONTEXTSTREAM_API_KEY: "{env:CONTEXTSTREAM_API_KEY}",
+  };
+
+  if (normalizeApiUrl(params.apiUrl) !== DEFAULT_CONTEXTSTREAM_API_URL) {
+    environment.CONTEXTSTREAM_API_URL = params.apiUrl;
+  }
+  if (params.contextPackEnabled === false) {
+    environment.CONTEXTSTREAM_CONTEXT_PACK = "false";
+  }
+
+  return environment;
+}
+
+function buildContextStreamOpenCodeLocalServer(params: SetupEnvParams): OpenCodeLocalServerJson {
+  return {
+    type: "local",
+    command: ["npx", "-y", "contextstream-mcp"],
+    environment: buildContextStreamOpenCodeEnvironment(params),
+    enabled: true,
+  };
+}
+
+function buildContextStreamOpenCodeRemoteServer(): OpenCodeRemoteServerJson {
+  return {
+    type: "remote",
+    url: OPENCODE_REMOTE_MCP_URL,
+    enabled: true,
   };
 }
 
@@ -611,6 +715,50 @@ async function upsertJsonVsCodeMcpConfig(
   return before === after ? "skipped" : "updated";
 }
 
+async function upsertOpenCodeMcpConfig(
+  filePath: string,
+  server: OpenCodeServerJson
+): Promise<"created" | "updated" | "skipped"> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const exists = await fileExists(filePath);
+
+  let root: any = {};
+  if (exists) {
+    const raw = await fs.readFile(filePath, "utf8").catch(() => "");
+    const parsed = tryParseJsonLike(raw);
+    if (!parsed.ok) throw new Error(`Invalid JSON in ${filePath}: ${parsed.error}`);
+    root = parsed.value;
+  }
+
+  if (!root || typeof root !== "object" || Array.isArray(root)) root = {};
+  if (!root.mcp || typeof root.mcp !== "object" || Array.isArray(root.mcp)) root.mcp = {};
+
+  const before = JSON.stringify({
+    schema: root.$schema ?? null,
+    contextstream: root.mcp.contextstream ?? null,
+  });
+
+  root.$schema = OPENCODE_CONFIG_SCHEMA_URL;
+  root.mcp.contextstream = server;
+
+  const after = JSON.stringify({
+    schema: root.$schema ?? null,
+    contextstream: root.mcp.contextstream ?? null,
+  });
+
+  await fs.writeFile(filePath, JSON.stringify(root, null, 2) + "\n", "utf8");
+  if (!exists) return "created";
+  return before === after ? "skipped" : "updated";
+}
+
+export const __setupTestUtils = {
+  buildContextStreamOpenCodeEnvironment,
+  buildContextStreamOpenCodeLocalServer,
+  buildContextStreamOpenCodeRemoteServer,
+  openCodeConfigPath,
+  upsertOpenCodeMcpConfig,
+};
+
 function claudeDesktopConfigPath(): string | null {
   const home = homedir();
   if (process.platform === "darwin") {
@@ -670,12 +818,7 @@ async function upsertCodexTomlConfig(
   if (!existing.includes(envMarker)) {
     await fs.writeFile(
       filePath,
-      existing.trimEnd() +
-      "\n\n" +
-      envMarker +
-      "\n" +
-      envLines +
-      "\n",
+      existing.trimEnd() + "\n\n" + envMarker + "\n" + envLines + "\n",
       "utf8"
     );
     return "updated";
@@ -831,12 +974,14 @@ async function selectProjectForCurrentDirectory(
     .sort((a, b) => (a.name || "").toLowerCase().localeCompare((b.name || "").toLowerCase()));
 
   const local = readLocalConfig(cwd);
-  const linked = local?.project_id
-    ? projects.find((p) => p.id === local.project_id)
-    : undefined;
+  const linked = local?.project_id ? projects.find((p) => p.id === local.project_id) : undefined;
   const folderMatch = projects.find((p) => p.name?.toLowerCase() === folderName.toLowerCase());
 
-  const options: Array<{ label: string; kind: "existing" | "create" | "skip"; project?: { id: string; name: string } }> = [];
+  const options: Array<{
+    label: string;
+    kind: "existing" | "create" | "skip";
+    project?: { id: string; name: string };
+  }> = [];
   const seen = new Set<string>();
 
   if (linked?.id && linked?.name) {
@@ -877,9 +1022,7 @@ async function selectProjectForCurrentDirectory(
   console.log("\nProject selection (current directory):");
   options.forEach((opt, i) => console.log(`  ${i + 1}) ${opt.label}`));
 
-  const choiceRaw = normalizeInput(
-    await rl.question(`Choose [1-${options.length}] (default 1): `)
-  );
+  const choiceRaw = normalizeInput(await rl.question(`Choose [1-${options.length}] (default 1): `));
   const choiceNum = Number.parseInt(choiceRaw || "1", 10);
   const selected = Number.isFinite(choiceNum) ? options[choiceNum - 1] : options[0];
 
@@ -980,7 +1123,9 @@ async function indexProjectWithProgress(
     }
 
     if (!projectId) {
-      console.log(`${colors.yellow}! Could not resolve project ID for ${projectName}${colors.reset}`);
+      console.log(
+        `${colors.yellow}! Could not resolve project ID for ${projectName}${colors.reset}`
+      );
       return;
     }
   } catch (err: any) {
@@ -1000,7 +1145,9 @@ async function indexProjectWithProgress(
       console.log(`${colors.dim}No indexable files found${colors.reset}`);
       return;
     } else {
-      console.log(`${colors.dim}Found ${totalFiles.toLocaleString()} files for indexing${colors.reset}`);
+      console.log(
+        `${colors.dim}Found ${totalFiles.toLocaleString()} files for indexing${colors.reset}`
+      );
     }
   } catch {
     console.log(`${colors.dim}Scanning files...${colors.reset}`);
@@ -1027,7 +1174,9 @@ async function indexProjectWithProgress(
     const size = formatBytes(bytesIndexed);
 
     // Clear line and write progress
-    process.stdout.write(`\r${colors.cyan}${spinner}${colors.reset} ${progressBar} ${colors.bright}${percentage}%${colors.reset} | ${colors.green}${filesIndexed.toLocaleString()}${colors.reset}/${totalFiles.toLocaleString()} files | ${colors.magenta}${size}${colors.reset} | ${colors.blue}${speed} files/s${colors.reset}   `);
+    process.stdout.write(
+      `\r${colors.cyan}${spinner}${colors.reset} ${progressBar} ${colors.bright}${percentage}%${colors.reset} | ${colors.green}${filesIndexed.toLocaleString()}${colors.reset}/${totalFiles.toLocaleString()} files | ${colors.magenta}${size}${colors.reset} | ${colors.blue}${speed} files/s${colors.reset}   `
+    );
   };
 
   // Start progress animation
@@ -1037,7 +1186,9 @@ async function indexProjectWithProgress(
   const ingestWithRetry = async (batch: any[], maxRetries = 3): Promise<number> => {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const result = (await client.ingestFiles(projectId, batch)) as { data?: { files_indexed?: number; status?: string } };
+        const result = (await client.ingestFiles(projectId, batch)) as {
+          data?: { files_indexed?: number; status?: string };
+        };
         // On cooldown or daily limit, return 0 (not batch.length)
         if (result.data?.status === "cooldown" || result.data?.status === "daily_limit_exceeded") {
           return 0;
@@ -1171,7 +1322,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     );
     const apiUrl = normalizeApiUrl(
       normalizeInput(await rl.question(`ContextStream API URL [${apiUrlDefault}]: `)) ||
-      apiUrlDefault
+        apiUrlDefault
     );
 
     let apiKey = normalizeInput(process.env.CONTEXTSTREAM_API_KEY || "");
@@ -1440,7 +1591,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     }
 
     // Editors without hooks need full rules; others get bootstrap (hooks deliver the rest)
-    const NO_HOOKS_EDITORS: EditorKey[] = ["codex", "aider", "antigravity"];
+    const NO_HOOKS_EDITORS: EditorKey[] = ["codex", "opencode", "aider", "antigravity"];
     const getModeForEditor = (editor: EditorKey): RuleMode =>
       NO_HOOKS_EDITORS.includes(editor) ? "full" : "bootstrap";
 
@@ -1456,19 +1607,24 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     console.log(`\nDetected plan: ${planLabel} (graph: ${graphTierLabel})`);
 
     // Context Pack: auto-enabled for Pro+ plans
-    const contextPackEnabled = !!detectedPlanName && ["pro", "team", "enterprise"].some(p => detectedPlanName.toLowerCase().includes(p));
+    const contextPackEnabled =
+      !!detectedPlanName &&
+      ["pro", "team", "enterprise"].some((p) => detectedPlanName.toLowerCase().includes(p));
 
     // Auto-Update: enabled by default, ask user if they want to disable
     console.log("\nAuto-Update:");
     console.log("  When enabled, ContextStream will automatically update to the latest version");
-    console.log("  on new sessions (checks daily). You can disable this if you prefer manual updates.");
+    console.log(
+      "  on new sessions (checks daily). You can disable this if you prefer manual updates."
+    );
     const currentAutoUpdate = isAutoUpdateEnabled();
     const autoUpdateChoice = normalizeInput(
       await rl.question(`Enable auto-update? [${currentAutoUpdate ? "Y/n" : "y/N"}]: `)
     ).toLowerCase();
-    const autoUpdateEnabled = autoUpdateChoice === ""
-      ? currentAutoUpdate  // Keep current setting if blank
-      : autoUpdateChoice === "y" || autoUpdateChoice === "yes";
+    const autoUpdateEnabled =
+      autoUpdateChoice === ""
+        ? currentAutoUpdate // Keep current setting if blank
+        : autoUpdateChoice === "y" || autoUpdateChoice === "yes";
 
     // Save the preference
     setAutoUpdatePreference(autoUpdateEnabled);
@@ -1480,6 +1636,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     const editors: EditorKey[] = [
       "codex",
+      "opencode",
       "claude",
       "cursor",
       "cline",
@@ -1576,7 +1733,20 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     // v0.4.x: consolidated (~11 tools) is default, router (~2 tools) uses PROGRESSIVE_MODE
     const mcpServer = buildContextStreamMcpServer({ apiUrl, apiKey, contextPackEnabled });
     const mcpServerClaude = buildContextStreamMcpServer({ apiUrl, apiKey, contextPackEnabled });
+    const mcpServerOpenCode = buildContextStreamOpenCodeLocalServer({
+      apiUrl,
+      apiKey,
+      contextPackEnabled,
+    });
     const vsCodeServer = buildContextStreamVsCodeServer({ apiUrl, apiKey, contextPackEnabled });
+    let hasPrintedOpenCodeEnvNote = false;
+    const printOpenCodeEnvNote = () => {
+      if (hasPrintedOpenCodeEnvNote) return;
+      hasPrintedOpenCodeEnvNote = true;
+      console.log(
+        "  OpenCode reads CONTEXTSTREAM_API_KEY from your environment. Export it before launching OpenCode."
+      );
+    };
 
     // Global MCP config
     const needsGlobalMcpConfig =
@@ -1639,6 +1809,21 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             continue;
           }
 
+          if (editor === "opencode") {
+            const filePath = openCodeConfigPath();
+            if (dryRun) {
+              writeActions.push({ kind: "mcp-config", target: filePath, status: "dry-run" });
+              console.log(`- ${EDITOR_LABELS[editor]}: would update ${filePath}`);
+              printOpenCodeEnvNote();
+              continue;
+            }
+            const status = await upsertOpenCodeMcpConfig(filePath, mcpServerOpenCode);
+            writeActions.push({ kind: "mcp-config", target: filePath, status });
+            console.log(`- ${EDITOR_LABELS[editor]}: ${status} ${filePath}`);
+            printOpenCodeEnvNote();
+            continue;
+          }
+
           if (editor === "cursor") {
             const filePath = path.join(homedir(), ".cursor", "mcp.json");
             if (dryRun) {
@@ -1683,6 +1868,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       roo: "roo",
       kilo: "kilo",
       codex: null, // No hooks API
+      opencode: null, // No hooks API
       aider: null, // No hooks API
       antigravity: null, // No hooks API
     };
@@ -1731,6 +1917,13 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     if (scope === "global" || scope === "both") {
       console.log("\nInstalling global rules...");
       for (const editor of configuredEditors) {
+        if (editor === "opencode") {
+          console.log(
+            `- ${EDITOR_LABELS[editor]}: rules are not auto-generated yet (MCP config only).`
+          );
+          continue;
+        }
+
         const filePath = globalRulesPathForEditor(editor);
         if (!filePath) {
           console.log(
@@ -1899,6 +2092,22 @@ export async function runSetupWizard(args: string[]): Promise<void> {
               continue;
             }
 
+            if (editor === "opencode") {
+              const openCodePath = path.join(projectPath, "opencode.json");
+              if (dryRun) {
+                writeActions.push({
+                  kind: "mcp-config",
+                  target: openCodePath,
+                  status: "dry-run",
+                });
+              } else {
+                const status = await upsertOpenCodeMcpConfig(openCodePath, mcpServerOpenCode);
+                writeActions.push({ kind: "mcp-config", target: openCodePath, status });
+              }
+              printOpenCodeEnvNote();
+              continue;
+            }
+
             if (editor === "kilo") {
               const kiloPath = path.join(projectPath, ".kilocode", "mcp.json");
               if (dryRun) {
@@ -1933,6 +2142,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       for (const editor of selectedEditors) {
         if (scope !== "project" && scope !== "both") continue;
         if (!configuredEditors.includes(editor)) continue;
+        if (editor === "opencode") continue;
         const rule = generateRuleContent(editor, {
           workspaceName,
           workspaceId: workspaceId && workspaceId !== "dry-run" ? workspaceId : undefined,
@@ -1979,11 +2189,15 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             console.log("PROJECT INDEXING");
             console.log("─".repeat(60));
             if (filesIndexed === 0) {
-              console.log("Indexing enables semantic code search and AI-powered graph knowledge for rich AI context.");
+              console.log(
+                "Indexing enables semantic code search and AI-powered graph knowledge for rich AI context."
+              );
             } else {
               console.log("Your project index is stale and could use a refresh.");
             }
-            console.log("Powered by our blazing-fast Rust engine, indexing typically takes under a minute,");
+            console.log(
+              "Powered by our blazing-fast Rust engine, indexing typically takes under a minute,"
+            );
             console.log("though larger projects may take a bit longer.\n");
             console.log("Your code is private and securely stored.\n");
 
@@ -2003,7 +2217,9 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             if (indexingEnabled) {
               await indexProjectWithProgress(client, process.cwd(), cwdConfig.workspace_id);
             } else {
-              console.log("\nIndexing skipped for now. You can start it later with: contextstream-mcp index <path>");
+              console.log(
+                "\nIndexing skipped for now. You can start it later with: contextstream-mcp index <path>"
+              );
             }
           }
         } catch {
@@ -2014,8 +2230,12 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       console.log("\n" + "─".repeat(60));
       console.log("PROJECT INDEXING");
       console.log("─".repeat(60));
-      console.log("Indexing enables semantic code search and AI-powered graph knowledge for rich AI context.");
-      console.log("Powered by our blazing-fast Rust engine, indexing typically takes under a minute,");
+      console.log(
+        "Indexing enables semantic code search and AI-powered graph knowledge for rich AI context."
+      );
+      console.log(
+        "Powered by our blazing-fast Rust engine, indexing typically takes under a minute,"
+      );
       console.log("though larger projects may take a bit longer.\n");
       console.log("Your code is private and securely stored.\n");
 
@@ -2042,7 +2262,9 @@ export async function runSetupWizard(args: string[]): Promise<void> {
           await indexProjectWithProgress(client, projectPath, workspaceId);
         }
       } else {
-        console.log("\nIndexing skipped for now. You can start it later with: contextstream-mcp index <path>");
+        console.log(
+          "\nIndexing skipped for now. You can start it later with: contextstream-mcp index <path>"
+        );
       }
     }
 
@@ -2066,7 +2288,9 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     );
 
     console.log("");
-    console.log("You're all set! ContextStream gives your AI persistent memory, semantic code search, and cross-session context.");
+    console.log(
+      "You're all set! ContextStream gives your AI persistent memory, semantic code search, and cross-session context."
+    );
     console.log("More at: https://contextstream.io/docs/mcp");
   } finally {
     rl.close();

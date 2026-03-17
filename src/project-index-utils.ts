@@ -2,6 +2,7 @@ type RecordValue = Record<string, unknown>;
 
 export type IndexFreshness = "fresh" | "recent" | "aging" | "stale" | "missing" | "unknown";
 export type IndexConfidence = "high" | "medium" | "low";
+export type GraphIngestIndexState = "ready" | "indexing" | "stale" | "missing";
 
 const INDEX_FRESH_HOURS = 1;
 const INDEX_RECENT_HOURS = 24;
@@ -195,5 +196,74 @@ export function classifyIndexConfidence(
   return {
     confidence: "low",
     reason: "Index state is inferred but lacks corroborating API/local metadata.",
+  };
+}
+
+export function classifyGraphIngestIndexState(input: {
+  statusResult: unknown;
+  locallyIndexed: boolean;
+}): {
+  state: GraphIngestIndexState;
+  freshness: IndexFreshness;
+  indexInProgress: boolean;
+  indexed: boolean;
+  projectIndexState?: string;
+  ageHours?: number;
+} {
+  const { statusResult, locallyIndexed } = input;
+  const candidates = candidateObjects(statusResult);
+  const projectIndexState = readString(candidates, "project_index_state")?.toLowerCase();
+  const indexInProgress = apiResultIsIndexing(statusResult);
+  const indexed = apiResultReportsIndexed(statusResult) || locallyIndexed;
+  const indexedAt = extractIndexTimestamp(statusResult);
+  const ageHours =
+    indexedAt !== undefined ? Math.floor((Date.now() - indexedAt.getTime()) / (1000 * 60 * 60)) : undefined;
+  const freshness = classifyIndexFreshness(indexed, ageHours);
+
+  if (indexInProgress) {
+    return {
+      state: "indexing",
+      freshness,
+      indexInProgress,
+      indexed,
+      projectIndexState,
+      ageHours,
+    };
+  }
+
+  const explicitlyMissing =
+    projectIndexState === "missing" ||
+    projectIndexState === "not_indexed" ||
+    projectIndexState === "unindexed";
+  if (!indexed || explicitlyMissing) {
+    return {
+      state: "missing",
+      freshness,
+      indexInProgress,
+      indexed,
+      projectIndexState,
+      ageHours,
+    };
+  }
+
+  const explicitlyStale = projectIndexState === "stale";
+  if (freshness === "stale" || explicitlyStale) {
+    return {
+      state: "stale",
+      freshness,
+      indexInProgress,
+      indexed,
+      projectIndexState,
+      ageHours,
+    };
+  }
+
+  return {
+    state: "ready",
+    freshness,
+    indexInProgress,
+    indexed,
+    projectIndexState,
+    ageHours,
   };
 }

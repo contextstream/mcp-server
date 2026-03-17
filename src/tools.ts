@@ -45,6 +45,7 @@ import {
 } from "./microcopy.js";
 import {
   apiResultIsIndexing,
+  classifyGraphIngestIndexState,
   apiResultReportsIndexed,
   classifyIndexConfidence,
   classifyIndexFreshness,
@@ -3841,6 +3842,150 @@ export function registerTools(
     })();
   }
 
+  async function runGraphIngestWithPreflight(projectId: string, wait: boolean): Promise<ToolTextResult> {
+    const folderPath = resolveFolderPath(undefined, sessionManager);
+    const localIndexProjectId = folderPath ? await indexedProjectIdForFolder(folderPath) : undefined;
+    const locallyIndexed = localIndexProjectId === projectId;
+    const suggestedPath = folderPath || "<your_project_path>";
+
+    let statusResult: unknown = {};
+    try {
+      statusResult = await client.projectIndexStatus(projectId);
+    } catch (error) {
+      if (!isNotFoundError(error)) throw error;
+    }
+
+    const preflight = classifyGraphIngestIndexState({
+      statusResult,
+      locallyIndexed,
+    });
+    const preflightData = {
+      index_state: preflight.state,
+      index_freshness: preflight.freshness,
+      index_age_hours: preflight.ageHours ?? null,
+      index_in_progress: preflight.indexInProgress,
+      project_index_state: preflight.projectIndexState ?? null,
+      locally_indexed: locallyIndexed,
+    };
+
+    if (preflight.state === "indexing") {
+      const deferred = {
+        status: "deferred",
+        wait,
+        reason: "Project index refresh is in progress. Graph ingest is deferred until index refresh completes.",
+        preflight: {
+          ...preflightData,
+          auto_refresh_started: false,
+          graph_ingest_executed: false,
+        },
+        next_step: `Run project(action="index_status") and retry graph(action="ingest") when freshness is not stale.`,
+      };
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Project indexing is currently in progress; graph ingest was deferred to avoid rebuilding edges from stale embeddings.\n\n${formatContent(deferred)}`,
+          },
+        ],
+        structuredContent: deferred,
+      };
+    }
+
+    if (preflight.state === "stale" || preflight.state === "missing") {
+      const validPath = folderPath ? await validateReadableDirectory(folderPath) : undefined;
+      if (!validPath?.ok) {
+        return errorResult(
+          `Graph ingest is blocked because the project index is ${preflight.state} and no readable project folder is available for auto-refresh.\nRun project(action="ingest_local", path="${suggestedPath}") first, then retry graph(action="ingest").`
+        );
+      }
+
+      if (!preflight.indexInProgress) {
+        startBackgroundIngest(projectId, validPath.resolvedPath, { force: true }, { preflight: true });
+      }
+
+      const deferred = {
+        status: "deferred",
+        wait,
+        reason: `Project index is ${preflight.state}. Started index refresh before graph ingest to avoid destructive edge rebuilds from stale embeddings.`,
+        preflight: {
+          ...preflightData,
+          auto_refresh_started: !preflight.indexInProgress,
+          auto_refresh_path: validPath.resolvedPath,
+          auto_refresh_force: true,
+          graph_ingest_executed: false,
+        },
+        next_step: `Monitor with project(action="index_status"), then rerun graph(action="ingest").`,
+      };
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Project index is ${preflight.state}; started index refresh and deferred graph ingest to prevent stale-edge rebuild.\n\n${formatContent(deferred)}`,
+          },
+        ],
+        structuredContent: deferred,
+      };
+    }
+
+    let estimate: { min: number; max: number; basis?: string } | null = null;
+    try {
+      const stats = await client.projectStatistics(projectId);
+      estimate = estimateGraphIngestMinutes(stats);
+    } catch (error) {
+      logDebug(`Failed to fetch project statistics for graph estimate: ${error}`);
+    }
+
+    const result = await client.graphIngest({ project_id: projectId, wait });
+    const estimateText = estimate
+      ? `Estimated time: ${estimate.min}-${estimate.max} min${estimate.basis ? ` (based on ${estimate.basis})` : ""}.`
+      : "Estimated time varies with repo size.";
+    const note = `Graph ingestion is running ${wait ? "synchronously" : "asynchronously"} and can take a few minutes. ${estimateText}`;
+    const structured = toStructured(result);
+    const structuredContent =
+      structured && typeof structured === "object"
+        ? {
+            ...structured,
+            wait,
+            note,
+            preflight: {
+              ...preflightData,
+              auto_refresh_started: false,
+              graph_ingest_executed: true,
+            },
+            ...(estimate
+              ? {
+                  estimate_minutes: { min: estimate.min, max: estimate.max },
+                  estimate_basis: estimate.basis,
+                }
+              : {}),
+          }
+        : {
+            wait,
+            note,
+            preflight: {
+              ...preflightData,
+              auto_refresh_started: false,
+              graph_ingest_executed: true,
+            },
+            ...(estimate
+              ? {
+                  estimate_minutes: { min: estimate.min, max: estimate.max },
+                  estimate_basis: estimate.basis,
+                }
+              : {}),
+          };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `${note}\n${formatContent(result)}`,
+        },
+      ],
+      structuredContent,
+    };
+  }
+
   function summarizeVideoTextExtraction(metadata: unknown): string | undefined {
     if (!metadata || typeof metadata !== "object") return undefined;
     const extraction = (metadata as Record<string, unknown>).video_text_extraction;
@@ -5508,54 +5653,7 @@ Access: Free`,
       }
 
       const wait = input.wait ?? false;
-      let estimate: { min: number; max: number; basis?: string } | null = null;
-
-      try {
-        const stats = await client.projectStatistics(projectId);
-        estimate = estimateGraphIngestMinutes(stats);
-      } catch (error) {
-        logDebug(`Failed to fetch project statistics for graph estimate: ${error}`);
-      }
-
-      const result = await client.graphIngest({ project_id: projectId, wait });
-      const estimateText = estimate
-        ? `Estimated time: ${estimate.min}-${estimate.max} min${estimate.basis ? ` (based on ${estimate.basis})` : ""}.`
-        : "Estimated time varies with repo size.";
-      const note = `Graph ingestion is running ${wait ? "synchronously" : "asynchronously"} and can take a few minutes. ${estimateText}`;
-      const structured = toStructured(result);
-      const structuredContent =
-        structured && typeof structured === "object"
-          ? {
-              ...structured,
-              wait,
-              note,
-              ...(estimate
-                ? {
-                    estimate_minutes: { min: estimate.min, max: estimate.max },
-                    estimate_basis: estimate.basis,
-                  }
-                : {}),
-            }
-          : {
-              wait,
-              note,
-              ...(estimate
-                ? {
-                    estimate_minutes: { min: estimate.min, max: estimate.max },
-                    estimate_basis: estimate.basis,
-                  }
-                : {}),
-            };
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `${note}\n${formatContent(result)}`,
-          },
-        ],
-        structuredContent,
-      };
+      return runGraphIngestWithPreflight(projectId, wait);
     }
   );
 
@@ -13078,14 +13176,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!projectId) {
               return errorResult("ingest requires: project_id");
             }
-            const result = await client.graphIngest({
-              project_id: projectId,
-              wait: input.wait,
-            });
-            return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
-            };
+            return runGraphIngestWithPreflight(projectId, input.wait ?? false);
           }
 
           case "circular_dependencies": {

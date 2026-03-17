@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   apiResultIsIndexing,
   apiResultReportsIndexed,
+  classifyGraphIngestIndexState,
   classifyIndexConfidence,
   classifyIndexFreshness,
   extractIndexTimestamp,
@@ -118,5 +119,55 @@ describe("index freshness helpers", () => {
   it("parses known timestamp keys", () => {
     const parsed = extractIndexTimestamp({ last_updated: "2026-02-20T18:00:00Z" });
     expect(parsed?.toISOString()).toBe("2026-02-20T18:00:00.000Z");
+  });
+});
+
+describe("classifyGraphIngestIndexState", () => {
+  it("returns ready for recent indexed payload", () => {
+    const result = classifyGraphIngestIndexState({
+      statusResult: {
+        indexed_files: 10,
+        last_updated: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+        project_index_state: "ready",
+      },
+      locallyIndexed: false,
+    });
+    expect(result.state).toBe("ready");
+  });
+
+  it("returns stale when project_index_state is stale", () => {
+    const result = classifyGraphIngestIndexState({
+      statusResult: {
+        indexed_files: 10,
+        last_updated: new Date().toISOString(),
+        project_index_state: "stale",
+      },
+      locallyIndexed: false,
+    });
+    expect(result.state).toBe("stale");
+    expect(result.projectIndexState).toBe("stale");
+  });
+
+  it("returns missing when index cannot be confirmed", () => {
+    const result = classifyGraphIngestIndexState({
+      statusResult: {
+        indexed_files: 0,
+        status: "ready",
+      },
+      locallyIndexed: false,
+    });
+    expect(result.state).toBe("missing");
+  });
+
+  it("returns indexing when status indicates in-progress commit", () => {
+    const result = classifyGraphIngestIndexState({
+      statusResult: {
+        project_index_state: "indexing",
+        pending_files: 3,
+      },
+      locallyIndexed: true,
+    });
+    expect(result.state).toBe("indexing");
+    expect(result.indexInProgress).toBe(true);
   });
 });

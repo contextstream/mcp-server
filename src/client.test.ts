@@ -66,3 +66,32 @@ describe("ContextStreamClient.captureContext", () => {
     );
   });
 });
+
+describe("ContextStreamClient.docsList", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("forwards optional query parameter for server-side doc filtering", async () => {
+    const client = new ContextStreamClient(baseConfig);
+    const fetchMock = vi.spyOn(globalThis, "fetch" as any).mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: {
+        get: () => "application/json",
+      },
+      json: async () => ({ items: [] }),
+    } as any);
+
+    await client.docsList({
+      workspace_id: "11111111-1111-4111-8111-111111111111",
+      query: "migration playbook",
+      per_page: 10,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const url = String(fetchMock.mock.calls[0]?.[0] ?? "");
+    expect(url).toContain("/docs?");
+    expect(url).toContain("query=migration+playbook");
+  });
+});

@@ -707,7 +707,7 @@ export function buildHooksConfig(options?: {
           {
             type: "command",
             command: getHookCommand("session-start"),
-            timeout: 10,
+            timeout: 15,
           },
         ],
       },

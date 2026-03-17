@@ -353,10 +353,7 @@ export async function runSessionInitHook(): Promise<void> {
   // Output Claude Code format
   console.log(
     JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "SessionStart",
-        additionalContext: formattedContext,
-      },
+      additionalContext: formattedContext,
     })
   );
 

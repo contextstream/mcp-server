@@ -66,6 +66,13 @@ describe("hooks-config", () => {
         }
       }
     });
+
+    it("should use 15s timeout for SessionStart hook", () => {
+      const config = buildHooksConfig();
+      const sessionStart = config?.SessionStart?.[0]?.hooks?.[0];
+      expect(sessionStart?.command).toContain("hook session-start");
+      expect(sessionStart?.timeout).toBe(15);
+    });
   });
 
   describe("mergeHooksIntoSettings", () => {

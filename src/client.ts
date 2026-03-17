@@ -6459,6 +6459,7 @@ export class ContextStreamClient {
     project_id?: string;
     doc_type?: "roadmap" | "spec" | "general";
     is_personal?: boolean;
+    query?: string;
     page?: number;
     per_page?: number;
   }) {
@@ -6468,6 +6469,7 @@ export class ContextStreamClient {
     if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
     if (params?.doc_type) query.set("doc_type", params.doc_type);
     if (params?.is_personal !== undefined) query.set("is_personal", String(params.is_personal));
+    if (params?.query) query.set("query", params.query);
     if (params?.page) query.set("page", String(params.page));
     if (params?.per_page) query.set("per_page", String(params.per_page));
     const suffix = query.toString() ? `?${query.toString()}` : "";

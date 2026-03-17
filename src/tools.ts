@@ -3624,6 +3624,21 @@ export function registerTools(
     return undefined;
   }
 
+  type RankedDocMatch = {
+    doc: any;
+    score: number;
+    exact: boolean;
+    source: "doc_id" | "exact_title" | "title_contains_query" | "all_terms" | "term_overlap";
+  };
+
+  function normalizeDocLookupText(value: string): string {
+    return value
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function tokenizeForDocMatch(query: string): string[] {
     const stopWords = new Set([
       "the",
@@ -3642,31 +3657,116 @@ export function registerTools(
       "plan",
       "phase",
       "phases",
+      "get",
+      "open",
+      "show",
+      "read",
     ]);
-    return query
-      .split(/[^A-Za-z0-9]+/)
-      .map((term) => term.trim().toLowerCase())
+    return normalizeDocLookupText(query)
+      .split(/\s+/)
+      .map((term) => term.trim())
       .filter((term) => term.length >= 3 && !stopWords.has(term));
   }
 
-  function scoreDocMatch(doc: any, terms: string[]): number {
-    const title = String(doc?.title ?? doc?.name ?? doc?.summary ?? "").toLowerCase();
-    const content = String(doc?.content ?? "").toLowerCase();
-    const haystack = `${title} ${content}`;
-    return terms.reduce((score, term) => (haystack.includes(term) ? score + 1 : score), 0);
+  function scoreDocMatch(doc: any, query: string, terms: string[]): RankedDocMatch {
+    const rawQuery = query.trim();
+    const normalizedQuery = normalizeDocLookupText(rawQuery);
+    const titleRaw = String(doc?.title ?? doc?.name ?? doc?.summary ?? "").trim();
+    const title = normalizeDocLookupText(titleRaw);
+    const docId = String(doc?.id ?? "").trim();
+
+    if (docId && rawQuery && docId.toLowerCase() === rawQuery.toLowerCase()) {
+      return { doc, score: 100, exact: true, source: "doc_id" };
+    }
+
+    if (title && normalizedQuery && title === normalizedQuery) {
+      return { doc, score: 95, exact: true, source: "exact_title" };
+    }
+
+    if (title && normalizedQuery && title.includes(normalizedQuery) && normalizedQuery.length >= 8) {
+      return { doc, score: 80, exact: false, source: "title_contains_query" };
+    }
+
+    if (terms.length === 0) {
+      return { doc, score: 0, exact: false, source: "term_overlap" };
+    }
+
+    const matchedTerms = terms.filter((term) => title.includes(term)).length;
+    if (matchedTerms === 0) {
+      return { doc, score: 0, exact: false, source: "term_overlap" };
+    }
+
+    if (matchedTerms === terms.length) {
+      return {
+        doc,
+        score: 60 + matchedTerms * 5,
+        exact: false,
+        source: "all_terms",
+      };
+    }
+
+    return {
+      doc,
+      score: matchedTerms * 10,
+      exact: false,
+      source: "term_overlap",
+    };
+  }
+
+  function rankDocsForQueryMatches(docs: any[], query: string, limit: number): RankedDocMatch[] {
+    const terms = tokenizeForDocMatch(query);
+    const scored = docs.map((doc, idx) => ({ idx, ...scoreDocMatch(doc, query, terms) }));
+    scored.sort((a, b) => b.score - a.score || a.idx - b.idx);
+    return scored.filter((entry) => entry.score > 0).slice(0, limit);
   }
 
   function rankDocsForQuery(docs: any[], query: string, limit: number): any[] {
-    const terms = tokenizeForDocMatch(query);
-    if (terms.length === 0) return docs.slice(0, limit);
+    const rankedMatches = rankDocsForQueryMatches(docs, query, limit);
+    return rankedMatches.length > 0 ? rankedMatches.map((entry) => entry.doc) : docs.slice(0, limit);
+  }
 
-    const scored = docs.map((doc, idx) => ({ idx, score: scoreDocMatch(doc, terms) }));
-    scored.sort((a, b) => b.score - a.score || a.idx - b.idx);
-    const matched = scored
-      .filter((entry) => entry.score > 0)
-      .slice(0, limit)
-      .map((entry) => docs[entry.idx]);
-    return matched.length > 0 ? matched : docs.slice(0, limit);
+  function selectResolvedDocMatch(matches: RankedDocMatch[]): RankedDocMatch | undefined {
+    if (matches.length === 0) return undefined;
+    if (matches[0].exact) return matches[0];
+    const top = matches[0];
+    const second = matches[1];
+    if (top.score >= 80 && (!second || second.score <= 40)) {
+      return top;
+    }
+    return undefined;
+  }
+
+  function extractMemorySearchResults(response: any): any[] {
+    const result = response?.data ?? response;
+    if (Array.isArray(result?.results)) return result.results;
+    if (Array.isArray(result?.items)) return result.items;
+    return [];
+  }
+
+  function buildHybridMemoryDocResults(memoryResults: any[], docMatches: RankedDocMatch[], limit: number): any[] {
+    const docs = docMatches.map((match) => ({
+      entity_type: "doc",
+      id: match.doc?.id ?? "unknown",
+      title: match.doc?.title ?? match.doc?.name ?? "Untitled",
+      preview: String(match.doc?.content ?? "").slice(0, 150),
+      score: match.score,
+      match_source: match.source,
+      doc_type: match.doc?.doc_type ?? "general",
+    }));
+
+    const memory = memoryResults.map((item: any) => ({
+      entity_type: "memory",
+      id: item?.id ?? item?.node_id ?? "unknown",
+      title: item?.title ?? item?.summary ?? item?.name ?? "Untitled",
+      preview: String(item?.content ?? item?.details ?? "").slice(0, 150),
+      score: Math.round(Number(item?.score ?? 0) * 100),
+      match_source: "memory_search",
+      node_type: item?.node_type ?? item?.event_type ?? item?.type ?? "unknown",
+    }));
+
+    const combined = [...docs, ...memory];
+    combined.sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+    return combined.slice(0, limit);
   }
 
   async function findDocsFallback(
@@ -11999,7 +12099,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .optional()
             .describe("Mermaid diagram type"),
           // Doc params
-          doc_id: z.string().uuid().optional().describe("Doc ID for get_doc/update_doc/delete_doc"),
+          doc_id: z
+            .string()
+            .optional()
+            .describe("Doc ID for get_doc/update_doc/delete_doc. For get_doc, accepts UUID or title/query text."),
           doc_type: z
             .enum(["roadmap", "spec", "general"])
             .optional()
@@ -12234,13 +12337,44 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.query) {
               return errorResult("search requires: query");
             }
-            const result = await client.memorySearch({
-              workspace_id: workspaceId,
-              project_id: projectId,
+            const [memoryResult, docsResult] = await Promise.all([
+              client.memorySearch({
+                workspace_id: workspaceId,
+                project_id: projectId,
+                query: input.query,
+                limit: input.limit,
+              }),
+              workspaceId
+                ? client.docsList({
+                    workspace_id: workspaceId,
+                    project_id: projectId,
+                    per_page: Math.max(10, Math.min(input.limit ?? 10, 25)),
+                  })
+                : Promise.resolve(undefined),
+            ]);
+            const memoryItems = extractMemorySearchResults(memoryResult);
+            const docsItems = extractCollectionArray(docsResult ?? {}) ?? [];
+            const docMatches = rankDocsForQueryMatches(
+              docsItems,
+              input.query,
+              Math.max(1, Math.min(input.limit ?? 10, 25))
+            );
+            const hybridResults = buildHybridMemoryDocResults(
+              memoryItems,
+              docMatches,
+              Math.max(1, Math.min(input.limit ?? 10, 25))
+            );
+            const outputText = formatContent({
               query: input.query,
-              limit: input.limit,
+              results: hybridResults,
+              memory_results: memoryItems,
+              doc_matches: docMatches.map((entry) => ({
+                ...entry.doc,
+                match_score: entry.score,
+                exact_match: entry.exact,
+                match_source: entry.source,
+              })),
             });
-            const outputText = formatContent(result);
             // Track token savings
             trackToolTokenSavings(client, "memory_search", outputText, {
               workspace_id: workspaceId,
@@ -12670,9 +12804,67 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.doc_id) {
               return errorResult("get_doc requires: doc_id");
             }
-            const getDocResult = await client.docsGet({ doc_id: input.doc_id });
+            const directDocId = normalizeUuid(input.doc_id);
+            if (directDocId) {
+              const getDocResult = await client.docsGet({ doc_id: directDocId });
+              return {
+                content: [{ type: "text" as const, text: formatContent(getDocResult) }],
+              };
+            }
+            if (!workspaceId) {
+              return errorResult(
+                "get_doc title/query lookups require workspace_id. Call session_init first or pass a doc UUID."
+              );
+            }
+            const candidateProjectIds = [projectId, explicitProjectId, undefined];
+            const fallback = await findDocsFallback(
+              workspaceId,
+              candidateProjectIds,
+              input.doc_id,
+              Math.max(10, Math.min(input.limit ?? 20, 30))
+            );
+            const rankedMatches = rankDocsForQueryMatches(
+              fallback?.docs ?? [],
+              input.doc_id,
+              Math.max(1, Math.min(input.limit ?? 10, 10))
+            );
+            const resolved = selectResolvedDocMatch(rankedMatches);
+            if (resolved) {
+              const resolvedDocId = String(resolved.doc?.id ?? "");
+              if (normalizeUuid(resolvedDocId)) {
+                const getDocResult = await client.docsGet({ doc_id: resolvedDocId });
+                return {
+                  content: [
+                    {
+                      type: "text" as const,
+                      text: `Resolved doc query "${input.doc_id}" to doc ID ${resolvedDocId}.\n\n${formatContent(
+                        getDocResult
+                      )}`,
+                    },
+                  ],
+                };
+              }
+            }
+            const topMatches = rankedMatches.slice(0, 5).map((entry) => ({
+              ...(entry.doc ?? {}),
+              match_score: entry.score,
+              exact_match: entry.exact,
+              match_source: entry.source,
+            }));
+            const noMatchMessage =
+              topMatches.length > 0
+                ? `Could not resolve "${input.doc_id}" to a single doc confidently.`
+                : `No docs found matching "${input.doc_id}".`;
             return {
-              content: [{ type: "text" as const, text: formatContent(getDocResult) }],
+              content: [
+                {
+                  type: "text" as const,
+                  text: `${noMatchMessage}\n\n${formatContent({
+                    query: input.doc_id,
+                    doc_matches: topMatches,
+                  })}`,
+                },
+              ],
             };
           }
 
@@ -12680,8 +12872,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.doc_id) {
               return errorResult("update_doc requires: doc_id");
             }
+            const updateDocId = normalizeUuid(input.doc_id);
+            if (!updateDocId) {
+              return errorResult("update_doc requires a valid UUID doc_id.");
+            }
             const updateDocResult = await client.docsUpdate({
-              doc_id: input.doc_id,
+              doc_id: updateDocId,
               title: input.title,
               content: input.content,
               doc_type: input.doc_type,
@@ -12696,7 +12892,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.doc_id) {
               return errorResult("delete_doc requires: doc_id");
             }
-            const deleteDocResult = await client.docsDelete({ doc_id: input.doc_id });
+            const deleteDocId = normalizeUuid(input.doc_id);
+            if (!deleteDocId) {
+              return errorResult("delete_doc requires a valid UUID doc_id.");
+            }
+            const deleteDocResult = await client.docsDelete({ doc_id: deleteDocId });
             return {
               content: [{ type: "text" as const, text: formatContent(deleteDocResult) }],
             };

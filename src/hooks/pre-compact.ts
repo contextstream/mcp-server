@@ -434,10 +434,7 @@ After compaction, call session_init(is_post_compact=true) to restore context.${c
   // Output Claude Code format
   console.log(
     JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "PreCompact",
-        additionalContext: context,
-      },
+      additionalContext: context,
     })
   );
 

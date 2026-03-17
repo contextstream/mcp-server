@@ -31,6 +31,7 @@ type LocalConfig = {
 };
 
 const DEFAULT_API_URL = "https://api.contextstream.io";
+const HOOK_SPECIFIC_OUTPUT_EVENTS = new Set(["PreToolUse", "UserPromptSubmit", "PostToolUse"]);
 
 export function readHookInput<T = Record<string, unknown>>(): T {
   try {
@@ -46,12 +47,16 @@ export function writeHookOutput(output?: {
   reason?: string;
   hookEventName?: string;
 }): void {
+  const eventName =
+    output?.hookEventName ||
+    (typeof process.env.HOOK_EVENT_NAME === "string" ? process.env.HOOK_EVENT_NAME.trim() : "");
+  const canUseHookSpecificOutput = HOOK_SPECIFIC_OUTPUT_EVENTS.has(eventName);
   const payload =
     output && (output.additionalContext || output.blocked || output.reason)
       ? {
-          hookSpecificOutput: output.additionalContext
+          hookSpecificOutput: output.additionalContext && canUseHookSpecificOutput
             ? {
-                hookEventName: output.hookEventName,
+                hookEventName: eventName,
                 additionalContext: output.additionalContext,
               }
             : undefined,

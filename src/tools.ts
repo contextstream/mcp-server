@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MessageExtraInfo, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { ContextStreamClient } from "./client.js";
+import { isLessonResult, isDecisionResult, extractEventTags } from "./client.js";
 import { readFilesFromDirectory, readAllFilesInBatches, countIndexableFiles } from "./files.js";
 import { SessionManager } from "./session-manager.js";
 import {
@@ -2067,6 +2068,7 @@ const CONSOLIDATED_TOOLS = new Set<string>([
   "reminder", // Consolidates reminders_list, reminders_create, etc.
   "integration", // Consolidates slack_*, github_*, notion_*, integrations_*
   "media", // Consolidates media indexing, search, and clip retrieval for Remotion/FFmpeg
+  "skill", // Skill management: list, get, create, update, run, delete, import, export, share
   "help", // Consolidates session_tools, auth_me, mcp_server_version, etc.
 ]);
 
@@ -2093,6 +2095,7 @@ function mapToolToConsolidatedDomain(toolName: string): string | null {
     return "integration";
   }
   if (toolName.startsWith("media_")) return "media";
+  if (toolName.startsWith("skill_")) return "skill";
 
   if (
     toolName === "session_tools" ||
@@ -2231,6 +2234,31 @@ function toStructured(data: unknown): StructuredContent {
     return data as { [x: string]: unknown };
   }
   return undefined;
+}
+
+// Skill tool formatting helpers
+function formatSkillDetail(skill: Record<string, any>): string {
+  const lines = [
+    `**${skill.title || skill.name || "?"}** (${skill.name || "?"})`,
+    `- ID: ${skill.id || "?"}`,
+    `- Scope: ${skill.scope || "personal"} | Status: ${skill.status || "active"}`,
+  ];
+  if (skill.description) lines.push(`- Description: ${skill.description}`);
+  if (skill.trigger_patterns?.length) lines.push(`- Triggers: ${skill.trigger_patterns.join(", ")}`);
+  if (skill.categories?.length) lines.push(`- Categories: ${skill.categories.join(", ")}`);
+  if (skill.priority != null) lines.push(`- Priority: ${skill.priority}`);
+  if (skill.version) lines.push(`- Version: ${skill.version}`);
+  if (skill.instruction_body) {
+    const body = String(skill.instruction_body);
+    lines.push(`\n### Instruction\n${body.length > 2000 ? body.slice(0, 2000) + "…" : body}`);
+  }
+  return lines.join("\n");
+}
+
+function formatRunResult(result: Record<string, any>): string {
+  if (result.instruction) return result.instruction;
+  if (result.output) return `Skill output:\n${result.output}`;
+  return JSON.stringify(result, null, 2);
 }
 
 /**
@@ -5394,6 +5422,204 @@ Access: Free`,
     }
   );
 
+  // -------------------------------------------------------------------------
+  // Skill tool (Rust MCP parity v0.1.75-v0.1.76)
+  // -------------------------------------------------------------------------
+
+  registerTool(
+    "skill",
+    {
+      title: "Manage reusable skills",
+      description: `Manage and execute reusable skills (instruction + action bundles). Skills are portable across projects, sessions, and tools.
+
+Actions:
+- list: Browse skills (filter by scope, status, category)
+- get: Get skill details by ID or name
+- create: Define a new skill with name, instruction, and triggers
+- update: Modify an existing skill
+- run: Execute a skill (by ID or name)
+- delete: Remove a skill
+- import: Import skills from file or content (supports markdown, JSON, cursorrules, claude_md)
+- export: Export skills in various formats
+- share: Change skill visibility scope`,
+      inputSchema: z.object({
+        action: z.enum(["list", "get", "create", "update", "run", "delete", "import", "export", "share"]).describe("The action to perform"),
+        skill_id: z.string().optional().describe("Skill ID (UUID)"),
+        name: z.string().optional().describe("Skill name (slug, e.g. 'deploy-checker')"),
+        title: z.string().optional().describe("Skill display title"),
+        description: z.string().optional().describe("Skill description"),
+        instruction_body: z.string().optional().describe("Markdown instruction text (the prompt)"),
+        trigger_patterns: z.array(z.string()).optional().describe("Keywords/phrases for auto-activation"),
+        trigger_regex: z.string().optional().describe("Optional regex for advanced trigger matching"),
+        categories: z.array(z.string()).optional().describe("Tags for discovery/filtering"),
+        actions: z.any().optional().describe("Action steps array [{type, tool, params, ...}]"),
+        params: z.any().optional().describe("Parameters passed to skill execution"),
+        dry_run: z.boolean().optional().describe("Preview execution without running"),
+        scope: z.enum(["personal", "team", "public", "all"]).optional().describe("Visibility scope"),
+        status: z.enum(["active", "draft", "archived"]).optional().describe("Skill status"),
+        is_personal: z.boolean().optional().describe("Whether skill is personal"),
+        priority: z.number().optional().describe("Skill priority 0-100 (higher = matched first)"),
+        content: z.string().optional().describe("Content string for import"),
+        file_path: z.string().optional().describe("Local file path for import"),
+        format: z.enum(["auto", "json", "markdown", "skills_md", "cursorrules", "claude_md", "aider", "zip"]).optional().describe("Import/export format"),
+        source_tool: z.string().optional().describe("Source tool name (for import provenance)"),
+        source_file: z.string().optional().describe("Source filename (for import provenance)"),
+        skill_ids: z.array(z.string()).optional().describe("Skill IDs for export"),
+        change_summary: z.string().optional().describe("Summary of changes (for version history)"),
+        workspace_id: z.string().optional().describe("Workspace ID (UUID)"),
+        project_id: z.string().optional().describe("Project ID (UUID)"),
+        query: z.string().optional().describe("Search query"),
+        category: z.string().optional().describe("Filter by category tag"),
+        limit: z.number().optional().describe("Max results to return"),
+      }),
+    },
+    async (input) => {
+      const action = input.action;
+
+      switch (action) {
+        case "list": {
+          const result = await client.listSkills({
+            workspace_id: input.workspace_id,
+            project_id: input.project_id,
+            scope: input.scope,
+            status: input.status,
+            category: input.category,
+            query: input.query,
+            is_personal: input.is_personal,
+            limit: input.limit,
+          }) as { items?: any[] };
+          const items = result.items || [];
+          let text = `Found ${items.length} skill(s).\n`;
+          for (const item of items) {
+            const name = item.name || "?";
+            const title = item.title || "?";
+            const scope = item.scope || "?";
+            const status = item.status || "?";
+            const id = item.id || "?";
+            text += `- ${title} (${name}) [${scope}|${status}] id=${id}\n`;
+          }
+          return { content: [{ type: "text" as const, text }] };
+        }
+        case "get": {
+          let skillData: any;
+          if (input.skill_id) {
+            skillData = await client.getSkill(input.skill_id);
+          } else if (input.name) {
+            const result = await client.listSkills({
+              workspace_id: input.workspace_id,
+              query: input.name,
+              limit: 1,
+            }) as { items?: any[] };
+            skillData = result.items?.find((s: any) => s.name === input.name) || result.items?.[0];
+            if (!skillData) throw new Error(`Skill '${input.name}' not found`);
+          } else {
+            throw new Error("Either skill_id or name is required for 'get'");
+          }
+          const detail = formatSkillDetail(skillData);
+          return { content: [{ type: "text" as const, text: detail }] };
+        }
+        case "create": {
+          if (!input.name) throw new Error("'name' is required for create");
+          if (!input.instruction_body) throw new Error("'instruction_body' is required for create");
+          const result = await client.createSkill({
+            name: input.name,
+            title: input.title || input.name,
+            instruction_body: input.instruction_body,
+            description: input.description,
+            trigger_patterns: input.trigger_patterns,
+            trigger_regex: input.trigger_regex,
+            categories: input.categories,
+            actions: input.actions,
+            scope: input.scope,
+            is_personal: input.is_personal,
+            priority: input.priority,
+            workspace_id: input.scope === "team" ? input.workspace_id : undefined,
+            project_id: undefined, // Skills are account-level by default
+            source_tool: input.source_tool,
+            source_file: input.source_file,
+          }) as { id?: string };
+          return { content: [{ type: "text" as const, text: `Skill '${input.name}' created (id=${result.id || "?"}).` }] };
+        }
+        case "update": {
+          if (!input.skill_id) throw new Error("'skill_id' is required for update");
+          const result = await client.updateSkill(input.skill_id, {
+            title: input.title,
+            description: input.description,
+            instruction_body: input.instruction_body,
+            trigger_patterns: input.trigger_patterns,
+            trigger_regex: input.trigger_regex,
+            categories: input.categories,
+            actions: input.actions,
+            scope: input.scope,
+            status: input.status,
+            is_personal: input.is_personal,
+            priority: input.priority,
+            change_summary: input.change_summary,
+          }) as { version?: number };
+          return { content: [{ type: "text" as const, text: `Skill ${input.skill_id} updated (version=${result.version || 0}).` }] };
+        }
+        case "run": {
+          let resolvedId = input.skill_id;
+          if (!resolvedId && input.name) {
+            const result = await client.listSkills({
+              workspace_id: input.workspace_id,
+              query: input.name,
+              limit: 1,
+            }) as { items?: any[] };
+            const found = result.items?.find((s: any) => s.name === input.name) || result.items?.[0];
+            if (!found?.id) throw new Error(`Skill '${input.name}' not found`);
+            resolvedId = found.id;
+          }
+          if (!resolvedId) throw new Error("Either skill_id or name is required for 'run'");
+          const result = await client.runSkill(resolvedId, {
+            params: input.params,
+            dry_run: input.dry_run,
+          });
+          return { content: [{ type: "text" as const, text: formatRunResult(result as any) }] };
+        }
+        case "delete": {
+          if (!input.skill_id) throw new Error("'skill_id' is required for delete");
+          await client.deleteSkill(input.skill_id);
+          return { content: [{ type: "text" as const, text: `Skill ${input.skill_id} deleted.` }] };
+        }
+        case "import": {
+          let importContent = input.content;
+          if (!importContent && input.file_path) {
+            const { readFile } = await import("fs/promises");
+            importContent = await readFile(input.file_path, "utf-8");
+          }
+          if (!importContent) throw new Error("Either 'content' or 'file_path' is required for import");
+          const result = await client.importSkills({
+            content: importContent,
+            format: input.format,
+            source_tool: input.source_tool,
+            source_file: input.source_file || input.file_path,
+            scope: input.scope,
+            workspace_id: input.workspace_id,
+          }) as { imported?: number; skipped?: number };
+          return { content: [{ type: "text" as const, text: `Import complete: ${result.imported || 0} imported, ${result.skipped || 0} skipped (duplicates).` }] };
+        }
+        case "export": {
+          const result = await client.exportSkills({
+            skill_ids: input.skill_ids,
+            format: input.format,
+            scope: input.scope,
+            workspace_id: input.workspace_id,
+          }) as { content?: string };
+          return { content: [{ type: "text" as const, text: result.content || JSON.stringify(result, null, 2) }] };
+        }
+        case "share": {
+          if (!input.skill_id) throw new Error("'skill_id' is required for share");
+          if (!input.scope) throw new Error("'scope' is required for share");
+          const result = await client.shareSkill(input.skill_id, input.scope) as { scope?: string };
+          return { content: [{ type: "text" as const, text: `Skill ${input.skill_id} shared with scope=${result.scope || input.scope}.` }] };
+        }
+        default:
+          throw new Error(`Invalid skill action: '${action}'. Valid: list, get, create, update, run, delete, import, export, share`);
+      }
+    }
+  );
+
   registerTool(
     "memory_bulk_ingest",
     {
@@ -5418,15 +5644,25 @@ Access: Free`,
     "memory_list_events",
     {
       title: "List memory events",
-      description: "List memory events (optionally scoped)",
+      description: "List memory events (optionally scoped). Supports tag-based and event_type filtering for precise provenance tracking.",
       inputSchema: z.object({
         workspace_id: z.string().uuid().optional(),
         project_id: z.string().uuid().optional(),
         limit: z.number().optional(),
+        tags: z.array(z.string()).optional().describe("Filter events that contain ALL of these tags"),
+        event_type: z.string().optional().describe("Filter by event type (e.g. decision, lesson, manual_note)"),
       }),
     },
     async (input) => {
-      const result = await client.listMemoryEvents(input);
+      const result = await client.listMemoryEvents(input) as { items?: any[] };
+      // Client-side tag post-filtering fallback (Issue #32)
+      if (input.tags && input.tags.length > 0 && result.items) {
+        const requiredTags = input.tags;
+        result.items = result.items.filter((item: any) => {
+          const itemTags = extractEventTags(item);
+          return requiredTags.every((tag) => itemTags.includes(tag));
+        });
+      }
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
         
@@ -5488,16 +5724,25 @@ Access: Free`,
     "memory_search",
     {
       title: "Memory-aware search",
-      description: "Search memory events/notes",
+      description: "Search memory events/notes. Supports optional tag-based pre-filtering.",
       inputSchema: z.object({
         query: z.string(),
         workspace_id: z.string().uuid().optional(),
         project_id: z.string().uuid().optional(),
         limit: z.number().optional(),
+        tags: z.array(z.string()).optional().describe("Filter results that contain ALL of these tags"),
       }),
     },
     async (input) => {
-      const result = await client.memorySearch(input);
+      const result = await client.memorySearch(input) as { results?: any[] };
+      // Client-side tag post-filtering (Issue #32)
+      if (input.tags && input.tags.length > 0 && result.results) {
+        const requiredTags = input.tags;
+        result.results = result.results.filter((item: any) => {
+          const itemTags = extractEventTags(item);
+          return requiredTags.every((tag) => itemTags.includes(tag));
+        });
+      }
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
         
@@ -7791,12 +8036,13 @@ Returns lessons filtered by:
         limit: input.limit * 2, // Fetch more to filter
       })) as { results?: any[] };
 
-      // Filter for lessons and apply filters
+      // Filter for lessons and apply filters — use isLessonResult() to catch events
+      // where event_type was normalized to manual_note (Issue #31)
       const lessons = (searchResult.results || [])
         .filter((item: any) => {
-          const tags = item.metadata?.tags || [];
-          const isLesson = tags.includes("lesson");
-          if (!isLesson) return false;
+          if (!isLessonResult(item)) return false;
+
+          const tags = extractEventTags(item);
 
           // Filter by category if specified
           if (input.category && !tags.includes(input.category)) {
@@ -7827,7 +8073,7 @@ Returns lessons filtered by:
       // Format lessons for display
       const formattedLessons = lessons
         .map((lesson: any, i: number) => {
-          const tags = lesson.metadata?.tags || [];
+          const tags = extractEventTags(lesson);
           const severity =
             tags.find((t: string) => t.startsWith("severity:"))?.split(":")[1] || "medium";
           const category =
@@ -7851,7 +8097,7 @@ Returns lessons filtered by:
               } as Record<string, string>
             )[severity] || "⚪";
 
-          return `${i + 1}. ${severityEmoji} **${lesson.title}**\n   Category: ${category} | Severity: ${severity}\n   ${lesson.content?.slice(0, 200)}...`;
+          return `${i + 1}. ${severityEmoji} **${lesson.title}**\n   Category: ${category} | Severity: ${severity}\n   ${lesson.content?.slice(0, 500)}...`;
         })
         .join("\n\n");
 

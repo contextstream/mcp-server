@@ -71,6 +71,76 @@ function normalizeTags(tags?: string[]): string[] | undefined {
   return normalized.length > 0 ? normalized : undefined;
 }
 
+// ---------- Event type detection helpers (Issue #31) ----------
+// The API may normalize event_type to "manual_note" and preserve the
+// user-intended type in metadata.original_type.  These helpers look at
+// every reasonable field so query tools can find events regardless of
+// how the API stored them.  Mirrors Rust MCP's is_lesson_result /
+// extract_memory_result_type pattern.
+
+/**
+ * Extract all tags from both top-level and metadata locations.
+ */
+export function extractEventTags(item: Record<string, any>): string[] {
+  const tags: string[] = [];
+  if (Array.isArray(item.tags)) {
+    tags.push(...item.tags.filter((t: unknown) => typeof t === "string"));
+  }
+  const metaTags = item.metadata?.tags;
+  if (Array.isArray(metaTags)) {
+    tags.push(...metaTags.filter((t: unknown) => typeof t === "string"));
+  }
+  return tags;
+}
+
+/**
+ * Determine the effective event type, checking event_type, node_type,
+ * type, and metadata.original_type in priority order.
+ */
+export function extractEffectiveEventType(item: Record<string, any>): string {
+  for (const field of ["event_type", "node_type", "type"]) {
+    const val = item[field];
+    if (typeof val === "string" && val.trim()) return val.trim();
+  }
+  for (const field of ["original_type", "node_type", "event_type", "type"]) {
+    const val = item.metadata?.[field];
+    if (typeof val === "string" && val.trim()) return val.trim();
+  }
+  return "unknown";
+}
+
+/**
+ * Is this item a lesson?  Checks multiple fields/tags.
+ */
+export function isLessonResult(item: Record<string, any>): boolean {
+  // Direct type field
+  const effectiveType = extractEffectiveEventType(item);
+  if (effectiveType === "lesson") return true;
+
+  // Tags
+  const tags = extractEventTags(item);
+  if (tags.some((t) => t === "lesson" || t === "lesson_system")) return true;
+
+  // Content pattern (structured lesson format)
+  const content = typeof item.content === "string" ? item.content : "";
+  if (content.includes("### Prevention") && content.includes("### Trigger")) return true;
+
+  return false;
+}
+
+/**
+ * Is this item a decision?  Checks multiple fields/tags.
+ */
+export function isDecisionResult(item: Record<string, any>): boolean {
+  const effectiveType = extractEffectiveEventType(item);
+  if (effectiveType === "decision") return true;
+
+  const tags = extractEventTags(item);
+  if (tags.includes("decision")) return true;
+
+  return false;
+}
+
 type GraphTier = "none" | "lite" | "full";
 
 /**
@@ -928,7 +998,13 @@ export class ContextStreamClient {
     return request(this.config, "/memory/events/ingest", { body: this.withDefaults(body) });
   }
 
-  listMemoryEvents(params?: { workspace_id?: string; project_id?: string; limit?: number }) {
+  listMemoryEvents(params?: {
+    workspace_id?: string;
+    project_id?: string;
+    limit?: number;
+    tags?: string[];
+    event_type?: string;
+  }) {
     const withDefaults = this.withDefaults(params || {});
     if (!withDefaults.workspace_id) {
       throw new Error("workspace_id is required for listing memory events");
@@ -936,6 +1012,8 @@ export class ContextStreamClient {
     const query = new URLSearchParams();
     if (params?.limit) query.set("limit", String(params.limit));
     if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
+    if (params?.event_type) query.set("event_type", params.event_type);
+    if (params?.tags && params.tags.length > 0) query.set("tags", params.tags.join(","));
     const suffix = query.toString() ? `?${query.toString()}` : "";
     return request(this.config, `/memory/events/workspace/${withDefaults.workspace_id}${suffix}`, {
       method: "GET",
@@ -4358,21 +4436,21 @@ export class ContextStreamClient {
 
       if (!searchResult?.results) return [];
 
-      // Filter for lessons with high/critical severity
+      // Filter for lessons with high/critical severity — use isLessonResult()
+      // to catch events where event_type was normalized (Issue #31)
       const lessons = searchResult.results
         .filter((item) => {
-          const tags = item.metadata?.tags || [];
-          const isLesson = tags.includes("lesson") || tags.includes("lesson_system");
-          if (!isLesson) return false;
+          if (!isLessonResult(item as Record<string, any>)) return false;
 
           // Get severity from tags or importance
+          const tags = extractEventTags(item as Record<string, any>);
           const severityTag = tags.find((t: string) => t.startsWith("severity:"));
           const severity = severityTag?.split(":")[1] || item.metadata?.importance || "medium";
           return severity === "critical" || severity === "high";
         })
         .slice(0, limit)
         .map((item) => {
-          const tags = item.metadata?.tags || [];
+          const tags = extractEventTags(item as Record<string, any>);
           const severityTag = tags.find((t: string) => t.startsWith("severity:"));
           const severity = severityTag?.split(":")[1] || item.metadata?.importance || "medium";
           const category =
@@ -4386,10 +4464,10 @@ export class ContextStreamClient {
               ].includes(t)
             ) || "unknown";
 
-          // Extract prevention from content
+          // Extract prevention from content — increased truncation limit (200→1000)
           const content = item.content || "";
           const preventionMatch = content.match(/### Prevention\n([\s\S]*?)(?:\n\n|\n\*\*|$)/);
-          const prevention = preventionMatch?.[1]?.trim() || content.slice(0, 200);
+          const prevention = preventionMatch?.[1]?.trim() || content.slice(0, 1000);
 
           return {
             title: item.title || "Lesson",
@@ -6546,6 +6624,121 @@ export class ContextStreamClient {
   async docsDelete(params: { doc_id: string }) {
     uuidSchema.parse(params.doc_id);
     return request(this.config, `/docs/${params.doc_id}`, { method: "DELETE" });
+  }
+
+  // -------------------------------------------------------------------------
+  // Skill methods (portable instruction + action bundles)
+  // -------------------------------------------------------------------------
+
+  async listSkills(params?: {
+    workspace_id?: string;
+    project_id?: string;
+    scope?: string;
+    status?: string;
+    category?: string;
+    query?: string;
+    is_personal?: boolean;
+    limit?: number;
+  }) {
+    const withDefaults = this.withDefaults(params || {});
+    const query = new URLSearchParams();
+    if (withDefaults.workspace_id) query.set("workspace_id", withDefaults.workspace_id);
+    if (params?.project_id) query.set("project_id", params.project_id);
+    if (params?.scope) query.set("scope", params.scope);
+    if (params?.status) query.set("status", params.status);
+    if (params?.category) query.set("category", params.category);
+    if (params?.query) query.set("query", params.query);
+    if (params?.is_personal !== undefined) query.set("is_personal", String(params.is_personal));
+    if (params?.limit) query.set("limit", String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request(this.config, `/skills${suffix}`, { method: "GET" });
+  }
+
+  async getSkill(skillId: string) {
+    return request(this.config, `/skills/${skillId}`, { method: "GET" });
+  }
+
+  async createSkill(params: {
+    name: string;
+    title: string;
+    instruction_body: string;
+    description?: string;
+    trigger_patterns?: string[];
+    trigger_regex?: string;
+    categories?: string[];
+    actions?: any;
+    scope?: string;
+    is_personal?: boolean;
+    priority?: number;
+    workspace_id?: string;
+    project_id?: string;
+    source_tool?: string;
+    source_file?: string;
+  }) {
+    return request(this.config, "/skills", { body: this.withDefaults(params) });
+  }
+
+  async updateSkill(
+    skillId: string,
+    params: {
+      title?: string;
+      description?: string;
+      instruction_body?: string;
+      trigger_patterns?: string[];
+      trigger_regex?: string;
+      categories?: string[];
+      actions?: any;
+      scope?: string;
+      status?: string;
+      is_personal?: boolean;
+      priority?: number;
+      change_summary?: string;
+    }
+  ) {
+    return request(this.config, `/skills/${skillId}`, {
+      method: "PATCH",
+      body: params,
+    });
+  }
+
+  async runSkill(
+    skillId: string,
+    params?: { params?: any; session_id?: string; dry_run?: boolean }
+  ) {
+    return request(this.config, `/skills/${skillId}/run`, {
+      body: params || {},
+    });
+  }
+
+  async deleteSkill(skillId: string) {
+    return request(this.config, `/skills/${skillId}`, { method: "DELETE" });
+  }
+
+  async importSkills(params: {
+    content: string;
+    format?: string;
+    source_tool?: string;
+    source_file?: string;
+    scope?: string;
+    workspace_id?: string;
+  }) {
+    return request(this.config, "/skills/import", { body: this.withDefaults(params) });
+  }
+
+  async exportSkills(params?: {
+    skill_ids?: string[];
+    format?: string;
+    scope?: string;
+    workspace_id?: string;
+  }) {
+    const withDefaults = this.withDefaults(params || {});
+    return request(this.config, "/skills/export", { body: withDefaults });
+  }
+
+  async shareSkill(skillId: string, scope: string) {
+    return request(this.config, `/skills/${skillId}/share`, {
+      body: { scope },
+    });
   }
 
   // -------------------------------------------------------------------------

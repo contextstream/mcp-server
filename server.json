@@ -21,6 +21,26 @@
       "registryType": "npm",
       "identifier": "@contextstream/mcp-server",
       "version": "0.4.67",
+      "environmentVariables": [
+        {
+          "name": "CONTEXTSTREAM_API_URL",
+          "description": "ContextStream API base URL.",
+          "value": "https://api.contextstream.io"
+        },
+        {
+          "name": "CONTEXTSTREAM_API_KEY",
+          "description": "ContextStream API key.",
+          "value": "{apiKey}",
+          "variables": {
+            "apiKey": {
+              "description": "ContextStream API key.",
+              "isRequired": true,
+              "isSecret": true,
+              "placeholder": "cbiq_..."
+            }
+          }
+        }
+      ],
       "transport": {
         "type": "stdio"
       }

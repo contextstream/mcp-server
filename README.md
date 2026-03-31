@@ -24,7 +24,7 @@
 <div align="center">
 
 ```bash
-npx @contextstream/mcp-server@latest setup
+npx --prefer-online -y @contextstream/mcp-server@latest setup
 ```
 
 </div>
@@ -32,6 +32,36 @@ npx @contextstream/mcp-server@latest setup
 <p align="center">
   <img src="compare1.gif" alt="ContextStream in action" width="700" />
 </p>
+
+---
+
+## Get Started (VS Code + Copilot)
+
+### Option 1: Rust MCP (recommended)
+
+```bash
+curl -fsSL https://contextstream.io/scripts/mcp.sh | bash
+```
+
+```powershell
+irm https://contextstream.io/scripts/mcp.ps1 | iex
+```
+
+Then run:
+
+```bash
+contextstream-mcp setup
+```
+
+### Option 2: Node MCP
+
+```bash
+npx --prefer-online -y @contextstream/mcp-server@latest setup
+```
+
+After setup, restart VS Code/Copilot.
+
+**Works with:** Claude Code • Cursor • VS Code • Claude Desktop • Codex CLI • OpenCode • Antigravity
 
 ---
 
@@ -76,56 +106,6 @@ Long conversation? ContextStream tracks token usage, auto-saves critical state, 
 
 ---
 
-## Choose Your Runtime (VS Code/Copilot)
-
-For VS Code + Copilot users, we recommend the Rust runtime because it gives the lowest-friction local install and startup path.
-
-### Recommended: Rust MCP
-
-```bash
-curl -fsSL https://contextstream.io/scripts/mcp.sh | bash
-```
-
-```powershell
-irm https://contextstream.io/scripts/mcp.ps1 | iex
-```
-
-### Alternative: Node MCP server
-
-```bash
-npx --prefer-online -y @contextstream/mcp-server@latest setup
-```
-
-### Marketplace install limitation
-
-MCP marketplace installs for npm packages can install and run the package entrypoint, but they do not run arbitrary shell bootstrap commands such as `curl ... | bash` or `irm ... | iex`. That means Rust bootstrap must currently be a separate explicit user step unless/ until the Rust runtime is distributed in a marketplace-compatible package format.
-
-## Quickest Post-Install Path (VS Code + Copilot)
-
-1. Install a runtime (Rust recommended).
-2. Run the setup wizard:
-
-```bash
-contextstream-mcp setup
-```
-
-3. In wizard prompts, keep Copilot selected and confirm canonical file writes.
-4. Restart VS Code/Copilot.
-
-This path is the default recommendation. Manual JSON config snippets below are backup options.
-
-## Setup Takes 30 Seconds (Node)
-
-```bash
-npx --prefer-online -y @contextstream/mcp-server@latest setup
-```
-
-The wizard handles authentication, configuration, editor integration, and optional hooks that supercharge your workflow.
-
-**Works with:** Claude Code • Cursor • VS Code • Claude Desktop • Codex CLI • OpenCode • Antigravity
-
----
-
 ## The Tools Your AI Gets
 
 ```
@@ -152,8 +132,8 @@ Your AI uses these automatically. You just code.
 <summary><b>Claude Code</b></summary>
 
 ```bash
-claude mcp add contextstream -- npx @contextstream/mcp-server
-claude mcp update contextstream -e CONTEXTSTREAM_API_KEY=your_key
+claude mcp add contextstream -- npx --prefer-online -y @contextstream/mcp-server@latest
+claude mcp update contextstream -e CONTEXTSTREAM_API_URL=https://api.contextstream.io -e CONTEXTSTREAM_API_KEY=your_key
 ```
 
 </details>
@@ -166,8 +146,11 @@ claude mcp update contextstream -e CONTEXTSTREAM_API_KEY=your_key
   "mcpServers": {
     "contextstream": {
       "command": "npx",
-      "args": ["-y", "@contextstream/mcp-server"],
-      "env": { "CONTEXTSTREAM_API_KEY": "your_key" }
+      "args": ["--prefer-online", "-y", "@contextstream/mcp-server@latest"],
+      "env": {
+        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+        "CONTEXTSTREAM_API_KEY": "your_key"
+      }
     }
   }
 }
@@ -233,7 +216,10 @@ For GitHub Copilot in VS Code, use project-level MCP at `.vscode/mcp.json`.
       "type": "stdio",
       "command": "contextstream-mcp",
       "args": [],
-      "env": { "CONTEXTSTREAM_API_KEY": "your_key" }
+      "env": {
+        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+        "CONTEXTSTREAM_API_KEY": "your_key"
+      }
     }
   }
 }
@@ -247,8 +233,11 @@ For GitHub Copilot in VS Code, use project-level MCP at `.vscode/mcp.json`.
     "contextstream": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@contextstream/mcp-server"],
-      "env": { "CONTEXTSTREAM_API_KEY": "your_key" }
+      "args": ["--prefer-online", "-y", "@contextstream/mcp-server@latest"],
+      "env": {
+        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+        "CONTEXTSTREAM_API_KEY": "your_key"
+      }
     }
   }
 }
@@ -275,7 +264,10 @@ Or add to `~/.copilot/mcp-config.json` (pick one runtime):
     "contextstream": {
       "command": "contextstream-mcp",
       "args": [],
-      "env": { "CONTEXTSTREAM_API_KEY": "your_key" }
+      "env": {
+        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+        "CONTEXTSTREAM_API_KEY": "your_key"
+      }
     }
   }
 }
@@ -288,8 +280,11 @@ Or add to `~/.copilot/mcp-config.json` (pick one runtime):
   "mcpServers": {
     "contextstream": {
       "command": "npx",
-      "args": ["-y", "@contextstream/mcp-server"],
-      "env": { "CONTEXTSTREAM_API_KEY": "your_key" }
+      "args": ["--prefer-online", "-y", "@contextstream/mcp-server@latest"],
+      "env": {
+        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+        "CONTEXTSTREAM_API_KEY": "your_key"
+      }
     }
   }
 }
@@ -301,83 +296,25 @@ For more information, see the [GitHub Copilot CLI documentation](https://docs.gi
 
 ---
 
-## VS Code + Copilot Canonical Setup
+## VS Code + Copilot Tips
 
-Select Copilot in setup; setup handles both configs automatically.
+- Run setup once and keep both config files:
+  - `~/.copilot/mcp-config.json`
+  - `.vscode/mcp.json`
+- Rust install: use `contextstream-mcp` as the command.
+- Node install: use `npx --prefer-online -y @contextstream/mcp-server@latest` as the command.
+- Use `mcpServers` in Copilot CLI config and `servers` in VS Code config.
 
-For the most reliable Copilot behavior with ContextStream, configure all three artifacts:
+## Quick Troubleshooting
 
-1. **Global Copilot CLI MCP config**: `~/.copilot/mcp-config.json`
-2. **Project VS Code MCP config**: `.vscode/mcp.json`
-3. **Project rules and skill files**:
-   - `.github/copilot-instructions.md`
-   - `.github/skills/contextstream-workflow/SKILL.md`
+- Remove duplicate ContextStream entries across Workspace/User config scopes.
+- Check `CONTEXTSTREAM_API_URL` and `CONTEXTSTREAM_API_KEY` are set.
+- Remove stale version pins like `@contextstream/mcp-server@0.3.xx`.
+- Restart VS Code/Copilot after config changes.
 
-This gives you MCP connectivity plus explicit no-hooks workflow guidance for Copilot sessions.
+## Marketplace Note
 
-If you installed Rust MCP, use `contextstream-mcp` as the command in both MCP files. If you installed via npm/marketplace, use `npx --prefer-online -y @contextstream/mcp-server@latest`.
-
-## Troubleshooting (Why Copilot/VS Code "isn't working")
-
-- **Wrong config location**: verify both `~/.copilot/mcp-config.json` and `.vscode/mcp.json` for project-specific VS Code usage.
-- **Malformed JSON**: remove comments/trailing commas in MCP JSON files.
-- **Stale config shape**: ensure root keys are correct (`mcpServers` for Copilot CLI, `servers` for VS Code).
-- **Rules missing**: ensure `.github/copilot-instructions.md` and the companion `SKILL.md` exist.
-- **Context discipline not followed**: first turn must call `init(...)` then `context(...)`; subsequent turns should call `context(...)` first.
-- **Indexing not ready**: after setup, allow indexing to complete; retry `search(mode="auto", ...)` before falling back to local scans.
-
-## Migration Notes
-
-- If you previously configured only one path, migrate to the canonical setup above.
-- If migrating from Node to Rust MCP, update both command fields (`~/.copilot/mcp-config.json` and `.vscode/mcp.json`) from `npx ... @contextstream/mcp-server@latest` to `contextstream-mcp`.
-- If older rules exist, regenerate rules and replace stale instructions with the current Copilot files.
-- Preserve other MCP servers in your JSON files; only update the `contextstream` entry.
-
-## Marketplace + Rust MCP Feasibility
-
-- Current `server.json` marketplace metadata for this package points to npm install, which is why one-click install resolves to Node MCP.
-- Marketplace clients do not execute external bootstrap scripts during package install, so they cannot trigger Rust install commands directly.
-- Once Rust MCP is published in a marketplace-supported package form (for example an additional registry package entry), `server.json` can expose both Node and Rust install targets for true one-click runtime choice.
-
-## Hook Coverage Matrix (Claude, Cursor, Antigravity)
-
-| Editor | Hook support | ContextStream strategy |
-|--------|--------------|------------------------|
-| Claude Code | Full lifecycle hooks | Hard enforcement + reminders + lifecycle persistence hooks |
-| Cursor | Lifecycle hooks (tool/MCP/shell/file/session) | Hard enforcement + reminder hooks + post-action indexing hooks |
-| Windsurf | Cascade hooks (pre/post tool and response events) | Hard enforcement via pre hooks + post-write/session hooks |
-| Antigravity | No documented lifecycle hooks | Strict rules-first flow + no-hooks operational guardrails |
-
-## Troubleshooting (ContextStream was skipped)
-
-- **Claude Code**
-  - Confirm hooks exist in `~/.claude/settings.json` or project `.claude/settings.json`.
-  - Verify ContextStream hook commands are present for `PreToolUse`, `UserPromptSubmit`, `SessionStart`, and `PreCompact`.
-  - Check `CONTEXTSTREAM_HOOK_ENABLED` is not set to `false`.
-- **Cursor**
-  - Confirm `.cursor/hooks.json` includes `preToolUse` and `beforeSubmitPrompt`.
-  - Verify `beforeMCPExecution` / `beforeShellExecution` / `beforeReadFile` hook entries exist after setup.
-  - If hooks are stale, rerun setup to regenerate ContextStream entries without deleting user hooks.
-- **Antigravity**
-  - Verify `~/.gemini/antigravity/mcp_config.json` has a healthy `contextstream` server block.
-  - Since hooks are unavailable, enforce manual discipline: `init(...)` then `context(...)`, and `search(mode="auto", ...)` before local scans.
-  - Re-index when search appears stale and retry ContextStream search before fallback.
-- **Windsurf**
-  - Confirm `~/.codeium/windsurf/mcp_config.json` includes `contextstream`.
-  - Confirm hooks in `~/.codeium/windsurf/hooks.json` include `pre_mcp_tool_use` and `pre_user_prompt`.
-  - If behavior is stale, rerun setup to regenerate ContextStream hook entries while preserving user hooks.
-- **All editors**
-  - Validate JSON shape (`mcpServers` vs `servers`) and remove trailing commas/comments.
-  - Keep first-call protocol strict: first turn `init(...)` then `context(...)`.
-  - Preserve non-ContextStream entries when regenerating configs.
-
-## Rust/Node Parity Checklist
-
-- Claude hook matrix includes current lifecycle events in both Rust and Node setup flows.
-- Cursor hook matrix includes tool/MCP/shell/file/session enforcement hooks in both implementations.
-- Windsurf hook matrix includes pre/post Cascade hook coverage in both implementations.
-- Antigravity remains explicit no-hooks with strengthened rules guidance in both implementations.
-- Hook/rules installers stay idempotent and avoid deleting non-ContextStream user entries.
+Marketplace npm installs can pin Node MCP versions and do not run external bootstrap scripts (`curl ... | bash` / `irm ... | iex`). Use the Rust install command directly when you want the Rust runtime.
 
 ---
 

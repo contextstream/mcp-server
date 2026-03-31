@@ -5,8 +5,16 @@ import {
   getClaudeSettingsPath,
   getHooksDir,
   ClaudeHooksConfig,
+  CLAUDE_ENFORCEMENT_CRITICAL_HOOKS,
+  CURSOR_ENFORCEMENT_CRITICAL_HOOKS,
+  installCursorHookScripts,
+  readCursorHooksConfig,
+  installWindsurfHookScripts,
+  readWindsurfHooksConfig,
 } from "./hooks-config.js";
 import { homedir } from "node:os";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 describe("hooks-config", () => {
@@ -72,6 +80,65 @@ describe("hooks-config", () => {
       const sessionStart = config?.SessionStart?.[0]?.hooks?.[0];
       expect(sessionStart?.command).toContain("hook session-start");
       expect(sessionStart?.timeout).toBe(15);
+    });
+
+    it("should include expanded Claude lifecycle hooks", () => {
+      const config = buildHooksConfig();
+      expect(config?.InstructionsLoaded).toBeDefined();
+      expect(config?.ConfigChange).toBeDefined();
+      expect(config?.CwdChanged).toBeDefined();
+      expect(config?.FileChanged).toBeDefined();
+      expect(config?.WorktreeCreate).toBeDefined();
+      expect(config?.WorktreeRemove).toBeDefined();
+      expect(config?.Elicitation).toBeDefined();
+      expect(config?.ElicitationResult).toBeDefined();
+      expect(config?.StopFailure).toBeDefined();
+      expect(config?.PostCompact).toBeDefined();
+      expect(config?.TaskCreated).toBeDefined();
+    });
+
+    it("should include all enforcement-critical Claude hooks", () => {
+      const config = buildHooksConfig();
+      for (const hookName of CLAUDE_ENFORCEMENT_CRITICAL_HOOKS) {
+        expect((config as Record<string, unknown>)[hookName]).toBeDefined();
+      }
+    });
+  });
+
+  describe("cursor hook coverage", () => {
+    it("installs all enforcement-critical Cursor hook events", async () => {
+      const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "contextstream-cursor-hooks-"));
+      try {
+        await installCursorHookScripts({ scope: "project", projectPath: projectDir });
+        const config = await readCursorHooksConfig("project", projectDir);
+
+        for (const hookName of CURSOR_ENFORCEMENT_CRITICAL_HOOKS) {
+          expect((config.hooks as Record<string, unknown>)[hookName]).toBeDefined();
+        }
+      } finally {
+        await fs.rm(projectDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("windsurf hook coverage", () => {
+    it("installs Windsurf pre/post hook matrix", async () => {
+      const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "contextstream-windsurf-hooks-"));
+      try {
+        await installWindsurfHookScripts({ scope: "project", projectPath: projectDir });
+        const config = await readWindsurfHooksConfig("project", projectDir);
+
+        expect(config.hooks.pre_mcp_tool_use).toBeDefined();
+        expect(config.hooks.pre_user_prompt).toBeDefined();
+        expect(config.hooks.pre_read_code).toBeDefined();
+        expect(config.hooks.pre_write_code).toBeDefined();
+        expect(config.hooks.pre_run_command).toBeDefined();
+        expect(config.hooks.post_write_code).toBeDefined();
+        expect(config.hooks.post_mcp_tool_use).toBeDefined();
+        expect(config.hooks.post_cascade_response_with_transcript).toBeDefined();
+      } finally {
+        await fs.rm(projectDir, { recursive: true, force: true });
+      }
     });
   });
 

@@ -38,4 +38,26 @@ describe("rules-templates plan-mode guidance", () => {
       copilotFiles.find((file) => file.filename.endsWith("SKILL.md"))?.content
     ).toContain("name: contextstream-workflow");
   });
+
+  it("applies no-hooks guidance to Copilot rules", () => {
+    const result = generateRuleContent("copilot", { mode: "bootstrap" });
+    expect(result).not.toBeNull();
+    expect(result!.content).toContain("No Hooks Available");
+    expect(result!.content).toContain("session_id");
+  });
+
+  it("includes Antigravity-specific no-hooks reliability guidance", () => {
+    const result = generateRuleContent("antigravity", { mode: "bootstrap" });
+    expect(result).not.toBeNull();
+    expect(result!.content).toContain("Antigravity-Specific Reliability Notes");
+    expect(result!.content).toContain("no documented lifecycle hooks");
+  });
+
+  it("generates Windsurf rules with always_on frontmatter", () => {
+    const result = generateRuleContent("windsurf", { mode: "bootstrap" });
+    expect(result).not.toBeNull();
+    expect(result!.filename).toBe(".windsurf/rules/contextstream.md");
+    expect(result!.content).toContain("trigger: always_on");
+    expect(result!.content).toContain("# Windsurf Rules");
+  });
 });

@@ -35,9 +35,11 @@ type McpScope = InstallScope | "skip";
 
 type EditorKey =
   | "codex"
+  | "copilot"
   | "opencode"
   | "claude"
   | "cursor"
+  | "windsurf"
   | "cline"
   | "kilo"
   | "roo"
@@ -46,9 +48,11 @@ type EditorKey =
 
 const EDITOR_LABELS: Record<EditorKey, string> = {
   codex: "Codex CLI",
+  copilot: "GitHub Copilot (VS Code)",
   opencode: "OpenCode",
   claude: "Claude Code",
   cursor: "Cursor / VS Code",
+  windsurf: "Windsurf",
   cline: "Cline",
   kilo: "Kilo Code",
   roo: "Roo Code",
@@ -59,11 +63,11 @@ const EDITOR_LABELS: Record<EditorKey, string> = {
 function supportsProjectMcpConfig(editor: EditorKey): boolean {
   return (
     editor === "opencode" ||
+    editor === "copilot" ||
     editor === "cursor" ||
     editor === "claude" ||
     editor === "kilo" ||
-    editor === "roo" ||
-    editor === "antigravity"
+    editor === "roo"
   );
 }
 
@@ -140,6 +144,7 @@ const CONTEXTSTREAM_PREAMBLE_PATTERNS: RegExp[] = [
   /^#\s+codex cli instructions$/i,
   /^#\s+claude code instructions$/i,
   /^#\s+cursor rules$/i,
+  /^#\s+windsurf rules$/i,
   /^#\s+cline rules$/i,
   /^#\s+kilo code rules$/i,
   /^#\s+roo code rules$/i,
@@ -311,6 +316,11 @@ function globalRulesPathForEditor(editor: EditorKey): string | null {
   switch (editor) {
     case "codex":
       return path.join(home, ".codex", "AGENTS.md");
+    case "copilot":
+      // Copilot instructions are project-scoped (`.github/copilot-instructions.md`).
+      return null;
+    case "opencode":
+      return path.join(home, ".opencode", "AGENTS.md");
     case "claude":
       return path.join(home, ".claude", "CLAUDE.md");
     case "cline":
@@ -326,6 +336,8 @@ function globalRulesPathForEditor(editor: EditorKey): string | null {
     case "cursor":
       // Cursor global rules are configured via the app UI; project rules are supported via `.cursorrules`.
       return null;
+    case "windsurf":
+      return path.join(home, ".codeium", "windsurf", "memories", "global_rules.md");
     default:
       return null;
   }
@@ -402,6 +414,17 @@ async function isClineInstalled(): Promise<boolean> {
   return anyPathExists(candidates);
 }
 
+async function isCopilotInstalled(): Promise<boolean> {
+  const home = homedir();
+  const candidates = [
+    path.join(home, ".copilot"),
+    path.join(home, ".config", "github-copilot"),
+    path.join(home, ".vscode", "extensions", "github.copilot-chat"),
+    path.join(home, ".vscode", "extensions", "github.copilot"),
+  ];
+  return anyPathExists(candidates);
+}
+
 async function isKiloInstalled(): Promise<boolean> {
   const home = homedir();
   const candidates = [path.join(home, ".kilocode"), path.join(home, ".config", "kilocode")];
@@ -447,6 +470,32 @@ async function isCursorInstalled(): Promise<boolean> {
   return anyPathExists(candidates);
 }
 
+async function isWindsurfInstalled(): Promise<boolean> {
+  const home = homedir();
+  const candidates: string[] = [path.join(home, ".codeium", "windsurf")];
+
+  if (process.platform === "darwin") {
+    candidates.push("/Applications/Windsurf.app");
+    candidates.push(path.join(home, "Applications", "Windsurf.app"));
+    candidates.push(path.join(home, "Library", "Application Support", "Windsurf"));
+  } else if (process.platform === "win32") {
+    const localApp = process.env.LOCALAPPDATA;
+    const programFiles = process.env.ProgramFiles;
+    const programFilesX86 = process.env["ProgramFiles(x86)"];
+    if (localApp) candidates.push(path.join(localApp, "Programs", "Windsurf", "Windsurf.exe"));
+    if (localApp) candidates.push(path.join(localApp, "Windsurf", "Windsurf.exe"));
+    if (programFiles) candidates.push(path.join(programFiles, "Windsurf", "Windsurf.exe"));
+    if (programFilesX86) candidates.push(path.join(programFilesX86, "Windsurf", "Windsurf.exe"));
+  } else {
+    candidates.push("/usr/bin/windsurf");
+    candidates.push("/usr/local/bin/windsurf");
+    candidates.push("/opt/Windsurf");
+    candidates.push("/opt/windsurf");
+  }
+
+  return anyPathExists(candidates);
+}
+
 async function isAntigravityInstalled(): Promise<boolean> {
   const home = homedir();
   const candidates: string[] = [path.join(home, ".gemini")];
@@ -479,12 +528,16 @@ async function isEditorInstalled(editor: EditorKey): Promise<boolean> {
   switch (editor) {
     case "codex":
       return isCodexInstalled();
+    case "copilot":
+      return isCopilotInstalled();
     case "opencode":
       return isOpenCodeInstalled();
     case "claude":
       return isClaudeInstalled();
     case "cursor":
       return isCursorInstalled();
+    case "windsurf":
+      return isWindsurfInstalled();
     case "cline":
       return isClineInstalled();
     case "kilo":
@@ -752,10 +805,14 @@ async function upsertOpenCodeMcpConfig(
 }
 
 export const __setupTestUtils = {
+  buildContextStreamMcpServer,
+  buildContextStreamVsCodeServer,
   buildContextStreamOpenCodeEnvironment,
   buildContextStreamOpenCodeLocalServer,
   buildContextStreamOpenCodeRemoteServer,
   openCodeConfigPath,
+  upsertJsonMcpConfig,
+  upsertJsonVsCodeMcpConfig,
   upsertOpenCodeMcpConfig,
 };
 
@@ -1591,7 +1648,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     }
 
     // Editors without hooks need full rules; others get bootstrap (hooks deliver the rest)
-    const NO_HOOKS_EDITORS: EditorKey[] = ["codex", "opencode", "aider", "antigravity"];
+    const NO_HOOKS_EDITORS: EditorKey[] = ["codex", "copilot", "opencode", "aider", "antigravity"];
     const getModeForEditor = (editor: EditorKey): RuleMode =>
       NO_HOOKS_EDITORS.includes(editor) ? "full" : "bootstrap";
 
@@ -1636,9 +1693,11 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     const editors: EditorKey[] = [
       "codex",
+      "copilot",
       "opencode",
       "claude",
       "cursor",
+      "windsurf",
       "cline",
       "kilo",
       "roo",
@@ -1728,6 +1787,31 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             : mcpChoice === "2"
               ? "project"
               : "both";
+    const copilotSelected = configuredEditors.includes("copilot");
+    let enforceCopilotCanonicalPair = copilotSelected && mcpScope !== "skip";
+
+    if (enforceCopilotCanonicalPair) {
+      const confirmCopilotPair = normalizeInput(
+        await rl.question(
+          "Configure Copilot canonical MCP files (~/.copilot/mcp-config.json + .vscode/mcp.json)? [Y/n]: "
+        )
+      ).toLowerCase();
+      enforceCopilotCanonicalPair =
+        confirmCopilotPair !== "n" && confirmCopilotPair !== "no";
+    }
+
+    if (enforceCopilotCanonicalPair) {
+      console.log(
+        "\nCopilot automation enabled: setup will write both ~/.copilot/mcp-config.json and project .vscode/mcp.json (no separate Copilot command needed)."
+      );
+      console.log(
+        "If you installed the Rust runtime, replace the generated command with `contextstream-mcp` in both files."
+      );
+    } else if (copilotSelected && mcpScope !== "skip") {
+      console.log(
+        "\nCopilot canonical pair disabled for this run. You can rerun setup anytime to generate both files together."
+      );
+    }
 
     // Build MCP server configs with selected toolset
     // v0.4.x: consolidated (~11 tools) is default, router (~2 tools) uses PROGRESSIVE_MODE
@@ -1750,7 +1834,10 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     // Global MCP config
     const needsGlobalMcpConfig =
-      mcpScope === "global" || mcpScope === "both" || (mcpScope === "project" && hasCodex);
+      mcpScope === "global" ||
+      mcpScope === "both" ||
+      (mcpScope === "project" && hasCodex) ||
+      enforceCopilotCanonicalPair;
     if (needsGlobalMcpConfig) {
       console.log("\nInstalling global MCP config...");
       for (const editor of configuredEditors) {
@@ -1769,6 +1856,19 @@ export async function runSetupWizard(args: string[]): Promise<void> {
               apiKey,
               contextPackEnabled,
             });
+            writeActions.push({ kind: "mcp-config", target: filePath, status });
+            console.log(`- ${EDITOR_LABELS[editor]}: ${status} ${filePath}`);
+            continue;
+          }
+
+          if (editor === "copilot") {
+            const filePath = path.join(homedir(), ".copilot", "mcp-config.json");
+            if (dryRun) {
+              writeActions.push({ kind: "mcp-config", target: filePath, status: "dry-run" });
+              console.log(`- ${EDITOR_LABELS[editor]}: would update ${filePath}`);
+              continue;
+            }
+            const status = await upsertJsonMcpConfig(filePath, mcpServer);
             writeActions.push({ kind: "mcp-config", target: filePath, status });
             console.log(`- ${EDITOR_LABELS[editor]}: ${status} ${filePath}`);
             continue;
@@ -1836,6 +1936,18 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             console.log(`- ${EDITOR_LABELS[editor]}: ${status} ${filePath}`);
             continue;
           }
+          if (editor === "windsurf") {
+            const filePath = path.join(homedir(), ".codeium", "windsurf", "mcp_config.json");
+            if (dryRun) {
+              writeActions.push({ kind: "mcp-config", target: filePath, status: "dry-run" });
+              console.log(`- ${EDITOR_LABELS[editor]}: would update ${filePath}`);
+              continue;
+            }
+            const status = await upsertJsonMcpConfig(filePath, mcpServer);
+            writeActions.push({ kind: "mcp-config", target: filePath, status });
+            console.log(`- ${EDITOR_LABELS[editor]}: ${status} ${filePath}`);
+            continue;
+          }
           if (editor === "cline") {
             console.log(
               `- ${EDITOR_LABELS[editor]}: MCP config is managed via the extension UI (skipping global).`
@@ -1864,10 +1976,12 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     const HOOKS_SUPPORTED_EDITORS: Record<EditorKey, SupportedEditor | null> = {
       claude: "claude",
       cursor: "cursor",
+      windsurf: "windsurf",
       cline: "cline",
       roo: "roo",
       kilo: "kilo",
       codex: null, // No hooks API
+      copilot: null, // No hooks API
       opencode: null, // No hooks API
       aider: null, // No hooks API
       antigravity: null, // No hooks API
@@ -1899,12 +2013,36 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             writeActions.push({ kind: "hooks", target: script, status: "created" });
             console.log(`- ${EDITOR_LABELS[editor]}: installed ${path.basename(script)}`);
           }
+          if (editor === "cursor") {
+            console.log(
+              "  Cursor hooks enabled: preToolUse, beforeSubmitPrompt, before/after MCP+shell, beforeReadFile, afterFileEdit, session lifecycle"
+            );
+          }
+          if (editor === "windsurf") {
+            console.log(
+              "  Windsurf hooks enabled: pre_mcp_tool_use, pre_user_prompt, pre/post code+command hooks, post_cascade_response_with_transcript"
+            );
+          }
         } catch (err: any) {
           const message = err instanceof Error ? err.message : String(err);
           console.log(`- ${EDITOR_LABELS[editor]}: failed to install hooks: ${message}`);
         }
       }
       console.log("  Disable hooks anytime with CONTEXTSTREAM_HOOK_ENABLED=false");
+    }
+
+    const noHookEditors = configuredEditors.filter((e) => HOOKS_SUPPORTED_EDITORS[e] === null);
+    if (noHookEditors.length > 0) {
+      console.log("\nEditors without lifecycle hooks (rules-only enforcement):");
+      for (const editor of noHookEditors) {
+        if (editor === "antigravity") {
+          console.log(
+            `- ${EDITOR_LABELS[editor]}: no hooks API available; relying on strict ContextStream rules + index/search discipline.`
+          );
+        } else {
+          console.log(`- ${EDITOR_LABELS[editor]}: no hooks API available; using rules-only enforcement.`);
+        }
+      }
     }
 
     // Code Privacy message
@@ -1917,13 +2055,6 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     if (scope === "global" || scope === "both") {
       console.log("\nInstalling global rules...");
       for (const editor of configuredEditors) {
-        if (editor === "opencode") {
-          console.log(
-            `- ${EDITOR_LABELS[editor]}: rules are not auto-generated yet (MCP config only).`
-          );
-          continue;
-        }
-
         const filePath = globalRulesPathForEditor(editor);
         if (!filePath) {
           console.log(
@@ -1963,7 +2094,8 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     const needsProjects =
       scope === "project" ||
       scope === "both" ||
-      ((mcpScope === "project" || mcpScope === "both") && hasProjectMcpEditors);
+      ((mcpScope === "project" || mcpScope === "both") && hasProjectMcpEditors) ||
+      enforceCopilotCanonicalPair;
 
     if (needsProjects) {
       console.log("\nProject setup...");
@@ -2063,8 +2195,13 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       }
 
       // Project MCP configs per editor
-      if (mcpScope === "project" || mcpScope === "both") {
+      if (mcpScope === "project" || mcpScope === "both" || enforceCopilotCanonicalPair) {
         for (const editor of configuredEditors) {
+          const shouldWriteProjectMcp =
+            mcpScope === "project" ||
+            mcpScope === "both" ||
+            (enforceCopilotCanonicalPair && editor === "copilot");
+          if (!shouldWriteProjectMcp) continue;
           try {
             if (editor === "cursor") {
               const cursorPath = path.join(projectPath, ".cursor", "mcp.json");
@@ -2078,6 +2215,13 @@ export async function runSetupWizard(args: string[]): Promise<void> {
                 writeActions.push({ kind: "mcp-config", target: cursorPath, status: status1 });
                 writeActions.push({ kind: "mcp-config", target: vscodePath, status: status2 });
               }
+              continue;
+            }
+
+            if (editor === "windsurf") {
+              console.log(
+                `- ${EDITOR_LABELS[editor]}: uses global MCP config only (${path.join(homedir(), ".codeium", "windsurf", "mcp_config.json")}).`
+              );
               continue;
             }
 
@@ -2105,6 +2249,17 @@ export async function runSetupWizard(args: string[]): Promise<void> {
                 writeActions.push({ kind: "mcp-config", target: openCodePath, status });
               }
               printOpenCodeEnvNote();
+              continue;
+            }
+
+            if (editor === "copilot") {
+              const vsCodePath = path.join(projectPath, ".vscode", "mcp.json");
+              if (dryRun) {
+                writeActions.push({ kind: "mcp-config", target: vsCodePath, status: "dry-run" });
+              } else {
+                const status = await upsertJsonVsCodeMcpConfig(vsCodePath, vsCodeServer);
+                writeActions.push({ kind: "mcp-config", target: vsCodePath, status });
+              }
               continue;
             }
 
@@ -2142,7 +2297,6 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       for (const editor of selectedEditors) {
         if (scope !== "project" && scope !== "both") continue;
         if (!configuredEditors.includes(editor)) continue;
-        if (editor === "opencode") continue;
         const rule = generateRuleContent(editor, {
           workspaceName,
           workspaceId: workspaceId && workspaceId !== "dry-run" ? workspaceId : undefined,
@@ -2286,6 +2440,18 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     console.log(
       "- For UI-based MCP setup (Cline/Kilo/Roo global), see https://contextstream.io/docs/mcp"
     );
+    if (copilotSelected) {
+      const nodeCommand = IS_WINDOWS
+        ? 'cmd /c npx --prefer-online -y @contextstream/mcp-server@latest'
+        : "npx --prefer-online -y @contextstream/mcp-server@latest";
+      console.log("\nGitHub Copilot + VS Code checklist:");
+      console.log("- Confirm ~/.copilot/mcp-config.json has a contextstream server entry.");
+      console.log("- Confirm .vscode/mcp.json has a contextstream server entry.");
+      console.log(`- Node runtime command: ${nodeCommand}`);
+      console.log(
+        "- If Rust MCP is installed, replace the command in both files with `contextstream-mcp` and set args to []."
+      );
+    }
 
     console.log("");
     console.log(

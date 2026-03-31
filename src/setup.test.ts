@@ -100,3 +100,66 @@ describe("OpenCode MCP setup", () => {
     expect(secondStatus).toBe("skipped");
   });
 });
+
+describe("Copilot MCP config automation", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(tempDirs.map((dir) => fs.rm(dir, { recursive: true, force: true })));
+    tempDirs.length = 0;
+  });
+
+  it("writes canonical global and project config shapes", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "contextstream-copilot-"));
+    tempDirs.push(tempDir);
+
+    const globalPath = path.join(tempDir, "mcp-config.json");
+    const projectPath = path.join(tempDir, ".vscode", "mcp.json");
+    const mcpServer = __setupTestUtils.buildContextStreamMcpServer({
+      apiUrl: "https://api.contextstream.io",
+      apiKey: "test-key",
+      contextPackEnabled: true,
+    });
+    const vsCodeServer = __setupTestUtils.buildContextStreamVsCodeServer({
+      apiUrl: "https://api.contextstream.io",
+      apiKey: "test-key",
+      contextPackEnabled: true,
+    });
+
+    await __setupTestUtils.upsertJsonMcpConfig(globalPath, mcpServer);
+    await __setupTestUtils.upsertJsonVsCodeMcpConfig(projectPath, vsCodeServer);
+
+    const globalConfig = JSON.parse(await fs.readFile(globalPath, "utf8"));
+    expect(globalConfig.mcpServers.contextstream).toBeTruthy();
+
+    const projectConfig = JSON.parse(await fs.readFile(projectPath, "utf8"));
+    expect(projectConfig.servers.contextstream).toMatchObject({ type: "stdio" });
+    expect(projectConfig.mcpServers).toBeUndefined();
+  });
+
+  it("is idempotent for canonical copilot writes", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "contextstream-copilot-idempotent-"));
+    tempDirs.push(tempDir);
+
+    const globalPath = path.join(tempDir, "mcp-config.json");
+    const projectPath = path.join(tempDir, ".vscode", "mcp.json");
+    const mcpServer = __setupTestUtils.buildContextStreamMcpServer({
+      apiUrl: "https://api.contextstream.io",
+      apiKey: "test-key",
+      contextPackEnabled: true,
+    });
+    const vsCodeServer = __setupTestUtils.buildContextStreamVsCodeServer({
+      apiUrl: "https://api.contextstream.io",
+      apiKey: "test-key",
+      contextPackEnabled: true,
+    });
+
+    await __setupTestUtils.upsertJsonMcpConfig(globalPath, mcpServer);
+    await __setupTestUtils.upsertJsonVsCodeMcpConfig(projectPath, vsCodeServer);
+    const globalSecond = await __setupTestUtils.upsertJsonMcpConfig(globalPath, mcpServer);
+    const projectSecond = await __setupTestUtils.upsertJsonVsCodeMcpConfig(projectPath, vsCodeServer);
+
+    expect(globalSecond).toBe("skipped");
+    expect(projectSecond).toBe("skipped");
+  });
+});

@@ -79,14 +79,25 @@ export interface ClaudeHooksConfig {
     UserPromptSubmit?: ClaudeHookMatcher[];
     PreCompact?: ClaudeHookMatcher[];
     SessionStart?: ClaudeHookMatcher[];
+    InstructionsLoaded?: ClaudeHookMatcher[];
+    ConfigChange?: ClaudeHookMatcher[];
+    CwdChanged?: ClaudeHookMatcher[];
+    FileChanged?: ClaudeHookMatcher[];
+    WorktreeCreate?: ClaudeHookMatcher[];
+    WorktreeRemove?: ClaudeHookMatcher[];
+    Elicitation?: ClaudeHookMatcher[];
+    ElicitationResult?: ClaudeHookMatcher[];
     Stop?: ClaudeHookMatcher[];
+    StopFailure?: ClaudeHookMatcher[];
     SessionEnd?: ClaudeHookMatcher[];
     SubagentStart?: ClaudeHookMatcher[];
     SubagentStop?: ClaudeHookMatcher[];
+    TaskCreated?: ClaudeHookMatcher[];
     TaskCompleted?: ClaudeHookMatcher[];
     TeammateIdle?: ClaudeHookMatcher[];
     Notification?: ClaudeHookMatcher[];
     PermissionRequest?: ClaudeHookMatcher[];
+    PostCompact?: ClaudeHookMatcher[];
     [key: string]: ClaudeHookMatcher[] | undefined;
   };
 }
@@ -608,6 +619,29 @@ export function getHooksDir(): string {
 }
 
 /**
+ * Enforcement-critical hooks that should always be present.
+ * We keep this list explicit for Rust/Node parity checks.
+ */
+export const CLAUDE_ENFORCEMENT_CRITICAL_HOOKS = [
+  "PreToolUse",
+  "UserPromptSubmit",
+  "SessionStart",
+  "PreCompact",
+  "PostToolUse",
+] as const;
+
+export const CURSOR_ENFORCEMENT_CRITICAL_HOOKS = [
+  "preToolUse",
+  "beforeSubmitPrompt",
+  "beforeMCPExecution",
+  "beforeShellExecution",
+  "beforeReadFile",
+  "afterFileEdit",
+  "sessionStart",
+  "preCompact",
+] as const;
+
+/**
  * Build the hooks configuration for Claude Code settings.
  * All hooks now run via Node.js (npx) - no Python dependency required.
  */
@@ -696,6 +730,18 @@ export function buildHooksConfig(options?: {
         ],
       },
     ];
+    config.PostCompact = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("post-compact"),
+            timeout: 15,
+          },
+        ],
+      },
+    ];
   }
 
   // Add SessionStart hook for full context injection (default ON)
@@ -708,6 +754,102 @@ export function buildHooksConfig(options?: {
             type: "command",
             command: getHookCommand("session-start"),
             timeout: 15,
+          },
+        ],
+      },
+    ];
+    config.InstructionsLoaded = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("instructions-loaded"),
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+    config.ConfigChange = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("config-change"),
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+    config.CwdChanged = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("cwd-changed"),
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+    config.FileChanged = [
+      {
+        matcher: ".*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("file-changed"),
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+    config.WorktreeCreate = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("worktree-create"),
+            timeout: 15,
+          },
+        ],
+      },
+    ];
+    config.WorktreeRemove = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("worktree-remove"),
+            timeout: 15,
+          },
+        ],
+      },
+    ];
+    config.Elicitation = [
+      {
+        matcher: ".*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("elicitation"),
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+    config.ElicitationResult = [
+      {
+        matcher: ".*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("elicitation-result"),
+            timeout: 10,
           },
         ],
       },
@@ -735,6 +877,18 @@ export function buildHooksConfig(options?: {
           {
             type: "command",
             command: getHookCommand("session-end"),
+            timeout: 10,
+          },
+        ],
+      },
+    ];
+    config.StopFailure = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: getHookCommand("stop-failure"),
             timeout: 10,
           },
         ],
@@ -849,6 +1003,12 @@ export function buildHooksConfig(options?: {
     {
       matcher: "Plan",
       hooks: [{ type: "command", command: getHookCommand("subagent-stop"), timeout: 15 }],
+    },
+  ];
+  config.TaskCreated = [
+    {
+      matcher: "*",
+      hooks: [{ type: "command", command: getHookCommand("task-created"), timeout: 10 }],
     },
   ];
   config.TaskCompleted = [
@@ -999,11 +1159,21 @@ export async function installClaudeCodeHooks(options: {
     getHookCommand("user-prompt-submit"),
     getHookCommand("on-save-intent"),
     getHookCommand("session-start"),
+    getHookCommand("instructions-loaded"),
+    getHookCommand("config-change"),
+    getHookCommand("cwd-changed"),
+    getHookCommand("file-changed"),
+    getHookCommand("worktree-create"),
+    getHookCommand("worktree-remove"),
+    getHookCommand("elicitation"),
+    getHookCommand("elicitation-result"),
     getHookCommand("stop"),
+    getHookCommand("stop-failure"),
     getHookCommand("session-end"),
     getHookCommand("post-tool-use-failure"),
     getHookCommand("subagent-start"),
     getHookCommand("subagent-stop"),
+    getHookCommand("task-created"),
     getHookCommand("task-completed"),
     getHookCommand("teammate-idle"),
     getHookCommand("notification"),
@@ -1011,6 +1181,7 @@ export async function installClaudeCodeHooks(options: {
   );
   if (options.includePreCompact !== false) {
     result.scripts.push(getHookCommand("pre-compact"));
+    result.scripts.push(getHookCommand("post-compact"));
   }
   if (options.includeMediaAware === true) {
     result.scripts.push(getHookCommand("media-aware"));
@@ -1841,6 +2012,21 @@ export interface CursorHooksConfig {
 }
 
 /**
+ * Windsurf hooks.json configuration structure.
+ */
+export interface WindsurfHooksConfig {
+  hooks: {
+    [eventName: string]: Array<{
+      command: string;
+      timeout?: number;
+      matcher?: string;
+      show_output?: boolean;
+      type?: "command";
+    }>;
+  };
+}
+
+/**
  * Get the path to Cursor's hooks configuration file.
  */
 export function getCursorHooksConfigPath(scope: "global" | "project", projectPath?: string): string {
@@ -1864,6 +2050,19 @@ export function getCursorHooksDir(scope: "global" | "project", projectPath?: str
     throw new Error("projectPath required for project scope");
   }
   return path.join(projectPath, ".cursor", "hooks");
+}
+
+/**
+ * Get the path to Windsurf's hooks configuration file.
+ */
+export function getWindsurfHooksConfigPath(scope: "global" | "project", projectPath?: string): string {
+  if (scope === "global") {
+    return path.join(homedir(), ".codeium", "windsurf", "hooks.json");
+  }
+  if (!projectPath) {
+    throw new Error("projectPath required for project scope");
+  }
+  return path.join(projectPath, ".windsurf", "hooks.json");
 }
 
 /**
@@ -1920,28 +2119,33 @@ export async function installCursorHookScripts(options: {
     });
   };
 
-  const filteredPreToolUse = filterContextStreamHooks(existingConfig.hooks.preToolUse) as Array<{
-    command: string;
-    type?: "command";
-    timeout?: number;
-    matcher?: { tool_name?: string };
-  }>;
-  const filteredBeforeSubmit = filterContextStreamHooks(existingConfig.hooks.beforeSubmitPrompt) as Array<{
-    command: string;
-    type?: "command";
-    timeout?: number;
-  }>;
+  const cleanedHooks: Record<string, any[]> = {};
+  for (const [eventName, entries] of Object.entries(existingConfig.hooks || {})) {
+    cleanedHooks[eventName] = filterContextStreamHooks(entries as any[]);
+  }
 
   const preToolUseCommand = getHookCommand("pre-tool-use");
   const userPromptCommand = getHookCommand("user-prompt-submit");
   const saveIntentCommand = getHookCommand("on-save-intent");
+  const postToolUseCommand = getHookCommand("post-tool-use");
+  const postToolUseFailureCommand = getHookCommand("post-tool-use-failure");
+  const preCompactCommand = getHookCommand("pre-compact");
+  const sessionStartCommand = getHookCommand("session-start");
+  const sessionEndCommand = getHookCommand("session-end");
+  const stopCommand = getHookCommand("stop");
+  const notificationCommand = getHookCommand("notification");
+  const permissionRequestCommand = getHookCommand("permission-request");
+  const subagentStartCommand = getHookCommand("subagent-start");
+  const subagentStopCommand = getHookCommand("subagent-stop");
+  const taskCompletedCommand = getHookCommand("task-completed");
+  const teammateIdleCommand = getHookCommand("teammate-idle");
 
   const config: CursorHooksConfig = {
     version: 1,
     hooks: {
-      ...existingConfig.hooks,
+      ...cleanedHooks,
       preToolUse: [
-        ...filteredPreToolUse,
+        ...(cleanedHooks.preToolUse || []),
         {
           command: preToolUseCommand,
           type: "command" as const,
@@ -1949,7 +2153,7 @@ export async function installCursorHookScripts(options: {
         },
       ],
       beforeSubmitPrompt: [
-        ...filteredBeforeSubmit,
+        ...(cleanedHooks.beforeSubmitPrompt || []),
         {
           command: userPromptCommand,
           type: "command" as const,
@@ -1960,6 +2164,70 @@ export async function installCursorHookScripts(options: {
           type: "command" as const,
           timeout: 5,
         },
+      ],
+      beforeMCPExecution: [
+        ...(cleanedHooks.beforeMCPExecution || []),
+        { command: preToolUseCommand, type: "command" as const, timeout: 5 },
+      ],
+      afterMCPExecution: [
+        ...(cleanedHooks.afterMCPExecution || []),
+        { command: postToolUseCommand, type: "command" as const, timeout: 10 },
+      ],
+      beforeShellExecution: [
+        ...(cleanedHooks.beforeShellExecution || []),
+        { command: preToolUseCommand, type: "command" as const, timeout: 5 },
+      ],
+      afterShellExecution: [
+        ...(cleanedHooks.afterShellExecution || []),
+        { command: postToolUseFailureCommand, type: "command" as const, timeout: 10 },
+      ],
+      beforeReadFile: [
+        ...(cleanedHooks.beforeReadFile || []),
+        { command: preToolUseCommand, type: "command" as const, timeout: 5 },
+      ],
+      afterFileEdit: [
+        ...(cleanedHooks.afterFileEdit || []),
+        { command: postToolUseCommand, type: "command" as const, timeout: 10 },
+      ],
+      preCompact: [
+        ...(cleanedHooks.preCompact || []),
+        { command: preCompactCommand, type: "command" as const, timeout: 15 },
+      ],
+      sessionStart: [
+        ...(cleanedHooks.sessionStart || []),
+        { command: sessionStartCommand, type: "command" as const, timeout: 15 },
+      ],
+      sessionEnd: [
+        ...(cleanedHooks.sessionEnd || []),
+        { command: sessionEndCommand, type: "command" as const, timeout: 10 },
+      ],
+      stop: [
+        ...(cleanedHooks.stop || []),
+        { command: stopCommand, type: "command" as const, timeout: 15 },
+      ],
+      subagentStart: [
+        ...(cleanedHooks.subagentStart || []),
+        { command: subagentStartCommand, type: "command" as const, timeout: 10 },
+      ],
+      subagentStop: [
+        ...(cleanedHooks.subagentStop || []),
+        { command: subagentStopCommand, type: "command" as const, timeout: 10 },
+      ],
+      taskCompleted: [
+        ...(cleanedHooks.taskCompleted || []),
+        { command: taskCompletedCommand, type: "command" as const, timeout: 10 },
+      ],
+      teammateIdle: [
+        ...(cleanedHooks.teammateIdle || []),
+        { command: teammateIdleCommand, type: "command" as const, timeout: 10 },
+      ],
+      notification: [
+        ...(cleanedHooks.notification || []),
+        { command: notificationCommand, type: "command" as const, timeout: 10 },
+      ],
+      permissionRequest: [
+        ...(cleanedHooks.permissionRequest || []),
+        { command: permissionRequestCommand, type: "command" as const, timeout: 10 },
       ],
     },
   };
@@ -1974,11 +2242,116 @@ export async function installCursorHookScripts(options: {
   };
 }
 
+/**
+ * Read existing Windsurf hooks config.
+ */
+export async function readWindsurfHooksConfig(
+  scope: "global" | "project",
+  projectPath?: string
+): Promise<WindsurfHooksConfig> {
+  const configPath = getWindsurfHooksConfigPath(scope, projectPath);
+  try {
+    const content = await fs.readFile(configPath, "utf-8");
+    return JSON.parse(content);
+  } catch {
+    return { hooks: {} };
+  }
+}
+
+/**
+ * Write Windsurf hooks config.
+ */
+export async function writeWindsurfHooksConfig(
+  config: WindsurfHooksConfig,
+  scope: "global" | "project",
+  projectPath?: string
+): Promise<void> {
+  const configPath = getWindsurfHooksConfigPath(scope, projectPath);
+  const dir = path.dirname(configPath);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(configPath, JSON.stringify(config, null, 2));
+}
+
+/**
+ * Install Windsurf hooks and update hooks.json config.
+ */
+export async function installWindsurfHookScripts(options: {
+  scope: "global" | "project";
+  projectPath?: string;
+}): Promise<{ preMcpToolUse: string; preUserPrompt: string; config: string }> {
+  const existingConfig = await readWindsurfHooksConfig(options.scope, options.projectPath);
+
+  const filterContextStreamHooks = (hooks: unknown[] | undefined): unknown[] => {
+    if (!hooks) return [];
+    return hooks.filter((h) => {
+      const hook = h as { command?: string };
+      return !hook.command?.toLowerCase().includes("contextstream");
+    });
+  };
+
+  const cleanedHooks: Record<string, any[]> = {};
+  for (const [eventName, entries] of Object.entries(existingConfig.hooks || {})) {
+    cleanedHooks[eventName] = filterContextStreamHooks(entries as any[]);
+  }
+
+  const preToolUseCommand = getHookCommand("pre-tool-use");
+  const userPromptCommand = getHookCommand("user-prompt-submit");
+  const postToolUseCommand = getHookCommand("post-tool-use");
+  const sessionEndCommand = getHookCommand("session-end");
+
+  const config: WindsurfHooksConfig = {
+    hooks: {
+      ...cleanedHooks,
+      pre_mcp_tool_use: [
+        ...(cleanedHooks.pre_mcp_tool_use || []),
+        { command: preToolUseCommand, show_output: true },
+      ],
+      pre_user_prompt: [
+        ...(cleanedHooks.pre_user_prompt || []),
+        { command: userPromptCommand },
+      ],
+      pre_read_code: [
+        ...(cleanedHooks.pre_read_code || []),
+        { command: preToolUseCommand, show_output: true },
+      ],
+      pre_write_code: [
+        ...(cleanedHooks.pre_write_code || []),
+        { command: preToolUseCommand, show_output: true },
+      ],
+      pre_run_command: [
+        ...(cleanedHooks.pre_run_command || []),
+        { command: preToolUseCommand, show_output: true },
+      ],
+      post_write_code: [
+        ...(cleanedHooks.post_write_code || []),
+        { command: postToolUseCommand, show_output: false },
+      ],
+      post_mcp_tool_use: [
+        ...(cleanedHooks.post_mcp_tool_use || []),
+        { command: postToolUseCommand, show_output: false },
+      ],
+      post_cascade_response_with_transcript: [
+        ...(cleanedHooks.post_cascade_response_with_transcript || []),
+        { command: sessionEndCommand },
+      ],
+    },
+  };
+
+  await writeWindsurfHooksConfig(config, options.scope, options.projectPath);
+  const configPath = getWindsurfHooksConfigPath(options.scope, options.projectPath);
+
+  return {
+    preMcpToolUse: preToolUseCommand,
+    preUserPrompt: userPromptCommand,
+    config: configPath,
+  };
+}
+
 // =============================================================================
 // UNIFIED EDITOR HOOKS INSTALLATION
 // =============================================================================
 
-export type SupportedEditor = "claude" | "cline" | "roo" | "kilo" | "cursor";
+export type SupportedEditor = "claude" | "cline" | "roo" | "kilo" | "cursor" | "windsurf";
 
 export interface EditorHooksResult {
   editor: SupportedEditor;
@@ -2064,6 +2437,15 @@ export async function installEditorHooks(options: {
       };
     }
 
+    case "windsurf": {
+      const scripts = await installWindsurfHookScripts({ scope, projectPath });
+      return {
+        editor: "windsurf",
+        installed: [scripts.preMcpToolUse, scripts.preUserPrompt, scripts.config],
+        hooksDir: path.dirname(scripts.config),
+      };
+    }
+
     default:
       throw new Error(`Unsupported editor: ${editor}`);
   }
@@ -2079,7 +2461,7 @@ export async function installAllEditorHooks(options: {
   includePostWrite?: boolean;
   editors?: SupportedEditor[];
 }): Promise<EditorHooksResult[]> {
-  const editors = options.editors || ["claude", "cline", "roo", "kilo", "cursor"];
+  const editors = options.editors || ["claude", "cline", "roo", "kilo", "cursor", "windsurf"];
   const results: EditorHooksResult[] = [];
 
   for (const editor of editors) {
@@ -2114,8 +2496,9 @@ ContextStream can install hooks for multiple AI code editors to enforce ContextS
 
 | Editor | Hooks Location | Hook Types |
 |--------|---------------|------------|
-| **Claude Code** | \`~/.claude/hooks/\` | PreToolUse, UserPromptSubmit, PreCompact |
-| **Cursor** | \`~/.cursor/hooks/\` | preToolUse, beforeSubmit |
+| **Claude Code** | \`~/.claude/hooks/\` | PreToolUse, UserPromptSubmit, SessionStart, Pre/PostCompact, PostToolUse |
+| **Cursor** | \`~/.cursor/hooks/\` | preToolUse, beforeSubmitPrompt, before/after MCP+Shell, beforeReadFile, afterFileEdit |
+| **Windsurf** | \`~/.codeium/windsurf/hooks.json\` | pre_mcp_tool_use, pre_user_prompt, pre/post code + command hooks |
 | **Cline** | \`~/Documents/Cline/Rules/Hooks/\` | PreToolUse, UserPromptSubmit |
 | **Roo Code** | \`~/.roo/hooks/\` | PreToolUse, UserPromptSubmit |
 | **Kilo Code** | \`~/.kilocode/hooks/\` | PreToolUse, UserPromptSubmit |
@@ -2126,9 +2509,19 @@ ${generateHooksDocumentation()}
 
 ### Cursor Hooks
 
-Cursor uses a \`hooks.json\` configuration file:
-- **preToolUse**: Blocks discovery tools before execution
-- **beforeSubmitPrompt**: Injects ContextStream rules reminder
+Cursor uses a \`hooks.json\` configuration file with enforcement + lifecycle hooks:
+- **preToolUse / beforeMCPExecution / beforeShellExecution / beforeReadFile**: blocks or redirects non-ContextStream-first flows
+- **beforeSubmitPrompt**: injects ContextStream rules reminder + save-intent capture
+- **afterMCPExecution / afterShellExecution / afterFileEdit**: post-action bookkeeping/index updates
+- **sessionStart / preCompact / stop / sessionEnd**: lifecycle persistence and reliability
+
+### Windsurf Hooks
+
+Windsurf uses a \`hooks.json\` configuration file:
+- **pre_mcp_tool_use / pre_read_code / pre_write_code / pre_run_command**: pre-action gating and enforcement
+- **pre_user_prompt**: injects ContextStream-first guidance each prompt
+- **post_write_code / post_mcp_tool_use**: post-action indexing bookkeeping
+- **post_cascade_response_with_transcript**: end-of-response/session capture
 
 #### Output Format
 \`\`\`json
@@ -2158,7 +2551,7 @@ Hooks are executable scripts named after the hook type (no extension).
 
 ### Installation
 
-Use \`generate_rules(install_hooks=true, editors=["claude", "cursor", "cline", "roo", "kilo"])\` to install hooks for specific editors, or omit \`editors\` to install for all.
+Use \`generate_rules(install_hooks=true, editors=["claude", "cursor", "windsurf", "cline", "roo", "kilo"])\` to install hooks for specific editors, or omit \`editors\` to install for all.
 
 ### Disabling Hooks
 

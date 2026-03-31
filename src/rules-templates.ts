@@ -979,8 +979,21 @@ After updating, user should restart their AI tool.
 ---
 `;
 
+const ANTIGRAVITY_SUPPLEMENT = `
+---
+## Antigravity-Specific Reliability Notes
+
+- Antigravity currently has no documented lifecycle hooks for ContextStream enforcement.
+- Treat ContextStream-first behavior as mandatory policy: run \`context(...)\` first, then \`search(mode="auto", ...)\` before local discovery.
+- Keep \`mcp_config.json\` valid and minimal: preserve non-ContextStream servers and only update the \`contextstream\` server block.
+- If ContextStream appears skipped, verify:
+  1. MCP server status is healthy in Antigravity settings
+  2. Project is indexed and \`search(mode="auto", ...)\` is retried before local fallbacks
+  3. Instructions file contains the current ContextStream managed block
+`;
+
 // Editors that don't have hooks support and need enhanced rules
-const NO_HOOKS_EDITORS = ["codex", "aider", "antigravity"];
+const NO_HOOKS_EDITORS = ["copilot", "codex", "opencode", "aider", "antigravity"];
 
 function buildCopilotSkillContent(): string {
   return `---
@@ -1132,6 +1145,7 @@ memory(
 | Persistent plan | \`session(action="capture_plan")\` |
 | Task status | \`memory(action="update_task")\` |
 | Decision capture | \`session(action="capture", event_type="decision")\` |
+| Update skill by name | \`skill(action="update", name="...", instruction_body="...", change_summary="...")\` |
 | Past context | \`session(action="recall", query="...")\` |
 | Lessons | \`session(action="get_lessons", query="...")\` |
 
@@ -1153,10 +1167,30 @@ ${rules}
 `,
   },
 
+  opencode: {
+    filename: "AGENTS.md",
+    description: "OpenCode CLI agent instructions",
+    build: (rules) => `# OpenCode CLI Instructions
+${rules}
+`,
+  },
+
   cursor: {
     filename: ".cursorrules",
     description: "Cursor AI rules",
     build: (rules) => `# Cursor Rules
+${rules}
+`,
+  },
+
+  windsurf: {
+    filename: ".windsurf/rules/contextstream.md",
+    description: "Windsurf AI rules",
+    build: (rules) => `---
+trigger: always_on
+---
+
+# Windsurf Rules
 ${rules}
 `,
   },
@@ -1297,6 +1331,10 @@ ${options.workspaceId ? `# Workspace ID: ${options.workspaceId}` : ""}
   // These editors need explicit guidance since there's no enforcement mechanism
   if (NO_HOOKS_EDITORS.includes(editor.toLowerCase())) {
     content += NO_HOOKS_SUPPLEMENT;
+  }
+
+  if (editor.toLowerCase() === "antigravity") {
+    content += ANTIGRAVITY_SUPPLEMENT;
   }
 
   // Append additional rules if provided

@@ -2261,6 +2261,96 @@ function formatRunResult(result: Record<string, any>): string {
   return JSON.stringify(result, null, 2);
 }
 
+type RankedSkillCandidate = {
+  id: string;
+  name: string;
+  title: string;
+  scope: string;
+  status: string;
+  score: number;
+};
+
+function computeSkillMatchScore(query: string, name: string, title: string): number | null {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) return null;
+  const normalizedName = String(name || "").trim().toLowerCase();
+  const normalizedTitle = String(title || "").trim().toLowerCase();
+
+  if (normalizedName === normalizedQuery) return 0;
+  if (normalizedTitle === normalizedQuery) return 1;
+  if (normalizedName.includes(normalizedQuery)) return 2;
+  if (normalizedTitle.includes(normalizedQuery)) return 3;
+  return null;
+}
+
+function rankSkillCandidates(query: string, items: any[]): RankedSkillCandidate[] {
+  return items
+    .map((item) => {
+      const id = String(item?.id || "");
+      const name = String(item?.name || "?");
+      const title = String(item?.title || name);
+      const score = computeSkillMatchScore(query, name, title);
+      if (!id || score == null) return null;
+      return {
+        id,
+        name,
+        title,
+        scope: String(item?.scope || "?"),
+        status: String(item?.status || "?"),
+        score,
+      } as RankedSkillCandidate;
+    })
+    .filter((item): item is RankedSkillCandidate => item !== null)
+    .sort((a, b) => {
+      if (a.score !== b.score) return a.score - b.score;
+      if (a.name !== b.name) return a.name.localeCompare(b.name);
+      if (a.title !== b.title) return a.title.localeCompare(b.title);
+      return a.id.localeCompare(b.id);
+    });
+}
+
+async function resolveSkillIdForAction(
+  client: any,
+  input: Record<string, any>,
+  action: string
+): Promise<string> {
+  if (input.skill_id) return input.skill_id;
+
+  const name = typeof input.name === "string" ? input.name.trim() : "";
+  if (!name) {
+    throw new Error(`Either skill_id or name is required for '${action}'`);
+  }
+
+  const result = (await client.listSkills({
+    workspace_id: input.workspace_id,
+    project_id: input.project_id,
+    query: name,
+    limit: 25,
+  })) as { items?: any[] };
+  const ranked = rankSkillCandidates(name, result.items || []);
+
+  if (ranked.length === 0) {
+    throw new Error(`Skill '${name}' not found. Provide a different name or skill_id.`);
+  }
+
+  const bestScore = ranked[0].score;
+  const bestCandidates = ranked.filter((candidate) => candidate.score === bestScore);
+  if (bestCandidates.length > 1) {
+    const candidates = bestCandidates
+      .slice(0, 5)
+      .map(
+        (candidate) =>
+          `- ${candidate.title} (${candidate.name}) [${candidate.scope}|${candidate.status}] id=${candidate.id}`
+      )
+      .join("\n");
+    throw new Error(
+      `Skill name '${name}' is ambiguous. Provide skill_id or use a more specific name. Candidates:\n${candidates}`
+    );
+  }
+
+  return ranked[0].id;
+}
+
 /**
  * Format timing summary for tool responses when SHOW_TIMING is enabled.
  * Returns empty string if timing display is disabled.
@@ -5501,20 +5591,8 @@ Actions:
           return { content: [{ type: "text" as const, text }] };
         }
         case "get": {
-          let skillData: any;
-          if (input.skill_id) {
-            skillData = await client.getSkill(input.skill_id);
-          } else if (input.name) {
-            const result = await client.listSkills({
-              workspace_id: input.workspace_id,
-              query: input.name,
-              limit: 1,
-            }) as { items?: any[] };
-            skillData = result.items?.find((s: any) => s.name === input.name) || result.items?.[0];
-            if (!skillData) throw new Error(`Skill '${input.name}' not found`);
-          } else {
-            throw new Error("Either skill_id or name is required for 'get'");
-          }
+          const resolvedId = await resolveSkillIdForAction(client, input, "get");
+          const skillData = (await client.getSkill(resolvedId)) as Record<string, any>;
           const detail = formatSkillDetail(skillData);
           return { content: [{ type: "text" as const, text: detail }] };
         }
@@ -5541,8 +5619,8 @@ Actions:
           return { content: [{ type: "text" as const, text: `Skill '${input.name}' created (id=${result.id || "?"}).` }] };
         }
         case "update": {
-          if (!input.skill_id) throw new Error("'skill_id' is required for update");
-          const result = await client.updateSkill(input.skill_id, {
+          const resolvedId = await resolveSkillIdForAction(client, input, "update");
+          const result = await client.updateSkill(resolvedId, {
             title: input.title,
             description: input.description,
             instruction_body: input.instruction_body,
@@ -5556,21 +5634,10 @@ Actions:
             priority: input.priority,
             change_summary: input.change_summary,
           }) as { version?: number };
-          return { content: [{ type: "text" as const, text: `Skill ${input.skill_id} updated (version=${result.version || 0}).` }] };
+          return { content: [{ type: "text" as const, text: `Skill ${resolvedId} updated (version=${result.version || 0}).` }] };
         }
         case "run": {
-          let resolvedId = input.skill_id;
-          if (!resolvedId && input.name) {
-            const result = await client.listSkills({
-              workspace_id: input.workspace_id,
-              query: input.name,
-              limit: 1,
-            }) as { items?: any[] };
-            const found = result.items?.find((s: any) => s.name === input.name) || result.items?.[0];
-            if (!found?.id) throw new Error(`Skill '${input.name}' not found`);
-            resolvedId = found.id;
-          }
-          if (!resolvedId) throw new Error("Either skill_id or name is required for 'run'");
+          const resolvedId = await resolveSkillIdForAction(client, input, "run");
           const result = await client.runSkill(resolvedId, {
             params: input.params,
             dry_run: input.dry_run,
@@ -5578,9 +5645,9 @@ Actions:
           return { content: [{ type: "text" as const, text: formatRunResult(result as any) }] };
         }
         case "delete": {
-          if (!input.skill_id) throw new Error("'skill_id' is required for delete");
-          await client.deleteSkill(input.skill_id);
-          return { content: [{ type: "text" as const, text: `Skill ${input.skill_id} deleted.` }] };
+          const resolvedId = await resolveSkillIdForAction(client, input, "delete");
+          await client.deleteSkill(resolvedId);
+          return { content: [{ type: "text" as const, text: `Skill ${resolvedId} deleted.` }] };
         }
         case "import": {
           let importContent = input.content;
@@ -5609,10 +5676,10 @@ Actions:
           return { content: [{ type: "text" as const, text: result.content || JSON.stringify(result, null, 2) }] };
         }
         case "share": {
-          if (!input.skill_id) throw new Error("'skill_id' is required for share");
           if (!input.scope) throw new Error("'scope' is required for share");
-          const result = await client.shareSkill(input.skill_id, input.scope) as { scope?: string };
-          return { content: [{ type: "text" as const, text: `Skill ${input.skill_id} shared with scope=${result.scope || input.scope}.` }] };
+          const resolvedId = await resolveSkillIdForAction(client, input, "share");
+          const result = await client.shareSkill(resolvedId, input.scope) as { scope?: string };
+          return { content: [{ type: "text" as const, text: `Skill ${resolvedId} shared with scope=${result.scope || input.scope}.` }] };
         }
         default:
           throw new Error(`Invalid skill action: '${action}'. Valid: list, get, create, update, run, delete, import, export, share`);
@@ -8396,6 +8463,9 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
         : skippedCount > 0
           ? `Generated ${createdCount} rule files. ${skippedCount} skipped (existing files). Re-run with overwrite_existing: true to replace ContextStream blocks.`
           : `Generated ${createdCount} rule files.`;
+      const copilotSetupNote = editors.includes("copilot")
+        ? "Select Copilot in setup; setup handles both ~/.copilot/mcp-config.json and project .vscode/mcp.json automatically."
+        : undefined;
 
       const globalPrompt = input.apply_global
         ? "Global rule update complete."
@@ -8412,6 +8482,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
         roo: "roo",
         kilo: "kilo",
         cursor: "cursor",
+        windsurf: "windsurf",
       };
       const hookSupportedEditors = editors.filter((e) => e in editorHookMap) as SupportedEditor[];
       const shouldInstallHooks = hookSupportedEditors.length > 0 && input.install_hooks !== false;
@@ -8451,6 +8522,10 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
                   { editor, file: "~/.cursor/hooks/contextstream-beforesubmit.py", status: "dry run - would create" },
                   { editor, file: "~/.cursor/hooks.json", status: "dry run - would update" }
                 );
+              } else if (editor === "windsurf") {
+                hooksResults.push(
+                  { editor, file: "~/.codeium/windsurf/hooks.json", status: "dry run - would update" }
+                );
               }
             }
           } else {
@@ -8480,6 +8555,7 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
         ...(globalTargets.length > 0 ? { global_targets: globalTargets } : {}),
         ...(hooksResults ? { hooks_results: hooksResults } : {}),
         message: baseMessage,
+        ...(copilotSetupNote ? { copilot_setup_note: copilotSetupNote } : {}),
         global_prompt: globalPrompt,
         ...(hooksPrompt ? { hooks_prompt: hooksPrompt } : {}),
       };
@@ -8603,6 +8679,12 @@ Supported editors: ${getAvailableEditors().join(", ")}`,
           : skippedCount > 0
             ? `Generated ${createdCount} rule files. ${skippedCount} skipped (existing files). Re-run with overwrite_existing: true to replace ContextStream blocks.`
             : `Generated ${createdCount} rule files.`,
+        ...(editors.includes("copilot")
+          ? {
+              copilot_setup_note:
+                "Select Copilot in setup; setup handles both ~/.copilot/mcp-config.json and project .vscode/mcp.json automatically.",
+            }
+          : {}),
       };
 
       return {
@@ -15982,6 +16064,7 @@ This will:
 - Start a 5-day Pro trial
 - Auto-configure your editor's MCP settings
 - Write rules files for better AI assistance
+- If you select Copilot, setup automatically writes both ~/.copilot/mcp-config.json and project .vscode/mcp.json
 
 Preview first:
   npx --prefer-online -y @contextstream/mcp-server@latest setup --dry-run

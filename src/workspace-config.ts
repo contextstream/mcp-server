@@ -23,9 +23,101 @@ export interface ParentMapping {
   workspace_name: string;
 }
 
+export interface FallbackWorkspaceRef {
+  workspace_id: string;
+  workspace_name: string;
+  updated_at?: string;
+}
+
+interface GlobalMappingsStore {
+  mappings: ParentMapping[];
+  fallback_workspace?: FallbackWorkspaceRef;
+}
+
 const CONFIG_DIR = ".contextstream";
 const CONFIG_FILE = "config.json";
+const MODERN_GLOBAL_DIR = ".contextstream";
+const MODERN_GLOBAL_MAPPINGS_FILE = "mappings.json";
 const GLOBAL_MAPPINGS_FILE = ".contextstream-mappings.json";
+
+function getHomeDir(): string {
+  return process.env.HOME || process.env.USERPROFILE || "";
+}
+
+function readMappingsFile(filePath: string): GlobalMappingsStore | null {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, "utf-8");
+    const parsed = JSON.parse(content) as unknown;
+
+    if (Array.isArray(parsed)) {
+      return { mappings: parsed as ParentMapping[] };
+    }
+
+    if (parsed && typeof parsed === "object") {
+      const obj = parsed as Record<string, unknown>;
+      const mappings = Array.isArray(obj.mappings) ? (obj.mappings as ParentMapping[]) : [];
+      const fallback =
+        obj.fallback_workspace && typeof obj.fallback_workspace === "object"
+          ? (obj.fallback_workspace as FallbackWorkspaceRef)
+          : undefined;
+      return { mappings, fallback_workspace: fallback };
+    }
+  } catch (e) {
+    console.error(`Failed to read global mappings from ${filePath}:`, e);
+  }
+  return null;
+}
+
+function writeMappingsFile(filePath: string, store: GlobalMappingsStore): boolean {
+  try {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(filePath, JSON.stringify(store, null, 2));
+    return true;
+  } catch (e) {
+    console.error(`Failed to write global mappings to ${filePath}:`, e);
+    return false;
+  }
+}
+
+function readGlobalStore(): GlobalMappingsStore {
+  const homeDir = getHomeDir();
+  if (!homeDir) return { mappings: [] };
+
+  const modernPath = path.join(homeDir, MODERN_GLOBAL_DIR, MODERN_GLOBAL_MAPPINGS_FILE);
+  const legacyPath = path.join(homeDir, GLOBAL_MAPPINGS_FILE);
+
+  const modern = readMappingsFile(modernPath);
+  if (modern) return modern;
+
+  const legacy = readMappingsFile(legacyPath);
+  if (!legacy) return { mappings: [] };
+
+  // One-time compatibility migration toward the shared modern path.
+  writeMappingsFile(modernPath, legacy);
+  return legacy;
+}
+
+function writeGlobalStore(store: GlobalMappingsStore): boolean {
+  const homeDir = getHomeDir();
+  if (!homeDir) return false;
+
+  const modernPath = path.join(homeDir, MODERN_GLOBAL_DIR, MODERN_GLOBAL_MAPPINGS_FILE);
+  const legacyPath = path.join(homeDir, GLOBAL_MAPPINGS_FILE);
+  const okModern = writeMappingsFile(modernPath, store);
+
+  // Best-effort legacy compatibility for older MCP clients.
+  let okLegacy = true;
+  try {
+    fs.writeFileSync(legacyPath, JSON.stringify(store.mappings, null, 2));
+  } catch {
+    okLegacy = false;
+  }
+  return okModern && okLegacy;
+}
 
 /**
  * Read workspace config from a repo's .contextstream/config.json
@@ -65,32 +157,15 @@ export function writeLocalConfig(repoPath: string, config: WorkspaceConfig): boo
  * Read global parent folder mappings from user's home directory
  */
 export function readGlobalMappings(): ParentMapping[] {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
-  const mappingsPath = path.join(homeDir, GLOBAL_MAPPINGS_FILE);
-  try {
-    if (fs.existsSync(mappingsPath)) {
-      const content = fs.readFileSync(mappingsPath, "utf-8");
-      return JSON.parse(content) as ParentMapping[];
-    }
-  } catch (e) {
-    console.error(`Failed to read global mappings:`, e);
-  }
-  return [];
+  return readGlobalStore().mappings;
 }
 
 /**
  * Write global parent folder mappings to user's home directory
  */
 export function writeGlobalMappings(mappings: ParentMapping[]): boolean {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
-  const mappingsPath = path.join(homeDir, GLOBAL_MAPPINGS_FILE);
-  try {
-    fs.writeFileSync(mappingsPath, JSON.stringify(mappings, null, 2));
-    return true;
-  } catch (e) {
-    console.error(`Failed to write global mappings:`, e);
-    return false;
-  }
+  const store = readGlobalStore();
+  return writeGlobalStore({ ...store, mappings });
 }
 
 /**
@@ -98,11 +173,28 @@ export function writeGlobalMappings(mappings: ParentMapping[]): boolean {
  */
 export function addGlobalMapping(mapping: ParentMapping): boolean {
   const normalizedPattern = path.normalize(mapping.pattern);
-  const mappings = readGlobalMappings();
+  const store = readGlobalStore();
+  const mappings = store.mappings;
   // Remove any existing mapping with same pattern
   const filtered = mappings.filter((m) => path.normalize(m.pattern) !== normalizedPattern);
   filtered.push({ ...mapping, pattern: normalizedPattern });
-  return writeGlobalMappings(filtered);
+  return writeGlobalStore({ ...store, mappings: filtered });
+}
+
+export function getGlobalFallbackWorkspace(): FallbackWorkspaceRef | null {
+  return readGlobalStore().fallback_workspace ?? null;
+}
+
+export function setGlobalFallbackWorkspace(fallback: FallbackWorkspaceRef): boolean {
+  const store = readGlobalStore();
+  return writeGlobalStore({
+    ...store,
+    fallback_workspace: {
+      workspace_id: fallback.workspace_id,
+      workspace_name: fallback.workspace_name,
+      updated_at: new Date().toISOString(),
+    },
+  });
 }
 
 /**

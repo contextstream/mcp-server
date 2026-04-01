@@ -17,6 +17,8 @@ import {
   readLocalConfig,
   writeLocalConfig,
   addGlobalMapping,
+  getGlobalFallbackWorkspace,
+  setGlobalFallbackWorkspace,
 } from "./workspace-config.js";
 import { globalCache, CacheKeys, CacheTTL } from "./cache.js";
 import { markProjectIndexed, clearProjectIndex, readIndexStatus } from "./hooks-config.js";
@@ -198,6 +200,9 @@ const INGEST_BENEFITS = [
   "Allow the AI assistant to find relevant code without manual file navigation",
   "Build a searchable knowledge base of your codebase structure",
 ];
+const GLOBAL_FALLBACK_WORKSPACE_NAME = ".contextstream-global";
+const GLOBAL_FALLBACK_WORKSPACE_DESCRIPTION =
+  "Auto-managed fallback workspace for ad-hoc directories outside explicit project mappings.";
 
 // Ingest recommendation status types
 type IngestStatus = "not_indexed" | "indexed" | "stale" | "recently_indexed" | "auto_started" | "auto_refreshing" | "disabled";
@@ -399,6 +404,54 @@ export class ContextStreamClient {
     if (String(error.code || "").toUpperCase() !== "BAD_REQUEST") return false;
     const message = String(error.message || "").toLowerCase();
     return message.includes("deserialize") || message.includes("deserial");
+  }
+
+  private async ensureGlobalFallbackWorkspace(): Promise<{
+    id: string;
+    name: string;
+    source: "global_fallback_cache" | "global_fallback_created";
+  } | null> {
+    const persisted = getGlobalFallbackWorkspace();
+    if (persisted?.workspace_id) {
+      try {
+        const wsResponse = await this.getWorkspace(persisted.workspace_id);
+        const workspace = unwrapApiResponse(wsResponse) as { id?: string; name?: string };
+        const workspaceId = typeof workspace.id === "string" ? workspace.id : persisted.workspace_id;
+        const workspaceName =
+          typeof workspace.name === "string" && workspace.name.trim()
+            ? workspace.name
+            : persisted.workspace_name || GLOBAL_FALLBACK_WORKSPACE_NAME;
+        setGlobalFallbackWorkspace({
+          workspace_id: workspaceId,
+          workspace_name: workspaceName,
+        });
+        return { id: workspaceId, name: workspaceName, source: "global_fallback_cache" };
+      } catch {
+        // Stale fallback workspace id; proceed to create/recover.
+      }
+    }
+
+    try {
+      const created = (await this.createWorkspace({
+        name: GLOBAL_FALLBACK_WORKSPACE_NAME,
+        description: GLOBAL_FALLBACK_WORKSPACE_DESCRIPTION,
+      })) as { id?: string; name?: string };
+      if (typeof created.id === "string") {
+        const workspaceName =
+          typeof created.name === "string" && created.name.trim()
+            ? created.name
+            : GLOBAL_FALLBACK_WORKSPACE_NAME;
+        setGlobalFallbackWorkspace({
+          workspace_id: created.id,
+          workspace_name: workspaceName,
+        });
+        return { id: created.id, name: workspaceName, source: "global_fallback_created" };
+      }
+    } catch {
+      // If fallback cannot be created, caller can continue with allow_no_workspace mode.
+    }
+
+    return null;
   }
 
   // Auth
@@ -631,6 +684,59 @@ export class ContextStreamClient {
     return request(this.config, `/projects/${projectId}/index`, { body: {} });
   }
 
+  private async searchWithCache(
+    endpoint: string,
+    searchType: string,
+    body: {
+      query: string;
+      workspace_id?: string;
+      project_id?: string;
+      limit?: number;
+      offset?: number;
+      content_max_chars?: number;
+      context_lines?: number;
+      exact_match_boost?: number;
+      output_format?: "full" | "paths" | "minimal" | "count";
+      hot_paths_hint?: {
+        entries: Array<{ path: string; score: number; source: "history" | "active" }>;
+        confidence: number;
+        generated_at: string;
+        profile_version: number;
+      };
+    }
+  ) {
+    const hintSig = (body.hot_paths_hint?.entries || [])
+      .slice(0, 4)
+      .map((entry) => `${entry.path}:${entry.score.toFixed(2)}`)
+      .join("|");
+    const cacheKey = `${CacheKeys.search(
+      body.query,
+      body.workspace_id
+    )}:${body.project_id || ""}:${searchType}:${body.limit || ""}:${body.offset || ""}:${hintSig}`;
+    const cached = globalCache.get(cacheKey);
+    if (cached) return cached;
+
+    const result = await request(this.config, endpoint, {
+      body: {
+        ...this.withDefaults(body),
+        search_type: searchType,
+        output_format: body.output_format,
+        filters: body.workspace_id
+          ? {}
+          : {
+            file_types: [],
+            languages: [],
+            file_paths: [],
+            exclude_paths: [],
+            content_types: [],
+            tags: [],
+          },
+      },
+    });
+    globalCache.set(cacheKey, result, CacheTTL.SEARCH);
+    return result;
+  }
+
   // Search - each method adds required search_type and filters fields
   // Optional params: context_lines (like grep -C), exact_match_boost (boost for exact matches)
   searchSemantic(body: {
@@ -643,24 +749,14 @@ export class ContextStreamClient {
     context_lines?: number;
     exact_match_boost?: number;
     output_format?: "full" | "paths" | "minimal" | "count";
+    hot_paths_hint?: {
+      entries: Array<{ path: string; score: number; source: "history" | "active" }>;
+      confidence: number;
+      generated_at: string;
+      profile_version: number;
+    };
   }) {
-    return request(this.config, "/search/semantic", {
-      body: {
-        ...this.withDefaults(body),
-        search_type: "semantic",
-        output_format: body.output_format,
-        filters: body.workspace_id
-          ? {}
-          : {
-            file_types: [],
-            languages: [],
-            file_paths: [],
-            exclude_paths: [],
-            content_types: [],
-            tags: [],
-          },
-      },
-    });
+    return this.searchWithCache("/search/semantic", "semantic", body);
   }
 
   searchHybrid(body: {
@@ -673,24 +769,14 @@ export class ContextStreamClient {
     context_lines?: number;
     exact_match_boost?: number;
     output_format?: "full" | "paths" | "minimal" | "count";
+    hot_paths_hint?: {
+      entries: Array<{ path: string; score: number; source: "history" | "active" }>;
+      confidence: number;
+      generated_at: string;
+      profile_version: number;
+    };
   }) {
-    return request(this.config, "/search/hybrid", {
-      body: {
-        ...this.withDefaults(body),
-        search_type: "hybrid",
-        output_format: body.output_format,
-        filters: body.workspace_id
-          ? {}
-          : {
-            file_types: [],
-            languages: [],
-            file_paths: [],
-            exclude_paths: [],
-            content_types: [],
-            tags: [],
-          },
-      },
-    });
+    return this.searchWithCache("/search/hybrid", "hybrid", body);
   }
 
   searchKeyword(body: {
@@ -703,24 +789,14 @@ export class ContextStreamClient {
     context_lines?: number;
     exact_match_boost?: number;
     output_format?: "full" | "paths" | "minimal" | "count";
+    hot_paths_hint?: {
+      entries: Array<{ path: string; score: number; source: "history" | "active" }>;
+      confidence: number;
+      generated_at: string;
+      profile_version: number;
+    };
   }) {
-    return request(this.config, "/search/keyword", {
-      body: {
-        ...this.withDefaults(body),
-        search_type: "keyword",
-        output_format: body.output_format,
-        filters: body.workspace_id
-          ? {}
-          : {
-            file_types: [],
-            languages: [],
-            file_paths: [],
-            exclude_paths: [],
-            content_types: [],
-            tags: [],
-          },
-      },
-    });
+    return this.searchWithCache("/search/keyword", "keyword", body);
   }
 
   searchPattern(body: {
@@ -733,24 +809,14 @@ export class ContextStreamClient {
     context_lines?: number;
     exact_match_boost?: number;
     output_format?: "full" | "paths" | "minimal" | "count";
+    hot_paths_hint?: {
+      entries: Array<{ path: string; score: number; source: "history" | "active" }>;
+      confidence: number;
+      generated_at: string;
+      profile_version: number;
+    };
   }) {
-    return request(this.config, "/search/pattern", {
-      body: {
-        ...this.withDefaults(body),
-        search_type: "pattern",
-        output_format: body.output_format,
-        filters: body.workspace_id
-          ? {}
-          : {
-            file_types: [],
-            languages: [],
-            file_paths: [],
-            exclude_paths: [],
-            content_types: [],
-            tags: [],
-          },
-      },
-    });
+    return this.searchWithCache("/search/pattern", "pattern", body);
   }
 
   /**
@@ -768,24 +834,14 @@ export class ContextStreamClient {
     context_lines?: number;
     exact_match_boost?: number;
     output_format?: "full" | "paths" | "minimal" | "count";
+    hot_paths_hint?: {
+      entries: Array<{ path: string; score: number; source: "history" | "active" }>;
+      confidence: number;
+      generated_at: string;
+      profile_version: number;
+    };
   }) {
-    return request(this.config, "/search/exhaustive", {
-      body: {
-        ...this.withDefaults(body),
-        search_type: "exhaustive",
-        output_format: body.output_format,
-        filters: body.workspace_id
-          ? {}
-          : {
-            file_types: [],
-            languages: [],
-            file_paths: [],
-            exclude_paths: [],
-            content_types: [],
-            tags: [],
-          },
-      },
-    });
+    return this.searchWithCache("/search/exhaustive", "exhaustive", body);
   }
 
   /**
@@ -802,24 +858,14 @@ export class ContextStreamClient {
     content_max_chars?: number;
     context_lines?: number;
     output_format?: "full" | "paths" | "minimal" | "count";
+    hot_paths_hint?: {
+      entries: Array<{ path: string; score: number; source: "history" | "active" }>;
+      confidence: number;
+      generated_at: string;
+      profile_version: number;
+    };
   }) {
-    return request(this.config, "/search/refactor", {
-      body: {
-        ...this.withDefaults(body),
-        search_type: "refactor",
-        output_format: body.output_format,
-        filters: body.workspace_id
-          ? {}
-          : {
-            file_types: [],
-            languages: [],
-            file_paths: [],
-            exclude_paths: [],
-            content_types: [],
-            tags: [],
-          },
-      },
-    });
+    return this.searchWithCache("/search/refactor", "refactor", body);
   }
 
   /**
@@ -835,24 +881,14 @@ export class ContextStreamClient {
     context_lines?: number;
     exact_match_boost?: number;
     output_format?: "full" | "paths" | "minimal" | "count";
+    hot_paths_hint?: {
+      entries: Array<{ path: string; score: number; source: "history" | "active" }>;
+      confidence: number;
+      generated_at: string;
+      profile_version: number;
+    };
   }) {
-    return request(this.config, "/search/crawl", {
-      body: {
-        ...this.withDefaults(body),
-        search_type: "crawl",
-        output_format: body.output_format,
-        filters: body.workspace_id
-          ? {}
-          : {
-              file_types: [],
-              languages: [],
-              file_paths: [],
-              exclude_paths: [],
-              content_types: [],
-              tags: [],
-            },
-      },
-    });
+    return this.searchWithCache("/search/crawl", "crawl", body);
   }
 
   // Flash / instruction cache
@@ -2241,8 +2277,12 @@ export class ContextStreamClient {
     },
     ideRoots: string[] = []
   ) {
-    let workspaceId = params.workspace_id || this.config.defaultWorkspaceId;
-    let projectId = params.project_id || this.config.defaultProjectId;
+    const explicitWorkspaceId = params.workspace_id;
+    const explicitProjectId = params.project_id;
+    const defaultWorkspaceId = this.config.defaultWorkspaceId;
+    const defaultProjectId = this.config.defaultProjectId;
+    let workspaceId = explicitWorkspaceId || defaultWorkspaceId;
+    let projectId = explicitProjectId || defaultProjectId;
     let workspaceName: string | undefined;
 
     // Build comprehensive initial context
@@ -2256,128 +2296,98 @@ export class ContextStreamClient {
 
     const rootPath = ideRoots.length > 0 ? ideRoots[0] : undefined;
 
-    // ========================================
-    // STEP 1: Workspace Discovery Chain
-    // ========================================
-    if (!workspaceId && rootPath) {
-      // Try local config and parent mappings first
+    // Folder-derived mappings outrank session defaults so we immediately
+    // switch away from catch-all fallback when entering a real mapped project.
+    if (rootPath && !explicitWorkspaceId) {
       const resolved = resolveWorkspace(rootPath);
-
-      if (resolved.config) {
+      if (resolved.config?.workspace_id) {
+        const previousWorkspaceId = workspaceId;
         workspaceId = resolved.config.workspace_id;
         workspaceName = resolved.config.workspace_name;
-        projectId = resolved.config.project_id || projectId;
+        if (!explicitProjectId && resolved.config.project_id) {
+          projectId = resolved.config.project_id;
+        }
         context.workspace_source = resolved.source;
         context.workspace_resolved_from =
           resolved.source === "local_config"
             ? `${rootPath}/.contextstream/config.json`
             : "parent_folder_mapping";
-      } else {
-        // No local config - try to find matching workspace by name or project
-        const folderName = rootPath ? path.basename(rootPath).toLowerCase() : "";
+        if (previousWorkspaceId && previousWorkspaceId !== workspaceId) {
+          context.workspace_scope_overridden = true;
+          context.workspace_scope_override_reason =
+            "folder mapping takes precedence over cached session defaults";
+        }
+      }
+    }
 
+    // ========================================
+    // STEP 1: Workspace Discovery Chain
+    // ========================================
+    if (!workspaceId && rootPath) {
+      // No folder mapping exists for this path. Prefer a single global catch-all
+      // workspace so context/memory still work in ad-hoc directories.
+      const fallback = await this.ensureGlobalFallbackWorkspace();
+      if (fallback) {
+        workspaceId = fallback.id;
+        workspaceName = fallback.name;
+        context.workspace_source = fallback.source;
+        context.workspace_only_mode = true;
+        context.project_skipped_reason =
+          "No project mapping found for this folder; using global fallback workspace context.";
+      } else {
+        // Preserve current behavior when fallback cannot be provisioned.
+        const folderName = rootPath ? path.basename(rootPath).toLowerCase() : "";
         try {
           const workspaces = (await this.listWorkspaces({ page_size: 50 })) as {
             items?: Array<{ id: string; name: string; description?: string }>;
           };
-
-          if (workspaces.items && workspaces.items.length > 0) {
-            // Try to find a workspace with a matching or similar name
-            let matchedWorkspace: { id: string; name: string; description?: string } | undefined;
-            let matchSource: string | undefined;
-
-            // 1. Exact name match (case-insensitive)
-            matchedWorkspace = workspaces.items.find((w) => w.name.toLowerCase() === folderName);
-            if (matchedWorkspace) {
-              matchSource = "workspace_name_exact";
-            }
-
-            // 2. Workspace name contains folder name or vice versa
-            if (!matchedWorkspace) {
-              matchedWorkspace = workspaces.items.find(
-                (w) =>
-                  w.name.toLowerCase().includes(folderName) ||
-                  folderName.includes(w.name.toLowerCase())
-              );
-              if (matchedWorkspace) {
-                matchSource = "workspace_name_partial";
-              }
-            }
-
-            // 3. Check if any workspace has a project with matching name
-            if (!matchedWorkspace) {
-              for (const ws of workspaces.items) {
-                try {
-                  const projects = (await this.listProjects({
-                    workspace_id: ws.id,
-                    page_size: 50,
-                  })) as {
-                    items?: Array<{ id: string; name: string }>;
-                  };
-                  const matchingProject = projects.items?.find(
-                    (p) =>
-                      p.name.toLowerCase() === folderName ||
-                      p.name.toLowerCase().includes(folderName) ||
-                      folderName.includes(p.name.toLowerCase())
-                  );
-                  if (matchingProject) {
-                    matchedWorkspace = ws;
-                    matchSource = "project_name_match";
-                    projectId = matchingProject.id;
-                    context.project_source = "matched_existing";
-                    break;
-                  }
-                } catch {
-                  /* continue checking other workspaces */
-                }
-              }
-            }
-
-            if (matchedWorkspace) {
-              // Found a matching workspace - use it
-              workspaceId = matchedWorkspace.id;
-              workspaceName = matchedWorkspace.name;
-              context.workspace_source = matchSource;
-              context.workspace_auto_matched = true;
-
-              // Save to local config for next time
-              writeLocalConfig(rootPath, {
-                workspace_id: matchedWorkspace.id,
-                workspace_name: matchedWorkspace.name,
-                associated_at: new Date().toISOString(),
-              });
-            } else {
-              // No match found - need user selection
-              context.status = "requires_workspace_selection";
-              context.workspace_candidates = workspaces.items.map((w) => ({
-                id: w.id,
-                name: w.name,
-                description: w.description,
-              }));
-              context.message = `New folder detected: "${rootPath ? path.basename(rootPath) : "this folder"}". Please select which workspace this belongs to, or create a new one.`;
-              context.ide_roots = ideRoots;
-              context.folder_name = rootPath ? path.basename(rootPath) : undefined;
-
-              // Return early - agent needs to ask user
-              return context;
-            }
-          } else {
-            // No workspaces exist yet. Ask the user for a name rather than
-            // auto-creating a workspace from the folder name.
-            const folderDisplayName = rootPath
-              ? path.basename(rootPath) || "this folder"
-              : "this folder";
-
-            context.status = "requires_workspace_name";
-            context.workspace_source = "none_found";
+          const items = Array.isArray(workspaces.items) ? workspaces.items : [];
+          if (items.length > 0) {
+            context.status = "requires_workspace_selection";
+            context.workspace_candidates = items.map((w) => ({
+              id: w.id,
+              name: w.name,
+              description: w.description,
+            }));
+            context.message = `New folder detected: "${folderName || "this folder"}". Please select which workspace this belongs to, or create a new one.`;
             context.ide_roots = ideRoots;
-            context.folder_name = folderDisplayName;
-            context.folder_path = rootPath;
-            context.suggested_project_name = folderDisplayName;
-            context.message = `No workspaces found for this account. Ask the user for a name for a new workspace, then create a project for "${folderDisplayName}".`;
-
-            // Return early - agent needs user input (workspace name)
+            context.folder_name = rootPath ? path.basename(rootPath) : undefined;
             return context;
+          }
+
+          context.status = "requires_workspace_name";
+          context.workspace_source = "none_found";
+          context.ide_roots = ideRoots;
+          context.folder_name = rootPath ? path.basename(rootPath) || "this folder" : "this folder";
+          context.folder_path = rootPath;
+          context.suggested_project_name = context.folder_name;
+          context.message = `No workspaces found for this account and fallback workspace creation failed. Ask the user for a workspace name to continue.`;
+          return context;
+        } catch (e) {
+          context.workspace_error = String(e);
+        }
+      }
+    }
+
+    // Fallback: if still no workspace and no IDE roots, use global catch-all workspace
+    if (!workspaceId && !rootPath) {
+      const fallback = await this.ensureGlobalFallbackWorkspace();
+      if (fallback) {
+        workspaceId = fallback.id;
+        workspaceName = fallback.name;
+        context.workspace_source = fallback.source;
+        context.workspace_only_mode = true;
+        context.project_skipped_reason =
+          "No folder context available; using global fallback workspace context.";
+      } else {
+        try {
+          const workspaces = (await this.listWorkspaces({ page_size: 1 })) as {
+            items?: Array<{ id: string; name: string }>;
+          };
+          if (workspaces.items && workspaces.items.length > 0) {
+            workspaceId = workspaces.items[0].id;
+            workspaceName = workspaces.items[0].name;
+            context.workspace_source = "fallback_first";
           }
         } catch (e) {
           context.workspace_error = String(e);
@@ -2385,24 +2395,20 @@ export class ContextStreamClient {
       }
     }
 
-    // Fallback: if still no workspace and no IDE roots, pick first available
-    if (!workspaceId && !rootPath) {
-      try {
-        const workspaces = (await this.listWorkspaces({ page_size: 1 })) as {
-          items?: Array<{ id: string; name: string }>;
-        };
-        if (workspaces.items && workspaces.items.length > 0) {
-          workspaceId = workspaces.items[0].id;
-          workspaceName = workspaces.items[0].name;
-          context.workspace_source = "fallback_first";
-        }
-      } catch (e) {
-        context.workspace_error = String(e);
+    // If we still couldn't resolve a workspace, do not silently continue.
+    // Ask the user to select/create a workspace unless explicitly allowed.
+    if (!workspaceId && !params.allow_no_workspace) {
+      const fallback = await this.ensureGlobalFallbackWorkspace();
+      if (fallback) {
+        workspaceId = fallback.id;
+        workspaceName = fallback.name;
+        context.workspace_source = fallback.source;
+        context.workspace_only_mode = true;
+        context.project_skipped_reason =
+          "No explicit workspace/project mapping found; using global fallback workspace context.";
       }
     }
 
-    // If we still couldn't resolve a workspace, do not silently continue.
-    // Ask the user to select/create a workspace unless explicitly allowed.
     if (!workspaceId && !params.allow_no_workspace) {
       const folderDisplayName = rootPath ? path.basename(rootPath) || "this folder" : "this folder";
 
@@ -2630,6 +2636,18 @@ export class ContextStreamClient {
     context.workspace_name = workspaceName;
     context.project_id = projectId;
     context.ide_roots = ideRoots;
+
+    if (!projectId && workspaceId) {
+      context.workspace_only_mode = true;
+      context.project_scope_hint = {
+        reason: "No project is associated with the current folder context.",
+        create_project_command:
+          rootPath && rootPath.trim()
+            ? `project(action="create", name="${path.basename(rootPath) || "default-project"}", workspace_id="${workspaceId}", folder_path="${rootPath}")`
+            : `project(action="create", name="default-project", workspace_id="${workspaceId}")`,
+        continue_workspace_only_command: "context(user_message=\"...\")",
+      };
+    }
 
     // Store session state for long-session re-index checks in context_smart
     this.sessionProjectId = projectId;

@@ -7,6 +7,8 @@ type PromptStateEntry = {
   require_init?: boolean;
   last_context_at?: string;
   last_state_change_at?: string;
+  index_wait_started_at?: string;
+  index_wait_until?: string;
   updated_at: string;
 };
 
@@ -92,6 +94,8 @@ function getOrCreateEntry(
     require_init: false,
     last_context_at: undefined,
     last_state_change_at: undefined,
+    index_wait_started_at: undefined,
+    index_wait_until: undefined,
     updated_at: nowIso(),
   };
   state.workspaces[cwd] = created;
@@ -135,6 +139,8 @@ export function clearContextRequired(cwd: string): void {
   if (!target) return;
   target.entry.require_context = false;
   target.entry.last_context_at = nowIso();
+  target.entry.index_wait_started_at = undefined;
+  target.entry.index_wait_until = undefined;
   target.entry.updated_at = nowIso();
   writeState(state);
 }
@@ -204,4 +210,45 @@ export function isContextFreshAndClean(cwd: string, maxAgeSeconds: number): bool
   }
 
   return true;
+}
+
+export function startIndexWaitWindow(cwd: string, waitSeconds: number): void {
+  if (!cwd.trim() || waitSeconds <= 0) return;
+  const state = readState();
+  const target = getOrCreateEntry(state, cwd);
+  if (!target) return;
+  const now = Date.now();
+  const existingUntil = target.entry.index_wait_until ? new Date(target.entry.index_wait_until).getTime() : NaN;
+  if (!Number.isNaN(existingUntil) && existingUntil > now) {
+    target.entry.updated_at = nowIso();
+    writeState(state);
+    return;
+  }
+  target.entry.index_wait_started_at = new Date(now).toISOString();
+  target.entry.index_wait_until = new Date(now + waitSeconds * 1000).toISOString();
+  target.entry.updated_at = nowIso();
+  writeState(state);
+}
+
+export function clearIndexWaitWindow(cwd: string): void {
+  if (!cwd.trim()) return;
+  const state = readState();
+  const target = getOrCreateEntry(state, cwd);
+  if (!target) return;
+  target.entry.index_wait_started_at = undefined;
+  target.entry.index_wait_until = undefined;
+  target.entry.updated_at = nowIso();
+  writeState(state);
+}
+
+export function indexWaitRemainingSeconds(cwd: string): number | null {
+  if (!cwd.trim()) return null;
+  const state = readState();
+  const target = getOrCreateEntry(state, cwd);
+  if (!target?.entry.index_wait_until) return null;
+  const until = new Date(target.entry.index_wait_until).getTime();
+  if (Number.isNaN(until)) return null;
+  const remainingMs = until - Date.now();
+  if (remainingMs <= 0) return null;
+  return Math.ceil(remainingMs / 1000);
 }

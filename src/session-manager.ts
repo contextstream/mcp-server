@@ -1,6 +1,7 @@
 import { randomUUID } from "crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ContextStreamClient } from "./client.js";
+import { globalHotPathStore } from "./hot-paths.js";
 
 /**
  * SessionManager tracks auto-context state per MCP connection.
@@ -709,6 +710,20 @@ export class SessionManager {
         (input.file_path as string) || (input.notebook_path as string) || (input.path as string);
       if (filePath && typeof filePath === "string") {
         this.activeFiles.add(filePath);
+        globalHotPathStore.recordPaths(
+          {
+            workspace_id:
+              typeof this.context?.workspace_id === "string"
+                ? (this.context.workspace_id as string)
+                : undefined,
+            project_id:
+              typeof this.context?.project_id === "string"
+                ? (this.context.project_id as string)
+                : undefined,
+          },
+          [filePath],
+          "activity_focus"
+        );
         // Keep only last 30 files
         if (this.activeFiles.size > 30) {
           const arr = Array.from(this.activeFiles);

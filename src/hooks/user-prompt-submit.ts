@@ -57,13 +57,12 @@ const FULL_REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
 2. FOR CODE SEARCH: Check index status, then search appropriately
    ⚠️ BEFORE searching: mcp__contextstream__project(action="index_status")
    ✅ IF indexed & fresh: Use mcp__contextstream__search(mode="auto", query="...") BEFORE Glob/Grep/Read/Explore/Task/EnterPlanMode
-   ✅ IF NOT indexed OR stale: Use local tools (Glob/Grep/Read) directly
-   ✅ IF search returns 0 results: Fallback to local tools (Glob/Grep/Read)
+   ✅ IF NOT indexed OR stale: wait for background refresh up to ~20s, retry mcp__contextstream__search(mode="auto", query="..."), then allow local tools only after the grace window
+   ✅ IF search still returns 0 results after retry/window: fallback to local tools (Glob/Grep/Read)
 
 3. WHEN LOCAL TOOLS (Glob/Grep/Read) ARE OK:
-   ✅ Project is NOT indexed (index_status.indexed=false)
-   ✅ Index is stale/outdated (>7 days old)
-   ✅ ContextStream search returns 0 results or errors
+   ✅ Stale/not-indexed grace window has elapsed (~20s default, configurable)
+   ✅ ContextStream search still returns 0 results or errors after retry
    ✅ User explicitly requests local tools
 
 4. FOR PLANS & TASKS: Use ContextStream, not file-based plans
@@ -664,23 +663,22 @@ Returns: \`indexed\` (true/false), \`last_indexed_at\`, \`file_count\`
 → Use \`search(mode="auto", query="...")\`
 
 **IF indexed=false OR last_indexed_at is stale (>7 days):**
-→ Use local tools (Glob/Grep/Read) directly
-→ OR run \`project(action="index")\` first, then search
+→ Wait up to ~20s for background refresh, retry \`search(mode="auto", query="...")\`
+→ After grace window: local tools are allowed if search still misses
 
-**IF search returns 0 results or errors:**
+**IF search still returns 0 results or errors after retry/window:**
 → Fallback to local tools (Glob/Grep/Read)
 
 ### ✅ When Local Tools (Glob/Grep/Read) Are OK:
-- Project is NOT indexed
-- Index is stale/outdated (>7 days)
-- ContextStream search returns 0 results
+- Stale/not-indexed grace window has elapsed (~20s default, configurable)
+- ContextStream search still returns 0 results after retry
 - ContextStream returns errors
 - User explicitly requests local tools
 
 ### On Session Start:
 1. Call \`init(folder_path="...")\` - triggers initial indexing
 2. Check \`project(action="index_status")\` before searching
-3. If not indexed: use local tools OR wait for indexing
+3. If not indexed: wait for background refresh (~20s), retry search, then use local tools only after the grace window
 
 ### After File Changes (Edit/Write/Create):
 Files are NOT auto-indexed. You MUST:

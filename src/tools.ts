@@ -54,6 +54,7 @@ import {
   indexHistoryEntryCount,
 } from "./project-index-utils.js";
 import { resolveTodoCompletionUpdate } from "./todo-utils.js";
+import { globalHotPathStore } from "./hot-paths.js";
 
 type StructuredContent = { [x: string]: unknown } | undefined;
 type ToolTextResult = {
@@ -3458,6 +3459,27 @@ export function registerTools(
     );
   }
 
+  function projectScopeRequiredResult(
+    action: string,
+    workspaceId?: string,
+    folderPath?: string
+  ): ToolTextResult {
+    const suggestedProjectName = folderPath ? path.basename(folderPath) || "default-project" : "default-project";
+    const createCommand = workspaceId
+      ? folderPath
+        ? `project(action="create", name="${suggestedProjectName}", workspace_id="${workspaceId}", folder_path="${folderPath}")`
+        : `project(action="create", name="${suggestedProjectName}", workspace_id="${workspaceId}")`
+      : folderPath
+        ? `init(folder_path="${folderPath}")`
+        : `init(folder_path="<your_project_path>")`;
+    const scopeHint = workspaceId
+      ? "Workspace-only fallback is active for this folder, but this action requires a project scope."
+      : "No workspace/project scope is currently resolved for this folder.";
+    return errorResult(
+      `${action} requires a project scope.\n${scopeHint}\nNext step: ${createCommand}`
+    );
+  }
+
   function isNotFoundError(error: unknown): boolean {
     return error instanceof HttpError && error.status === 404;
   }
@@ -5334,9 +5356,9 @@ Access: Free`,
     async (input) => {
       const projectId = resolveProjectId(input.project_id);
       if (!projectId) {
-        return errorResult(
-          "Error: project_id is required. Please call session_init first or provide project_id explicitly."
-        );
+        const folderPath = resolveFolderPath(undefined, sessionManager) || undefined;
+        const workspaceId = resolveWorkspaceId(undefined);
+        return projectScopeRequiredResult("index", workspaceId, folderPath);
       }
 
       const result = await client.indexProject(projectId);
@@ -5370,6 +5392,12 @@ Access: Free`,
     context_lines?: number;
     exact_match_boost?: number;
     output_format?: "full" | "paths" | "minimal" | "count";
+    hot_paths_hint?: {
+      entries: Array<{ path: string; score: number; source: "history" | "active" }>;
+      confidence: number;
+      generated_at: string;
+      profile_version: number;
+    };
   }) {
     const limit =
       typeof input.limit === "number" && input.limit > 0
@@ -5399,6 +5427,7 @@ Access: Free`,
       context_lines: contextLines,
       exact_match_boost: exactMatchBoost,
       output_format: input.output_format,
+      hot_paths_hint: input.hot_paths_hint,
     };
   }
 
@@ -11035,10 +11064,20 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         let selected: SelectedSearch | undefined;
         let explicitScopeHadNoResults = false;
 
+        const activePaths = sessionManager?.getActiveFiles?.() || [];
+        const hotPathsHint = globalHotPathStore.buildHint({
+          workspace_id: workspaceId,
+          project_id: explicitProjectId || resolvedFolderProjectId || localIndexProjectId || sessionProjectId,
+          query: input.query,
+          active_paths: activePaths,
+          limit: 8,
+        });
+
         const baseParams = normalizeSearchParams({
           ...input,
           workspace_id: workspaceId,
           project_id: undefined,
+          hot_paths_hint: hotPathsHint,
           output_format:
             input.output_format || suggestOutputFormat(input.query, requestedMode === "team" ? "hybrid" : requestedMode),
         });
@@ -11159,6 +11198,16 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
         const roundTripMs = Date.now() - startTime;
         const { results, total } = extractSearchEnvelope(selected.result);
+        const resultPaths = results
+          .map((item: any) => (typeof item?.file_path === "string" ? item.file_path : ""))
+          .filter(Boolean);
+        if (resultPaths.length > 0) {
+          globalHotPathStore.recordPaths(
+            { workspace_id: workspaceId, project_id: selected.project_id || sessionProjectId },
+            resultPaths.slice(0, 20),
+            "search_result"
+          );
+        }
         const lines: string[] = [];
 
         if (SHOW_TIMING) {
@@ -11172,6 +11221,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         }
         if (modeFallbackNote) {
           lines.push(modeFallbackNote);
+        }
+        if (hotPathsHint?.entries?.length) {
+          lines.push(
+            `Hot-path hint active (${hotPathsHint.entries.length} paths, confidence ${(hotPathsHint.confidence * 100).toFixed(0)}%).`
+          );
+          lines.push(
+            "Hot-path weighting is bounded and additive only; if hotspot paths do not match this query, baseline search ranking is used."
+          );
         }
 
         if (results.length > 0) {
@@ -11243,6 +11300,20 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             project_id: docsFallback.project_id,
             docs: docsFallback.docs,
             count: docsFallback.docs.length,
+          };
+        }
+        if (hotPathsHint?.entries?.length) {
+          (structuredData as any).hot_path_hint = {
+            active: true,
+            path_count: hotPathsHint.entries.length,
+            confidence: hotPathsHint.confidence,
+            guardrail: "bounded_additive_prior",
+            fallback_behavior: "if no affinity match, baseline ranking remains unchanged",
+          };
+        } else {
+          (structuredData as any).hot_path_hint = {
+            active: false,
+            fallback_behavior: "baseline ranking only",
           };
         }
         const resultWithMeta = {
@@ -13823,6 +13894,17 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         let projectId = explicitProjectId || resolveProjectId(undefined);
         const folderPath =
           input.folder_path || input.path || resolveFolderPath(undefined, sessionManager) || undefined;
+        if (folderPath) {
+          const mapping = resolveWorkspace(folderPath);
+          const mappedWorkspaceId = normalizeUuid(mapping.config?.workspace_id);
+          const mappedProjectId = normalizeUuid(mapping.config?.project_id);
+          if (!input.workspace_id && mappedWorkspaceId) {
+            workspaceId = mappedWorkspaceId;
+          }
+          if (!explicitProjectId && mappedProjectId) {
+            projectId = mappedProjectId;
+          }
+        }
 
         switch (input.action) {
           case "list": {
@@ -13839,7 +13921,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           case "get": {
             if (!projectId) {
-              return errorResult("get requires: project_id");
+              return projectScopeRequiredResult("get", workspaceId, folderPath);
             }
             const result = await client.getProject(projectId);
             return {
@@ -13865,7 +13947,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           case "update": {
             if (!projectId) {
-              return errorResult("update requires: project_id");
+              return projectScopeRequiredResult("update", workspaceId, folderPath);
             }
             const result = await client.updateProject(projectId, {
               name: input.name,
@@ -13879,7 +13961,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           case "delete": {
             if (!projectId) {
-              return errorResult("delete requires: project_id");
+              return projectScopeRequiredResult("delete", workspaceId, folderPath);
             }
             const result = await client.deleteProject(projectId);
             const normalized =
@@ -13902,7 +13984,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           case "index": {
             if (!projectId) {
-              return errorResult("index requires: project_id");
+              return projectScopeRequiredResult("index", workspaceId, folderPath);
             }
             try {
               const result = await client.indexProject(projectId);
@@ -13959,7 +14041,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           case "overview": {
             if (!projectId) {
-              return errorResult("overview requires: project_id");
+              return projectScopeRequiredResult("overview", workspaceId, folderPath);
             }
             const result = await client.projectOverview(projectId);
             return {
@@ -13970,7 +14052,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           case "statistics": {
             if (!projectId) {
-              return errorResult("statistics requires: project_id");
+              return projectScopeRequiredResult("statistics", workspaceId, folderPath);
             }
             const result = await client.projectStatistics(projectId);
             return {
@@ -13981,7 +14063,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           case "files": {
             if (!projectId) {
-              return errorResult("files requires: project_id");
+              return projectScopeRequiredResult("files", workspaceId, folderPath);
             }
             const result = await client.projectFiles(projectId);
             return {
@@ -14148,7 +14230,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           case "index_history": {
             if (!projectId) {
-              return errorResult("index_history requires: project_id");
+              return projectScopeRequiredResult("index_history", workspaceId, folderPath);
             }
             const result = await client.projectIndexHistory(projectId, {
               machine_id: input.machine_id,
@@ -14198,7 +14280,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               return errorResult("ingest_local requires: path");
             }
             if (!projectId) {
-              return errorResult("ingest_local requires: project_id");
+              return projectScopeRequiredResult("ingest_local", workspaceId, ingestPath);
             }
             const validPath = await validateReadableDirectory(ingestPath);
             if (!validPath.ok) {

@@ -15,6 +15,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import { globalHotPathStore } from "../hot-paths.js";
 
 const ENABLED = process.env.CONTEXTSTREAM_READ_HOOK_ENABLED !== "false";
 
@@ -216,11 +217,25 @@ export async function runOnReadHook(): Promise<void> {
     case "Read":
       target = input.tool_input?.file_path || "";
       resultSummary = `Read file: ${target}`;
+      if (target) {
+        globalHotPathStore.recordPaths(
+          { workspace_id: WORKSPACE_ID || undefined, project_id: undefined },
+          [target],
+          "activity_read"
+        );
+      }
       break;
     case "Glob":
       target = input.tool_input?.pattern || "";
       const globFiles = input.tool_result?.files || [];
       resultSummary = `Found ${globFiles.length} files matching ${target}`;
+      if (globFiles.length > 0) {
+        globalHotPathStore.recordPaths(
+          { workspace_id: WORKSPACE_ID || undefined, project_id: undefined },
+          globFiles.slice(0, 30),
+          "activity_focus"
+        );
+      }
       break;
     case "Grep":
       target = input.tool_input?.pattern || "";

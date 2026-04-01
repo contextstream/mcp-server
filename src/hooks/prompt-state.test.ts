@@ -3,15 +3,18 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
 import {
+  clearIndexWaitWindow,
   clearContextRequired,
   clearInitRequired,
   cleanupStale,
+  indexWaitRemainingSeconds,
   isContextFreshAndClean,
   isContextRequired,
   isInitRequired,
   markContextRequired,
   markInitRequired,
   markStateChanged,
+  startIndexWaitWindow,
 } from "./prompt-state.js";
 
 const STATE_PATH = path.join(homedir(), ".contextstream", "prompt-state.json");
@@ -93,5 +96,27 @@ describe("prompt-state", () => {
 
     const parsed = JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
     expect(Object.keys(parsed.workspaces)).toHaveLength(0);
+  });
+
+  it("tracks index wait window lifecycle", () => {
+    const cwd = "/tmp/cs-index-wait";
+    startIndexWaitWindow(cwd, 20);
+    const remaining = indexWaitRemainingSeconds(cwd);
+    expect(remaining).not.toBeNull();
+    expect((remaining ?? 0) > 0).toBe(true);
+    expect((remaining ?? 0) <= 20).toBe(true);
+
+    clearIndexWaitWindow(cwd);
+    expect(indexWaitRemainingSeconds(cwd)).toBeNull();
+  });
+
+  it("clears index wait window when context is satisfied", () => {
+    const cwd = "/tmp/cs-index-wait-clear-context";
+    markContextRequired(cwd);
+    startIndexWaitWindow(cwd, 20);
+    expect(indexWaitRemainingSeconds(cwd)).not.toBeNull();
+
+    clearContextRequired(cwd);
+    expect(indexWaitRemainingSeconds(cwd)).toBeNull();
   });
 });

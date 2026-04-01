@@ -124,6 +124,18 @@ Your AI uses these automatically. You just code.
 
 ---
 
+## Global Fallback Workspace (Unmapped Folders)
+
+ContextStream now supports a catch-all mode for random folders (for example `~` or ad-hoc dirs) that are not associated with a project/workspace yet.
+
+- `init(...)` resolves normal folder mappings first (`.contextstream/config.json`, parent/global mappings).
+- If no mapping exists, it uses a single hidden global fallback workspace (`.contextstream-global`) in workspace-only mode.
+- Context/memory/session tools continue to work without hard setup errors.
+- Project-bound actions (for example `project(action="ingest_local")`) return guided remediation to create/select a project instead of failing with a raw `project_id required` error.
+- As soon as you enter a mapped project folder, that real workspace/project is prioritized and replaces fallback scope.
+
+---
+
 ## Manual Configuration
 
 > Skip this if you ran the setup wizard.

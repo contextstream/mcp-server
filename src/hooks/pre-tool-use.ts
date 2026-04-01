@@ -17,12 +17,15 @@ import * as path from "node:path";
 import { homedir } from "node:os";
 import {
   cleanupStale,
+  clearIndexWaitWindow,
   clearContextRequired,
   clearInitRequired,
+  indexWaitRemainingSeconds,
   isContextFreshAndClean,
   isContextRequired,
   isInitRequired,
   markStateChanged,
+  startIndexWaitWindow,
 } from "./prompt-state.js";
 
 const ENABLED = process.env.CONTEXTSTREAM_HOOK_ENABLED !== "false";
@@ -30,6 +33,9 @@ const INDEX_STATUS_FILE = path.join(homedir(), ".contextstream", "indexed-projec
 const DEBUG_FILE = "/tmp/pretooluse-hook-debug.log";
 const STALE_THRESHOLD_DAYS = 7;
 const CONTEXT_FRESHNESS_SECONDS = 120;
+const DEFAULT_INDEX_WAIT_SECONDS = 20;
+const MIN_INDEX_WAIT_SECONDS = 15;
+const MAX_INDEX_WAIT_SECONDS = 20;
 
 const DISCOVERY_PATTERNS = ["**/*", "**/", "src/**", "lib/**", "app/**", "components/**"];
 
@@ -99,6 +105,43 @@ function isDiscoveryGrep(filePath: string | undefined): boolean {
   }
   if (filePath.includes("*") || filePath.includes("**")) {
     return true;
+  }
+  return false;
+}
+
+function configuredIndexWaitSeconds(): number {
+  const parsed = Number.parseInt(process.env.CONTEXTSTREAM_INDEX_WAIT_SECONDS ?? "", 10);
+  if (Number.isNaN(parsed)) return DEFAULT_INDEX_WAIT_SECONDS;
+  return Math.min(MAX_INDEX_WAIT_SECONDS, Math.max(MIN_INDEX_WAIT_SECONDS, parsed));
+}
+
+function isLocalDiscoveryToolDuringIndexWait(tool: string, toolInput: HookInput["tool_input"]): boolean {
+  if (tool === "Glob" || tool === "Explore" || tool === "SemanticSearch" || tool === "codebase_search") {
+    return true;
+  }
+  if (tool === "Task") {
+    const subagentTypeRaw =
+      (toolInput as { subagent_type?: string; subagentType?: string })?.subagent_type ||
+      (toolInput as { subagent_type?: string; subagentType?: string })?.subagentType ||
+      "";
+    return subagentTypeRaw.toLowerCase().includes("explore");
+  }
+  if (tool === "Grep" || tool === "Search" || tool === "grep_search" || tool === "code_search") {
+    const filePath = toolInput?.path || "";
+    return isDiscoveryGrep(filePath);
+  }
+  if (tool === "Read" || tool === "ReadFile" || tool === "read_file") {
+    const filePath =
+      (toolInput as { file_path?: string; path?: string; file?: string; target_file?: string })?.file_path ||
+      toolInput?.path ||
+      (toolInput as { file_path?: string; path?: string; file?: string; target_file?: string })?.file ||
+      (toolInput as { file_path?: string; path?: string; file?: string; target_file?: string })?.target_file ||
+      "";
+    return isDiscoveryGrep(filePath);
+  }
+  if (tool === "list_files" || tool === "search_files" || tool === "search_files_content" || tool === "find_files" || tool === "find_by_name") {
+    const pattern = toolInput?.path || (toolInput as { regex?: string; pattern?: string; query?: string })?.regex || (toolInput as { regex?: string; pattern?: string; query?: string })?.pattern || (toolInput as { regex?: string; pattern?: string; query?: string })?.query || "";
+    return !pattern || isDiscoveryGlob(pattern) || isDiscoveryGrep(pattern);
   }
   return false;
 }
@@ -453,12 +496,22 @@ export async function runPreToolUseHook(): Promise<void> {
     }
   }
 
-  // Check if project is indexed
-  const { isIndexed } = isProjectIndexed(cwd);
-  fs.appendFileSync(DEBUG_FILE, `[PreToolUse] isIndexed=${isIndexed}\n`);
-  if (!isIndexed) {
-    // Project not indexed - allow local tools
-    fs.appendFileSync(DEBUG_FILE, `[PreToolUse] Project not indexed, allowing\n`);
+  // Check index status and enforce stale-index grace window before local fallback.
+  const { isIndexed, isStale } = isProjectIndexed(cwd);
+  fs.appendFileSync(DEBUG_FILE, `[PreToolUse] isIndexed=${isIndexed}, isStale=${isStale}\n`);
+  if (isIndexed && !isStale) {
+    clearIndexWaitWindow(cwd);
+  } else {
+    const waitSeconds = configuredIndexWaitSeconds();
+    if (isLocalDiscoveryToolDuringIndexWait(tool, toolInput)) {
+      startIndexWaitWindow(cwd, waitSeconds);
+      const remaining = indexWaitRemainingSeconds(cwd);
+      if (remaining && remaining > 0) {
+        const msg = `Index refresh grace window is active (${remaining}s remaining). Keep ContextStream search-first flow: mcp__contextstream__search(mode="auto", query="..."). Do not use local discovery tools yet for stale/not-indexed projects. Retry after refresh; local fallback is allowed only after ~${waitSeconds}s if index is still unavailable.`;
+        blockWithMessage(editorFormat, msg);
+      }
+      allowTool(editorFormat, cwd, recordStateChange);
+    }
     allowTool(editorFormat, cwd, recordStateChange);
   }
 

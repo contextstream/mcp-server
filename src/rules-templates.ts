@@ -992,7 +992,7 @@ const ANTIGRAVITY_SUPPLEMENT = `
 `;
 
 // Editors that don't have hooks support and need enhanced rules
-const NO_HOOKS_EDITORS = ["copilot", "codex", "opencode", "aider", "antigravity"];
+const NO_HOOKS_EDITORS = ["copilot", "codex", "opencode", "aider", "antigravity", "kilo"];
 
 function buildCopilotSkillContent(): string {
   return `---
@@ -1203,7 +1203,7 @@ ${rules}
   },
 
   kilo: {
-    filename: ".kilocode/rules/contextstream.md",
+    filename: ".kilo/rules/contextstream.md",
     description: "Kilo Code AI rules",
     build: (rules) => `# Kilo Code Rules
 ${rules}

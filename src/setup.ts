@@ -326,7 +326,7 @@ function globalRulesPathForEditor(editor: EditorKey): string | null {
     case "cline":
       return path.join(home, "Documents", "Cline", "Rules", "contextstream.md");
     case "kilo":
-      return path.join(home, ".kilocode", "rules", "contextstream.md");
+      return path.join(kiloConfigDir(), "rules", "contextstream.md");
     case "roo":
       return path.join(home, ".roo", "rules", "contextstream.md");
     case "aider":
@@ -427,7 +427,11 @@ async function isCopilotInstalled(): Promise<boolean> {
 
 async function isKiloInstalled(): Promise<boolean> {
   const home = homedir();
-  const candidates = [path.join(home, ".kilocode"), path.join(home, ".config", "kilocode")];
+  const candidates = [
+    kiloConfigDir(),
+    path.join(home, ".kilocode"),
+    path.join(home, ".config", "kilocode"),
+  ];
   return anyPathExists(candidates);
 }
 
@@ -576,6 +580,13 @@ type OpenCodeRemoteServerJson = {
 
 type OpenCodeServerJson = OpenCodeLocalServerJson | OpenCodeRemoteServerJson;
 
+type KiloServerJson = {
+  type: "local";
+  command: string[];
+  environment: Record<string, string>;
+  enabled: true;
+};
+
 const IS_WINDOWS = process.platform === "win32";
 const DEFAULT_CONTEXTSTREAM_API_URL = "https://api.contextstream.io";
 const OPENCODE_CONFIG_SCHEMA_URL = "https://opencode.ai/config.json";
@@ -585,6 +596,8 @@ type SetupEnvParams = {
   apiUrl: string;
   apiKey: string;
   contextPackEnabled?: boolean;
+  workspaceId?: string;
+  projectId?: string;
 };
 
 function escapeTomlString(value: string): string {
@@ -600,11 +613,33 @@ function formatTomlEnvLines(env: Record<string, string>): string {
 function buildSetupEnv(params: SetupEnvParams): Record<string, string> {
   const contextPack = params.contextPackEnabled === false ? "false" : "true";
 
-  return {
+  const env: Record<string, string> = {
     CONTEXTSTREAM_API_URL: params.apiUrl,
-    CONTEXTSTREAM_API_KEY: params.apiKey,
+    CONTEXTSTREAM_ALLOW_HEADER_AUTH: "false",
+    CONTEXTSTREAM_WORKSPACE_ID: params.workspaceId ?? "",
+    CONTEXTSTREAM_PROJECT_ID: params.projectId ?? "",
+    CONTEXTSTREAM_USER_AGENT: `contextstream-mcp/${VERSION}`,
+    CONTEXTSTREAM_TOOLSET: "standard",
+    CONTEXTSTREAM_LOG_LEVEL: "quiet",
+    CONTEXTSTREAM_OUTPUT_FORMAT: "compact",
     CONTEXTSTREAM_CONTEXT_PACK: contextPack,
+    CONTEXTSTREAM_TRANSCRIPTS_ENABLED: "false",
+    CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED: "false",
+    CONTEXTSTREAM_SHOW_TIMING: "false",
+    CONTEXTSTREAM_PROGRESSIVE_MODE: "false",
+    CONTEXTSTREAM_ROUTER_MODE: "false",
+    CONTEXTSTREAM_CONSOLIDATED: "true",
+    CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS: "true",
+    CONTEXTSTREAM_SEARCH_LIMIT: "10",
+    CONTEXTSTREAM_SEARCH_MAX_CHARS: "800",
+    CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT: "true",
   };
+
+  if (params.apiKey) {
+    env.CONTEXTSTREAM_API_KEY = params.apiKey;
+  }
+
+  return env;
 }
 
 function buildContextStreamMcpServer(params: SetupEnvParams): McpServerJson {
@@ -682,6 +717,62 @@ function buildContextStreamOpenCodeRemoteServer(): OpenCodeRemoteServerJson {
     url: OPENCODE_REMOTE_MCP_URL,
     enabled: true,
   };
+}
+
+/** Kilo CLI config directory (~/.config/kilo/). */
+function kiloConfigDir(): string {
+  const home = homedir();
+  if (process.platform === "win32") {
+    const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+    return path.join(appData, "kilo");
+  }
+  return path.join(home, ".config", "kilo");
+}
+
+function buildContextStreamKiloServer(params: SetupEnvParams): KiloServerJson {
+  const env = buildSetupEnv(params);
+  // Kilo project config should not embed the API key — it comes from
+  // the global kilo.jsonc or the user's environment.
+  delete env.CONTEXTSTREAM_API_KEY;
+
+  return {
+    type: "local",
+    command: ["npx", "-y", "@contextstream/mcp-server@latest"],
+    environment: env,
+    enabled: true,
+  };
+}
+
+async function upsertKiloMcpConfig(
+  filePath: string,
+  server: KiloServerJson
+): Promise<"created" | "updated" | "skipped"> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const exists = await fileExists(filePath);
+
+  let root: any = {};
+  if (exists) {
+    const raw = await fs.readFile(filePath, "utf8").catch(() => "");
+    const parsed = tryParseJsonLike(raw);
+    if (!parsed.ok) throw new Error(`Invalid JSON in ${filePath}: ${parsed.error}`);
+    root = parsed.value;
+  }
+
+  if (!root || typeof root !== "object" || Array.isArray(root)) root = {};
+  if (!root.mcp || typeof root.mcp !== "object" || Array.isArray(root.mcp)) root.mcp = {};
+
+  // Auto-add instructions reference if not present
+  if (!root.instructions) {
+    root.instructions = [".kilo/rules/*.md"];
+  }
+
+  const before = JSON.stringify(root.mcp.contextstream ?? null);
+  root.mcp.contextstream = server;
+  const after = JSON.stringify(root.mcp.contextstream ?? null);
+
+  await fs.writeFile(filePath, JSON.stringify(root, null, 2) + "\n", "utf8");
+  if (!exists) return "created";
+  return before === after ? "skipped" : "updated";
 }
 
 function stripJsonComments(input: string): string {
@@ -810,10 +901,13 @@ export const __setupTestUtils = {
   buildContextStreamOpenCodeEnvironment,
   buildContextStreamOpenCodeLocalServer,
   buildContextStreamOpenCodeRemoteServer,
+  buildContextStreamKiloServer,
+  kiloConfigDir,
   openCodeConfigPath,
   upsertJsonMcpConfig,
   upsertJsonVsCodeMcpConfig,
   upsertOpenCodeMcpConfig,
+  upsertKiloMcpConfig,
 };
 
 function claudeDesktopConfigPath(): string | null {
@@ -1815,14 +1909,16 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     // Build MCP server configs with selected toolset
     // v0.4.x: consolidated (~11 tools) is default, router (~2 tools) uses PROGRESSIVE_MODE
-    const mcpServer = buildContextStreamMcpServer({ apiUrl, apiKey, contextPackEnabled });
-    const mcpServerClaude = buildContextStreamMcpServer({ apiUrl, apiKey, contextPackEnabled });
-    const mcpServerOpenCode = buildContextStreamOpenCodeLocalServer({
+    const setupEnvBase: SetupEnvParams = {
       apiUrl,
       apiKey,
       contextPackEnabled,
-    });
-    const vsCodeServer = buildContextStreamVsCodeServer({ apiUrl, apiKey, contextPackEnabled });
+      workspaceId: workspaceId && workspaceId !== "dry-run" ? workspaceId : undefined,
+    };
+    const mcpServer = buildContextStreamMcpServer(setupEnvBase);
+    const mcpServerClaude = buildContextStreamMcpServer(setupEnvBase);
+    const mcpServerOpenCode = buildContextStreamOpenCodeLocalServer(setupEnvBase);
+    const vsCodeServer = buildContextStreamVsCodeServer(setupEnvBase);
     let hasPrintedOpenCodeEnvNote = false;
     const printOpenCodeEnvNote = () => {
       if (hasPrintedOpenCodeEnvNote) return;
@@ -1954,7 +2050,20 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             );
             continue;
           }
-          if (editor === "kilo" || editor === "roo") {
+          if (editor === "kilo") {
+            const filePath = path.join(kiloConfigDir(), "kilo.jsonc");
+            if (dryRun) {
+              writeActions.push({ kind: "mcp-config", target: filePath, status: "dry-run" });
+              console.log(`- ${EDITOR_LABELS[editor]}: would update ${filePath}`);
+              continue;
+            }
+            const kiloServer = buildContextStreamKiloServer(setupEnvBase);
+            const status = await upsertKiloMcpConfig(filePath, kiloServer);
+            writeActions.push({ kind: "mcp-config", target: filePath, status });
+            console.log(`- ${EDITOR_LABELS[editor]}: ${status} ${filePath}`);
+            continue;
+          }
+          if (editor === "roo") {
             console.log(
               `- ${EDITOR_LABELS[editor]}: project MCP config supported via file; global is managed via the app UI.`
             );
@@ -1979,7 +2088,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       windsurf: "windsurf",
       cline: "cline",
       roo: "roo",
-      kilo: "kilo",
+      kilo: null, // Kilo CLI: no hooks API, enforcement via rules + skills
       codex: null, // No hooks API
       copilot: null, // No hooks API
       opencode: null, // No hooks API
@@ -2195,6 +2304,20 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       }
 
       // Project MCP configs per editor
+      // Resolve project-level env params (no API key in project configs — it comes from global/env)
+      const isCurrentProject = path.resolve(projectPath) === path.resolve(process.cwd());
+      const projectIdForPath = isCurrentProject ? selectedCurrentProject?.id : undefined;
+      const projectSetupEnv: SetupEnvParams = {
+        apiUrl,
+        apiKey: "", // Omit API key from project configs — comes from global config or environment
+        contextPackEnabled,
+        workspaceId: workspaceId && workspaceId !== "dry-run" ? workspaceId : undefined,
+        projectId: projectIdForPath,
+      };
+      const projectMcpServer = buildContextStreamMcpServer(projectSetupEnv);
+      const projectVsCodeServer = buildContextStreamVsCodeServer(projectSetupEnv);
+      const projectMcpServerClaude = buildContextStreamMcpServer(projectSetupEnv);
+
       if (mcpScope === "project" || mcpScope === "both" || enforceCopilotCanonicalPair) {
         for (const editor of configuredEditors) {
           const shouldWriteProjectMcp =
@@ -2210,8 +2333,8 @@ export async function runSetupWizard(args: string[]): Promise<void> {
                 writeActions.push({ kind: "mcp-config", target: cursorPath, status: "dry-run" });
                 writeActions.push({ kind: "mcp-config", target: vscodePath, status: "dry-run" });
               } else {
-                const status1 = await upsertJsonMcpConfig(cursorPath, mcpServer);
-                const status2 = await upsertJsonVsCodeMcpConfig(vscodePath, vsCodeServer);
+                const status1 = await upsertJsonMcpConfig(cursorPath, projectMcpServer);
+                const status2 = await upsertJsonVsCodeMcpConfig(vscodePath, projectVsCodeServer);
                 writeActions.push({ kind: "mcp-config", target: cursorPath, status: status1 });
                 writeActions.push({ kind: "mcp-config", target: vscodePath, status: status2 });
               }
@@ -2230,7 +2353,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
               if (dryRun) {
                 writeActions.push({ kind: "mcp-config", target: mcpPath, status: "dry-run" });
               } else {
-                const status = await upsertJsonMcpConfig(mcpPath, mcpServerClaude);
+                const status = await upsertJsonMcpConfig(mcpPath, projectMcpServerClaude);
                 writeActions.push({ kind: "mcp-config", target: mcpPath, status });
               }
               continue;
@@ -2245,7 +2368,8 @@ export async function runSetupWizard(args: string[]): Promise<void> {
                   status: "dry-run",
                 });
               } else {
-                const status = await upsertOpenCodeMcpConfig(openCodePath, mcpServerOpenCode);
+                const projectOpenCode = buildContextStreamOpenCodeLocalServer(projectSetupEnv);
+                const status = await upsertOpenCodeMcpConfig(openCodePath, projectOpenCode);
                 writeActions.push({ kind: "mcp-config", target: openCodePath, status });
               }
               printOpenCodeEnvNote();
@@ -2257,18 +2381,19 @@ export async function runSetupWizard(args: string[]): Promise<void> {
               if (dryRun) {
                 writeActions.push({ kind: "mcp-config", target: vsCodePath, status: "dry-run" });
               } else {
-                const status = await upsertJsonVsCodeMcpConfig(vsCodePath, vsCodeServer);
+                const status = await upsertJsonVsCodeMcpConfig(vsCodePath, projectVsCodeServer);
                 writeActions.push({ kind: "mcp-config", target: vsCodePath, status });
               }
               continue;
             }
 
             if (editor === "kilo") {
-              const kiloPath = path.join(projectPath, ".kilocode", "mcp.json");
+              const kiloPath = path.join(projectPath, "kilo.jsonc");
               if (dryRun) {
                 writeActions.push({ kind: "mcp-config", target: kiloPath, status: "dry-run" });
               } else {
-                const status = await upsertJsonMcpConfig(kiloPath, mcpServer);
+                const kiloServer = buildContextStreamKiloServer(projectSetupEnv);
+                const status = await upsertKiloMcpConfig(kiloPath, kiloServer);
                 writeActions.push({ kind: "mcp-config", target: kiloPath, status });
               }
               continue;
@@ -2279,7 +2404,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
               if (dryRun) {
                 writeActions.push({ kind: "mcp-config", target: rooPath, status: "dry-run" });
               } else {
-                const status = await upsertJsonMcpConfig(rooPath, mcpServer);
+                const status = await upsertJsonMcpConfig(rooPath, projectMcpServer);
                 writeActions.push({ kind: "mcp-config", target: rooPath, status });
               }
               continue;

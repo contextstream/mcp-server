@@ -217,7 +217,26 @@ For the local variant, export `CONTEXTSTREAM_API_KEY` before launching OpenCode.
 <details>
 <summary><b>VS Code</b></summary>
 
-For GitHub Copilot in VS Code, use project-level MCP at `.vscode/mcp.json`.
+For GitHub Copilot in VS Code, the easiest path is the hosted remote MCP with built-in OAuth. Marketplace installs should write this remote server definition automatically.
+
+**Hosted remote MCP (recommended)**
+
+```json
+{
+  "servers": {
+    "contextstream": {
+      "type": "http",
+      "url": "https://mcp.contextstream.io/mcp"
+    }
+  }
+}
+```
+
+On first use, VS Code should prompt you to authorize ContextStream in the browser and then complete setup without an API key in the config file.
+
+`npx @contextstream/mcp-server@latest setup` now defaults VS Code/Copilot to this hosted remote when you are using the production ContextStream cloud. To force a local runtime instead, run setup with `CONTEXTSTREAM_VSCODE_MCP_MODE=local`.
+
+For self-hosted or non-default API deployments, local runtime remains the default:
 
 **Rust MCP (recommended)**
 
@@ -230,7 +249,12 @@ For GitHub Copilot in VS Code, use project-level MCP at `.vscode/mcp.json`.
       "args": [],
       "env": {
         "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
-        "CONTEXTSTREAM_API_KEY": "your_key"
+        "CONTEXTSTREAM_API_KEY": "your_key",
+        "CONTEXTSTREAM_TOOLSET": "complete",
+        "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+        "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+        "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+        "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400"
       }
     }
   }
@@ -248,7 +272,12 @@ For GitHub Copilot in VS Code, use project-level MCP at `.vscode/mcp.json`.
       "args": ["--prefer-online", "-y", "@contextstream/mcp-server@latest"],
       "env": {
         "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
-        "CONTEXTSTREAM_API_KEY": "your_key"
+        "CONTEXTSTREAM_API_KEY": "your_key",
+        "CONTEXTSTREAM_TOOLSET": "complete",
+        "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+        "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+        "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+        "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400"
       }
     }
   }
@@ -278,7 +307,12 @@ Or add to `~/.copilot/mcp-config.json` (pick one runtime):
       "args": [],
       "env": {
         "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
-        "CONTEXTSTREAM_API_KEY": "your_key"
+        "CONTEXTSTREAM_API_KEY": "your_key",
+        "CONTEXTSTREAM_TOOLSET": "complete",
+        "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+        "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+        "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+        "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400"
       }
     }
   }
@@ -295,7 +329,12 @@ Or add to `~/.copilot/mcp-config.json` (pick one runtime):
       "args": ["--prefer-online", "-y", "@contextstream/mcp-server@latest"],
       "env": {
         "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
-        "CONTEXTSTREAM_API_KEY": "your_key"
+        "CONTEXTSTREAM_API_KEY": "your_key",
+        "CONTEXTSTREAM_TOOLSET": "complete",
+        "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+        "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+        "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+        "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400"
       }
     }
   }
@@ -315,6 +354,8 @@ For more information, see the [GitHub Copilot CLI documentation](https://docs.gi
   - `.vscode/mcp.json`
 - Rust install: use `contextstream-mcp` as the command.
 - Node install: use `npx --prefer-online -y @contextstream/mcp-server@latest` as the command.
+- Force local VS Code/Copilot setup with `CONTEXTSTREAM_VSCODE_MCP_MODE=local`.
+- Force hosted remote VS Code/Copilot setup with `CONTEXTSTREAM_VSCODE_MCP_MODE=remote`.
 - Use `mcpServers` in Copilot CLI config and `servers` in VS Code config.
 
 ## Quick Troubleshooting
@@ -326,7 +367,9 @@ For more information, see the [GitHub Copilot CLI documentation](https://docs.gi
 
 ## Marketplace Note
 
-Marketplace npm installs can pin Node MCP versions and do not run external bootstrap scripts (`curl ... | bash` / `irm ... | iex`). Use the Rust install command directly when you want the Rust runtime.
+The MCP marketplace entry now targets the hosted remote MCP at `https://mcp.contextstream.io/mcp` so VS Code can use the native OAuth flow instead of writing a local npm-based stdio config.
+
+Use the Rust or Node local runtime configs above only when you explicitly want local execution, custom/self-hosted endpoints, or editor environments that do not support the hosted remote flow.
 
 ---
 

@@ -563,6 +563,19 @@ type McpServerJson = {
   env: Record<string, string>;
 };
 
+type VsCodeStdioServerJson = {
+  type: "stdio";
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+};
+
+type VsCodeHttpServerJson = {
+  type: "http";
+  url: string;
+  headers: Record<string, string>;
+};
+
 type OpenCodeEnvironment = Record<string, string>;
 
 type OpenCodeLocalServerJson = {
@@ -589,8 +602,21 @@ type KiloServerJson = {
 
 const IS_WINDOWS = process.platform === "win32";
 const DEFAULT_CONTEXTSTREAM_API_URL = "https://api.contextstream.io";
+const DEFAULT_CONTEXTSTREAM_MCP_URL = "https://mcp.contextstream.io/mcp";
+const DEFAULT_CONTEXTSTREAM_TOOLSET = "complete";
+const DEFAULT_CONTEXTSTREAM_OUTPUT_FORMAT = "compact";
+const DEFAULT_CONTEXTSTREAM_SEARCH_LIMIT = "15";
+const DEFAULT_CONTEXTSTREAM_SEARCH_MAX_CHARS = "2400";
+const DEFAULT_CONTEXTSTREAM_TRANSCRIPTS_ENABLED = "true";
+const DEFAULT_CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED = "true";
+const VSCODE_MCP_MODE_ENV = "CONTEXTSTREAM_VSCODE_MCP_MODE";
 const OPENCODE_CONFIG_SCHEMA_URL = "https://opencode.ai/config.json";
-const OPENCODE_REMOTE_MCP_URL = "https://mcp.contextstream.com";
+const REMOTE_HEADER_TOOLSET = "X-ContextStream-Toolset";
+const REMOTE_HEADER_OUTPUT_FORMAT = "X-ContextStream-Output-Format";
+const REMOTE_HEADER_SEARCH_LIMIT = "X-ContextStream-Search-Limit";
+const REMOTE_HEADER_SEARCH_MAX_CHARS = "X-ContextStream-Search-Max-Chars";
+const REMOTE_HEADER_TRANSCRIPTS_ENABLED = "X-ContextStream-Transcripts-Enabled";
+const REMOTE_HEADER_CONSOLIDATED = "X-ContextStream-Consolidated";
 
 type SetupEnvParams = {
   apiUrl: string;
@@ -599,6 +625,8 @@ type SetupEnvParams = {
   workspaceId?: string;
   projectId?: string;
 };
+
+type VsCodeMcpMode = "auto" | "remote" | "local";
 
 function escapeTomlString(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -619,19 +647,19 @@ function buildSetupEnv(params: SetupEnvParams): Record<string, string> {
     CONTEXTSTREAM_WORKSPACE_ID: params.workspaceId ?? "",
     CONTEXTSTREAM_PROJECT_ID: params.projectId ?? "",
     CONTEXTSTREAM_USER_AGENT: `contextstream-mcp/${VERSION}`,
-    CONTEXTSTREAM_TOOLSET: "standard",
+    CONTEXTSTREAM_TOOLSET: DEFAULT_CONTEXTSTREAM_TOOLSET,
     CONTEXTSTREAM_LOG_LEVEL: "quiet",
-    CONTEXTSTREAM_OUTPUT_FORMAT: "compact",
+    CONTEXTSTREAM_OUTPUT_FORMAT: DEFAULT_CONTEXTSTREAM_OUTPUT_FORMAT,
     CONTEXTSTREAM_CONTEXT_PACK: contextPack,
-    CONTEXTSTREAM_TRANSCRIPTS_ENABLED: "false",
-    CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED: "false",
+    CONTEXTSTREAM_TRANSCRIPTS_ENABLED: DEFAULT_CONTEXTSTREAM_TRANSCRIPTS_ENABLED,
+    CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED: DEFAULT_CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED,
     CONTEXTSTREAM_SHOW_TIMING: "false",
     CONTEXTSTREAM_PROGRESSIVE_MODE: "false",
     CONTEXTSTREAM_ROUTER_MODE: "false",
     CONTEXTSTREAM_CONSOLIDATED: "true",
     CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS: "true",
-    CONTEXTSTREAM_SEARCH_LIMIT: "10",
-    CONTEXTSTREAM_SEARCH_MAX_CHARS: "800",
+    CONTEXTSTREAM_SEARCH_LIMIT: DEFAULT_CONTEXTSTREAM_SEARCH_LIMIT,
+    CONTEXTSTREAM_SEARCH_MAX_CHARS: DEFAULT_CONTEXTSTREAM_SEARCH_MAX_CHARS,
     CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT: "true",
   };
 
@@ -660,14 +688,52 @@ function buildContextStreamMcpServer(params: SetupEnvParams): McpServerJson {
   };
 }
 
-type VsCodeServerJson = {
-  type: "stdio";
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-};
+type VsCodeServerJson = VsCodeStdioServerJson | VsCodeHttpServerJson;
+
+function resolveVsCodeMcpMode(): VsCodeMcpMode {
+  const rawValue = process.env[VSCODE_MCP_MODE_ENV]?.trim().toLowerCase();
+  if (rawValue === "remote" || rawValue === "local") {
+    return rawValue;
+  }
+  return "auto";
+}
+
+function getHostedRemoteMcpUrl(): string {
+  const override = process.env.CONTEXTSTREAM_MCP_HTTP_URL?.trim();
+  return override || DEFAULT_CONTEXTSTREAM_MCP_URL;
+}
+
+function buildHostedRemoteHeaders(): Record<string, string> {
+  return {
+    [REMOTE_HEADER_TOOLSET]: DEFAULT_CONTEXTSTREAM_TOOLSET,
+    [REMOTE_HEADER_OUTPUT_FORMAT]: DEFAULT_CONTEXTSTREAM_OUTPUT_FORMAT,
+    [REMOTE_HEADER_SEARCH_LIMIT]: DEFAULT_CONTEXTSTREAM_SEARCH_LIMIT,
+    [REMOTE_HEADER_SEARCH_MAX_CHARS]: DEFAULT_CONTEXTSTREAM_SEARCH_MAX_CHARS,
+    [REMOTE_HEADER_TRANSCRIPTS_ENABLED]: DEFAULT_CONTEXTSTREAM_TRANSCRIPTS_ENABLED,
+    [REMOTE_HEADER_CONSOLIDATED]: "true",
+  };
+}
+
+function shouldUseHostedRemoteMcp(apiUrl: string): boolean {
+  const mode = resolveVsCodeMcpMode();
+  if (mode === "remote") {
+    return true;
+  }
+  if (mode === "local") {
+    return false;
+  }
+  return normalizeApiUrl(apiUrl) === DEFAULT_CONTEXTSTREAM_API_URL;
+}
 
 function buildContextStreamVsCodeServer(params: SetupEnvParams): VsCodeServerJson {
+  if (shouldUseHostedRemoteMcp(params.apiUrl)) {
+    return {
+      type: "http",
+      url: getHostedRemoteMcpUrl(),
+      headers: buildHostedRemoteHeaders(),
+    };
+  }
+
   const env = buildSetupEnv(params);
 
   // Windows requires cmd /c wrapper to execute npx
@@ -690,6 +756,16 @@ function buildContextStreamVsCodeServer(params: SetupEnvParams): VsCodeServerJso
 function buildContextStreamOpenCodeEnvironment(params: SetupEnvParams): OpenCodeEnvironment {
   const environment: OpenCodeEnvironment = {
     CONTEXTSTREAM_API_KEY: "{env:CONTEXTSTREAM_API_KEY}",
+    CONTEXTSTREAM_TOOLSET: DEFAULT_CONTEXTSTREAM_TOOLSET,
+    CONTEXTSTREAM_LOG_LEVEL: "quiet",
+    CONTEXTSTREAM_OUTPUT_FORMAT: DEFAULT_CONTEXTSTREAM_OUTPUT_FORMAT,
+    CONTEXTSTREAM_TRANSCRIPTS_ENABLED: DEFAULT_CONTEXTSTREAM_TRANSCRIPTS_ENABLED,
+    CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED: DEFAULT_CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED,
+    CONTEXTSTREAM_CONSOLIDATED: "true",
+    CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS: "true",
+    CONTEXTSTREAM_SEARCH_LIMIT: DEFAULT_CONTEXTSTREAM_SEARCH_LIMIT,
+    CONTEXTSTREAM_SEARCH_MAX_CHARS: DEFAULT_CONTEXTSTREAM_SEARCH_MAX_CHARS,
+    CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT: "true",
   };
 
   if (normalizeApiUrl(params.apiUrl) !== DEFAULT_CONTEXTSTREAM_API_URL) {
@@ -714,7 +790,7 @@ function buildContextStreamOpenCodeLocalServer(params: SetupEnvParams): OpenCode
 function buildContextStreamOpenCodeRemoteServer(): OpenCodeRemoteServerJson {
   return {
     type: "remote",
-    url: OPENCODE_REMOTE_MCP_URL,
+    url: getHostedRemoteMcpUrl(),
     enabled: true,
   };
 }
@@ -851,7 +927,26 @@ async function upsertJsonVsCodeMcpConfig(
     root.servers = {};
 
   const before = JSON.stringify(root.servers.contextstream ?? null);
-  root.servers.contextstream = server;
+  const existingServer = root.servers.contextstream;
+  if (
+    existingServer &&
+    typeof existingServer === "object" &&
+    !Array.isArray(existingServer) &&
+    existingServer.type === "http" &&
+    server.type === "http"
+  ) {
+    root.servers.contextstream = {
+      ...server,
+      headers: {
+        ...server.headers,
+        ...(existingServer.headers && typeof existingServer.headers === "object"
+          ? existingServer.headers
+          : {}),
+      },
+    };
+  } else {
+    root.servers.contextstream = server;
+  }
   const after = JSON.stringify(root.servers.contextstream ?? null);
 
   await fs.writeFile(filePath, JSON.stringify(root, null, 2) + "\n", "utf8");

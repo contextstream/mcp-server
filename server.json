@@ -16,36 +16,6 @@
     "knowledge-graph",
     "ai-tools"
   ],
-  "packages": [
-    {
-      "registryType": "npm",
-      "identifier": "@contextstream/mcp-server",
-      "version": "0.4.70",
-      "environmentVariables": [
-        {
-          "name": "CONTEXTSTREAM_API_URL",
-          "description": "ContextStream API base URL.",
-          "value": "https://api.contextstream.io"
-        },
-        {
-          "name": "CONTEXTSTREAM_API_KEY",
-          "description": "ContextStream API key.",
-          "value": "{apiKey}",
-          "variables": {
-            "apiKey": {
-              "description": "ContextStream API key.",
-              "isRequired": true,
-              "isSecret": true,
-              "placeholder": "cbiq_..."
-            }
-          }
-        }
-      ],
-      "transport": {
-        "type": "stdio"
-      }
-    }
-  ],
   "icons": [
     {
       "src": "https://contextstream.io/favicon.svg",
@@ -66,40 +36,14 @@
     {
       "type": "streamable-http",
       "url": "https://mcp.contextstream.io/mcp",
-      "headers": [
-        {
-          "name": "Authorization",
-          "value": "Bearer {apiKey}",
-          "variables": {
-            "apiKey": {
-              "description": "ContextStream API key or JWT.",
-              "isRequired": true,
-              "isSecret": true,
-              "placeholder": "cbiq_..."
-            }
-          }
-        },
-        {
-          "name": "X-ContextStream-Workspace-Id",
-          "value": "{workspaceId}",
-          "variables": {
-            "workspaceId": {
-              "description": "Optional workspace ID.",
-              "isRequired": false
-            }
-          }
-        },
-        {
-          "name": "X-ContextStream-Project-Id",
-          "value": "{projectId}",
-          "variables": {
-            "projectId": {
-              "description": "Optional project ID.",
-              "isRequired": false
-            }
-          }
-        }
-      ]
+      "headers": {
+        "X-ContextStream-Toolset": "complete",
+        "X-ContextStream-Output-Format": "compact",
+        "X-ContextStream-Search-Limit": "15",
+        "X-ContextStream-Search-Max-Chars": "2400",
+        "X-ContextStream-Transcripts-Enabled": "true",
+        "X-ContextStream-Consolidated": "true"
+      }
     }
   ]
 }

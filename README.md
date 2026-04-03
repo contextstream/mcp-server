@@ -226,7 +226,7 @@ For GitHub Copilot in VS Code, the easiest path is the hosted remote MCP with bu
   "servers": {
     "contextstream": {
       "type": "http",
-      "url": "https://mcp.contextstream.io/mcp"
+      "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
     }
   }
 }
@@ -367,7 +367,7 @@ For more information, see the [GitHub Copilot CLI documentation](https://docs.gi
 
 ## Marketplace Note
 
-The MCP marketplace entry now targets the hosted remote MCP at `https://mcp.contextstream.io/mcp` so VS Code can use the native OAuth flow instead of writing a local npm-based stdio config.
+The MCP marketplace entry now targets the hosted remote MCP at `https://mcp.contextstream.io/mcp?default_context_mode=fast` so VS Code can use the native OAuth flow instead of writing a local npm-based stdio config.
 
 Use the Rust or Node local runtime configs above only when you explicitly want local execution, custom/self-hosted endpoints, or editor environments that do not support the hosted remote flow.
 

@@ -69,7 +69,7 @@ describe("OpenCode MCP setup", () => {
   it("builds the remote OpenCode server config", () => {
     expect(__setupTestUtils.buildContextStreamOpenCodeRemoteServer()).toEqual({
       type: "remote",
-      url: "https://mcp.contextstream.io/mcp",
+      url: "https://mcp.contextstream.io/mcp?default_context_mode=fast",
       enabled: true,
     });
   });
@@ -168,7 +168,7 @@ describe("Copilot MCP config automation", () => {
     const projectConfig = JSON.parse(await fs.readFile(projectPath, "utf8"));
     expect(projectConfig.servers.contextstream).toEqual({
       type: "http",
-      url: "https://mcp.contextstream.io/mcp",
+      url: "https://mcp.contextstream.io/mcp?default_context_mode=fast",
       headers: {
         "X-ContextStream-Toolset": "complete",
         "X-ContextStream-Output-Format": "compact",
@@ -262,7 +262,7 @@ describe("Copilot MCP config automation", () => {
           servers: {
             contextstream: {
               type: "http",
-              url: "https://mcp.contextstream.io/mcp",
+              url: "https://mcp.contextstream.io/mcp?default_context_mode=fast",
               headers: {
                 "X-ContextStream-Transcripts-Enabled": "false",
               },

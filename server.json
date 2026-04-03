@@ -35,7 +35,7 @@
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://mcp.contextstream.io/mcp",
+      "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast",
       "headers": {
         "X-ContextStream-Toolset": "complete",
         "X-ContextStream-Output-Format": "compact",

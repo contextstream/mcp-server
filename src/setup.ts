@@ -602,7 +602,8 @@ type KiloServerJson = {
 
 const IS_WINDOWS = process.platform === "win32";
 const DEFAULT_CONTEXTSTREAM_API_URL = "https://api.contextstream.io";
-const DEFAULT_CONTEXTSTREAM_MCP_URL = "https://mcp.contextstream.io/mcp";
+const DEFAULT_CONTEXTSTREAM_MCP_URL =
+  "https://mcp.contextstream.io/mcp?default_context_mode=fast";
 const DEFAULT_CONTEXTSTREAM_TOOLSET = "complete";
 const DEFAULT_CONTEXTSTREAM_OUTPUT_FORMAT = "compact";
 const DEFAULT_CONTEXTSTREAM_SEARCH_LIMIT = "15";

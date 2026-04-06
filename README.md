@@ -365,6 +365,31 @@ For more information, see the [GitHub Copilot CLI documentation](https://docs.gi
 - Remove stale version pins like `@contextstream/mcp-server@0.3.xx`.
 - Restart VS Code/Copilot after config changes.
 
+## Known Limitations
+
+### HTTP transport OAuth and vscode.dev dependency
+
+The hosted HTTP MCP transport (`https://mcp.contextstream.io/mcp`) uses OAuth authentication that routes through `vscode.dev` for the redirect flow. This can fail in environments where `vscode.dev` is blocked (corporate networks, regional restrictions, CDN-level blocks).
+
+**Workaround:** Use the stdio transport (Rust binary or Node.js) with API key authentication instead:
+
+```json
+{
+  "contextstream": {
+    "type": "stdio",
+    "command": "npx",
+    "args": ["-y", "@contextstream/mcp-server@latest"],
+    "env": {
+      "CONTEXTSTREAM_API_KEY": "your-api-key"
+    }
+  }
+}
+```
+
+### SDK version compatibility
+
+`@modelcontextprotocol/sdk` versions 1.28.0 and above introduce breaking changes. The `package.json` pins the SDK to `>=1.25.1 <1.28.0` to prevent incompatible resolutions. If you experience Zod schema errors on startup, ensure your SDK version is below 1.28.0.
+
 ## Marketplace Note
 
 The MCP marketplace entry now targets the hosted remote MCP at `https://mcp.contextstream.io/mcp?default_context_mode=fast` so VS Code can use the native OAuth flow instead of writing a local npm-based stdio config.

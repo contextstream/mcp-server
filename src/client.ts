@@ -98,8 +98,17 @@ export function extractEventTags(item: Record<string, any>): string[] {
 /**
  * Determine the effective event type, checking event_type, node_type,
  * type, and metadata.original_type in priority order.
+ * When event_type is "manual_note" (API normalization), prefer metadata.original_type.
  */
 export function extractEffectiveEventType(item: Record<string, any>): string {
+  const topLevel = item.event_type;
+  const isNormalized = typeof topLevel === "string" && topLevel.trim() === "manual_note";
+
+  if (isNormalized) {
+    const orig = item.metadata?.original_type;
+    if (typeof orig === "string" && orig.trim()) return orig.trim();
+  }
+
   for (const field of ["event_type", "node_type", "type"]) {
     const val = item[field];
     if (typeof val === "string" && val.trim()) return val.trim();
@@ -3136,17 +3145,16 @@ export class ContextStreamClient {
       case "preference":
       case "note":
       case "implementation":
-        apiEventType = "manual_note";
+        apiEventType = params.event_type;
         tags.push(params.event_type);
         break;
-      // Lesson system types - all stored as manual_note with specific tags
+      // Lesson system types — store with original type + lesson_system tag
       case "correction":
       case "lesson":
       case "warning":
       case "frustration":
-        apiEventType = "manual_note";
+        apiEventType = params.event_type;
         tags.push(params.event_type);
-        // Add lesson-related tag for easier filtering
         if (!tags.includes("lesson_system")) {
           tags.push("lesson_system");
         }
@@ -5234,7 +5242,7 @@ export class ContextStreamClient {
     if (!withDefaults.workspace_id) {
       throw new Error("workspace_id is required for integrations status");
     }
-    const result = await request(this.config, `/integrations/workspaces/${withDefaults.workspace_id}/integrations/status`, {
+    const result = await request(this.config, `/integrations/workspaces/${withDefaults.workspace_id}/status`, {
       method: "GET",
     });
     return unwrapApiResponse(result);
@@ -5256,7 +5264,7 @@ export class ContextStreamClient {
     if (params?.days) query.set("days", String(params.days));
     if (params?.repo) query.set("repo", params.repo);
     const suffix = query.toString() ? `?${query.toString()}` : "";
-    return request(this.config, `/github/summary${suffix}`, { method: "GET" });
+    return request(this.config, `/integrations/workspaces/${withDefaults.workspace_id}/github/summary${suffix}`, { method: "GET" });
   }
 
   /**
@@ -5275,7 +5283,7 @@ export class ContextStreamClient {
     if (params?.days) query.set("days", String(params.days));
     if (params?.channel) query.set("channel", params.channel);
     const suffix = query.toString() ? `?${query.toString()}` : "";
-    return request(this.config, `/slack/summary${suffix}`, { method: "GET" });
+    return request(this.config, `/integrations/workspaces/${withDefaults.workspace_id}/slack/summary${suffix}`, { method: "GET" });
   }
 
   /**

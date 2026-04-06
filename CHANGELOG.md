@@ -1,5 +1,124 @@
 # Changelog
 
+## 0.4.71
+
+**Feature parity with Rust MCP v0.2.22, 8 GitHub issue fixes, and search enrichment.**
+
+### Critical Fixes
+
+- **SDK version pin (Issue #36)** — Pin `@modelcontextprotocol/sdk` to `>=1.25.1 <1.28.0`. Versions 1.28.0+ break all ContextStream installs with a Zod schema error. New installs now resolve to a working SDK version.
+
+- **list_events filtering (Issue #34)** — Consolidated `memory(action="list_events")` now passes `tags` and `event_type` filter parameters to the API and applies client-side post-filtering using `extractEffectiveEventType()` and `extractEventTags()`. Previously all filters were silently dropped.
+
+- **Event type preservation (Issue #35)** — Capture flows now store the original event type (`lesson`, `insight`, `preference`, etc.) instead of normalizing everything to `manual_note`. The `extractEffectiveEventType()` helper now prioritizes `metadata.original_type` when the top-level type is `manual_note`.
+
+### Multi-Field Detection Fixes (Issue #38)
+
+- **graph(decisions)** — Falls back to `memory(decisions)` when graph query returns empty, ensuring decisions captured via MCP are always retrievable.
+- **session(summary)** — Enriches zero-count summaries with client-side event counting using `isDecisionResult()` and `isLessonResult()`.
+- **session(decision_trace)** — Adds timeout handling with keyword-based fallback using `isDecisionResult()` on recent events.
+- **session(recall)** — Fixes misleading "No memories found" hint when `memory_results.data.results` contains actual data.
+
+### Search Improvements
+
+- **Embedding timeout fallback (Issue #37)** — When semantic/auto search fails with "Embedding timed out", automatically retries with keyword mode instead of returning an error.
+- **Local ripgrep enrichment** — Zero-result searches now fall back to local `rg` (ripgrep) subprocess search, providing results even when the API returns nothing.
+- **Code identifier routing** — Multi-word queries containing camelCase or snake_case tokens now route to hybrid mode instead of pure semantic for better code search.
+- **Refactor mode fallback** — `search.refactor` gracefully falls back to keyword search if the `/search/refactor` endpoint returns 404.
+
+### New Tools
+
+- **VCS tool** — New `vcs` consolidated tool for git operations: `status`, `diff`, `log`, `blame`, `branches`, `stash_list`. Read-only git subprocess calls scoped to the project directory.
+
+### Audit Fixes (ported from Rust MCP v0.2.22)
+
+- `project.recent_changes` falls back to `cwd` when no folder path is available.
+- `graph.contradictions` now accepts optional `node_id` (returns hint instead of error when omitted).
+- Integration client paths fixed: `githubSummary`, `slackSummary`, and `integrationsStatus` now use workspace-scoped API routes.
+- Plan ghost titles sanitized: "(No assistant output found...)" replaced with "Untitled plan".
+- Transcript missing titles: generates `{type} transcript — {date}` fallback.
+- Lessons deduplicated by normalized title in `get_lessons`.
+
+```bash
+npm install -g @contextstream/mcp-server@0.4.71
+```
+
+---
+
+## 0.4.70
+
+**Kilo Code editor support and MCP env wizard improvements.**
+
+- Added Kilo Code (`kilo.jsonc`) MCP config generation in setup wizard.
+- Aligned VS Code and hosted MCP default paths.
+- Default hosted MCP to fast context mode.
+
+---
+
+## 0.4.69
+
+**Global workspace-only fallback, project-scope remediation, and hot-path reliability.**
+
+- Global workspace fallback when project scope resolution fails.
+- Project-scope remediation for stale or deleted project mappings.
+- Hot-path store reliability improvements.
+
+---
+
+## 0.4.68
+
+**Patch release — version bump and dependency updates.**
+
+- Bump `hono` from 4.12.5 to 4.12.8.
+- Bump `@hono/node-server` from 1.19.9 to 1.19.11.
+- Bump `ajv` from 6.12.6 to 6.14.0.
+
+---
+
+## 0.4.67
+
+**Streamlined VS Code and Copilot onboarding.**
+
+- Simplified README onboarding instructions.
+- Added marketplace environment placeholders.
+
+---
+
+## 0.4.66
+
+**Query tools fix, tag-based filtering, and Skills tool (Rust parity).**
+
+### Fixes
+
+- **Event type fallback (Issue #31)** — Query tools now use multi-field detection (`isLessonResult`, `isDecisionResult`, `extractEffectiveEventType`) to handle API event type normalization.
+- **Tag filtering (Issue #32)** — Client-side tag post-filtering for `list_events` when API-side filtering is incomplete.
+
+### New
+
+- **Skills tool** — Full skill management: `list`, `get`, `create`, `update`, `run`, `delete`, `import`, `export`, `share`. Ported from Rust MCP for parity.
+- **Lesson truncation limits** — Increased preview truncation from 120 to 1000 characters.
+
+```bash
+npm install -g @contextstream/mcp-server@0.4.66
+```
+
+---
+
+## 0.4.65
+
+**Tag propagation fix, dependency bumps, and opencode config support.**
+
+- **Tag propagation fix (PR #18)** — Tags now correctly propagate through capture and query flows.
+- **opencode MCP config support (PR #26)** — Added config generation for the opencode editor.
+- Bump `picomatch` from 4.0.3 to 4.0.4.
+- Bump `flatted` from 3.3.3 to 3.4.2.
+
+```bash
+npm install -g @contextstream/mcp-server@0.4.65
+```
+
+---
+
 ## 0.4.64
 
 **Decision query fixes, Dart indexing, Copilot rules generation, and todo state compatibility.**

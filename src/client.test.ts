@@ -41,7 +41,7 @@ describe("ContextStreamClient.captureContext", () => {
     );
   });
 
-  it("keeps lesson-system events stored as manual notes with lesson tags", async () => {
+  it("preserves lesson event type with lesson tags", async () => {
     const client = new ContextStreamClient(baseConfig);
     const createMemoryEvent = vi
       .spyOn(client, "createMemoryEvent")
@@ -56,7 +56,7 @@ describe("ContextStreamClient.captureContext", () => {
 
     expect(createMemoryEvent).toHaveBeenCalledWith(
       expect.objectContaining({
-        event_type: "manual_note",
+        event_type: "lesson",
         tags: expect.arrayContaining(["lesson", "lesson_system"]),
         metadata: expect.objectContaining({
           original_type: "lesson",

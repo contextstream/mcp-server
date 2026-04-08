@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MessageExtraInfo, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { ContextStreamClient } from "./client.js";
-import { isLessonResult, isDecisionResult, extractEventTags, extractEffectiveEventType } from "./client.js";
+import { isLessonResult, isDecisionResult, extractEventTags, extractEffectiveEventType, resolveItemKind, filterItemsByKind, sortContextItems, IndexKeeper, type SmartContextItem, type ContextItemKind } from "./client.js";
 import { readFilesFromDirectory, readAllFilesInBatches, countIndexableFiles } from "./files.js";
 import { SessionManager } from "./session-manager.js";
 import {
@@ -2018,6 +2018,7 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
 const OUTPUT_FORMAT = process.env.CONTEXTSTREAM_OUTPUT_FORMAT || "compact";
 const COMPACT_OUTPUT = OUTPUT_FORMAT === "compact";
 const SHOW_TIMING = process.env.CONTEXTSTREAM_SHOW_TIMING === "true" || process.env.CONTEXTSTREAM_SHOW_TIMING === "1";
+const CONCISE_TOOL_TEXT = process.env.CONTEXTSTREAM_CONCISE_TOOL_TEXT?.toLowerCase() !== "false";
 const INCLUDE_STRUCTURED_CONTENT = parseBoolEnvDefault(
   process.env.CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT,
   true
@@ -2040,6 +2041,92 @@ function maybeStripStructuredContent(result: ToolTextResult): ToolTextResult {
 // =============================================================================
 // END Strategy 7
 // =============================================================================
+
+// ---------------------------------------------------------------------------
+// Smart context typed item formatting helpers
+// ---------------------------------------------------------------------------
+
+function formatTypedLessons(items: SmartContextItem[], compact: boolean): string {
+  if (items.length === 0) return "";
+  const MAX = 5;
+  const entries = items.slice(0, MAX).map((item) => {
+    const sev = item.score >= 0.8 ? "CRIT" : item.score >= 0.5 ? "HIGH" : "note";
+    return compact ? `[LESSON:${sev}] ${item.value}` : `Lesson (${sev}): ${item.value}`;
+  });
+  return entries.join("\n");
+}
+
+function formatTypedPreferences(items: SmartContextItem[], compact: boolean): string {
+  if (items.length === 0) return "";
+  const MAX = 5;
+  const entries = items.slice(0, MAX).map((item) =>
+    compact ? `[PREF] ${item.value}` : `Preference: ${item.value}`
+  );
+  return entries.join("\n");
+}
+
+function formatTypedVcs(items: SmartContextItem[], compact: boolean): string {
+  if (items.length === 0) return "";
+  const MAX = 5;
+  const entries = items.slice(0, MAX).map((item) =>
+    compact ? `[VCS] ${item.value}` : `VCS: ${item.value}`
+  );
+  return entries.join("\n");
+}
+
+function formatTypedSkills(items: SmartContextItem[], compact: boolean): string {
+  if (items.length === 0) return "";
+  const MAX = 5;
+  const entries = items.slice(0, MAX).map((item) =>
+    compact ? `[SKILL] ${item.value}` : `Skill: ${item.value}`
+  );
+  return entries.join("\n");
+}
+
+function formatTypedSnapshots(items: SmartContextItem[], compact: boolean): string {
+  if (items.length === 0) return "";
+  const MAX = 3;
+  const entries = items.slice(0, MAX).map((item) =>
+    compact ? `[SNAPSHOT] ${item.value}` : `Transcript snapshot: ${item.value}`
+  );
+  return entries.join("\n");
+}
+
+function hasServerVcsItems(items?: SmartContextItem[]): boolean {
+  if (!items || items.length === 0) return false;
+  return items.some((i) => resolveItemKind(i) === "vcs");
+}
+
+// Warm context cache: single entry per-process keyed on workspace+project
+const WARM_CACHE_TTL_MS = 30_000;
+let warmCacheEntry: {
+  key: string;
+  timestamp: number;
+  result: any;
+} | null = null;
+
+function getWarmCacheKey(workspaceId?: string, projectId?: string): string {
+  return `${workspaceId || ""}:${projectId || ""}`;
+}
+
+function getWarmCache(workspaceId?: string, projectId?: string): any | null {
+  if (!warmCacheEntry) return null;
+  const key = getWarmCacheKey(workspaceId, projectId);
+  if (warmCacheEntry.key !== key) return null;
+  if (Date.now() - warmCacheEntry.timestamp > WARM_CACHE_TTL_MS) {
+    warmCacheEntry = null;
+    return null;
+  }
+  return warmCacheEntry.result;
+}
+
+function setWarmCache(workspaceId: string | undefined, projectId: string | undefined, result: any): void {
+  warmCacheEntry = {
+    key: getWarmCacheKey(workspaceId, projectId),
+    timestamp: Date.now(),
+    result,
+  };
+}
 
 // =============================================================================
 // Strategy 8: Consolidated Domain Tools (v0.4.x default)
@@ -2568,6 +2655,8 @@ export function registerTools(
   options?: { toolSurfaceProfile?: ToolSurfaceProfile }
 ) {
   const upgradeUrl = process.env.CONTEXTSTREAM_UPGRADE_URL || "https://contextstream.io/pricing";
+  const indexKeeper = new IndexKeeper();
+  indexKeeper.attach(client);
   const toolSurfaceProfile = normalizeToolSurfaceProfile(
     options?.toolSurfaceProfile || process.env.CONTEXTSTREAM_TOOL_SURFACE_PROFILE
   );
@@ -3511,6 +3600,19 @@ export function registerTools(
     return error instanceof HttpError && error.status === 404;
   }
 
+  function isAccessDeniedError(error: unknown): boolean {
+    return error instanceof HttpError && (error.status === 403 || error.status === 401);
+  }
+
+  function isScopeInvalidResult(result: any): boolean {
+    const data = result?.data ?? result ?? {};
+    return (
+      data.scope_is_valid === false ||
+      data.scope_invalid === true ||
+      (typeof data.error === "string" && data.error.includes("project_access_denied"))
+    );
+  }
+
   function isRequiresIngestEndpointError(error: unknown): boolean {
     if (!(error instanceof HttpError)) return false;
     if (error.status !== 400) return false;
@@ -3527,6 +3629,141 @@ export function registerTools(
     return tokens.some(
       (t) => /[A-Z][a-z]/.test(t) || t.includes("_") || t.includes(".") || t.includes("::")
     );
+  }
+
+  function isArtifactLikePath(filePath: string): boolean {
+    const normalized = filePath.toLowerCase().replace(/\\/g, "/");
+    return (
+      normalized.includes("/.next/") ||
+      normalized.includes("/.next.bak/") ||
+      normalized.includes("/node_modules/") ||
+      normalized.includes("/dist/") ||
+      normalized.includes("/build/") ||
+      normalized.includes("/target/") ||
+      normalized.includes("/coverage/") ||
+      normalized.endsWith(".js.map") ||
+      normalized.endsWith(".css.map") ||
+      normalized.endsWith(".d.ts.map") ||
+      normalized.endsWith(".min.js") ||
+      normalized.startsWith("archives-ignore/") ||
+      normalized.includes("/archives-ignore/") ||
+      (normalized.startsWith("archives-") && normalized.includes("/tasks/"))
+    );
+  }
+
+  function queryExplicitlyTargetsArtifacts(query: string): boolean {
+    const lower = query.toLowerCase();
+    return (
+      lower.includes(".map") ||
+      lower.includes("source map") ||
+      lower.includes("sourcemap") ||
+      lower.includes("node_modules") ||
+      lower.includes(".next") ||
+      lower.includes("dist/") ||
+      lower.includes("build/") ||
+      lower.includes("coverage")
+    );
+  }
+
+  function shouldFilterArtifactPaths(
+    mode: string,
+    query: string
+  ): boolean {
+    if (mode === "pattern" || mode === "exhaustive") return false;
+    if (queryExplicitlyTargetsArtifacts(query)) return false;
+    return true;
+  }
+
+  const MIRROR_PREFIXES = [
+    "contextstream-ai-brain-export/",
+    "contextstream/",
+    "web/users/",
+  ];
+
+  function canonicalizeRepoPath(filePath: string): string {
+    let normalized = filePath.replace(/\\/g, "/");
+    while (normalized.startsWith("./")) {
+      normalized = normalized.slice(2);
+    }
+    for (const prefix of MIRROR_PREFIXES) {
+      if (normalized.startsWith(prefix)) {
+        normalized = normalized.slice(prefix.length);
+        break;
+      }
+    }
+    if (normalized.startsWith(".claude/worktrees/")) {
+      const rest = normalized.slice(".claude/worktrees/".length);
+      const slashIdx = rest.indexOf("/");
+      if (slashIdx >= 0) {
+        normalized = rest.slice(slashIdx + 1);
+      }
+    }
+    const projectsIdx = normalized.indexOf("/projects/");
+    if (projectsIdx >= 0) {
+      const afterProjects = normalized.slice(projectsIdx + "/projects/".length);
+      const uuidEndIdx = afterProjects.indexOf("/");
+      if (uuidEndIdx >= 0 && /^[0-9a-f-]{36}/i.test(afterProjects)) {
+        normalized = afterProjects.slice(uuidEndIdx + 1);
+      }
+    }
+    return normalized;
+  }
+
+  function extractSymbolAnchors(query: string): string[] {
+    const tokens = query.split(/\s+/).filter(Boolean);
+    const anchors: string[] = [];
+    for (const t of tokens) {
+      const cleaned = t.replace(/^["'`]+|["'`]+$/g, "");
+      if (!cleaned) continue;
+      const hasMixedCase = /[a-z]/.test(cleaned) && /[A-Z]/.test(cleaned);
+      const hasUnderscore = cleaned.includes("_");
+      const hasNamespaceSep = cleaned.includes("::") || cleaned.includes(".");
+      const isAllCaps = cleaned.length >= 3 && /^[A-Z0-9_]+$/.test(cleaned);
+      if (hasMixedCase || hasUnderscore || hasNamespaceSep || isAllCaps) {
+        anchors.push(cleaned);
+      }
+    }
+    return anchors;
+  }
+
+  function applySymbolAnchorRerank(
+    results: any[],
+    anchors: string[]
+  ): any[] {
+    if (anchors.length === 0 || results.length === 0) return results;
+    const lowerAnchors = anchors.map((a) => a.toLowerCase());
+
+    const scored = results.map((r, idx) => {
+      const fp = (r.file_path || "").toLowerCase();
+      const content = (r.content || "").toLowerCase();
+      let anchorHits = 0;
+      for (const anchor of lowerAnchors) {
+        if (fp.includes(anchor) || content.includes(anchor)) anchorHits++;
+      }
+      const isNoisy = isArtifactLikePath(r.file_path || "");
+      return { item: r, anchorHits, isNoisy, originalIdx: idx };
+    });
+
+    scored.sort((a, b) => {
+      if (b.anchorHits !== a.anchorHits) return b.anchorHits - a.anchorHits;
+      if (a.isNoisy !== b.isNoisy) return a.isNoisy ? 1 : -1;
+      return a.originalIdx - b.originalIdx;
+    });
+
+    return scored.map((s) => s.item);
+  }
+
+  function deduplicateSearchResults(results: any[]): any[] {
+    const seen = new Set<string>();
+    return results.filter((r) => {
+      const fp = r.file_path ? canonicalizeRepoPath(r.file_path) : "";
+      const startLine = r.start_line || r.metadata?.start_line || "";
+      const key = fp ? `${fp}:${startLine}` : "";
+      if (!key) return true;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
 
   async function runLocalRipgrep(
@@ -9227,9 +9464,9 @@ This saves ~80% tokens compared to including full chat history.`,
           .optional()
           .describe("Context format (default: minified)"),
         mode: z
-          .enum(["standard", "pack"])
+          .enum(["standard", "pack", "fast"])
           .optional()
-          .describe("Context pack mode (default: pack when enabled)"),
+          .describe("Context mode: standard (default), pack (includes code context), fast (cached quick response)"),
         distill: z
           .boolean()
           .optional()
@@ -9375,21 +9612,149 @@ This saves ~80% tokens compared to including full chat history.`,
         clientName = detectedClientInfo.name;
       }
 
-      const result = await client.getSmartContext({
-        user_message: input.user_message,
-        workspace_id: workspaceId,
-        project_id: projectId,
-        max_tokens: input.max_tokens,
-        format: input.format,
-        mode: input.mode,
-        distill: input.distill,
-        session_tokens: sessionTokens,
-        context_threshold: contextThreshold,
-        save_exchange: input.save_exchange,
-        session_id: sessionId,
-        client_name: clientName,
-        assistant_message: input.assistant_message,
-      });
+      const conversationTurns = sessionManager?.getConversationTurns() ?? 0;
+      const isFastMode = input.mode === "fast";
+      const folderPathCtx = resolveFolderPath(undefined, sessionManager);
+
+      if (isFastMode && workspaceId) {
+        const fastResult = await client.getContextFast({ workspace_id: workspaceId, project_id: projectId });
+        if (fastResult && fastResult.context) {
+          const roundTripMs = Date.now() - startTime;
+          const timingStr = SHOW_TIMING ? ` | ${roundTripMs}ms` : "";
+          return {
+            content: [{ type: "text" as const, text: `${fastResult.context}\n---\nfast mode${timingStr}` }],
+          };
+        }
+      }
+
+      const cachedResult = conversationTurns >= 2 ? getWarmCache(workspaceId, projectId) : null;
+
+      let proactiveVcsPromise: Promise<{ repos: any[]; pulls: any[]; issues: any[]; activity: any[]; notifications: any[] }> | undefined;
+      if (conversationTurns <= 3 && workspaceId && !isFastMode) {
+        proactiveVcsPromise = (async () => {
+          const repos = await client.getVcsRepos({ workspace_id: workspaceId!, per_page: 10 });
+          if (repos.length === 0) return { repos: [], pulls: [], issues: [], activity: [], notifications: [] };
+          const pullPromises = repos.slice(0, 5).map((r: any) =>
+            client.getVcsResource({ workspace_id: workspaceId!, path: `repos/${r.id || r.repo_id}/pulls`, per_page: 5 })
+          );
+          const issuePromises = repos.slice(0, 5).map((r: any) =>
+            client.getVcsResource({ workspace_id: workspaceId!, path: `repos/${r.id || r.repo_id}/issues`, per_page: 5 })
+          );
+          const [pullResults, issueResults] = await Promise.all([
+            Promise.all(pullPromises),
+            Promise.all(issuePromises),
+          ]);
+          return {
+            repos,
+            pulls: pullResults.flat(),
+            issues: issueResults.flat(),
+            activity: [],
+            notifications: [],
+          };
+        })().catch(() => ({ repos: [], pulls: [], issues: [], activity: [], notifications: [] }));
+      }
+
+      let recentChangesPromise: Promise<string> | undefined;
+      if (conversationTurns <= 2 && folderPathCtx && !CONCISE_TOOL_TEXT && !isFastMode) {
+        recentChangesPromise = (async () => {
+          try {
+            const { stdout } = await execFileAsync("git", [
+              "log", "--oneline", '--format=%h %s (%ar)', "-n5",
+            ], { cwd: folderPathCtx!, timeout: 3000, maxBuffer: 64 * 1024 });
+            return stdout.trim();
+          } catch { return ""; }
+        })();
+      }
+
+      let result: any;
+      if (cachedResult) {
+        result = cachedResult;
+        const fastOverlay = await client.getContextFast({ workspace_id: workspaceId, project_id: projectId });
+        if (fastOverlay?.context) {
+          result = { ...result, context: result.context + "\n" + fastOverlay.context };
+          if (fastOverlay.items && Array.isArray(fastOverlay.items)) {
+            result.items = [...(result.items || []), ...fastOverlay.items];
+          }
+        }
+      } else {
+        result = await client.getSmartContext({
+          user_message: input.user_message,
+          workspace_id: workspaceId,
+          project_id: projectId,
+          max_tokens: input.max_tokens,
+          format: input.format,
+          mode: input.mode === "fast" ? "standard" : input.mode,
+          distill: input.distill,
+          session_tokens: sessionTokens,
+          context_threshold: contextThreshold,
+          save_exchange: input.save_exchange,
+          session_id: sessionId,
+          client_name: clientName,
+          assistant_message: input.assistant_message,
+        });
+        if (workspaceId) {
+          setWarmCache(workspaceId, projectId, result);
+        }
+      }
+
+      const typedItems: SmartContextItem[] = Array.isArray(result.items) ? result.items : [];
+      const hasTypedItems = typedItems.length > 0;
+      const compact = COMPACT_OUTPUT || CONCISE_TOOL_TEXT;
+
+      let typedContextBlock = "";
+      if (hasTypedItems) {
+        const parts: string[] = [];
+        const prefItems = filterItemsByKind(typedItems, "preference");
+        const lessonItems = filterItemsByKind(typedItems, "lesson");
+        const vcsItems = filterItemsByKind(typedItems, "vcs");
+        const skillItems = filterItemsByKind(typedItems, "skill");
+        const snapItems = filterItemsByKind(typedItems, "transcript_snapshot");
+
+        const prefText = formatTypedPreferences(prefItems, compact);
+        if (prefText) parts.push(prefText);
+        const lessonText = formatTypedLessons(lessonItems, compact);
+        if (lessonText) parts.push(lessonText);
+        const vcsText = formatTypedVcs(vcsItems, compact);
+        if (vcsText) parts.push(vcsText);
+        const skillText = formatTypedSkills(skillItems, compact);
+        if (skillText) parts.push(skillText);
+        if (conversationTurns <= 3) {
+          const snapText = formatTypedSnapshots(snapItems, compact);
+          if (snapText) parts.push(snapText);
+        }
+        if (parts.length > 0) {
+          typedContextBlock = "\n" + parts.join("\n") + "\n";
+        }
+      }
+
+      let proactiveVcsBlock = "";
+      if (proactiveVcsPromise) {
+        try {
+          const vcsCtx = await proactiveVcsPromise;
+          if (!hasServerVcsItems(typedItems) && (vcsCtx.pulls.length > 0 || vcsCtx.issues.length > 0)) {
+            const vParts: string[] = [];
+            if (vcsCtx.pulls.length > 0) {
+              vParts.push(compact ? `[VCS] ${vcsCtx.pulls.length} open PR(s)` : `Open PRs: ${vcsCtx.pulls.length}`);
+            }
+            if (vcsCtx.issues.length > 0) {
+              vParts.push(compact ? `[VCS] ${vcsCtx.issues.length} open issue(s)` : `Open issues: ${vcsCtx.issues.length}`);
+            }
+            if (vParts.length > 0) proactiveVcsBlock = "\n" + vParts.join("\n");
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      let recentChangesBlock = "";
+      if (recentChangesPromise) {
+        try {
+          const changes = await recentChangesPromise;
+          if (changes) {
+            recentChangesBlock = compact
+              ? `\n[RECENT_CHANGES] ${changes.split("\n").slice(0, 3).join("; ")}`
+              : `\n[RECENT_CHANGES]\n${changes}`;
+          }
+        } catch { /* non-fatal */ }
+      }
 
       // Track response tokens in SessionManager for context pressure calculation
       if (sessionManager && result.token_estimate) {
@@ -9552,7 +9917,7 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
       // The server now does intelligent filtering and provides warnings via the warnings field
       const serverWarnings = result.warnings || [];
       const serverWarningsLine = serverWarnings.length > 0
-        ? "\n\n" + serverWarnings.map(w => `⚠️ ${w}`).join("\n")
+        ? "\n\n" + serverWarnings.map((w: string) => `⚠️ ${w}`).join("\n")
         : "";
 
       // Generate semantic intent hints for AI (risk, decision capture suggestions)
@@ -9581,7 +9946,7 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
         }
       }
 
-      // Include dynamic instructions from SmartRouter if present
+      // Include dynamic instructions if present
       const instructionsLine = result.instructions ? `\n\n[INSTRUCTIONS] ${result.instructions}` : "";
 
       // Generate suggested rules notice if the API returned pending rule suggestions
@@ -9603,7 +9968,7 @@ Action: ${cp.suggested_action === "prepare_save" ? "Consider saving important de
       ].filter(Boolean).join("");
 
       // Include post-compact context if restored
-      const finalContext = postCompactContext + result.context;
+      const finalContext = postCompactContext + result.context + typedContextBlock + proactiveVcsBlock + recentChangesBlock;
 
       // Build complete output with clean summary + full data (no value lost)
       const textParts = [
@@ -10809,6 +11174,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
         // Check and index changed files (fire and forget) - fallback for editors without hooks
         client.checkAndIndexChangedFiles().catch(() => {});
+        const folderPathForKeeper = resolveFolderPath(undefined, sessionManager);
+        const projectIdForKeeper = resolveProjectId(undefined);
+        if (folderPathForKeeper && projectIdForKeeper) {
+          indexKeeper.tick(projectIdForKeeper, folderPathForKeeper).catch(() => {});
+        }
 
         const startTime = Date.now();
         const modeInput = input.mode || "auto";
@@ -10852,12 +11222,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const project = (await client.getProject(explicitProjectId)) as any;
             const projectWorkspaceId = normalizeUuid(project?.workspace_id || project?.workspaceId);
             if (workspaceId && projectWorkspaceId && projectWorkspaceId !== workspaceId) {
-              explicitProjectScopeNote = `Explicit project_id ${explicitProjectId} belongs to workspace ${projectWorkspaceId}; auto-corrected to current workspace ${workspaceId}.`;
+              explicitProjectScopeNote = `Explicit project_id ${explicitProjectId} belongs to a different workspace and was ignored. Do NOT pass this project_id again — omit it and let the session resolve the correct project scope automatically.`;
               explicitProjectId = undefined;
             }
           } catch (error) {
             if (isNotFoundError(error)) {
-              explicitProjectScopeNote = `Explicit project_id ${explicitProjectId} was not found; auto-corrected using folder/index project mapping.`;
+              explicitProjectScopeNote = `Explicit project_id ${explicitProjectId} was not found. Do NOT pass this project_id again — omit it and let the session resolve the correct project scope automatically.`;
               explicitProjectId = undefined;
             } else {
               throw error;
@@ -11192,6 +11562,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             input.output_format || suggestOutputFormat(input.query, requestedMode === "team" ? "hybrid" : requestedMode),
         });
 
+        let parallelRgPromise: Promise<Array<{ file_path: string; line: number; content: string; score: number }>> | undefined;
+        if (containsCodeIdentifiers(input.query) && folderPath && requestedMode !== "pattern") {
+          parallelRgPromise = runLocalRipgrep(input.query, folderPath, input.limit || 10);
+        }
+
         if (requestedMode === "team") {
           try {
             const teamResult = await runSearchForMode("team", {
@@ -11220,6 +11595,20 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             try {
               const modeResult = await runSearchForMode(requestedMode, paramsForCandidate);
               const envelope = extractSearchEnvelope(modeResult.result);
+
+              if (isScopeInvalidResult(modeResult.result)) {
+                if (!selected) {
+                  selected = {
+                    index,
+                    project_id: candidateProjectId,
+                    result: modeResult.result,
+                    executedMode: modeResult.executedMode,
+                    fallbackNote: modeResult.fallbackNote,
+                  };
+                }
+                continue;
+              }
+
               if (explicitProjectId && index === 0 && envelope.results.length === 0) {
                 explicitScopeHadNoResults = true;
               }
@@ -11245,7 +11634,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 };
               }
             } catch (error) {
-              if (isNotFoundError(error)) {
+              if (isNotFoundError(error) || isAccessDeniedError(error)) {
                 continue;
               }
               const errMsg = error instanceof Error ? error.message : String(error);
@@ -11339,8 +11728,56 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
         const roundTripMs = Date.now() - startTime;
         let { results, total } = extractSearchEnvelope(selected.result);
+        const scopeInvalid = isScopeInvalidResult(selected.result);
 
-        if (results.length === 0 && folderPath) {
+        for (const r of results) {
+          if (r.file_path) {
+            const canonical = canonicalizeRepoPath(r.file_path);
+            if (canonical !== r.file_path) r.file_path = canonical;
+          }
+        }
+        results = deduplicateSearchResults(results);
+
+        if (shouldFilterArtifactPaths(selected.executedMode, input.query) && results.length > 0) {
+          const beforeLen = results.length;
+          results = results.filter((r: any) =>
+            r.file_path ? !isArtifactLikePath(r.file_path) : true
+          );
+          if (results.length < beforeLen) {
+            modeFallbackNote = appendNote(
+              modeFallbackNote,
+              `Filtered ${beforeLen - results.length} artifact/generated path(s).`
+            );
+          }
+        }
+
+        if (results.length === 0 && !scopeInvalid) {
+          const escalationModes: Array<typeof selected.executedMode> = (() => {
+            switch (selected.executedMode) {
+              case "semantic": return ["hybrid", "keyword"];
+              case "hybrid": return ["keyword"];
+              case "keyword": return ["hybrid"];
+              default: return [];
+            }
+          })();
+          for (const escMode of escalationModes) {
+            try {
+              const escResult = await runSearchForMode(escMode, {
+                ...baseParams, workspace_id: workspaceId, project_id: selected.project_id,
+              });
+              const escEnvelope = extractSearchEnvelope(escResult.result);
+              if (escEnvelope.results.length > 0) {
+                results = escEnvelope.results;
+                total = escEnvelope.total;
+                modeFallbackNote = appendNote(modeFallbackNote, `${selected.executedMode} returned 0 results; escalated to ${escMode}.`);
+                break;
+              }
+            } catch { /* continue */ }
+          }
+        }
+
+        const parallelCoversFallback = !!parallelRgPromise && selected.executedMode !== "pattern";
+        if (results.length === 0 && folderPath && !parallelCoversFallback) {
           const rgResults = await runLocalRipgrep(input.query, folderPath, input.limit || 10);
           if (rgResults.length > 0) {
             results = rgResults.map((r) => ({
@@ -11357,6 +11794,27 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             );
           }
         }
+
+        if (parallelRgPromise) {
+          try {
+            const parallelRgResults = await parallelRgPromise;
+            if (parallelRgResults.length > 0) {
+              const existingPaths = new Set(results.map((r: any) => r.file_path).filter(Boolean));
+              const newEntries = parallelRgResults
+                .filter((r) => !existingPaths.has(r.file_path))
+                .map((r) => ({ file_path: r.file_path, start_line: r.line, content: r.content, score: r.score, source: "local_ripgrep" }));
+              if (newEntries.length > 0) {
+                results = [...results, ...newEntries];
+              }
+            }
+          } catch { /* parallel rg failures are non-fatal */ }
+        }
+
+        const symbolAnchors = extractSymbolAnchors(input.query);
+        if (symbolAnchors.length > 0 && results.length > 1) {
+          results = applySymbolAnchorRerank(results, symbolAnchors);
+        }
+        total = results.length;
 
         const resultPaths = results
           .map((item: any) => (typeof item?.file_path === "string" ? item.file_path : ""))
@@ -11376,13 +11834,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           lines.push(`🔍 ${total} results for "${input.query}"`);
         }
 
-        if (modeAutoSelected) {
+        if (modeAutoSelected && !(CONCISE_TOOL_TEXT && results.length > 0)) {
           lines.push(`Mode auto-selected: \`${requestedMode}\`. ${modeRecommendation.reason}`);
         }
-        if (modeFallbackNote) {
+        if (modeFallbackNote && !(CONCISE_TOOL_TEXT && results.length > 0)) {
           lines.push(modeFallbackNote);
         }
-        if (hotPathsHint?.entries?.length) {
+        if (hotPathsHint?.entries?.length && !CONCISE_TOOL_TEXT) {
           lines.push(
             `Hot-path hint active (${hotPathsHint.entries.length} paths, confidence ${(hotPathsHint.confidence * 100).toFixed(0)}%).`
           );
@@ -14559,6 +15017,19 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             }
             const validPath = await validateReadableDirectory(ingestPath);
             if (!validPath.ok) {
+              try {
+                const pathExists = await fs.promises.stat(ingestPath).then(() => true).catch(() => false);
+                if (!pathExists) {
+                  const apiResult = await client.ingestFromPath(projectId, ingestPath, {
+                    force: input.force,
+                  });
+                  return {
+                    content: [{ type: "text" as const, text: `Delegated ingest to API for path: ${ingestPath}\n${formatContent(apiResult)}` }],
+                  };
+                }
+              } catch {
+                // fall through to original error
+              }
               return errorResult(validPath.error);
             }
             const ingestOptions = {
@@ -16385,21 +16856,41 @@ Example workflow:
   }
 
     // -------------------------------------------------------------------------
-    // vcs - Version control operations via git subprocess
+    // vcs - Version control: local git + remote API (repos, PRs, issues, commits)
     // -------------------------------------------------------------------------
     registerTool(
       "vcs",
       {
         title: "Version Control",
-        description: `Git version control operations. Actions: status (working tree status), diff (show changes), log (commit history), blame (line-by-line authorship), branches (list branches), stash_list (list stashes).`,
+        description: `Git version control and remote repo operations.
+
+Local git actions: status, diff, log, blame, branches, stash_list
+Remote API actions: list_repos, get_repo, sync_repo, list_pulls, get_pull, get_pull_diff, get_pull_comments, get_pull_commits, get_pull_checks, get_pull_summary, summarize_pull, review_pull, comment_pull, merge_pull, list_issues, get_issue, create_issue, update_issue, comment_issue, list_commits, get_commit, get_commit_diff, compare_refs, list_branches_remote, list_tags, get_tree, get_blob, search_code, search_vcs, get_activity, list_notifications, mark_notification_read, mark_all_notifications_read, list_links, create_link, delete_link, list_automations, create_automation, update_automation, delete_automation, register_webhook, unregister_webhook`,
         inputSchema: z.object({
-          action: z
-            .enum(["status", "diff", "log", "blame", "branches", "stash_list"])
-            .describe("VCS action to perform"),
-          path: z.string().optional().describe("File path for diff/blame (relative to repo root)"),
-          ref: z.string().optional().describe("Git ref (branch, tag, commit) for log/diff"),
-          limit: z.number().optional().describe("Max entries for log (default: 20)"),
+          action: z.string().describe("VCS action to perform"),
+          workspace_id: z.string().uuid().optional().describe("Workspace ID for remote VCS actions"),
+          repo_ref: z.string().optional().describe("Repository reference (owner/repo) for remote actions"),
+          repo_id: z.string().optional().describe("Repository ID for remote actions"),
+          path: z.string().optional().describe("File path for diff/blame/tree/blob"),
+          ref: z.string().optional().describe("Git ref (branch, tag, commit)"),
+          base_ref: z.string().optional().describe("Base ref for compare_refs"),
+          limit: z.number().optional().describe("Max entries (default: 20)"),
           staged: z.boolean().optional().describe("Show staged changes only (for diff)"),
+          pull_number: z.number().optional().describe("Pull request number"),
+          issue_number: z.number().optional().describe("Issue number"),
+          notification_id: z.string().optional().describe("Notification ID"),
+          link_id: z.string().optional().describe("Link ID"),
+          automation_id: z.string().optional().describe("Automation ID"),
+          title: z.string().optional().describe("Title for create_issue"),
+          body: z.string().optional().describe("Body content"),
+          state: z.string().optional().describe("State filter (open/closed)"),
+          labels: z.array(z.string()).optional().describe("Labels for issues"),
+          per_page: z.number().optional().describe("Results per page"),
+          page: z.number().optional().describe("Page number"),
+          event: z.string().optional().describe("Review event (APPROVE/REQUEST_CHANGES/COMMENT)"),
+          provider: z.string().optional().describe("VCS provider (github/gitlab/bitbucket)"),
+          query: z.string().optional().describe("Search query"),
+          data: z.record(z.any()).optional().describe("Additional data for create/update operations"),
         }),
       },
       async (input) => {
@@ -16420,60 +16911,167 @@ Example workflow:
           }
         };
 
-        switch (input.action) {
-          case "status": {
-            const output = await runGit(["status", "--porcelain=v2", "--branch"]);
-            return { content: [{ type: "text" as const, text: output || "Working tree clean." }] };
-          }
-          case "diff": {
-            const args = ["diff"];
-            if (input.staged) args.push("--staged");
-            if (input.ref) args.push(input.ref);
-            if (input.path) args.push("--", input.path);
-            const output = await runGit(args);
-            return { content: [{ type: "text" as const, text: output || "No changes." }] };
-          }
-          case "log": {
-            const limit = input.limit || 20;
-            const args = ["log", `--max-count=${limit}`, "--format=%H %ai %an <%ae>%n  %s", "--no-decorate"];
-            if (input.ref) args.push(input.ref);
-            if (input.path) args.push("--", input.path);
-            const output = await runGit(args);
-            return { content: [{ type: "text" as const, text: output || "No commits." }] };
-          }
-          case "blame": {
-            if (!input.path) return errorResult("blame requires: path");
-            const args = ["blame", "--porcelain", input.path];
-            if (input.ref) args.splice(1, 0, input.ref);
-            const output = await runGit(args);
-            const summaryLines: string[] = [];
-            const blameLines = output.split("\n");
-            let currentCommit = "";
-            let currentAuthor = "";
-            let lineNum = 0;
-            for (const line of blameLines) {
-              if (/^[0-9a-f]{40}\s/.test(line)) {
-                const parts = line.split(" ");
-                currentCommit = parts[0].slice(0, 8);
-                lineNum = parseInt(parts[2] || "0", 10);
-              } else if (line.startsWith("author ")) {
-                currentAuthor = line.slice(7);
-              } else if (line.startsWith("\t")) {
-                summaryLines.push(`${currentCommit} (${currentAuthor}) L${lineNum}: ${line.slice(1)}`);
-              }
+        const localActions = new Set(["status", "diff", "log", "blame", "branches", "stash_list"]);
+        if (localActions.has(input.action)) {
+          switch (input.action) {
+            case "status": {
+              const output = await runGit(["status", "--porcelain=v2", "--branch"]);
+              return { content: [{ type: "text" as const, text: output || "Working tree clean." }] };
             }
-            return { content: [{ type: "text" as const, text: summaryLines.join("\n") || output }] };
+            case "diff": {
+              const args = ["diff"];
+              if (input.staged) args.push("--staged");
+              if (input.ref) args.push(input.ref);
+              if (input.path) args.push("--", input.path);
+              const output = await runGit(args);
+              return { content: [{ type: "text" as const, text: output || "No changes." }] };
+            }
+            case "log": {
+              const limit = input.limit || 20;
+              const args = ["log", `--max-count=${limit}`, "--format=%H %ai %an <%ae>%n  %s", "--no-decorate"];
+              if (input.ref) args.push(input.ref);
+              if (input.path) args.push("--", input.path);
+              const output = await runGit(args);
+              return { content: [{ type: "text" as const, text: output || "No commits." }] };
+            }
+            case "blame": {
+              if (!input.path) return errorResult("blame requires: path");
+              const args = ["blame", "--porcelain", input.path];
+              if (input.ref) args.splice(1, 0, input.ref);
+              const output = await runGit(args);
+              const summaryLines: string[] = [];
+              const blameLines = output.split("\n");
+              let currentCommit = "";
+              let currentAuthor = "";
+              let lineNum = 0;
+              for (const line of blameLines) {
+                if (/^[0-9a-f]{40}\s/.test(line)) {
+                  const parts = line.split(" ");
+                  currentCommit = parts[0].slice(0, 8);
+                  lineNum = parseInt(parts[2] || "0", 10);
+                } else if (line.startsWith("author ")) {
+                  currentAuthor = line.slice(7);
+                } else if (line.startsWith("\t")) {
+                  summaryLines.push(`${currentCommit} (${currentAuthor}) L${lineNum}: ${line.slice(1)}`);
+                }
+              }
+              return { content: [{ type: "text" as const, text: summaryLines.join("\n") || output }] };
+            }
+            case "branches": {
+              const output = await runGit(["branch", "-a", "--format=%(refname:short) %(objectname:short) %(subject)"]);
+              return { content: [{ type: "text" as const, text: output || "No branches." }] };
+            }
+            case "stash_list": {
+              const output = await runGit(["stash", "list"]);
+              return { content: [{ type: "text" as const, text: output || "No stashes." }] };
+            }
+            default:
+              return errorResult(`Unknown local vcs action: ${input.action}`);
           }
-          case "branches": {
-            const output = await runGit(["branch", "-a", "--format=%(refname:short) %(objectname:short) %(subject)"]);
-            return { content: [{ type: "text" as const, text: output || "No branches." }] };
-          }
-          case "stash_list": {
-            const output = await runGit(["stash", "list"]);
-            return { content: [{ type: "text" as const, text: output || "No stashes." }] };
-          }
+        }
+
+        let wsId = resolveWorkspaceId(input.workspace_id);
+        if (!wsId) {
+          return errorResult("Remote VCS actions require a workspace_id. Call init() first or pass workspace_id.");
+        }
+
+        const resolveRepoPath = (): string => {
+          if (input.repo_id) return `repos/${input.repo_id}`;
+          if (input.repo_ref) return `repos/${encodeURIComponent(input.repo_ref)}`;
+          return "repos";
+        };
+        const repoPath = resolveRepoPath();
+        const q: Record<string, string | number | boolean | undefined> = {
+          state: input.state,
+          per_page: input.per_page,
+          page: input.page,
+        };
+
+        switch (input.action) {
+          case "list_repos":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: "repos", query: q })) }] };
+          case "get_repo":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: repoPath })) }] };
+          case "sync_repo":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "POST", path: `${repoPath}/sync` })) }] };
+          case "list_pulls":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/pulls`, query: q })) }] };
+          case "get_pull":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/pulls/${input.pull_number}` })) }] };
+          case "get_pull_diff":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/pulls/${input.pull_number}/diff` })) }] };
+          case "get_pull_comments":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/pulls/${input.pull_number}/comments` })) }] };
+          case "get_pull_commits":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/pulls/${input.pull_number}/commits` })) }] };
+          case "get_pull_checks":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/pulls/${input.pull_number}/checks` })) }] };
+          case "get_pull_summary":
+          case "summarize_pull":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/pulls/${input.pull_number}/summary` })) }] };
+          case "review_pull":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "POST", path: `${repoPath}/pulls/${input.pull_number}/reviews`, body: { event: input.event || "COMMENT", body: input.body } })) }] };
+          case "comment_pull":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "POST", path: `${repoPath}/pulls/${input.pull_number}/comments`, body: { body: input.body } })) }] };
+          case "merge_pull":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "PUT", path: `${repoPath}/pulls/${input.pull_number}/merge`, body: input.data })) }] };
+          case "list_issues":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/issues`, query: q })) }] };
+          case "get_issue":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/issues/${input.issue_number}` })) }] };
+          case "create_issue":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "POST", path: `${repoPath}/issues`, body: { title: input.title, body: input.body, labels: input.labels } })) }] };
+          case "update_issue":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "PATCH", path: `${repoPath}/issues/${input.issue_number}`, body: { title: input.title, body: input.body, state: input.state, labels: input.labels, ...input.data } })) }] };
+          case "comment_issue":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "POST", path: `${repoPath}/issues/${input.issue_number}/comments`, body: { body: input.body } })) }] };
+          case "list_commits":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/commits`, query: { ...q, ref: input.ref } })) }] };
+          case "get_commit":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/commits/${input.ref}` })) }] };
+          case "get_commit_diff":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/commits/${input.ref}/diff` })) }] };
+          case "compare_refs":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/compare/${input.base_ref}...${input.ref}` })) }] };
+          case "list_branches_remote":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/branches`, query: q })) }] };
+          case "list_tags":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/tags`, query: q })) }] };
+          case "get_tree":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/tree`, query: { ref: input.ref, path: input.path } })) }] };
+          case "get_blob":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/blob`, query: { ref: input.ref, path: input.path } })) }] };
+          case "search_code":
+          case "search_vcs":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/search`, query: { q: input.query, ...q } })) }] };
+          case "get_activity":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/activity`, query: { limit: input.limit } })) }] };
+          case "list_notifications":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: "notifications", query: q })) }] };
+          case "mark_notification_read":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "PUT", path: `notifications/${input.notification_id}/read` })) }] };
+          case "mark_all_notifications_read":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "PUT", path: "notifications/read-all" })) }] };
+          case "list_links":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/links` })) }] };
+          case "create_link":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "POST", path: `${repoPath}/links`, body: input.data })) }] };
+          case "delete_link":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "DELETE", path: `${repoPath}/links/${input.link_id}` })) }] };
+          case "list_automations":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "GET", path: `${repoPath}/automations` })) }] };
+          case "create_automation":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "POST", path: `${repoPath}/automations`, body: input.data })) }] };
+          case "update_automation":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "PUT", path: `${repoPath}/automations/${input.automation_id}`, body: input.data })) }] };
+          case "delete_automation":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "DELETE", path: `${repoPath}/automations/${input.automation_id}` })) }] };
+          case "register_webhook":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "POST", path: `${repoPath}/webhooks`, body: input.data })) }] };
+          case "unregister_webhook":
+            return { content: [{ type: "text" as const, text: formatContent(await client.vcsApiRequest({ workspace_id: wsId, method: "DELETE", path: `${repoPath}/webhooks`, body: input.data })) }] };
           default:
-            return errorResult(`Unknown vcs action: ${input.action}`);
+            return errorResult(`Unknown vcs action: ${input.action}. Use 'status', 'diff', 'log', 'blame', 'branches', 'stash_list' for local git, or remote API actions like 'list_repos', 'list_pulls', 'list_issues', etc.`);
         }
       }
     );

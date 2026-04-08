@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
+import { homedir } from "node:os";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import { request, HttpError } from "./http.js";
@@ -155,7 +156,7 @@ export function isDecisionResult(item: Record<string, any>): boolean {
 type GraphTier = "none" | "lite" | "full";
 
 /**
- * Semantic intent classification from SmartRouter
+ * Semantic intent classification
  * Provides intent type, risk level, and capture suggestions
  */
 interface SemanticIntent {
@@ -169,6 +170,84 @@ interface SemanticIntent {
   extracted_entities?: string[];
   explanation?: string;
 }
+
+type ContextItemKind =
+  | "rule" | "lesson" | "decision" | "memory" | "knowledge_node"
+  | "code" | "flash" | "graph" | "instruction" | "tool_suggestion"
+  | "warning" | "synthesis" | "pack" | "suggested_rule"
+  | "vcs" | "preference" | "skill" | "transcript_snapshot" | "unknown";
+
+type Precedence = "always" | "critical" | "high" | "normal" | "low";
+
+const WIRE_CODE_TO_KIND: Record<string, ContextItemKind> = {
+  W: "rule", P: "rule", L: "lesson", D: "decision",
+  M: "memory", T: "memory", VC: "vcs", PR: "preference",
+  SK: "skill", TN: "transcript_snapshot", C: "code",
+  F: "flash", G: "graph", I: "instruction", TS: "tool_suggestion",
+  WA: "warning", SY: "synthesis", PK: "pack", SR: "suggested_rule",
+  KN: "knowledge_node",
+};
+
+const KIND_DEFAULT_PRECEDENCE: Record<ContextItemKind, Precedence> = {
+  rule: "always", lesson: "critical", decision: "high",
+  preference: "high", skill: "high",
+  memory: "normal", knowledge_node: "normal", code: "normal",
+  flash: "normal", instruction: "normal", tool_suggestion: "normal",
+  warning: "normal", synthesis: "normal", pack: "normal",
+  suggested_rule: "normal", vcs: "normal", transcript_snapshot: "normal",
+  graph: "low", unknown: "low",
+};
+
+interface SmartContextItem {
+  typ: string;
+  value: string;
+  score: number;
+  item_id?: string;
+  item_type?: string;
+}
+
+interface ContextManifest {
+  budget: number;
+  used: number;
+  included_count: number;
+  dropped_count: number;
+  degraded_subsystems: string[];
+}
+
+function resolveItemKind(item: SmartContextItem): ContextItemKind {
+  if (item.item_type) {
+    const lower = item.item_type.toLowerCase() as ContextItemKind;
+    if (lower in KIND_DEFAULT_PRECEDENCE) return lower;
+  }
+  return WIRE_CODE_TO_KIND[item.typ] || "unknown";
+}
+
+function resolveItemPrecedence(item: SmartContextItem): Precedence {
+  return KIND_DEFAULT_PRECEDENCE[resolveItemKind(item)] || "normal";
+}
+
+const PRECEDENCE_ORDER: Record<Precedence, number> = {
+  always: 0, critical: 1, high: 2, normal: 3, low: 4,
+};
+
+function sortContextItems(items: SmartContextItem[]): SmartContextItem[] {
+  return [...items].sort((a, b) => {
+    const pa = PRECEDENCE_ORDER[resolveItemPrecedence(a)] ?? 3;
+    const pb = PRECEDENCE_ORDER[resolveItemPrecedence(b)] ?? 3;
+    if (pa !== pb) return pa - pb;
+    return b.score - a.score;
+  });
+}
+
+function filterItemsByKind(items: SmartContextItem[], kind: ContextItemKind): SmartContextItem[] {
+  return items.filter((i) => resolveItemKind(i) === kind).sort((a, b) => b.score - a.score);
+}
+
+export {
+  type SmartContextItem, type ContextItemKind, type Precedence, type ContextManifest,
+  resolveItemKind, resolveItemPrecedence, sortContextItems, filterItemsByKind,
+  WIRE_CODE_TO_KIND, KIND_DEFAULT_PRECEDENCE,
+};
 
 function pickString(value: unknown): string | null {
   if (typeof value !== "string") return null;
@@ -321,6 +400,88 @@ function isMultiProjectFolder(folderPath: string): { isMultiProject: boolean; pr
   } catch {
     // If we can't read the directory, assume it's not multi-project
     return { isMultiProject: false, projectCount: 0, projectNames: [] };
+  }
+}
+
+const INDEX_KEEPER_INCREMENTAL_INTERVAL_MS = 10_000;
+const INDEX_KEEPER_AGING_INTERVAL_MS = 300_000;
+const INDEX_KEEPER_STALE_INTERVAL_MS = 60_000;
+const INDEX_KEEPER_AGING_THRESHOLD_HOURS = 4;
+const INDEX_KEEPER_AGING_MAX_FILES = 20_000;
+
+export class IndexKeeper {
+  private lastIncremental = 0;
+  private lastAging = 0;
+  private lastStale = 0;
+  private client: ContextStreamClient | null = null;
+
+  attach(client: ContextStreamClient) {
+    this.client = client;
+  }
+
+  private shouldFire(lastMs: number, intervalMs: number): boolean {
+    return Date.now() - lastMs >= intervalMs;
+  }
+
+  async tick(projectId?: string, folderPath?: string): Promise<void> {
+    if (!this.client || !projectId || !folderPath) return;
+    try {
+      await this.checkIncremental(projectId, folderPath);
+      await this.checkAgingRefresh(projectId, folderPath);
+    } catch { /* non-fatal */ }
+  }
+
+  private async checkIncremental(projectId: string, folderPath: string): Promise<void> {
+    if (!this.shouldFire(this.lastIncremental, INDEX_KEEPER_INCREMENTAL_INTERVAL_MS)) return;
+    this.lastIncremental = Date.now();
+    if (!this.client) return;
+    try {
+      await this.client.checkAndIndexChangedFiles();
+    } catch { /* non-fatal */ }
+  }
+
+  private async checkAgingRefresh(projectId: string, folderPath: string): Promise<void> {
+    if (!this.shouldFire(this.lastAging, INDEX_KEEPER_AGING_INTERVAL_MS)) return;
+    this.lastAging = Date.now();
+    if (!this.client) return;
+
+    const ageHours = this.client.localIndexAgeHours(folderPath);
+    if (ageHours === null || ageHours < INDEX_KEEPER_AGING_THRESHOLD_HOURS) return;
+
+    console.error(`[ContextStream] IndexKeeper: aging refresh for ${folderPath} (${ageHours}h old)`);
+    try {
+      await this.client.ingestLocal({
+        projectId,
+        rootPath: folderPath,
+        maxFiles: INDEX_KEEPER_AGING_MAX_FILES,
+      });
+    } catch (e) {
+      console.error(`[ContextStream] IndexKeeper aging refresh failed:`, e);
+    }
+  }
+
+  maybeTriggerStaleReingest(params: {
+    projectId: string;
+    folderPath: string;
+    freshness: string;
+  }): string | undefined {
+    if (params.freshness !== "stale") return undefined;
+    if (!this.shouldFire(this.lastStale, INDEX_KEEPER_STALE_INTERVAL_MS)) return undefined;
+    this.lastStale = Date.now();
+    if (!this.client) return undefined;
+
+    const client = this.client;
+    const pid = params.projectId;
+    const fp = params.folderPath;
+    setImmediate(async () => {
+      try {
+        await client.ingestLocal({ projectId: pid, rootPath: fp });
+        console.error(`[ContextStream] IndexKeeper: stale re-ingest completed for ${fp}`);
+      } catch (e) {
+        console.error(`[ContextStream] IndexKeeper stale re-ingest failed:`, e);
+      }
+    });
+    return `Started background re-index for ${fp} because the current index is stale.`;
   }
 }
 
@@ -1753,6 +1914,21 @@ export class ContextStreamClient {
     });
   }
 
+  async ingestFromPath(projectId: string, pathStr: string, opts?: {
+    force?: boolean;
+    include_media?: boolean;
+    max_files?: number;
+  }): Promise<any> {
+    return request(this.config, `/projects/${projectId}/files/ingest-from-path`, {
+      body: {
+        path: pathStr,
+        force: opts?.force ?? false,
+        include_media: opts?.include_media ?? false,
+        max_files: opts?.max_files,
+      },
+    });
+  }
+
   /**
    * High-level local ingest: reads files from disk, applies SHA-256 content
    * hash filtering, batches, and sends to the API with cooldown/status handling.
@@ -1829,8 +2005,24 @@ export class ContextStreamClient {
           }
         }
       } catch (e) {
-        console.error(`[ContextStream] Batch ingest error:`, e);
-        // Continue with next batch on transient failure
+        console.error(`[ContextStream] Batch ingest error (attempt 1):`, e);
+        try {
+          const retryResult = (await this.ingestFiles(projectId, filteredBatch, ingestOptions)) as {
+            data?: IngestApiData;
+          };
+          const data = retryResult.data;
+          if (data) {
+            filesIndexed += data.files_indexed ?? 0;
+            apiSkipped += data.files_skipped ?? 0;
+            lastStatus = data.status;
+            if (data.status === "cooldown" || data.status === "daily_limit_exceeded") {
+              abortedEarly = true;
+              break;
+            }
+          }
+        } catch (retryErr) {
+          console.error(`[ContextStream] Batch ingest retry failed:`, retryErr);
+        }
       }
     }
 
@@ -1911,6 +2103,29 @@ export class ContextStreamClient {
     this.indexChangedFilesAsync().catch(() => {
       // Silently ignore errors - this is best-effort
     });
+  }
+
+  localIndexAgeHours(folderPath: string): number | null {
+    try {
+      const resolvedFolder = path.resolve(folderPath);
+      const fs = require("node:fs");
+      const statusPath = path.join(homedir(), ".contextstream", "index-status.json");
+      const raw = fs.readFileSync(statusPath, "utf-8");
+      const status = JSON.parse(raw);
+      const projects = status.projects ?? {};
+      for (const [projectPath, info] of Object.entries(projects) as [string, any][]) {
+        const resolvedProjectPath = path.resolve(projectPath);
+        if (resolvedFolder === resolvedProjectPath || resolvedFolder.startsWith(`${resolvedProjectPath}${path.sep}`)) {
+          if (info?.indexed_at) {
+            const ageMs = Date.now() - new Date(info.indexed_at).getTime();
+            return Math.floor(ageMs / 3_600_000);
+          }
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -3999,10 +4214,13 @@ export class ContextStreamClient {
       threshold_warning: boolean;
       suggested_action: "none" | "prepare_save" | "save_now";
     };
-    /** Dynamic instructions from SmartRouter */
+    /** Dynamic instructions */
     instructions?: string;
-    /** Semantic intent classification from SmartRouter (Pro+ tiers) */
+    /** Semantic intent classification (Pro+ tiers) */
     semantic_intent?: SemanticIntent;
+    items?: SmartContextItem[];
+    manifest?: ContextManifest;
+    matched_skills_typed?: Array<{ name: string; instruction_preview?: string }>;
   }> {
     const withDefaults = this.withDefaults(params);
     const maxTokens = params.max_tokens || 800;
@@ -4420,6 +4638,81 @@ export class ContextStreamClient {
       ...(warnings.length > 0 && { warnings }), // Include version warnings
       ...(this.indexRefreshInProgress ? { index_status: "refreshing" as const } : {}),
     };
+  }
+
+  async getContextFast(params: {
+    workspace_id?: string;
+    project_id?: string;
+  }): Promise<{ context: string; items?: SmartContextItem[]; action_required?: any } | null> {
+    const withDefaults = this.withDefaults(params);
+    if (!withDefaults.workspace_id) return null;
+    try {
+      const result = await request(this.config, "/context/hook", {
+        body: withDefaults,
+        timeoutMs: 5000,
+      }) as any;
+      const data = result?.data ?? result ?? {};
+      return {
+        context: data.context || "",
+        items: Array.isArray(data.items) ? data.items : undefined,
+        action_required: data.action_required,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async getVcsRepos(params: {
+    workspace_id: string;
+    per_page?: number;
+  }): Promise<any[]> {
+    try {
+      const result = await request(this.config, `/integrations/workspaces/${params.workspace_id}/vcs/repos`, {
+        method: "GET",
+        timeoutMs: 3000,
+      }) as any;
+      return Array.isArray(result?.data) ? result.data : Array.isArray(result) ? result : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async getVcsResource(params: {
+    workspace_id: string;
+    path: string;
+    per_page?: number;
+  }): Promise<any[]> {
+    const qs = params.per_page ? `?per_page=${params.per_page}` : "";
+    try {
+      const result = await request(this.config, `/integrations/workspaces/${params.workspace_id}/vcs/${params.path}${qs}`, {
+        method: "GET",
+        timeoutMs: 4000,
+      }) as any;
+      return Array.isArray(result?.data) ? result.data : Array.isArray(result) ? result : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async vcsApiRequest(params: {
+    workspace_id: string;
+    method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+    path: string;
+    body?: any;
+    query?: Record<string, string | number | boolean | undefined>;
+  }): Promise<any> {
+    const queryParts: string[] = [];
+    if (params.query) {
+      for (const [k, v] of Object.entries(params.query)) {
+        if (v !== undefined && v !== null) queryParts.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`);
+      }
+    }
+    const qs = queryParts.length > 0 ? `?${queryParts.join("&")}` : "";
+    const url = `/integrations/workspaces/${params.workspace_id}/vcs/${params.path}${qs}`;
+    return request(this.config, url, {
+      method: params.method,
+      ...(params.body ? { body: params.body } : {}),
+    });
   }
 
   /**

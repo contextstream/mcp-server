@@ -378,6 +378,7 @@ export async function readFilesFromDirectory(
     } catch {
       return; // Skip directories we can't read
     }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
 
     for (const entry of entries) {
       if (files.length >= maxFiles) break;
@@ -490,6 +491,7 @@ export async function* readAllFilesInBatches(
     } catch {
       return;
     }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
 
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
@@ -627,6 +629,7 @@ export async function* readChangedFilesInBatches(
     } catch {
       return;
     }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
 
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
@@ -763,6 +766,7 @@ export async function countIndexableFiles(
     } catch {
       return;
     }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
 
     for (const entry of entries) {
       if (count >= maxFiles) {

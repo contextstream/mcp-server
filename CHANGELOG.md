@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.72
+
+**Feature parity pass 2: search quality, smart context surfacing, full VCS API, IndexKeeper.**
+
+### Search Quality
+
+- **Artifact path filtering** — Post-API filtering removes results from `.next/`, `node_modules/`, `dist/`, `build/`, `target/`, `coverage/`, `archives-ignore/`, and source map files. Bypassed for `pattern`/`exhaustive` modes and queries targeting artifacts.
+- **Mode escalation** — When primary mode returns 0 results, progressively retries broader modes (semantic -> hybrid -> keyword, etc.).
+- **Scope-invalid candidate skipping** — Search fallback loop now skips candidates returning `project_access_denied` or `scope_invalid`, trying the next candidate instead of returning empty.
+- **Path canonicalization** — Strips internal storage prefixes (`contextstream-ai-brain-export/`, `web/users/`, `.claude/worktrees/`) and deduplicates results by canonical path.
+- **Parallel ripgrep pre-fetch** — For identifier queries, spawns ripgrep in parallel with the API call (not just zero-result fallback). Merges deduplicated results.
+- **Symbol anchor reranking** — Extracts symbol-like tokens from queries and promotes results matching those tokens, demoting artifact/doc paths.
+- **Concise tool text** — New `CONTEXTSTREAM_CONCISE_TOOL_TEXT` env var (default: on). Suppresses mode selection notes and hot-path details when results are present.
+- **Stale project_id messaging** — Invalid project IDs now return "Do NOT pass this project_id again" to prevent AI from repeating bad IDs.
+
+### Smart Context Surfacing
+
+- **Typed context items** — New `SmartContextItem`, `ContextItemKind`, `Precedence`, `ContextManifest` types with wire code mapping (W/P->Rule, L->Lesson, D->Decision, VC->Vcs, PR->Preference, SK->Skill, TN->TranscriptSnapshot).
+- **Three-tier context path** — Fast mode (~20-50ms cached response), warm cache (30s TTL for turns 2+), and full smart call. Reduces latency on subsequent turns.
+- **Typed item rendering** — When API returns `items[]`, renders by kind with precedence ordering. Formatting helpers for preferences, lessons, VCS, skills, and transcript snapshots. Compact mode uses terse `[PREF]`, `[LESSON]`, `[VCS]` tags.
+- **Proactive VCS context** — On early turns (<= 3), parallel fetch of open PRs, issues from linked VCS repos. Deduplicates against server-provided typed VCS items.
+- **Proactive recent changes** — On turns <= 2, parallel `git log --oneline -5` appended as `[RECENT_CHANGES]` block.
+
+### VCS API Integration
+
+- **Full 49-action VCS proxy** — Expanded from 6 local git actions to full API coverage: repos (list/get/sync), pull requests (list/get/diff/comments/commits/checks/summary/review/comment/merge), issues (list/get/create/update/comment), commits (list/get/diff/compare), branches/tags, tree/blob, search, activity, notifications, links, automations, webhooks.
+- **VCS client methods** — `vcsApiRequest()`, `getVcsRepos()`, `getVcsResource()` added to client.
+
+### Project & Index Maintenance
+
+- **HTTP transport ingest delegation** — When `ingest_local` path doesn't exist locally, delegates to API via `POST /projects/{id}/files/ingest-from-path`.
+- **IndexKeeper** — Background maintenance service: incremental check (10s), aging refresh (5min, index > 4h, 20k file cap), stale re-ingest (60s, triggered post-search).
+- **Batch retry** — Failed ingest batches are retried once before continuing to the next batch.
+- **Deterministic file walk** — All `walkDir` functions now sort directory entries by name for consistent hash manifests.
+
 ## 0.4.71
 
 **Feature parity with Rust MCP v0.2.22, 8 GitHub issue fixes, and search enrichment.**

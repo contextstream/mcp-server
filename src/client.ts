@@ -4133,14 +4133,16 @@ export class ContextStreamClient {
         for (const item of memory.items) {
           const createdAt = item.created_at || "";
           if (createdAt > params.since) {
-            const type = item.metadata?.original_type || "memory";
+            const isDecision = isDecisionResult(item as Record<string, any>);
+            const isLesson = isLessonResult(item as Record<string, any>);
+            const type = isDecision ? "decision" : isLesson ? "lesson" : extractEffectiveEventType(item as Record<string, any>);
             items.push({
               type,
               title: item.title || "Untitled",
               created_at: createdAt,
             });
 
-            if (type === "decision") newDecisions++;
+            if (isDecision) newDecisions++;
             else newMemory++;
           }
         }
@@ -4717,7 +4719,7 @@ export class ContextStreamClient {
 
   /**
    * Get high-priority lessons that should be surfaced proactively.
-   * Returns critical and high severity lessons for warnings.
+   * Returns lessons found via semantic search, with event listing fallback.
    */
   async getHighPriorityLessons(params: {
     workspace_id: string;
@@ -4734,8 +4736,34 @@ export class ContextStreamClient {
   > {
     const limit = params.limit || 5;
 
+    const mapLesson = (item: any) => {
+      const tags = extractEventTags(item as Record<string, any>);
+      const severityTag = tags.find((t: string) => t.startsWith("severity:"));
+      const severity = severityTag?.split(":")[1] || item.metadata?.importance || "medium";
+      const category =
+        tags.find((t: string) =>
+          [
+            "workflow",
+            "code_quality",
+            "verification",
+            "communication",
+            "project_specific",
+          ].includes(t)
+        ) || "unknown";
+
+      const content = item.content || "";
+      const preventionMatch = content.match(/### Prevention\n([\s\S]*?)(?:\n\n|\n\*\*|$)/);
+      const prevention = preventionMatch?.[1]?.trim() || content.slice(0, 1000);
+
+      return {
+        title: item.title || "Lesson",
+        severity,
+        category,
+        prevention,
+      };
+    };
+
     try {
-      // Search for lessons, prioritizing those relevant to the context
       const searchQuery = params.context_hint
         ? `${params.context_hint} lesson warning prevention mistake`
         : "lesson warning prevention mistake critical high";
@@ -4744,7 +4772,7 @@ export class ContextStreamClient {
         query: searchQuery,
         workspace_id: params.workspace_id,
         project_id: params.project_id,
-        limit: limit * 2, // Fetch more to filter
+        limit: limit * 2,
       })) as {
         results?: Array<{
           title?: string;
@@ -4753,50 +4781,30 @@ export class ContextStreamClient {
         }>;
       };
 
-      if (!searchResult?.results) return [];
+      if (searchResult?.results) {
+        const lessons = searchResult.results
+          .filter((item) => isLessonResult(item as Record<string, any>))
+          .slice(0, limit)
+          .map(mapLesson);
 
-      // Filter for lessons with high/critical severity — use isLessonResult()
-      // to catch events where event_type was normalized (Issue #31)
-      const lessons = searchResult.results
-        .filter((item) => {
-          if (!isLessonResult(item as Record<string, any>)) return false;
+        if (lessons.length > 0) return lessons;
+      }
 
-          // Get severity from tags or importance
-          const tags = extractEventTags(item as Record<string, any>);
-          const severityTag = tags.find((t: string) => t.startsWith("severity:"));
-          const severity = severityTag?.split(":")[1] || item.metadata?.importance || "medium";
-          return severity === "critical" || severity === "high";
-        })
-        .slice(0, limit)
-        .map((item) => {
-          const tags = extractEventTags(item as Record<string, any>);
-          const severityTag = tags.find((t: string) => t.startsWith("severity:"));
-          const severity = severityTag?.split(":")[1] || item.metadata?.importance || "medium";
-          const category =
-            tags.find((t: string) =>
-              [
-                "workflow",
-                "code_quality",
-                "verification",
-                "communication",
-                "project_specific",
-              ].includes(t)
-            ) || "unknown";
+      // Fallback: list events with lesson tag when semantic search misses
+      const eventResult = (await this.listMemoryEvents({
+        workspace_id: params.workspace_id,
+        event_type: "lesson",
+        limit: limit * 2,
+      })) as { items?: any[] };
 
-          // Extract prevention from content — increased truncation limit (200→1000)
-          const content = item.content || "";
-          const preventionMatch = content.match(/### Prevention\n([\s\S]*?)(?:\n\n|\n\*\*|$)/);
-          const prevention = preventionMatch?.[1]?.trim() || content.slice(0, 1000);
+      if (eventResult?.items) {
+        return eventResult.items
+          .filter((item: any) => isLessonResult(item as Record<string, any>))
+          .slice(0, limit)
+          .map(mapLesson);
+      }
 
-          return {
-            title: item.title || "Lesson",
-            severity,
-            category,
-            prevention,
-          };
-        });
-
-      return lessons;
+      return [];
     } catch {
       return [];
     }

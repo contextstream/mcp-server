@@ -12220,7 +12220,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               context_hint: input.query,
               limit: input.limit,
             });
-            let lessons = (result as any)?.data?.lessons || (result as any)?.lessons || [];
+            let lessons = Array.isArray(result) ? result : (result as any)?.data?.lessons || (result as any)?.lessons || [];
             if (Array.isArray(lessons) && lessons.length > 1) {
               const seen = new Set<string>();
               lessons = lessons.filter((lesson: any) => {
@@ -12229,12 +12229,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 seen.add(key);
                 return true;
               });
-              if ((result as any)?.data?.lessons) (result as any).data.lessons = lessons;
-              else if ((result as any)?.lessons) (result as any).lessons = lessons;
             }
             const resultWithHint = (Array.isArray(lessons) && lessons.length === 0)
-              ? { ...(result as object), hint: getEmptyStateHint("get_lessons") }
-              : result;
+              ? { lessons: [], hint: getEmptyStateHint("get_lessons") }
+              : { lessons };
             return {
               content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
 
@@ -12409,6 +12407,20 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.query) {
               return errorResult("decision_trace requires: query");
             }
+            const doFallback = async () => {
+              const events = await client.listMemoryEvents({
+                workspace_id: workspaceId,
+                project_id: projectId,
+                limit: 50,
+              }).catch(() => ({ items: [] })) as { items?: any[] };
+              const decisions = (events?.items || []).filter((item: any) => isDecisionResult(item));
+              const queryLower = (input.query || "").toLowerCase();
+              const matched = decisions.filter((d: any) => {
+                const text = `${d.title || ""} ${d.content || ""}`.toLowerCase();
+                return queryLower.split(/\s+/).some((w: string) => w.length > 2 && text.includes(w));
+              }).slice(0, input.limit || 10);
+              return matched;
+            };
             try {
               const result = await client.decisionTrace({
                 workspace_id: workspaceId,
@@ -12417,6 +12429,23 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 include_impact: input.include_impact,
                 limit: input.limit,
               });
+              const resultDecisions = (result as any)?.decisions || (result as any)?.data?.decisions || [];
+              if (Array.isArray(resultDecisions) && resultDecisions.length === 0) {
+                const fallbackDecisions = await doFallback();
+                if (fallbackDecisions.length > 0) {
+                  return {
+                    content: [{
+                      type: "text" as const,
+                      text: formatContent({
+                        decisions: fallbackDecisions,
+                        total: fallbackDecisions.length,
+                        fallback_reason: "api_empty_result",
+                        hint: "Decision trace used event listing fallback because the API returned no results.",
+                      }),
+                    }],
+                  };
+                }
+              }
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
                 
@@ -12425,17 +12454,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               const isTimeout = err?.message?.toLowerCase().includes("timeout") ||
                 err?.message?.toLowerCase().includes("embedding timed out");
               if (!isTimeout) throw err;
-              const events = await client.listMemoryEvents({
-                workspace_id: workspaceId,
-                project_id: projectId,
-                limit: 50,
-              }).catch(() => ({ items: [] })) as { items?: any[] };
-              const decisions = (events?.items || []).filter((item: any) => isDecisionResult(item));
-              const queryLower = input.query.toLowerCase();
-              const matched = decisions.filter((d: any) => {
-                const text = `${d.title || ""} ${d.content || ""}`.toLowerCase();
-                return queryLower.split(/\s+/).some((w: string) => w.length > 2 && text.includes(w));
-              }).slice(0, input.limit || 10);
+              const matched = await doFallback();
               return {
                 content: [{
                   type: "text" as const,

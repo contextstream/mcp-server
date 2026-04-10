@@ -63,6 +63,30 @@ type ToolTextResult = {
   isError?: boolean;
 };
 
+/**
+ * Zod schema that accepts either a real JSON array or a JSON-encoded string
+ * of an array. LLMs sometimes serialize array parameters as strings like
+ * '["a","b"]' instead of actual arrays, causing validation errors.
+ */
+function stringOrArray<T extends z.ZodTypeAny>(itemSchema: T) {
+  return z.union([
+    z.array(itemSchema),
+    z.string().transform((val, ctx) => {
+      try {
+        const parsed = JSON.parse(val);
+        if (!Array.isArray(parsed)) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Expected array or JSON string of array" });
+          return z.NEVER;
+        }
+        return parsed;
+      } catch {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Invalid JSON string for array parameter" });
+        return z.NEVER;
+      }
+    }),
+  ]);
+}
+
 const execFileAsync = promisify(execFile);
 
 function parseBoolEnvDefault(raw: string | undefined, fallback: boolean): boolean {
@@ -4707,7 +4731,7 @@ export function registerTools(
       .boolean()
       .optional()
       .describe("Force version bump even with no new entries (for push)"),
-    ids: z.array(z.string()).optional().describe("Entry IDs to acknowledge (for ack)"),
+    ids: stringOrArray(z.string()).optional().describe("Entry IDs to acknowledge (for ack)"),
     expected_version: z.number().optional().describe("Expected version for checkpoint verify"),
   });
 
@@ -5900,9 +5924,9 @@ Actions:
         title: z.string().optional().describe("Skill display title"),
         description: z.string().optional().describe("Skill description"),
         instruction_body: z.string().optional().describe("Markdown instruction text (the prompt)"),
-        trigger_patterns: z.array(z.string()).optional().describe("Keywords/phrases for auto-activation"),
+        trigger_patterns: stringOrArray(z.string()).optional().describe("Keywords/phrases for auto-activation"),
         trigger_regex: z.string().optional().describe("Optional regex for advanced trigger matching"),
-        categories: z.array(z.string()).optional().describe("Tags for discovery/filtering"),
+        categories: stringOrArray(z.string()).optional().describe("Tags for discovery/filtering"),
         actions: z.any().optional().describe("Action steps array [{type, tool, params, ...}]"),
         params: z.any().optional().describe("Parameters passed to skill execution"),
         dry_run: z.boolean().optional().describe("Preview execution without running"),
@@ -5915,7 +5939,7 @@ Actions:
         format: z.enum(["auto", "json", "markdown", "skills_md", "cursorrules", "claude_md", "aider", "zip"]).optional().describe("Import/export format"),
         source_tool: z.string().optional().describe("Source tool name (for import provenance)"),
         source_file: z.string().optional().describe("Source filename (for import provenance)"),
-        skill_ids: z.array(z.string()).optional().describe("Skill IDs for export"),
+        skill_ids: stringOrArray(z.string()).optional().describe("Skill IDs for export"),
         change_summary: z.string().optional().describe("Summary of changes (for version history)"),
         workspace_id: z.string().optional().describe("Workspace ID (UUID)"),
         project_id: z.string().optional().describe("Project ID (UUID)"),
@@ -6077,7 +6101,7 @@ Actions:
         workspace_id: z.string().uuid().optional(),
         project_id: z.string().uuid().optional(),
         limit: z.number().optional(),
-        tags: z.array(z.string()).optional().describe("Filter events that contain ALL of these tags"),
+        tags: stringOrArray(z.string()).optional().describe("Filter events that contain ALL of these tags"),
         event_type: z.string().optional().describe("Filter by event type (e.g. decision, lesson, manual_note)"),
       }),
     },
@@ -6158,7 +6182,7 @@ Actions:
         workspace_id: z.string().uuid().optional(),
         project_id: z.string().uuid().optional(),
         limit: z.number().optional(),
-        tags: z.array(z.string()).optional().describe("Filter results that contain ALL of these tags"),
+        tags: stringOrArray(z.string()).optional().describe("Filter results that contain ALL of these tags"),
       }),
     },
     async (input) => {
@@ -7915,7 +7939,7 @@ Use this to persist decisions, insights, preferences, or important information.`
           .describe("Type of context being captured"),
         title: z.string().describe("Brief title for the captured context"),
         content: z.string().describe("Full content/details to capture"),
-        tags: z.array(z.string()).optional().describe("Tags for categorization"),
+        tags: stringOrArray(z.string()).optional().describe("Tags for categorization"),
         importance: z
           .enum(["low", "medium", "high", "critical"])
           .optional()
@@ -9191,7 +9215,7 @@ After compression, the AI can use session_recall to retrieve this context in fut
         project_id: z.string().uuid().optional(),
         title: z.string(),
         description: z.string().optional(),
-        goals: z.array(z.string()).optional(),
+        goals: stringOrArray(z.string()).optional(),
         steps: z
           .array(
             z.object({
@@ -9204,7 +9228,7 @@ After compression, the AI can use session_recall to retrieve this context in fut
           )
           .optional(),
         status: z.enum(["draft", "active", "completed", "archived", "abandoned"]).optional(),
-        tags: z.array(z.string()).optional(),
+        tags: stringOrArray(z.string()).optional(),
         due_at: z.string().optional(),
         is_personal: z.boolean().optional(),
       }),
@@ -9244,7 +9268,7 @@ After compression, the AI can use session_recall to retrieve this context in fut
         plan_id: z.string().uuid(),
         title: z.string().optional(),
         description: z.string().optional(),
-        goals: z.array(z.string()).optional(),
+        goals: stringOrArray(z.string()).optional(),
         status: z.enum(["draft", "active", "completed", "archived", "abandoned"]).optional(),
       }),
     },
@@ -10705,7 +10729,7 @@ Example prompts:
         workspace_id: z.string().uuid().optional(),
         query: z.string().describe("Search query"),
         limit: z.number().optional().describe("Maximum results (default: 20)"),
-        sources: z.array(z.string()).optional().describe("Filter by source: github, slack"),
+        sources: stringOrArray(z.string()).optional().describe("Filter by source: github, slack"),
         days: z.number().optional().describe("Filter to results within N days"),
         sort_by: z
           .enum(["relevance", "recent", "engagement"])
@@ -10791,7 +10815,7 @@ Example prompts:
           .optional()
           .describe("Filter by knowledge type"),
         query: z.string().optional().describe("Optional search query to filter knowledge"),
-        sources: z.array(z.string()).optional().describe("Filter by source: github, slack"),
+        sources: stringOrArray(z.string()).optional().describe("Filter by source: github, slack"),
         limit: z.number().optional().describe("Maximum items to return (default: 20)"),
       }),
     },
@@ -11009,7 +11033,7 @@ Example: Create a reminder to "Review PR #123" for tomorrow at 10am with high pr
           .enum(["low", "normal", "high", "urgent"])
           .optional()
           .describe("Priority level (default: normal)"),
-        keywords: z.array(z.string()).optional().describe("Keywords for contextual surfacing"),
+        keywords: stringOrArray(z.string()).optional().describe("Keywords for contextual surfacing"),
         recurrence: z
           .enum(["daily", "weekly", "monthly"])
           .optional()
@@ -12023,7 +12047,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .optional()
             .describe("Event type for capture"),
           importance: z.enum(["low", "medium", "high", "critical"]).optional(),
-          tags: z.array(z.string()).optional(),
+          tags: stringOrArray(z.string()).optional(),
           // Lesson-specific
           category: z
             .enum(["workflow", "code_quality", "verification", "communication", "project_specific"])
@@ -12032,7 +12056,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           impact: z.string().optional().describe("What went wrong"),
           prevention: z.string().optional().describe("How to prevent in future"),
           severity: z.enum(["low", "medium", "high", "critical"]).optional(),
-          keywords: z.array(z.string()).optional(),
+          keywords: stringOrArray(z.string()).optional(),
           // Other params
           since: z.string().optional().describe("ISO timestamp for delta"),
           limit: z.number().optional(),
@@ -12063,7 +12087,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           // Plan-specific params
           plan_id: z.string().uuid().optional().describe("Plan ID for get_plan/update_plan"),
           description: z.string().optional().describe("Description for capture_plan"),
-          goals: z.array(z.string()).optional().describe("Goals for capture_plan"),
+          goals: stringOrArray(z.string()).optional().describe("Goals for capture_plan"),
           steps: z
             .array(
               z.object({
@@ -12104,7 +12128,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .enum(["accept", "reject", "modify"])
             .optional()
             .describe("Action to perform on suggested rule"),
-          modified_keywords: z.array(z.string()).optional().describe("Modified keywords when action is modify"),
+          modified_keywords: stringOrArray(z.string()).optional().describe("Modified keywords when action is modify"),
           modified_instruction: z.string().optional().describe("Modified instruction when action is modify"),
           min_confidence: z.number().optional().describe("Minimum confidence threshold for listing rules"),
         }),
@@ -13146,9 +13170,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .optional()
             .describe("Task priority"),
           order: z.number().optional().describe("Task order within plan"),
-          task_ids: z.array(z.string().uuid()).optional().describe("Task IDs for reorder_tasks"),
+          task_ids: stringOrArray(z.string().uuid()).optional().describe("Task IDs for reorder_tasks"),
           blocked_reason: z.string().optional().describe("Reason when task is blocked"),
-          tags: z.array(z.string()).optional().describe("Tags for event or task categorization"),
+          tags: stringOrArray(z.string()).optional().describe("Tags for event or task categorization"),
           // Batch import params
           events: z
             .array(
@@ -13176,7 +13200,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                     })
                   )
                   .optional(),
-                tags: z.array(z.string()).optional(),
+                tags: stringOrArray(z.string()).optional(),
                 occurred_at: z.string().optional().describe("ISO timestamp for when the event occurred"),
               })
             )
@@ -15167,7 +15191,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .describe("Which branch takes priority: default_branch_wins (default), newest_wins, feature_branch_wins"),
           conflict_resolution: z.enum(["newest_timestamp", "default_branch", "manual"]).optional()
             .describe("How to resolve conflicts: newest_timestamp (default), default_branch, manual"),
-          allowed_machines: z.array(z.string()).optional()
+          allowed_machines: stringOrArray(z.string()).optional()
             .describe("List of allowed machine IDs (empty = all allowed)"),
           auto_sync_enabled: z.boolean().optional()
             .describe("Whether to auto-sync from all machines (default: true)"),
@@ -15393,7 +15417,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           remind_at: z.string().optional().describe("ISO 8601 datetime"),
           priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
           recurrence: z.enum(["daily", "weekly", "monthly"]).optional(),
-          keywords: z.array(z.string()).optional(),
+          keywords: stringOrArray(z.string()).optional(),
           // Snooze params
           until: z.string().optional().describe("ISO 8601 datetime"),
           // Filter params
@@ -16241,7 +16265,7 @@ Example workflow:
             ),
           fps: z.number().optional().describe("Frames per second for remotion format (default: 30)"),
           // Common params
-          tags: z.array(z.string()).optional().describe("Tags to associate with media"),
+          tags: stringOrArray(z.string()).optional().describe("Tags to associate with media"),
           limit: z.number().optional().describe("Maximum results to return"),
         }),
       },
@@ -16681,7 +16705,7 @@ Example workflow:
           category: z.string().optional(),
           // For editor_rules
           folder_path: z.string().optional(),
-          editors: z.array(z.string()).optional(),
+          editors: stringOrArray(z.string()).optional(),
           mode: z.enum(["minimal", "full", "bootstrap"]).optional(),
           dry_run: z.boolean().optional(),
           workspace_id: z.string().uuid().optional(),
@@ -16903,7 +16927,7 @@ Remote API actions: list_repos, get_repo, sync_repo, list_pulls, get_pull, get_p
           title: z.string().optional().describe("Title for create_issue"),
           body: z.string().optional().describe("Body content"),
           state: z.string().optional().describe("State filter (open/closed)"),
-          labels: z.array(z.string()).optional().describe("Labels for issues"),
+          labels: stringOrArray(z.string()).optional().describe("Labels for issues"),
           per_page: z.number().optional().describe("Results per page"),
           page: z.number().optional().describe("Page number"),
           event: z.string().optional().describe("Review event (APPROVE/REQUEST_CHANGES/COMMENT)"),

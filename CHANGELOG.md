@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Parity + Issue Remediation
+
+- Added adaptive ingest behavior for 413 payload errors with recursive batch splitting, conservative payload limits, and oversized serialized-file skipping.
+- Wired `project(action="files")` pagination/filter arguments through to the API client and improved `project(action="index_status")` diagnostics when pending file paths are not returned by the backend.
+- Improved session resiliency: `getHighPriorityLessons`, `getContextSummary`, `getContextDelta`, and `decision_trace` now log actionable fallback diagnostics and continue with fallback flows where possible.
+- Added compatibility metadata support for `session(action="capture", agent, mode)` by encoding these values into tags/content so current APIs remain queryable.
+- Clarified graph timeout failures with targeted remediation hints for `graph(action="dependencies")`.
+
+### Ownership Notes
+
+- Issues tied to Desktop/Web products (e.g. Windows updater binary packaging, dashboard buttons/version display, Atlas visualization UI) require changes outside this repository.
+- This repository now surfaces clearer diagnostics for those backend/UI-coupled cases, but full resolution for those issues remains in the owning product repositories/services.
+
 ## 0.4.72
 
 **Feature parity pass 2: search quality, smart context surfacing, full VCS API, IndexKeeper.**

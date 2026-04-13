@@ -50,6 +50,7 @@ import {
   apiResultReportsIndexed,
   classifyIndexConfidence,
   classifyIndexFreshness,
+  extractPendingFilePaths,
   extractIndexTimestamp,
   indexHistoryEntryCount,
 } from "./project-index-utils.js";
@@ -5338,7 +5339,25 @@ Examples:
 
         const parsed = operation.inputSchema.safeParse(input.arguments || {});
         if (!parsed.success) {
-          return errorResult(`Invalid arguments for ${input.name}: ${parsed.error.message}`);
+          const details = parsed.error.issues
+            .map((issue) => {
+              const path = issue.path.length > 0 ? issue.path.join(".") : "input";
+              const rawValue =
+                issue.path.length > 0
+                  ? issue.path.reduce<any>((acc, key) => (acc && typeof acc === "object" ? acc[key] : undefined), input.arguments || {})
+                  : input.arguments;
+              const rawText = typeof rawValue === "string" ? rawValue.trim() : "";
+              const prefixHint =
+                issue.code === "invalid_string" &&
+                issue.validation === "uuid" &&
+                /^[0-9a-f]{8,}$/i.test(rawText) &&
+                rawText.length < 36
+                  ? ` (UUID prefix '${rawText}' detected; provide full UUID or wait for prefix resolution support)`
+                  : "";
+              return `${path}: ${issue.message}${prefixHint}`;
+            })
+            .join("; ");
+          return errorResult(`Invalid arguments for ${input.name}: ${details || parsed.error.message}`);
         }
 
         return operation.handler(parsed.data);
@@ -12026,6 +12045,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           query: z.string().optional().describe("Query for recall/search/lessons/decision_trace"),
           content: z.string().optional().describe("Content for capture/remember/compress"),
           title: z.string().optional().describe("Title for capture/capture_lesson/capture_plan"),
+          agent: z.string().optional().describe("Agent name metadata for capture/search filtering"),
+          mode: z.string().optional().describe("Mode metadata for capture/search filtering (e.g., primary/subagent)"),
           event_type: z
             .enum([
               "decision",
@@ -12143,14 +12164,25 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.event_type || !input.title || !input.content) {
               return errorResult("capture requires: event_type, title, content");
             }
+            const captureTags = Array.isArray(input.tags) ? [...input.tags] : [];
+            if (input.agent) {
+              captureTags.push(`agent:${input.agent.trim()}`);
+            }
+            if (input.mode) {
+              captureTags.push(`mode:${input.mode.trim()}`);
+            }
+            const captureContent =
+              input.agent || input.mode
+                ? `[Agent: ${input.agent || "unknown"} | Mode: ${input.mode || "unknown"}]\n\n${input.content}`
+                : input.content;
             const result = await client.captureContext({
               workspace_id: workspaceId,
               project_id: projectId,
               event_type: input.event_type,
               title: input.title,
-              content: input.content,
+              content: captureContent,
               importance: input.importance,
-              tags: input.tags,
+              tags: captureTags,
               session_id: input.session_id,
               code_refs: input.code_refs,
               provenance: input.provenance,
@@ -12477,16 +12509,19 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             } catch (err: any) {
               const isTimeout = err?.message?.toLowerCase().includes("timeout") ||
                 err?.message?.toLowerCase().includes("embedding timed out");
-              if (!isTimeout) throw err;
               const matched = await doFallback();
+              const fallbackReason = isTimeout ? "embedding_timeout" : "api_error";
+              const fallbackHint = isTimeout
+                ? "Decision trace fell back to keyword search due to embedding timeout."
+                : `Decision trace used event fallback after API error: ${err?.message || "unknown error"}.`;
               return {
                 content: [{
                   type: "text" as const,
                   text: formatContent({
                     decisions: matched,
                     total: matched.length,
-                    fallback_reason: "embedding_timeout",
-                    hint: "Decision trace fell back to keyword search due to embedding timeout.",
+                    fallback_reason: fallbackReason,
+                    hint: fallbackHint,
                   }),
                 }],
               };
@@ -14426,21 +14461,32 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.target) {
               return errorResult("dependencies requires: target { type, id }");
             }
-            const result = await client.graphDependencies({
-              target: input.target,
-              max_depth: input.max_depth,
-              include_transitive: input.include_transitive,
-            });
-            const outputText = formatContent(result);
-            // Track token savings
-            trackToolTokenSavings(client, "graph_dependencies", outputText, {
-              workspace_id: workspaceId,
-              project_id: projectId,
-            });
-            return {
-              content: [{ type: "text" as const, text: outputText }],
-              
-            };
+            try {
+              const result = await client.graphDependencies({
+                target: input.target,
+                max_depth: input.max_depth,
+                include_transitive: input.include_transitive,
+              });
+              const outputText = formatContent(result);
+              // Track token savings
+              trackToolTokenSavings(client, "graph_dependencies", outputText, {
+                workspace_id: workspaceId,
+                project_id: projectId,
+              });
+              return {
+                content: [{ type: "text" as const, text: outputText }],
+                
+              };
+            } catch (err: any) {
+              const message = err?.message || "Graph dependencies request failed.";
+              const lower = String(message).toLowerCase();
+              if (lower.includes("timed out") || lower.includes("timeout")) {
+                return errorResult(
+                  `graph(dependencies) timed out. Try max_depth=1, narrow target scope, and run graph(action="ingest") again before retrying. Original error: ${message}`
+                );
+              }
+              return errorResult(`graph(dependencies) failed: ${message}`);
+            }
           }
 
           case "impact": {
@@ -14841,7 +14887,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!projectId) {
               return projectScopeRequiredResult("files", workspaceId, folderPath);
             }
-            const result = await client.projectFiles(projectId);
+            const result = await client.projectFiles(projectId, {
+              page: input.page,
+              page_size: input.page_size,
+              sort_by: input.sort_by,
+              sort_order: input.sort_order,
+              path_pattern: input.path_pattern,
+            });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
               
@@ -14956,6 +15008,22 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 : {};
             const responseData =
               response.data && typeof response.data === "object" ? { ...response.data } : {};
+            const rootPendingCandidates = response as Record<string, unknown>;
+            if (responseData.pending_files === undefined) {
+              const pendingCandidate = rootPendingCandidates.pending_files;
+              if (typeof pendingCandidate === "number" || typeof pendingCandidate === "string") {
+                responseData.pending_files = pendingCandidate;
+              }
+            }
+            if (responseData.pending_file_paths === undefined) {
+              const pendingPathCandidate =
+                rootPendingCandidates.pending_file_paths ??
+                rootPendingCandidates.pending_paths ??
+                rootPendingCandidates.pending_files_list;
+              if (Array.isArray(pendingPathCandidate)) {
+                responseData.pending_file_paths = pendingPathCandidate;
+              }
+            }
             responseData.indexed = indexed;
             if (locallyIndexed && !selected.apiIndexed) {
               responseData.indexed_source = "local";
@@ -14971,6 +15039,18 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             responseData.index_confidence_reason = confidenceReason;
             responseData.index_timestamp = indexedAt ? indexedAt.toISOString() : null;
             responseData.index_in_progress = apiIndexing;
+            const pendingFilesRaw = responseData.pending_files;
+            const pendingFiles =
+              typeof pendingFilesRaw === "number"
+                ? pendingFilesRaw
+                : typeof pendingFilesRaw === "string"
+                  ? Number(pendingFilesRaw)
+                  : 0;
+            const pendingPaths = extractPendingFilePaths(response);
+            if (apiIndexing && pendingFiles > 0 && pendingPaths.length === 0) {
+              responseData.pending_files_diagnostic =
+                "API reports pending_files but did not provide pending file paths.";
+            }
             response.data = responseData;
 
             let text = "";
@@ -14992,6 +15072,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             text += ` Freshness: ${freshness} (${ageDisplay}). Confidence: ${confidenceLevel}.`;
             if (confidenceLevel !== "high") {
               text += ` ${confidenceReason}`;
+            }
+            if (apiIndexing && pendingFiles > 0 && pendingPaths.length === 0) {
+              text += " Pending file paths are unavailable in this API response.";
             }
             if (freshness === "stale" || freshness === "missing") {
               const ingestPath = folderPath || "<folder>";

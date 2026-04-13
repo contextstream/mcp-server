@@ -32,9 +32,11 @@ describe("files", () => {
 
     const count = await countIndexableFiles(root, { maxFiles: 10 });
     const files = await readFilesFromDirectory(root, { maxFiles: 10 });
+    const dartFile = files.find((file) => file.path === path.join("lib", "main.dart"));
 
     expect(count.count).toBe(1);
     expect(files.map((file) => file.path)).toContain(path.join("lib", "main.dart"));
+    expect(dartFile?.language).toBe("dart");
   });
 
   it("detects Dart language metadata", () => {

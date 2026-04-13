@@ -338,6 +338,9 @@ interface IngestLocalResult {
 
 // Auto-index file cap (matches Rust client)
 const AUTO_INDEX_FILE_CAP = 10000;
+const INGEST_MAX_BATCH_BYTES = 1024 * 1024;
+const INGEST_MAX_BATCH_FILES = 20;
+const INGEST_MAX_SINGLE_FILE_PAYLOAD_BYTES = 512 * 1024;
 
 // Project markers that indicate a directory is a standalone project
 const PROJECT_MARKERS = [
@@ -1717,9 +1720,26 @@ export class ContextStreamClient {
     return request(this.config, `/projects/${projectId}/statistics`, { method: "GET" });
   }
 
-  projectFiles(projectId: string) {
+  projectFiles(
+    projectId: string,
+    params?: {
+      page?: number;
+      page_size?: number;
+      sort_by?: "path" | "indexed" | "size";
+      sort_order?: "asc" | "desc";
+      path_pattern?: string;
+    }
+  ) {
     uuidSchema.parse(projectId);
-    return request(this.config, `/projects/${projectId}/files`, { method: "GET" });
+    const queryParams = new URLSearchParams();
+    if (params?.page) queryParams.set("page", params.page.toString());
+    if (params?.page_size) queryParams.set("page_size", params.page_size.toString());
+    if (params?.sort_by) queryParams.set("sort_by", params.sort_by);
+    if (params?.sort_order) queryParams.set("sort_order", params.sort_order);
+    if (params?.path_pattern) queryParams.set("path_pattern", params.path_pattern);
+    const queryString = queryParams.toString();
+    const url = `/projects/${projectId}/files${queryString ? `?${queryString}` : ""}`;
+    return request(this.config, url, { method: "GET" });
   }
 
   projectIndexStatus(projectId: string) {
@@ -1914,6 +1934,242 @@ export class ContextStreamClient {
     });
   }
 
+  private estimateIngestFilePayloadBytes(file: {
+    path: string;
+    content: string;
+    language?: string;
+    git_commit_sha?: string;
+    git_commit_timestamp?: string;
+    source_modified_at?: string;
+    machine_id?: string;
+    git_branch?: string;
+    git_default_branch?: string;
+    is_default_branch?: boolean;
+  }): number {
+    return Buffer.byteLength(JSON.stringify(file), "utf8");
+  }
+
+  private splitOversizedIngestFiles(
+    files: Array<{
+      path: string;
+      content: string;
+      language?: string;
+      git_commit_sha?: string;
+      git_commit_timestamp?: string;
+      source_modified_at?: string;
+      machine_id?: string;
+      git_branch?: string;
+      git_default_branch?: string;
+      is_default_branch?: boolean;
+    }>
+  ): {
+    accepted: Array<{
+      path: string;
+      content: string;
+      language?: string;
+      git_commit_sha?: string;
+      git_commit_timestamp?: string;
+      source_modified_at?: string;
+      machine_id?: string;
+      git_branch?: string;
+      git_default_branch?: string;
+      is_default_branch?: boolean;
+    }>;
+    skipped: number;
+  } {
+    const accepted: Array<{
+      path: string;
+      content: string;
+      language?: string;
+      git_commit_sha?: string;
+      git_commit_timestamp?: string;
+      source_modified_at?: string;
+      machine_id?: string;
+      git_branch?: string;
+      git_default_branch?: string;
+      is_default_branch?: boolean;
+    }> = [];
+    let skipped = 0;
+
+    for (const file of files) {
+      const payloadBytes = this.estimateIngestFilePayloadBytes(file);
+      if (payloadBytes > INGEST_MAX_SINGLE_FILE_PAYLOAD_BYTES) {
+        skipped += 1;
+        console.error(
+          `[ContextStream] Skipping oversized file payload during ingest: ${file.path} (${payloadBytes} bytes serialized)`
+        );
+        continue;
+      }
+      accepted.push(file);
+    }
+
+    return { accepted, skipped };
+  }
+
+  private buildIngestPayloadBatches(
+    files: Array<{
+      path: string;
+      content: string;
+      language?: string;
+      git_commit_sha?: string;
+      git_commit_timestamp?: string;
+      source_modified_at?: string;
+      machine_id?: string;
+      git_branch?: string;
+      git_default_branch?: string;
+      is_default_branch?: boolean;
+    }>
+  ): Array<
+    Array<{
+      path: string;
+      content: string;
+      language?: string;
+      git_commit_sha?: string;
+      git_commit_timestamp?: string;
+      source_modified_at?: string;
+      machine_id?: string;
+      git_branch?: string;
+      git_default_branch?: string;
+      is_default_branch?: boolean;
+    }>
+  > {
+    const batches: Array<
+      Array<{
+        path: string;
+        content: string;
+        language?: string;
+        git_commit_sha?: string;
+        git_commit_timestamp?: string;
+        source_modified_at?: string;
+        machine_id?: string;
+        git_branch?: string;
+        git_default_branch?: string;
+        is_default_branch?: boolean;
+      }>
+    > = [];
+    let currentBatch: Array<{
+      path: string;
+      content: string;
+      language?: string;
+      git_commit_sha?: string;
+      git_commit_timestamp?: string;
+      source_modified_at?: string;
+      machine_id?: string;
+      git_branch?: string;
+      git_default_branch?: string;
+      is_default_branch?: boolean;
+    }> = [];
+    let currentBatchBytes = 0;
+
+    for (const file of files) {
+      const fileBytes = this.estimateIngestFilePayloadBytes(file);
+      const exceedsBatchBytes = currentBatchBytes + fileBytes > INGEST_MAX_BATCH_BYTES;
+      const exceedsBatchFiles = currentBatch.length >= INGEST_MAX_BATCH_FILES;
+
+      if (currentBatch.length > 0 && (exceedsBatchBytes || exceedsBatchFiles)) {
+        batches.push(currentBatch);
+        currentBatch = [];
+        currentBatchBytes = 0;
+      }
+
+      currentBatch.push(file);
+      currentBatchBytes += fileBytes;
+    }
+
+    if (currentBatch.length > 0) {
+      batches.push(currentBatch);
+    }
+    return batches;
+  }
+
+  async ingestFilesAdaptive(
+    projectId: string,
+    files: Array<{
+      path: string;
+      content: string;
+      language?: string;
+      git_commit_sha?: string;
+      git_commit_timestamp?: string;
+      source_modified_at?: string;
+      machine_id?: string;
+      git_branch?: string;
+      git_default_branch?: string;
+      is_default_branch?: boolean;
+    }>,
+    options?: { write_to_disk?: boolean; overwrite?: boolean; force?: boolean }
+  ): Promise<{ data: IngestApiData }> {
+    uuidSchema.parse(projectId);
+    if (files.length === 0) return { data: { files_indexed: 0, files_skipped: 0, status: "completed" } };
+
+    const { accepted, skipped } = this.splitOversizedIngestFiles(files);
+    if (accepted.length === 0) {
+      return {
+        data: {
+          files_indexed: 0,
+          files_skipped: skipped,
+          status: "partial",
+          message: "All files exceeded serialized payload size limits.",
+        },
+      };
+    }
+
+    const pending = this.buildIngestPayloadBatches(accepted);
+    let filesIndexed = 0;
+    let filesSkipped = skipped;
+    let status: IngestApiData["status"] = "completed";
+    let message: string | undefined;
+
+    while (pending.length > 0) {
+      const batch = pending.shift();
+      if (!batch || batch.length === 0) continue;
+      try {
+        const result = (await this.ingestFiles(projectId, batch, options)) as { data?: IngestApiData };
+        const data = result.data;
+        if (!data) continue;
+        filesIndexed += data.files_indexed ?? 0;
+        filesSkipped += data.files_skipped ?? 0;
+        status = data.status ?? status;
+        message = data.message ?? message;
+
+        if (data.status === "cooldown" || data.status === "daily_limit_exceeded") {
+          return {
+            data: {
+              files_indexed: filesIndexed,
+              files_skipped: filesSkipped,
+              status: data.status,
+              message,
+            },
+          };
+        }
+      } catch (err) {
+        const isPayloadTooLarge = err instanceof HttpError && err.status === 413;
+        if (isPayloadTooLarge && batch.length > 1) {
+          const mid = Math.ceil(batch.length / 2);
+          pending.unshift(batch.slice(mid));
+          pending.unshift(batch.slice(0, mid));
+          continue;
+        }
+        if (isPayloadTooLarge && batch.length === 1) {
+          filesSkipped += 1;
+          console.error(
+            `[ContextStream] Skipping file after repeated 413 payload responses: ${batch[0]?.path || "<unknown>"}`
+          );
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    return {
+      data: {
+        files_indexed: filesIndexed,
+        files_skipped: filesSkipped,
+        status: filesSkipped > skipped ? "partial" : status,
+        message,
+      },
+    };
+  }
+
   async ingestFromPath(projectId: string, pathStr: string, opts?: {
     force?: boolean;
     include_media?: boolean;
@@ -1955,8 +2211,16 @@ export class ContextStreamClient {
     let lastStatus: IngestApiData["status"] = "completed";
 
     const fileSource = sinceTimestamp
-      ? readChangedFilesInBatches(rootPath, sinceTimestamp, { batchSize: 50 })
-      : readAllFilesInBatches(rootPath, { batchSize: 50 });
+      ? readChangedFilesInBatches(rootPath, sinceTimestamp, {
+          batchSize: INGEST_MAX_BATCH_FILES,
+          maxFilesPerBatch: INGEST_MAX_BATCH_FILES,
+          maxBatchBytes: INGEST_MAX_BATCH_BYTES,
+        })
+      : readAllFilesInBatches(rootPath, {
+          batchSize: INGEST_MAX_BATCH_FILES,
+          maxFilesPerBatch: INGEST_MAX_BATCH_FILES,
+          maxBatchBytes: INGEST_MAX_BATCH_BYTES,
+        });
 
     for await (const batch of fileSource) {
       if (maxFiles !== undefined && totalFiles >= maxFiles) break;
@@ -1985,7 +2249,7 @@ export class ContextStreamClient {
 
       // Send filtered batch to API
       try {
-        const result = (await this.ingestFiles(projectId, filteredBatch, ingestOptions)) as {
+        const result = (await this.ingestFilesAdaptive(projectId, filteredBatch, ingestOptions)) as {
           data?: IngestApiData;
         };
 
@@ -2007,7 +2271,7 @@ export class ContextStreamClient {
       } catch (e) {
         console.error(`[ContextStream] Batch ingest error (attempt 1):`, e);
         try {
-          const retryResult = (await this.ingestFiles(projectId, filteredBatch, ingestOptions)) as {
+          const retryResult = (await this.ingestFilesAdaptive(projectId, filteredBatch, ingestOptions)) as {
             data?: IngestApiData;
           };
           const data = retryResult.data;
@@ -2160,7 +2424,7 @@ export class ContextStreamClient {
       }
 
       // Index the files
-      await this.ingestFiles(this.sessionProjectId, filesToIndex);
+      await this.ingestFilesAdaptive(this.sessionProjectId, filesToIndex);
 
       // Update last indexed time to now
       this.lastIndexedTime = new Date();
@@ -3668,8 +3932,25 @@ export class ContextStreamClient {
           parts.push(`  (+${decisions.items.length - 3} more)`);
         }
       }
-    } catch {
-      /* optional */
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[ContextStream] getContextSummary memoryDecisions failed: ${message}`);
+    }
+
+    if (decisionCount === 0) {
+      try {
+        const events = (await this.listMemoryEvents({
+          workspace_id: withDefaults.workspace_id,
+          project_id: withDefaults.project_id,
+          limit: 100,
+        })) as { items?: Array<Record<string, unknown>> };
+        if (Array.isArray(events.items)) {
+          decisionCount = events.items.filter((item) => isDecisionResult(item)).length;
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[ContextStream] getContextSummary decision fallback failed: ${message}`);
+      }
     }
 
     // Get preferences count and sample
@@ -3701,8 +3982,27 @@ export class ContextStreamClient {
         parts.push("");
         parts.push(`🧠 Memory: ${memoryCount} events stored`);
       }
-    } catch {
-      /* optional */
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[ContextStream] getContextSummary memorySummary failed: ${message}`);
+    }
+
+    if (memoryCount === 0) {
+      try {
+        const events = (await this.listMemoryEvents({
+          workspace_id: withDefaults.workspace_id,
+          project_id: withDefaults.project_id,
+          limit: 100,
+        })) as { items?: unknown[] };
+        if (Array.isArray(events.items) && events.items.length > 0) {
+          memoryCount = events.items.length;
+          parts.push("");
+          parts.push(`🧠 Memory: ${memoryCount} events stored`);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[ContextStream] getContextSummary memory fallback failed: ${message}`);
+      }
     }
 
     // Add usage hint
@@ -4147,8 +4447,9 @@ export class ContextStreamClient {
           }
         }
       }
-    } catch {
-      /* optional */
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[ContextStream] getContextDelta listMemoryEvents failed: ${message}`);
     }
 
     return {
@@ -4763,11 +5064,11 @@ export class ContextStreamClient {
       };
     };
 
-    try {
-      const searchQuery = params.context_hint
-        ? `${params.context_hint} lesson warning prevention mistake`
-        : "lesson warning prevention mistake critical high";
+    const searchQuery = params.context_hint
+      ? `${params.context_hint} lesson warning prevention mistake`
+      : "lesson warning prevention mistake critical high";
 
+    try {
       const searchResult = (await this.memorySearch({
         query: searchQuery,
         workspace_id: params.workspace_id,
@@ -4789,8 +5090,13 @@ export class ContextStreamClient {
 
         if (lessons.length > 0) return lessons;
       }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[ContextStream] getHighPriorityLessons memorySearch failed: ${message}`);
+    }
 
-      // Fallback: list events with lesson tag when semantic search misses
+    try {
+      // Fallback: list events with lesson tag when semantic search misses or fails
       const eventResult = (await this.listMemoryEvents({
         workspace_id: params.workspace_id,
         event_type: "lesson",
@@ -4803,11 +5109,12 @@ export class ContextStreamClient {
           .slice(0, limit)
           .map(mapLesson);
       }
-
-      return [];
-    } catch {
-      return [];
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[ContextStream] getHighPriorityLessons listMemoryEvents fallback failed: ${message}`);
     }
+
+    return [];
   }
 
   /**

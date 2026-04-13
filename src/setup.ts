@@ -1433,7 +1433,7 @@ async function indexProjectWithProgress(
   const ingestWithRetry = async (batch: any[], maxRetries = 3): Promise<number> => {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const result = (await client.ingestFiles(projectId, batch)) as {
+        const result = (await client.ingestFilesAdaptive(projectId, batch)) as {
           data?: { files_indexed?: number; status?: string };
         };
         // On cooldown or daily limit, return 0 (not batch.length)
@@ -1457,8 +1457,12 @@ async function indexProjectWithProgress(
   let failedBatches = 0;
 
   try {
-    // Index files in smaller batches (25) for better reliability
-    for await (const batch of readAllFilesInBatches(projectPath, { batchSize: 25 })) {
+    // Use conservative request sizes to reduce 413 payload failures.
+    for await (const batch of readAllFilesInBatches(projectPath, {
+      batchSize: 20,
+      maxFilesPerBatch: 20,
+      maxBatchBytes: 1024 * 1024,
+    })) {
       try {
         const indexed = await ingestWithRetry(batch);
         filesIndexed += indexed;

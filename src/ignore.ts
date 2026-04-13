@@ -39,6 +39,13 @@ const DEFAULT_IGNORE_PATTERNS = [
   "out/",
   ".next/",
   ".nuxt/",
+  ".svelte-kit/",
+  ".parcel-cache/",
+  ".turbo/",
+  ".gradle/",
+  ".cache/",
+  "bin/",
+  "obj/",
 
   // Python
   "__pycache__/",
@@ -66,6 +73,8 @@ const DEFAULT_IGNORE_PATTERNS = [
   "poetry.lock",
   "Gemfile.lock",
   "composer.lock",
+  "*.min.js",
+  "*.min.css",
 
   // OS files
   ".DS_Store",

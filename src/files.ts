@@ -117,6 +117,11 @@ const IGNORE_DIRS = new Set([
   "out",
   ".next",
   ".nuxt",
+  ".svelte-kit",
+  ".parcel-cache",
+  ".turbo",
+  ".gradle",
+  ".cache",
   "__pycache__",
   ".pytest_cache",
   ".mypy_cache",
@@ -127,6 +132,8 @@ const IGNORE_DIRS = new Set([
   "vendor",
   "coverage",
   ".coverage",
+  "bin",
+  "obj",
   ".idea",
   ".vscode",
   ".vs",
@@ -151,14 +158,14 @@ const IGNORE_FILES = new Set([
 const MAX_FILE_SIZE = 5 * 1024 * 1024;
 
 // Size-based batching configuration (matching API's BatchConfig::for_api())
-// Max total bytes per batch (10MB)
-const MAX_BATCH_BYTES = 10 * 1024 * 1024;
+// Max total bytes per batch (1MB) to avoid strict gateway payload limits.
+const MAX_BATCH_BYTES = 1024 * 1024;
 
 // Files larger than this are processed individually (2MB)
 const LARGE_FILE_THRESHOLD = 2 * 1024 * 1024;
 
-// Soft limit on files per batch (backup limit if size-based batching allows too many)
-const MAX_FILES_PER_BATCH = 200;
+// Soft limit on files per batch for conservative ingest requests.
+const MAX_FILES_PER_BATCH = 20;
 
 // ============================================================================
 // Git Info Extraction (for multi-machine sync)
@@ -413,6 +420,7 @@ export async function readFilesFromDirectory(
           const file: FileToIngest = {
             path: relPath,
             content,
+            language: detectLanguage(relPath),
             // Always include machine_id and source_modified_at
             machine_id: gitCtx.machineId,
             source_modified_at: stat.mtime.toISOString(),
@@ -519,6 +527,7 @@ export async function* readAllFilesInBatches(
           const file: FileWithSize = {
             path: relPath,
             content,
+            language: detectLanguage(relPath),
             sizeBytes: stat.size,
             // Always include machine_id and source_modified_at
             machine_id: gitCtx.machineId,
@@ -663,6 +672,7 @@ export async function* readChangedFilesInBatches(
           const file: FileWithSize = {
             path: relPath,
             content,
+            language: detectLanguage(relPath),
             sizeBytes: stat.size,
             // Always include machine_id and source_modified_at
             machine_id: gitCtx.machineId,

@@ -5,6 +5,7 @@ import {
   classifyGraphIngestIndexState,
   classifyIndexConfidence,
   classifyIndexFreshness,
+  extractPendingFilePaths,
   extractIndexTimestamp,
   indexHistoryEntryCount,
 } from "./project-index-utils.js";
@@ -75,6 +76,24 @@ describe("apiResultIsIndexing", () => {
       pending_files: 3,
     };
     expect(apiResultIsIndexing(payload)).toBe(true);
+  });
+});
+
+describe("extractPendingFilePaths", () => {
+  it("reads pending paths from nested payload", () => {
+    const payload = {
+      data: {
+        pending_file_paths: ["lib/a.dart", "lib/b.dart"],
+      },
+    };
+    expect(extractPendingFilePaths(payload)).toEqual(["lib/a.dart", "lib/b.dart"]);
+  });
+
+  it("reads legacy pending paths aliases", () => {
+    const payload = {
+      pending_paths: ["src/main.ts"],
+    };
+    expect(extractPendingFilePaths(payload)).toEqual(["src/main.ts"]);
   });
 });
 

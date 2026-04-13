@@ -59,6 +59,20 @@ function readString(candidates: RecordValue[], key: string): string | undefined 
   return undefined;
 }
 
+function readStringArray(candidates: RecordValue[], keys: string[]): string[] {
+  for (const candidate of candidates) {
+    for (const key of keys) {
+      const value = candidate[key];
+      if (!Array.isArray(value)) continue;
+      const items = value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+      if (items.length > 0) {
+        return items;
+      }
+    }
+  }
+  return [];
+}
+
 export function extractIndexTimestamp(result: unknown): Date | undefined {
   const candidates = candidateObjects(result);
   for (const key of ["last_updated", "indexed_at", "last_indexed"]) {
@@ -110,6 +124,11 @@ export function apiResultIsIndexing(result: unknown): boolean {
 
   const pendingFiles = readNumber(candidates, ["pending_files"]) ?? 0;
   return pendingFiles > 0;
+}
+
+export function extractPendingFilePaths(result: unknown): string[] {
+  const candidates = candidateObjects(result);
+  return readStringArray(candidates, ["pending_file_paths", "pending_paths", "pending_files_list"]);
 }
 
 function countFromObject(value: unknown): number | undefined {

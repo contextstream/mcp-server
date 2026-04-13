@@ -117,6 +117,8 @@ secret.txt
       expect(ig.ignores("build/main.js")).toBe(true);
       expect(ig.ignores("target/release/app")).toBe(true);
       expect(ig.ignores(".next/cache")).toBe(true);
+      expect(ig.ignores(".turbo/state.json")).toBe(true);
+      expect(ig.ignores(".parcel-cache/chunk")).toBe(true);
     });
 
     it("should ignore lock files", async () => {

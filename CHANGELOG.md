@@ -2,6 +2,10 @@
 
 ## 0.4.75
 
+### Security
+
+- Bumped transitive `hono` dependency to 4.12.14 to resolve GHSA-458j-xx4x-4375 (moderate — improper JSX attribute-name handling in `hono/jsx` SSR).
+
 ### Rust MCP Parity (v0.2.46 → v0.2.57 + 6a43ded)
 
 - **Search scoring thresholds (v0.2.46):** Raised `HYBRID_LOW_CONFIDENCE_SCORE` from 0.35 → 0.55 and lowered `SEMANTIC_SWITCH_MIN_IMPROVEMENT` from 0.08 → 0.02 so mediocre hybrid results trigger semantic fallback and semantic wins don't need to massively outperform hybrid.

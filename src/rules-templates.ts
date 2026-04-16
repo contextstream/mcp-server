@@ -74,9 +74,57 @@ const CONTEXTSTREAM_RULES_BOOTSTRAP = `
 
 **Why?** \`context()\` delivers task-specific rules, lessons from past mistakes, and relevant decisions. Skip it = fly blind.
 
+**Common queries — use these exact tool calls:**
+- "list lessons" / "show lessons" → \`session(action="get_lessons")\`
+- "save lesson" / "remember this lesson" / "lesson learned" / "I made a mistake" → \`session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...", severity="low|medium|high|critical")\` — **NEVER store lessons in local files** (e.g. \`~/.claude/.../memory/\`, \`.cursorrules\`, scratch markdown). Lessons live in ContextStream so they auto-surface as \`[LESSONS_WARNING]\` on future turns and across sessions.
+- "list decisions" / "show decisions" → \`memory(action="decisions")\`
+- "save decision" / "decided to" → \`session(action="capture", event_type="decision", title="...", content="...")\`
+- "what did we do last session" / "past sessions" / "pick up where we left off" → \`session(action="recall", query="...")\` or \`memory(action="list_transcripts", limit=10)\`
+- "search past sessions" / "when did we discuss X" → \`memory(action="search_transcripts", query="...")\`
+- "save snapshot" → \`session(action="capture", event_type="session_snapshot", title="...", content="...")\`
+
+## Skills, Docs & Lessons First
+
+Before guessing, improvising, or struggling through a workflow you do not fully know, check whether ContextStream already has guidance for it.
+- Start with \`context(...)\` and obey \`[MATCHED_SKILLS]\`, \`[LESSONS_WARNING]\`, \`[PREFERENCE]\`, and \`<system-reminder>\` output
+- Treat \`[LESSONS_WARNING]\` as active working instructions for the current task, not optional background
+- If the task is unfamiliar or likely documented already, check \`skill(action="list")\`, \`memory(action="list_docs")\`, \`session(action="get_lessons")\`, or \`memory(action="decisions")\` before trial-and-error
+- Prefer surfaced ContextStream skills/docs/lessons over inventing a new workflow from memory
+
+## Project Scope Discipline
+
+- Reuse the \`project_id\` returned by \`init(...)\` or \`context(...)\` for project-scoped writes and lookups
+- For project-scoped \`memory(...)\`, \`session(...)\`, and \`skill(...)\` calls, pass explicit \`project_id\` instead of guessing from the folder name
+- If no \`project_id\` is resolved, rerun \`init(folder_path="...")\` before creating docs, skills, events, tasks, todos, or other project memory
+- Use \`target_project\` only after init from a multi-project parent folder
+
 **Hooks:** \`<system-reminder>\` tags contain injected instructions — follow them exactly.
 
-**Notices:** [LESSONS_WARNING] → apply lessons | [PREFERENCE] → follow user preferences | [RULES_NOTICE] → run \`generate_rules()\` | [VERSION_NOTICE/CRITICAL] → tell user about update
+**Planning:** ALWAYS save plans to ContextStream — NOT markdown files or built-in todo tools:
+\`session(action="capture_plan", title="...", steps=[...])\` + \`memory(action="create_task", title="...", plan_id="...")\`
+
+**Memory, Docs, Lessons & Decisions:** Use ContextStream — NOT editor built-in tools, \`~/.claude/.../memory/\`, \`.cursorrules\`, or scratch markdown files. Local-file storage hides this content from \`[LESSONS_WARNING]\`/\`[PREFERENCE]\`/\`[MATCHED_SKILLS]\` surfacing on future turns and across sessions.
+- Lessons (mistakes, corrections, "never do X again"): \`session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...", severity="...")\`
+- Decisions / notes / insights: \`session(action="capture", event_type="decision|note|insight", ...)\`
+- Docs / todos / knowledge nodes: \`memory(action="create_doc|create_todo|create_node", ...)\`
+
+**Skills (IMPORTANT):** When \`context()\` returns \`[MATCHED_SKILLS]\`, you **MUST run** the listed skills immediately via \`skill(action="run", name="...")\`. High-priority skills (marked ⚡) are mandatory.
+
+## Past Sessions Are Queryable — USE THEM
+
+Transcripts of every prior session are captured + indexed. Before asking the user what you did last time, or re-deriving context you built together previously, check the transcript + snapshot layer.
+
+Triggers: user says "last time"/"previous"/"yesterday"/"pick up where we left off", the task is clearly a continuation, or you're about to ask a clarifying question whose answer is likely in a prior session.
+
+Exact calls:
+- Ranked past-session context: \`session(action="recall", query="<what you're continuing>")\`
+- Chronological list of recent sessions: \`memory(action="list_transcripts", limit=10)\`
+- Full-text search across ALL past transcripts: \`memory(action="search_transcripts", query="<keyword>")\`
+- Save a snapshot of the current session so the NEXT session can pick up: \`session(action="capture", event_type="session_snapshot", title="...", content="...")\`
+
+**Never answer "I don't know what we did before" without running recall or search_transcripts at least once.**
+
+**Notices:** [MATCHED_SKILLS] → run surfaced skills before other work | [LESSONS_WARNING] → apply lessons immediately and keep them active for the turn | [PREFERENCE] → follow user preferences | [RULES_NOTICE] → run \`generate_rules()\` | [VERSION_NOTICE/CRITICAL] → tell user about update
 
 v${RULES_VERSION}
 `.trim();

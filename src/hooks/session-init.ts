@@ -259,6 +259,26 @@ function formatContext(ctx: ContextResponse | null, options: FormatOptions = {})
     "On the first message in a new session call `mcp__contextstream__init(...)` then `mcp__contextstream__context(user_message=\"...\")`. After that, call `mcp__contextstream__context(user_message=\"...\")` on every message."
   );
 
+  parts.push("\n## 📜 Past Sessions Are Queryable — check before re-deriving context");
+  parts.push(
+    "Transcripts of every prior session are captured + indexed. If the user references past work (\"last time\", \"previous\", \"yesterday\", \"pick up where we left off\"), or you're continuing something, call ONE of these BEFORE asking clarifying questions:"
+  );
+  parts.push(
+    "- `mcp__contextstream__session(action=\"recall\", query=\"<what you're continuing>\")` — ranked fusion of transcripts/snapshots/docs/decisions"
+  );
+  parts.push(
+    "- `mcp__contextstream__memory(action=\"list_transcripts\", limit=10)` — chronological list of recent sessions"
+  );
+  parts.push(
+    "- `mcp__contextstream__memory(action=\"search_transcripts\", query=\"<keyword>\")` — full-text search across ALL past transcripts"
+  );
+  parts.push(
+    "- `mcp__contextstream__memory(action=\"list_events\", event_type=\"session_snapshot\")` — manual bookmarks at turning points"
+  );
+  parts.push(
+    "At the end of this session, save a snapshot so the next session can pick up: `mcp__contextstream__session(action=\"capture\", event_type=\"session_snapshot\", title=\"...\", content=\"<what we did + next step>\")`."
+  );
+
   return parts.join("\n");
 }
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.75
+
+### Rust MCP Parity (v0.2.46 → v0.2.57 + 6a43ded)
+
+- **Search scoring thresholds (v0.2.46):** Raised `HYBRID_LOW_CONFIDENCE_SCORE` from 0.35 → 0.55 and lowered `SEMANTIC_SWITCH_MIN_IMPROVEMENT` from 0.08 → 0.02 so mediocre hybrid results trigger semantic fallback and semantic wins don't need to massively outperform hybrid.
+- **Semantic retry for NL queries (v0.2.46):** `shouldRetrySemanticFallback` now allows NL queries that route to `hybrid` (e.g. containing UI component terms like "page" or "layout") to retry with semantic. Skips only clearly structural modes (`pattern`/`exhaustive`/`refactor`/`team`) and identifier queries. (Server-side keyword sub-token demotion lives in the backend search engine and is not mirrored client-side.)
+- **Null workspace_id guard (v0.2.47):** `createMemoryEvent` now returns the clearer "workspace_id is required for session capture but was not set. Run init first." error before issuing the API call. `session_id` is forwarded to the event body root in addition to metadata.
+- **Rules block refresh (v0.2.51 / v0.2.52 / v0.2.53 / v0.2.57 / 6a43ded):** Regenerated rules now include a "Common queries" quick-reference, a "Skills, Docs & Lessons First" block, a "Project Scope Discipline" block, a "Past Sessions Are Queryable" block with exact tool calls, an expanded "Memory, Docs, Lessons & Decisions" guidance block with explicit local-file warnings, an updated `[MATCHED_SKILLS]`/`[LESSONS_WARNING]` notices row, and `save lesson` / `save decision` rows to prevent agents from writing lesson/decision markdown to local files invisible to the surfacing pipeline.
+- **Session tool description (6a43ded):** Promoted `capture_lesson` and `recall` to the first sentences of the `session` tool description so LLMs scanning tool descriptions immediately see "LESSONS LIVE HERE" and "PAST SESSIONS LIVE HERE" before the comma-separated action list.
+- **Past Sessions banner (v0.2.57):** SessionStart hook additional context now includes a "📜 Past Sessions Are Queryable" banner with exact tool calls (`session(action="recall")`, `memory(action="list_transcripts")`, `memory(action="search_transcripts")`) so agents check transcripts before asking the user what happened previously.
+
+### Issue Remediation
+
+- **#53 Truncated UUID prefixes:** Added `validateIdOrPrefixHint` helper and wired it into the `session` and `memory` tool handlers. Truncated UUID-shaped inputs (8–35 hex-ish chars) now return a targeted error identifying the offending field and explaining that prefix resolution isn't supported. `event_id`, `plan_id`, `task_id`, `node_id`, `todo_id`, `diagram_id`, `transcript_id`, `lesson_id`, and `suggestion_id` schema validators were relaxed from `.uuid()` to `string()` so the friendly handler-level error fires instead of a generic Zod "Invalid uuid" message. Full prefix resolution remains a backend concern.
+- **#54 Top-level agent/mode metadata:** `session(action="capture" | "capture_lesson")` no longer pollutes event content with `[Agent: X | Mode: Y]` headers. `agent` and `mode` are now forwarded as structured top-level fields on the `/memory/events` request, stored in event `metadata`, and preserved as the `agent:<name>` / `mode:<value>` tag convention for backward-compatible filtering. `memory(action="list_events", agent, mode)` accepts the same structured filters and translates them into tag queries plus a client-side post-filter that matches either the tag or the structured field.
+
+### Cross-Repo Ownership
+
+- Issues tied to downstream Desktop/Web/backend products (Windows updater binary, dashboard re-index button, dashboard version display, Atlas knowledge graph visualization, `graph(dependencies)` engine timeout) were filed in their owning repositories. No code changes for those are landed here.
+
 ## Unreleased
 
 ### Parity + Issue Remediation

@@ -478,6 +478,31 @@ function normalizeUuid(value?: string): string | undefined {
   return uuidSchema.safeParse(value).success ? value : undefined;
 }
 
+/**
+ * Detect values that look like truncated UUID prefixes (hex+hyphen, 8–35 chars)
+ * so tool handlers can emit a clear error instead of passing malformed IDs to
+ * the API where they silently return empty or cryptic failures. See issue #53.
+ */
+function isTruncatedUuidPrefix(value: string): boolean {
+  if (!value || value.length >= 36) return false;
+  if (value.length < 8) return false;
+  return /^[0-9a-fA-F-]+$/.test(value) && /[0-9a-fA-F]/.test(value);
+}
+
+/**
+ * Validate an ID input for shape, returning a helpful error when a truncated
+ * UUID prefix is detected. Full UUIDs and undefined/empty pass through. Prefix
+ * resolution requires backend support and is not available in this client.
+ */
+function validateIdOrPrefixHint(value: string | null | undefined, fieldName: string): string | null {
+  if (!value) return null;
+  if (uuidSchema.safeParse(value).success) return null;
+  if (isTruncatedUuidPrefix(value)) {
+    return `${fieldName}="${value}" looks like a truncated UUID prefix (${value.length} chars). This client requires the full 36-character UUID — prefix resolution is not supported yet. Call \`init\` or \`context\` to resurface the canonical ID, or paste the full UUID.`;
+  }
+  return null;
+}
+
 type RulesNotice = {
   status: "behind" | "missing" | "unknown";
   current?: string;
@@ -3890,8 +3915,8 @@ export function registerTools(
   const DOC_QUERY_KEYWORDS = ["doc", "docs", "document", "documents", "spec", "specification", "plan", "roadmap"];
   const DOC_LOOKUP_VERBS = ["list", "show", "find", "open", "read", "lookup", "look up", "get"];
   const QUESTION_WORDS = ["how", "what", "where", "why", "when", "which", "who", "does", "is", "can", "should"];
-  const HYBRID_LOW_CONFIDENCE_SCORE = 0.35;
-  const SEMANTIC_SWITCH_MIN_IMPROVEMENT = 0.08;
+  const HYBRID_LOW_CONFIDENCE_SCORE = 0.55;
+  const SEMANTIC_SWITCH_MIN_IMPROVEMENT = 0.02;
 
   function isIdentifierQuery(query: string): boolean {
     const trimmed = query.trim();
@@ -4079,7 +4104,16 @@ export function registerTools(
     result: any
   ): boolean {
     if (mode !== "hybrid") return false;
-    if (recommendSearchMode(query).mode !== "semantic") return false;
+    const recommended = recommendSearchMode(query).mode;
+    if (
+      recommended === "pattern" ||
+      recommended === "exhaustive" ||
+      recommended === "refactor" ||
+      recommended === "team"
+    ) {
+      return false;
+    }
+    if (isIdentifierQuery(query)) return false;
     const { results } = extractSearchEnvelope(result);
     return results.length === 0 || maxResultScore(result) < HYBRID_LOW_CONFIDENCE_SCORE;
   }
@@ -12007,7 +12041,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "session",
       {
         title: "Session",
-        description: `Session management operations. Actions: capture (save decision/insight), capture_lesson (save lesson from mistake), get_lessons (retrieve lessons), recall (natural language recall), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (context-enriched search), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan (save implementation plan), get_plan (retrieve plan with tasks), update_plan (modify plan), list_plans (list all plans). Suggested rules actions: list_suggested_rules (view ML-generated rule suggestions), suggested_rule_action (accept/reject/modify a suggestion), suggested_rules_stats (view ML accuracy stats). Team actions (team plans only): team_decisions (team-wide decisions), team_lessons (team-wide lessons), team_plans (plans across team workspaces).`,
+        description: `Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). PAST SESSIONS LIVE HERE: use action='recall' FIRST when the user references "last time", "previous", "yesterday", or is continuing prior work — full-text transcripts are indexed across every prior session. Actions: capture (save decision/insight), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons (retrieve lessons), recall (retrieve past conversation context via ranked fusion of transcripts/snapshots/docs/decisions), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (searches MEMORY/conversation history only, not code), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan, get_plan, update_plan, list_plans. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Team actions: team_decisions, team_lessons, team_plans.`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -12105,8 +12139,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               slack_thread_url: z.string().url().optional(),
             })
             .optional(),
-          // Plan-specific params
-          plan_id: z.string().uuid().optional().describe("Plan ID for get_plan/update_plan"),
+          // Plan-specific params (accept string so truncated UUID prefixes emit a friendly handler-level error; see issue #53)
+          plan_id: z.string().optional().describe("Plan ID (full 36-char UUID) for get_plan/update_plan"),
+          event_id: z.string().optional().describe("Event ID (full 36-char UUID)"),
+          task_id: z.string().optional().describe("Task ID (full 36-char UUID)"),
+          node_id: z.string().optional().describe("Node ID (full 36-char UUID)"),
+          lesson_id: z.string().optional().describe("Lesson ID (full 36-char UUID)"),
+          suggestion_id: z.string().optional().describe("Suggestion ID (full 36-char UUID)"),
           description: z.string().optional().describe("Description for capture_plan"),
           goals: stringOrArray(z.string()).optional().describe("Goals for capture_plan"),
           steps: z
@@ -12159,33 +12198,42 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         const explicitProjectId = normalizeUuid(input.project_id);
         let projectId = explicitProjectId || resolveProjectId(undefined);
 
+        const prefixCheck =
+          validateIdOrPrefixHint(input.event_id, "event_id") ||
+          validateIdOrPrefixHint(input.plan_id, "plan_id") ||
+          validateIdOrPrefixHint(input.task_id, "task_id") ||
+          validateIdOrPrefixHint(input.node_id, "node_id") ||
+          validateIdOrPrefixHint(input.lesson_id, "lesson_id") ||
+          validateIdOrPrefixHint(input.suggestion_id, "suggestion_id");
+        if (prefixCheck) {
+          return errorResult(prefixCheck);
+        }
+
         switch (input.action) {
           case "capture": {
             if (!input.event_type || !input.title || !input.content) {
               return errorResult("capture requires: event_type, title, content");
             }
             const captureTags = Array.isArray(input.tags) ? [...input.tags] : [];
-            if (input.agent) {
-              captureTags.push(`agent:${input.agent.trim()}`);
-            }
-            if (input.mode) {
-              captureTags.push(`mode:${input.mode.trim()}`);
-            }
-            const captureContent =
-              input.agent || input.mode
-                ? `[Agent: ${input.agent || "unknown"} | Mode: ${input.mode || "unknown"}]\n\n${input.content}`
-                : input.content;
+            const trimmedAgent = input.agent?.trim() || undefined;
+            const trimmedMode = input.mode?.trim() || undefined;
+            // Tag convention preserved so tag-filter queries keep working until the
+            // backend indexes top-level agent/mode. See issue #54.
+            if (trimmedAgent) captureTags.push(`agent:${trimmedAgent}`);
+            if (trimmedMode) captureTags.push(`mode:${trimmedMode}`);
             const result = await client.captureContext({
               workspace_id: workspaceId,
               project_id: projectId,
               event_type: input.event_type,
               title: input.title,
-              content: captureContent,
+              content: input.content,
               importance: input.importance,
               tags: captureTags,
               session_id: input.session_id,
               code_refs: input.code_refs,
               provenance: input.provenance,
+              agent: trimmedAgent,
+              mode: trimmedMode,
             });
             // Add educational hint based on event type
             const captureHint = getCaptureHint(input.event_type);
@@ -12243,6 +12291,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 ],
               };
             }
+            const lessonTrimmedAgent = input.agent?.trim() || undefined;
+            const lessonTrimmedMode = input.mode?.trim() || undefined;
+            const lessonTags = [...(input.keywords || [])];
+            if (lessonTrimmedAgent) lessonTags.push(`agent:${lessonTrimmedAgent}`);
+            if (lessonTrimmedMode) lessonTags.push(`mode:${lessonTrimmedMode}`);
             const result = await client.captureContext({
               workspace_id: workspaceId,
               project_id: projectId,
@@ -12255,7 +12308,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   : input.severity === "high"
                     ? "high"
                     : "medium",
-              tags: input.keywords || [],
+              tags: lessonTags,
+              agent: lessonTrimmedAgent,
+              mode: lessonTrimmedMode,
             });
             // Add educational hint for lessons
             const lessonHint = getCaptureHint("lesson");
@@ -13132,9 +13187,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
           project_id: z.string().uuid().optional(),
-          // ID params
-          event_id: z.string().uuid().optional(),
-          node_id: z.string().uuid().optional(),
+          // ID params — accept bare string so handler-level validation can emit friendly errors for truncated UUID prefixes (issue #53)
+          event_id: z.string().optional(),
+          node_id: z.string().optional(),
           // Content params
           title: z.string().optional(),
           content: z.string().optional(),
@@ -13145,6 +13200,19 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           query: z.string().optional(),
           category: z.string().optional(),
           limit: z.number().optional(),
+          // Structured identity metadata for filtering captured events (issue #54)
+          agent: z
+            .string()
+            .optional()
+            .describe(
+              "Filter events by agent name (matches both the structured `agent` field and the `agent:<name>` tag convention)."
+            ),
+          mode: z
+            .string()
+            .optional()
+            .describe(
+              "Filter events by mode (matches both the structured `mode` field and the `mode:<value>` tag convention)."
+            ),
           // Node relations
           relations: z
             .array(
@@ -13176,19 +13244,17 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               })
             )
             .optional(),
-          // Task-specific params
+          // Task-specific params (see issue #53)
           task_id: z
             .string()
-            .uuid()
             .optional()
-            .describe("Task ID for get_task/update_task/delete_task"),
+            .describe("Task ID for get_task/update_task/delete_task (full 36-char UUID)"),
           plan_id: z
             .string()
-            .uuid()
             .nullable()
             .optional()
             .describe(
-              "Plan ID: for create_task (link to plan), update_task (set UUID to link, null to unlink), list_tasks (filter by plan)"
+              "Plan ID (full 36-char UUID): for create_task (link to plan), update_task (set UUID to link, null to unlink), list_tasks (filter by plan)"
             ),
           plan_step_id: z.string().optional().describe("Which plan step this task implements"),
           description: z.string().optional().describe("Description for task"),
@@ -13242,7 +13308,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .optional()
             .describe("Array of events for import_batch action"),
           // Todo params
-          todo_id: z.string().uuid().optional().describe("Todo ID for get_todo/update_todo/delete_todo"),
+          todo_id: z.string().optional().describe("Todo ID for get_todo/update_todo/delete_todo (full 36-char UUID)"),
           todo_priority: z
             .enum(["low", "medium", "high", "urgent"])
             .optional()
@@ -13257,7 +13323,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .describe("Todo completion flag for update_todo"),
           due_at: z.string().optional().describe("Due date (ISO 8601) for todo"),
           // Diagram params
-          diagram_id: z.string().uuid().optional().describe("Diagram ID for get_diagram/update_diagram/delete_diagram"),
+          diagram_id: z.string().optional().describe("Diagram ID for get_diagram/update_diagram/delete_diagram (full 36-char UUID)"),
           diagram_type: z
             .enum(["flowchart", "sequence", "class", "er", "gantt", "mindmap", "pie", "other"])
             .optional()
@@ -13288,7 +13354,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .optional()
             .describe("Mark as personal (only visible to creator). For create/list actions on todos, diagrams, docs."),
           // Transcript params
-          transcript_id: z.string().uuid().optional().describe("Transcript ID for get_transcript/delete_transcript"),
+          transcript_id: z.string().optional().describe("Transcript ID for get_transcript/delete_transcript (full 36-char UUID)"),
           session_id: z.string().optional().describe("Session ID filter for list_transcripts"),
           client_name: z.string().optional().describe("Client name filter for list_transcripts (e.g., 'claude', 'cursor')"),
           started_after: z.string().optional().describe("ISO timestamp - filter transcripts started after this time"),
@@ -13299,6 +13365,19 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         let workspaceId = resolveWorkspaceId(input.workspace_id);
         const explicitProjectId = normalizeUuid(input.project_id);
         let projectId = explicitProjectId || resolveProjectId(undefined);
+
+        const prefixCheck =
+          validateIdOrPrefixHint(input.event_id, "event_id") ||
+          validateIdOrPrefixHint(input.node_id, "node_id") ||
+          validateIdOrPrefixHint(input.doc_id, "doc_id") ||
+          validateIdOrPrefixHint(input.todo_id, "todo_id") ||
+          validateIdOrPrefixHint(input.task_id, "task_id") ||
+          validateIdOrPrefixHint(input.plan_id, "plan_id") ||
+          validateIdOrPrefixHint(input.diagram_id, "diagram_id") ||
+          validateIdOrPrefixHint(input.transcript_id, "transcript_id");
+        if (prefixCheck) {
+          return errorResult(prefixCheck);
+        }
 
         switch (input.action) {
           case "create_event": {
@@ -13360,22 +13439,36 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
 
           case "list_events": {
+            // Translate structured agent/mode filters into the tag-based convention
+            // so queries work before the backend indexes these fields (issue #54).
+            const agentFilter = input.agent?.trim();
+            const modeFilter = input.mode?.trim();
+            const baseTags = Array.isArray(input.tags) ? [...input.tags] : [];
+            const tagFilters = [...baseTags];
+            if (agentFilter) tagFilters.push(`agent:${agentFilter}`);
+            if (modeFilter) tagFilters.push(`mode:${modeFilter}`);
             const result = await client.listMemoryEvents({
               workspace_id: workspaceId,
               project_id: projectId,
               limit: input.limit,
-              tags: input.tags,
+              tags: tagFilters.length > 0 ? tagFilters : undefined,
               event_type: input.event_type,
             }) as { items?: any[]; data?: { items?: any[] } };
             // Client-side tag post-filtering fallback (Issue #34)
             const items = (result as any)?.data?.items || (result as any)?.items || [];
             if (Array.isArray(items)) {
               let filtered = items;
-              if (input.tags && input.tags.length > 0) {
-                const requiredTags = input.tags;
+              if (tagFilters.length > 0) {
+                const requiredTags = tagFilters;
                 filtered = filtered.filter((item: any) => {
                   const itemTags = extractEventTags(item);
-                  return requiredTags.every((tag: string) => itemTags.includes(tag));
+                  // Match either the tag convention or structured agent/mode on the item
+                  return requiredTags.every((tag: string) => {
+                    if (itemTags.includes(tag)) return true;
+                    if (tag.startsWith("agent:") && item?.agent === tag.slice(6)) return true;
+                    if (tag.startsWith("mode:") && item?.mode === tag.slice(5)) return true;
+                    return false;
+                  });
                 });
               }
               if (input.event_type) {

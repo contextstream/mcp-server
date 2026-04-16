@@ -1172,6 +1172,7 @@ export class ContextStreamClient {
   createMemoryEvent(body: {
     workspace_id?: string;
     project_id?: string;
+    session_id?: string;
     event_type: string;
     title: string;
     content: string;
@@ -1179,13 +1180,15 @@ export class ContextStreamClient {
     metadata?: Record<string, unknown>;
     provenance?: Record<string, unknown>;
     code_refs?: Array<{ file_path: string; symbol_id?: string; symbol_name?: string }>;
+    agent?: string;
+    mode?: string;
   }) {
     const withDefaults = this.withDefaults(body);
 
     // Validate required fields
     if (!withDefaults.workspace_id) {
       throw new Error(
-        "workspace_id is required for creating memory events. Set defaultWorkspaceId in config or provide workspace_id."
+        "workspace_id is required for session capture but was not set. Run init first."
       );
     }
 
@@ -1195,10 +1198,16 @@ export class ContextStreamClient {
     }
 
     const normalizedTags = normalizeTags(body.tags);
-    const apiBody = {
+    // agent/mode are forwarded as top-level fields so the backend can index them
+    // as structured metadata once it supports the schema (see issue #54). Until
+    // then servers that reject unknown fields should be rare; if any do, fall
+    // back to metadata-only storage by omitting the root fields.
+    const apiBody: Record<string, unknown> = {
       ...withDefaults,
       ...(normalizedTags ? { tags: normalizedTags } : {}),
     };
+    if (body.agent) apiBody.agent = body.agent;
+    if (body.mode) apiBody.mode = body.mode;
 
     return request(this.config, "/memory/events", { body: apiBody });
   }
@@ -3592,6 +3601,8 @@ export class ContextStreamClient {
     importance?: "low" | "medium" | "high" | "critical";
     provenance?: Record<string, unknown>;
     code_refs?: Array<{ file_path: string; symbol_id?: string; symbol_name?: string }>;
+    agent?: string;
+    mode?: string;
   }) {
     const withDefaults = this.withDefaults(params);
 
@@ -3648,16 +3659,21 @@ export class ContextStreamClient {
     return this.createMemoryEvent({
       workspace_id: withDefaults.workspace_id,
       project_id: withDefaults.project_id,
+      session_id: params.session_id,
       event_type: apiEventType,
       title: params.title,
       content: params.content,
       tags: normalizedTags,
       provenance: params.provenance,
       code_refs: params.code_refs,
+      agent: params.agent,
+      mode: params.mode,
       metadata: {
         original_type: params.event_type,
         session_id: params.session_id,
         ...(normalizedTags ? { tags: normalizedTags } : {}),
+        ...(params.agent ? { agent: params.agent } : {}),
+        ...(params.mode ? { mode: params.mode } : {}),
         importance: params.importance || "medium",
         captured_at: new Date().toISOString(),
         source: "mcp_auto_capture",

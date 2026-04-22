@@ -478,6 +478,21 @@ function normalizeUuid(value?: string): string | undefined {
   return uuidSchema.safeParse(value).success ? value : undefined;
 }
 
+type PrefixResourceKind =
+  | "event"
+  | "node"
+  | "plan"
+  | "task"
+  | "todo"
+  | "diagram"
+  | "doc"
+  | "transcript";
+
+type PrefixResolutionResult = { value?: string; error?: string };
+
+const PREFIX_PAGE_SIZE = 200;
+const PREFIX_MAX_PAGES = 5;
+
 /**
  * Detect values that look like truncated UUID prefixes (hex+hyphen, 8–35 chars)
  * so tool handlers can emit a clear error instead of passing malformed IDs to
@@ -489,18 +504,213 @@ function isTruncatedUuidPrefix(value: string): boolean {
   return /^[0-9a-fA-F-]+$/.test(value) && /[0-9a-fA-F]/.test(value);
 }
 
-/**
- * Validate an ID input for shape, returning a helpful error when a truncated
- * UUID prefix is detected. Full UUIDs and undefined/empty pass through. Prefix
- * resolution requires backend support and is not available in this client.
- */
-function validateIdOrPrefixHint(value: string | null | undefined, fieldName: string): string | null {
-  if (!value) return null;
-  if (uuidSchema.safeParse(value).success) return null;
-  if (isTruncatedUuidPrefix(value)) {
-    return `${fieldName}="${value}" looks like a truncated UUID prefix (${value.length} chars). This client requires the full 36-character UUID — prefix resolution is not supported yet. Call \`init\` or \`context\` to resurface the canonical ID, or paste the full UUID.`;
+function normalizeTagsWithFallback(
+  tags: string[] | undefined,
+  agent: string | undefined,
+  mode: string | undefined
+): string[] | undefined {
+  const normalized = new Set<string>();
+  for (const tag of tags ?? []) {
+    const trimmed = String(tag ?? "").trim();
+    if (trimmed) normalized.add(trimmed);
   }
-  return null;
+  if (agent) normalized.add(`agent:${agent}`);
+  if (mode) normalized.add(`mode:${mode}`);
+  return normalized.size > 0 ? [...normalized] : undefined;
+}
+
+function itemMatchesAgentMode(item: any, agent: string | undefined, mode: string | undefined): boolean {
+  if (!agent && !mode) return true;
+  const tags = extractEventTags(item);
+  if (agent && item?.agent !== agent && !tags.includes(`agent:${agent}`)) return false;
+  if (mode && item?.mode !== mode && !tags.includes(`mode:${mode}`)) return false;
+  return true;
+}
+
+function extractPrefixedEntityIds(value: any, prefix: string, matches = new Set<string>()): string[] {
+  if (!value) return [...matches];
+  if (Array.isArray(value)) {
+    for (const item of value) extractPrefixedEntityIds(item, prefix, matches);
+    return [...matches];
+  }
+  if (typeof value !== "object") return [...matches];
+
+  const maybe = value as Record<string, unknown>;
+  const id = maybe.id;
+  if (
+    typeof id === "string" &&
+    id.toLowerCase().startsWith(prefix.toLowerCase()) &&
+    uuidSchema.safeParse(id).success
+  ) {
+    matches.add(id);
+  }
+  for (const child of Object.values(maybe)) {
+    extractPrefixedEntityIds(child, prefix, matches);
+  }
+  return [...matches];
+}
+
+async function listEntityPrefixMatches(
+  client: ContextStreamClient,
+  resource: PrefixResourceKind,
+  prefix: string,
+  workspaceId: string,
+  projectId?: string
+): Promise<string[]> {
+  const matches = new Set<string>();
+
+  const addMatches = (payload: unknown) => {
+    for (const id of extractPrefixedEntityIds(payload, prefix)) {
+      matches.add(id);
+    }
+  };
+
+  switch (resource) {
+    case "event": {
+      addMatches(
+        await client.listMemoryEvents({
+          workspace_id: workspaceId,
+          project_id: projectId,
+          limit: PREFIX_PAGE_SIZE,
+        })
+      );
+      break;
+    }
+    case "node": {
+      addMatches(
+        await client.listKnowledgeNodes({
+          workspace_id: workspaceId,
+          project_id: projectId,
+          limit: PREFIX_PAGE_SIZE,
+        })
+      );
+      break;
+    }
+    case "task": {
+      for (let page = 0; page < PREFIX_MAX_PAGES; page += 1) {
+        const offset = page * PREFIX_PAGE_SIZE;
+        const payload = await client.listTasks({
+          workspace_id: workspaceId,
+          project_id: projectId,
+          limit: PREFIX_PAGE_SIZE,
+          offset,
+        });
+        addMatches(payload);
+      }
+      break;
+    }
+    case "plan": {
+      for (let page = 0; page < PREFIX_MAX_PAGES; page += 1) {
+        const offset = page * PREFIX_PAGE_SIZE;
+        const payload = await client.listPlans({
+          workspace_id: workspaceId,
+          project_id: projectId,
+          limit: PREFIX_PAGE_SIZE,
+          offset,
+        });
+        addMatches(payload);
+      }
+      break;
+    }
+    case "todo": {
+      for (let page = 1; page <= PREFIX_MAX_PAGES; page += 1) {
+        addMatches(
+          await client.todosList({
+            workspace_id: workspaceId,
+            project_id: projectId,
+            page,
+            per_page: PREFIX_PAGE_SIZE,
+          })
+        );
+      }
+      break;
+    }
+    case "diagram": {
+      for (let page = 1; page <= PREFIX_MAX_PAGES; page += 1) {
+        addMatches(
+          await client.diagramsList({
+            workspace_id: workspaceId,
+            project_id: projectId,
+            page,
+            per_page: PREFIX_PAGE_SIZE,
+          })
+        );
+      }
+      break;
+    }
+    case "doc": {
+      for (let page = 1; page <= PREFIX_MAX_PAGES; page += 1) {
+        addMatches(
+          await client.docsList({
+            workspace_id: workspaceId,
+            project_id: projectId,
+            page,
+            per_page: PREFIX_PAGE_SIZE,
+          })
+        );
+      }
+      break;
+    }
+    case "transcript": {
+      for (let page = 1; page <= PREFIX_MAX_PAGES; page += 1) {
+        addMatches(
+          await client.listTranscripts({
+            workspace_id: workspaceId,
+            project_id: projectId,
+            page,
+            per_page: PREFIX_PAGE_SIZE,
+          })
+        );
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return [...matches];
+}
+
+async function resolveIdOrPrefix(
+  client: ContextStreamClient,
+  value: string | null | undefined,
+  fieldName: string,
+  workspaceId: string | undefined,
+  projectId: string | undefined,
+  resource?: PrefixResourceKind
+): Promise<PrefixResolutionResult> {
+  if (!value) return {};
+  if (uuidSchema.safeParse(value).success) return { value };
+  if (!isTruncatedUuidPrefix(value)) return { value };
+  if (!resource) {
+    return {
+      error: `${fieldName}="${value}" looks like a truncated UUID prefix (${value.length} chars), but this action cannot resolve that ID type yet. Use the full 36-character UUID.`,
+    };
+  }
+  if (!workspaceId) {
+    return {
+      error: `${fieldName}="${value}" looks like a truncated UUID prefix (${value.length} chars). Prefix resolution requires workspace scope; call \`session_init\` first or provide workspace_id, or use the full UUID.`,
+    };
+  }
+
+  let matches: string[] = [];
+  try {
+    matches = await listEntityPrefixMatches(client, resource, value, workspaceId, projectId);
+  } catch (error) {
+    return {
+      error: `Failed to resolve ${fieldName} prefix "${value}" (${resource}): ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  if (matches.length === 0) {
+    return { error: `No ${resource} found matching UUID prefix "${value}" (${fieldName}).` };
+  }
+  if (matches.length > 1) {
+    const examples = matches.slice(0, 5).join(", ");
+    return {
+      error: `Ambiguous ${fieldName} prefix "${value}" matched ${matches.length} ${resource}s: ${examples}. Provide the full UUID.`,
+    };
+  }
+  return { value: matches[0] };
 }
 
 type RulesNotice = {
@@ -6179,7 +6389,7 @@ Actions:
     "memory_create_node",
     {
       title: "Create knowledge node",
-      description: "Create a knowledge node with optional relations",
+      description: "Create a knowledge node",
       inputSchema: z.object({
         workspace_id: z.string().uuid().optional(),
         project_id: z.string().uuid().optional(),
@@ -6197,6 +6407,11 @@ Actions:
       }),
     },
     async (input) => {
+      if (input.relations !== undefined) {
+        return errorResult(
+          "memory_create_node relations is not yet supported. Remove `relations` and retry; edge management is not available yet."
+        );
+      }
       const result = await client.createKnowledgeNode(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
@@ -6996,6 +7211,11 @@ Runs in the background and returns immediately; use 'projects_index_status' to m
       }),
     },
     async (input) => {
+      if (input.relations !== undefined) {
+        return errorResult(
+          "memory_update_node relations is not yet supported. Remove `relations` and retry; edge management is not available yet."
+        );
+      }
       const { node_id, ...body } = input;
       const result = await client.updateKnowledgeNode(node_id, body);
       return {
@@ -12198,16 +12418,64 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         const explicitProjectId = normalizeUuid(input.project_id);
         let projectId = explicitProjectId || resolveProjectId(undefined);
 
-        const prefixCheck =
-          validateIdOrPrefixHint(input.event_id, "event_id") ||
-          validateIdOrPrefixHint(input.plan_id, "plan_id") ||
-          validateIdOrPrefixHint(input.task_id, "task_id") ||
-          validateIdOrPrefixHint(input.node_id, "node_id") ||
-          validateIdOrPrefixHint(input.lesson_id, "lesson_id") ||
-          validateIdOrPrefixHint(input.suggestion_id, "suggestion_id");
-        if (prefixCheck) {
-          return errorResult(prefixCheck);
-        }
+        const resolvedSessionEventId = await resolveIdOrPrefix(
+          client,
+          input.event_id,
+          "event_id",
+          workspaceId,
+          projectId,
+          "event"
+        );
+        if (resolvedSessionEventId.error) return errorResult(resolvedSessionEventId.error);
+        if (resolvedSessionEventId.value) input.event_id = resolvedSessionEventId.value;
+        const resolvedSessionPlanId = await resolveIdOrPrefix(
+          client,
+          input.plan_id,
+          "plan_id",
+          workspaceId,
+          projectId,
+          "plan"
+        );
+        if (resolvedSessionPlanId.error) return errorResult(resolvedSessionPlanId.error);
+        if (resolvedSessionPlanId.value) input.plan_id = resolvedSessionPlanId.value;
+        const resolvedSessionTaskId = await resolveIdOrPrefix(
+          client,
+          input.task_id,
+          "task_id",
+          workspaceId,
+          projectId,
+          "task"
+        );
+        if (resolvedSessionTaskId.error) return errorResult(resolvedSessionTaskId.error);
+        if (resolvedSessionTaskId.value) input.task_id = resolvedSessionTaskId.value;
+        const resolvedSessionNodeId = await resolveIdOrPrefix(
+          client,
+          input.node_id,
+          "node_id",
+          workspaceId,
+          projectId,
+          "node"
+        );
+        if (resolvedSessionNodeId.error) return errorResult(resolvedSessionNodeId.error);
+        if (resolvedSessionNodeId.value) input.node_id = resolvedSessionNodeId.value;
+        const resolvedLessonId = await resolveIdOrPrefix(
+          client,
+          input.lesson_id,
+          "lesson_id",
+          workspaceId,
+          projectId
+        );
+        if (resolvedLessonId.error) return errorResult(resolvedLessonId.error);
+        if (resolvedLessonId.value) input.lesson_id = resolvedLessonId.value;
+        const resolvedSuggestionId = await resolveIdOrPrefix(
+          client,
+          input.suggestion_id,
+          "suggestion_id",
+          workspaceId,
+          projectId
+        );
+        if (resolvedSuggestionId.error) return errorResult(resolvedSuggestionId.error);
+        if (resolvedSuggestionId.value) input.suggestion_id = resolvedSuggestionId.value;
 
         switch (input.action) {
           case "capture": {
@@ -13200,18 +13468,18 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           query: z.string().optional(),
           category: z.string().optional(),
           limit: z.number().optional(),
-          // Structured identity metadata for filtering captured events (issue #54)
+          // Structured identity metadata for capture/search/list flows (issue #54)
           agent: z
             .string()
             .optional()
             .describe(
-              "Filter events by agent name (matches both the structured `agent` field and the `agent:<name>` tag convention)."
+              "Agent identity metadata (capture/create filters) and query filter. Matches both structured `agent` and `agent:<name>` tag fallback."
             ),
           mode: z
             .string()
             .optional()
             .describe(
-              "Filter events by mode (matches both the structured `mode` field and the `mode:<value>` tag convention)."
+              "Mode metadata (capture/create filters) and query filter. Matches both structured `mode` and `mode:<value>` tag fallback."
             ),
           // Node relations
           relations: z
@@ -13366,34 +13634,107 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         const explicitProjectId = normalizeUuid(input.project_id);
         let projectId = explicitProjectId || resolveProjectId(undefined);
 
-        const prefixCheck =
-          validateIdOrPrefixHint(input.event_id, "event_id") ||
-          validateIdOrPrefixHint(input.node_id, "node_id") ||
-          validateIdOrPrefixHint(input.doc_id, "doc_id") ||
-          validateIdOrPrefixHint(input.todo_id, "todo_id") ||
-          validateIdOrPrefixHint(input.task_id, "task_id") ||
-          validateIdOrPrefixHint(input.plan_id, "plan_id") ||
-          validateIdOrPrefixHint(input.diagram_id, "diagram_id") ||
-          validateIdOrPrefixHint(input.transcript_id, "transcript_id");
-        if (prefixCheck) {
-          return errorResult(prefixCheck);
-        }
+        const resolvedMemoryEventId = await resolveIdOrPrefix(
+          client,
+          input.event_id,
+          "event_id",
+          workspaceId,
+          projectId,
+          "event"
+        );
+        if (resolvedMemoryEventId.error) return errorResult(resolvedMemoryEventId.error);
+        if (resolvedMemoryEventId.value) input.event_id = resolvedMemoryEventId.value;
+        const resolvedMemoryNodeId = await resolveIdOrPrefix(
+          client,
+          input.node_id,
+          "node_id",
+          workspaceId,
+          projectId,
+          "node"
+        );
+        if (resolvedMemoryNodeId.error) return errorResult(resolvedMemoryNodeId.error);
+        if (resolvedMemoryNodeId.value) input.node_id = resolvedMemoryNodeId.value;
+        const resolvedMemoryDocId = await resolveIdOrPrefix(
+          client,
+          input.doc_id,
+          "doc_id",
+          workspaceId,
+          projectId,
+          "doc"
+        );
+        if (resolvedMemoryDocId.error) return errorResult(resolvedMemoryDocId.error);
+        if (resolvedMemoryDocId.value) input.doc_id = resolvedMemoryDocId.value;
+        const resolvedMemoryTodoId = await resolveIdOrPrefix(
+          client,
+          input.todo_id,
+          "todo_id",
+          workspaceId,
+          projectId,
+          "todo"
+        );
+        if (resolvedMemoryTodoId.error) return errorResult(resolvedMemoryTodoId.error);
+        if (resolvedMemoryTodoId.value) input.todo_id = resolvedMemoryTodoId.value;
+        const resolvedMemoryTaskId = await resolveIdOrPrefix(
+          client,
+          input.task_id,
+          "task_id",
+          workspaceId,
+          projectId,
+          "task"
+        );
+        if (resolvedMemoryTaskId.error) return errorResult(resolvedMemoryTaskId.error);
+        if (resolvedMemoryTaskId.value) input.task_id = resolvedMemoryTaskId.value;
+        const resolvedMemoryPlanId = await resolveIdOrPrefix(
+          client,
+          input.plan_id,
+          "plan_id",
+          workspaceId,
+          projectId,
+          "plan"
+        );
+        if (resolvedMemoryPlanId.error) return errorResult(resolvedMemoryPlanId.error);
+        if (resolvedMemoryPlanId.value) input.plan_id = resolvedMemoryPlanId.value;
+        const resolvedMemoryDiagramId = await resolveIdOrPrefix(
+          client,
+          input.diagram_id,
+          "diagram_id",
+          workspaceId,
+          projectId,
+          "diagram"
+        );
+        if (resolvedMemoryDiagramId.error) return errorResult(resolvedMemoryDiagramId.error);
+        if (resolvedMemoryDiagramId.value) input.diagram_id = resolvedMemoryDiagramId.value;
+        const resolvedMemoryTranscriptId = await resolveIdOrPrefix(
+          client,
+          input.transcript_id,
+          "transcript_id",
+          workspaceId,
+          projectId,
+          "transcript"
+        );
+        if (resolvedMemoryTranscriptId.error) return errorResult(resolvedMemoryTranscriptId.error);
+        if (resolvedMemoryTranscriptId.value) input.transcript_id = resolvedMemoryTranscriptId.value;
 
         switch (input.action) {
           case "create_event": {
             if (!input.event_type || !input.title || !input.content) {
               return errorResult("create_event requires: event_type, title, content");
             }
+            const trimmedAgent = input.agent?.trim() || undefined;
+            const trimmedMode = input.mode?.trim() || undefined;
+            const eventTags = normalizeTagsWithFallback(input.tags, trimmedAgent, trimmedMode);
             const result = await client.createMemoryEvent({
               workspace_id: workspaceId,
               project_id: projectId,
               event_type: input.event_type,
               title: input.title,
               content: input.content,
-              tags: input.tags,
+              tags: eventTags,
               metadata: input.metadata,
               provenance: input.provenance,
               code_refs: input.code_refs,
+              agent: trimmedAgent,
+              mode: trimmedMode,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -13538,13 +13879,17 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.node_type || !input.title || !input.content) {
               return errorResult("create_node requires: node_type, title, content");
             }
+            if (input.relations !== undefined) {
+              return errorResult(
+                "create_node relations is not yet supported. Remove `relations` and retry; edge management is not available yet."
+              );
+            }
             const result = await client.createKnowledgeNode({
               workspace_id: workspaceId,
               project_id: projectId,
               node_type: input.node_type,
               title: input.title,
               content: input.content,
-              relations: input.relations,
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
@@ -13566,6 +13911,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           case "update_node": {
             if (!input.node_id) {
               return errorResult("update_node requires: node_id");
+            }
+            if (input.relations !== undefined) {
+              return errorResult(
+                "update_node relations is not yet supported. Remove `relations` and retry; edge management is not available yet."
+              );
             }
             const result = await client.updateKnowledgeNode(input.node_id, {
               title: input.title,
@@ -13618,12 +13968,16 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.query) {
               return errorResult("search requires: query");
             }
+            const searchAgent = input.agent?.trim() || undefined;
+            const searchMode = input.mode?.trim() || undefined;
             const [memoryResult, docsResult] = await Promise.all([
               client.memorySearch({
                 workspace_id: workspaceId,
                 project_id: projectId,
                 query: input.query,
                 limit: input.limit,
+                agent: searchAgent,
+                mode: searchMode,
               }),
               workspaceId
                 ? client.docsList({
@@ -13633,7 +13987,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                   })
                 : Promise.resolve(undefined),
             ]);
-            const memoryItems = extractMemorySearchResults(memoryResult);
+            const memoryItems = extractMemorySearchResults(memoryResult).filter((item) =>
+              itemMatchesAgentMode(item, searchAgent, searchMode)
+            );
             const docsItems = extractCollectionArray(docsResult ?? {}) ?? [];
             const docMatches = rankDocsForQueryMatches(
               docsItems,
@@ -13727,6 +14083,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               return errorResult("create_task requires workspace_id. Call session_init first.");
             }
             const requestedTaskStatus = input.task_status ?? input.status;
+            const taskAgent = input.agent?.trim() || undefined;
+            const taskMode = input.mode?.trim() || undefined;
+            const taskTags = normalizeTagsWithFallback(input.tags, taskAgent, taskMode);
             const result = await client.createTask({
               workspace_id: workspaceId,
               project_id: projectId,
@@ -13739,7 +14098,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               priority: input.priority,
               order: input.order,
               code_refs: input.code_refs,
-              tags: input.tags,
+              tags: taskTags,
+              agent: taskAgent,
+              mode: taskMode,
               is_personal: input.is_personal,
             });
             // Add task lifecycle hint
@@ -13817,18 +14178,32 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               return errorResult("list_tasks requires workspace_id. Call session_init first.");
             }
             const requestedTaskStatus = input.task_status ?? input.status;
+            const listTaskAgent = input.agent?.trim() || undefined;
+            const listTaskMode = input.mode?.trim() || undefined;
             const result = await client.listTasks({
               workspace_id: workspaceId,
               project_id: projectId,
               plan_id: input.plan_id ?? undefined,
               status: requestedTaskStatus,
               priority: input.priority,
+              agent: listTaskAgent,
+              mode: listTaskMode,
               limit: input.limit,
               is_personal: input.is_personal,
             });
-            // Add empty state hint if no tasks found
             const tasks = (result as any)?.data?.tasks || (result as any)?.tasks || (result as any)?.data?.items || (result as any)?.items || [];
-            const resultWithHint = (Array.isArray(tasks) && tasks.length === 0)
+            if (Array.isArray(tasks) && (listTaskAgent || listTaskMode)) {
+              const filtered = tasks.filter((task: any) =>
+                itemMatchesAgentMode(task, listTaskAgent, listTaskMode)
+              );
+              if ((result as any)?.data?.tasks) (result as any).data.tasks = filtered;
+              else if ((result as any)?.tasks) (result as any).tasks = filtered;
+              else if ((result as any)?.data?.items) (result as any).data.items = filtered;
+              else if ((result as any)?.items) (result as any).items = filtered;
+            }
+            // Add empty state hint if no tasks found
+            const hintedTasks = (result as any)?.data?.tasks || (result as any)?.tasks || (result as any)?.data?.items || (result as any)?.items || [];
+            const resultWithHint = (Array.isArray(hintedTasks) && hintedTasks.length === 0)
               ? { ...(result as object), hint: getEmptyStateHint("list_tasks") }
               : result;
             return {

@@ -1244,7 +1244,6 @@ export class ContextStreamClient {
     node_type: string;
     title: string;
     content: string;
-    relations?: Array<{ type: string; target_id: string }>;
   }) {
     const withDefaults = this.withDefaults(body);
     if (!withDefaults.workspace_id) {
@@ -1269,11 +1268,6 @@ export class ContextStreamClient {
       valid_from: new Date().toISOString(),
     };
 
-    if (withDefaults.relations && withDefaults.relations.length) {
-      // Preserve requested relations in node context (API does not currently accept relations on create).
-      apiBody.context = { relations: withDefaults.relations };
-    }
-
     return request(this.config, "/memory/nodes", { body: apiBody });
   }
 
@@ -1296,6 +1290,8 @@ export class ContextStreamClient {
     workspace_id?: string;
     project_id?: string;
     limit?: number;
+    agent?: string;
+    mode?: string;
   }) {
     return request(this.config, "/memory/search", { body: this.withDefaults(body) });
   }
@@ -2622,14 +2618,12 @@ export class ContextStreamClient {
     body: {
       title?: string;
       content?: string;
-      relations?: Array<{ type: string; target_id: string }>;
     }
   ) {
     uuidSchema.parse(nodeId);
     const apiBody: Record<string, any> = {};
     if (body.title !== undefined) apiBody.summary = body.title;
     if (body.content !== undefined) apiBody.details = body.content;
-    if (body.relations && body.relations.length) apiBody.context = { relations: body.relations };
     return request(this.config, `/memory/nodes/${nodeId}`, { method: "PUT", body: apiBody });
   }
 
@@ -6661,6 +6655,8 @@ export class ContextStreamClient {
     order?: number;
     code_refs?: Array<{ file_path: string; symbol_name?: string; line_range?: [number, number] }>;
     tags?: string[];
+    agent?: string;
+    mode?: string;
     is_personal?: boolean;
   }) {
     const withDefaults = this.withDefaults(params);
@@ -6679,6 +6675,8 @@ export class ContextStreamClient {
     plan_id?: string;
     status?: string;
     priority?: string;
+    agent?: string;
+    mode?: string;
     is_personal?: boolean;
     limit?: number;
     offset?: number;
@@ -6690,6 +6688,8 @@ export class ContextStreamClient {
     if (params?.plan_id) query.set("plan_id", params.plan_id);
     if (params?.status) query.set("status", params.status);
     if (params?.priority) query.set("priority", params.priority);
+    if (params?.agent) query.set("agent", params.agent);
+    if (params?.mode) query.set("mode", params.mode);
     if (params?.is_personal !== undefined) query.set("is_personal", String(params.is_personal));
     if (params?.limit) query.set("limit", String(params.limit));
     if (params?.offset) query.set("offset", String(params.offset));

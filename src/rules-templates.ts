@@ -34,15 +34,22 @@ const CONTEXTSTREAM_TOOL_NAMES = [
   "context", // Renamed from context_smart - get relevant context every message
   "context_feedback",
   "generate_rules",
+  "instruct",
+  "flash",
+  "ram",
 
   // Consolidated domain tools (v0.4.x default)
   "search", // Modes: auto (recommended), semantic, hybrid (legacy alias), keyword, pattern
   "session", // Actions: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search, decision_trace
   "memory", // Actions: create_event, get_event, update_event, delete_event, list_events, distill_event, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, search, decisions, timeline, summary
+  "entity", // Actions: list, get, create, update, delete for structured taxonomy entities
+  "capsule", // Actions: open, create, share, bootstrap_prompt, graph, audit
   "graph", // Actions: dependencies, impact, call_path, related, path, decisions, ingest, circular_dependencies, unused_code, contradictions
   "project", // Actions: list, get, create, update, index, overview, statistics, files, index_status, ingest_local
   "workspace", // Actions: list, get, associate, bootstrap
   "reminder", // Actions: list, active, create, snooze, complete, dismiss
+  "media", // Actions: index, status, search, get_clip, list, delete
+  "skill", // Actions: list, run, create, update, import
   "integration", // Provider: slack, github, all; Actions: status, search, stats, activity, contributors, knowledge, summary, channels, discussions, sync_users, repos, issues
   "help", // Actions: tools, auth, version, editor_rules, enable_bundle
 ] as const;
@@ -82,6 +89,9 @@ const CONTEXTSTREAM_RULES_BOOTSTRAP = `
 - "what did we do last session" / "past sessions" / "pick up where we left off" → \`session(action="recall", query="...")\` or \`memory(action="list_transcripts", limit=10)\`
 - "search past sessions" / "when did we discuss X" → \`memory(action="search_transcripts", query="...")\`
 - "save snapshot" → \`session(action="capture", event_type="session_snapshot", title="...", content="...")\`
+- "list media" / "show assets" / "show photos/videos/audio/docs" → \`media(action="list", content_types=["image"])\` (use \`image|video|audio|document\`; omit \`content_types\` for all assets)
+- "find media" / "search photos/videos/audio/docs" / "what's in this PDF/video/audio?" → \`media(action="search", query="...", content_types=["document"])\`
+- "index media" / "upload asset" / "read this photo/video/audio/PDF" → \`media(action="index", file_path="...", content_type="image")\` or \`media(action="index", external_url="...", content_type="document")\`
 
 ## Skills, Docs & Lessons First
 

@@ -71,6 +71,8 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: "decisions", hint: "choices" },
       { name: "timeline", hint: "history" },
       { name: "distill_event", hint: "extract" },
+      { name: "search_archive", hint: "cold" },
+      { name: "entity", hint: "taxonomy" },
       // Task actions
       { name: "create_task", hint: "new-task" },
       { name: "get_task", hint: "get-task" },
@@ -112,6 +114,20 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: "get_clip", hint: "get-segment" },
       { name: "list", hint: "browse" },
       { name: "delete", hint: "remove" },
+    ],
+  },
+  {
+    name: "Capsule",
+    tools: [
+      { name: "open", hint: "hydrate" },
+      { name: "create", hint: "snapshot" },
+      { name: "share", hint: "handoff" },
+      { name: "chunk", hint: "lazy" },
+      { name: "bootstrap_prompt", hint: "paste" },
+      { name: "graph", hint: "json" },
+      { name: "list_shares", hint: "shares" },
+      { name: "revoke_share", hint: "revoke" },
+      { name: "audit", hint: "access" },
     ],
   },
   {

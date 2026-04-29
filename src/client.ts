@@ -55,9 +55,16 @@ function normalizeNodeType(input: string): string {
       return "Habit";
     case "lesson":
       return "Lesson";
+    case "goal":
+      return "Goal";
+    case "risk":
+      return "Risk";
+    case "term":
+    case "glossary":
+      return "Term";
     default:
       throw new Error(
-        `Invalid node_type: ${JSON.stringify(input)} (expected one of fact|decision|preference|constraint|habit|lesson)`
+        `Invalid node_type: ${JSON.stringify(input)} (expected one of fact|decision|preference|constraint|habit|lesson|goal|risk|term)`
       );
   }
 }
@@ -72,6 +79,104 @@ function normalizeTags(tags?: string[]): string[] | undefined {
     )
   );
   return normalized.length > 0 ? normalized : undefined;
+}
+
+const ENTITY_KIND_TO_PATH: Record<string, string> = {
+  ticket: "tickets",
+  tickets: "tickets",
+  handoff: "handoffs",
+  handoffs: "handoffs",
+  backlog_view: "backlog-views",
+  "backlog-view": "backlog-views",
+  backlogview: "backlog-views",
+  backlog: "backlog-views",
+  backlog_views: "backlog-views",
+  "backlog-views": "backlog-views",
+  incident: "incidents",
+  incidents: "incidents",
+  release: "releases",
+  releases: "releases",
+  experiment: "experiments",
+  experiments: "experiments",
+  goal: "goals",
+  goals: "goals",
+  key_result: "key-results",
+  "key-result": "key-results",
+  keyresult: "key-results",
+  kr: "key-results",
+  key_results: "key-results",
+  "key-results": "key-results",
+  sprint: "sprints",
+  sprints: "sprints",
+  review: "reviews",
+  reviews: "reviews",
+  risk: "risks",
+  risks: "risks",
+};
+
+export const VALID_ENTITY_KINDS = [
+  "ticket",
+  "handoff",
+  "backlog_view",
+  "incident",
+  "release",
+  "experiment",
+  "goal",
+  "key_result",
+  "sprint",
+  "review",
+  "risk",
+] as const;
+
+function entityKindToPath(kind: string): string | undefined {
+  return ENTITY_KIND_TO_PATH[String(kind ?? "").trim().toLowerCase()];
+}
+
+function appendQuery(query: URLSearchParams, key: string, value: unknown) {
+  if (value === undefined || value === null) return;
+  if (typeof value === "string" && value.trim() === "") return;
+  if (typeof value === "object") return;
+  query.set(key, String(value));
+}
+
+function extractCapsuleShareToken(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.startsWith("brain_") || trimmed.startsWith("capsule_")) {
+    return trimmed.split(/[/?#]/)[0];
+  }
+  const patterns = ["/api/v1/brain/shares/", "/api/v1/capsules/shares/", "/c/"];
+  for (const pattern of patterns) {
+    const idx = trimmed.indexOf(pattern);
+    if (idx >= 0) {
+      const suffix = trimmed.slice(idx + pattern.length);
+      const token = suffix.split(/[/?#.]/)[0];
+      if (token.startsWith("brain_") || token.startsWith("capsule_")) return token;
+    }
+  }
+  return undefined;
+}
+
+function extractCapsuleId(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("cap_")) return trimmed.split(/[/?#]/)[0];
+  const marker = "/api/v1/capsules/";
+  const idx = trimmed.indexOf(marker);
+  if (idx >= 0) {
+    const capsuleId = trimmed.slice(idx + marker.length).split(/[/?#]/)[0];
+    if (capsuleId.startsWith("cap_")) return capsuleId;
+  }
+  return undefined;
+}
+
+export function resolveCapsuleShareToken(value: string): string {
+  const token = extractCapsuleShareToken(value);
+  if (!token) {
+    throw new Error(
+      "Could not resolve a capsule share token; pass share_token or a URL containing /c/, brain_, capsule_, or /api/v1/capsules/shares/"
+    );
+  }
+  return token;
 }
 
 // ---------- Event type detection helpers (Issue #31) ----------
@@ -857,6 +962,276 @@ export class ContextStreamClient {
     return request(this.config, `/projects/${projectId}/index`, { body: {} });
   }
 
+  // Taxonomy expansion entities: generic CRUD over tickets, handoffs,
+  // incidents, releases, experiments, OKRs, reviews, and risks.
+  async entityList(kind: string, params?: {
+    workspace_id?: string;
+    project_id?: string;
+    query?: Record<string, unknown>;
+  }) {
+    const segment = entityKindToPath(kind);
+    if (!segment) {
+      throw new Error(`Unknown entity kind: ${kind}. Valid kinds: ${VALID_ENTITY_KINDS.join(", ")}`);
+    }
+    const withDefaults = this.withDefaults({
+      workspace_id: params?.workspace_id,
+      project_id: params?.project_id,
+    });
+    const query = new URLSearchParams();
+    appendQuery(query, "workspace_id", withDefaults.workspace_id);
+    appendQuery(query, "project_id", withDefaults.project_id);
+    for (const [key, value] of Object.entries(params?.query || {})) {
+      appendQuery(query, key, value);
+    }
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request(this.config, `/${segment}${suffix}`, { method: "GET" });
+  }
+
+  async entityGet(kind: string, id: string) {
+    const segment = entityKindToPath(kind);
+    if (!segment) {
+      throw new Error(`Unknown entity kind: ${kind}. Valid kinds: ${VALID_ENTITY_KINDS.join(", ")}`);
+    }
+    uuidSchema.parse(id);
+    return request(this.config, `/${segment}/${id}`, { method: "GET" });
+  }
+
+  async entityCreate(kind: string, params: {
+    workspace_id?: string;
+    project_id?: string;
+    body?: Record<string, unknown>;
+  }) {
+    const segment = entityKindToPath(kind);
+    if (!segment) {
+      throw new Error(`Unknown entity kind: ${kind}. Valid kinds: ${VALID_ENTITY_KINDS.join(", ")}`);
+    }
+    const body: Record<string, unknown> = { ...(params.body || {}) };
+    const withDefaults = this.withDefaults({
+      workspace_id: params.workspace_id,
+      project_id: params.project_id,
+    });
+    if (!("workspace_id" in body) && withDefaults.workspace_id) body.workspace_id = withDefaults.workspace_id;
+    if (!("project_id" in body) && withDefaults.project_id) body.project_id = withDefaults.project_id;
+
+    if (segment === "key-results") {
+      const goalId = typeof body.goal_id === "string" ? body.goal_id : "";
+      uuidSchema.parse(goalId);
+      delete body.goal_id;
+      return request(this.config, `/goals/${goalId}/key-results`, { body });
+    }
+
+    return request(this.config, `/${segment}`, { body });
+  }
+
+  async entityUpdate(kind: string, id: string, body: Record<string, unknown>) {
+    const segment = entityKindToPath(kind);
+    if (!segment) {
+      throw new Error(`Unknown entity kind: ${kind}. Valid kinds: ${VALID_ENTITY_KINDS.join(", ")}`);
+    }
+    uuidSchema.parse(id);
+    return request(this.config, `/${segment}/${id}`, { method: "PATCH", body });
+  }
+
+  async entityDelete(kind: string, id: string) {
+    const segment = entityKindToPath(kind);
+    if (!segment) {
+      throw new Error(`Unknown entity kind: ${kind}. Valid kinds: ${VALID_ENTITY_KINDS.join(", ")}`);
+    }
+    uuidSchema.parse(id);
+    return request(this.config, `/${segment}/${id}`, { method: "DELETE" });
+  }
+
+  // ContextCapsules: portable, shareable, hydrate-on-demand project/workspace
+  // context snapshots.
+  async createCapsule(params: {
+    scope?: string;
+    workspace_id?: string;
+    project_id?: string;
+    name?: string;
+    purpose?: string;
+    mode?: string;
+    sections?: string[];
+    audience?: string;
+    include_personal?: boolean;
+    include_code?: string;
+    redaction_level?: string;
+    permissions?: string;
+    max_inline_tokens?: number;
+    refresh_if_stale?: boolean;
+  }) {
+    return request(this.config, "/capsules", { body: this.withDefaults(params) });
+  }
+
+  async getCapsule(capsuleId: string) {
+    return request(this.config, `/capsules/${capsuleId}`, { method: "GET" });
+  }
+
+  private capsuleLocatorPath(params: {
+    capsule_id?: string;
+    share_token?: string;
+    url?: string;
+  }, extraPath?: string): string {
+    const suffix = extraPath ? `/${extraPath.replace(/^\/+/, "")}` : "";
+    if (params.capsule_id) {
+      const capsuleId = extractCapsuleId(params.capsule_id) || params.capsule_id.trim();
+      return `/capsules/${capsuleId}${suffix}`;
+    }
+    if (params.share_token) {
+      const value = params.share_token.trim();
+      const capsuleId = extractCapsuleId(value);
+      if (capsuleId) return `/capsules/${capsuleId}${suffix}`;
+      const token = extractCapsuleShareToken(value) || value;
+      return `/capsules/shares/${token}${suffix}`;
+    }
+    if (params.url) {
+      const token = extractCapsuleShareToken(params.url);
+      if (token) return `/capsules/shares/${token}${suffix}`;
+      const capsuleId = extractCapsuleId(params.url);
+      if (capsuleId) return `/capsules/${capsuleId}${suffix}`;
+      throw new Error("Unsupported ContextCapsule locator URL");
+    }
+    throw new Error("capsule_id, share_token, or url is required");
+  }
+
+  async openCapsule(params: {
+    capsule_id?: string;
+    share_token?: string;
+    url?: string;
+    format?: string;
+    hydrate?: boolean;
+  }) {
+    if (params.format && params.format !== "summary") {
+      throw new Error(
+        "openCapsule only supports JSON/summary responses; use capsuleContextDoc for markdown/text or capsuleStream for ndjson"
+      );
+    }
+    const query = new URLSearchParams();
+    if (params.format === "summary") query.set("format", "summary");
+    if (params.hydrate) query.set("hydrate", "true");
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request(this.config, `${this.capsuleLocatorPath(params)}${suffix}`, { method: "GET" });
+  }
+
+  async capsuleContextDoc(params: {
+    capsule_id?: string;
+    share_token?: string;
+    url?: string;
+    format?: string;
+  }) {
+    const suffix = ["text", "plain", "txt"].includes(params.format || "") ? "context.txt" : "context.md";
+    return request<string>(this.config, this.capsuleLocatorPath(params, suffix), { method: "GET" });
+  }
+
+  async capsuleChunk(params: {
+    capsule_id?: string;
+    share_token?: string;
+    url?: string;
+    chunk_id: string;
+  }) {
+    return request(this.config, this.capsuleLocatorPath(params, `chunks/${params.chunk_id}`), {
+      method: "GET",
+    });
+  }
+
+  async capsuleStream(params: {
+    capsule_id?: string;
+    share_token?: string;
+    url?: string;
+    cursor_chunk_id?: string;
+  }) {
+    return request<string>(this.config, this.capsuleLocatorPath(params, "stream"), {
+      body: params.cursor_chunk_id ? { cursor_chunk_id: params.cursor_chunk_id } : {},
+    });
+  }
+
+  async capsuleShare(capsuleId: string, params: Record<string, unknown>) {
+    return request(this.config, `/capsules/${capsuleId}/share`, { body: params });
+  }
+
+  async capsuleListShares(params: {
+    capsule_id?: string;
+    workspace_id?: string;
+    project_id?: string;
+  }) {
+    if (params.capsule_id) {
+      return request(this.config, `/capsules/${params.capsule_id}/shares`, { method: "GET" });
+    }
+    const withDefaults = this.withDefaults({
+      workspace_id: params.workspace_id,
+      project_id: params.project_id,
+    });
+    if (withDefaults.project_id) {
+      return request(this.config, `/projects/${withDefaults.project_id}/capsules/shares`, {
+        method: "GET",
+      });
+    }
+    if (withDefaults.workspace_id) {
+      return request(this.config, `/workspaces/${withDefaults.workspace_id}/capsules/shares`, {
+        method: "GET",
+      });
+    }
+    throw new Error("capsule_id, project_id, or workspace_id is required for listing capsule shares");
+  }
+
+  async capsuleRevokeShare(shareId: string) {
+    uuidSchema.parse(shareId);
+    return request(this.config, `/capsules/shares/${shareId}`, { method: "DELETE" });
+  }
+
+  async capsuleAudit(params: {
+    capsule_id?: string;
+    workspace_id?: string;
+    project_id?: string;
+    event_kind?: string;
+    access_scope?: string;
+    limit?: number;
+    offset?: number;
+  }) {
+    const withDefaults = this.withDefaults({
+      workspace_id: params.workspace_id,
+      project_id: params.project_id,
+    });
+    let base: string;
+    if (params.capsule_id) base = `/capsules/${params.capsule_id}/audit`;
+    else if (withDefaults.project_id) base = `/projects/${withDefaults.project_id}/capsules/audit`;
+    else if (withDefaults.workspace_id) base = `/workspaces/${withDefaults.workspace_id}/capsules/audit`;
+    else throw new Error("capsule_id, project_id, or workspace_id is required for capsule audit");
+    const query = new URLSearchParams();
+    appendQuery(query, "event_kind", params.event_kind);
+    appendQuery(query, "access_scope", params.access_scope);
+    appendQuery(query, "limit", params.limit);
+    appendQuery(query, "offset", params.offset);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request(this.config, `${base}${suffix}`, { method: "GET" });
+  }
+
+  async listCapsules(params: {
+    workspace_id?: string;
+    project_id?: string;
+    limit?: number;
+  }) {
+    const withDefaults = this.withDefaults(params);
+    const limit = Math.max(1, Math.min(params.limit || 50, 200));
+    if (withDefaults.project_id) {
+      return request(this.config, `/projects/${withDefaults.project_id}/capsules?limit=${limit}`, {
+        method: "GET",
+      });
+    }
+    if (withDefaults.workspace_id) {
+      return request(this.config, `/workspaces/${withDefaults.workspace_id}/capsules?limit=${limit}`, {
+        method: "GET",
+      });
+    }
+    throw new Error("workspace_id or project_id is required for listing capsules");
+  }
+
+  async capsuleGraph(kind: "explorer" | "knowledge" | "code", tokenOrUrl: string) {
+    const token = resolveCapsuleShareToken(tokenOrUrl);
+    const suffix =
+      kind === "explorer" ? "explorer" : kind === "knowledge" ? "knowledge-graph" : "code-graph";
+    return request(this.config, `/capsules/shares/${token}/${suffix}`, { method: "GET" });
+  }
+
   private async searchWithCache(
     endpoint: string,
     searchType: string,
@@ -1299,6 +1674,7 @@ export class ContextStreamClient {
   memoryDecisions(params?: {
     workspace_id?: string;
     project_id?: string;
+    query?: string;
     category?: string;
     limit?: number;
   }) {
@@ -1306,6 +1682,7 @@ export class ContextStreamClient {
     const withDefaults = this.withDefaults(params || {});
     if (withDefaults.workspace_id) query.set("workspace_id", withDefaults.workspace_id);
     if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
+    if (params?.query) query.set("query", params.query);
     if (params?.category) query.set("category", params.category);
     if (params?.limit) query.set("limit", String(params.limit));
     const suffix = query.toString() ? `?${query.toString()}` : "";
@@ -2680,6 +3057,20 @@ export class ContextStreamClient {
   memorySummary(workspaceId: string) {
     uuidSchema.parse(workspaceId);
     return request(this.config, `/memory/search/summary/${workspaceId}`, { method: "GET" });
+  }
+
+  sessionRestoreContext(params: {
+    snapshot_id?: string;
+    max_snapshots?: number;
+    session_id?: string;
+    workspace_id?: string;
+    project_id?: string;
+    trigger?: string;
+    include_durable_context?: boolean;
+  }) {
+    return request(this.config, "/session/restore", {
+      body: this.withDefaults(params),
+    });
   }
 
   // Graph extended operations
@@ -6747,6 +7138,7 @@ export class ContextStreamClient {
    */
   async mediaInitUpload(params: {
     workspace_id?: string;
+    project_id?: string;
     filename: string;
     size_bytes: number;
     content_type: "video" | "audio" | "image" | "document" | "text" | "code" | "other";
@@ -6770,6 +7162,7 @@ export class ContextStreamClient {
       mime_type: params.mime_type,
       title: params.title,
       tags: params.tags || [],
+      project_id: params.project_id,
     };
     const result = await request(
       this.config,
@@ -6852,7 +7245,9 @@ export class ContextStreamClient {
    */
   async mediaListContent(params: {
     workspace_id?: string;
+    project_id?: string;
     content_type?: string;
+    content_types?: string[];
     status?: string;
     limit?: number;
     offset?: number;
@@ -6879,7 +7274,11 @@ export class ContextStreamClient {
       throw new Error("workspace_id is required for listing content");
     }
     const query = new URLSearchParams();
-    if (params?.content_type) query.set("content_type", params.content_type);
+    const contentTypes = params?.content_types?.length
+      ? params.content_types.join(",")
+      : params?.content_type;
+    if (contentTypes) query.set("content_type", contentTypes);
+    if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
     if (params?.status) query.set("status", params.status);
     if (params?.limit) query.set("limit", String(params.limit));
     if (params?.offset) query.set("offset", String(params.offset));
@@ -6897,8 +7296,10 @@ export class ContextStreamClient {
    */
   async mediaSearchContent(params: {
     workspace_id?: string;
+    project_id?: string;
     query: string;
     content_type?: string;
+    content_types?: string[];
     limit?: number;
     offset?: number;
   }): Promise<{
@@ -6921,13 +7322,44 @@ export class ContextStreamClient {
     }
     const query = new URLSearchParams();
     query.set("q", params.query);
-    if (params.content_type) query.set("content_type", params.content_type);
+    const contentTypes = params.content_types?.length
+      ? params.content_types.join(",")
+      : params.content_type;
+    if (contentTypes) query.set("content_type", contentTypes);
+    if (withDefaults.project_id) query.set("project_id", withDefaults.project_id);
     if (params.limit) query.set("limit", String(params.limit));
     if (params.offset) query.set("offset", String(params.offset));
     const result = await request(
       this.config,
       `/workspaces/${withDefaults.workspace_id}/content/search?${query.toString()}`,
       { method: "GET" }
+    );
+    return unwrapApiResponse(result);
+  }
+
+  async mediaIndexUrl(params: {
+    workspace_id?: string;
+    project_id?: string;
+    external_url: string;
+    content_type?: string;
+    tags?: string[];
+  }) {
+    const withDefaults = this.withDefaults(params);
+    if (!withDefaults.workspace_id) {
+      throw new Error("workspace_id is required for media URL indexing");
+    }
+    const result = await request(
+      this.config,
+      `/workspaces/${withDefaults.workspace_id}/content/index-url`,
+      {
+        method: "POST",
+        body: {
+          external_url: params.external_url,
+          content_type: params.content_type,
+          tags: params.tags || [],
+          project_id: withDefaults.project_id,
+        },
+      }
     );
     return unwrapApiResponse(result);
   }
@@ -7185,7 +7617,7 @@ export class ContextStreamClient {
   async docsList(params?: {
     workspace_id?: string;
     project_id?: string;
-    doc_type?: "roadmap" | "spec" | "general";
+    doc_type?: string;
     is_personal?: boolean;
     query?: string;
     page?: number;
@@ -7212,7 +7644,7 @@ export class ContextStreamClient {
     project_id?: string;
     title: string;
     content: string;
-    doc_type?: "roadmap" | "spec" | "general";
+    doc_type?: string;
     metadata?: Record<string, unknown>;
     is_personal?: boolean;
   }) {
@@ -7260,7 +7692,7 @@ export class ContextStreamClient {
     doc_id: string;
     title?: string;
     content?: string;
-    doc_type?: "roadmap" | "spec" | "general";
+    doc_type?: string;
     metadata?: Record<string, unknown>;
   }) {
     uuidSchema.parse(params.doc_id);

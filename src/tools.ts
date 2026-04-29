@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MessageExtraInfo, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { ContextStreamClient } from "./client.js";
-import { isLessonResult, isDecisionResult, extractEventTags, extractEffectiveEventType, resolveItemKind, filterItemsByKind, sortContextItems, IndexKeeper, type SmartContextItem, type ContextItemKind } from "./client.js";
+import { isLessonResult, isDecisionResult, extractEventTags, extractEffectiveEventType, resolveItemKind, filterItemsByKind, sortContextItems, IndexKeeper, VALID_ENTITY_KINDS, type SmartContextItem, type ContextItemKind } from "./client.js";
 import { readFilesFromDirectory, readAllFilesInBatches, countIndexableFiles } from "./files.js";
 import { SessionManager } from "./session-manager.js";
 import {
@@ -125,6 +125,8 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   memory: "memory",
   graph: "graph",
   media: "media",
+  capsule: "capsule",
+  entity: "entity",
   instruct: "instruct",
   flash: "flash",
   ram: "ram",
@@ -1640,6 +1642,9 @@ const STANDARD_TOOLSET = new Set<string>([
   "instruct",
   "ram",
   "mem",
+  "media",
+  "capsule",
+  "entity",
   // Reminders (6)
   "reminders_list",
   "reminders_active",
@@ -1728,10 +1733,9 @@ const ALL_INTEGRATION_TOOLS = new Set<string>([
 // CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS=true (default) | false
 const AUTO_HIDE_INTEGRATIONS = process.env.CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS !== "false";
 
-// Environment variable to control automatic context restoration on session_init
-// CONTEXTSTREAM_RESTORE_CONTEXT=true (default) | false
-// When true, session_init always attempts to restore from recent snapshots
-const RESTORE_CONTEXT_DEFAULT = process.env.CONTEXTSTREAM_RESTORE_CONTEXT !== "false";
+// Environment variable to control automatic context restoration on session_init.
+// CONTEXTSTREAM_RESTORE_CONTEXT=true enables restore even without is_post_compact=true.
+const RESTORE_CONTEXT_DEFAULT = process.env.CONTEXTSTREAM_RESTORE_CONTEXT === "true";
 
 // ============================================
 // CLIENT DETECTION (Strategy 3)
@@ -2153,8 +2157,9 @@ const operationsRegistry = new Map<string, OperationConfig>();
 
 // Category mapping for operations
 function inferOperationCategory(name: string): string {
-  if (name === "init" || name === "context" || name.startsWith("session_") || name.startsWith("context_")) return "Session";
-  if (name.startsWith("memory_")) return "Memory";
+  if (name === "init" || name === "context" || name === "session" || name.startsWith("session_") || name.startsWith("context_")) return "Session";
+  if (name === "memory" || name === "entity" || name.startsWith("memory_")) return "Memory";
+  if (name === "capsule") return "Utility";
   if (name.startsWith("search_")) return "Search";
   if (name.startsWith("graph_")) return "Graph";
   if (name.startsWith("workspace")) return "Workspace";
@@ -2417,6 +2422,8 @@ const CONSOLIDATED_TOOLS = new Set<string>([
   "integration", // Consolidates slack_*, github_*, notion_*, integrations_*
   "media", // Consolidates media indexing, search, and clip retrieval for Remotion/FFmpeg
   "skill", // Skill management: list, get, create, update, run, delete, import, export, share
+  "capsule", // ContextCapsule snapshots and shares
+  "entity", // Structured taxonomy entities
   "help", // Consolidates session_tools, auth_me, mcp_server_version, etc.
   "vcs", // Version control: status, diff, log, blame, branches, stash_list
 ]);
@@ -2431,6 +2438,8 @@ function mapToolToConsolidatedDomain(toolName: string): string | null {
   if (toolName.startsWith("search_")) return "search";
   if (toolName.startsWith("session_") || toolName === "context_feedback") return "session";
   if (toolName.startsWith("memory_") || toolName === "decision_trace") return "memory";
+  if (toolName === "entity") return "entity";
+  if (toolName === "capsule") return "capsule";
   if (toolName.startsWith("graph_")) return "graph";
   if (toolName.startsWith("projects_")) return "project";
   if (toolName.startsWith("workspaces_") || toolName.startsWith("workspace_")) return "workspace";
@@ -2576,6 +2585,680 @@ function resolveToolFilter(surfaceProfile: ToolSurfaceProfile = normalizeToolSur
 function formatContent(data: unknown, forceFormat?: "compact" | "pretty") {
   const usePretty = forceFormat === "pretty" || (!forceFormat && !COMPACT_OUTPUT);
   return usePretty ? JSON.stringify(data, null, 2) : JSON.stringify(data);
+}
+
+const VALID_NODE_TYPES = [
+  "fact",
+  "decision",
+  "preference",
+  "constraint",
+  "habit",
+  "lesson",
+  "goal",
+  "risk",
+  "term",
+] as const;
+
+const VALID_DOC_TYPES = [
+  "roadmap",
+  "spec",
+  "runbook",
+  "adr",
+  "rfc",
+  "postmortem",
+  "retro",
+  "release_notes",
+  "playbook",
+  "prd",
+  "user_story",
+  "persona",
+  "interview",
+  "design_spec",
+  "critique",
+  "glossary",
+  "oncall_schedule",
+  "slo",
+  "q_and_a",
+  "changelog",
+  "style_guide",
+  "general",
+] as const;
+
+const CAPSULE_ACTIONS = [
+  "open",
+  "get",
+  "list",
+  "create",
+  "share",
+  "chunk",
+  "stream",
+  "context_doc",
+  "bootstrap_prompt",
+  "graph",
+  "audit",
+  "list_shares",
+  "revoke_share",
+  "explain",
+] as const;
+
+const CAPSULE_FORMATS = ["summary", "markdown", "text", "ndjson"] as const;
+const CAPSULE_AUDIENCES = ["self", "team", "external_agent", "public_link", "support"] as const;
+const CAPSULE_INCLUDE_CODE = ["none", "lazy", "inline"] as const;
+const CAPSULE_REDACTION_LEVELS = ["none", "standard", "strict"] as const;
+const CAPSULE_PURPOSES = [
+  "bootstrap",
+  "handoff",
+  "snapshot",
+  "debug",
+  "review",
+  "onboarding",
+  "external_agent",
+  "custom",
+] as const;
+const CAPSULE_SCOPES = ["workspace", "project"] as const;
+const CAPSULE_MODES = ["live", "snapshot"] as const;
+const CAPSULE_GRAPHS = ["explorer", "knowledge", "code"] as const;
+const CAPSULE_ACCESS_SCOPES = ["authenticated", "authenticated_share", "public_share"] as const;
+
+function collectionCount(value: unknown): number {
+  if (Array.isArray(value)) return value.length;
+  if (!value || typeof value !== "object") return 0;
+  const obj = value as Record<string, any>;
+  for (const key of ["items", "results", "todos", "tasks", "events", "nodes", "diagrams", "docs", "transcripts"]) {
+    if (Array.isArray(obj[key])) return obj[key].length;
+  }
+  if (obj.data && typeof obj.data === "object") return collectionCount(obj.data);
+  return 0;
+}
+
+function pluralEntityKind(kind: string): string {
+  switch (kind) {
+    case "ticket":
+      return "tickets";
+    case "handoff":
+      return "handoffs";
+    case "backlog_view":
+      return "backlog views";
+    case "incident":
+      return "incidents";
+    case "release":
+      return "releases";
+    case "experiment":
+      return "experiments";
+    case "goal":
+      return "goals";
+    case "key_result":
+      return "key results";
+    case "sprint":
+      return "sprints";
+    case "review":
+      return "reviews";
+    case "risk":
+      return "risks";
+    default:
+      return `${kind}s`;
+  }
+}
+
+function capsuleArray(value: unknown): any[] {
+  if (Array.isArray(value)) return value;
+  const obj = value as any;
+  if (Array.isArray(obj?.data)) return obj.data;
+  if (Array.isArray(obj?.items)) return obj.items;
+  if (Array.isArray(obj?.data?.items)) return obj.data.items;
+  return [];
+}
+
+function capsuleScopeSummary(scope: unknown): string | undefined {
+  if (typeof scope === "string" && scope.trim()) return scope.trim();
+  if (!scope || typeof scope !== "object") return undefined;
+  const obj = scope as Record<string, any>;
+  if (typeof obj.kind === "string" && obj.kind.trim()) return obj.kind.trim();
+  if (obj.project_id !== undefined && obj.project_id !== null) return "project";
+  if (obj.workspace_id !== undefined && obj.workspace_id !== null) return "workspace";
+  return undefined;
+}
+
+function formatExpiresHumanized(expiresAt: unknown): string {
+  if (typeof expiresAt !== "string" || !expiresAt.trim()) return "no expiry";
+  const timestamp = Date.parse(expiresAt);
+  if (!Number.isFinite(timestamp)) return expiresAt.trim();
+  const deltaSeconds = Math.floor((timestamp - Date.now()) / 1000);
+  const abs = Math.abs(deltaSeconds);
+  if (deltaSeconds <= 0) {
+    if (abs >= 86400) return `expired (${Math.floor(abs / 86400)}d ago)`;
+    if (abs >= 3600) return `expired (${Math.floor(abs / 3600)}h ago)`;
+    return `expired (${Math.max(1, Math.floor(abs / 60))}m ago)`;
+  }
+  if (deltaSeconds >= 86400) return `in ${Math.floor(deltaSeconds / 86400)}d`;
+  if (deltaSeconds >= 3600) return `in ${Math.floor(deltaSeconds / 3600)}h`;
+  return `in ${Math.max(1, Math.floor(deltaSeconds / 60))}m`;
+}
+
+function totalCapsuleSectionItems(capsule: any): number {
+  const sections = Array.isArray(capsule?.sections) ? capsule.sections : [];
+  return sections.reduce((sum: number, section: any) => sum + Number(section?.item_count || 0), 0);
+}
+
+function formatCapsuleCreateHeadline(capsule: any): string {
+  const parts = [`✓ ${capsule?.capsule_id || capsule?.id || "ContextCapsule"}`];
+  const scope = capsuleScopeSummary(capsule?.scope);
+  if (scope) parts.push(`scope=${scope}`);
+  const sections = Array.isArray(capsule?.sections) ? capsule.sections : [];
+  parts.push(`${sections.length} sections`);
+  const total = totalCapsuleSectionItems(capsule);
+  if (total > 0) parts.push(`${total} items indexed`);
+  if (capsule?.expires_at) parts.push(`expires ${formatExpiresHumanized(capsule.expires_at)}`);
+  return parts.join(" · ");
+}
+
+function formatCapsuleOpenHeadline(capsule: any): string {
+  const parts = ["✓ opened"];
+  const capsuleId = capsule?.capsule_id || capsule?.id;
+  if (capsuleId) parts.push(`id=${capsuleId}`);
+  const scope = capsuleScopeSummary(capsule?.scope);
+  if (scope) parts.push(`scope=${scope}`);
+  if (capsule?.expires_at) parts.push(`expires ${formatExpiresHumanized(capsule.expires_at)}`);
+  const sections = Array.isArray(capsule?.sections) ? capsule.sections : [];
+  parts.push(`${sections.length} sections ready`);
+  return parts.join(" · ");
+}
+
+function formatCapsuleShareHeadline(capsuleId: string, response: any): string {
+  const audience = response?.audience || "unknown";
+  const shareUrl = response?.share_url || "";
+  const agentUrl = response?.agent_url || response?.api_url || "";
+  const expires = formatExpiresHumanized(response?.expires_at);
+  if (audience === "external_agent") {
+    return `✓ Agent URL: ${agentUrl || "unavailable"} · Dashboard URL: ${shareUrl || "unavailable"}`;
+  }
+  if (audience === "team") {
+    return `✓ ${shareUrl || "unavailable"} · authenticated team link · expires ${expires}`;
+  }
+  const url = shareUrl || agentUrl || "unavailable";
+  const policy = response?.single_use && (response?.use_count ?? 0) === 0
+    ? "single-use, unread"
+    : response?.single_use
+      ? "single-use"
+      : "multi-use";
+  const label = audience === "unknown" ? `ContextCapsule ${capsuleId}` : audience;
+  return `✓ ${url} · ${label} · ${policy} · expires ${expires}`;
+}
+
+function formatGraphHeadline(value: any): string {
+  const nodes = Array.isArray(value?.nodes) ? value.nodes.length : 0;
+  const edges = Array.isArray(value?.edges) ? value.edges.length : 0;
+  return `✓ ${nodes} nodes · ${edges} edges · returned as JSON`;
+}
+
+function formatListSharesHeadline(
+  shares: any[],
+  capsuleId?: string,
+  projectId?: string,
+  workspaceId?: string
+): string {
+  const singleUnread = shares.filter((s) => s?.single_use && (s?.use_count ?? 0) === 0 && !s?.revoked_at).length;
+  const multiUse = shares.filter((s) => !s?.single_use && !s?.revoked_at).length;
+  const revoked = shares.filter((s) => Boolean(s?.revoked_at)).length;
+  const parts = [`✓ ${shares.length} shares`];
+  if (!capsuleId) {
+    const target = projectId
+      ? `project ${projectId}`
+      : workspaceId
+        ? `workspace ${workspaceId}`
+        : "the current default scope";
+    parts.push(`for ${target}`);
+  }
+  parts.push(`${singleUnread} single-use, unread`);
+  parts.push(`${multiUse} multi-use`);
+  parts.push(`${revoked} revoked`);
+  return parts.join(" · ");
+}
+
+function formatRevokeShareText(response: any): string {
+  const url = response?.share_url || response?.agent_url || response?.api_url;
+  return url
+    ? `✓ revoked · subsequent reads return 410 Gone\nRevoked share: ${url}`
+    : "✓ revoked · subsequent reads return 410 Gone";
+}
+
+function formatCapsuleSummary(capsule: any): string {
+  const title = capsule?.name || capsule?.capsule_id || capsule?.id || "ContextCapsule";
+  const purpose = capsule?.purpose || "unknown";
+  const mode = capsule?.mode || "unknown";
+  const shareUrl = capsule?.links?.share_url || capsule?.share_url || "-";
+  const expires = capsule?.expires_at || "no expiry";
+  const redactionLevel = capsule?.policy?.redaction_level || "unknown";
+  const redactionCounts = capsule?.redaction_summary?.counts
+    ? JSON.stringify(capsule.redaction_summary.counts)
+    : "{}";
+  const bootstrap = capsule?.bootstrap || {};
+  const llm = bootstrap?.llm_overview || {};
+  const summary = llm?.summary || bootstrap?.summary || "No bootstrap summary available.";
+  const sections = Array.isArray(capsule?.sections) ? capsule.sections : [];
+  const lines = [
+    `Opened ContextCapsule: ${title} (purpose: ${purpose}, mode: ${mode})`,
+    `Share URL: ${shareUrl}`,
+    `Expires: ${expires}`,
+    `Redaction: ${redactionLevel} (counts: ${redactionCounts})`,
+    "",
+    "Bootstrap summary:",
+    String(summary),
+  ];
+  if (Array.isArray(llm?.recommended_first_actions) && llm.recommended_first_actions.length > 0) {
+    lines.push("", "Recommended first actions:");
+    llm.recommended_first_actions.slice(0, 8).forEach((item: unknown, index: number) => {
+      lines.push(`${index + 1}. ${String(item)}`);
+    });
+  }
+  if (sections.length > 0) {
+    lines.push("", "Sections:");
+    for (const section of sections) {
+      const chunkIds = Array.isArray(section?.chunk_ids) ? section.chunk_ids : [];
+      const hasInline = section?.data && !(typeof section.data === "object" && Object.keys(section.data).length === 0);
+      const modeLabel = chunkIds.length > 0 && !hasInline ? "lazy (fetch via action=chunk)" : hasInline ? "inline" : "metadata";
+      const inlineTokens = section?.inline_tokens !== undefined ? `${section.inline_tokens} tok` : "-";
+      lines.push(`- ${section?.id || "section"}: ${section?.item_count || 0} items, ${chunkIds.length} chunk id(s), ${modeLabel}, ${inlineTokens}`);
+    }
+  }
+  const projectExplorer = capsule?.links?.project_explorer_url;
+  const knowledgeGraph = capsule?.links?.knowledge_graph_url;
+  const codeGraph = capsule?.links?.code_graph_url;
+  if (projectExplorer || knowledgeGraph || codeGraph) {
+    lines.push("", "Deep dives (dashboard, auth required):");
+    if (projectExplorer) lines.push(`  Project explorer: ${projectExplorer}`);
+    if (knowledgeGraph) lines.push(`  Knowledge graph: ${knowledgeGraph}`);
+    if (codeGraph) lines.push(`  Code graph: ${codeGraph}`);
+  }
+  return lines.join("\n");
+}
+
+function applyCapsuleShareDefaults(input: Record<string, any>) {
+  const params = { ...input };
+  const audience = params.audience || "external_agent";
+  if (["external_agent", "public_link", "support"].includes(audience)) {
+    if (params.include_personal === undefined) params.include_personal = false;
+    if (params.include_code === undefined) params.include_code = "none";
+    if (params.redaction_level === undefined) params.redaction_level = "standard";
+    if (params.permissions === undefined) params.permissions = "read_only";
+  } else if (audience === "team" && params.permissions === undefined) {
+    params.permissions = "read_only";
+  }
+  params.audience = audience;
+  return params;
+}
+
+function formatCapsuleShareResult(capsuleId: string, response: any): string {
+  const audience = response?.audience || "unknown";
+  const shareUrl = response?.share_url;
+  const agentUrl = response?.agent_url || response?.api_url;
+  const lines = [
+    formatCapsuleShareHeadline(capsuleId, response),
+    `Shared ContextCapsule ${capsuleId}.`,
+    `Audience: ${audience}`,
+  ];
+  if (audience === "external_agent") {
+    if (agentUrl) lines.push(`Agent URL (paste into LLMs): ${agentUrl}`);
+    if (shareUrl) lines.push(`Dashboard URL (open in browser): ${shareUrl}`);
+    if (!agentUrl && !shareUrl) lines.push("URL: unavailable");
+  } else {
+    lines.push(`URL: ${shareUrl || agentUrl || "unavailable"}`);
+    if (agentUrl) {
+      lines.push(`${audience === "team" ? "Agent URL (requires Authorization)" : "Agent URL (paste into LLMs)"}: ${agentUrl}`);
+    }
+  }
+  if (audience === "team") {
+    lines.push("Access: authenticated team link; recipients must sign in and have workspace or project access.");
+  }
+  if (response?.single_use) {
+    lines.push("Share policy: single-use; a short grace window starts on first open for parallel reads.");
+  } else {
+    lines.push(`Share policy: ${audience === "team" ? "authenticated multi-use" : "multi-use"} (max_uses=${response?.max_uses ?? "none"}, use_count=${response?.use_count ?? 0})`);
+  }
+  const warnings = Array.isArray(response?.warnings) && response.warnings.length > 0 ? response.warnings.join(", ") : "none";
+  lines.push(`Warnings: ${warnings}`);
+  return lines.join("\n");
+}
+
+const BOOTSTRAP_NOISE_SECTION_IDS = new Set(["graph", "file_catalog", "code_chunks", "atlas"]);
+const BOOTSTRAP_HIGH_BUDGET_SECTION_IDS = new Set(["decisions", "lessons", "docs", "plans", "skills", "diagrams"]);
+const BOOTSTRAP_MEDIUM_BUDGET_SECTION_IDS = new Set([
+  "tasks",
+  "todos",
+  "preferences",
+  "memory_events",
+  "session_snapshots",
+  "reminders",
+]);
+
+function bootstrapItemBudget(sectionId: string): { maxItems: number; bodyChars: number } {
+  if (BOOTSTRAP_HIGH_BUDGET_SECTION_IDS.has(sectionId)) return { maxItems: 25, bodyChars: 600 };
+  if (BOOTSTRAP_MEDIUM_BUDGET_SECTION_IDS.has(sectionId)) return { maxItems: 12, bodyChars: 350 };
+  return { maxItems: 6, bodyChars: 250 };
+}
+
+function truncateLine(text: string, max: number): string {
+  const single = text.split(/\s+/).filter(Boolean).join(" ");
+  return single.length <= max ? single : `${single.slice(0, Math.max(0, max - 3))}...`;
+}
+
+function truncateBlock(text: string, max: number): string {
+  const trimmed = text.trim();
+  return trimmed.length <= max ? trimmed : `${trimmed.slice(0, Math.max(0, max - 3))}...`;
+}
+
+function pickStringField(obj: Record<string, any>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function renderBootstrapItems(data: any, budget: { maxItems: number; bodyChars: number }) {
+  const items = Array.isArray(data?.items)
+    ? data.items
+    : Array.isArray(data?.preview)
+      ? data.preview
+      : [];
+  const titleKeys = ["title", "name", "summary", "headline", "objective", "question"];
+  const bodyKeys = ["content", "details", "description", "instruction", "body", "answer", "rationale", "preview"];
+  return items.slice(0, budget.maxItems).map((raw: any) => {
+    if (!raw || typeof raw !== "object") {
+      return { body: truncateBlock(String(raw), budget.bodyChars) };
+    }
+    const title = pickStringField(raw, titleKeys);
+    const body = pickStringField(raw, bodyKeys);
+    if (!title && !body) {
+      return { body: truncateBlock(JSON.stringify(raw), budget.bodyChars) };
+    }
+    return {
+      title: title ? truncateLine(title, 200) : undefined,
+      body: body ? truncateBlock(body, budget.bodyChars) : undefined,
+    };
+  });
+}
+
+function sectionDisplayTitle(section: any): string {
+  return typeof section?.title === "string" && section.title.trim()
+    ? section.title.trim()
+    : String(section?.id || "section");
+}
+
+function renderBootstrapPrompt(capsule: any): string {
+  const lines: string[] = [];
+  const title = String(capsule?.name || capsule?.capsule_id || capsule?.id || "ContextCapsule").trim();
+  lines.push(`# ${title}`, "");
+
+  const bootstrap = capsule?.bootstrap || {};
+  const llm = bootstrap?.llm_overview || {};
+  const summary = llm?.summary || bootstrap?.summary;
+  if (typeof summary === "string" && summary.trim()) {
+    lines.push("## Summary", "", summary.trim(), "");
+  }
+
+  const actions = Array.isArray(llm?.recommended_first_actions)
+    ? llm.recommended_first_actions
+    : Array.isArray(bootstrap?.recommended_first_actions)
+      ? bootstrap.recommended_first_actions
+      : [];
+  if (actions.length > 0) {
+    lines.push("## Recommended First Actions", "");
+    actions.filter((item: unknown) => String(item).trim()).forEach((item: unknown, index: number) => {
+      lines.push(`${index + 1}. ${String(item).trim()}`);
+    });
+    lines.push("");
+  }
+
+  const sections = Array.isArray(capsule?.sections) ? capsule.sections : [];
+  const narrative = sections.filter((section: any) => {
+    const count = Number(section?.item_count || 0);
+    const chunks = Array.isArray(section?.chunk_ids) ? section.chunk_ids.length : 0;
+    return (count > 0 || chunks > 0) && !BOOTSTRAP_NOISE_SECTION_IDS.has(String(section?.id || ""));
+  });
+  const noise = sections.filter((section: any) => {
+    const count = Number(section?.item_count || 0);
+    const chunks = Array.isArray(section?.chunk_ids) ? section.chunk_ids.length : 0;
+    return (count > 0 || chunks > 0) && BOOTSTRAP_NOISE_SECTION_IDS.has(String(section?.id || ""));
+  });
+
+  if (narrative.length > 0) {
+    lines.push("## Sections", "");
+    for (const section of narrative) {
+      lines.push(`### ${sectionDisplayTitle(section)}`, "");
+      if (typeof section?.summary === "string" && section.summary.trim()) {
+        lines.push(section.summary.trim(), "");
+      }
+      const meta: string[] = [];
+      if (section?.item_count !== undefined) meta.push(`Items: ${section.item_count}`);
+      const chunkIds = Array.isArray(section?.chunk_ids) ? section.chunk_ids : [];
+      if (chunkIds.length > 0) meta.push(`Chunks: ${chunkIds.length}`);
+      if (meta.length > 0) lines.push(meta.join("  ·  "), "");
+
+      const items = renderBootstrapItems(section?.data, bootstrapItemBudget(String(section?.id || "")));
+      for (const item of items) {
+        if (item.title) lines.push(`#### ${item.title}`, "");
+        if (item.body) lines.push(item.body, "");
+      }
+      const total = Number(section?.item_count || 0);
+      if (total > items.length && items.length > 0) {
+        lines.push(`_...${total - items.length} more - fetch the full capsule via the share link or curl to see all items._`, "");
+      }
+    }
+  }
+
+  if (noise.length > 0) {
+    lines.push("## Index summary", "");
+    for (const section of noise) {
+      const parts: string[] = [];
+      const count = Number(section?.item_count || 0);
+      const chunks = Array.isArray(section?.chunk_ids) ? section.chunk_ids.length : 0;
+      if (count > 0) parts.push(`${count} items`);
+      if (chunks > 0) parts.push(`${chunks} chunks`);
+      lines.push(`- **${sectionDisplayTitle(section)}** - ${parts.join(", ")}`);
+    }
+    lines.push("");
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function formatBootstrapPromptHeadline(capsule: any, prompt: string): string {
+  const sections = Array.isArray(capsule?.sections) ? capsule.sections : [];
+  const renderedSections = sections.filter((section: any) => {
+    const count = Number(section?.item_count || 0);
+    const chunks = Array.isArray(section?.chunk_ids) ? section.chunk_ids.length : 0;
+    return (count > 0 || chunks > 0) && !BOOTSTRAP_NOISE_SECTION_IDS.has(String(section?.id || ""));
+  }).length;
+  const chars = [...prompt].length;
+  const parts = ["✓ bootstrap prompt"];
+  const capsuleId = capsule?.capsule_id || capsule?.id;
+  if (capsuleId) parts.push(`id=${capsuleId}`);
+  parts.push(`${renderedSections} sections`);
+  parts.push(`~${Math.floor(chars / 4)} tokens`);
+  parts.push(`${chars} chars`);
+  return parts.join(" · ");
+}
+
+function normalizeMediaContentTypeLabel(value: string): "video" | "audio" | "image" | "document" {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  switch (normalized) {
+    case "video":
+    case "videos":
+    case "movie":
+    case "movies":
+    case "clip":
+    case "clips":
+    case "footage":
+      return "video";
+    case "audio":
+    case "sound":
+    case "voice":
+    case "recording":
+    case "recordings":
+    case "podcast":
+    case "podcasts":
+      return "audio";
+    case "image":
+    case "images":
+    case "photo":
+    case "photos":
+    case "picture":
+    case "pictures":
+    case "screenshot":
+    case "screenshots":
+    case "png":
+    case "jpg":
+    case "jpeg":
+    case "gif":
+    case "webp":
+      return "image";
+    case "document":
+    case "documents":
+    case "doc":
+    case "docs":
+    case "pdf":
+    case "pdfs":
+    case "slide":
+    case "slides":
+    case "presentation":
+    case "presentations":
+    case "deck":
+    case "decks":
+    case "docx":
+    case "pptx":
+      return "document";
+    case "":
+      throw new Error("content_type cannot be empty");
+    default:
+      throw new Error(
+        `Invalid content_type '${value}'. Use one of: video, audio, image, document. Friendly aliases are supported: photos/images -> image, docs/PDFs/slides -> document.`
+      );
+  }
+}
+
+function normalizeOptionalMediaContentType(value?: string): "video" | "audio" | "image" | "document" | undefined {
+  return value === undefined ? undefined : normalizeMediaContentTypeLabel(value);
+}
+
+function normalizeMediaContentTypeFilters(values?: string[]): Array<"video" | "audio" | "image" | "document"> | undefined {
+  if (!values || values.length === 0) return undefined;
+  const seen = new Set<"video" | "audio" | "image" | "document">();
+  for (const value of values) {
+    seen.add(normalizeMediaContentTypeLabel(value));
+  }
+  return seen.size > 0 ? [...seen] : undefined;
+}
+
+function extractProjectItems(value: any): any[] {
+  const data = value?.data ?? value;
+  if (Array.isArray(data?.items)) return data.items;
+  if (Array.isArray(data?.projects)) return data.projects;
+  if (Array.isArray(data)) return data;
+  return [];
+}
+
+async function resolveTargetProjectId(
+  client: ContextStreamClient,
+  workspaceId: string | undefined,
+  targetProject: string | undefined
+): Promise<{ projectId?: string; error?: string }> {
+  const target = targetProject?.trim();
+  if (!target) return {};
+  const direct = normalizeUuid(target);
+  if (direct) return { projectId: direct };
+  if (!workspaceId) {
+    return {
+      error: `target_project '${target}' requires workspace scope. Call init(folder_path="...") first or provide workspace_id.`,
+    };
+  }
+  const projects = extractProjectItems(await client.listProjects({ workspace_id: workspaceId, page_size: 200 }));
+  const normalized = target.toLowerCase();
+  const matches = projects.filter((project: any) => {
+    const names = [
+      project?.name,
+      project?.slug,
+      project?.path ? path.basename(String(project.path)) : undefined,
+    ]
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim().toLowerCase());
+    return names.includes(normalized);
+  });
+  if (matches.length === 1 && typeof matches[0]?.id === "string") {
+    return { projectId: matches[0].id };
+  }
+  if (matches.length > 1) {
+    return {
+      error: `target_project '${target}' matched multiple projects: ${matches
+        .slice(0, 5)
+        .map((p: any) => `${p.name || p.id} (${p.id})`)
+        .join(", ")}. Provide project_id explicitly.`,
+    };
+  }
+  const available = projects
+    .slice(0, 12)
+    .map((project: any) => project?.name)
+    .filter(Boolean)
+    .join(", ");
+  return {
+    error: `Unknown target_project '${target}'. Available projects: ${available || "none"}`,
+  };
+}
+
+const MEDIA_MEMORY_KEYWORDS = [
+  "image",
+  "photo",
+  "screenshot",
+  "video",
+  "audio",
+  "media",
+  "upload",
+  "pdf",
+  "ppt",
+  "pptx",
+  "slide",
+  "slides",
+  "deck",
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "mp4",
+  "mp3",
+  "wav",
+  "svg",
+];
+
+function mediaMemoryFallbackItems(response: any): any[] {
+  const data = response?.data ?? response;
+  const results = Array.isArray(data?.results)
+    ? data.results
+    : Array.isArray(data?.items)
+      ? data.items
+      : [];
+  return results.filter((item: any) => {
+    const text = `${item?.title || ""} ${item?.content || ""} ${item?.event_type || ""}`.toLowerCase();
+    return MEDIA_MEMORY_KEYWORDS.some((keyword) => text.includes(keyword));
+  });
+}
+
+function formatRestoreContextBlock(result: any, includeEmpty: boolean): string | undefined {
+  const data = result?.data ?? result;
+  const restored = Boolean(data?.restored);
+  if (!restored) {
+    return includeEmpty
+      ? '[POST_COMPACTION_RESTORE] No saved snapshot/transcript was found. Use `session(action="recall", query="what were we doing before compaction")`, then `memory(action="search_transcripts", query="...")` if recall is thin.'
+      : undefined;
+  }
+  const source = data?.source || "saved snapshots/transcripts";
+  const summary = data?.summary || data?.conversation_summary || "Context restored.";
+  const recommendation = data?.recommendation || data?.next_step;
+  const lines = ["[POST_COMPACTION_RESTORE]", `Source: ${source}`, String(summary)];
+  if (typeof recommendation === "string" && recommendation.trim()) {
+    lines.push(`Next: ${recommendation.trim()}`);
+  }
+  return lines.join("\n");
 }
 
 const GHOST_TITLE_PATTERNS = [
@@ -7466,7 +8149,7 @@ This does semantic search on the first message. You only need context on subsequ
           .boolean()
           .optional()
           .describe(
-            "Controls context restoration from recent snapshots. Defaults to true (always restores). Set to false to skip restoration. Can also be controlled via CONTEXTSTREAM_RESTORE_CONTEXT environment variable."
+            "Set true immediately after context compaction to restore snapshots/transcripts when hooks are unavailable. Can also be enabled by CONTEXTSTREAM_RESTORE_CONTEXT=true."
           ),
       }),
     },
@@ -7505,9 +8188,8 @@ This does semantic search on the first message. You only need context on subsequ
       const sessionId = typeof result.session_id === "string" ? result.session_id : undefined;
       result.educational_tip = getSessionInitTip(sessionId ?? "");
 
-      // Handle context restoration - always try to restore from recent snapshots by default
-      // Can be disabled via CONTEXTSTREAM_RESTORE_CONTEXT=false or input.is_post_compact=false
-      const shouldRestoreContext = input.is_post_compact ?? RESTORE_CONTEXT_DEFAULT;
+      // Handle context restoration only for post-compaction init or an explicit env opt-in.
+      const shouldRestoreContext = input.is_post_compact === true || (input.is_post_compact === undefined && RESTORE_CONTEXT_DEFAULT);
       if (shouldRestoreContext) {
         (result as any).is_post_compact = true;
         const workspaceIdForRestore =
@@ -7517,27 +8199,53 @@ This does semantic search on the first message. You only need context on subsequ
 
         if (workspaceIdForRestore) {
           try {
-            // List recent events and filter for session_snapshot
-            const listResult = await client.listMemoryEvents({
-              workspace_id: workspaceIdForRestore,
-              project_id: projectIdForRestore,
-              limit: 50,
-            });
+            let restoreHandled = false;
+            try {
+              const restoreResult = await client.sessionRestoreContext({
+                session_id: input.session_id || sessionId,
+                workspace_id: workspaceIdForRestore,
+                project_id: projectIdForRestore,
+                trigger: "manual_post_compact",
+                include_durable_context: true,
+                max_snapshots: 3,
+              });
+              (result as any).post_compact_restore = restoreResult;
+              const restoreBlock = formatRestoreContextBlock(restoreResult, true);
+              if (restoreBlock) {
+                (result as any).post_compact_restore_text = restoreBlock;
+              }
+              const restoreData = (restoreResult as any)?.data ?? restoreResult;
+              if (restoreData?.restored) {
+                (result as any).post_compact_hint = POST_COMPACT_HINTS.restored;
+                (result as any).is_post_compact = true;
+                restoreHandled = true;
+              }
+            } catch (err) {
+              logDebug(`session_init restore API fallback to local snapshots: ${err}`);
+            }
 
-            const allEvents =
-              (listResult as any)?.data?.items ||
-              (listResult as any)?.items ||
-              (listResult as any)?.data ||
-              [];
+            if (!restoreHandled) {
+              // List recent events and filter for session_snapshot
+              const listResult = await client.listMemoryEvents({
+                workspace_id: workspaceIdForRestore,
+                project_id: projectIdForRestore,
+                limit: 50,
+              });
+
+              const allEvents =
+                (listResult as any)?.data?.items ||
+                (listResult as any)?.items ||
+                (listResult as any)?.data ||
+                [];
 
             // Filter for session_snapshot events (check event_type, metadata.original_type, or tags)
-            const snapshots = allEvents.filter(
-              (e: any) =>
-                e.event_type === "session_snapshot" ||
-                e.metadata?.original_type === "session_snapshot" ||
-                e.metadata?.tags?.includes("session_snapshot") ||
-                e.tags?.includes("session_snapshot")
-            );
+              const snapshots = allEvents.filter(
+                (e: any) =>
+                  e.event_type === "session_snapshot" ||
+                  e.metadata?.original_type === "session_snapshot" ||
+                  e.metadata?.tags?.includes("session_snapshot") ||
+                  e.tags?.includes("session_snapshot")
+              );
 
             if (snapshots && snapshots.length > 0) {
               const latestSnapshot = snapshots[0];
@@ -7612,6 +8320,7 @@ This does semantic search on the first message. You only need context on subsequ
             } else {
               (result as any).is_post_compact = true;
               (result as any).post_compact_hint = POST_COMPACT_HINTS.no_snapshot;
+            }
             }
           } catch (err) {
             logDebug(`Failed to restore post-compact context: ${err}`);
@@ -8433,6 +9142,7 @@ Use this in combination with session_init(is_post_compact=true) for seamless con
       inputSchema: z.object({
         workspace_id: z.string().uuid().optional(),
         project_id: z.string().uuid().optional(),
+        session_id: z.string().optional().describe("Session ID to restore context for"),
         snapshot_id: z
           .string()
           .uuid()
@@ -8443,6 +9153,14 @@ Use this in combination with session_init(is_post_compact=true) for seamless con
           .optional()
           .default(1)
           .describe("Number of recent snapshots to consider (default: 1)"),
+        trigger: z
+          .string()
+          .optional()
+          .describe("Restore trigger, e.g. manual_post_compact or token_drop_post_compact"),
+        include_durable_context: z
+          .boolean()
+          .optional()
+          .describe("Include durable snapshots/transcripts/docs/decisions in restore payload (default true)"),
       }),
     },
     async (input) => {
@@ -8465,6 +9183,24 @@ Use this in combination with session_init(is_post_compact=true) for seamless con
       }
 
       try {
+        try {
+          const apiResult = await client.sessionRestoreContext({
+            workspace_id: workspaceId,
+            project_id: projectId,
+            session_id: input.session_id,
+            snapshot_id: input.snapshot_id,
+            max_snapshots: input.max_snapshots,
+            trigger: input.trigger,
+            include_durable_context: input.include_durable_context ?? true,
+          });
+          return {
+            content: [{ type: "text" as const, text: formatRestoreContextBlock(apiResult, true) || formatContent(apiResult) }],
+            structuredContent: toStructured(apiResult),
+          };
+        } catch (error) {
+          logDebug(`session_restore_context API fallback to local snapshots: ${error}`);
+        }
+
         // If specific snapshot_id provided, fetch that event
         if (input.snapshot_id) {
           const eventResult = await client.getMemoryEvent(input.snapshot_id);
@@ -12261,7 +12997,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "session",
       {
         title: "Session",
-        description: `Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). PAST SESSIONS LIVE HERE: use action='recall' FIRST when the user references "last time", "previous", "yesterday", or is continuing prior work — full-text transcripts are indexed across every prior session. Actions: capture (save decision/insight), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons (retrieve lessons), recall (retrieve past conversation context via ranked fusion of transcripts/snapshots/docs/decisions), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (searches MEMORY/conversation history only, not code), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan, get_plan, update_plan, list_plans. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Team actions: team_decisions, team_lessons, team_plans.`,
+        description: `Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). PAST SESSIONS LIVE HERE: use action='recall' FIRST when the user references "last time", "previous", "yesterday", or is continuing prior work — full-text transcripts are indexed across every prior session. context() may surface [GROUNDING]; use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills) outside context(). Actions: capture (save decision/insight), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons (retrieve lessons), recall (retrieve past conversation context via ranked fusion of transcripts/snapshots/docs/decisions), ground (one-shot prior-work bundle), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (searches MEMORY/conversation history only, not code), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan, get_plan, update_plan, list_plans. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Team actions: team_decisions, team_lessons, team_plans.`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -12269,6 +13005,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "capture_lesson",
               "get_lessons",
               "recall",
+              "ground",
               "remember",
               "user_context",
               "summary",
@@ -12297,6 +13034,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           project_id: z.string().uuid().optional(),
           // Content params
           query: z.string().optional().describe("Query for recall/search/lessons/decision_trace"),
+          user_message: z.string().optional().describe("Natural-language anchor for action=ground (falls back to query)"),
           content: z.string().optional().describe("Content for capture/remember/compress"),
           title: z.string().optional().describe("Title for capture/capture_lesson/capture_plan"),
           agent: z.string().optional().describe("Agent name metadata for capture/search filtering"),
@@ -12327,7 +13065,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           category: z
             .enum(["workflow", "code_quality", "verification", "communication", "project_specific"])
             .optional(),
-          trigger: z.string().optional().describe("What caused the problem"),
+          trigger: z.string().optional().describe("What caused the problem (for capture_lesson), or restore trigger for restore_context"),
           impact: z.string().optional().describe("What went wrong"),
           prevention: z.string().optional().describe("How to prevent in future"),
           severity: z.enum(["low", "medium", "high", "critical"]).optional(),
@@ -12402,6 +13140,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .optional()
             .default(1)
             .describe("Number of recent snapshots to consider (default: 1)"),
+          include_durable_context: z
+            .boolean()
+            .optional()
+            .describe("Include durable snapshots/transcripts/docs/decisions in restore payload (default true)"),
           // Suggested rules params
           rule_id: z.string().uuid().optional().describe("Suggested rule ID for actions"),
           rule_action: z
@@ -12615,6 +13357,90 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             return {
               content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
 
+            };
+          }
+
+          case "ground": {
+            const userMessage = (input.user_message || input.query || "").trim();
+            if (!userMessage) {
+              return errorResult("ground requires: user_message (or query)");
+            }
+
+            const recall = await client.smartSearch({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              query: userMessage,
+              include_related: true,
+              include_decisions: true,
+            }).catch((error) => ({ error: error?.message || String(error) }));
+
+            const decisionMatches =
+              input.include_decisions === false
+                ? []
+                : await client.memoryDecisions({
+                    workspace_id: workspaceId,
+                    project_id: projectId,
+                    query: userMessage,
+                    limit: Math.min(input.limit || 5, 10),
+                  }).catch(() => []);
+
+            const docMatches =
+              input.include_related === false
+                ? []
+                : await client.docsList({
+                    workspace_id: workspaceId,
+                    project_id: projectId,
+                    query: userMessage,
+                    per_page: Math.min(input.limit || 5, 10),
+                  }).catch(() => []);
+
+            const lessons = workspaceId
+              ? await client.getHighPriorityLessons({
+                  workspace_id: workspaceId,
+                  project_id: projectId,
+                  context_hint: userMessage,
+                  limit: Math.min(input.limit || 5, 10),
+                }).catch(() => [])
+              : [];
+
+            const skills = await client.listSkills({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              query: userMessage,
+              limit: Math.min(input.limit || 5, 10),
+            }).catch(() => []);
+
+            const lines = ["[GROUNDING_BUNDLE] One-shot prior-work pack for this message.", ""];
+            const recallResults = (recall as any)?.memory_results?.data?.results ||
+              (recall as any)?.memory_results?.results ||
+              (recall as any)?.data?.results ||
+              (recall as any)?.results ||
+              [];
+            if (Array.isArray(recallResults) && recallResults.length > 0) {
+              lines.push("[GROUNDING] Prior work matching your message:");
+              recallResults.slice(0, 5).forEach((item: any, index: number) => {
+                lines.push(`${index + 1}. ${item.title || item.summary || item.id || "Untitled"}`);
+              });
+              lines.push("");
+            }
+            if (collectionCount(decisionMatches) > 0) {
+              lines.push(`Decisions: ${collectionCount(decisionMatches)} match(es).`);
+            }
+            if (collectionCount(docMatches) > 0) {
+              lines.push(`Docs: ${collectionCount(docMatches)} match(es).`);
+            }
+            lines.push("Structured fields: `lessons`, `skills`, `recall`, `decision_matches`, `doc_matches`.");
+
+            const structured = {
+              recall,
+              decision_matches: decisionMatches,
+              doc_matches: docMatches,
+              lessons,
+              skills,
+            };
+            return {
+              content: [{ type: "text" as const, text: lines.join("\n") }],
+              structuredContent: structured,
             };
           }
 
@@ -12951,6 +13777,24 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               return errorResult(
                 "restore_context requires workspace_id. Call session_init first."
               );
+            }
+
+            try {
+              const apiResult = await client.sessionRestoreContext({
+                workspace_id: workspaceId,
+                project_id: projectId,
+                session_id: input.session_id,
+                snapshot_id: input.snapshot_id,
+                max_snapshots: input.max_snapshots,
+                trigger: input.trigger,
+                include_durable_context: input.include_durable_context ?? true,
+              });
+              return {
+                content: [{ type: "text" as const, text: formatRestoreContextBlock(apiResult, true) || formatContent(apiResult) }],
+                structuredContent: toStructured(apiResult),
+              };
+            } catch (error) {
+              logDebug(`session(action=restore_context) API fallback to local snapshots: ${error}`);
             }
 
             // If specific snapshot_id provided, fetch that event
@@ -13386,13 +14230,329 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
     );
 
     // -------------------------------------------------------------------------
+    // entity - Structured taxonomy expansion entities
+    // -------------------------------------------------------------------------
+    registerTool(
+      "entity",
+      {
+        title: "Structured Entity Operations",
+        description: "Unified CRUD across taxonomy expansion entities. Kinds: ticket, handoff, backlog_view, incident, release, experiment, goal, key_result, sprint, review, risk. Actions: list, get, create, update, delete. Body is free-form JSON forwarded to the API; workspace_id/project_id default to active scope when omitted.",
+        inputSchema: z.object({
+          kind: z.enum(VALID_ENTITY_KINDS).describe("Entity kind"),
+          action: z.enum(["list", "get", "create", "update", "delete"]).describe("Action to perform"),
+          id: z.string().uuid().optional().describe("Entity ID (required for get / update / delete)"),
+          workspace_id: z.string().uuid().optional(),
+          project_id: z.string().uuid().optional(),
+          body: z.record(z.any()).optional().describe("JSON body for create / update"),
+          query: z.record(z.any()).optional().describe("Filter params for list"),
+        }),
+      },
+      async (input) => {
+        const workspaceId = resolveWorkspaceId(input.workspace_id);
+        const projectId = normalizeUuid(input.project_id) || resolveProjectId(undefined);
+        const kind = input.kind;
+
+        switch (input.action) {
+          case "list": {
+            const result = await client.entityList(kind, {
+              workspace_id: workspaceId,
+              project_id: projectId,
+              query: input.query,
+            });
+            return {
+              content: [{ type: "text" as const, text: `Found ${collectionCount(result)} ${pluralEntityKind(kind)}.\n${formatContent(result)}` }],
+              structuredContent: toStructured(result),
+            };
+          }
+          case "get": {
+            if (!input.id) return errorResult("entity get requires: id");
+            const result = await client.entityGet(kind, input.id);
+            return {
+              content: [{ type: "text" as const, text: `Fetched ${kind} ${input.id}.\n${formatContent(result)}` }],
+              structuredContent: toStructured(result),
+            };
+          }
+          case "create": {
+            if (input.body !== undefined && (typeof input.body !== "object" || Array.isArray(input.body))) {
+              return errorResult("entity create requires body to be a JSON object");
+            }
+            const result = await client.entityCreate(kind, {
+              workspace_id: workspaceId,
+              project_id: projectId,
+              body: input.body,
+            });
+            return {
+              content: [{ type: "text" as const, text: `Created ${kind}.\n${formatContent(result)}` }],
+              structuredContent: toStructured(result),
+            };
+          }
+          case "update": {
+            if (!input.id) return errorResult("entity update requires: id");
+            if (input.body !== undefined && (typeof input.body !== "object" || Array.isArray(input.body))) {
+              return errorResult("entity update requires body to be a JSON object");
+            }
+            const result = await client.entityUpdate(kind, input.id, input.body || {});
+            return {
+              content: [{ type: "text" as const, text: `Updated ${kind} ${input.id}.\n${formatContent(result)}` }],
+              structuredContent: toStructured(result),
+            };
+          }
+          case "delete": {
+            if (!input.id) return errorResult("entity delete requires: id");
+            const result = await client.entityDelete(kind, input.id);
+            return {
+              content: [{ type: "text" as const, text: `Deleted ${kind} ${input.id}.\n${formatContent(result)}` }],
+              structuredContent: toStructured(result),
+            };
+          }
+        }
+      }
+    );
+
+    // -------------------------------------------------------------------------
+    // capsule - ContextCapsule portable handoff/snapshot operations
+    // -------------------------------------------------------------------------
+    registerTool(
+      "capsule",
+      {
+        title: "ContextCapsule",
+        description: "ContextCapsule: portable, shareable, hydrate-on-demand snapshots of project context. Use capsule when the user pastes a /c/<token> link or capsule token, asks for a handoff/share/team/external-agent link, wants to bootstrap a fresh agent with project state, asks for a paste-ready handoff prompt (bootstrap prompt / prompt for another LLM), wants share-token graphs, or wants to list/audit capsules. Do not use capsule for normal turn-by-turn retrieval; use context instead. Team share links are authenticated and reusable by default; external_agent/public_link/support shares are token-gated and single-use by default.",
+        inputSchema: z.object({
+          action: z.enum(CAPSULE_ACTIONS).describe("Action to perform"),
+          capsule_id: z.string().optional().describe("ContextCapsule ID"),
+          share_token: z.string().optional().describe("Existing brain_/capsule_ share token"),
+          share_id: z.string().uuid().optional().describe("ContextCapsule share UUID"),
+          url: z.string().optional().describe("ContextCapsule or AI Brain share URL"),
+          format: z.enum(CAPSULE_FORMATS).optional().describe("Output format"),
+          hydrate: z.boolean().optional().describe("Whether to fully hydrate the capsule"),
+          chunk_id: z.string().optional().describe("Chunk ID for chunk action"),
+          cursor_chunk_id: z.string().optional().describe("NDJSON stream cursor chunk ID"),
+          audience: z.enum(CAPSULE_AUDIENCES).optional().describe("Share audience. team creates an authenticated member link; external_agent/public_link/support create token-gated links. self is valid for capsule policy but does not mint share tokens."),
+          expires_in_days: z.number().optional().describe("Share expiry in days (defaults: team=7, external_agent/public_link/support=1)"),
+          multi_use: z.boolean().optional().describe("Allow the share to be opened multiple times until expiry. Defaults to true for team links and false for token-gated links."),
+          include_personal: z.boolean().optional().describe("Include personal artifacts"),
+          include_code: z.enum(CAPSULE_INCLUDE_CODE).optional().describe("Code inclusion mode"),
+          redaction_level: z.enum(CAPSULE_REDACTION_LEVELS).optional().describe("Redaction level"),
+          permissions: z.string().optional().describe("Permissions for the capsule/share"),
+          scope: z.enum(CAPSULE_SCOPES).optional().describe("Capsule scope"),
+          workspace_id: z.string().uuid().optional(),
+          project_id: z.string().uuid().optional(),
+          purpose: z.enum(CAPSULE_PURPOSES).optional().describe("Capsule purpose"),
+          name: z.string().optional().describe("Capsule/share name"),
+          mode: z.enum(CAPSULE_MODES).optional().describe("Capsule mode"),
+          sections: stringOrArray(z.string()).optional().describe("Explicit sections to include"),
+          event_kind: z.string().optional().describe("Filter audit events by kind"),
+          access_scope: z.enum(CAPSULE_ACCESS_SCOPES).optional().describe("Filter audit events by access scope"),
+          limit: z.number().optional().describe("Maximum audit events or list caps"),
+          offset: z.number().optional().describe("Audit result offset"),
+          graph: z.enum(CAPSULE_GRAPHS).optional().describe("Graph kind for action=graph"),
+          max_uses: z.number().optional().describe("Burn-after-N-reads cap for action=share. Team links default to no max-use cap; token-gated single-use links default to max_uses=1 with a short grace window after first open."),
+          max_inline_tokens: z.number().optional().describe("Cap inline section tokens during action=create"),
+          refresh_if_stale: z.boolean().optional().describe("Force regenerate manifest if stale"),
+        }),
+      },
+      async (input) => {
+        const workspaceId = resolveWorkspaceId(input.workspace_id);
+        const projectId = normalizeUuid(input.project_id) || resolveProjectId(undefined);
+
+        switch (input.action) {
+          case "open": {
+            if (input.format === "markdown" || input.format === "text") {
+              const text = await client.capsuleContextDoc(input);
+              return { content: [{ type: "text" as const, text }] };
+            }
+            if (input.format === "ndjson") {
+              const ndjson = await client.capsuleStream(input);
+              return {
+                content: [{ type: "text" as const, text: `NDJSON stream retrieved (${String(ndjson).length} bytes).` }],
+                structuredContent: { ndjson },
+              };
+            }
+            const response = await client.openCapsule(input);
+            const summaryText = `${formatCapsuleOpenHeadline(response)}\n\n${formatCapsuleSummary(response)}`;
+            if (input.hydrate) {
+              const ndjson = await client.capsuleStream(input);
+              return {
+                content: [{ type: "text" as const, text: `${summaryText}\nHydrated stream attached.` }],
+                structuredContent: { capsule: response, ndjson },
+              };
+            }
+            return {
+              content: [{ type: "text" as const, text: summaryText }],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "get": {
+            if (!input.capsule_id) return errorResult("capsule get requires: capsule_id");
+            const response = await client.getCapsule(input.capsule_id);
+            return {
+              content: [{ type: "text" as const, text: `${formatCapsuleOpenHeadline(response)}\n\n${formatCapsuleSummary(response)}` }],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "list": {
+            const response = await client.listCapsules({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              limit: input.limit,
+            });
+            const items = capsuleArray(response);
+            const lines = [`Found ${items.length} ContextCapsule(s).`];
+            for (const cap of items.slice(0, 20)) {
+              lines.push(`- ${cap?.name || cap?.capsule_id || cap?.id || "ContextCapsule"} (${cap?.purpose || "unknown"}, ${cap?.mode || "unknown"})`);
+            }
+            return {
+              content: [{ type: "text" as const, text: `${lines.join("\n")}\n${formatContent(response)}` }],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "create": {
+            const response = await client.createCapsule({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              scope: input.scope,
+              name: input.name,
+              purpose: input.purpose,
+              mode: input.mode,
+              sections: input.sections,
+              audience: input.audience,
+              include_personal: input.include_personal,
+              include_code: input.include_code,
+              redaction_level: input.redaction_level,
+              permissions: input.permissions,
+              max_inline_tokens: input.max_inline_tokens,
+              refresh_if_stale: input.refresh_if_stale,
+            });
+            return {
+              content: [{ type: "text" as const, text: `${formatCapsuleCreateHeadline(response)}\n\n${formatCapsuleSummary(response)}` }],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "share": {
+            if (!input.capsule_id) return errorResult("capsule share requires: capsule_id");
+            if (input.audience === "self") {
+              return errorResult("audience=self does not mint share tokens; use authenticated capsule endpoints instead");
+            }
+            const params = applyCapsuleShareDefaults({
+              name: input.name,
+              audience: input.audience,
+              include_personal: input.include_personal,
+              include_code: input.include_code,
+              redaction_level: input.redaction_level,
+              permissions: input.permissions,
+              expires_in_days: input.expires_in_days,
+              multi_use: input.multi_use,
+              max_uses: input.max_uses,
+            });
+            const response = await client.capsuleShare(input.capsule_id, params);
+            return {
+              content: [{ type: "text" as const, text: formatCapsuleShareResult(input.capsule_id, response) }],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "chunk": {
+            if (!input.chunk_id) return errorResult("capsule chunk requires: chunk_id");
+            const response = await client.capsuleChunk({ ...input, chunk_id: input.chunk_id });
+            return {
+              content: [{ type: "text" as const, text: `Retrieved ContextCapsule chunk ${input.chunk_id}.\n${formatContent(response)}` }],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "stream": {
+            const ndjson = await client.capsuleStream(input);
+            return {
+              content: [{ type: "text" as const, text: `NDJSON stream retrieved (${String(ndjson).length} bytes).` }],
+              structuredContent: { ndjson },
+            };
+          }
+          case "context_doc": {
+            const text = await client.capsuleContextDoc(input);
+            return { content: [{ type: "text" as const, text }] };
+          }
+          case "bootstrap_prompt": {
+            const response = await client.openCapsule({
+              capsule_id: input.capsule_id,
+              share_token: input.share_token,
+              url: input.url,
+            });
+            const prompt = renderBootstrapPrompt(response);
+            const chars = [...prompt].length;
+            return {
+              content: [{ type: "text" as const, text: `${formatBootstrapPromptHeadline(response, prompt)}\n\n${prompt}` }],
+              structuredContent: {
+                capsule_id: (response as any)?.capsule_id || (response as any)?.id,
+                bootstrap_prompt: prompt,
+                char_count: chars,
+                token_estimate: Math.floor(chars / 4),
+                capsule: response,
+              },
+            };
+          }
+          case "graph": {
+            if (!input.graph) return errorResult("capsule graph requires: graph");
+            const locator = input.share_token || input.url;
+            if (!locator) return errorResult("capsule graph requires: share_token or url");
+            const response = await client.capsuleGraph(input.graph, locator);
+            return {
+              content: [{ type: "text" as const, text: `${formatGraphHeadline(response)}\n${formatContent(response)}` }],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "audit": {
+            const response = await client.capsuleAudit({
+              capsule_id: input.capsule_id,
+              workspace_id: workspaceId,
+              project_id: projectId,
+              event_kind: input.event_kind,
+              access_scope: input.access_scope,
+              limit: input.limit,
+              offset: input.offset,
+            });
+            return {
+              content: [{ type: "text" as const, text: `Found ${capsuleArray(response).length} audit event(s).\n${formatContent(response)}` }],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "list_shares": {
+            const response = await client.capsuleListShares({
+              capsule_id: input.capsule_id,
+              workspace_id: workspaceId,
+              project_id: projectId,
+            });
+            return {
+              content: [{ type: "text" as const, text: `${formatListSharesHeadline(capsuleArray(response), input.capsule_id, projectId, workspaceId)}\n${formatContent(response)}` }],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "revoke_share": {
+            if (!input.share_id) return errorResult("capsule revoke_share requires: share_id");
+            const response = await client.capsuleRevokeShare(input.share_id);
+            return {
+              content: [{ type: "text" as const, text: `${formatRevokeShareText(response)}\n${formatContent(response)}` }],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "explain":
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "ContextCapsule packages ContextStream context into a portable artifact. Use `context` for normal turn-by-turn retrieval and `capsule` when you need a shareable, renderable, lazy-hydrated handoff or snapshot.",
+                },
+              ],
+            };
+        }
+      }
+    );
+
+    // -------------------------------------------------------------------------
     // memory - Consolidates memory event and node operations
     // -------------------------------------------------------------------------
     registerTool(
       "memory",
       {
         title: "Memory",
-        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap. Transcript actions: list_transcripts (list saved conversations), get_transcript (get full transcript by ID), search_transcripts (semantic search across conversations), delete_transcript. Team actions (team plans only): team_tasks, team_todos, team_diagrams, team_docs.`,
+        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap. Transcript actions: list_transcripts (list saved conversations), get_transcript (get full transcript by ID), search_transcripts (semantic search across conversations), search_archive (remote Atlas archive; local npm returns unavailable), delete_transcript. Team actions (team plans only): team_tasks, team_todos, team_diagrams, team_docs.`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -13445,6 +14605,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "list_transcripts",
               "get_transcript",
               "search_transcripts",
+              "search_archive",
               "delete_transcript",
               // Team actions
               "team_tasks",
@@ -13462,10 +14623,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           title: z.string().optional(),
           content: z.string().optional(),
           event_type: z.string().optional(),
-          node_type: z.string().optional(),
+          node_type: z.enum(VALID_NODE_TYPES).optional(),
           metadata: z.record(z.any()).optional(),
           // Query params
           query: z.string().optional(),
+          scope: z.string().optional().describe("Archive collection scope for search_archive: transcripts, decisions, lessons, docs"),
           category: z.string().optional(),
           limit: z.number().optional(),
           // Structured identity metadata for capture/search/list flows (issue #54)
@@ -13602,7 +14764,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             .optional()
             .describe("Doc ID for get_doc/update_doc/delete_doc. For get_doc, accepts UUID or title/query text."),
           doc_type: z
-            .enum(["roadmap", "spec", "general"])
+            .enum(VALID_DOC_TYPES)
             .optional()
             .describe("Document type"),
           milestones: z
@@ -14831,6 +15993,24 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
+            };
+          }
+
+          case "search_archive": {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "[ARCHIVE] disabled (Atlas Online Archive is only available in the remote Rust MCP binary).",
+                },
+              ],
+              structuredContent: {
+                stages_used: ["atlas_online_archive"],
+                available: false,
+                query: input.query || "",
+                scope: input.scope,
+                results: [],
+              },
             };
           }
 
@@ -16784,21 +17964,21 @@ Example workflow:
             .describe("Action to perform"),
           workspace_id: z.string().uuid().optional(),
           project_id: z.string().uuid().optional(),
+          target_project: z.string().optional().describe("Target child project by folder name or project name"),
           // Index params
           file_path: z.string().optional().describe("Local path to media file for indexing"),
           external_url: z.string().url().optional().describe("External URL to media file for indexing"),
           content_type: z
-            .enum(["video", "audio", "image", "document"])
+            .string()
             .optional()
-            .describe("Type of media content (auto-detected if not provided)"),
+            .describe("Type of media content. Use video, audio, image, or document; friendly aliases like photos/images and docs/PDFs/slides are accepted."),
           // Status/get_clip/delete params
           content_id: z.string().uuid().optional().describe("Content ID from index operation"),
           // Search params
           query: z.string().optional().describe("Semantic search query for media content"),
-          content_types: z
-            .array(z.enum(["video", "audio", "image", "document"]))
+          content_types: stringOrArray(z.string())
             .optional()
-            .describe("Filter search to specific content types"),
+            .describe("Filter search/list to content types: video, audio, image, document. Friendly aliases are accepted."),
           // Get clip params
           start: z
             .string()
@@ -16822,7 +18002,18 @@ Example workflow:
       },
       async (input) => {
         const workspaceId = resolveWorkspaceId(input.workspace_id);
-        const projectId = resolveProjectId(input.project_id);
+        const targetProject = await resolveTargetProjectId(client, workspaceId, input.target_project);
+        if (targetProject.error) return errorResult(targetProject.error);
+        const explicitProjectScope = Boolean(input.project_id?.trim() || input.target_project?.trim());
+        const projectId = normalizeUuid(input.project_id) || targetProject.projectId || resolveProjectId(undefined);
+        let contentType: "video" | "audio" | "image" | "document" | undefined;
+        let contentTypeFilters: Array<"video" | "audio" | "image" | "document"> | undefined;
+        try {
+          contentType = normalizeOptionalMediaContentType(input.content_type);
+          contentTypeFilters = normalizeMediaContentTypeFilters(input.content_types);
+        } catch (error) {
+          return errorResult(error instanceof Error ? error.message : String(error));
+        }
 
         switch (input.action) {
           case "index": {
@@ -16879,19 +18070,24 @@ Example workflow:
                 ".gif": "image/gif",
                 ".webp": "image/webp",
                 ".svg": "image/svg+xml",
+                ".pdf": "application/pdf",
+                ".doc": "application/msword",
+                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ".ppt": "application/vnd.ms-powerpoint",
+                ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
               };
               const mimeType = mimeTypes[ext] || "application/octet-stream";
 
               // Auto-detect content type from extension
-              let contentType: "video" | "audio" | "image" | "document" | "text" | "code" | "other" = "other";
-              if (input.content_type) {
-                contentType = input.content_type as typeof contentType;
+              let detectedContentType: "video" | "audio" | "image" | "document" | "text" | "code" | "other" = "document";
+              if (contentType) {
+                detectedContentType = contentType;
               } else if (mimeType.startsWith("video/")) {
-                contentType = "video";
+                detectedContentType = "video";
               } else if (mimeType.startsWith("audio/")) {
-                contentType = "audio";
+                detectedContentType = "audio";
               } else if (mimeType.startsWith("image/")) {
-                contentType = "image";
+                detectedContentType = "image";
               }
 
               const filename = pathModule.basename(resolvedPath);
@@ -16900,9 +18096,10 @@ Example workflow:
                 // Initialize upload to get presigned URL
                 const uploadInit = await client.mediaInitUpload({
                   workspace_id: workspaceId,
+                  project_id: projectId,
                   filename,
                   size_bytes: fileStats.size,
-                  content_type: contentType,
+                  content_type: detectedContentType,
                   mime_type: mimeType,
                   tags: input.tags,
                 });
@@ -16935,7 +18132,7 @@ Example workflow:
                   message: "Media file uploaded successfully. Indexing has been triggered.",
                   content_id: uploadInit.content_id,
                   filename,
-                  content_type: contentType,
+                  content_type: detectedContentType,
                   size_bytes: fileStats.size,
                   mime_type: mimeType,
                   note: "Use media(action='status', content_id='...') to check indexing progress.",
@@ -16948,7 +18145,7 @@ Example workflow:
                   content: [
                     {
                       type: "text" as const,
-                      text: `✅ Media uploaded successfully!\n\nContent ID: ${uploadInit.content_id}\nFilename: ${filename}\nType: ${contentType}\nSize: ${(fileStats.size / 1024 / 1024).toFixed(2)} MB${statusNote}\n\nIndexing has been triggered. Use media(action='status', content_id='${uploadInit.content_id}') to check progress.`,
+                      text: `✅ Media uploaded successfully!\n\nContent ID: ${uploadInit.content_id}\nFilename: ${filename}\nType: ${detectedContentType}\nSize: ${(fileStats.size / 1024 / 1024).toFixed(2)} MB${statusNote}\n\nIndexing has been triggered. Use media(action='status', content_id='${uploadInit.content_id}') to check progress.`,
                     },
                   ],
                   structuredContent: result,
@@ -16959,18 +18156,17 @@ Example workflow:
               }
             }
 
-            // Handle external URL (not yet implemented - requires backend support)
-            const result = {
-              status: "not_implemented",
-              message:
-                "External URL indexing is not yet implemented. Please use file_path for local files instead.",
-              action: "index",
-              external_url: input.external_url,
-              content_type: input.content_type,
-            };
+            const result = await client.mediaIndexUrl({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              external_url: input.external_url!,
+              content_type: contentType,
+              tags: input.tags,
+            });
+            const contentId = (result as any)?.content_id || (result as any)?.id || "unknown";
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: `Media indexed with content_id: ${contentId}\n${formatContent(result)}` }],
+              structuredContent: result as StructuredContent,
             };
           }
 
@@ -17038,12 +18234,34 @@ Example workflow:
             try {
               const searchResult = await client.mediaSearchContent({
                 workspace_id: workspaceId,
+                project_id: projectId,
                 query: input.query,
-                content_type: input.content_types?.[0], // API accepts single type for now
+                content_types: contentTypeFilters,
                 limit: input.limit,
               });
 
               if (searchResult.results.length === 0) {
+                const fallback = await client.memorySearch({
+                  workspace_id: workspaceId,
+                  project_id: projectId,
+                  query: input.query,
+                  limit: input.limit || 10,
+                }).then(mediaMemoryFallbackItems).catch(() => []);
+                if (fallback.length > 0) {
+                  return {
+                    content: [
+                      {
+                        type: "text" as const,
+                        text: `Workspace content search returned 0 results; found ${fallback.length} media-related item(s) via memory search fallback (source: memory_search_media).\n${formatContent(fallback)}`,
+                      },
+                    ],
+                    structuredContent: {
+                      results: fallback,
+                      source: "memory_search_media",
+                      explicit_project_scope: explicitProjectScope,
+                    },
+                  };
+                }
                 return {
                   content: [
                     {
@@ -17161,7 +18379,8 @@ Example workflow:
             try {
               const listResult = await client.mediaListContent({
                 workspace_id: workspaceId,
-                content_type: input.content_types?.[0], // API accepts single type for now
+                project_id: projectId,
+                content_types: contentTypeFilters,
                 limit: input.limit,
               });
 

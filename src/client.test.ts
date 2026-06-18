@@ -129,6 +129,55 @@ describe("ContextStreamClient.projectFiles", () => {
   });
 });
 
+describe("ContextStreamClient.createSkill", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("defaults new skills to active status when none is provided", async () => {
+    const client = new ContextStreamClient(baseConfig);
+    const fetchMock = vi.spyOn(globalThis, "fetch" as any).mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => "application/json" },
+      json: async () => ({ id: "skill-1" }),
+    } as any);
+
+    await client.createSkill({
+      name: "deploy-checker",
+      title: "Deploy Checker",
+      instruction_body: "Run the deploy checks.",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    expect(body.status).toBe("active");
+  });
+
+  it("honors an explicit draft status instead of defaulting to active", async () => {
+    const client = new ContextStreamClient(baseConfig);
+    const fetchMock = vi.spyOn(globalThis, "fetch" as any).mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => "application/json" },
+      json: async () => ({ id: "skill-2" }),
+    } as any);
+
+    await client.createSkill({
+      name: "draft-skill",
+      title: "Draft Skill",
+      instruction_body: "Not ready yet.",
+      status: "draft",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    expect(body.status).toBe("draft");
+  });
+});
+
 describe("ContextStreamClient ingest/session fallbacks", () => {
   afterEach(() => {
     vi.restoreAllMocks();

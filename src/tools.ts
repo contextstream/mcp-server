@@ -6940,6 +6940,10 @@ Actions:
             categories: input.categories,
             actions: input.actions,
             scope: input.scope,
+            // Default to "active" so saved skills are usable immediately
+            // without a dashboard status change; "draft"/"archived" must be
+            // requested explicitly at save time.
+            status: input.status,
             is_personal: input.is_personal,
             priority: input.priority,
             workspace_id: input.scope === "team" ? input.workspace_id : undefined,

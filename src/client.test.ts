@@ -226,6 +226,30 @@ describe("ContextStreamClient.createSkill", () => {
     const body = JSON.parse(String(init?.body ?? "{}"));
     expect(body.status).toBe("active");
   });
+
+  it("defaults to active when status is an empty or whitespace-only string", async () => {
+    // The backend treats a missing status as "Draft", so an empty/whitespace
+    // status must be normalized to "active" rather than forwarded as-is.
+    const client = new ContextStreamClient(baseConfig);
+    const fetchMock = vi.spyOn(globalThis, "fetch" as any).mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => "application/json" },
+      json: async () => ({ id: "skill-empty" }),
+    } as any);
+
+    await client.createSkill({
+      name: "empty-status",
+      title: "Empty Status",
+      instruction_body: "Should be active.",
+      status: "   ",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    expect(body.status).toBe("active");
+  });
 });
 
 describe("ContextStreamClient ingest/session fallbacks", () => {

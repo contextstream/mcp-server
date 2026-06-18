@@ -28,6 +28,7 @@
 
 ### Parity + Issue Remediation
 
+- **Skills default to active on save (Slack report):** `skill(action="create")` now sends `status: "active"` by default so skills saved through the MCP are usable immediately instead of landing as "Draft" in the dashboard. An explicit `status: "draft"` (or `"archived"`) at save time is still honored. `createSkill` now accepts an optional `status` parameter and the tool layer forwards `input.status`.
 - Added adaptive ingest behavior for 413 payload errors with recursive batch splitting, conservative payload limits, and oversized serialized-file skipping.
 - Wired `project(action="files")` pagination/filter arguments through to the API client and improved `project(action="index_status")` diagnostics when pending file paths are not returned by the backend.
 - Improved session resiliency: `getHighPriorityLessons`, `getContextSummary`, `getContextDelta`, and `decision_trace` now log actionable fallback diagnostics and continue with fallback flows where possible.

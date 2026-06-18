@@ -7750,6 +7750,7 @@ export class ContextStreamClient {
     categories?: string[];
     actions?: any;
     scope?: string;
+    status?: string;
     is_personal?: boolean;
     priority?: number;
     workspace_id?: string;
@@ -7757,7 +7758,11 @@ export class ContextStreamClient {
     source_tool?: string;
     source_file?: string;
   }) {
-    return request(this.config, "/skills", { body: this.withDefaults(params) });
+    // Skills saved through the MCP default to "active" so they are usable
+    // immediately without a dashboard status change. Callers that want a
+    // draft can pass status: "draft" explicitly.
+    const withStatus = { status: "active", ...params };
+    return request(this.config, "/skills", { body: this.withDefaults(withStatus) });
   }
 
   async updateSkill(

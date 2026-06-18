@@ -7760,8 +7760,14 @@ export class ContextStreamClient {
   }) {
     // Skills saved through the MCP default to "active" so they are usable
     // immediately without a dashboard status change. Callers that want a
-    // draft can pass status: "draft" explicitly.
-    const withStatus = { status: "active", ...params };
+    // draft can pass status: "draft" explicitly. Use a non-empty-string
+    // check (not just truthiness) so an explicit `status: undefined` from
+    // the tool handler — which would otherwise override the default via
+    // object spread and be dropped by JSON.stringify — still resolves to
+    // "active".
+    const status =
+      typeof params.status === "string" && params.status.trim() ? params.status : "active";
+    const withStatus = { ...params, status };
     return request(this.config, "/skills", { body: this.withDefaults(withStatus) });
   }
 

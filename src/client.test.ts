@@ -177,6 +177,28 @@ describe("ContextStreamClient.createSkill", () => {
     expect(body.status).toBe("draft");
   });
 
+  it("honors an explicit archived status instead of defaulting to active", async () => {
+    const client = new ContextStreamClient(baseConfig);
+    const fetchMock = vi.spyOn(globalThis, "fetch" as any).mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => "application/json" },
+      json: async () => ({ id: "skill-archived" }),
+    } as any);
+
+    await client.createSkill({
+      name: "archived-skill",
+      title: "Archived Skill",
+      instruction_body: "Retired skill.",
+      status: "archived",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    expect(body.status).toBe("archived");
+  });
+
   it("defaults to active even when status is explicitly undefined (tool handler path)", async () => {
     // The skill(create) tool handler always forwards `status: input.status`,
     // which is `undefined` when the caller omits it. A naive

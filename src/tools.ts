@@ -6930,12 +6930,11 @@ Actions:
         case "create": {
           if (!input.name) throw new Error("'name' is required for create");
           if (!input.instruction_body) throw new Error("'instruction_body' is required for create");
-          // Default to "active" so saved skills are usable immediately
-          // without a dashboard status change; "draft"/"archived" must be
-          // requested explicitly at save time. The API backend defaults a
-          // missing/empty status to "draft", so we resolve it here at the
-          // tool layer. createSkill() also applies this as a safety net.
-          const status = input.status && input.status.trim() ? input.status : "active";
+          // Forward the caller's status verbatim. When omitted, input.status is
+          // undefined; createSkill() resolves undefined/empty/whitespace status
+          // to "active" via a post-spread non-empty-string check, so saved skills
+          // are usable immediately without a dashboard status change. An
+          // explicit "draft" or "archived" is honored as-is.
           const result = await client.createSkill({
             name: input.name,
             title: input.title || input.name,
@@ -6946,7 +6945,7 @@ Actions:
             categories: input.categories,
             actions: input.actions,
             scope: input.scope,
-            status,
+            status: input.status,
             is_personal: input.is_personal,
             priority: input.priority,
             workspace_id: input.scope === "team" ? input.workspace_id : undefined,

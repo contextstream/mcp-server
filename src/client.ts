@@ -7763,13 +7763,12 @@ export class ContextStreamClient {
     // draft can pass status: "draft" explicitly. Use a post-spread
     // non-empty-string check: after spreading the input fields, resolve
     // undefined/empty/whitespace status to "active" so explicit "draft" or
-    // "archived" values are still honored. This is a defense-in-depth safety
-    // net: the skill(create) tool handler also defaults status to "active",
-    // but direct callers (or a future handler that forwards
-    // `status: input.status`, which is undefined when omitted) would otherwise
-    // let that undefined override a naive `{ status: "active", ...params }`
-    // default and JSON.stringify would drop the field, causing the API to
-    // fall back to "Draft".
+    // "archived" values are still honored. The skill(create) tool handler
+    // forwards `status: input.status` verbatim (undefined when omitted); a
+    // naive `{ status: "active", ...params }` default would let that
+    // undefined override the default and JSON.stringify would drop the field,
+    // causing the API to fall back to "Draft". This check is the single
+    // source of truth for the default-active behavior.
     const body = { ...params };
     if (typeof body.status !== "string" || !body.status.trim()) {
       body.status = "active";

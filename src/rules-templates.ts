@@ -42,13 +42,14 @@ const CONTEXTSTREAM_TOOL_NAMES = [
   "session", // Actions: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search, decision_trace
   "memory", // Actions: create_event, get_event, update_event, delete_event, list_events, distill_event, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, search, decisions, timeline, summary
   "entity", // Actions: list, get, create, update, delete for structured taxonomy entities
-  "capsule", // Actions: open, create, share, bootstrap_prompt, graph, audit
+  "capsule", // Actions: open, create, share, bootstrap_prompt, graph, audit, delete
+  "qa", // Actions: ask (grounded answer with citations), search (prior Q&A), save_kb/list_kb/get_kb/update_kb/delete_kb (knowledge base), feedback
   "graph", // Actions: dependencies, impact, call_path, related, path, decisions, ingest, circular_dependencies, unused_code, contradictions
-  "project", // Actions: list, get, create, update, index, overview, statistics, files, index_status, ingest_local
+  "project", // Actions: list, get, create, update, index, purge, forget_local, remove_paths, merge, overview, statistics, files, index_status, ingest_local
   "workspace", // Actions: list, get, associate, bootstrap
   "reminder", // Actions: list, active, create, snooze, complete, dismiss
   "media", // Actions: index, status, search, get_clip, list, delete
-  "skill", // Actions: list, run, create, update, import
+  "skill", // Actions: list, run, create, update, supersede, import
   "integration", // Provider: slack, github, all; Actions: status, search, stats, activity, contributors, knowledge, summary, channels, discussions, sync_users, repos, issues
   "help", // Actions: tools, auth, version, editor_rules, enable_bundle
 ] as const;

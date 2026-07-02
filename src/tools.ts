@@ -31,7 +31,7 @@ import {
   type SupportedEditor,
 } from "./hooks-config.js";
 import { HttpError } from "./http.js";
-import { resolveWorkspace } from "./workspace-config.js";
+import { forgetLocalConfig, resolveWorkspace } from "./workspace-config.js";
 import { trackToolTokenSavings, type TokenSavingsToolType } from "./token-savings.js";
 import {
   getSessionInitTip,
@@ -127,6 +127,7 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   media: "media",
   capsule: "capsule",
   entity: "entity",
+  qa: "qa",
   instruct: "instruct",
   flash: "flash",
   ai: "ai",
@@ -1641,6 +1642,19 @@ const STANDARD_TOOLSET = new Set<string>([
   "media",
   "capsule",
   "entity",
+  "qa",
+  "skill",
+  "vcs",
+  "integration",
+  // Per-action write surfaces (parity with the Rust MCP standard toolset)
+  "capture_plan",
+  "memory_create_doc",
+  "memory_update_doc",
+  "memory_delete_doc",
+  "memory_create_task",
+  "memory_update_task",
+  "memory_create_todo",
+  "memory_complete_todo",
   // Reminders (6)
   "reminders_list",
   "reminders_active",
@@ -2153,7 +2167,7 @@ const operationsRegistry = new Map<string, OperationConfig>();
 
 // Category mapping for operations
 function inferOperationCategory(name: string): string {
-  if (name === "init" || name === "context" || name === "session" || name.startsWith("session_") || name.startsWith("context_")) return "Session";
+  if (name === "init" || name === "context" || name === "session" || name === "qa" || name.startsWith("session_") || name.startsWith("context_")) return "Session";
   if (name === "memory" || name === "entity" || name.startsWith("memory_")) return "Memory";
   if (name === "capsule") return "Utility";
   if (name.startsWith("search_")) return "Search";
@@ -2417,9 +2431,28 @@ const CONSOLIDATED_TOOLS = new Set<string>([
   "media", // Consolidates media indexing, search, and clip retrieval for Remotion/FFmpeg
   "skill", // Skill management: list, get, create, update, run, delete, import, export, share
   "capsule", // ContextCapsule snapshots and shares
+  "qa", // Agent Q&A over the workspace/project knowledge base
   "entity", // Structured taxonomy entities
   "help", // Consolidates session_tools, auth_me, mcp_server_version, etc.
   "vcs", // Version control: status, diff, log, blame, branches, stash_list
+  // Per-action write surfaces. Surfaced so MCP clients that display only the
+  // tool name (opencode, Cursor, Codex, Claude Code) can render
+  // `contextstream_capture_plan` instead of the generic `contextstream_session`.
+  // They dispatch to the same handlers as the corresponding
+  // session(action=...) / memory(action=...) calls, so model prompts can
+  // still go either route.
+  "capture_plan",
+  "session_capture",
+  "session_capture_lesson",
+  "session_remember",
+  "memory_create_doc",
+  "memory_update_doc",
+  "memory_delete_doc",
+  "memory_create_task",
+  "memory_update_task",
+  "memory_create_todo",
+  "memory_complete_todo",
+  "memory_create_event",
 ]);
 
 function mapToolToConsolidatedDomain(toolName: string): string | null {
@@ -2434,6 +2467,7 @@ function mapToolToConsolidatedDomain(toolName: string): string | null {
   if (toolName.startsWith("memory_") || toolName === "decision_trace") return "memory";
   if (toolName === "entity") return "entity";
   if (toolName === "capsule") return "capsule";
+  if (toolName === "qa") return "qa";
   if (toolName.startsWith("graph_")) return "graph";
   if (toolName.startsWith("projects_")) return "project";
   if (toolName.startsWith("workspaces_") || toolName.startsWith("workspace_")) return "workspace";
@@ -2632,6 +2666,7 @@ const CAPSULE_ACTIONS = [
   "audit",
   "list_shares",
   "revoke_share",
+  "delete",
   "explain",
 ] as const;
 
@@ -6878,7 +6913,7 @@ Access: Free`,
     "skill",
     {
       title: "Manage reusable skills",
-      description: `Manage and execute reusable skills (instruction + action bundles). Skills are portable across projects, sessions, and tools.
+      description: `Manage and execute reusable skills (instruction + action bundles). Skills are portable across projects, sessions, and tools. Use 'supersede' to retire a stale skill (archives it so it stops surfacing).
 
 Actions:
 - list: Browse skills (filter by scope, status, category)
@@ -6891,7 +6926,7 @@ Actions:
 - export: Export skills in various formats
 - share: Change skill visibility scope`,
       inputSchema: z.object({
-        action: z.enum(["list", "get", "create", "update", "run", "delete", "import", "export", "share"]).describe("The action to perform"),
+        action: z.enum(["list", "get", "create", "update", "supersede", "run", "delete", "import", "export", "share"]).describe("The action to perform"),
         skill_id: z.string().optional().describe("Skill ID (UUID)"),
         name: z.string().optional().describe("Skill name (slug, e.g. 'deploy-checker')"),
         title: z.string().optional().describe("Skill display title"),
@@ -6914,6 +6949,7 @@ Actions:
         source_file: z.string().optional().describe("Source filename (for import provenance)"),
         skill_ids: stringOrArray(z.string()).optional().describe("Skill IDs for export"),
         change_summary: z.string().optional().describe("Summary of changes (for version history)"),
+        superseded_by: z.string().optional().describe("Replacement skill (name or id), recorded when action='supersede'"),
         workspace_id: z.string().optional().describe("Workspace ID (UUID)"),
         project_id: z.string().optional().describe("Project ID (UUID)"),
         query: z.string().optional().describe("Search query"),
@@ -7000,6 +7036,25 @@ Actions:
           }) as { version?: number };
           return { content: [{ type: "text" as const, text: `Skill ${resolvedId} updated (version=${result.version || 0}).` }] };
         }
+        case "supersede": {
+          const resolvedId = await resolveSkillIdForAction(client, input, "supersede");
+          const changeSummary =
+            input.superseded_by?.trim()
+              ? `Superseded by ${input.superseded_by.trim()}`
+              : input.change_summary || "Superseded";
+          await client.updateSkill(resolvedId, {
+            status: "archived",
+            change_summary: changeSummary,
+          });
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Skill ${resolvedId} superseded (archived — it will stop surfacing in matches).${input.superseded_by ? ` Replacement: ${input.superseded_by}.` : ""}`,
+              },
+            ],
+          };
+        }
         case "run": {
           const resolvedId = await resolveSkillIdForAction(client, input, "run");
           const result = await client.runSkill(resolvedId, {
@@ -7046,7 +7101,7 @@ Actions:
           return { content: [{ type: "text" as const, text: `Skill ${resolvedId} shared with scope=${result.scope || input.scope}.` }] };
         }
         default:
-          throw new Error(`Invalid skill action: '${action}'. Valid: list, get, create, update, run, delete, import, export, share`);
+          throw new Error(`Invalid skill action: '${action}'. Valid: list, get, create, update, supersede, run, delete, import, export, share`);
       }
     }
   );
@@ -13023,6 +13078,118 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       }
     );
 
+    // Resolve a lesson reference (UUID or lookup text) to its memory event id.
+    // Text lookups rank exact title matches first and refuse ambiguous
+    // matches so a bulk-worded lookup can never silently edit the wrong lesson.
+    async function resolveLessonEventId(
+      lookup: string,
+      workspaceId?: string,
+      projectId?: string,
+      limit?: number
+    ): Promise<{ id: string; note?: string } | { error: string }> {
+      const trimmed = lookup.trim();
+      if (normalizeUuid(trimmed)) return { id: normalizeUuid(trimmed) as string };
+      if (!workspaceId) {
+        return { error: "Lesson lookup by title requires workspace scope. Run init first." };
+      }
+
+      const searchLimit = Math.min(Math.max(limit || 50, 10), 100);
+      const extractItems = (result: unknown): Array<Record<string, any>> => {
+        if (Array.isArray(result)) return result;
+        const r = result as Record<string, any>;
+        for (const key of ["lessons", "items", "events", "results"]) {
+          const nested = r?.[key] ?? r?.data?.[key];
+          if (Array.isArray(nested)) return nested;
+        }
+        return [];
+      };
+
+      let candidates: Array<Record<string, any>> = [];
+      try {
+        candidates = extractItems(
+          await client.getHighPriorityLessons({
+            workspace_id: workspaceId,
+            project_id: projectId,
+            context_hint: trimmed,
+            limit: searchLimit,
+          })
+        );
+      } catch {
+        // fall through to the event-list fallback
+      }
+      if (candidates.length === 0) {
+        try {
+          candidates = extractItems(
+            await client.listMemoryEvents({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              event_type: "lesson",
+              limit: searchLimit,
+            })
+          );
+        } catch {
+          // resolution error reported below
+        }
+      }
+
+      const normalize = (value: unknown) =>
+        String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+      const target = normalize(trimmed);
+      const withIds = candidates
+        .map((item) => ({
+          id: normalizeUuid(item?.id || item?.event_id || item?.lesson_id),
+          title: String(item?.title || item?.summary || "").trim(),
+        }))
+        .filter((item): item is { id: string; title: string } => Boolean(item.id));
+
+      const exact = withIds.filter((item) => normalize(item.title) === target);
+      if (exact.length === 1) return { id: exact[0].id };
+      if (exact.length > 1) {
+        const listing = exact.slice(0, 5).map((m) => `- ${m.title} (id: ${m.id})`).join("\n");
+        return {
+          error: `Multiple lessons share the exact title "${trimmed}". Pass the lesson_id UUID instead:\n${listing}`,
+        };
+      }
+
+      const partial = withIds.filter(
+        (item) => normalize(item.title).includes(target) || target.includes(normalize(item.title))
+      );
+      if (partial.length === 1) {
+        return {
+          id: partial[0].id,
+          note: `Resolved lesson "${trimmed}" to **${partial[0].title}** (id: ${partial[0].id}).`,
+        };
+      }
+      if (partial.length > 1) {
+        const listing = partial.slice(0, 5).map((m) => `- ${m.title} (id: ${m.id})`).join("\n");
+        return {
+          error: `Lesson lookup "${trimmed}" is ambiguous. Pass the lesson_id UUID instead:\n${listing}`,
+        };
+      }
+      return {
+        error: `No lessons found matching "${trimmed}". Use session(action="get_lessons", query="${trimmed}") to inspect candidates.`,
+      };
+    }
+
+    // Exact-title matches for a delete_all-style bulk lookup. Restricting to
+    // exact (whitespace-normalized, case-insensitive) title equality keeps a
+    // broad lookup from ever matching more than the caller intended.
+    function exactTitleMatches(
+      items: Array<Record<string, any>>,
+      lookup: string
+    ): Array<{ id: string; title: string }> {
+      const normalize = (value: unknown) =>
+        String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+      const target = normalize(lookup);
+      return items
+        .map((item) => ({
+          id: normalizeUuid(item?.id || item?.event_id || item?.node_id),
+          title: String(item?.title || item?.summary || "").trim(),
+        }))
+        .filter((m): m is { id: string; title: string } => Boolean(m.id))
+        .filter((m) => normalize(m.title) === target);
+    }
+
     // -------------------------------------------------------------------------
     // session - Consolidates session management tools
     // -------------------------------------------------------------------------
@@ -13030,13 +13197,15 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "session",
       {
         title: "Session",
-        description: `Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). PAST SESSIONS LIVE HERE: use action='recall' FIRST when the user references "last time", "previous", "yesterday", or is continuing prior work — full-text transcripts are indexed across every prior session. context() may surface [GROUNDING]; use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills) outside context(). Actions: capture (save decision/insight), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons (retrieve lessons), recall (retrieve past conversation context via ranked fusion of transcripts/snapshots/docs/decisions), ground (one-shot prior-work bundle), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (searches MEMORY/conversation history only, not code), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan, get_plan, update_plan, list_plans. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Team actions: team_decisions, team_lessons, team_plans.`,
+        description: `Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). PAST SESSIONS LIVE HERE: use action='recall' FIRST when the user references "last time", "previous", "yesterday", or is continuing prior work — full-text transcripts are indexed across every prior session. context() may surface [GROUNDING]; use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills) outside context(). Actions: capture (save decision/insight), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons (retrieve lessons), update_lesson / delete_lesson (maintain a saved lesson by lesson_id — UUID or lookup text), recall (retrieve past conversation context via ranked fusion of transcripts/snapshots/docs/decisions), ground (one-shot prior-work bundle), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (searches MEMORY/conversation history only, not code), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan, get_plan, update_plan, list_plans. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Team actions: team_decisions, team_lessons, team_plans.`,
         inputSchema: z.object({
           action: z
             .enum([
               "capture",
               "capture_lesson",
               "get_lessons",
+              "update_lesson",
+              "delete_lesson",
               "recall",
               "ground",
               "remember",
@@ -13390,6 +13559,50 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             return {
               content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
 
+            };
+          }
+
+          case "update_lesson": {
+            if (!input.lesson_id) {
+              return errorResult("update_lesson requires: lesson_id (UUID or lesson title text)");
+            }
+            if (!input.title && !input.content) {
+              return errorResult("update_lesson requires at least one of: title, content");
+            }
+            const resolved = await resolveLessonEventId(
+              input.lesson_id,
+              workspaceId,
+              projectId,
+              input.limit
+            );
+            if ("error" in resolved) return errorResult(resolved.error);
+            const result = await client.updateMemoryEvent(resolved.id, {
+              title: input.title,
+              content: input.content,
+            });
+            const note = resolved.note ? `${resolved.note}\n` : "";
+            return {
+              content: [{ type: "text" as const, text: `${note}Lesson updated: ${resolved.id}.` }],
+              structuredContent: toStructured(result),
+            };
+          }
+
+          case "delete_lesson": {
+            if (!input.lesson_id) {
+              return errorResult("delete_lesson requires: lesson_id (UUID or lesson title text)");
+            }
+            const resolved = await resolveLessonEventId(
+              input.lesson_id,
+              workspaceId,
+              projectId,
+              input.limit
+            );
+            if ("error" in resolved) return errorResult(resolved.error);
+            const result = await client.deleteMemoryEvent(resolved.id);
+            const note = resolved.note ? `${resolved.note}\n` : "";
+            return {
+              content: [{ type: "text" as const, text: `${note}Lesson deleted: ${resolved.id}.` }],
+              structuredContent: toStructured(result),
             };
           }
 
@@ -14380,6 +14593,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           offset: z.number().optional().describe("Audit result offset"),
           graph: z.enum(CAPSULE_GRAPHS).optional().describe("Graph kind for action=graph"),
           max_uses: z.number().optional().describe("Burn-after-N-reads cap for action=share. Team links default to no max-use cap; token-gated single-use links default to max_uses=1 with a short grace window after first open."),
+          require_unlock_key: z.boolean().optional().describe("For action=share: require a one-time unlock key to open the share"),
+          unlock_destinations: stringOrArray(z.string()).optional().describe("For action=share with require_unlock_key=true: destinations that receive the unlock key"),
           max_inline_tokens: z.number().optional().describe("Cap inline section tokens during action=create"),
           refresh_if_stale: z.boolean().optional().describe("Force regenerate manifest if stale"),
         }),
@@ -14476,6 +14691,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               expires_in_days: input.expires_in_days,
               multi_use: input.multi_use,
               max_uses: input.max_uses,
+              require_unlock_key: input.require_unlock_key,
+              unlock_destinations: Array.isArray(input.unlock_destinations)
+                ? input.unlock_destinations
+                : input.unlock_destinations
+                  ? [input.unlock_destinations]
+                  : undefined,
             });
             const response = await client.capsuleShare(input.capsule_id, params);
             return {
@@ -14565,6 +14786,14 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               structuredContent: toStructured(response),
             };
           }
+          case "delete": {
+            if (!input.capsule_id) return errorResult("capsule delete requires: capsule_id");
+            const response = await client.deleteCapsule(input.capsule_id);
+            return {
+              content: [{ type: "text" as const, text: `✓ ContextCapsule deleted: ${input.capsule_id}` }],
+              structuredContent: toStructured(response),
+            };
+          }
           case "explain":
             return {
               content: [
@@ -14579,13 +14808,346 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
     );
 
     // -------------------------------------------------------------------------
+    // qa - Agent Q&A over the workspace/project knowledge base
+    // -------------------------------------------------------------------------
+    const QA_ACTIONS = [
+      "ask",
+      "search",
+      "save_kb",
+      "list_kb",
+      "get_kb",
+      "update_kb",
+      "delete_kb",
+      "feedback",
+      "explain",
+    ] as const;
+    const QA_KB_KINDS = ["guidance", "guardrail", "faq", "runbook", "caveat"] as const;
+    // Answers are always attributed to the public assistant branding.
+    const QA_MODEL_BRANDING = "ContextCode";
+    // Only fields that are part of the public answer contract are surfaced.
+    const QA_ANSWER_PUBLIC_FIELDS = new Set([
+      "id",
+      "question_id",
+      "answer_id",
+      "question_text",
+      "answer_text",
+      "confidence",
+      "source_refs",
+      "prompt_token_count",
+      "completion_token_count",
+      "total_token_count",
+      "total_latency_ms",
+      "cached",
+      "tier1_count",
+      "tier2_count",
+      "feedback_score",
+      "created_at",
+      "tags",
+      "workspace_id",
+      "project_id",
+      "session_id",
+    ]);
+
+    function sanitizeQaAnswer(answer: Record<string, any>): Record<string, any> {
+      const safe: Record<string, any> = {};
+      for (const [key, value] of Object.entries(answer || {})) {
+        if (QA_ANSWER_PUBLIC_FIELDS.has(key)) safe[key] = value;
+      }
+      safe.model_name = QA_MODEL_BRANDING;
+      return safe;
+    }
+
+    function sanitizeQaSearch(data: Record<string, any>): Record<string, any> {
+      const items = Array.isArray(data?.items) ? data.items : [];
+      return {
+        items: items.map((item: any) => ({
+          question: item?.question,
+          answers: Array.isArray(item?.answers)
+            ? item.answers.map((a: any) => sanitizeQaAnswer(a))
+            : [],
+        })),
+        total: data?.total,
+        page: data?.page,
+        per_page: data?.per_page,
+      };
+    }
+
+    function formatQaCitations(sourceRefs: unknown): string {
+      if (!Array.isArray(sourceRefs) || sourceRefs.length === 0) return "";
+      const lines = ["", "Sources:"];
+      for (const ref of sourceRefs.slice(0, 10)) {
+        if (typeof ref === "string") {
+          lines.push(`- ${ref}`);
+          continue;
+        }
+        const r = (ref ?? {}) as Record<string, any>;
+        const kind = r.kind || r.type || "source";
+        const id = r.id || r.ref || "";
+        const title = r.title || r.summary || "";
+        lines.push(`- [${kind}${id ? `:${id}` : ""}] ${title}`.trimEnd());
+      }
+      if (sourceRefs.length > 10) lines.push(`… ${sourceRefs.length - 10} more`);
+      return lines.join("\n");
+    }
+
+    registerTool(
+      "qa",
+      {
+        title: "Agent Q&A",
+        description:
+          'ContextStream agent Q&A — ask the workspace/project knowledge base when you get stuck.\n\nWhen to use:\n- You need workspace-specific knowledge you cannot derive from code: prior decisions ("why was X chosen over Y?"), conventions ("what\'s the file naming pattern in this repo?"), runbooks ("how does the team handle this kind of incident?"), guardrails ("what\'s off-limits in this workspace?").\n- You\'re about to make a non-trivial choice and the workspace probably has prior context that shapes it.\n- A teammate has likely answered this before and you\'d rather reuse than re-derive.\n\nWhen NOT to use:\n- General programming questions you can answer yourself or via web search ("how does Rust async work?").\n- Things you can determine by reading the code right in front of you — read it first.\n- Trivial syntax or single-line questions.\n\nNot a reflex, not a last resort. If you\'re spending more than ~30 seconds stuck on something workspace-shaped, ask. If you can find the answer in 30 seconds yourself, do that.\n\nActions:\n- ask: submit a question, get a grounded answer with citations + confidence.\n- search: vector-similarity-free listing of prior Q&A — check before re-asking.\n- save_kb: store guidance/guardrail/faq/runbook/caveat for future asks to reference.\n- list_kb: browse stored knowledge.\n- get_kb / update_kb / delete_kb: manage individual KB items.\n- feedback: rate an answer (-1, 0, +1) so future retrievals weight it appropriately.\n\nAnswers come from ContextCode, ContextStream\'s grounded Q&A agent. Every claim cites the source (`[id=decision:abc]` / `[id=lesson:xyz]` / `[id=qa_kb_item:def]` etc.) so you can verify before acting on it.',
+        inputSchema: z.object({
+          action: z.enum(QA_ACTIONS).describe("Action to perform"),
+          question: z.string().optional().describe("Natural-language question (action=ask)"),
+          workspace_id: z.string().uuid().optional(),
+          project_id: z.string().uuid().optional(),
+          session_id: z
+            .string()
+            .optional()
+            .describe("Optional MCP session id — links the question to the AI session that asked"),
+          max_tokens: z.number().optional().describe("Override max answer tokens (action=ask)"),
+          temperature: z
+            .number()
+            .optional()
+            .describe("Override sampling temperature (action=ask, default 0.2)"),
+          tags: stringOrArray(z.string())
+            .optional()
+            .describe("Tags to attach to the persisted question (action=ask)"),
+          scope_summary: z
+            .string()
+            .optional()
+            .describe(
+              "Human-readable scope label fed into the prompt (e.g. 'workspace=Engineering, project=api')"
+            ),
+          query: z
+            .string()
+            .optional()
+            .describe(
+              "Free-text filter against prior Q&A question text (action=search) or KB title/content (action=list_kb)"
+            ),
+          asked_by_user_id: z
+            .string()
+            .uuid()
+            .optional()
+            .describe("Filter prior Q&A by who asked (action=search)"),
+          tag: z.string().optional().describe("Filter by tag (action=search, list_kb)"),
+          page: z.number().optional().describe("Page number (1-based)"),
+          per_page: z.number().optional().describe("Page size"),
+          id: z
+            .string()
+            .uuid()
+            .optional()
+            .describe("KB item id (action=get_kb / update_kb / delete_kb)"),
+          title: z.string().optional().describe("KB item title (action=save_kb / update_kb)"),
+          content: z.string().optional().describe("KB item body (action=save_kb / update_kb)"),
+          kind: z.enum(QA_KB_KINDS).optional().describe("KB item kind (action=save_kb / update_kb)"),
+          metadata: z
+            .record(z.unknown())
+            .optional()
+            .describe("Optional metadata (action=save_kb / update_kb)"),
+          created_by: z
+            .string()
+            .uuid()
+            .optional()
+            .describe("Filter KB items by creator user id (action=list_kb)"),
+          answer_id: z.string().uuid().optional().describe("Answer id to rate (action=feedback)"),
+          score: z.number().optional().describe("Feedback score: -1, 0, or +1 (action=feedback)"),
+        }),
+      },
+      async (input) => {
+        const workspaceId = resolveWorkspaceId(input.workspace_id);
+        const projectId = normalizeUuid(input.project_id) || resolveProjectId(undefined);
+        const qaTags = Array.isArray(input.tags) ? input.tags : input.tags ? [input.tags] : undefined;
+
+        switch (input.action) {
+          case "ask": {
+            if (!input.question?.trim()) return errorResult("qa ask requires: question");
+            const response = await client.qaAsk({
+              question: input.question.trim(),
+              workspace_id: workspaceId,
+              project_id: projectId,
+              session_id: input.session_id,
+              max_tokens: input.max_tokens,
+              temperature: input.temperature,
+              tags: qaTags,
+              scope_summary: input.scope_summary,
+            });
+            const answer = (response ?? {}) as Record<string, any>;
+            const confidence =
+              typeof answer.confidence === "number"
+                ? ` (confidence ${(answer.confidence * 100).toFixed(0)}%)`
+                : "";
+            const cached = answer.cached ? " [cached]" : "";
+            const text = [
+              `✓ Answer from ${QA_MODEL_BRANDING}${confidence}${cached}`,
+              "",
+              String(answer.answer_text || "").trim(),
+              formatQaCitations(answer.source_refs),
+            ]
+              .filter(Boolean)
+              .join("\n");
+            return {
+              content: [{ type: "text" as const, text }],
+              structuredContent: toStructured(sanitizeQaAnswer(answer)),
+            };
+          }
+          case "search": {
+            const response = await client.qaSearch({
+              q: input.query,
+              workspace_id: workspaceId,
+              project_id: projectId,
+              session_id: input.session_id,
+              asked_by_user_id: input.asked_by_user_id,
+              tag: input.tag,
+              page: input.page,
+              per_page: input.per_page,
+            });
+            const data = (response ?? {}) as Record<string, any>;
+            const items = Array.isArray(data.items) ? data.items : [];
+            const lines = [`✓ Found ${data.total ?? items.length} prior Q&A item(s).`];
+            for (const item of items.slice(0, 10)) {
+              const q = item?.question?.question_text || "(question)";
+              const answerCount = Array.isArray(item?.answers) ? item.answers.length : 0;
+              lines.push(`- ${q} (${answerCount} answer${answerCount === 1 ? "" : "s"})`);
+            }
+            if (items.length === 0) {
+              lines.push("No prior Q&A in scope — use action=ask to ask a fresh question.");
+            }
+            return {
+              content: [{ type: "text" as const, text: lines.join("\n") }],
+              structuredContent: toStructured(sanitizeQaSearch(data)),
+            };
+          }
+          case "save_kb": {
+            if (!input.title?.trim() || !input.content?.trim() || !input.kind) {
+              return errorResult("qa save_kb requires: title, content, kind");
+            }
+            const item = (await client.qaCreateKbItem({
+              title: input.title.trim(),
+              content: input.content,
+              kind: input.kind,
+              workspace_id: workspaceId,
+              project_id: projectId,
+              tags: qaTags,
+              metadata: input.metadata,
+            })) as Record<string, any>;
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `✓ KB item saved: ${item?.title || input.title} (${item?.kind || input.kind}) — id ${item?.id || "?"}`,
+                },
+              ],
+              structuredContent: toStructured(item),
+            };
+          }
+          case "list_kb": {
+            const response = await client.qaListKbItems({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              kind: input.kind,
+              tag: input.tag,
+              q: input.query,
+              created_by: input.created_by,
+              page: input.page,
+              per_page: input.per_page,
+            });
+            const data = (response ?? {}) as Record<string, any>;
+            const items = Array.isArray(data.items) ? data.items : Array.isArray(data) ? data : [];
+            const lines = [`✓ Found ${data.total ?? items.length} KB item(s).`];
+            for (const item of items.slice(0, 15)) {
+              lines.push(`- [${item?.kind || "kb"}] ${item?.title || item?.id || "(untitled)"}`);
+            }
+            if (items.length === 0) {
+              lines.push("No KB items in scope — use action=save_kb to store guidance.");
+            }
+            return {
+              content: [{ type: "text" as const, text: lines.join("\n") }],
+              structuredContent: toStructured(data),
+            };
+          }
+          case "get_kb": {
+            if (!input.id) return errorResult("qa get_kb requires: id");
+            const item = (await client.qaGetKbItem(input.id)) as Record<string, any>;
+            const body = String(item?.content || "").trim();
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `✓ KB item: ${item?.title || input.id} (${item?.kind || "kb"})\n\n${body}`,
+                },
+              ],
+              structuredContent: toStructured(item),
+            };
+          }
+          case "update_kb": {
+            if (!input.id) return errorResult("qa update_kb requires: id");
+            const item = (await client.qaUpdateKbItem(input.id, {
+              title: input.title,
+              content: input.content,
+              kind: input.kind,
+              tags: qaTags,
+              metadata: input.metadata,
+              project_id: normalizeUuid(input.project_id),
+            })) as Record<string, any>;
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `✓ KB item updated: ${item?.title || input.id}`,
+                },
+              ],
+              structuredContent: toStructured(item),
+            };
+          }
+          case "delete_kb": {
+            if (!input.id) return errorResult("qa delete_kb requires: id");
+            const response = await client.qaDeleteKbItem(input.id);
+            return {
+              content: [{ type: "text" as const, text: `✓ KB item deleted: ${input.id}` }],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "feedback": {
+            if (!input.answer_id) return errorResult("qa feedback requires: answer_id");
+            if (input.score === undefined || ![-1, 0, 1].includes(input.score)) {
+              return errorResult("qa feedback requires: score of -1, 0, or 1");
+            }
+            const response = (await client.qaFeedback({
+              answer_id: input.answer_id,
+              score: input.score,
+            })) as Record<string, any>;
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `✓ Feedback recorded (${input.score > 0 ? `+${input.score}` : input.score}) for answer ${input.answer_id}.`,
+                },
+              ],
+              structuredContent: toStructured(response),
+            };
+          }
+          case "explain":
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "Agent Q&A — ask ContextCode questions about your workspace/project when stuck. Use action=ask for a grounded answer, action=search to check for prior Q&A, action=save_kb to store guidance/guardrails/runbooks the agent should consult in future answers.",
+                },
+              ],
+            };
+        }
+      }
+    );
+
+    // -------------------------------------------------------------------------
     // memory - Consolidates memory event and node operations
     // -------------------------------------------------------------------------
     registerTool(
       "memory",
       {
         title: "Memory",
-        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap. Transcript actions: list_transcripts (list saved conversations), get_transcript (get full transcript by ID), search_transcripts (semantic search across conversations), search_archive (hosted archive tier; local npm returns unavailable), delete_transcript. Team actions (team plans only): team_tasks, team_todos, team_diagrams, team_docs.`,
+        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event (accepts event_id UUID or exact title; delete_all=true bulk-removes exact-title matches), list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node (accepts node_id UUID or exact title; delete_all=true bulk-removes exact-title matches), list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap. Transcript actions: list_transcripts (list saved conversations), get_transcript (get full transcript by ID), search_transcripts (semantic search across conversations), search_archive (hosted archive tier; local npm returns unavailable), delete_transcript. Team actions (team plans only): team_tasks, team_todos, team_diagrams, team_docs.`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -14686,6 +15248,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             )
             .optional(),
           new_content: z.string().optional().describe("For supersede_node: the new content to replace the node with"),
+          delete_all: z.boolean().optional().describe("For delete_node/delete_event with a non-UUID lookup: delete ALL exact-title matches in one call instead of erroring on ambiguity"),
           reason: z.string().optional().describe("For supersede_node: reason for the supersede"),
           // Provenance
           provenance: z
@@ -14967,10 +15530,48 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.event_id) {
               return errorResult("delete_event requires: event_id");
             }
-            const result = await client.deleteMemoryEvent(input.event_id);
+            const eventUuid = normalizeUuid(input.event_id);
+            if (eventUuid) {
+              const result = await client.deleteMemoryEvent(eventUuid);
+              return {
+                content: [{ type: "text" as const, text: formatContent(result) }],
+
+              };
+            }
+            if (!workspaceId) {
+              return errorResult("delete_event by title requires workspace scope. Run init first.");
+            }
+            const listed = (await client.listMemoryEvents({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              limit: 200,
+            })) as Record<string, any>;
+            const listedItems = Array.isArray(listed)
+              ? listed
+              : listed?.items || listed?.data?.items || [];
+            const matches = exactTitleMatches(listedItems, input.event_id);
+            if (matches.length === 0) {
+              return errorResult(`No events found with exact title "${input.event_id}".`);
+            }
+            if (matches.length > 1 && !input.delete_all) {
+              const listing = matches.slice(0, 5).map((m) => `- ${m.title} (id: ${m.id})`).join("\n");
+              return errorResult(
+                `Multiple events share the exact title "${input.event_id}":\n${listing}\nPass the event_id UUID to delete one, or pass delete_all=true to remove ALL exact-title matches in one call.`
+              );
+            }
+            const deletedEventIds: string[] = [];
+            for (const match of matches) {
+              await client.deleteMemoryEvent(match.id);
+              deletedEventIds.push(match.id);
+            }
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Deleted ${deletedEventIds.length} event(s) with title "${input.event_id}".`,
+                },
+              ],
+              structuredContent: { deleted_ids: deletedEventIds, count: deletedEventIds.length },
             };
           }
 
@@ -15126,10 +15727,48 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!input.node_id) {
               return errorResult("delete_node requires: node_id");
             }
-            const result = await client.deleteKnowledgeNode(input.node_id);
+            const nodeUuid = normalizeUuid(input.node_id);
+            if (nodeUuid) {
+              const result = await client.deleteKnowledgeNode(nodeUuid);
+              return {
+                content: [{ type: "text" as const, text: formatContent(result) }],
+
+              };
+            }
+            if (!workspaceId) {
+              return errorResult("delete_node by title requires workspace scope. Run init first.");
+            }
+            const listedNodes = (await client.listKnowledgeNodes({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              limit: 200,
+            })) as Record<string, any>;
+            const nodeItems = Array.isArray(listedNodes)
+              ? listedNodes
+              : listedNodes?.items || listedNodes?.data?.items || listedNodes?.nodes || [];
+            const nodeMatches = exactTitleMatches(nodeItems, input.node_id);
+            if (nodeMatches.length === 0) {
+              return errorResult(`No nodes found with exact title "${input.node_id}".`);
+            }
+            if (nodeMatches.length > 1 && !input.delete_all) {
+              const listing = nodeMatches.slice(0, 5).map((m) => `- ${m.title} (id: ${m.id})`).join("\n");
+              return errorResult(
+                `Multiple nodes share the exact title "${input.node_id}":\n${listing}\nPass the node_id UUID to delete one, or pass delete_all=true to remove ALL exact-title matches in one call.`
+              );
+            }
+            const deletedNodeIds: string[] = [];
+            for (const match of nodeMatches) {
+              await client.deleteKnowledgeNode(match.id);
+              deletedNodeIds.push(match.id);
+            }
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Deleted ${deletedNodeIds.length} node(s) with title "${input.node_id}".`,
+                },
+              ],
+              structuredContent: { deleted_ids: deletedNodeIds, count: deletedNodeIds.length },
             };
           }
 
@@ -16345,7 +16984,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "project",
       {
         title: "Project",
-        description: `Project management. Actions: list, get, create, update, delete, index (trigger indexing), overview, statistics, files, index_status, index_history (audit trail of indexed files), ingest_local (index local folder), team_projects (list all team projects - team plans only), recent_changes (git log/diff for recent file changes).`,
+        description: `Project management. Actions: list, get, create, update, delete, index (trigger indexing), purge (completely de-index a project — removes file indices, code chunks, and search vectors but keeps the project record), forget_local (stop this machine from re-binding a folder to its saved scope; server data untouched), remove_paths (de-index specific files by exact path — pass paths=[...]), merge (merge source_project_id into project_id), overview, statistics, files, index_status, index_history (audit trail of indexed files), ingest_local (index local folder), team_projects (list all team projects - team plans only), recent_changes (git log/diff for recent file changes).`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -16355,6 +16994,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "update",
               "delete",
               "index",
+              "purge",
+              "forget_local",
+              "remove_paths",
+              "merge",
               "overview",
               "statistics",
               "files",
@@ -16372,6 +17015,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           description: z.string().optional(),
           folder_path: z.string().optional(),
           generate_editor_rules: z.boolean().optional(),
+          paths: stringOrArray(z.string()).optional().describe("Exact indexed file paths (relative to the project root) to de-index (for remove_paths)"),
+          source_project_id: z.string().uuid().optional().describe("Source project ID to merge into project_id (for merge)"),
           // Ingest params
           path: z.string().optional().describe("Local path to ingest"),
           overwrite: z.boolean().optional(),
@@ -16920,6 +17565,97 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             } catch (error) {
               return errorResult(error instanceof Error ? error.message : String(error));
             }
+          }
+
+          case "purge": {
+            const targetProjectId = normalizeUuid(input.project_id) || resolveProjectId(undefined);
+            if (!targetProjectId) return errorResult("purge requires: project_id");
+            const result = await client.purgeProjectIndex(targetProjectId);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `✓ Project ${targetProjectId} de-indexed: file indices, code chunks, and search vectors removed. The project record is kept. Run project(action="ingest_local", path="<folder>") to re-index.`,
+                },
+              ],
+              structuredContent: toStructured(result),
+            };
+          }
+
+          case "remove_paths": {
+            const targetProjectId = normalizeUuid(input.project_id) || resolveProjectId(undefined);
+            if (!targetProjectId) return errorResult("remove_paths requires: project_id");
+            const removePaths = Array.isArray(input.paths)
+              ? input.paths
+              : input.paths
+                ? [input.paths]
+                : [];
+            if (removePaths.length === 0) {
+              return errorResult(
+                "remove_paths requires: paths (exact indexed file paths relative to the project root)"
+              );
+            }
+            const result = (await client.removeProjectFiles(
+              targetProjectId,
+              removePaths
+            )) as Record<string, any>;
+            const removedCount = Array.isArray(result?.removed)
+              ? result.removed.length
+              : (result?.removed ?? removePaths.length);
+            const notFoundCount = Array.isArray(result?.not_found)
+              ? result.not_found.length
+              : (result?.not_found ?? 0);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `✓ De-indexed ${removedCount} path(s) from project ${targetProjectId}${notFoundCount ? ` (${notFoundCount} not found)` : ""}.`,
+                },
+              ],
+              structuredContent: toStructured(result),
+            };
+          }
+
+          case "forget_local": {
+            const forgetPath = path.resolve(input.folder_path || folderPath || process.cwd());
+            const outcome = forgetLocalConfig(forgetPath);
+            const lines = [
+              outcome.local_config_removed
+                ? `✓ Removed local scope binding for ${forgetPath}.`
+                : `No local scope binding found for ${forgetPath} (nothing to remove).`,
+              "Server-side data is untouched.",
+            ];
+            if (outcome.matching_parent_pattern) {
+              lines.push(
+                `Note: parent-folder mapping "${outcome.matching_parent_pattern}" still covers this folder and will re-associate it on next init.`
+              );
+            }
+            lines.push('Run init(folder_path="...") to re-associate this folder.');
+            return {
+              content: [{ type: "text" as const, text: lines.join("\n") }],
+              structuredContent: toStructured(outcome),
+            };
+          }
+
+          case "merge": {
+            const targetProjectId = normalizeUuid(input.project_id) || resolveProjectId(undefined);
+            const sourceProjectId = normalizeUuid(input.source_project_id);
+            if (!targetProjectId || !sourceProjectId) {
+              return errorResult("merge requires: project_id (target) and source_project_id");
+            }
+            if (targetProjectId === sourceProjectId) {
+              return errorResult("merge requires two different projects");
+            }
+            const result = await client.mergeProject(targetProjectId, sourceProjectId);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `✓ Merged project ${sourceProjectId} into ${targetProjectId}.`,
+                },
+              ],
+              structuredContent: toStructured(result),
+            };
           }
 
           default:
@@ -18923,6 +19659,156 @@ Remote API actions: list_repos, get_repo, sync_repo, list_pulls, get_pull, get_p
     );
 
   applyToolSurfaceProfile(activeSurfaceProfile, false);
+
+    // -------------------------------------------------------------------------
+    // Per-action write surfaces for the memory domain. These dispatch to the
+    // consolidated memory handler so behavior (scope resolution, friendly
+    // errors) is identical to memory(action=...). The session-side flat tools
+    // (capture_plan, session_capture, session_capture_lesson, session_remember,
+    // memory_create_event) already exist as individual registrations above.
+    // -------------------------------------------------------------------------
+    {
+      const memoryOperation = operationsRegistry.get("memory");
+      if (memoryOperation) {
+        const dispatchMemory = (action: string) => async (input: any, extra?: MessageExtraInfo) =>
+          (memoryOperation.handler as (i: any, e?: MessageExtraInfo) => Promise<ToolTextResult>)(
+            { ...input, action },
+            extra
+          );
+        const scopeFields = {
+          workspace_id: z.string().uuid().optional(),
+          project_id: z.string().uuid().optional(),
+        };
+
+        registerTool(
+          "memory_create_doc",
+          {
+            title: "Create doc",
+            description:
+              'Create a durable doc (spec, runbook, ADR, RFC, etc.). Same handler as memory(action="create_doc").',
+            inputSchema: z.object({
+              ...scopeFields,
+              title: z.string().describe("Doc title"),
+              content: z.string().describe("Doc body (markdown)"),
+              doc_type: z.string().optional().describe("Doc type (spec, runbook, adr, rfc, general, ...)"),
+              tags: stringOrArray(z.string()).optional(),
+              metadata: z.record(z.any()).optional(),
+              is_personal: z.boolean().optional(),
+            }),
+          },
+          dispatchMemory("create_doc")
+        );
+
+        registerTool(
+          "memory_update_doc",
+          {
+            title: "Update doc",
+            description: 'Update an existing doc. Same handler as memory(action="update_doc").',
+            inputSchema: z.object({
+              ...scopeFields,
+              doc_id: z.string().describe("Doc ID or title lookup"),
+              title: z.string().optional(),
+              content: z.string().optional(),
+              doc_type: z.string().optional(),
+              tags: stringOrArray(z.string()).optional(),
+              metadata: z.record(z.any()).optional(),
+            }),
+          },
+          dispatchMemory("update_doc")
+        );
+
+        registerTool(
+          "memory_delete_doc",
+          {
+            title: "Delete doc",
+            description: 'Delete a doc. Same handler as memory(action="delete_doc").',
+            inputSchema: z.object({
+              ...scopeFields,
+              doc_id: z.string().describe("Doc ID or title lookup"),
+            }),
+          },
+          dispatchMemory("delete_doc")
+        );
+
+        registerTool(
+          "memory_create_task",
+          {
+            title: "Create task",
+            description:
+              'Create a project-tracking task, optionally linked to a plan step. Same handler as memory(action="create_task").',
+            inputSchema: z.object({
+              ...scopeFields,
+              title: z.string().describe("Task title"),
+              description: z
+                .string()
+                .optional()
+                .describe("Concrete work, acceptance criteria, verification"),
+              priority: z.string().optional(),
+              task_status: z.string().optional(),
+              plan_id: z.string().optional().describe("Plan ID when the task belongs to a plan"),
+              plan_step_id: z.string().optional().describe("Plan step ID (e.g. plan-step-1)"),
+              tags: stringOrArray(z.string()).optional(),
+              order: z.number().optional(),
+            }),
+          },
+          dispatchMemory("create_task")
+        );
+
+        registerTool(
+          "memory_update_task",
+          {
+            title: "Update task",
+            description:
+              'Update a task (status, fields, plan linkage). Same handler as memory(action="update_task").',
+            inputSchema: z.object({
+              ...scopeFields,
+              task_id: z.string().describe("Task ID or title lookup"),
+              title: z.string().optional(),
+              description: z.string().optional(),
+              priority: z.string().optional(),
+              task_status: z.string().optional(),
+              plan_id: z.string().optional(),
+              plan_step_id: z.string().optional(),
+              blocked_reason: z.string().optional(),
+              order: z.number().optional(),
+              code_refs: z.array(z.record(z.any())).optional(),
+            }),
+          },
+          dispatchMemory("update_task")
+        );
+
+        registerTool(
+          "memory_create_todo",
+          {
+            title: "Create todo",
+            description: 'Create a lightweight todo. Same handler as memory(action="create_todo").',
+            inputSchema: z.object({
+              ...scopeFields,
+              content: z.string().describe("Todo content"),
+              title: z.string().optional(),
+              todo_priority: z.string().optional().describe("low, medium, high, or urgent"),
+              due_at: z.string().optional().describe("Due date (ISO 8601)"),
+              is_personal: z.boolean().optional(),
+              tags: stringOrArray(z.string()).optional(),
+            }),
+          },
+          dispatchMemory("create_todo")
+        );
+
+        registerTool(
+          "memory_complete_todo",
+          {
+            title: "Complete todo",
+            description: 'Mark a todo complete. Same handler as memory(action="complete_todo").',
+            inputSchema: z.object({
+              ...scopeFields,
+              todo_id: z.string().describe("Todo ID or title lookup"),
+            }),
+          },
+          dispatchMemory("complete_todo")
+        );
+      }
+    }
 
   // =============================================================================
   // END CONSOLIDATED DOMAIN TOOLS

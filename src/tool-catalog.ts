@@ -35,6 +35,8 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: "delta", hint: "changes" },
       { name: "get_lessons", hint: "learn" },
       { name: "capture_lesson", hint: "mistake" },
+      { name: "update_lesson", hint: "edit" },
+      { name: "delete_lesson", hint: "rm" },
       { name: "get_user_context", hint: "prefs" },
       { name: "smart_search", hint: "deep-find" },
       // Plan actions
@@ -126,6 +128,17 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: "list_shares", hint: "shares" },
       { name: "revoke_share", hint: "revoke" },
       { name: "audit", hint: "access" },
+      { name: "delete", hint: "rm" },
+    ],
+  },
+  {
+    name: "QA",
+    tools: [
+      { name: "ask", hint: "grounded-answer" },
+      { name: "search", hint: "prior-qa" },
+      { name: "save_kb", hint: "store" },
+      { name: "list_kb", hint: "browse" },
+      { name: "feedback", hint: "rate" },
     ],
   },
   {
@@ -147,6 +160,10 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: "create", hint: "" },
       { name: "delete", hint: "" },
       { name: "index", hint: "scan-code" },
+      { name: "purge", hint: "deindex" },
+      { name: "remove_paths", hint: "rm-files" },
+      { name: "forget_local", hint: "unbind" },
+      { name: "merge", hint: "combine" },
       { name: "files", hint: "list-files" },
       { name: "overview", hint: "summary" },
       { name: "recent_changes", hint: "git-log" },

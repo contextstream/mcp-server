@@ -9,9 +9,31 @@
  * self-heals implicit ("soft") drift, and recovers once from stale-scope
  * errors.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { HttpError } from "./http.js";
 import { getAuthOverride } from "./auth-context.js";
 import { resolveWorkspace } from "./workspace-config.js";
+
+// Scope-resolution notes are recorded through an async-local channel so tool
+// handlers don't have to thread them through every return site; the outer
+// tool wrapper captures and prepends them to the rendered result.
+const scopeNoteContext = new AsyncLocalStorage<{ note?: string }>();
+
+/** Run fn while capturing any scope-resolution notes recorded within. */
+export async function runWithScopeNoteCapture<T>(
+  fn: () => Promise<T> | T
+): Promise<{ result: T; note?: string }> {
+  const holder: { note?: string } = {};
+  const result = await scopeNoteContext.run(holder, async () => fn());
+  return { result, note: holder.note };
+}
+
+function recordScopeNote(note?: string): void {
+  if (!note) return;
+  const holder = scopeNoteContext.getStore();
+  if (!holder) return;
+  holder.note = holder.note ? `${holder.note} ${note}` : note;
+}
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -222,6 +244,17 @@ export async function resolveWriteScope(
   input: WriteScopeInput,
   deps?: ScopeResolutionDeps
 ): Promise<ResolvedWriteScope> {
+  const scope = await resolveWriteScopeInner(client, session, input, deps);
+  recordScopeNote(scope.note);
+  return scope;
+}
+
+async function resolveWriteScopeInner(
+  client: ScopeClient,
+  session: ScopeSession | null | undefined,
+  input: WriteScopeInput,
+  deps?: ScopeResolutionDeps
+): Promise<ResolvedWriteScope> {
   const explicitWorkspace = normalizeScopeUuid(input.workspaceId);
   const explicitProject = normalizeScopeUuid(input.projectId);
   const ctx = session?.getContext() ?? null;
@@ -398,12 +431,11 @@ export async function recoverWriteScopeAfterProjectError(
 }
 
 /** Prepend a scope note (if any) to a tool result's first text block. */
-export function prependScopeNote<
-  T extends { content: Array<{ type: "text"; text: string }> },
->(result: T, note: string | undefined): T {
-  if (!note) return result;
-  const first = result.content?.[0];
-  if (first && first.type === "text") {
+export function prependScopeNote<T>(result: T, note: string | undefined): T {
+  if (!note || !result || typeof result !== "object") return result;
+  const content = (result as { content?: Array<{ type?: string; text?: string }> }).content;
+  const first = Array.isArray(content) ? content[0] : undefined;
+  if (first && first.type === "text" && typeof first.text === "string") {
     first.text = `[SCOPE] ${note}\n${first.text}`;
   }
   return result;

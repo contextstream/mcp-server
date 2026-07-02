@@ -32,6 +32,14 @@ import {
 } from "./hooks-config.js";
 import { HttpError } from "./http.js";
 import { forgetLocalConfig, resolveWorkspace } from "./workspace-config.js";
+import {
+  isScopeError,
+  prependScopeNote,
+  recoverWriteScopeAfterProjectError,
+  resolveProjectScopeId,
+  resolveWriteScope,
+  runWithScopeNoteCapture,
+} from "./scope.js";
 import { trackToolTokenSavings, type TokenSavingsToolType } from "./token-savings.js";
 import {
   getSessionInitTip,
@@ -2652,6 +2660,54 @@ const VALID_DOC_TYPES = [
   "general",
 ] as const;
 
+// Actions whose writes resolve scope centrally (drift healing) and are
+// eligible for a one-shot retry after a stale-scope error.
+const MEMORY_WRITE_SCOPE_ACTIONS = new Set([
+  "create_event",
+  "create_node",
+  "create_task",
+  "create_todo",
+  "create_diagram",
+  "create_doc",
+  "create_roadmap",
+  "import_batch",
+]);
+const SESSION_WRITE_SCOPE_ACTIONS = new Set([
+  "capture",
+  "capture_lesson",
+  "capture_plan",
+  "remember",
+]);
+const SCOPE_RETRY_FLAT_TOOLS = new Set([
+  "capture_plan",
+  "session_capture",
+  "session_capture_lesson",
+  "session_remember",
+  "memory_create_doc",
+  "memory_update_doc",
+  "memory_delete_doc",
+  "memory_create_task",
+  "memory_update_task",
+  "memory_create_todo",
+  "memory_complete_todo",
+  "memory_create_event",
+]);
+const SCOPE_RETRY_CONSOLIDATED_ACTIONS = new Set([
+  ...MEMORY_WRITE_SCOPE_ACTIONS,
+  ...SESSION_WRITE_SCOPE_ACTIONS,
+  "decisions",
+  "create",
+  "list",
+]);
+
+function scopeRetryEligible(toolName: string, action: unknown): boolean {
+  if (SCOPE_RETRY_FLAT_TOOLS.has(toolName)) return true;
+  if (toolName === "memory" || toolName === "session" || toolName === "entity") {
+    return typeof action === "string" && SCOPE_RETRY_CONSOLIDATED_ACTIONS.has(action);
+  }
+  return false;
+}
+
 const CAPSULE_ACTIONS = [
   "open",
   "get",
@@ -4298,9 +4354,41 @@ export function registerTools(
         const integrationGated = await gateIfIntegrationTool(name);
         if (integrationGated) return integrationGated;
 
-        const result = await handler(input, extra);
-        return maybeStripStructuredContent(result);
+        const { result, note } = await runWithScopeNoteCapture(() => handler(input, extra));
+        return maybeStripStructuredContent(prependScopeNote(result, note));
       } catch (error: any) {
+        // One-shot scope recovery for write-capable calls: heal a stale
+        // workspace/project binding, then retry the handler once. The retried
+        // call re-resolves scope from the corrected session context.
+        if (
+          sessionManager &&
+          isScopeError(error) &&
+          scopeRetryEligible(name, (input as Record<string, unknown> | undefined)?.action)
+        ) {
+          const ctx = sessionManager.getContext();
+          const attempted = {
+            workspaceId:
+              typeof ctx?.workspace_id === "string" ? (ctx.workspace_id as string) : undefined,
+            projectId:
+              typeof ctx?.project_id === "string" ? (ctx.project_id as string) : undefined,
+            recovered: false,
+          };
+          try {
+            const recoveredScope = await recoverWriteScopeAfterProjectError(
+              client,
+              sessionManager,
+              attempted,
+              error
+            );
+            if (recoveredScope) {
+              const { result, note } = await runWithScopeNoteCapture(() => handler(input, extra));
+              const combined = [recoveredScope.note, note].filter(Boolean).join(" ");
+              return maybeStripStructuredContent(prependScopeNote(result, combined || undefined));
+            }
+          } catch {
+            // Retry failed — fall through and render the original error.
+          }
+        }
         const rawMessage = error?.message || String(error);
         const errorMessage =
           rawMessage.length > 500 ? `${rawMessage.slice(0, 500)}…` : rawMessage;
@@ -13421,6 +13509,20 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         if (resolvedSuggestionId.error) return errorResult(resolvedSuggestionId.error);
         if (resolvedSuggestionId.value) input.suggestion_id = resolvedSuggestionId.value;
 
+        // Capture-style writes resolve a consistent scope centrally (project
+        // names accepted, implicit drift healed, explicit-stale errors).
+        if (SESSION_WRITE_SCOPE_ACTIONS.has(input.action)) {
+          const projectLookup = await resolveProjectScopeId(client, workspaceId, input.project_id);
+          if (projectLookup.error) return errorResult(projectLookup.error);
+          const writeScope = await resolveWriteScope(client, sessionManager ?? null, {
+            workspaceId: input.workspace_id,
+            projectId: projectLookup.id,
+          });
+          if (writeScope.error) return errorResult(writeScope.error);
+          workspaceId = writeScope.workspaceId;
+          projectId = writeScope.projectId;
+        }
+
         switch (input.action) {
           case "capture": {
             if (!input.event_type || !input.title || !input.content) {
@@ -15472,6 +15574,22 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         );
         if (resolvedMemoryTranscriptId.error) return errorResult(resolvedMemoryTranscriptId.error);
         if (resolvedMemoryTranscriptId.value) input.transcript_id = resolvedMemoryTranscriptId.value;
+
+        // Write actions resolve a consistent scope centrally: project names
+        // are accepted in place of UUIDs, implicit workspace/project drift is
+        // healed before the first attempt, and an explicitly requested but
+        // inaccessible project is a hard error.
+        if (MEMORY_WRITE_SCOPE_ACTIONS.has(input.action)) {
+          const projectLookup = await resolveProjectScopeId(client, workspaceId, input.project_id);
+          if (projectLookup.error) return errorResult(projectLookup.error);
+          const writeScope = await resolveWriteScope(client, sessionManager ?? null, {
+            workspaceId: input.workspace_id,
+            projectId: projectLookup.id,
+          });
+          if (writeScope.error) return errorResult(writeScope.error);
+          workspaceId = writeScope.workspaceId;
+          projectId = writeScope.projectId;
+        }
 
         switch (input.action) {
           case "create_event": {

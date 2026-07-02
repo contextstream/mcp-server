@@ -1330,6 +1330,10 @@ export interface IndexedProjectInfo {
   indexed_at: string;
   project_id?: string;
   project_name?: string;
+  /** Git HEAD at local-ingest time; drift from it marks the index stale. */
+  git_head?: string;
+  /** Normalized git remote identity; folder binding requires a match. */
+  git_remote?: string;
 }
 
 export interface IndexStatusFile {
@@ -1365,15 +1369,26 @@ export async function writeIndexStatus(status: IndexStatusFile): Promise<void> {
  */
 export async function markProjectIndexed(
   projectPath: string,
-  options?: { project_id?: string; project_name?: string }
+  options?: {
+    project_id?: string;
+    project_name?: string;
+    git_head?: string;
+    git_remote?: string;
+  }
 ): Promise<void> {
   const status = await readIndexStatus();
   const resolvedPath = path.resolve(projectPath);
 
+  // Fields omitted by this caller keep their previously recorded values, so a
+  // marking that carries no git identity can never wipe the identity the
+  // local-ingest path recorded.
+  const previous = status.projects[resolvedPath];
   status.projects[resolvedPath] = {
     indexed_at: new Date().toISOString(),
-    project_id: options?.project_id,
-    project_name: options?.project_name,
+    project_id: options?.project_id ?? previous?.project_id,
+    project_name: options?.project_name ?? previous?.project_name,
+    git_head: options?.git_head ?? previous?.git_head,
+    git_remote: options?.git_remote ?? previous?.git_remote,
   };
 
   await writeIndexStatus(status);

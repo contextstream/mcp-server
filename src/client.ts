@@ -23,6 +23,7 @@ import {
 } from "./workspace-config.js";
 import { globalCache, CacheKeys, CacheTTL } from "./cache.js";
 import { markProjectIndexed, clearProjectIndex, readIndexStatus } from "./hooks-config.js";
+import { readGitHead, readGitRemoteIdentity } from "./project-index-utils.js";
 import { VERSION, getUpdateNotice, getVersionWarning, getVersionInstructions, type VersionNotice } from "./version.js";
 
 const uuidSchema = z.string().uuid();
@@ -521,6 +522,7 @@ export class IndexKeeper {
   private lastIncremental = 0;
   private lastAging = 0;
   private lastStale = 0;
+  private lastDrift = 0;
   private client: ContextStreamClient | null = null;
 
   attach(client: ContextStreamClient) {
@@ -536,6 +538,7 @@ export class IndexKeeper {
     try {
       await this.checkIncremental(projectId, folderPath);
       await this.checkAgingRefresh(projectId, folderPath);
+      await this.checkGitHeadDrift(projectId, folderPath);
     } catch { /* non-fatal */ }
   }
 
@@ -565,6 +568,31 @@ export class IndexKeeper {
       });
     } catch (e) {
       console.error(`[ContextStream] IndexKeeper aging refresh failed:`, e);
+    }
+  }
+
+  /**
+   * Detect commits made outside this session: when the folder's git HEAD has
+   * moved past the HEAD recorded at local-ingest time, start a background
+   * re-ingest and refresh the recorded HEAD so the check converges.
+   */
+  private async checkGitHeadDrift(projectId: string, folderPath: string): Promise<void> {
+    if (!this.shouldFire(this.lastDrift, INDEX_KEEPER_STALE_INTERVAL_MS)) return;
+    this.lastDrift = Date.now();
+    if (!this.client) return;
+    try {
+      const status = await readIndexStatus();
+      const entry = status.projects?.[path.resolve(folderPath)];
+      if (!entry?.git_head) return;
+      const currentHead = await readGitHead(folderPath);
+      if (!currentHead || currentHead === entry.git_head) return;
+      console.error(
+        `[ContextStream] IndexKeeper: git HEAD moved since last ingest for ${folderPath}; starting re-index`
+      );
+      await this.client.ingestLocal({ projectId, rootPath: folderPath });
+      await markProjectIndexed(folderPath, { project_id: projectId, git_head: currentHead });
+    } catch {
+      /* non-fatal */
     }
   }
 
@@ -2866,6 +2894,7 @@ export class ContextStreamClient {
     const resolvedFolder = path.resolve(folderPath);
 
     let bestMatch: { projectId: string; matchLen: number } | null = null;
+    let currentRemotePromise: Promise<string | null> | undefined;
     for (const [projectPath, info] of Object.entries(projects)) {
       const resolvedProjectPath = path.resolve(projectPath);
       if (
@@ -2880,6 +2909,15 @@ export class ContextStreamClient {
 
       if (ContextStreamClient.isStaleIndexEntry(info?.indexed_at)) {
         continue;
+      }
+
+      // Twin/repair binding requires matching git-remote identity: a repo
+      // that merely shares a name or path leaf must never bind to this entry.
+      if (info?.git_remote) {
+        currentRemotePromise ??= readGitRemoteIdentity(resolvedFolder);
+        if ((await currentRemotePromise) !== info.git_remote) {
+          continue;
+        }
       }
 
       const projectId =
@@ -3472,7 +3510,17 @@ export class ContextStreamClient {
               // Pre-write index status to prevent race conditions
               const projectIdCopy = projectId;
               const rootPathCopy = rootPath;
-              markProjectIndexed(rootPathCopy, { project_id: projectIdCopy }).catch(() => {});
+              void (async () => {
+                const [gitHead, gitRemote] = await Promise.all([
+                  readGitHead(rootPathCopy),
+                  readGitRemoteIdentity(rootPathCopy),
+                ]);
+                await markProjectIndexed(rootPathCopy, {
+                  project_id: projectIdCopy,
+                  git_head: gitHead ?? undefined,
+                  git_remote: gitRemote ?? undefined,
+                });
+              })().catch(() => {});
 
               // Fire-and-forget: start indexing in background (deferred to next event loop tick)
               setImmediate(async () => {

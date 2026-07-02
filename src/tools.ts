@@ -61,6 +61,8 @@ import {
   extractPendingFilePaths,
   extractIndexTimestamp,
   indexHistoryEntryCount,
+  readGitHead,
+  readGitRemoteIdentity,
 } from "./project-index-utils.js";
 import { resolveTodoCompletionUpdate } from "./todo-utils.js";
 import { globalHotPathStore } from "./hot-paths.js";
@@ -5425,6 +5427,7 @@ export function registerTools(
     const projects = status.projects ?? {};
     const resolvedFolder = path.resolve(folderPath);
     let bestMatch: { projectId: string; matchLen: number } | undefined;
+    let currentRemotePromise: Promise<string | null> | undefined;
 
     for (const [projectPath, info] of Object.entries(projects)) {
       const resolvedProjectPath = path.resolve(projectPath);
@@ -5434,6 +5437,13 @@ export function registerTools(
         resolvedProjectPath.startsWith(`${resolvedFolder}${path.sep}`);
       if (!matches) continue;
       if (!info?.indexed_at) continue;
+
+      // Twin/repair binding requires matching git-remote identity: a repo
+      // that merely shares a name or path leaf must never bind to this entry.
+      if (info?.git_remote) {
+        currentRemotePromise ??= readGitRemoteIdentity(resolvedFolder);
+        if ((await currentRemotePromise) !== info.git_remote) continue;
+      }
 
       const indexedAt = new Date(info.indexed_at);
       if (!Number.isNaN(indexedAt.getTime())) {
@@ -5528,7 +5538,17 @@ export function registerTools(
     options: { preflight?: boolean } = {}
   ): void {
     // Pre-write index status to prevent race conditions
-    markProjectIndexed(resolvedPath, { project_id: projectId }).catch(() => {});
+    void (async () => {
+      const [gitHead, gitRemote] = await Promise.all([
+        readGitHead(resolvedPath),
+        readGitRemoteIdentity(resolvedPath),
+      ]);
+      await markProjectIndexed(resolvedPath, {
+        project_id: projectId,
+        git_head: gitHead ?? undefined,
+        git_remote: gitRemote ?? undefined,
+      });
+    })().catch(() => {});
 
     (async () => {
       try {
@@ -13014,6 +13034,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         const roundTripMs = Date.now() - startTime;
         let { results, total } = extractSearchEnvelope(selected.result);
         const scopeInvalid = isScopeInvalidResult(selected.result);
+        if (scopeInvalid) {
+          modeFallbackNote = appendNote(
+            modeFallbackNote,
+            '[SCOPE_UNRELIABLE] The backend flagged this search\'s workspace/project scope as invalid — results may come from the wrong project. Run init(folder_path="...") to re-bind, or pass workspace_id/project_id explicitly.'
+          );
+        }
 
         for (const r of results) {
           if (r.file_path) {

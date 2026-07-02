@@ -63,6 +63,7 @@ import {
   indexHistoryEntryCount,
   readGitHead,
   readGitRemoteIdentity,
+  countDirtyFilesSince,
 } from "./project-index-utils.js";
 import { resolveTodoCompletionUpdate } from "./todo-utils.js";
 import { globalHotPathStore } from "./hot-paths.js";
@@ -2701,6 +2702,24 @@ const SCOPE_RETRY_CONSOLIDATED_ACTIONS = new Set([
   "create",
   "list",
 ]);
+
+// Identifier-shaped queries are code intent even as a lone token: a symbol
+// lookup like `search_first_redirect_decision` must not blend memory/media
+// hits into workspace-scoped results. Conservative — prose and plain memory
+// words (e.g. "decisions") are unaffected.
+export function queryHasCodeIntent(query: string): boolean {
+  const trimmed = query.trim();
+  if (!trimmed) return false;
+  const tokens = trimmed.split(/\s+/);
+  const tokenHasIdentifierShape = (token: string): boolean =>
+    /^[a-z0-9]+(?:_[a-z0-9]+)+$/i.test(token) || // snake_case
+    /^[a-z]+(?:[A-Z][a-z0-9]*)+$/.test(token) || // camelCase
+    /^(?:[A-Z][a-z0-9]+){2,}$/.test(token) || // PascalCase
+    token.includes("::") ||
+    /^[\w$]+\.[\w$.]+$/.test(token); // dotted member access
+  if (tokens.length === 1) return tokenHasIdentifierShape(tokens[0]);
+  return tokens.some(tokenHasIdentifierShape);
+}
 
 // A degenerate step/task title turns prose into unsearchable junk tasks —
 // reject at capture time with a per-title reason.
@@ -6894,6 +6913,7 @@ Access: Free`,
     content_max_chars?: number;
     context_lines?: number;
     exact_match_boost?: number;
+    include_memory?: boolean;
     output_format?: "full" | "paths" | "minimal" | "count";
     hot_paths_hint?: {
       entries: Array<{ path: string; score: number; source: "history" | "active" }>;
@@ -6920,15 +6940,25 @@ Access: Free`,
       typeof input.exact_match_boost === "number" && input.exact_match_boost >= 1
         ? Math.min(input.exact_match_boost, 10)
         : undefined;
+    const resolvedProjectId = resolveProjectId(input.project_id);
+    // Identifier-shaped queries suppress memory/media blending on
+    // workspace-scoped searches unless the caller opts in explicitly.
+    const includeMemory =
+      typeof input.include_memory === "boolean"
+        ? input.include_memory
+        : !resolvedProjectId && queryHasCodeIntent(input.query)
+          ? false
+          : undefined;
     return {
       query: input.query,
       workspace_id: resolveWorkspaceId(input.workspace_id),
-      project_id: resolveProjectId(input.project_id),
+      project_id: resolvedProjectId,
       limit,
       offset,
       content_max_chars: contentMax,
       context_lines: contextLines,
       exact_match_boost: exactMatchBoost,
+      include_memory: includeMemory,
       output_format: input.output_format,
       hot_paths_hint: input.hot_paths_hint,
     };
@@ -12449,6 +12479,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           project_id: z.string().uuid().optional(),
           limit: z.number().optional().describe("Max results to return (default: 3)"),
           offset: z.number().optional().describe("Offset for pagination"),
+          include_memory: z.boolean().optional().describe("Include memory/doc matches in search results (defaults to false for project-scoped and identifier-shaped searches)"),
           content_max_chars: z
             .number()
             .optional()
@@ -13062,6 +13093,49 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
         }
 
+        // Freshness guard: prune hits whose local file was deleted since the
+        // index, and surface a non-silent advisory when tracked files changed
+        // after the last index (IndexKeeper's incremental pass re-ingests
+        // them in the background).
+        let indexHealthNote: string | undefined;
+        if (folderPath) {
+          const beforePrune = results.length;
+          results = results.filter((r: any) => {
+            if (typeof r?.file_path !== "string" || !r.file_path) return true;
+            if (path.isAbsolute(r.file_path)) return true;
+            try {
+              return fs.existsSync(path.join(folderPath, r.file_path));
+            } catch {
+              return true;
+            }
+          });
+          if (results.length < beforePrune) {
+            indexHealthNote = appendNote(
+              indexHealthNote,
+              `Pruned ${beforePrune - results.length} hit(s) whose local file no longer exists.`
+            );
+          }
+          try {
+            const indexStatusFile = await readIndexStatus();
+            const indexEntry = indexStatusFile.projects?.[path.resolve(folderPath)];
+            if (indexEntry?.indexed_at) {
+              const indexedAtMs = Date.parse(indexEntry.indexed_at);
+              const dirtyCount = await countDirtyFilesSince(
+                folderPath,
+                Number.isFinite(indexedAtMs) ? indexedAtMs : 0
+              );
+              if (dirtyCount > 0) {
+                indexHealthNote = appendNote(
+                  indexHealthNote,
+                  `[INDEX_HEALTH] ${dirtyCount} file(s) changed since last index — background refresh runs automatically; retry search if a just-edited symbol is missing.`
+                );
+              }
+            }
+          } catch {
+            // Best-effort advisory only.
+          }
+        }
+
         if (results.length === 0 && !scopeInvalid) {
           const escalationModes: Array<typeof selected.executedMode> = (() => {
             switch (selected.executedMode) {
@@ -13150,6 +13224,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         }
         if (modeFallbackNote && !(CONCISE_TOOL_TEXT && results.length > 0)) {
           lines.push(modeFallbackNote);
+        }
+        if (indexHealthNote) {
+          lines.push(indexHealthNote);
         }
         if (hotPathsHint?.entries?.length && !CONCISE_TOOL_TEXT) {
           lines.push(
@@ -13245,6 +13322,31 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             fallback_behavior: "baseline ranking only",
           };
         }
+        // Honest provenance when the server recovered an empty NL search via
+        // fast-tier query rewrites. Older backends omit the fields and
+        // behavior is unchanged.
+        const rawSearchEnvelope = ((selected.result as any)?.data ??
+          selected.result ??
+          {}) as Record<string, any>;
+        if (rawSearchEnvelope.recovered_via_rewrite === true) {
+          const rewrittenQueries = Array.isArray(rawSearchEnvelope.rewritten_queries)
+            ? rawSearchEnvelope.rewritten_queries.filter(
+                (q: unknown): q is string => typeof q === "string"
+              )
+            : [];
+          const rewriteList = rewrittenQueries
+            .slice(0, 3)
+            .map((q) => `"${q}"`)
+            .join(", ");
+          lines.push(
+            `0 direct hits — recovered via server-side rewrites${rewriteList ? `: ${rewriteList}` : ""}.`
+          );
+          (structuredData as any).rewrite_recovery = {
+            recovered_via_rewrite: true,
+            rewritten_queries: rewrittenQueries,
+          };
+        }
+
         const resultWithMeta = {
           ...(selected.result as any),
           data: structuredData,

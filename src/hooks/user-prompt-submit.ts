@@ -55,14 +55,13 @@ const FULL_REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
    - On subsequent messages, default to context() first. Narrow bypass: immediate read-only ContextStream calls when context is fresh and no state-changing tool has run.
 
 2. FOR CODE SEARCH: Check index status, then search appropriately
-   ⚠️ BEFORE searching: mcp__contextstream__project(action="index_status")
-   ✅ IF indexed & fresh: Use mcp__contextstream__search(mode="auto", query="...") BEFORE Glob/Grep/Read/Explore/Task/EnterPlanMode
-   ✅ IF NOT indexed OR stale: wait for background refresh up to ~20s, retry mcp__contextstream__search(mode="auto", query="..."), then allow local tools only after the grace window
-   ✅ IF search still returns 0 results after retry/window: fallback to local tools (Glob/Grep/Read)
+   ✅ Use mcp__contextstream__search(mode="auto", query="...") BEFORE Glob/Grep/Read/Explore/Task/EnterPlanMode
+   ✅ Run search even while the index is still building — keyword hits return immediately, results fill in as you work
+   ✅ IF search itself returns 0 results/errors: retry once, THEN fall back to local tools (Glob/Grep/Read)
 
 3. WHEN LOCAL TOOLS (Glob/Grep/Read) ARE OK:
-   ✅ Stale/not-indexed grace window has elapsed (~20s default, configurable)
    ✅ ContextStream search still returns 0 results or errors after retry
+   ✅ The file was just written this turn (known-new, not yet indexed)
    ✅ User explicitly requests local tools
 
 4. FOR PLANS & TASKS: Use ContextStream, not file-based plans
@@ -663,8 +662,8 @@ Returns: \`indexed\` (true/false), \`last_indexed_at\`, \`file_count\`
 → Use \`search(mode="auto", query="...")\`
 
 **IF indexed=false OR last_indexed_at is stale (>7 days):**
-→ Wait up to ~20s for background refresh, retry \`search(mode="auto", query="...")\`
-→ After grace window: local tools are allowed if search still misses
+→ Run \`search(mode="auto", query="...")\` anyway — keyword hits return immediately while indexing builds
+→ Local tools only if search itself returns 0 results/errors on a retry
 
 **IF search still returns 0 results or errors after retry/window:**
 → Fallback to local tools (Glob/Grep/Read)

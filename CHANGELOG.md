@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.79
+
+**Rust MCP parity pass 4: metadata/UX polish cluster (v0.3.11–v0.5.27).**
+
+### Grounding Quality (v0.3.29 + v0.5.27)
+
+- Ground-bundle items never render as bare "Untitled": display titles fall back from title → summary → first meaningful content line → a typed id.
+- Operational hook telemetry (`operation`/`command_execution`/`file_operation`) older than 7 days — unknown age counts as stale — is dropped from the ground bundle so months-old telemetry cannot bury real prior work. Hook captures already posted `event_type=operation` (verified, no change needed).
+
+### Model Awareness (v0.3.44 + v0.3.49 subsets)
+
+- When the MCP client surfaces its model at initialize, API requests carry `X-ContextStream-Model` so server-side events attribute to the real model; the header is omitted when the model is unknown (existing behavior).
+- Known 1M-window models raise the context-pressure threshold to ~650k instead of the conservative 70k default; unknown/older models keep the default exactly.
+
+### Tier Gating (v0.3.38)
+
+- Tier-gated tools return a structured `plan_restricted` block (current plan, required tier, upgrade URL) alongside the text nudge, so clients can render an upgrade prompt without parsing error text.
+
+### Tool-Description Teaching (v0.3.11 + v0.3.13)
+
+- The memory tool description now teaches that docs/runbooks/specs/decisions live in memory (never on disk) and routes tickets/bugs/incidents/releases to the `entity` tool.
+
+### Verified Without Change
+
+- Full-body rendering in `get_task`/`get_event`/`get_todo`/`get_transcript` (v0.3.28): the TS renderer never truncated.
+- Hook telemetry classification as `operation` (v0.5.27 hook half): already the default in the shared hook capture helper.
+
+### Deferred
+
+- v0.3.27 icon metadata (niche MCP client support), v0.3.40 freshness-aware grounding (server-rendered), v0.3.69/70 media summary polish.
+
 ## 0.4.78
 
 **Rust MCP parity pass 3: search-quality cluster (v0.3.45–v0.5.26).**

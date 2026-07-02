@@ -8286,7 +8286,7 @@ This does semantic search on the first message. You only need context on subsequ
             "Current workspace/project folder path (absolute). Use this when IDE roots are not available."
           ),
         workspace_id: z.string().uuid().optional().describe("Workspace to initialize context for"),
-        project_id: z.string().uuid().optional().describe("Project to initialize context for"),
+        project_id: z.string().optional().describe("Project to initialize context for (UUID, or a project name to look up)"),
         session_id: z
           .string()
           .optional()
@@ -8350,12 +8350,50 @@ This does semantic search on the first message. You only need context on subsequ
         ideRoots = [input.folder_path];
       }
 
+      // A non-UUID project_id is treated as a project name, matching the
+      // scope-resolution behavior elsewhere.
+      if (input.project_id && !normalizeUuid(input.project_id)) {
+        const projectLookup = await resolveProjectScopeId(
+          client,
+          resolveWorkspaceId(input.workspace_id),
+          input.project_id
+        );
+        if (projectLookup.error) return errorResult(projectLookup.error);
+        input.project_id = projectLookup.id;
+      }
+
       // Pass detected client name for analytics tracking
       const clientName = getDetectedClientName();
-      const result = (await client.initSession(
-        { ...input, client_name: clientName || undefined },
-        ideRoots
-      )) as Record<string, unknown>;
+      // An explicit folder_path expresses "bind to this folder": suppress any
+      // header-injected scope so folder resolution can actually run. If folder
+      // resolution then yields no workspace (typical through the HTTP gateway,
+      // where the server cannot read the caller's local config), restore the
+      // inherited header scope as the fallback.
+      const inheritedOverride = getAuthOverride();
+      const suppressHeaderScope = Boolean(
+        input.folder_path && (inheritedOverride?.workspaceId || inheritedOverride?.projectId)
+      );
+      const runInit = () =>
+        client.initSession(
+          { ...input, client_name: clientName || undefined },
+          ideRoots
+        ) as Promise<Record<string, unknown>>;
+      let result: Record<string, unknown>;
+      if (suppressHeaderScope) {
+        result = await runWithAuthOverride(
+          { ...inheritedOverride, workspaceId: undefined, projectId: undefined },
+          runInit
+        );
+        if (typeof result.workspace_id !== "string" || !result.workspace_id) {
+          result = await runInit();
+          if (typeof result.workspace_id === "string" && result.workspace_id) {
+            (result as any).scope_note =
+              "Folder resolution found no workspace; restored the request's inherited header scope.";
+          }
+        }
+      } else {
+        result = await runInit();
+      }
 
       // Add compact tool reference to help AI know available tools
       result.tools_hint = getCoreToolsHint();

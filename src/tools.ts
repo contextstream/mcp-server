@@ -2700,6 +2700,37 @@ const SCOPE_RETRY_CONSOLIDATED_ACTIONS = new Set([
   "list",
 ]);
 
+// A degenerate step/task title turns prose into unsearchable junk tasks —
+// reject at capture time with a per-title reason.
+export function degenerateTitleReason(title: unknown): string | null {
+  if (typeof title !== "string") return "missing";
+  const trimmed = title.trim();
+  if (!trimmed) return "empty";
+  if (/^-+$/.test(trimmed)) return "placeholder dashes";
+  if (trimmed.includes("\n")) return "multi-line";
+  if (trimmed.length > 200) return `too long (${trimmed.length} chars, max 200)`;
+  if (!trimmed.includes(" ") && /^[\w@.\\/-]+\.[a-z0-9]{1,8}$/i.test(trimmed)) {
+    return "bare file path";
+  }
+  if (/^(\.{0,2}\/)?[\w.-]+(\/[\w.-]+)+\/?$/.test(trimmed)) return "bare file path";
+  return null;
+}
+
+export function collectDegenerateStepTitles(steps: unknown): string | null {
+  if (!Array.isArray(steps)) return null;
+  const issues: string[] = [];
+  steps.forEach((step, index) => {
+    const title = (step as Record<string, unknown> | null)?.title;
+    const reason = degenerateTitleReason(title);
+    if (reason) {
+      const shown = typeof title === "string" ? title.slice(0, 60) : String(title);
+      issues.push(`- step ${index + 1}: ${reason} ("${shown}")`);
+    }
+  });
+  if (issues.length === 0) return null;
+  return `capture_plan rejected: ${issues.length} step title(s) are not usable as task titles:\n${issues.join("\n")}\nGive each step a short, action-oriented title; put details in the step description.`;
+}
+
 function scopeRetryEligible(toolName: string, action: unknown): boolean {
   if (SCOPE_RETRY_FLAT_TOOLS.has(toolName)) return true;
   if (toolName === "memory" || toolName === "session" || toolName === "entity") {
@@ -10457,6 +10488,13 @@ After compression, the AI can use session_recall to retrieve this context in fut
       }),
     },
     async (input) => {
+      const degenerateSteps = collectDegenerateStepTitles(input.steps);
+      if (degenerateSteps) {
+        return {
+          content: [{ type: "text" as const, text: degenerateSteps }],
+          isError: true,
+        };
+      }
       const result = await client.createPlan(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
@@ -13204,6 +13242,109 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       }
     );
 
+    // Resolve a plan reference for get_plan/update_plan. A UUID is used
+    // directly; other text matches against plan titles in scope; with no
+    // reference at all, the latest actionable plan is picked, preferring
+    // substantive plans (progress, active status, or linked tasks) over
+    // stray 0% drafts. A miss returns the in-scope listing — never a
+    // dead-end.
+    async function resolvePlanForAction(input: {
+      plan_id?: string;
+      query?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<{ planId: string; note?: string } | { listing: string } | { error: string }> {
+      const direct = normalizeUuid(input.plan_id);
+      if (direct) return { planId: direct };
+
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return {
+          error: "Plan lookup requires workspace scope. Run init first, or pass plan_id as a UUID.",
+        };
+      }
+      const projectId = normalizeUuid(input.project_id) || resolveProjectId(undefined);
+      let plans: Array<Record<string, any>> = [];
+      try {
+        const listed = (await client.listPlans({
+          workspace_id: workspaceId,
+          project_id: projectId,
+          limit: 50,
+        })) as any;
+        const collected = Array.isArray(listed)
+          ? listed
+          : listed?.items || listed?.plans || listed?.data?.items || listed?.data?.plans || listed?.data;
+        plans = Array.isArray(collected) ? collected : [];
+      } catch (error) {
+        return {
+          error: `Could not list plans for lookup: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+
+      const lookupRaw = (input.plan_id || input.query || "").trim();
+      if (lookupRaw) {
+        const lookup = lookupRaw.toLowerCase();
+        const matches = plans.filter((p) =>
+          String(p?.title ?? "").trim().toLowerCase().includes(lookup)
+        );
+        const singleId = matches.length === 1 ? normalizeUuid(matches[0]?.id) : undefined;
+        if (singleId) {
+          return {
+            planId: singleId,
+            note: `Resolved plan "${lookupRaw}" to **${matches[0]?.title}**.`,
+          };
+        }
+        if (matches.length > 1) {
+          return {
+            listing: formatPlanCandidates(matches, `Multiple plans match "${lookupRaw}" — pass plan_id:`),
+          };
+        }
+        return {
+          listing: formatPlanCandidates(plans, `No plan matches "${lookupRaw}". Plans in scope:`),
+        };
+      }
+
+      const actionable = plans.filter(
+        (p) => String(p?.status ?? "").toLowerCase() !== "archived"
+      );
+      if (actionable.length === 0) {
+        return { listing: formatPlanCandidates(plans, "No actionable plans in scope.") };
+      }
+      const isSubstantive = (p: Record<string, any>) => {
+        const progress = Number(p?.progress ?? p?.progress_percent ?? 0);
+        const status = String(p?.status ?? "").toLowerCase();
+        const taskCount = Array.isArray(p?.tasks) ? p.tasks.length : Number(p?.task_count ?? 0);
+        return progress > 0 || status === "active" || taskCount > 0;
+      };
+      const pick = actionable.find(isSubstantive) ?? actionable[0];
+      const pickId = normalizeUuid(pick?.id);
+      if (!pickId) {
+        return { listing: formatPlanCandidates(plans, "Plans in scope:") };
+      }
+      const others = actionable
+        .filter((p) => p !== pick)
+        .slice(0, 3)
+        .map((p) => `- ${p?.title || p?.id}`)
+        .join("\n");
+      return {
+        planId: pickId,
+        note: `Auto-resolved to the latest actionable plan: **${pick?.title || pickId}**.${others ? `\nOther actionable plans:\n${others}` : ""}`,
+      };
+    }
+
+    function formatPlanCandidates(plans: Array<Record<string, any>>, headline: string): string {
+      if (!plans.length) {
+        return `${headline}\n(none) — save one with session(action="capture_plan", title="...", steps=[...]).`;
+      }
+      const lines = plans.slice(0, 10).map((p) => {
+        const status = String(p?.status ?? "unknown");
+        const progress = Number(p?.progress ?? p?.progress_percent ?? 0);
+        const progressLabel = Number.isFinite(progress) && progress > 0 ? ` ${progress}%` : "";
+        return `- ${p?.title || "(untitled)"} [${status}${progressLabel}] (id: ${p?.id})`;
+      });
+      return `${headline}\n${lines.join("\n")}`;
+    }
+
     // Resolve a lesson reference (UUID or lookup text) to its memory event id.
     // Text lookups rank exact title matches first and refuse ambiguous
     // matches so a bulk-worded lookup can never silently edit the wrong lesson.
@@ -13426,7 +13567,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             })
             .optional(),
           // Plan-specific params (accept string so truncated UUID prefixes emit a friendly handler-level error; see issue #53)
-          plan_id: z.string().optional().describe("Plan ID (full 36-char UUID) for get_plan/update_plan"),
+          plan_id: z.string().optional().describe("Plan ID (UUID) or plan title text for get_plan/update_plan; omit to resolve the latest actionable plan"),
           event_id: z.string().optional().describe("Event ID (full 36-char UUID)"),
           task_id: z.string().optional().describe("Task ID (full 36-char UUID)"),
           node_id: z.string().optional().describe("Node ID (full 36-char UUID)"),
@@ -14071,6 +14212,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!workspaceId) {
               return errorResult("capture_plan requires workspace_id. Call session_init first.");
             }
+            const degenerateSteps = collectDegenerateStepTitles(input.steps);
+            if (degenerateSteps) {
+              return errorResult(degenerateSteps);
+            }
             const result = await client.createPlan({
               workspace_id: workspaceId,
               project_id: projectId,
@@ -14095,25 +14240,32 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
 
           case "get_plan": {
-            if (!input.plan_id) {
-              return errorResult("get_plan requires: plan_id");
+            const resolvedPlan = await resolvePlanForAction(input);
+            if ("error" in resolvedPlan) return errorResult(resolvedPlan.error);
+            if ("listing" in resolvedPlan) {
+              return { content: [{ type: "text" as const, text: resolvedPlan.listing }] };
             }
             const result = await client.getPlan({
-              plan_id: input.plan_id,
+              plan_id: resolvedPlan.planId,
               include_tasks: input.include_tasks !== false,
             });
+            const planText = resolvedPlan.note
+              ? `${resolvedPlan.note}\n${formatContent(result)}`
+              : formatContent(result);
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: planText }],
+
             };
           }
 
           case "update_plan": {
-            if (!input.plan_id) {
-              return errorResult("update_plan requires: plan_id");
+            const resolvedPlanForUpdate = await resolvePlanForAction(input);
+            if ("error" in resolvedPlanForUpdate) return errorResult(resolvedPlanForUpdate.error);
+            if ("listing" in resolvedPlanForUpdate) {
+              return { content: [{ type: "text" as const, text: resolvedPlanForUpdate.listing }] };
             }
             const result = await client.updatePlan({
-              plan_id: input.plan_id,
+              plan_id: resolvedPlanForUpdate.planId,
               title: input.title,
               content: input.content,
               description: input.description,

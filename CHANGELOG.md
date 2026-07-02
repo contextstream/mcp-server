@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.4.76
+
+**Rust MCP parity (v0.2.92 → v0.5.27), pass 1: tool-surface parity + confidentiality scrub.**
+
+### Confidentiality Scrub (parity with Rust v0.3.2–v0.3.4, v0.3.12, v0.5.15)
+
+- Removed internal implementation naming from user-facing strings and comments: archive-tier wording in the memory tool description and the `search_archive` local-unavailable response, cache naming in hook comments. The fabricated `stages_used` marker is now `hosted_archive`.
+- Dropped the `ram`/`mem` compatibility aliases for `instruct` (the Rust MCP dropped them in v0.3.2). `flash` remains.
+- Tool error display no longer echoes raw API error bodies: an allowlist keeps known-actionable fields (code, message, validation issues, rate-limit info, request id), messages are length-capped, and stack traces are stripped.
+
+### New Tool Surfaces
+
+- **`qa` tool** (Rust v0.3.1/v0.3.5): agent Q&A over the workspace/project knowledge base via the public `/qa_agent/*` endpoints — `ask` (grounded answer with citations + confidence), `search` (prior Q&A listing), `save_kb`/`list_kb`/`get_kb`/`update_kb`/`delete_kb` (guidance/guardrail/faq/runbook/caveat items), `feedback` (-1/0/+1). Structured answers surface only public answer-contract fields and always attribute answers to ContextCode.
+- **Per-action write surfaces**: `capture_plan`, `session_capture`, `session_capture_lesson`, `session_remember`, and `memory_create_event` are now part of the default (consolidated) and standard toolsets, joined by new `memory_create_doc`, `memory_update_doc`, `memory_delete_doc`, `memory_create_task`, `memory_update_task`, `memory_create_todo`, and `memory_complete_todo` tools that dispatch to the consolidated memory handler, so clients that render only tool names get descriptive write tools.
+- **`skill`, `vcs`, and `integration` join the standard toolset** — previously registered but invisible in the default surface (same fix class as Rust v0.3.5, which surfaced qa/entity/vcs through the standard/consolidated toolsets).
+
+### New Actions on Existing Tools
+
+- **session:** `update_lesson` / `delete_lesson` (v0.3.30) with UUID-or-title lesson resolution — exact title matches win, ambiguous lookups are refused with candidates listed.
+- **memory:** `delete_all` (v0.5.24) — `delete_event`/`delete_node` accept an exact title in place of a UUID; multiple matches error unless `delete_all=true` removes all exact-title matches in one call.
+- **capsule:** `delete` (v0.5.21); `share` accepts `require_unlock_key` + `unlock_destinations` (v0.3.48).
+- **project:** `purge` (de-index, keep project record), `remove_paths` (de-index exact paths), `forget_local` (remove the folder's local scope binding only; server data untouched), `merge` (merge source project into target).
+- **skill:** `supersede` (v0.3.51) — archives the skill with a change summary so it stops surfacing in matches.
+
+### Verified Without Change
+
+- Per-initialize tool-surface profile reset (Rust v0.5.16): the initialize interceptor already resets the active profile to the construction-time default on every initialize, so a prior client's auto-detected narrowing cannot bleed into the next client.
+
+### Not Ported Yet (tracked follow-ups)
+
+- Scope & routing recovery cluster (v0.3.6–v0.3.10, v0.3.53–v0.3.58, v0.5.7, v0.5.14, v0.5.17–v0.5.18), search-behavior parity (v0.3.34, v0.3.45, v0.3.52, v0.3.63, v0.5.10, v0.5.23, v0.5.26), grounding freshness + metadata polish (v0.3.27–v0.3.29, v0.3.40, v0.3.44, v0.3.49, v0.5.27), and session `retro_capture` / `set_account_mode` (require session-state machinery this package does not have yet).
+- Hosted-only premium surfaces (`chart`, `async_job`) are intentionally not exposed: they are not part of the local Rust stdio build surface either.
+
+### Tooling
+
+- `scripts/registration-smoke.mts`: registration smoke test asserting the default consolidated surface (required tool names present; `ram`/`mem`/`chart`/`async_job` absent).
+
 ## 0.4.75
 
 ### Security
@@ -24,7 +61,7 @@
 
 - Issues tied to downstream Desktop/Web/backend products (Windows updater binary, dashboard re-index button, dashboard version display, Atlas knowledge graph visualization, `graph(dependencies)` engine timeout) were filed in their owning repositories. No code changes for those are landed here.
 
-## Unreleased
+## 0.4.76 (continued) — previously unreleased fixes
 
 ### Parity + Issue Remediation
 

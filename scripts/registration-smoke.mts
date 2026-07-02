@@ -4,10 +4,10 @@ process.env.CONTEXTSTREAM_LOG_LEVEL = "quiet";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
-const { loadConfig } = await import("./src/config.js");
-const { ContextStreamClient } = await import("./src/client.js");
-const { registerTools } = await import("./src/tools.js");
-const { SessionManager } = await import("./src/session-manager.js");
+const { loadConfig } = await import("../src/config.js");
+const { ContextStreamClient } = await import("../src/client.js");
+const { registerTools } = await import("../src/tools.js");
+const { SessionManager } = await import("../src/session-manager.js");
 
 const config = loadConfig();
 const client = new ContextStreamClient(config);

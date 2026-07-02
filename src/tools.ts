@@ -129,8 +129,6 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   entity: "entity",
   instruct: "instruct",
   flash: "flash",
-  ram: "ram",
-  mem: "mem",
   ai: "ai",
   generate_rules: "rules",
   generate_editor_rules: "rules",
@@ -1640,8 +1638,6 @@ const STANDARD_TOOLSET = new Set<string>([
   "search_keyword",
   "flash",
   "instruct",
-  "ram",
-  "mem",
   "media",
   "capsule",
   "entity",
@@ -2410,8 +2406,6 @@ const CONSOLIDATED_TOOLS = new Set<string>([
   "generate_editor_rules", // Standalone - editor rules helper
   "flash", // Compatibility alias for instruct
   "instruct", // Session-scoped instruction cache
-  "ram", // Compatibility alias for instruct
-  "mem", // Compatibility alias for instruct
   "search", // Consolidates search_semantic, search_hybrid, search_keyword, search_pattern
   "session", // Consolidates session_capture, session_recall, etc.
   "memory", // Consolidates memory_create_event, memory_get_event, etc.
@@ -4272,8 +4266,10 @@ export function registerTools(
         const result = await handler(input, extra);
         return maybeStripStructuredContent(result);
       } catch (error: any) {
-        const errorMessage = error?.message || String(error);
-        const errorDetails = error?.body || error?.details || null;
+        const rawMessage = error?.message || String(error);
+        const errorMessage =
+          rawMessage.length > 500 ? `${rawMessage.slice(0, 500)}…` : rawMessage;
+        const errorDetails = sanitizeErrorDetails(error?.body || error?.details || null);
         const errorCode = error?.code || error?.status || "UNKNOWN_ERROR";
 
         const isPlanLimit =
@@ -4434,6 +4430,57 @@ export function registerTools(
       content: [{ type: "text" as const, text }],
       isError: true,
     };
+  }
+
+  // Error payloads may carry server-side diagnostic attributes that are not
+  // meant for end-user display. Only known-actionable fields survive, and
+  // output is depth/length-capped so failed bulk operations don't flood the
+  // transcript.
+  const ERROR_DETAIL_SAFE_KEYS = new Set([
+    "code",
+    "message",
+    "detail",
+    "details",
+    "field",
+    "fields",
+    "errors",
+    "issues",
+    "validation",
+    "hint",
+    "hints",
+    "rate_limit",
+    "retry_after",
+    "request_id",
+    "status",
+    "param",
+    "path",
+  ]);
+  const MAX_ERROR_DETAIL_CHARS = 600;
+
+  function sanitizeErrorDetails(details: unknown, depth = 0): unknown {
+    if (details === null || details === undefined) return null;
+    if (typeof details === "string") {
+      const withoutStack = details.split("\n    at ")[0];
+      return withoutStack.length > MAX_ERROR_DETAIL_CHARS
+        ? `${withoutStack.slice(0, MAX_ERROR_DETAIL_CHARS)}…`
+        : withoutStack;
+    }
+    if (typeof details === "number" || typeof details === "boolean") return details;
+    if (Array.isArray(details)) {
+      if (depth >= 2) return undefined;
+      return details.slice(0, 10).map((item) => sanitizeErrorDetails(item, depth + 1));
+    }
+    if (typeof details === "object") {
+      if (depth >= 2) return undefined;
+      const safe: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(details as Record<string, unknown>)) {
+        if (!ERROR_DETAIL_SAFE_KEYS.has(key)) continue;
+        const sanitized = sanitizeErrorDetails(value, depth + 1);
+        if (sanitized !== undefined && sanitized !== null) safe[key] = sanitized;
+      }
+      return Object.keys(safe).length > 0 ? safe : null;
+    }
+    return undefined;
   }
 
   function detectToolSurfaceProfileFromInitializeParams(
@@ -5804,27 +5851,7 @@ export function registerTools(
     "instruct",
     {
       title: "Session instructions",
-      description: `${instructionToolDescription} Compatibility aliases: ram, mem.`,
-      inputSchema: instructionToolSchema,
-    },
-    executeInstructionTool
-  );
-
-  registerTool(
-    "ram",
-    {
-      title: "Session instructions (ram alias)",
-      description: `Alias of instruct. ${instructionToolDescription}`,
-      inputSchema: instructionToolSchema,
-    },
-    executeInstructionTool
-  );
-
-  registerTool(
-    "mem",
-    {
-      title: "Session instructions (mem alias)",
-      description: `Alias of instruct. ${instructionToolDescription}`,
+      description: instructionToolDescription,
       inputSchema: instructionToolSchema,
     },
     executeInstructionTool
@@ -14558,7 +14585,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "memory",
       {
         title: "Memory",
-        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap. Transcript actions: list_transcripts (list saved conversations), get_transcript (get full transcript by ID), search_transcripts (semantic search across conversations), search_archive (remote Atlas archive; local npm returns unavailable), delete_transcript. Team actions (team plans only): team_tasks, team_todos, team_diagrams, team_docs.`,
+        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap. Transcript actions: list_transcripts (list saved conversations), get_transcript (get full transcript by ID), search_transcripts (semantic search across conversations), search_archive (hosted archive tier; local npm returns unavailable), delete_transcript. Team actions (team plans only): team_tasks, team_todos, team_diagrams, team_docs.`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -16007,11 +16034,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               content: [
                 {
                   type: "text" as const,
-                  text: "[ARCHIVE] disabled (Atlas Online Archive is only available in the remote Rust MCP binary).",
+                  text: "[ARCHIVE] disabled (the archive tier is available on hosted ContextStream deployments).",
                 },
               ],
               structuredContent: {
-                stages_used: ["atlas_online_archive"],
+                stages_used: ["hosted_archive"],
                 available: false,
                 query: input.query || "",
                 scope: input.scope,

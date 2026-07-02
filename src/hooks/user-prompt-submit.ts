@@ -418,7 +418,7 @@ async function saveLastExchange(exchange: LastExchange, cwd: string, clientName?
 }
 
 /**
- * Fast hook context fetch from /api/v1/context/hook (Redis-cached, ~20-50ms).
+ * Fast hook context fetch from /api/v1/context/hook (server-cached, ~20-50ms).
  * Returns compact context string with preferences + lessons + core rules.
  */
 async function fetchHookContext(): Promise<string | null> {
@@ -784,7 +784,7 @@ export async function runUserPromptSubmitHook(): Promise<void> {
     // ==========================================
     // CLAUDE CODE: FAST PATH (~20-50ms)
     // ==========================================
-    // Makes a single fast HTTP call to /context/hook (Redis-cached).
+    // Makes a single fast HTTP call to /context/hook (server-cached).
     // Returns preferences + lessons + core rules.
     // Falls back to static reminder if API is unreachable.
     loadConfigFromMcpJson(cwd);

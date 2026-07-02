@@ -36,7 +36,6 @@ const CONTEXTSTREAM_TOOL_NAMES = [
   "generate_rules",
   "instruct",
   "flash",
-  "ram",
 
   // Consolidated domain tools (v0.4.x default)
   "search", // Modes: auto (recommended), semantic, hybrid (legacy alias), keyword, pattern

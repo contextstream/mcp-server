@@ -27,8 +27,6 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: "context", hint: "each-msg" },
       { name: "instruct", hint: "hot-state" },
       { name: "flash", hint: "alias" },
-      { name: "ram", hint: "alias" },
-      { name: "mem", hint: "alias" },
       { name: "capture", hint: "save" },
       { name: "recall", hint: "find" },
       { name: "remember", hint: "quick" },

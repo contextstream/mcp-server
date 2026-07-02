@@ -30,7 +30,7 @@ import {
   installAllEditorHooks,
   type SupportedEditor,
 } from "./hooks-config.js";
-import { HttpError } from "./http.js";
+import { HttpError, setActiveModelId } from "./http.js";
 import { forgetLocalConfig, resolveWorkspace } from "./workspace-config.js";
 import {
   isScopeError,
@@ -2703,6 +2703,55 @@ const SCOPE_RETRY_CONSOLIDATED_ACTIONS = new Set([
   "list",
 ]);
 
+// Grounding/recall items must never render as bare "Untitled": fall back
+// from title to summary to the first meaningful content line to a typed id.
+export function displayTitle(item: Record<string, any> | null | undefined): string {
+  const clip = (value: string) => (value.length > 80 ? `${value.slice(0, 77)}…` : value);
+  const direct = String(item?.title ?? "").trim();
+  if (direct && direct.toLowerCase() !== "untitled") return clip(direct);
+  const summary = String(item?.summary ?? "").trim();
+  if (summary) return clip(summary);
+  const content = String(item?.content ?? "").trim();
+  if (content) {
+    const firstLine =
+      content
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line.length > 2) || "";
+    if (firstLine) return clip(firstLine);
+  }
+  const kind = String(item?.event_type ?? item?.kind ?? item?.type ?? "item").trim() || "item";
+  const id = String(item?.id ?? "").trim();
+  return id ? `${kind} ${id.slice(0, 8)}` : kind;
+}
+
+// Hook telemetry (permission prompts, subagent lifecycle, checkpoints) is
+// operational noise once it ages: months-old telemetry must not bury real
+// prior work in a grounding bundle. Unknown age counts as stale.
+const OPERATIONAL_GROUNDING_KINDS = new Set(["operation", "command_execution", "file_operation"]);
+const OPERATIONAL_GROUNDING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function isStaleOperationalGroundingItem(
+  item: Record<string, any> | null | undefined
+): boolean {
+  const kind = String(item?.event_type ?? item?.kind ?? item?.type ?? "").toLowerCase();
+  if (!OPERATIONAL_GROUNDING_KINDS.has(kind)) return false;
+  const stamp = item?.occurred_at ?? item?.created_at ?? item?.timestamp;
+  const ms =
+    typeof stamp === "string" || typeof stamp === "number" ? Date.parse(String(stamp)) : NaN;
+  if (!Number.isFinite(ms)) return true;
+  return Date.now() - ms > OPERATIONAL_GROUNDING_MAX_AGE_MS;
+}
+
+// 1M-context models warn near ~650k tokens instead of the conservative 70k
+// default; unknown or older models keep the default exactly.
+export function isLargeContextModel(modelId: string): boolean {
+  const normalized = modelId.trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized.includes("[1m]")) return true;
+  return /(opus-4[-.]?8|fable-5)/.test(normalized);
+}
+
 // Identifier-shaped queries are code intent even as a lone token: a symbol
 // lookup like `search_first_redirect_decision` must not blend memory/media
 // hits into workspace-scoped results. Conservative — prose and plain memory
@@ -3817,6 +3866,17 @@ export function registerTools(
       const detected =
         detectToolSurfaceProfileFromInitializeParams(request?.params) || toolSurfaceProfile;
       activeSurfaceProfile = detected;
+      // When the client surfaces its model at initialize, attribute API
+      // calls to it (X-ContextStream-Model) and size the context-pressure
+      // threshold to the model's window. No-op when the model is unknown.
+      const modelParam =
+        typeof request?.params?.model === "string" ? (request.params.model as string) : "";
+      if (modelParam.trim()) {
+        setActiveModelId(modelParam);
+        if (isLargeContextModel(modelParam)) {
+          sessionManager?.setContextThreshold(650_000);
+        }
+      }
       const result = await originalOnInitialize(request);
       return result;
     };
@@ -3899,11 +3959,27 @@ export function registerTools(
     const planName = await client.getPlanName();
     if (planName !== "free") return null;
 
-    return errorResult(
-      [`Access denied: \`${toolName}\` requires ContextStream PRO.`, `Upgrade: ${upgradeUrl}`].join(
-        "\n"
-      )
-    );
+    // Structured tier-gate result so clients can render an upgrade nudge
+    // instead of parsing error text.
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: [
+            `Access denied: \`${toolName}\` requires ContextStream PRO.`,
+            `Current plan: ${planName}. Upgrade: ${upgradeUrl}`,
+          ].join("\n"),
+        },
+      ],
+      structuredContent: {
+        plan_restricted: true,
+        tool: toolName,
+        current_plan: planName,
+        required_tier: "pro",
+        upgrade_url: upgradeUrl,
+      },
+      isError: true,
+    };
   }
 
   const graphToolTiers = new Map<string, "lite" | "full">([
@@ -14071,10 +14147,13 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               (recall as any)?.data?.results ||
               (recall as any)?.results ||
               [];
-            if (Array.isArray(recallResults) && recallResults.length > 0) {
+            const freshRecallResults = Array.isArray(recallResults)
+              ? recallResults.filter((item: any) => !isStaleOperationalGroundingItem(item))
+              : [];
+            if (freshRecallResults.length > 0) {
               lines.push("[GROUNDING] Prior work matching your message:");
-              recallResults.slice(0, 5).forEach((item: any, index: number) => {
-                lines.push(`${index + 1}. ${item.title || item.summary || item.id || "Untitled"}`);
+              freshRecallResults.slice(0, 5).forEach((item: any, index: number) => {
+                lines.push(`${index + 1}. ${displayTitle(item)}`);
               });
               lines.push("");
             }
@@ -15567,7 +15646,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "memory",
       {
         title: "Memory",
-        description: `Memory operations for events and nodes. Event actions: create_event, get_event, update_event, delete_event (accepts event_id UUID or exact title; delete_all=true bulk-removes exact-title matches), list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node (accepts node_id UUID or exact title; delete_all=true bulk-removes exact-title matches), list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap. Transcript actions: list_transcripts (list saved conversations), get_transcript (get full transcript by ID), search_transcripts (semantic search across conversations), search_archive (hosted archive tier; local npm returns unavailable), delete_transcript. Team actions (team plans only): team_tasks, team_todos, team_diagrams, team_docs.`,
+        description: `Persistent memory — docs, runbooks, specs, ADRs, decisions, lessons, tasks, and todos live HERE, never on disk: when the user mentions "the doc on X", "our runbook for Y", or "why we decided Z", use action="search" or list_docs/get_doc — NOT filesystem tools. Tasks here are lightweight project-tracking items; for tickets, bugs, incidents, releases, or handoffs use the entity tool instead. Event actions: create_event, get_event, update_event, delete_event (accepts event_id UUID or exact title; delete_all=true bulk-removes exact-title matches), list_events, distill_event, import_batch (bulk import array of events). Node actions: create_node, get_node, update_node, delete_node (accepts node_id UUID or exact title; delete_all=true bulk-removes exact-title matches), list_nodes, supersede_node. Query actions: search, decisions, timeline, summary. Task actions: create_task (create task, optionally linked to plan), get_task, update_task (can link/unlink task to plan via plan_id), delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram. Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap. Transcript actions: list_transcripts (list saved conversations), get_transcript (get full transcript by ID), search_transcripts (semantic search across conversations), search_archive (hosted archive tier; local npm returns unavailable), delete_transcript. Team actions (team plans only): team_tasks, team_todos, team_diagrams, team_docs.`,
         inputSchema: z.object({
           action: z
             .enum([

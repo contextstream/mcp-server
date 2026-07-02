@@ -639,6 +639,19 @@ export class ContextStreamClient {
     }
   }
 
+  /**
+   * Clear the client's default workspace/project IDs. Used by scope recovery
+   * when a previously-promoted default turns out to be stale for this session.
+   */
+  clearDefaults(input?: { workspace?: boolean; project?: boolean }) {
+    if (input?.workspace !== false) {
+      this.config.defaultWorkspaceId = undefined;
+    }
+    if (input?.project !== false) {
+      this.config.defaultProjectId = undefined;
+    }
+  }
+
   private withDefaults<T extends { workspace_id?: string; project_id?: string }>(input: T): T {
     const { defaultWorkspaceId, defaultProjectId } = this.config;
     const providedWorkspaceId = this.coerceUuid(input.workspace_id);

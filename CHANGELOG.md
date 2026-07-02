@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.4.77
+
+**Rust MCP parity pass 2: scope & routing correctness (v0.3.6–v0.5.18 cluster).**
+
+### Central Scope Resolution (new `src/scope.ts`)
+
+- Write paths — memory `create_event`/`create_node`/`create_task`/`create_todo`/`create_diagram`/`create_doc`/`create_roadmap`/`import_batch`, session `capture`/`capture_lesson`/`capture_plan`/`remember`, and all flat write tools — now resolve a consistent `{workspace, project}` pair before the first attempt. A "soft" workspace (neither caller-provided, nor request-header-provided, nor backed by the folder's saved config) that disagrees with the candidate project's real workspace is self-healed by adopting the project's workspace and persisting the correction; explicit workspaces stay authoritative and a mismatched project is dropped with a `[SCOPE]` note instead (Rust v0.5.18 semantics).
+- Project **names** are accepted wherever a `project_id` is taken on these paths (and on `init`): a non-UUID value is matched case-insensitively (ignoring spaces/underscores/hyphens) against the workspace's projects, with a helpful error naming known projects on a miss (v0.3.7).
+- One-shot recovery after stale-scope errors (v0.3.53–v0.3.58): a rejected project retries workspace-only; a stale workspace is cleared (new `SessionManager.replaceScope` + `ContextStreamClient.clearDefaults`) and re-resolved from the folder's saved config, with the retried call re-running against the corrected session context and a `[SCOPE]` note explaining what changed. Applies to memory/session/entity actions and the flat write tools, including the `memory decisions` read path.
+- An explicitly requested but inaccessible project is a hard error instead of a silent mis-scope.
+
+### init Precedence (v0.3.9 + v0.5.7)
+
+- `init(folder_path=…)` suppresses header-injected workspace/project scope so folder binding actually runs; when folder resolution yields no workspace (typical through the HTTP gateway, where the server cannot read the caller's local config), the inherited header scope is restored as the fallback and noted in the result.
+- `init` `project_id` accepts a project name.
+
+### Plan Lookup Hardening (v0.5.14)
+
+- `get_plan`/`update_plan` never dead-end: `plan_id` accepts a UUID or title text, or can be omitted to auto-resolve the latest actionable plan — preferring substantive plans (progress, active status, linked tasks) over stray 0% drafts, and disclosing the auto-pick plus other actionable plans. A miss returns the in-scope plan listing; an empty scope points at `capture_plan`.
+- `capture_plan` (session action and flat tool) rejects degenerate step titles (empty, placeholder dashes, multi-line, >200 chars, bare file paths) with per-title reasons.
+
+### Search Scope Loudness + Local Index Identity (v0.5.7 + v0.5.17)
+
+- `[SCOPE_UNRELIABLE]` banner when the backend flags a search's scope as invalid (previously skipped silently).
+- The local index registry records the git HEAD and normalized git remote identity at local-ingest time. Folder-to-project binding requires the folder's current remote identity to match the recorded one — a repo that merely shares a name or path leaf can never bind to another repo's project. IndexKeeper detects out-of-session commits (HEAD moved past the recorded ingest HEAD) and starts a background re-ingest. Non-git folders and entries without recorded identity are unaffected.
+
+### Already Equivalent (verified, no change)
+
+- Entity list/create inherit the session's active scope (v0.3.10); repeated `init(folder_path=…)` re-binds; per-initialize tool-surface profile reset (v0.5.16).
+
+### Still Tracked for Later Passes
+
+- Search-quality behaviors (v0.3.34, v0.3.45, v0.3.52, v0.3.63, v0.5.10, v0.5.23, v0.5.26); grounding freshness + metadata polish (v0.3.27–29, v0.3.40, v0.3.44, v0.3.49, v0.5.27); session `retro_capture`/`set_account_mode`.
+
 ## 0.4.76
 
 **Rust MCP parity (v0.2.92 → v0.5.27), pass 1: tool-surface parity + confidentiality scrub.**

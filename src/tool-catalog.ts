@@ -28,6 +28,8 @@ export const TOOL_CATALOG: ToolCategory[] = [
       { name: "instruct", hint: "hot-state" },
       { name: "flash", hint: "alias" },
       { name: "capture", hint: "save" },
+      { name: "retro_capture", hint: "backfill" },
+      { name: "set_account_mode", hint: "team-personal" },
       { name: "recall", hint: "find" },
       { name: "remember", hint: "quick" },
       { name: "compress", hint: "end" },

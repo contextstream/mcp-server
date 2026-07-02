@@ -8170,6 +8170,20 @@ export class ContextStreamClient {
     return unwrapApiResponse(result);
   }
 
+  // Account execution context (team/personal selection)
+  async getAccountContext() {
+    const result = await request(this.config, "/account/context", { method: "GET" });
+    return unwrapApiResponse(result);
+  }
+
+  async selectAccountContext(selection: string) {
+    const result = await request(this.config, "/account/context", {
+      method: "PUT",
+      body: { selection },
+    });
+    return unwrapApiResponse(result);
+  }
+
   async mergeProject(targetProjectId: string, sourceProjectId: string) {
     uuidSchema.parse(targetProjectId);
     uuidSchema.parse(sourceProjectId);

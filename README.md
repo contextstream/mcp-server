@@ -9,6 +9,11 @@
 </p>
 
 <p align="center">
+  🏆 <b>90.0% on LongMemEval-S</b> — the full 500-instance suite with the official judge.<br/>
+  Beats supermemory with statistical significance; matches Zep. <a href="https://contextstream.io/benchmarks">See the benchmarks →</a>
+</p>
+
+<p align="center">
   <a href="https://www.npmjs.com/package/@contextstream/mcp-server"><img src="https://img.shields.io/npm/v/@contextstream/mcp-server.svg" alt="npm version" /></a>
   <a href="https://www.npmjs.com/package/@contextstream/mcp-server"><img src="https://img.shields.io/npm/dm/@contextstream/mcp-server.svg" alt="npm downloads" /></a>
   <a href="https://github.com/contextstream/mcp-server/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/@contextstream/mcp-server.svg" alt="MIT license" /></a>
@@ -40,6 +45,22 @@ npx --prefer-online -y @contextstream/mcp-server@latest setup --yes
 <p align="center">
   <img src="compare1.gif" alt="Side-by-side comparison: an AI coding assistant with ContextStream memory and semantic search vs. without" width="700" />
 </p>
+
+---
+
+## We win on memory benchmarks — measured honestly
+
+**ContextStream scores 90.0% on the full LongMemEval-S benchmark**, the standard test of conversational memory over ~115k-token multi-session histories. That's the complete 500-instance suite with the official GPT-4o judge — 450/500 correct (89.6% single-shot, 90.0% with self-consistency k=3; Wilson 95% CI [87.1%, 92.3%]). Published June 14, 2026.
+
+| System | LongMemEval-S | Notes |
+|---|:---:|---|
+| **ContextStream** | **90.0%** | Full 500 instances, official GPT-4o judge |
+| Zep | 90.2% | Vendor-published — a statistical tie (0.2 pt is inside measurement noise) |
+| supermemory | 85.4% | Vendor-published — ContextStream wins with statistical significance |
+
+On **multi-session recall** — the memory that actually matters for a coding agent working across days of sessions — ContextStream scores **81.2% vs Zep's published 57.9%** in the per-family comparison. And on the agentic project-memory benchmark, the same memory raises **agent task success from 58% to 96%**.
+
+Full methodology, per-family breakdowns, and judge-comparability notes (competitor numbers are cited from each vendor's own publications): **[contextstream.io/benchmarks](https://contextstream.io/benchmarks)**
 
 ---
 
@@ -310,6 +331,10 @@ Your code is private and securely stored, isolated per workspace with no cross-t
 ### How much does it cost?
 
 There's a free tier to start with. Larger indexes, the full code graph, and team features are on paid plans: see [pricing](https://contextstream.io/pricing).
+
+### How does ContextStream score on memory benchmarks?
+
+90.0% on the full 500-instance LongMemEval-S suite with the official GPT-4o judge (89.6% single-shot) — beating supermemory's published 85.4% with statistical significance and matching Zep's published 90.2% within the confidence interval. On multi-session recall specifically, ContextStream scores 81.2% vs Zep's published 57.9%. Methodology and per-family breakdowns: [contextstream.io/benchmarks](https://contextstream.io/benchmarks).
 
 ### How is this different from other AI memory tools?
 

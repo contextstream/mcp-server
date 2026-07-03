@@ -7963,4 +7963,162 @@ export class ContextStreamClient {
     const { rule_id, ...body } = params;
     return request(this.config, `/suggested-rules/${rule_id}/action`, { method: "POST", body });
   }
+
+  // =========================================================================
+  // Agent Q&A surface (/qa_agent/*) — grounded workspace/project Q&A.
+  // Answers are attributed to ContextCode, the public assistant branding.
+  // =========================================================================
+
+  async qaAsk(params: {
+    question: string;
+    workspace_id?: string;
+    project_id?: string;
+    session_id?: string;
+    max_tokens?: number;
+    temperature?: number;
+    tags?: string[];
+    scope_summary?: string;
+  }) {
+    const body = this.withDefaults(params);
+    const result = await request(this.config, "/qa_agent/ask", { body });
+    return unwrapApiResponse(result);
+  }
+
+  async qaSearch(params?: {
+    q?: string;
+    workspace_id?: string;
+    project_id?: string;
+    session_id?: string;
+    asked_by_user_id?: string;
+    tag?: string;
+    page?: number;
+    per_page?: number;
+  }) {
+    const withDefaults = this.withDefaults(params || {});
+    const query = new URLSearchParams();
+    appendQuery(query, "q", params?.q);
+    appendQuery(query, "workspace_id", withDefaults.workspace_id);
+    appendQuery(query, "project_id", withDefaults.project_id);
+    appendQuery(query, "session_id", params?.session_id);
+    appendQuery(query, "asked_by_user_id", params?.asked_by_user_id);
+    appendQuery(query, "tag", params?.tag);
+    appendQuery(query, "page", params?.page);
+    appendQuery(query, "per_page", params?.per_page);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const result = await request(this.config, `/qa_agent/search${suffix}`, { method: "GET" });
+    return unwrapApiResponse(result);
+  }
+
+  async qaFeedback(params: { answer_id: string; score: number }) {
+    uuidSchema.parse(params.answer_id);
+    const result = await request(this.config, "/qa_agent/feedback", { body: params });
+    return unwrapApiResponse(result);
+  }
+
+  async qaCreateKbItem(params: {
+    title: string;
+    content: string;
+    kind: string;
+    workspace_id?: string;
+    project_id?: string;
+    tags?: string[];
+    metadata?: Record<string, unknown>;
+  }) {
+    const body = this.withDefaults(params);
+    const result = await request(this.config, "/qa_agent/kb", { body });
+    return unwrapApiResponse(result);
+  }
+
+  async qaListKbItems(params?: {
+    workspace_id?: string;
+    project_id?: string;
+    kind?: string;
+    tag?: string;
+    q?: string;
+    created_by?: string;
+    page?: number;
+    per_page?: number;
+  }) {
+    const withDefaults = this.withDefaults(params || {});
+    const query = new URLSearchParams();
+    appendQuery(query, "workspace_id", withDefaults.workspace_id);
+    appendQuery(query, "project_id", withDefaults.project_id);
+    appendQuery(query, "kind", params?.kind);
+    appendQuery(query, "tag", params?.tag);
+    appendQuery(query, "q", params?.q);
+    appendQuery(query, "created_by", params?.created_by);
+    appendQuery(query, "page", params?.page);
+    appendQuery(query, "per_page", params?.per_page);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const result = await request(this.config, `/qa_agent/kb${suffix}`, { method: "GET" });
+    return unwrapApiResponse(result);
+  }
+
+  async qaGetKbItem(id: string) {
+    uuidSchema.parse(id);
+    const result = await request(this.config, `/qa_agent/kb/${id}`, { method: "GET" });
+    return unwrapApiResponse(result);
+  }
+
+  async qaUpdateKbItem(
+    id: string,
+    body: {
+      title?: string;
+      content?: string;
+      kind?: string;
+      tags?: string[];
+      metadata?: Record<string, unknown>;
+      project_id?: string;
+    }
+  ) {
+    uuidSchema.parse(id);
+    const result = await request(this.config, `/qa_agent/kb/${id}`, { method: "PATCH", body });
+    return unwrapApiResponse(result);
+  }
+
+  async qaDeleteKbItem(id: string) {
+    uuidSchema.parse(id);
+    return request(this.config, `/qa_agent/kb/${id}`, { method: "DELETE" }).then((r) =>
+      r === "" || r == null ? { success: true } : r
+    );
+  }
+
+  // Capsule maintenance
+  async deleteCapsule(capsuleId: string) {
+    return request(this.config, `/capsules/${capsuleId}`, { method: "DELETE" }).then((r) =>
+      r === "" || r == null ? { success: true } : r
+    );
+  }
+
+  // Project index maintenance
+  async purgeProjectIndex(projectId: string) {
+    uuidSchema.parse(projectId);
+    const result = await request(this.config, `/projects/${projectId}/index/purge`, { body: {} });
+    globalCache.delete(CacheKeys.project(projectId));
+    globalCache.delete(`project_overview:${projectId}`);
+    return unwrapApiResponse(result);
+  }
+
+  async removeProjectFiles(projectId: string, paths: string[]) {
+    uuidSchema.parse(projectId);
+    const result = await request(this.config, `/projects/${projectId}/files/remove`, {
+      body: { paths },
+    });
+    globalCache.delete(CacheKeys.project(projectId));
+    globalCache.delete(`project_overview:${projectId}`);
+    return unwrapApiResponse(result);
+  }
+
+  async mergeProject(targetProjectId: string, sourceProjectId: string) {
+    uuidSchema.parse(targetProjectId);
+    uuidSchema.parse(sourceProjectId);
+    const result = await request(this.config, `/projects/${targetProjectId}/merge`, {
+      body: { source_project_id: sourceProjectId },
+    });
+    for (const id of [targetProjectId, sourceProjectId]) {
+      globalCache.delete(CacheKeys.project(id));
+      globalCache.delete(`project_overview:${id}`);
+    }
+    return unwrapApiResponse(result);
+  }
 }

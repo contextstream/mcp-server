@@ -154,6 +154,35 @@ export function writeLocalConfig(repoPath: string, config: WorkspaceConfig): boo
 }
 
 /**
+ * Stop this machine from re-binding a folder to its saved scope: removes the
+ * repo's local config file. Parent-folder pattern mappings are left intact —
+ * the matching pattern (if any) is reported so callers can explain that the
+ * folder will re-associate through it unless the mapping itself is changed.
+ */
+export function forgetLocalConfig(repoPath: string): {
+  local_config_removed: boolean;
+  config_path: string;
+  matching_parent_pattern: string | null;
+} {
+  const configPath = path.join(repoPath, CONFIG_DIR, CONFIG_FILE);
+  let removed = false;
+  try {
+    if (fs.existsSync(configPath)) {
+      fs.unlinkSync(configPath);
+      removed = true;
+    }
+  } catch (e) {
+    console.error(`Failed to remove local config ${configPath}:`, e);
+  }
+  const mapping = findMatchingMapping(repoPath);
+  return {
+    local_config_removed: removed,
+    config_path: configPath,
+    matching_parent_pattern: mapping?.pattern ?? null,
+  };
+}
+
+/**
  * Read global parent folder mappings from user's home directory
  */
 export function readGlobalMappings(): ParentMapping[] {

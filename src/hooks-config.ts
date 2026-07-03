@@ -2139,21 +2139,24 @@ export async function installCursorHookScripts(options: {
     cleanedHooks[eventName] = filterContextStreamHooks(entries as any[]);
   }
 
-  const preToolUseCommand = getHookCommand("pre-tool-use");
-  const userPromptCommand = getHookCommand("user-prompt-submit");
-  const saveIntentCommand = getHookCommand("on-save-intent");
-  const postToolUseCommand = getHookCommand("post-tool-use");
-  const postToolUseFailureCommand = getHookCommand("post-tool-use-failure");
-  const preCompactCommand = getHookCommand("pre-compact");
-  const sessionStartCommand = getHookCommand("session-start");
-  const sessionEndCommand = getHookCommand("session-end");
-  const stopCommand = getHookCommand("stop");
-  const notificationCommand = getHookCommand("notification");
-  const permissionRequestCommand = getHookCommand("permission-request");
-  const subagentStartCommand = getHookCommand("subagent-start");
-  const subagentStopCommand = getHookCommand("subagent-stop");
-  const taskCompletedCommand = getHookCommand("task-completed");
-  const teammateIdleCommand = getHookCommand("teammate-idle");
+  // Cursor's hook input shape matches Claude Code's, but its response
+  // contract differs — the flag lets hook runtimes emit Cursor-schema output.
+  const cursorHookCommand = (name: string) => `${getHookCommand(name)} --editor=cursor`;
+  const preToolUseCommand = cursorHookCommand("pre-tool-use");
+  const userPromptCommand = cursorHookCommand("user-prompt-submit");
+  const saveIntentCommand = cursorHookCommand("on-save-intent");
+  const postToolUseCommand = cursorHookCommand("post-tool-use");
+  const postToolUseFailureCommand = cursorHookCommand("post-tool-use-failure");
+  const preCompactCommand = cursorHookCommand("pre-compact");
+  const sessionStartCommand = cursorHookCommand("session-start");
+  const sessionEndCommand = cursorHookCommand("session-end");
+  const stopCommand = cursorHookCommand("stop");
+  const notificationCommand = cursorHookCommand("notification");
+  const permissionRequestCommand = cursorHookCommand("permission-request");
+  const subagentStartCommand = cursorHookCommand("subagent-start");
+  const subagentStopCommand = cursorHookCommand("subagent-stop");
+  const taskCompletedCommand = cursorHookCommand("task-completed");
+  const teammateIdleCommand = cursorHookCommand("teammate-idle");
 
   const config: CursorHooksConfig = {
     version: 1,

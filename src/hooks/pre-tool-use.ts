@@ -329,12 +329,16 @@ function outputClineAllow(): never {
  * Output for Cursor format (JSON decision based)
  */
 function outputCursorBlock(reason: string): never {
-  console.log(JSON.stringify({ decision: "deny", reason }));
+  // Current Cursor permission schema — the legacy {decision, reason} shape
+  // is silently ignored by Cursor's hook runner.
+  console.log(
+    JSON.stringify({ permission: "deny", agent_message: reason, user_message: reason })
+  );
   process.exit(0);
 }
 
 function outputCursorAllow(): never {
-  console.log(JSON.stringify({ decision: "allow" }));
+  console.log(JSON.stringify({ permission: "allow" }));
   process.exit(0);
 }
 
@@ -364,6 +368,12 @@ function allowTool(
 }
 
 function detectEditorFormat(input: HookInput): "claude" | "cline" | "cursor" {
+  // The Cursor hook installer appends --editor=cursor to the command, since
+  // Cursor's input shape is otherwise indistinguishable from Claude Code's
+  // while its response contract differs.
+  if (process.argv.includes("--editor=cursor")) {
+    return "cursor";
+  }
   // Cline/Roo/Kilo format uses camelCase (hookName, toolName)
   if (input.hookName !== undefined || input.toolName !== undefined) {
     return "cline";

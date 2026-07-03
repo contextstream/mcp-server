@@ -65,11 +65,13 @@ Usage:
   npx --prefer-online -y @contextstream/mcp-server@latest
   contextstream-mcp
   contextstream-mcp setup
+  contextstream-mcp doctor
   contextstream-mcp http
   contextstream-mcp hook <hook-name>
 
 Commands:
   setup                      Interactive onboarding wizard (rules + workspace mapping)
+  doctor                     Read-only diagnostics: auth, API, folder scope, index health, rules, hooks
   verify-key [--json]        Verify API key and show account info
   update-hooks [flags]       Update hooks for all editors (Claude, Cursor, Cline, Roo, Kilo)
     --scope=global           Install hooks globally (default)
@@ -181,6 +183,12 @@ async function main() {
 
   if (args[0] === "setup") {
     await runSetupWizard(args.slice(1));
+    return;
+  }
+
+  if (args[0] === "doctor") {
+    const { runDoctor } = await import("./doctor.js");
+    await runDoctor();
     return;
   }
 

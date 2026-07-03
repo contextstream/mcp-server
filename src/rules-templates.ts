@@ -1233,9 +1233,17 @@ ${rules}
   },
 
   cursor: {
-    filename: ".cursorrules",
-    description: "Cursor AI rules",
-    build: (rules) => `# Cursor Rules
+    // Cursor Agent mode does not read .cursorrules at all; only
+    // .cursor/rules/*.mdc loads in every mode (Chat/Composer/Agent).
+    // Existing .cursorrules blocks are left in place for older Cursor
+    // versions but are no longer created.
+    filename: ".cursor/rules/contextstream.mdc",
+    description: "Cursor AI rules (.cursor/rules MDC — loaded in all Cursor modes)",
+    build: (rules) => `---
+alwaysApply: true
+---
+
+# Cursor Rules
 ${rules}
 `,
   },

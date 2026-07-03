@@ -2677,6 +2677,7 @@ const MEMORY_WRITE_SCOPE_ACTIONS = new Set([
 ]);
 const SESSION_WRITE_SCOPE_ACTIONS = new Set([
   "capture",
+  "retro_capture",
   "capture_lesson",
   "capture_plan",
   "remember",
@@ -2723,6 +2724,78 @@ export function displayTitle(item: Record<string, any> | null | undefined): stri
   const kind = String(item?.event_type ?? item?.kind ?? item?.type ?? "item").trim() || "item";
   const id = String(item?.id ?? "").trim();
   return id ? `${kind} ${id.slice(0, 8)}` : kind;
+}
+
+export interface RetroCaptureSource {
+  kind: string;
+  id?: string;
+  title: string;
+  preview?: string;
+  created_at?: string;
+  score?: number;
+}
+
+// Assemble retro_capture content: manual text (or a default line) plus the
+// source query and numbered source evidence, so the captured event stands on
+// its own without re-running the lookup.
+export function buildRetroCaptureContent(
+  manualContent: string | undefined,
+  query: string | undefined,
+  sources: RetroCaptureSource[]
+): string {
+  let text =
+    manualContent?.trim() || "Retroactive capture assembled from prior ContextStream sources.";
+  const trimmedQuery = query?.trim();
+  if (trimmedQuery) {
+    text += `\n\nSource query: ${trimmedQuery}`;
+  }
+  if (sources.length > 0) {
+    text += "\n\nSource evidence:\n";
+    sources.forEach((source, index) => {
+      text += `${index + 1}. [${source.kind}] ${source.title}`;
+      if (source.id) text += ` (${source.id})`;
+      if (source.created_at) text += ` — ${source.created_at}`;
+      if (source.preview) text += `\n   ${source.preview}`;
+      text += "\n";
+    });
+  }
+  return text;
+}
+
+export function retroCaptureSourceFromItem(
+  kind: string,
+  item: Record<string, any>
+): RetroCaptureSource {
+  const preview = String(item?.content ?? item?.snippet ?? item?.summary ?? "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 200);
+  const scoreRaw = item?.score ?? item?.relevance;
+  return {
+    kind,
+    id: typeof item?.id === "string" ? item.id : undefined,
+    title: displayTitle(item),
+    preview: preview || undefined,
+    created_at:
+      typeof item?.occurred_at === "string"
+        ? item.occurred_at
+        : typeof item?.created_at === "string"
+          ? item.created_at
+          : undefined,
+    score: typeof scoreRaw === "number" ? scoreRaw : undefined,
+  };
+}
+
+export function dedupeRetroCaptureSources(sources: RetroCaptureSource[]): RetroCaptureSource[] {
+  const seen = new Set<string>();
+  const deduped: RetroCaptureSource[] = [];
+  for (const source of sources) {
+    const key = `${source.kind}:${source.id ?? source.title.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(source);
+  }
+  return deduped;
 }
 
 // Hook telemetry (permission prompts, subagent lifecycle, checkpoints) is
@@ -13668,17 +13741,19 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "session",
       {
         title: "Session",
-        description: `Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). PAST SESSIONS LIVE HERE: use action='recall' FIRST when the user references "last time", "previous", "yesterday", or is continuing prior work — full-text transcripts are indexed across every prior session. context() may surface [GROUNDING]; use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills) outside context(). Actions: capture (save decision/insight), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons (retrieve lessons), update_lesson / delete_lesson (maintain a saved lesson by lesson_id — UUID or lookup text), recall (retrieve past conversation context via ranked fusion of transcripts/snapshots/docs/decisions), ground (one-shot prior-work bundle), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (searches MEMORY/conversation history only, not code), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan, get_plan, update_plan, list_plans. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Team actions: team_decisions, team_lessons, team_plans.`,
+        description: `Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). PAST SESSIONS LIVE HERE: use action='recall' FIRST when the user references "last time", "previous", "yesterday", or is continuing prior work — full-text transcripts are indexed across every prior session. context() may surface [GROUNDING]; use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills) outside context(). Actions: capture (save decision/insight), retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance — title plus content and/or query/transcript_ids), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons (retrieve lessons), update_lesson / delete_lesson (maintain a saved lesson by lesson_id — UUID or lookup text), recall (retrieve past conversation context via ranked fusion of transcripts/snapshots/docs/decisions), ground (one-shot prior-work bundle), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (searches MEMORY/conversation history only, not code), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan, get_plan, update_plan, list_plans. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Team actions: team_decisions, team_lessons, team_plans. Team/personal mode: set_account_mode (team|personal|auto).`,
         inputSchema: z.object({
           action: z
             .enum([
               "capture",
+              "retro_capture",
               "capture_lesson",
               "get_lessons",
               "update_lesson",
               "delete_lesson",
               "recall",
               "ground",
+              "set_account_mode",
               "remember",
               "user_context",
               "summary",
@@ -13776,6 +13851,9 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           task_id: z.string().optional().describe("Task ID (full 36-char UUID)"),
           node_id: z.string().optional().describe("Node ID (full 36-char UUID)"),
           lesson_id: z.string().optional().describe("Lesson ID (full 36-char UUID)"),
+          transcript_id: z.string().optional().describe("Transcript ID to use as source evidence for retro_capture"),
+          transcript_ids: stringOrArray(z.string()).optional().describe("Transcript IDs to use as source evidence for retro_capture"),
+          account_mode: z.enum(["team", "personal", "auto"]).optional().describe("Execution mode for set_account_mode"),
           suggestion_id: z.string().optional().describe("Suggestion ID (full 36-char UUID)"),
           description: z.string().optional().describe("Description for capture_plan"),
           goals: stringOrArray(z.string()).optional().describe("Goals for capture_plan"),
@@ -13938,6 +14016,187 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             return {
               content: [{ type: "text" as const, text: formatContent(resultWithHint) }],
 
+            };
+          }
+
+          case "retro_capture": {
+            const retroEventType = input.event_type || "note";
+            if (retroEventType === "plan") {
+              return errorResult(
+                'retro_capture does not accept event_type="plan" — use session(action="capture_plan") for plans.'
+              );
+            }
+            if (!input.title) {
+              return errorResult("retro_capture requires: title");
+            }
+            const retroQuery = (input.query || "").trim() || undefined;
+            const transcriptIds = Array.from(
+              new Set(
+                [
+                  ...(input.transcript_id ? [input.transcript_id] : []),
+                  ...(Array.isArray(input.transcript_ids)
+                    ? input.transcript_ids
+                    : input.transcript_ids
+                      ? [input.transcript_ids]
+                      : []),
+                ]
+                  .map((value) => String(value).trim())
+                  .filter(Boolean)
+              )
+            );
+            const manualContent = (input.content || "").trim() || undefined;
+            if (!manualContent && !retroQuery && transcriptIds.length === 0) {
+              return errorResult(
+                "retro_capture requires: content, query, transcript_id, or transcript_ids."
+              );
+            }
+
+            let retroSources: RetroCaptureSource[] = [];
+            let sourceLookupError: string | undefined;
+            try {
+              if (retroQuery) {
+                const recallPayload = (await client.smartSearch({
+                  workspace_id: workspaceId,
+                  project_id: projectId,
+                  query: retroQuery,
+                  include_related: input.include_related,
+                  include_decisions: input.include_decisions,
+                })) as Record<string, any>;
+                const recallItems =
+                  recallPayload?.memory_results?.data?.results ||
+                  recallPayload?.memory_results?.results ||
+                  recallPayload?.data?.results ||
+                  recallPayload?.results ||
+                  [];
+                if (Array.isArray(recallItems)) {
+                  for (const item of recallItems.slice(0, Math.min(input.limit || 10, 25))) {
+                    retroSources.push(
+                      retroCaptureSourceFromItem(
+                        String(item?.event_type ?? item?.kind ?? item?.type ?? "memory"),
+                        item
+                      )
+                    );
+                  }
+                }
+              }
+              for (const transcriptId of transcriptIds) {
+                const transcript = (await client.getTranscript(transcriptId)) as Record<
+                  string,
+                  any
+                >;
+                const payload = (transcript as any)?.data ?? transcript ?? {};
+                retroSources.push(
+                  retroCaptureSourceFromItem("transcript", { ...payload, id: transcriptId })
+                );
+              }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              if (manualContent && transcriptIds.length === 0) {
+                // Source enrichment is best-effort when the caller supplied
+                // the content; record the failure in provenance instead.
+                sourceLookupError = message;
+                retroSources = [];
+              } else {
+                return errorResult(`retro_capture source lookup failed: ${message}`);
+              }
+            }
+            retroSources = dedupeRetroCaptureSources(retroSources);
+
+            if (!manualContent && retroSources.length === 0) {
+              return errorResult(
+                "No prior ContextStream sources matched retro_capture. Provide content directly or broaden query/transcript_ids."
+              );
+            }
+
+            const retroContent = buildRetroCaptureContent(manualContent, retroQuery, retroSources);
+            const retroProvenance: Record<string, any> = {
+              ...((input.provenance as Record<string, any>) || {}),
+              source: "mcp_retro_capture",
+              ...(retroQuery ? { source_query: retroQuery } : {}),
+              ...(transcriptIds.length ? { source_transcript_ids: transcriptIds } : {}),
+              sources: retroSources.map((s) => ({ ...s })),
+            };
+            if (sourceLookupError) retroProvenance.source_lookup_error = sourceLookupError;
+
+            const retroTags = [
+              ...(Array.isArray(input.tags) ? input.tags : input.tags ? [input.tags] : []),
+              "retro_capture",
+            ];
+            const retroResult = await client.createMemoryEvent({
+              workspace_id: workspaceId,
+              project_id: projectId,
+              event_type: retroEventType,
+              title: input.title,
+              content: retroContent,
+              tags: retroTags,
+              provenance: retroProvenance as any,
+              code_refs: input.code_refs,
+            });
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `✓ Retroactive ${retroEventType} captured: ${input.title} (${retroSources.length} source${retroSources.length === 1 ? "" : "s"}).`,
+                },
+              ],
+              structuredContent: {
+                ...toStructured(retroResult),
+                retro_capture: {
+                  source_query: retroQuery ?? null,
+                  source_transcript_ids: transcriptIds,
+                  source_count: retroSources.length,
+                  source_results: retroSources,
+                },
+              },
+            };
+          }
+
+          case "set_account_mode": {
+            const accountMode = input.account_mode;
+            if (!accountMode) {
+              return errorResult("set_account_mode requires: account_mode (team | personal | auto).");
+            }
+            let accountSnapshot: Record<string, any> | null = null;
+            if (accountMode === "team" || accountMode === "personal") {
+              try {
+                accountSnapshot = (await client.selectAccountContext(accountMode)) as Record<
+                  string,
+                  any
+                >;
+              } catch (error) {
+                return errorResult(
+                  `Could not select the ${accountMode} account context: ${
+                    error instanceof Error ? error.message : String(error)
+                  }`
+                );
+              }
+            } else {
+              accountSnapshot = (await client
+                .getAccountContext()
+                .catch(() => null)) as Record<string, any> | null;
+            }
+            const accountLines = [`✓ Account execution mode preference set to ${accountMode}.`];
+            if (accountSnapshot && typeof accountSnapshot === "object") {
+              accountLines.push("[ACCOUNT_CONTEXT]");
+              for (const key of [
+                "active_mode",
+                "preference",
+                "account_type",
+                "selected_context",
+                "effective_plan",
+                "team_membership",
+              ]) {
+                if (accountSnapshot[key] !== undefined) {
+                  accountLines.push(`${key}=${accountSnapshot[key]}`);
+                }
+              }
+            }
+            return {
+              content: [{ type: "text" as const, text: accountLines.join("\n") }],
+              structuredContent: toStructured({
+                account_mode: accountMode,
+                account_context: accountSnapshot,
+              }),
             };
           }
 

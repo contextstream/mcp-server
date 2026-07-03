@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.80
+
+**Rust MCP parity pass 5: session-state cluster.**
+
+### session `retro_capture`
+
+- After-the-fact decision/note/snapshot capture from prior work with source provenance. Takes a title plus at least one of `content`, `query`, or `transcript_id(s)`: sources are collected from recall and transcript reads, deduplicated, and assembled into the event content as numbered `[kind] title (id) — date` evidence with a `Source query:` line. Provenance records `source=mcp_retro_capture`, the source query, transcript ids, and source snippets; source-lookup failures are tolerated only when manual content was provided (recorded as `provenance.source_lookup_error`). The structured result echoes a `retro_capture` block (source query, transcript ids, count, results). Plan event types are rejected — `capture_plan` owns plans. Participates in write-scope resolution and one-shot scope recovery.
+
+### session `set_account_mode`
+
+- Validates `team | personal | auto`; team/personal select the account context via the public account-context endpoint (auto only reads the current snapshot), and the result renders an `[ACCOUNT_CONTEXT]` block. Note: per-call `account_mode` overrides on other tools remain unported (they depend on execution-state plumbing this package does not carry).
+
 ## 0.4.79
 
 **Rust MCP parity pass 4: metadata/UX polish cluster (v0.3.11–v0.5.27).**

@@ -39,7 +39,7 @@ const CONTEXTSTREAM_TOOL_NAMES = [
 
   // Consolidated domain tools (v0.4.x default)
   "search", // Modes: auto (recommended), semantic, hybrid (legacy alias), keyword, pattern
-  "session", // Actions: capture, capture_lesson, get_lessons, recall, remember, user_context, summary, compress, delta, smart_search, decision_trace
+  "session", // Actions: capture, retro_capture, capture_lesson, get_lessons, update_lesson, delete_lesson, recall, ground, set_account_mode, remember, user_context, summary, compress, delta, smart_search, decision_trace
   "memory", // Actions: create_event, get_event, update_event, delete_event, list_events, distill_event, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, search, decisions, timeline, summary
   "entity", // Actions: list, get, create, update, delete for structured taxonomy entities
   "capsule", // Actions: open, create, share, bootstrap_prompt, graph, audit, delete

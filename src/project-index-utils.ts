@@ -1,4 +1,53 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
 type RecordValue = Record<string, unknown>;
+
+/** Current git HEAD commit for a folder, or null when unavailable. */
+export async function readGitHead(folderPath: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", folderPath, "rev-parse", "HEAD"], {
+      timeout: 2_000,
+    });
+    const head = stdout.trim();
+    return /^[0-9a-f]{40}$/i.test(head) ? head.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Normalized origin identity (host/org/repo) for a folder, or null. */
+export async function readGitRemoteIdentity(folderPath: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", folderPath, "config", "--get", "remote.origin.url"],
+      { timeout: 2_000 }
+    );
+    return normalizeGitRemote(stdout);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reduce a git remote URL to a comparable identity: lowercase host/org/repo
+ * with scheme, credentials, and .git suffix stripped. Both
+ * `git@github.com:org/repo.git` and `https://github.com/org/repo` normalize
+ * to `github.com/org/repo`.
+ */
+export function normalizeGitRemote(url: string): string | null {
+  const trimmed = url.trim().toLowerCase();
+  if (!trimmed) return null;
+  const withoutScheme = trimmed.replace(/^[a-z+]+:\/\//, "").replace(/^[^@/]*@/, "");
+  const unified = withoutScheme
+    .replace(":", "/")
+    .replace(/\.git\/?$/, "")
+    .replace(/\/+$/, "");
+  return unified || null;
+}
 
 export type IndexFreshness = "fresh" | "recent" | "aging" | "stale" | "missing" | "unknown";
 export type IndexConfidence = "high" | "medium" | "low";

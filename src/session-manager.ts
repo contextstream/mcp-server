@@ -168,6 +168,54 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Replace the active workspace/project scope, allowing fields to be cleared.
+   * Unlike updateScope (merge-only), passing null removes the binding — used by
+   * scope recovery when a stale scope must be dropped before re-resolution.
+   */
+  replaceScope(input: {
+    workspace_id?: string | null;
+    project_id?: string | null;
+    folder_path?: string;
+  }) {
+    if (!this.context) {
+      this.context = {};
+    }
+
+    if (input.workspace_id === null) {
+      delete this.context.workspace_id;
+    } else if (typeof input.workspace_id === "string" && input.workspace_id.trim()) {
+      this.context.workspace_id = input.workspace_id;
+    }
+
+    if (input.project_id === null) {
+      delete this.context.project_id;
+    } else if (typeof input.project_id === "string" && input.project_id.trim()) {
+      this.context.project_id = input.project_id;
+    }
+
+    if (typeof input.folder_path === "string" && input.folder_path.trim()) {
+      this.context.folder_path = input.folder_path;
+      this.folderPath = input.folder_path;
+    }
+
+    this.client.clearDefaults({
+      workspace: input.workspace_id === null,
+      project: input.project_id === null || input.workspace_id === null,
+    });
+    const workspaceId =
+      typeof this.context.workspace_id === "string"
+        ? (this.context.workspace_id as string)
+        : undefined;
+    const projectId =
+      typeof this.context.project_id === "string"
+        ? (this.context.project_id as string)
+        : undefined;
+    if (workspaceId || projectId) {
+      this.client.setDefaults({ workspace_id: workspaceId, project_id: projectId });
+    }
+  }
+
   private extractDefaultSearchMode(context: Record<string, unknown>): string | null {
     const fromWorkspace =
       context.workspace &&

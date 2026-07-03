@@ -32,6 +32,14 @@ import {
 } from "./hooks-config.js";
 import { HttpError } from "./http.js";
 import { forgetLocalConfig, resolveWorkspace } from "./workspace-config.js";
+import {
+  isScopeError,
+  prependScopeNote,
+  recoverWriteScopeAfterProjectError,
+  resolveProjectScopeId,
+  resolveWriteScope,
+  runWithScopeNoteCapture,
+} from "./scope.js";
 import { trackToolTokenSavings, type TokenSavingsToolType } from "./token-savings.js";
 import {
   getSessionInitTip,
@@ -53,6 +61,8 @@ import {
   extractPendingFilePaths,
   extractIndexTimestamp,
   indexHistoryEntryCount,
+  readGitHead,
+  readGitRemoteIdentity,
 } from "./project-index-utils.js";
 import { resolveTodoCompletionUpdate } from "./todo-utils.js";
 import { globalHotPathStore } from "./hot-paths.js";
@@ -2652,6 +2662,85 @@ const VALID_DOC_TYPES = [
   "general",
 ] as const;
 
+// Actions whose writes resolve scope centrally (drift healing) and are
+// eligible for a one-shot retry after a stale-scope error.
+const MEMORY_WRITE_SCOPE_ACTIONS = new Set([
+  "create_event",
+  "create_node",
+  "create_task",
+  "create_todo",
+  "create_diagram",
+  "create_doc",
+  "create_roadmap",
+  "import_batch",
+]);
+const SESSION_WRITE_SCOPE_ACTIONS = new Set([
+  "capture",
+  "capture_lesson",
+  "capture_plan",
+  "remember",
+]);
+const SCOPE_RETRY_FLAT_TOOLS = new Set([
+  "capture_plan",
+  "session_capture",
+  "session_capture_lesson",
+  "session_remember",
+  "memory_create_doc",
+  "memory_update_doc",
+  "memory_delete_doc",
+  "memory_create_task",
+  "memory_update_task",
+  "memory_create_todo",
+  "memory_complete_todo",
+  "memory_create_event",
+]);
+const SCOPE_RETRY_CONSOLIDATED_ACTIONS = new Set([
+  ...MEMORY_WRITE_SCOPE_ACTIONS,
+  ...SESSION_WRITE_SCOPE_ACTIONS,
+  "decisions",
+  "create",
+  "list",
+]);
+
+// A degenerate step/task title turns prose into unsearchable junk tasks —
+// reject at capture time with a per-title reason.
+export function degenerateTitleReason(title: unknown): string | null {
+  if (typeof title !== "string") return "missing";
+  const trimmed = title.trim();
+  if (!trimmed) return "empty";
+  if (/^-+$/.test(trimmed)) return "placeholder dashes";
+  if (trimmed.includes("\n")) return "multi-line";
+  if (trimmed.length > 200) return `too long (${trimmed.length} chars, max 200)`;
+  if (!trimmed.includes(" ") && /^[\w@.\\/-]+\.[a-z0-9]{1,8}$/i.test(trimmed)) {
+    return "bare file path";
+  }
+  if (/^(\.{0,2}\/)?[\w.-]+(\/[\w.-]+)+\/?$/.test(trimmed)) return "bare file path";
+  return null;
+}
+
+export function collectDegenerateStepTitles(steps: unknown): string | null {
+  if (!Array.isArray(steps)) return null;
+  const issues: string[] = [];
+  steps.forEach((step, index) => {
+    const title = (step as Record<string, unknown> | null)?.title;
+    const reason = degenerateTitleReason(title);
+    if (reason) {
+      const shown = typeof title === "string" ? title.slice(0, 60) : String(title);
+      issues.push(`- step ${index + 1}: ${reason} ("${shown}")`);
+    }
+  });
+  if (issues.length === 0) return null;
+  return `capture_plan rejected: ${issues.length} step title(s) are not usable as task titles:\n${issues.join("\n")}\nGive each step a short, action-oriented title; put details in the step description.`;
+}
+
+function scopeRetryEligible(toolName: string, action: unknown): boolean {
+  if (SCOPE_RETRY_FLAT_TOOLS.has(toolName)) return true;
+  if (toolName === "memory" || toolName === "session" || toolName === "entity") {
+    return typeof action === "string" && SCOPE_RETRY_CONSOLIDATED_ACTIONS.has(action);
+  }
+  return false;
+}
+
 const CAPSULE_ACTIONS = [
   "open",
   "get",
@@ -4298,9 +4387,41 @@ export function registerTools(
         const integrationGated = await gateIfIntegrationTool(name);
         if (integrationGated) return integrationGated;
 
-        const result = await handler(input, extra);
-        return maybeStripStructuredContent(result);
+        const { result, note } = await runWithScopeNoteCapture(() => handler(input, extra));
+        return maybeStripStructuredContent(prependScopeNote(result, note));
       } catch (error: any) {
+        // One-shot scope recovery for write-capable calls: heal a stale
+        // workspace/project binding, then retry the handler once. The retried
+        // call re-resolves scope from the corrected session context.
+        if (
+          sessionManager &&
+          isScopeError(error) &&
+          scopeRetryEligible(name, (input as Record<string, unknown> | undefined)?.action)
+        ) {
+          const ctx = sessionManager.getContext();
+          const attempted = {
+            workspaceId:
+              typeof ctx?.workspace_id === "string" ? (ctx.workspace_id as string) : undefined,
+            projectId:
+              typeof ctx?.project_id === "string" ? (ctx.project_id as string) : undefined,
+            recovered: false,
+          };
+          try {
+            const recoveredScope = await recoverWriteScopeAfterProjectError(
+              client,
+              sessionManager,
+              attempted,
+              error
+            );
+            if (recoveredScope) {
+              const { result, note } = await runWithScopeNoteCapture(() => handler(input, extra));
+              const combined = [recoveredScope.note, note].filter(Boolean).join(" ");
+              return maybeStripStructuredContent(prependScopeNote(result, combined || undefined));
+            }
+          } catch {
+            // Retry failed — fall through and render the original error.
+          }
+        }
         const rawMessage = error?.message || String(error);
         const errorMessage =
           rawMessage.length > 500 ? `${rawMessage.slice(0, 500)}…` : rawMessage;
@@ -5306,6 +5427,7 @@ export function registerTools(
     const projects = status.projects ?? {};
     const resolvedFolder = path.resolve(folderPath);
     let bestMatch: { projectId: string; matchLen: number } | undefined;
+    let currentRemotePromise: Promise<string | null> | undefined;
 
     for (const [projectPath, info] of Object.entries(projects)) {
       const resolvedProjectPath = path.resolve(projectPath);
@@ -5315,6 +5437,13 @@ export function registerTools(
         resolvedProjectPath.startsWith(`${resolvedFolder}${path.sep}`);
       if (!matches) continue;
       if (!info?.indexed_at) continue;
+
+      // Twin/repair binding requires matching git-remote identity: a repo
+      // that merely shares a name or path leaf must never bind to this entry.
+      if (info?.git_remote) {
+        currentRemotePromise ??= readGitRemoteIdentity(resolvedFolder);
+        if ((await currentRemotePromise) !== info.git_remote) continue;
+      }
 
       const indexedAt = new Date(info.indexed_at);
       if (!Number.isNaN(indexedAt.getTime())) {
@@ -5409,7 +5538,17 @@ export function registerTools(
     options: { preflight?: boolean } = {}
   ): void {
     // Pre-write index status to prevent race conditions
-    markProjectIndexed(resolvedPath, { project_id: projectId }).catch(() => {});
+    void (async () => {
+      const [gitHead, gitRemote] = await Promise.all([
+        readGitHead(resolvedPath),
+        readGitRemoteIdentity(resolvedPath),
+      ]);
+      await markProjectIndexed(resolvedPath, {
+        project_id: projectId,
+        git_head: gitHead ?? undefined,
+        git_remote: gitRemote ?? undefined,
+      });
+    })().catch(() => {});
 
     (async () => {
       try {
@@ -8198,7 +8337,7 @@ This does semantic search on the first message. You only need context on subsequ
             "Current workspace/project folder path (absolute). Use this when IDE roots are not available."
           ),
         workspace_id: z.string().uuid().optional().describe("Workspace to initialize context for"),
-        project_id: z.string().uuid().optional().describe("Project to initialize context for"),
+        project_id: z.string().optional().describe("Project to initialize context for (UUID, or a project name to look up)"),
         session_id: z
           .string()
           .optional()
@@ -8262,12 +8401,50 @@ This does semantic search on the first message. You only need context on subsequ
         ideRoots = [input.folder_path];
       }
 
+      // A non-UUID project_id is treated as a project name, matching the
+      // scope-resolution behavior elsewhere.
+      if (input.project_id && !normalizeUuid(input.project_id)) {
+        const projectLookup = await resolveProjectScopeId(
+          client,
+          resolveWorkspaceId(input.workspace_id),
+          input.project_id
+        );
+        if (projectLookup.error) return errorResult(projectLookup.error);
+        input.project_id = projectLookup.id;
+      }
+
       // Pass detected client name for analytics tracking
       const clientName = getDetectedClientName();
-      const result = (await client.initSession(
-        { ...input, client_name: clientName || undefined },
-        ideRoots
-      )) as Record<string, unknown>;
+      // An explicit folder_path expresses "bind to this folder": suppress any
+      // header-injected scope so folder resolution can actually run. If folder
+      // resolution then yields no workspace (typical through the HTTP gateway,
+      // where the server cannot read the caller's local config), restore the
+      // inherited header scope as the fallback.
+      const inheritedOverride = getAuthOverride();
+      const suppressHeaderScope = Boolean(
+        input.folder_path && (inheritedOverride?.workspaceId || inheritedOverride?.projectId)
+      );
+      const runInit = () =>
+        client.initSession(
+          { ...input, client_name: clientName || undefined },
+          ideRoots
+        ) as Promise<Record<string, unknown>>;
+      let result: Record<string, unknown>;
+      if (suppressHeaderScope) {
+        result = await runWithAuthOverride(
+          { ...inheritedOverride, workspaceId: undefined, projectId: undefined },
+          runInit
+        );
+        if (typeof result.workspace_id !== "string" || !result.workspace_id) {
+          result = await runInit();
+          if (typeof result.workspace_id === "string" && result.workspace_id) {
+            (result as any).scope_note =
+              "Folder resolution found no workspace; restored the request's inherited header scope.";
+          }
+        }
+      } else {
+        result = await runInit();
+      }
 
       // Add compact tool reference to help AI know available tools
       result.tools_hint = getCoreToolsHint();
@@ -10331,6 +10508,13 @@ After compression, the AI can use session_recall to retrieve this context in fut
       }),
     },
     async (input) => {
+      const degenerateSteps = collectDegenerateStepTitles(input.steps);
+      if (degenerateSteps) {
+        return {
+          content: [{ type: "text" as const, text: degenerateSteps }],
+          isError: true,
+        };
+      }
       const result = await client.createPlan(input);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
@@ -12850,6 +13034,12 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         const roundTripMs = Date.now() - startTime;
         let { results, total } = extractSearchEnvelope(selected.result);
         const scopeInvalid = isScopeInvalidResult(selected.result);
+        if (scopeInvalid) {
+          modeFallbackNote = appendNote(
+            modeFallbackNote,
+            '[SCOPE_UNRELIABLE] The backend flagged this search\'s workspace/project scope as invalid — results may come from the wrong project. Run init(folder_path="...") to re-bind, or pass workspace_id/project_id explicitly.'
+          );
+        }
 
         for (const r of results) {
           if (r.file_path) {
@@ -13078,6 +13268,109 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       }
     );
 
+    // Resolve a plan reference for get_plan/update_plan. A UUID is used
+    // directly; other text matches against plan titles in scope; with no
+    // reference at all, the latest actionable plan is picked, preferring
+    // substantive plans (progress, active status, or linked tasks) over
+    // stray 0% drafts. A miss returns the in-scope listing — never a
+    // dead-end.
+    async function resolvePlanForAction(input: {
+      plan_id?: string;
+      query?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<{ planId: string; note?: string } | { listing: string } | { error: string }> {
+      const direct = normalizeUuid(input.plan_id);
+      if (direct) return { planId: direct };
+
+      const workspaceId = resolveWorkspaceId(input.workspace_id);
+      if (!workspaceId) {
+        return {
+          error: "Plan lookup requires workspace scope. Run init first, or pass plan_id as a UUID.",
+        };
+      }
+      const projectId = normalizeUuid(input.project_id) || resolveProjectId(undefined);
+      let plans: Array<Record<string, any>> = [];
+      try {
+        const listed = (await client.listPlans({
+          workspace_id: workspaceId,
+          project_id: projectId,
+          limit: 50,
+        })) as any;
+        const collected = Array.isArray(listed)
+          ? listed
+          : listed?.items || listed?.plans || listed?.data?.items || listed?.data?.plans || listed?.data;
+        plans = Array.isArray(collected) ? collected : [];
+      } catch (error) {
+        return {
+          error: `Could not list plans for lookup: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+
+      const lookupRaw = (input.plan_id || input.query || "").trim();
+      if (lookupRaw) {
+        const lookup = lookupRaw.toLowerCase();
+        const matches = plans.filter((p) =>
+          String(p?.title ?? "").trim().toLowerCase().includes(lookup)
+        );
+        const singleId = matches.length === 1 ? normalizeUuid(matches[0]?.id) : undefined;
+        if (singleId) {
+          return {
+            planId: singleId,
+            note: `Resolved plan "${lookupRaw}" to **${matches[0]?.title}**.`,
+          };
+        }
+        if (matches.length > 1) {
+          return {
+            listing: formatPlanCandidates(matches, `Multiple plans match "${lookupRaw}" — pass plan_id:`),
+          };
+        }
+        return {
+          listing: formatPlanCandidates(plans, `No plan matches "${lookupRaw}". Plans in scope:`),
+        };
+      }
+
+      const actionable = plans.filter(
+        (p) => String(p?.status ?? "").toLowerCase() !== "archived"
+      );
+      if (actionable.length === 0) {
+        return { listing: formatPlanCandidates(plans, "No actionable plans in scope.") };
+      }
+      const isSubstantive = (p: Record<string, any>) => {
+        const progress = Number(p?.progress ?? p?.progress_percent ?? 0);
+        const status = String(p?.status ?? "").toLowerCase();
+        const taskCount = Array.isArray(p?.tasks) ? p.tasks.length : Number(p?.task_count ?? 0);
+        return progress > 0 || status === "active" || taskCount > 0;
+      };
+      const pick = actionable.find(isSubstantive) ?? actionable[0];
+      const pickId = normalizeUuid(pick?.id);
+      if (!pickId) {
+        return { listing: formatPlanCandidates(plans, "Plans in scope:") };
+      }
+      const others = actionable
+        .filter((p) => p !== pick)
+        .slice(0, 3)
+        .map((p) => `- ${p?.title || p?.id}`)
+        .join("\n");
+      return {
+        planId: pickId,
+        note: `Auto-resolved to the latest actionable plan: **${pick?.title || pickId}**.${others ? `\nOther actionable plans:\n${others}` : ""}`,
+      };
+    }
+
+    function formatPlanCandidates(plans: Array<Record<string, any>>, headline: string): string {
+      if (!plans.length) {
+        return `${headline}\n(none) — save one with session(action="capture_plan", title="...", steps=[...]).`;
+      }
+      const lines = plans.slice(0, 10).map((p) => {
+        const status = String(p?.status ?? "unknown");
+        const progress = Number(p?.progress ?? p?.progress_percent ?? 0);
+        const progressLabel = Number.isFinite(progress) && progress > 0 ? ` ${progress}%` : "";
+        return `- ${p?.title || "(untitled)"} [${status}${progressLabel}] (id: ${p?.id})`;
+      });
+      return `${headline}\n${lines.join("\n")}`;
+    }
+
     // Resolve a lesson reference (UUID or lookup text) to its memory event id.
     // Text lookups rank exact title matches first and refuse ambiguous
     // matches so a bulk-worded lookup can never silently edit the wrong lesson.
@@ -13300,7 +13593,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             })
             .optional(),
           // Plan-specific params (accept string so truncated UUID prefixes emit a friendly handler-level error; see issue #53)
-          plan_id: z.string().optional().describe("Plan ID (full 36-char UUID) for get_plan/update_plan"),
+          plan_id: z.string().optional().describe("Plan ID (UUID) or plan title text for get_plan/update_plan; omit to resolve the latest actionable plan"),
           event_id: z.string().optional().describe("Event ID (full 36-char UUID)"),
           task_id: z.string().optional().describe("Task ID (full 36-char UUID)"),
           node_id: z.string().optional().describe("Node ID (full 36-char UUID)"),
@@ -13420,6 +13713,20 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         );
         if (resolvedSuggestionId.error) return errorResult(resolvedSuggestionId.error);
         if (resolvedSuggestionId.value) input.suggestion_id = resolvedSuggestionId.value;
+
+        // Capture-style writes resolve a consistent scope centrally (project
+        // names accepted, implicit drift healed, explicit-stale errors).
+        if (SESSION_WRITE_SCOPE_ACTIONS.has(input.action)) {
+          const projectLookup = await resolveProjectScopeId(client, workspaceId, input.project_id);
+          if (projectLookup.error) return errorResult(projectLookup.error);
+          const writeScope = await resolveWriteScope(client, sessionManager ?? null, {
+            workspaceId: input.workspace_id,
+            projectId: projectLookup.id,
+          });
+          if (writeScope.error) return errorResult(writeScope.error);
+          workspaceId = writeScope.workspaceId;
+          projectId = writeScope.projectId;
+        }
 
         switch (input.action) {
           case "capture": {
@@ -13931,6 +14238,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             if (!workspaceId) {
               return errorResult("capture_plan requires workspace_id. Call session_init first.");
             }
+            const degenerateSteps = collectDegenerateStepTitles(input.steps);
+            if (degenerateSteps) {
+              return errorResult(degenerateSteps);
+            }
             const result = await client.createPlan({
               workspace_id: workspaceId,
               project_id: projectId,
@@ -13955,25 +14266,32 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
 
           case "get_plan": {
-            if (!input.plan_id) {
-              return errorResult("get_plan requires: plan_id");
+            const resolvedPlan = await resolvePlanForAction(input);
+            if ("error" in resolvedPlan) return errorResult(resolvedPlan.error);
+            if ("listing" in resolvedPlan) {
+              return { content: [{ type: "text" as const, text: resolvedPlan.listing }] };
             }
             const result = await client.getPlan({
-              plan_id: input.plan_id,
+              plan_id: resolvedPlan.planId,
               include_tasks: input.include_tasks !== false,
             });
+            const planText = resolvedPlan.note
+              ? `${resolvedPlan.note}\n${formatContent(result)}`
+              : formatContent(result);
             return {
-              content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              content: [{ type: "text" as const, text: planText }],
+
             };
           }
 
           case "update_plan": {
-            if (!input.plan_id) {
-              return errorResult("update_plan requires: plan_id");
+            const resolvedPlanForUpdate = await resolvePlanForAction(input);
+            if ("error" in resolvedPlanForUpdate) return errorResult(resolvedPlanForUpdate.error);
+            if ("listing" in resolvedPlanForUpdate) {
+              return { content: [{ type: "text" as const, text: resolvedPlanForUpdate.listing }] };
             }
             const result = await client.updatePlan({
-              plan_id: input.plan_id,
+              plan_id: resolvedPlanForUpdate.planId,
               title: input.title,
               content: input.content,
               description: input.description,
@@ -15472,6 +15790,22 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         );
         if (resolvedMemoryTranscriptId.error) return errorResult(resolvedMemoryTranscriptId.error);
         if (resolvedMemoryTranscriptId.value) input.transcript_id = resolvedMemoryTranscriptId.value;
+
+        // Write actions resolve a consistent scope centrally: project names
+        // are accepted in place of UUIDs, implicit workspace/project drift is
+        // healed before the first attempt, and an explicitly requested but
+        // inaccessible project is a hard error.
+        if (MEMORY_WRITE_SCOPE_ACTIONS.has(input.action)) {
+          const projectLookup = await resolveProjectScopeId(client, workspaceId, input.project_id);
+          if (projectLookup.error) return errorResult(projectLookup.error);
+          const writeScope = await resolveWriteScope(client, sessionManager ?? null, {
+            workspaceId: input.workspace_id,
+            projectId: projectLookup.id,
+          });
+          if (writeScope.error) return errorResult(writeScope.error);
+          workspaceId = writeScope.workspaceId;
+          projectId = writeScope.projectId;
+        }
 
         switch (input.action) {
           case "create_event": {

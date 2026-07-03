@@ -64,14 +64,18 @@ function printHelp() {
 Usage:
   npx --prefer-online -y @contextstream/mcp-server@latest
   contextstream-mcp
-  contextstream-mcp setup
+  contextstream-mcp setup [--yes] [--dry-run] [--editors=claude,cursor] [--no-doctor]
   contextstream-mcp doctor
+  contextstream-mcp index [path]
   contextstream-mcp http
   contextstream-mcp hook <hook-name>
 
 Commands:
-  setup                      Interactive onboarding wizard (rules + workspace mapping)
+  setup                      Onboarding wizard (rules + workspace mapping). --yes runs zero-prompt
+                             with defaults; --editors=<csv> pre-selects editors; --no-doctor skips
+                             the final verification step
   doctor                     Read-only diagnostics: auth, API, folder scope, index health, rules, hooks
+  index [path]               Index a project folder now (the wizard runs this in the background)
   verify-key [--json]        Verify API key and show account info
   update-hooks [flags]       Update hooks for all editors (Claude, Cursor, Cline, Roo, Kilo)
     --scope=global           Install hooks globally (default)
@@ -189,6 +193,12 @@ async function main() {
   if (args[0] === "doctor") {
     const { runDoctor } = await import("./doctor.js");
     await runDoctor();
+    return;
+  }
+
+  if (args[0] === "index") {
+    const { runIndexCommand } = await import("./setup.js");
+    await runIndexCommand(args[1] || process.cwd());
     return;
   }
 

@@ -1194,7 +1194,7 @@ async function selectProjectForCurrentDirectory(
   cwd: string,
   workspaceId: string | undefined,
   dryRun: boolean,
-  rl: ReturnType<typeof createInterface>
+  question: (query: string) => Promise<string>
 ): Promise<ProjectSelection | undefined> {
   if (!workspaceId || workspaceId === "dry-run") {
     return undefined;
@@ -1269,7 +1269,7 @@ async function selectProjectForCurrentDirectory(
   console.log("\nProject selection (current directory):");
   options.forEach((opt, i) => console.log(`  ${i + 1}) ${opt.label}`));
 
-  const choiceRaw = normalizeInput(await rl.question(`Choose [1-${options.length}] (default 1): `));
+  const choiceRaw = normalizeInput(await question(`Choose [1-${options.length}] (default 1): `));
   const choiceNum = Number.parseInt(choiceRaw || "1", 10);
   const selected = Number.isFinite(choiceNum) ? options[choiceNum - 1] : options[0];
 
@@ -1311,6 +1311,20 @@ async function selectProjectForCurrentDirectory(
   }
 
   return undefined;
+}
+
+/**
+ * `contextstream-mcp index <path>` — resolve the project for a folder and
+ * run indexing with progress. Also the target of the wizard's detached
+ * background project-setup child.
+ */
+export async function runIndexCommand(targetPath: string): Promise<void> {
+  const resolvedPath = path.resolve(targetPath);
+  const { loadConfig } = await import("./config.js");
+  const config = loadConfig();
+  const client = new ContextStreamClient(config);
+  const localConfig = readLocalConfig(resolvedPath);
+  await indexProjectWithProgress(client, resolvedPath, localConfig?.workspace_id);
 }
 
 async function indexProjectWithProgress(
@@ -1506,7 +1520,18 @@ async function indexProjectWithProgress(
 
 export async function runSetupWizard(args: string[]): Promise<void> {
   const dryRun = args.includes("--dry-run");
+  const assumeYes = args.includes("--yes") || args.includes("-y");
+  const skipDoctor = args.includes("--no-doctor");
+  const editorsFlag = args
+    .find((arg) => arg.startsWith("--editors="))
+    ?.slice("--editors=".length)
+    .trim();
   const rl = createInterface({ input: stdin, output: stdout });
+  // Zero-prompt mode: every prompt resolves to "" so each call site's
+  // documented default applies; sites where "" is not the right automated
+  // answer special-case assumeYes explicitly.
+  const question = (query: string): Promise<string> =>
+    assumeYes ? Promise.resolve("") : rl.question(query);
 
   const writeActions: Array<{
     kind: "rules" | "workspace-config" | "mcp-config" | "hooks";
@@ -1524,7 +1549,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     if (!exists) return true;
 
     const answer = normalizeInput(
-      await rl.question(
+      await question(
         `Rules file already exists at ${filePath}. Replace ContextStream block? [y/N/a/s]: `
       )
     ).toLowerCase();
@@ -1557,12 +1582,19 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
       console.log("");
       const continueAnyway = normalizeInput(
-        await rl.question("Continue with current version anyway? [y/N]: ")
+        await question("Continue with current version anyway? [y/N]: ")
       ).toLowerCase();
       if (continueAnyway !== "y" && continueAnyway !== "yes") {
-        console.log("\nExiting. Run the command above to use the latest version.");
-        rl.close();
-        return;
+        if (assumeYes) {
+          // Automation must not dead-end on the version gate.
+          console.log(
+            "\n--yes: continuing with the current version (rerun via @latest when convenient)."
+          );
+        } else {
+          console.log("\nExiting. Run the command above to use the latest version.");
+          rl.close();
+          return;
+        }
       }
       console.log("");
     }
@@ -1572,7 +1604,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       process.env.CONTEXTSTREAM_API_URL || savedCreds?.api_url || "https://api.contextstream.io"
     );
     const apiUrl = normalizeApiUrl(
-      normalizeInput(await rl.question(`ContextStream API URL [${apiUrlDefault}]: `)) ||
+      normalizeInput(await question(`ContextStream API URL [${apiUrlDefault}]: `)) ||
         apiUrlDefault
     );
 
@@ -1583,7 +1615,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     if (apiKey) {
       const confirm = normalizeInput(
-        await rl.question(
+        await question(
           `Use CONTEXTSTREAM_API_KEY from environment (${maskApiKey(apiKey)})? [Y/n]: `
         )
       );
@@ -1595,7 +1627,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     if (!apiKey && savedCreds?.api_key && normalizeApiUrl(savedCreds.api_url) === apiUrl) {
       const confirm = normalizeInput(
-        await rl.question(
+        await question(
           `Use saved API key from ${credentialsFilePath()} (${maskApiKey(savedCreds.api_key)})? [Y/n]: `
         )
       );
@@ -1605,18 +1637,25 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       }
     }
 
+    if (!apiKey && assumeYes) {
+      // Zero-prompt mode cannot mint credentials or drive a browser flow.
+      throw new Error(
+        "--yes needs credentials: set CONTEXTSTREAM_API_KEY (or run `contextstream-mcp setup` interactively once so the wizard can save one)."
+      );
+    }
+
     if (!apiKey) {
       console.log("\nAuthentication:");
       console.log("  1) Browser login (recommended)");
       console.log("  2) Paste an API key");
-      const authChoice = normalizeInput(await rl.question("Choose [1/2] (default 1): ")) || "1";
+      const authChoice = normalizeInput(await question("Choose [1/2] (default 1): ")) || "1";
 
       if (authChoice === "2") {
         console.log("\nYou need a ContextStream API key to continue.");
         console.log(
           "Create one here (then paste it): https://app.contextstream.io/settings/api-keys\n"
         );
-        apiKey = normalizeInput(await rl.question("CONTEXTSTREAM_API_KEY: "));
+        apiKey = normalizeInput(await question("CONTEXTSTREAM_API_KEY: "));
         apiKeySource = "paste";
       } else {
         const anonClient = new ContextStreamClient(buildClientConfig({ apiUrl }));
@@ -1754,6 +1793,42 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       }
     }
 
+    // Project setup must never block onboarding (soft-wait): indexing runs
+    // in a detached child that survives this wizard exiting. Search works
+    // immediately — keyword first, semantic as the index builds.
+    async function startBackgroundIndexing(projectPath: string): Promise<void> {
+      const projectLabel = path.basename(projectPath);
+      try {
+        const { spawn } = await import("node:child_process");
+        const entry = process.argv[1];
+        if (!entry) throw new Error("cannot resolve CLI entry point");
+        const child = spawn(process.execPath, [entry, "index", projectPath], {
+          detached: true,
+          stdio: "ignore",
+          env: {
+            ...process.env,
+            CONTEXTSTREAM_API_URL: apiUrl,
+            ...(apiKey ? { CONTEXTSTREAM_API_KEY: apiKey } : {}),
+          },
+        });
+        child.unref();
+        console.log(`\nProject setup started in the background for '${projectLabel}'.`);
+        console.log(
+          "Search works immediately — keyword results first, semantic as the index builds."
+        );
+        console.log(
+          'Check progress anytime: project(action="index_status") or `contextstream-mcp doctor`.'
+        );
+      } catch (error) {
+        console.log(
+          `\nCould not start background project setup for '${projectLabel}' (${
+            error instanceof Error ? error.message : String(error)
+          }).`
+        );
+        console.log(`Run it manually: contextstream-mcp index ${projectPath}`);
+      }
+    }
+
     // Workspace selection
     let workspaceId: string | undefined;
     let workspaceName: string | undefined;
@@ -1763,16 +1838,16 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     console.log("  1) Create a new workspace");
     console.log("  2) Select an existing workspace");
     console.log("  3) Skip (rules only, no workspace mapping)");
-    const wsChoice = normalizeInput(await rl.question("Choose [1/2/3] (default 2): ")) || "2";
+    const wsChoice = normalizeInput(await question("Choose [1/2/3] (default 2): ")) || "2";
 
     if (wsChoice === "1") {
-      const name = normalizeInput(await rl.question("Workspace name: "));
+      const name = normalizeInput(await question("Workspace name: "));
       if (!name) throw new Error("Workspace name is required.");
-      const description = normalizeInput(await rl.question("Workspace description (optional): "));
+      const description = normalizeInput(await question("Workspace description (optional): "));
       let visibility = "private";
       while (true) {
         const raw =
-          normalizeInput(await rl.question("Visibility [private/team/org] (default private): ")) ||
+          normalizeInput(await question("Visibility [private/team/org] (default private): ")) ||
           "private";
         const normalized = raw.trim().toLowerCase() === "public" ? "org" : raw.trim().toLowerCase();
         if (normalized === "private" || normalized === "team" || normalized === "org") {
@@ -1812,9 +1887,12 @@ export async function runSetupWizard(args: string[]): Promise<void> {
         items.slice(0, 20).forEach((w, i) => {
           console.log(`  ${i + 1}) ${w.name || "Untitled"}${w.id ? ` (${w.id})` : ""}`);
         });
-        const idxRaw = normalizeInput(
-          await rl.question("Select workspace number (or blank to skip): ")
-        );
+        const idxRaw =
+          assumeYes && items.length === 1
+            ? "1"
+            : normalizeInput(
+                await question("Select workspace number (or blank to skip): ")
+              );
         if (idxRaw) {
           const idx = Number.parseInt(idxRaw, 10);
           const selected = Number.isFinite(idx) ? items[idx - 1] : undefined;
@@ -1832,7 +1910,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
         process.cwd(),
         workspaceId,
         dryRun,
-        rl
+        question
       );
       if (selectedCurrentProject) {
         console.log(
@@ -1870,7 +1948,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     );
     const currentAutoUpdate = isAutoUpdateEnabled();
     const autoUpdateChoice = normalizeInput(
-      await rl.question(`Enable auto-update? [${currentAutoUpdate ? "Y/n" : "y/N"}]: `)
+      await question(`Enable auto-update? [${currentAutoUpdate ? "Y/n" : "y/N"}]: `)
     ).toLowerCase();
     const autoUpdateEnabled =
       autoUpdateChoice === ""
@@ -1898,11 +1976,27 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       "aider",
       "antigravity",
     ];
-    console.log('\nSelect editors to configure (comma-separated numbers, or "all"):');
-    editors.forEach((e, i) => console.log(`  ${i + 1}) ${EDITOR_LABELS[e]}`));
-    const selectedRaw = normalizeInput(await rl.question("Editors [all]: ")) || "all";
-    const selectedNums = parseNumberList(selectedRaw, editors.length);
-    const selectedEditors = selectedNums.length ? selectedNums.map((n) => editors[n - 1]) : editors;
+    let selectedEditors: EditorKey[];
+    if (editorsFlag) {
+      const requested = editorsFlag
+        .split(",")
+        .map((name) => name.trim().toLowerCase())
+        .filter(Boolean);
+      const unknown = requested.filter((name) => !editors.includes(name as EditorKey));
+      if (unknown.length) {
+        throw new Error(
+          `Unknown editor(s) in --editors: ${unknown.join(", ")}. Known: ${editors.join(", ")}`
+        );
+      }
+      selectedEditors = editors.filter((editor) => requested.includes(editor));
+      console.log(`\nEditors (from --editors): ${selectedEditors.join(", ")}`);
+    } else {
+      console.log('\nSelect editors to configure (comma-separated numbers, or "all"):');
+      editors.forEach((e, i) => console.log(`  ${i + 1}) ${EDITOR_LABELS[e]}`));
+      const selectedRaw = normalizeInput(await question("Editors [all]: ")) || "all";
+      const selectedNums = parseNumberList(selectedRaw, editors.length);
+      selectedEditors = selectedNums.length ? selectedNums.map((n) => editors[n - 1]) : editors;
+    }
 
     const editorDetected = new Map<EditorKey, boolean>();
     for (const editor of selectedEditors) {
@@ -1913,13 +2007,15 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       editorDetected.set("codex", true);
     }
     const undetectedEditors = selectedEditors.filter((editor) => !editorDetected.get(editor));
-    let allowUndetectedEditors = false;
-    if (undetectedEditors.length) {
+    // Editors explicitly named via --editors are configured even when not
+    // detected; plain --yes sticks to detected editors only ("" → No below).
+    let allowUndetectedEditors = Boolean(editorsFlag);
+    if (undetectedEditors.length && !editorsFlag) {
       console.log("\nEditors not detected on this system:");
       undetectedEditors.forEach((editor) => console.log(`- ${EDITOR_LABELS[editor]}`));
       console.log('If your editor is installed but not detected, choose "yes" to force config.');
       const confirm = normalizeInput(
-        await rl.question("Configure these anyway? [y/N]: ")
+        await question("Configure these anyway? [y/N]: ")
       ).toLowerCase();
       allowUndetectedEditors = confirm === "y" || confirm === "yes";
     }
@@ -1944,7 +2040,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     console.log("  1) Global");
     console.log("  2) Project");
     console.log("  3) Both");
-    const scopeChoice = normalizeInput(await rl.question("Choose [1/2/3] (default 2): ")) || "2";
+    const scopeChoice = normalizeInput(await question("Choose [1/2/3] (default 2): ")) || "2";
     const scope: InstallScope =
       scopeChoice === "1" ? "global" : scopeChoice === "2" ? "project" : "both";
 
@@ -1967,7 +2063,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     const mcpChoiceDefault = hasCodex && !hasProjectMcpEditors ? "1" : "2";
     const mcpChoice =
       normalizeInput(
-        await rl.question(
+        await question(
           `Choose [${hasCodex && !hasProjectMcpEditors ? "1/2" : "1/2/3/4"}] (default ${mcpChoiceDefault}): `
         )
       ) || mcpChoiceDefault;
@@ -1986,7 +2082,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
     if (enforceCopilotCanonicalPair) {
       const confirmCopilotPair = normalizeInput(
-        await rl.question(
+        await question(
           "Configure Copilot canonical MCP files (~/.copilot/mcp-config.json + .vscode/mcp.json)? [Y/n]: "
         )
       ).toLowerCase();
@@ -2075,7 +2171,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             if (desktopPath) {
               const useDesktop =
                 normalizeInput(
-                  await rl.question("Also configure Claude Desktop (GUI app)? [y/N]: ")
+                  await question("Also configure Claude Desktop (GUI app)? [y/N]: ")
                 ).toLowerCase() === "y";
               if (useDesktop) {
                 if (dryRun) {
@@ -2310,7 +2406,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       console.log("\nProject setup...");
 
       const addCwd = normalizeInput(
-        await rl.question(`Add current folder as a project? [Y/n] (${process.cwd()}): `)
+        await question(`Add current folder as a project? [Y/n] (${process.cwd()}): `)
       );
       if (addCwd.toLowerCase() !== "n" && addCwd.toLowerCase() !== "no") {
         projectPaths.add(path.resolve(process.cwd()));
@@ -2320,17 +2416,17 @@ export async function runSetupWizard(args: string[]): Promise<void> {
         console.log("\n  1) Add another project path");
         console.log("  2) Add all projects under a folder");
         console.log("  3) Continue");
-        const choice = normalizeInput(await rl.question("Choose [1/2/3] (default 3): ")) || "3";
+        const choice = normalizeInput(await question("Choose [1/2/3] (default 3): ")) || "3";
         if (choice === "3") break;
 
         if (choice === "1") {
-          const p = normalizeInput(await rl.question("Project folder path: "));
+          const p = normalizeInput(await question("Project folder path: "));
           if (p) projectPaths.add(path.resolve(p));
           continue;
         }
 
         if (choice === "2") {
-          const parent = normalizeInput(await rl.question("Parent folder path: "));
+          const parent = normalizeInput(await question("Parent folder path: "));
           if (!parent) continue;
           const parentAbs = path.resolve(parent);
           const projects = await discoverProjectsUnderFolder(parentAbs);
@@ -2344,7 +2440,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
           projects.slice(0, 25).forEach((p) => console.log(`- ${p}`));
           if (projects.length > 25) console.log(`…and ${projects.length - 25} more`);
 
-          const confirm = normalizeInput(await rl.question("Add these projects? [Y/n]: "));
+          const confirm = normalizeInput(await question("Add these projects? [Y/n]: "));
           if (confirm.toLowerCase() === "n" || confirm.toLowerCase() === "no") continue;
           projects.forEach((p) => projectPaths.add(p));
         }
@@ -2361,7 +2457,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       workspaceId !== "dry-run" &&
       projects.length > 1 &&
       normalizeInput(
-        await rl.question("Also create a parent folder mapping for auto-detection? [y/N]: ")
+        await question("Also create a parent folder mapping for auto-detection? [y/N]: ")
       ).toLowerCase() === "y";
 
     for (const projectPath of projects) {
@@ -2565,7 +2661,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
           if (filesIndexed === 0 || isStale) {
             console.log("\n" + "─".repeat(60));
-            console.log("PROJECT INDEXING");
+            console.log("PROJECT SETUP");
             console.log("─".repeat(60));
             if (filesIndexed === 0) {
               console.log(
@@ -2581,7 +2677,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             console.log("Your code is private and securely stored.\n");
 
             const indexChoice = normalizeInput(
-              await rl.question("Perform indexing now? [Y/n]: ")
+              await question("Perform indexing now? [Y/n]: ")
             ).toLowerCase();
 
             const indexingEnabled = indexChoice !== "n" && indexChoice !== "no";
@@ -2594,10 +2690,10 @@ export async function runSetupWizard(args: string[]): Promise<void> {
             });
 
             if (indexingEnabled) {
-              await indexProjectWithProgress(client, process.cwd(), cwdConfig.workspace_id);
+              await startBackgroundIndexing(process.cwd());
             } else {
               console.log(
-                "\nIndexing skipped for now. You can start it later with: contextstream-mcp index <path>"
+                "\nProject setup skipped for now. Start it later with: contextstream-mcp index <path>"
               );
             }
           }
@@ -2607,7 +2703,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       }
     } else if (projects.length > 0 && !dryRun) {
       console.log("\n" + "─".repeat(60));
-      console.log("PROJECT INDEXING");
+      console.log("PROJECT SETUP");
       console.log("─".repeat(60));
       console.log(
         "Indexing enables semantic code search and AI-powered graph knowledge for rich AI context."
@@ -2619,7 +2715,7 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       console.log("Your code is private and securely stored.\n");
 
       const indexChoice = normalizeInput(
-        await rl.question("Update index for full-featured context now? [Y/n]: ")
+        await question("Update index for full-featured context now? [Y/n]: ")
       ).toLowerCase();
 
       const indexingEnabled = indexChoice !== "n" && indexChoice !== "no";
@@ -2638,11 +2734,11 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
       if (indexingEnabled) {
         for (const projectPath of projects) {
-          await indexProjectWithProgress(client, projectPath, workspaceId);
+          await startBackgroundIndexing(projectPath);
         }
       } else {
         console.log(
-          "\nIndexing skipped for now. You can start it later with: contextstream-mcp index <path>"
+          "\nProject setup skipped for now. Start it later with: contextstream-mcp index <path>"
         );
       }
     }
@@ -2676,6 +2772,31 @@ export async function runSetupWizard(args: string[]): Promise<void> {
       console.log(
         "- If Rust MCP is installed, replace the command in both files with `contextstream-mcp` and set args to []."
       );
+    }
+
+    if (!dryRun && !skipDoctor) {
+      console.log("\n" + "─".repeat(60));
+      console.log("VERIFYING YOUR SETUP");
+      console.log("─".repeat(60));
+      try {
+        // Verification must see the auth this wizard just configured, even
+        // when the key came from the saved-credentials file or a paste.
+        if (apiKey && !process.env.CONTEXTSTREAM_API_KEY) {
+          process.env.CONTEXTSTREAM_API_KEY = apiKey;
+        }
+        if (!process.env.CONTEXTSTREAM_API_URL) {
+          process.env.CONTEXTSTREAM_API_URL = apiUrl;
+        }
+        const { runDoctor } = await import("./doctor.js");
+        await runDoctor();
+      } catch (error) {
+        console.log(
+          `Verification could not run: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      // Doctor findings are advisory inside setup — a fresh project's
+      // still-building index must not fail the wizard.
+      process.exitCode = 0;
     }
 
     console.log("");

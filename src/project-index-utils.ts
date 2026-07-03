@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 
 const execFileAsync = promisify(execFile);
 
@@ -47,6 +49,50 @@ export function normalizeGitRemote(url: string): string | null {
     .replace(/\.git\/?$/, "")
     .replace(/\/+$/, "");
   return unified || null;
+}
+
+/**
+ * Count tracked files with local modifications that postdate the last index —
+ * the drift signal for "results may be stale". Deleted files count
+ * unconditionally; modified files count when their mtime is newer than
+ * indexedAtMs (pass 0 to disable the mtime gate). Bounded and best-effort:
+ * non-git folders and probe failures return 0.
+ */
+export async function countDirtyFilesSince(
+  folderPath: string,
+  indexedAtMs: number
+): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", folderPath, "status", "--porcelain"], {
+      timeout: 2_000,
+      maxBuffer: 256 * 1024,
+    });
+    const entries = stdout.split("\n").filter(Boolean).slice(0, 200);
+    let count = 0;
+    for (const entry of entries) {
+      const statusCode = entry.slice(0, 2);
+      const relPath = entry.slice(3).trim();
+      if (!relPath) continue;
+      if (statusCode.includes("D")) {
+        count += 1;
+        continue;
+      }
+      if (indexedAtMs <= 0) {
+        count += 1;
+        continue;
+      }
+      try {
+        const stat = await fs.stat(path.join(folderPath, relPath));
+        if (stat.mtimeMs > indexedAtMs) count += 1;
+      } catch {
+        // Unstat-able (renamed/removed mid-check) counts as drift.
+        count += 1;
+      }
+    }
+    return count;
+  } catch {
+    return 0;
+  }
 }
 
 export type IndexFreshness = "fresh" | "recent" | "aging" | "stale" | "missing" | "unknown";

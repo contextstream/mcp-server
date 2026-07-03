@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.78
+
+**Rust MCP parity pass 3: search-quality cluster (v0.3.45–v0.5.26).**
+
+### Search-First Contract (v0.5.23)
+
+- Every agent-facing surface that permitted a preemptive "index not ready → use local tools" fallback (generated rules blocks, hook reminder text) now states the reactive-only contract: run `search(...)` first even while the index is still building (keyword hits return immediately); fall back to local tools ONLY after search itself returns 0 results/errors on a retry, for known-new edits, or on explicit user request. The rules version tracks the package version, so managed rule blocks regenerate on next run.
+
+### Code-Intent Gating (v0.3.52)
+
+- Identifier-shaped queries (snake_case, camelCase, PascalCase, `::`/dotted member access — even as a lone token) suppress memory/doc blending on workspace-scoped searches, so a symbol lookup no longer ranks docs or branding assets alongside code. Conservative: prose and plain memory words are unaffected. The consolidated `search` tool now exposes `include_memory` for explicit opt-in/out.
+
+### Zero-Result Rewrite Recovery (v0.5.26)
+
+- When the backend recovers an empty natural-language search by retrying query rewrites, the output carries an honest provenance line ("0 direct hits — recovered via server-side rewrites: …") and a `rewrite_recovery` structured block. Older backends omit the fields and behavior is unchanged.
+
+### Freshness Guard (v0.3.45 + v0.3.63)
+
+- Search results whose local file no longer exists under the active folder are pruned, with a note.
+- A non-silent `[INDEX_HEALTH]` advisory reports how many tracked files changed since the last index (git-status based, mtime-gated against the recorded `indexed_at`, bounded and best-effort). IndexKeeper's incremental pass continues to re-ingest changed files in the background; this pass adds the visibility.
+
+### Deferred (need their own pass)
+
+- v0.3.34 "untouchable search quality v2" ranking/cache-freshness overhaul and v0.5.10 stale-index-root auto-heal: each is a ~400-line search-engine-side rework in the Rust tree; the TS server already carries partial equivalents from 0.4.72 (mode escalation, artifact filtering, ripgrep pre-fetch, IndexKeeper). Porting the remainder faithfully needs a dedicated pass.
+
 ## 0.4.77
 
 **Rust MCP parity pass 2: scope & routing correctness (v0.3.6–v0.5.18 cluster).**

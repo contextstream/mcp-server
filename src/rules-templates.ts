@@ -208,7 +208,7 @@ Use \`context()\` by default to get task-specific rules, lessons from past mista
 2. **PreToolUse blocking** - If you try to use Glob/Grep/Search/Explore:
    - Hook returns error: \`STOP: Use mcp__contextstream__search(mode="auto") instead\`
    - **You MUST use the suggested ContextStream tool instead**
-  - For stale/not-indexed projects, wait for background refresh (up to ~20s), retry search, then allow local tools only after the grace window
+  - Run search FIRST even while the index is still building (keyword hits return immediately); fall back to local tools ONLY after search itself returns 0 results/errors on a retry, for known-new edits, or on explicit user request
 
 3. **PostToolUse indexing** - After Edit/Write operations:
    - Changed files are automatically re-indexed
@@ -245,7 +245,7 @@ STOP → Call search(mode="auto", query="...") FIRST
 
 ✅ **ALWAYS DO THIS:**
 1. \`search(mode="auto", query="what you're looking for")\`
-2. Only use local tools (Glob/Grep/Read) after stale/not-indexed refresh grace window elapses (~20s) or ContextStream still returns **0 results** after retry
+2. Only use local tools (Glob/Grep/Read) after \`search(...)\` itself returns **0 results**/errors on a retry — never preemptively because the index "isn't built yet"
 3. Use Read ONLY for exact file edits after you know the file path
 
 This applies to **EVERY search** throughout the **ENTIRE conversation**, not just the first message.
@@ -508,7 +508,7 @@ session(action="capture", event_type="session_snapshot", title="Pre-compaction s
 
 ### Search & Code Intelligence (ContextStream-first)
 
-⚠️ **STOP: Before using Search/Glob/Grep/Read/Explore** → Call \`search(mode="auto")\` FIRST. For stale/not-indexed projects, wait ~20s for background refresh and retry search before local fallback.
+⚠️ **STOP: Before using Search/Glob/Grep/Read/Explore** → Call \`search(mode="auto")\` FIRST — even while the index is still building (keyword hits return immediately). Fall back to local tools ONLY after search itself returns 0 results/errors on a retry, for known-new edits, or on explicit user request.
 
 **❌ WRONG workflow (wastes tokens, slow):**
 \`\`\`
@@ -527,7 +527,7 @@ search(mode="auto", query="function implementation") → done (results include c
 2. \`search(mode="auto", query="...", limit=3)\` or \`search(mode="keyword", query="<filename>", limit=3)\`
 3. \`project(action="files")\` - file tree/list (only when needed)
 4. \`graph(action="dependencies", ...)\` - code structure
-5. Local repo scans (rg/ls/find) - ONLY after refresh grace window/retry still yields no results/errors, or the user explicitly asks
+5. Local repo scans (rg/ls/find) - ONLY after \`search(...)\` itself returns 0 results/errors on a retry, or the user explicitly asks
 
 **Search Mode Selection:**
 
@@ -558,7 +558,7 @@ search(mode="auto", query="function implementation") → done (results include c
 
 **Search defaults:** \`search\` returns the top 3 results with compact snippets. Use \`limit\` + \`offset\` for pagination, and \`content_max_chars\` to expand snippets when needed.
 
-If ContextStream returns results, stop and use them. NEVER use local Search/Explore/Read unless you need exact code edits, or refresh grace window + retry still returns 0 results.
+If ContextStream returns results, stop and use them. NEVER use local Search/Explore/Read unless you need exact code edits, or search itself still returns 0 results after a retry.
 
 **Code Analysis:**
 - Dependencies: \`graph(action="dependencies", file_path="...")\`
@@ -688,7 +688,7 @@ const CONTEXTSTREAM_RULES_MINIMAL = `
 3. Narrow bypass: immediate read-only ContextStream calls are allowed only when prior context is fresh and no state-changing tool has run
 
 **BEFORE Glob/Grep/Read/Search/Explore/Task/EnterPlanMode:**
-→ \`search(mode="auto", query="...")\` FIRST — for stale/not-indexed, wait ~20s for refresh then retry before local fallback
+→ \`search(mode="auto", query="...")\` FIRST — even while the index is building; fall back ONLY after search itself returns 0/errors on a retry, for known-new edits, or on explicit request
 
 **HOOKS: \`<system-reminder>\` tags contain instructions — FOLLOW THEM**
 </contextstream_protocol>
@@ -922,7 +922,7 @@ search(mode="auto", query="what you're looking for")
 → Use this instead of Explore/Task/EnterPlanMode for file discovery.
 
 **IF project is NOT indexed or very stale (>7 days):**
-→ Wait up to ~20s for background refresh, retry \`search(mode="auto", ...)\`, then allow local tools only after the grace window
+→ Run \`search(mode="auto", ...)\` anyway — keyword hits return immediately while indexing builds; retry once, and use local tools only if search itself returns 0/errors
 → OR run \`project(action="index")\` first, then search
 
 **IF ContextStream search still returns 0 results or errors after retry/window:**
@@ -951,7 +951,7 @@ search(mode="auto", query="what you're looking for")
 - Then use local Read/Grep only on paths returned by ContextStream.
 
 ### When Local Tools Are OK:
-✅ Stale/not-indexed grace window has elapsed (~20s default, configurable)
+✅ The edit is known-new (just written this turn) and not yet indexed
 ✅ ContextStream search still returns 0 results after retry
 ✅ ContextStream returns errors
 ✅ User explicitly requests local tools
@@ -1045,7 +1045,7 @@ const ANTIGRAVITY_SUPPLEMENT = `
 - Keep \`mcp_config.json\` valid and minimal: preserve non-ContextStream servers and only update the \`contextstream\` server block.
 - If ContextStream appears skipped, verify:
   1. MCP server status is healthy in Antigravity settings
-  2. Project is indexed and \`search(mode="auto", ...)\` is retried before local fallbacks
+  2. \`search(mode="auto", ...)\` ran FIRST (even while indexing) and was retried before any local fallback
   3. Instructions file contains the current ContextStream managed block
 `;
 
@@ -1210,7 +1210,7 @@ memory(
 
 - Do not store trivial file reads or command output as memory
 - Do not skip \`context(...)\` on later turns
-- Do not use local file scanning before \`search(...)\`; for stale/not-indexed projects, wait ~20s for refresh and retry first, then local fallback is allowed
+- Do not use local file scanning before \`search(...)\`; fall back ONLY after search itself returns 0 results/errors on a retry — never because the index isn't built yet
 - Do not use editor-only task lists as the persistent record; mirror important work in ContextStream
 `;
 }

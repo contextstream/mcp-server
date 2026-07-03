@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.80 (continued) — parity passes 6–8
+
+**Rust MCP parity passes 6–8 (final): deep search, editor surfaces, polish audit.** Folded into the unpublished 0.4.80 release.
+
+### Deep Search (v0.3.34 + v0.5.10 portable subsets)
+
+- **Post-rank token fusion** (semantic/hybrid): results are re-scored by query-token hits in content/path/location plus exact-query and path boosts, so exact matches surface above merely-similar hits; reorders are noted and recorded.
+- **Adaptive retry thresholds:** identifier/symbol queries accept lower-confidence hybrid results before a semantic retry (0.4/0.48), natural-language questions demand more (0.6); semantic displaces hybrid for code-shaped queries only when it wins by a wider margin (0.04).
+- Result lines carry a **confidence band** (high/medium/low) next to the score, and structured output records `fallback_stages` (requested/executed mode, token fusion, server rewrite recovery).
+- **Auto-heal stale index roots:** when a folder has no local index binding but a recorded binding elsewhere shares its exact git remote identity (repo moved/renamed/recloned), both folder-to-project binders adopt that project here and refresh the binding. Name/path-leaf similarity never binds.
+
+### Editor Surfaces (v0.5.25 + v0.5.27 subsets)
+
+- **Cursor rules** now write to `.cursor/rules/contextstream.mdc` with `alwaysApply` frontmatter — Cursor Agent mode does not read `.cursorrules` at all, so managed rules were invisible exactly where they mattered most. Existing `.cursorrules` blocks are left in place for older Cursor versions but are no longer created.
+- **Cursor hook responses** use the current permission schema (`{permission, agent_message, user_message}`) instead of the ignored legacy `{decision, reason}` shape; the Cursor hook installer appends `--editor=cursor` so hook runtimes can tell Cursor apart from Claude Code.
+- **New `contextstream-mcp doctor` command:** read-only diagnostics across auth, API reachability, folder scope binding, local index health (git identity/HEAD drift included), editor rule files, and installed hooks — one ✓/✗ line per check with a next-step hint, and it runs without credentials (diagnosing missing auth is part of the job).
+
+### Verified Without Change / Deferred
+
+- Media list/search summaries (v0.3.69/70): the media tool already renders actionable formatted output for both; only the download-URL enrichment for top items is unported.
+- v0.3.27 per-call display titles and icon metadata: the substantive parts (per-action tools, branded titles) shipped in 0.4.76; transport-level call-title/icon cosmetics depend on MCP client/SDK support and stay deferred.
+- Setup `--yes` zero-prompt path (v0.5.27): the interactive wizard's prompts are call-site-specific; a faithful non-interactive path needs its own pass.
+- Cursor schemas for non-permission hooks (sessionStart `additional_context` casing, `postToolUse` spec): the deny/allow contract — the inert steering channel — is fixed; the remainder is tracked.
+
 ## 0.4.80
 
 **Rust MCP parity pass 5: session-state cluster.**

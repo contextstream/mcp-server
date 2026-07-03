@@ -64,6 +64,7 @@ import {
   readGitHead,
   readGitRemoteIdentity,
   countDirtyFilesSince,
+  findTwinBindingByRemote,
 } from "./project-index-utils.js";
 import { resolveTodoCompletionUpdate } from "./todo-utils.js";
 import { globalHotPathStore } from "./hot-paths.js";
@@ -2825,6 +2826,49 @@ export function isLargeContextModel(modelId: string): boolean {
   return /(opus-4[-.]?8|fable-5)/.test(normalized);
 }
 
+// Post-rank token fusion: boost results whose content/path/location contain
+// query tokens (or the exact normalized query), then stable-sort so exact
+// matches surface above merely-similar ones. Ties fall back to base score,
+// then original order.
+export function applyPostRankFusion(
+  results: Array<Record<string, any>>,
+  query: string
+): { results: Array<Record<string, any>>; reordered: boolean } {
+  if (!Array.isArray(results) || results.length < 2) return { results, reordered: false };
+  const tokens = query
+    .toLowerCase()
+    .split(/[^a-z0-9_$.]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3);
+  if (tokens.length === 0) return { results, reordered: false };
+  const normalizedQuery = query.trim().toLowerCase();
+
+  const rows = results.map((item, idx) => {
+    const base = typeof item?.score === "number" ? item.score : 0;
+    const pathText = String(item?.file_path ?? "").toLowerCase();
+    const haystack = `${String(item?.content ?? "").toLowerCase()} ${pathText} ${String(
+      item?.location ?? ""
+    ).toLowerCase()}`;
+    const tokenHits = tokens.filter((token) => haystack.includes(token)).length;
+    const exactBoost =
+      normalizedQuery.length >= 3 && haystack.includes(normalizedQuery) ? 0.16 : 0;
+    const pathBoost = tokens.some((token) => pathText.includes(token)) ? 0.06 : 0;
+    const fusion = base + Math.min(tokenHits, 3) * 0.08 + exactBoost + pathBoost;
+    return { idx, fusion, base, item };
+  });
+
+  rows.sort((a, b) => b.fusion - a.fusion || b.base - a.base || a.idx - b.idx);
+  const reordered = rows.some((row, newIdx) => row.idx !== newIdx);
+  return { results: rows.map((row) => row.item), reordered };
+}
+
+export function scoreConfidenceBand(score: unknown): "high" | "medium" | "low" | "unknown" {
+  if (typeof score !== "number" || Number.isNaN(score)) return "unknown";
+  if (score >= 0.85) return "high";
+  if (score >= 0.6) return "medium";
+  return "low";
+}
+
 // Identifier-shaped queries are code intent even as a lone token: a symbol
 // lookup like `search_first_redirect_decision` must not blend memory/media
 // hits into workspace-scoped results. Conservative — prose and plain memory
@@ -5182,6 +5226,24 @@ export function registerTools(
   const HYBRID_LOW_CONFIDENCE_SCORE = 0.55;
   const SEMANTIC_SWITCH_MIN_IMPROVEMENT = 0.02;
 
+  // Adaptive retry thresholds, shaped by the query: identifier/symbol
+  // lookups accept lower-confidence hybrid hits before a semantic retry,
+  // while natural-language questions demand more confidence; semantic only
+  // displaces hybrid for code-shaped queries when it wins by a wider margin.
+  function adaptiveHybridRetryThreshold(query: string): number {
+    if (isIdentifierQuery(query)) return 0.4;
+    if (containsCodeIdentifiers(query)) return 0.48;
+    const lower = query.trim().toLowerCase();
+    if (QUESTION_WORDS.some((word) => lower.startsWith(word))) return 0.6;
+    return HYBRID_LOW_CONFIDENCE_SCORE;
+  }
+
+  function adaptiveSemanticSwitchImprovement(query: string): number {
+    return containsCodeIdentifiers(query) || isIdentifierQuery(query)
+      ? 0.04
+      : SEMANTIC_SWITCH_MIN_IMPROVEMENT;
+  }
+
   function isIdentifierQuery(query: string): boolean {
     const trimmed = query.trim();
     if (!trimmed || trimmed.length < 2 || trimmed.includes(" ")) return false;
@@ -5379,17 +5441,21 @@ export function registerTools(
     }
     if (isIdentifierQuery(query)) return false;
     const { results } = extractSearchEnvelope(result);
-    return results.length === 0 || maxResultScore(result) < HYBRID_LOW_CONFIDENCE_SCORE;
+    return results.length === 0 || maxResultScore(result) < adaptiveHybridRetryThreshold(query);
   }
 
-  function shouldPreferSemanticResults(hybridResult: any, semanticResult: any): boolean {
+  function shouldPreferSemanticResults(
+    query: string,
+    hybridResult: any,
+    semanticResult: any
+  ): boolean {
     const hybrid = extractSearchEnvelope(hybridResult);
     const semantic = extractSearchEnvelope(semanticResult);
     if (semantic.results.length === 0) return false;
     if (hybrid.results.length === 0) return true;
     const hybridTop = maxResultScore(hybridResult);
     const semanticTop = maxResultScore(semanticResult);
-    return semanticTop > hybridTop + SEMANTIC_SWITCH_MIN_IMPROVEMENT;
+    return semanticTop > hybridTop + adaptiveSemanticSwitchImprovement(query);
   }
 
   function shouldRetryKeywordWithSemantic(query: string): boolean {
@@ -5628,6 +5694,28 @@ export function registerTools(
       const matchLen = resolvedProjectPath.length;
       if (!bestMatch || matchLen > bestMatch.matchLen) {
         bestMatch = { projectId, matchLen };
+      }
+    }
+
+    if (!bestMatch) {
+      // Auto-heal stale index roots: the folder moved/renamed but its git
+      // remote identity matches a recorded binding — adopt it here.
+      currentRemotePromise ??= readGitRemoteIdentity(resolvedFolder);
+      const currentRemote = await currentRemotePromise;
+      const twin = findTwinBindingByRemote(
+        currentRemote,
+        resolvedFolder,
+        Object.entries(projects)
+      );
+      if (twin) {
+        void (async () => {
+          await markProjectIndexed(resolvedFolder, {
+            project_id: twin.projectId,
+            git_remote: currentRemote ?? undefined,
+            git_head: (await readGitHead(resolvedFolder)) ?? undefined,
+          });
+        })().catch(() => {});
+        return twin.projectId;
       }
     }
 
@@ -12848,7 +12936,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           if (shouldRetrySemanticFallback(input.query, dispatchMode, result)) {
             try {
               const semanticResult = await executeSearchMode("semantic", baseParams);
-              if (shouldPreferSemanticResults(result, semanticResult)) {
+              if (shouldPreferSemanticResults(input.query, result, semanticResult)) {
                 result = semanticResult;
                 executedMode = "semantic";
                 fallbackNote = appendNote(
@@ -13350,6 +13438,24 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
         }
         total = results.length;
 
+        // Post-rank token fusion (semantic/hybrid): exact-token matches
+        // surface above merely-similar hits.
+        let fusionReordered = false;
+        if (
+          (selected.executedMode === "semantic" || selected.executedMode === "hybrid") &&
+          results.length > 1
+        ) {
+          const fusion = applyPostRankFusion(results, input.query);
+          if (fusion.reordered) {
+            fusionReordered = true;
+            results = fusion.results;
+            modeFallbackNote = appendNote(
+              modeFallbackNote,
+              "Reordered results by exact-token fusion."
+            );
+          }
+        }
+
         const resultPaths = results
           .map((item: any) => (typeof item?.file_path === "string" ? item.file_path : ""))
           .filter(Boolean);
@@ -13395,7 +13501,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               ? `${filePath}:${startLine}`
               : r.location || filePath || r.breadcrumb || "";
             const language = r.language || r.metadata?.language || "";
-            const score = r.score ? `${(r.score * 100).toFixed(0)}%` : "";
+            const score =
+              typeof r.score === "number"
+                ? `${(r.score * 100).toFixed(0)}% ${scoreConfidenceBand(r.score)}`
+                : "";
             const langTag = language ? `[${language}]` : "";
             lines.push(`${i + 1}. ${location} ${langTag} ${score}`.trim());
           });
@@ -13495,6 +13604,16 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             rewritten_queries: rewrittenQueries,
           };
         }
+
+        // Honest record of the stages that produced this result set.
+        (structuredData as any).fallback_stages = [
+          `requested:${requestedMode}`,
+          ...(selected.executedMode !== requestedMode
+            ? [`executed:${selected.executedMode}`]
+            : []),
+          ...(fusionReordered ? ["token_fusion"] : []),
+          ...((structuredData as any).rewrite_recovery ? ["server_rewrite_recovery"] : []),
+        ];
 
         const resultWithMeta = {
           ...(selected.result as any),

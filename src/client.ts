@@ -23,7 +23,7 @@ import {
 } from "./workspace-config.js";
 import { globalCache, CacheKeys, CacheTTL } from "./cache.js";
 import { markProjectIndexed, clearProjectIndex, readIndexStatus } from "./hooks-config.js";
-import { readGitHead, readGitRemoteIdentity } from "./project-index-utils.js";
+import { readGitHead, readGitRemoteIdentity, findTwinBindingByRemote } from "./project-index-utils.js";
 import { VERSION, getUpdateNotice, getVersionWarning, getVersionInstructions, type VersionNotice } from "./version.js";
 
 const uuidSchema = z.string().uuid();
@@ -2931,6 +2931,24 @@ export class ContextStreamClient {
       const matchLen = resolvedProjectPath.length;
       if (!bestMatch || matchLen > bestMatch.matchLen) {
         bestMatch = { projectId, matchLen };
+      }
+    }
+
+    if (!bestMatch) {
+      // Auto-heal stale index roots: adopt a recorded binding whose git
+      // remote identity matches this folder (repo moved/renamed/recloned).
+      currentRemotePromise ??= readGitRemoteIdentity(resolvedFolder);
+      const currentRemote = await currentRemotePromise;
+      const twin = findTwinBindingByRemote(currentRemote, resolvedFolder, Object.entries(projects));
+      if (twin) {
+        void (async () => {
+          await markProjectIndexed(resolvedFolder, {
+            project_id: twin.projectId,
+            git_remote: currentRemote ?? undefined,
+            git_head: (await readGitHead(resolvedFolder)) ?? undefined,
+          });
+        })().catch(() => {});
+        return twin.projectId;
       }
     }
 

@@ -70,6 +70,16 @@ export interface RequestOptions {
   workspaceId?: string;
 }
 
+// The agent's model id, when the MCP client surfaced one at initialize.
+// Forwarded as X-ContextStream-Model so server-side events attribute to the
+// real model; omitted (existing behavior) when unknown.
+let activeModelId: string | null = null;
+
+export function setActiveModelId(modelId: string | null | undefined): void {
+  const trimmed = typeof modelId === "string" ? modelId.trim() : "";
+  activeModelId = trimmed ? trimmed : null;
+}
+
 const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 const MAX_RETRIES = 3;
 const BASE_DELAY = 1000;
@@ -114,6 +124,7 @@ export async function request<T>(
   };
   if (apiKey) headers["X-API-Key"] = apiKey;
   if (jwt) headers["Authorization"] = `Bearer ${jwt}`;
+  if (activeModelId) headers["X-ContextStream-Model"] = activeModelId;
   const workspaceId =
     authOverride?.workspaceId ||
     options.workspaceId ||

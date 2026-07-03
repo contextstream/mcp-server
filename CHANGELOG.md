@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.4.81
+## 0.4.80 (continued) — parity passes 6–8
 
-**Rust MCP parity passes 6–8 (final): deep search, editor surfaces, polish audit.**
+**Rust MCP parity passes 6–8 (final): deep search, editor surfaces, polish audit.** Folded into the unpublished 0.4.80 release.
 
 ### Deep Search (v0.3.34 + v0.5.10 portable subsets)
 

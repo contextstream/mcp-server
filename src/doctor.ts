@@ -129,7 +129,9 @@ export async function runDoctor(): Promise<void> {
     ruleFilesFound += 1;
     const content = fsSync.readFileSync(filePath, "utf-8");
     const managed =
-      content.includes("contextstream-rules-hash") || content.includes("<contextstream>");
+      content.includes("contextstream-rules-hash") ||
+      content.includes("<contextstream>") ||
+      content.includes("<!-- BEGIN ContextStream -->");
     if (managed) {
       ok(`${editor}: ${template.filename} (managed block present).`);
     } else {

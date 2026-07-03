@@ -35,12 +35,18 @@ export async function readSavedCredentials(): Promise<SavedCredentialsV1 | null>
     const parsed: unknown = JSON.parse(raw);
     if (!isRecord(parsed)) return null;
 
+    // Other ContextStream components write a legacy shape ({api_key, saved_at}
+    // with no version/api_url). Accept it — a key saved without a URL belongs
+    // to the default API — so a key saved by one component works in all.
     const version = parsed.version;
-    if (version !== 1) return null;
+    if (version !== undefined && version !== 1) return null;
 
-    const apiUrl = typeof parsed.api_url === "string" ? normalizeApiUrl(parsed.api_url) : "";
     const apiKey = typeof parsed.api_key === "string" ? parsed.api_key.trim() : "";
-    if (!apiUrl || !apiKey) return null;
+    if (!apiKey) return null;
+    const apiUrl =
+      typeof parsed.api_url === "string" && parsed.api_url.trim()
+        ? normalizeApiUrl(parsed.api_url)
+        : normalizeApiUrl(process.env.CONTEXTSTREAM_API_URL || "https://api.contextstream.io");
 
     const email = typeof parsed.email === "string" ? parsed.email.trim() : "";
     const createdAt = typeof parsed.created_at === "string" ? parsed.created_at : "";

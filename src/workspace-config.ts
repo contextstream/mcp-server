@@ -18,9 +18,16 @@ export interface WorkspaceConfig {
 }
 
 export interface ParentMapping {
-  pattern: string; // e.g., "/home/user/dev/projects/*"
+  pattern?: string; // e.g., "/home/user/dev/projects/*"
   workspace_id: string;
-  workspace_name: string;
+  workspace_name?: string;
+  /**
+   * Interop: other ContextStream components write exact-folder entries
+   * ({path, workspace_id, project_id, ...}) instead of glob patterns.
+   */
+  path?: string;
+  project_id?: string;
+  project_name?: string;
 }
 
 export interface FallbackWorkspaceRef {
@@ -178,7 +185,7 @@ export function forgetLocalConfig(repoPath: string): {
   return {
     local_config_removed: removed,
     config_path: configPath,
-    matching_parent_pattern: mapping?.pattern ?? null,
+    matching_parent_pattern: mapping?.pattern ?? mapping?.path ?? null,
   };
 }
 
@@ -201,11 +208,15 @@ export function writeGlobalMappings(mappings: ParentMapping[]): boolean {
  * Add a new parent folder mapping
  */
 export function addGlobalMapping(mapping: ParentMapping): boolean {
+  if (typeof mapping.pattern !== "string" || !mapping.pattern.trim()) return false;
   const normalizedPattern = path.normalize(mapping.pattern);
   const store = readGlobalStore();
   const mappings = store.mappings;
-  // Remove any existing mapping with same pattern
-  const filtered = mappings.filter((m) => path.normalize(m.pattern) !== normalizedPattern);
+  // Remove any existing pattern mapping with the same pattern; leave
+  // exact-folder interop entries (no pattern) untouched.
+  const filtered = mappings.filter(
+    (m) => typeof m.pattern !== "string" || path.normalize(m.pattern) !== normalizedPattern
+  );
   filtered.push({ ...mapping, pattern: normalizedPattern });
   return writeGlobalStore({ ...store, mappings: filtered });
 }
@@ -234,6 +245,20 @@ export function findMatchingMapping(repoPath: string): ParentMapping | null {
   const normalizedRepo = path.normalize(repoPath);
 
   for (const mapping of mappings) {
+    // Interop: exact-folder entries carry `path` (plus project info) rather
+    // than a glob pattern. Match the folder itself or any subfolder.
+    if (typeof mapping.path === "string" && mapping.path.trim()) {
+      const normalizedExact = path.normalize(mapping.path);
+      if (
+        normalizedRepo === normalizedExact ||
+        normalizedRepo.startsWith(normalizedExact + path.sep)
+      ) {
+        return mapping;
+      }
+      continue;
+    }
+
+    if (typeof mapping.pattern !== "string" || !mapping.pattern.trim()) continue;
     const normalizedPattern = path.normalize(mapping.pattern);
 
     // Handle wildcard patterns like "/home/user/dev/projects/*" (or "C:\\dev\\projects\\*")
@@ -265,13 +290,16 @@ export function resolveWorkspace(repoPath: string): {
     return { config: localConfig, source: "local_config" };
   }
 
-  // Step 2: Check parent folder mappings
+  // Step 2: Check parent folder mappings (glob patterns or exact-folder
+  // interop entries, which may also carry project scope)
   const mapping = findMatchingMapping(repoPath);
   if (mapping) {
     return {
       config: {
         workspace_id: mapping.workspace_id,
         workspace_name: mapping.workspace_name,
+        project_id: mapping.project_id,
+        project_name: mapping.project_name,
       },
       source: "parent_mapping",
     };

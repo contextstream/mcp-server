@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.81
+
+**Setup wizard: zero-prompt `--yes`, background project setup, doctor verification — plus cross-component interop fixes.**
+
+### Setup Wizard
+
+- **`setup --yes` (or `-y`)** runs the entire wizard with zero prompts: every prompt's documented default applies. The outdated-version gate proceeds with a warning instead of exiting; missing credentials fail fast with an actionable message (set `CONTEXTSTREAM_API_KEY` or run setup interactively once); a single listed workspace is auto-selected (multiple → skip); undetected editors are skipped. `--editors=<csv>` pre-answers the editor selection (and force-configures the named editors even when undetected); `--no-doctor` skips final verification.
+- **Project setup never blocks onboarding:** indexing now runs in a detached child process and the wizard returns immediately — search works right away (keyword first, semantic as the index builds), with progress available via `project(action="index_status")` or `contextstream-mcp doctor`. The indexing section is retitled PROJECT SETUP.
+- **The wizard ends with VERIFYING YOUR SETUP:** the `doctor` diagnostics run inline against the just-configured auth, so any misconfiguration surfaces with its next-step hint while you're still in the terminal. Findings are advisory — setup still exits 0.
+- **New `contextstream-mcp index [path]` command** — previously the skip-hint referenced a command that did not exist; it now indexes a folder on demand and is the target of the wizard's background child.
+
+### Cross-Component Interop
+
+- `readSavedCredentials` accepts the legacy `{api_key, saved_at}` credentials shape (no `version`/`api_url`) — a key saved by one ContextStream component now works in all of them.
+- Folder-mapping resolution understands exact-folder entries (`{path, workspace_id, project_id, …}`) written by other components alongside glob patterns, carries their project scope through `resolveWorkspace`, and skips malformed entries instead of crashing.
+- `doctor` recognizes the setup wizard's managed-rules markers.
+
 ## 0.4.80 (continued) — parity passes 6–8
 
 **Rust MCP parity passes 6–8 (final): deep search, editor surfaces, polish audit.** Folded into the unpublished 0.4.80 release.

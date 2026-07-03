@@ -95,6 +95,31 @@ export async function countDirtyFilesSince(
   }
 }
 
+/**
+ * Auto-heal for stale index roots: when a folder has no index binding but a
+ * recorded binding elsewhere shares its git remote identity (the repo was
+ * moved, renamed, or freshly cloned), that binding's project can be adopted
+ * here. Identity must match exactly; name/path-leaf similarity never binds.
+ */
+export function findTwinBindingByRemote(
+  currentRemote: string | null,
+  resolvedFolder: string,
+  entries: Array<[string, { project_id?: string; git_remote?: string } | undefined]>
+): { path: string; projectId: string } | null {
+  if (!currentRemote) return null;
+  for (const [entryPath, info] of entries) {
+    if (path.resolve(entryPath) === resolvedFolder) continue;
+    if (!info?.git_remote || info.git_remote !== currentRemote) continue;
+    const projectId =
+      typeof info?.project_id === "string" && info.project_id.trim()
+        ? info.project_id.trim()
+        : undefined;
+    if (!projectId) continue;
+    return { path: entryPath, projectId };
+  }
+  return null;
+}
+
 export type IndexFreshness = "fresh" | "recent" | "aging" | "stale" | "missing" | "unknown";
 export type IndexConfidence = "high" | "medium" | "low";
 export type GraphIngestIndexState = "ready" | "indexing" | "stale" | "missing";

@@ -130,23 +130,24 @@ Anything that speaks the Model Context Protocol can connect — the table just s
 
 ---
 
-## The tools your AI gets
+## Tools
 
-36 tools in the default surface, organized as consolidated domains so they cost ~75% fewer tokens than individual registrations:
+36 tools in the default surface, organized as consolidated domains so they cost ~75% fewer tokens than individual registrations. The tools your AI gets:
 
-```
-init / context   → workspace state + the right context on every message
-search           → semantic, hybrid, keyword, pattern, exhaustive, refactor modes
-memory           → events, decisions, docs, runbooks, tasks, todos, diagrams, transcripts
-session          → capture decisions & lessons, recall past sessions, plans, retroactive capture
-qa               → grounded Q&A over your workspace knowledge base, with citations
-graph            → dependencies, impact analysis, circular deps, unused code
-capsule          → portable, shareable context snapshots for agent handoffs
-entity           → tickets, incidents, releases, sprints, OKRs, risks
-project / workspace / skill / media / vcs / reminder / integration / help
-```
+- **init** / **context** — workspace state + the right context on every message
+- **search** — semantic, hybrid, keyword, pattern, exhaustive, refactor modes
+- **memory** — events, decisions, docs, runbooks, tasks, todos, diagrams, transcripts
+- **session** — capture decisions & lessons, recall past sessions, plans, retroactive capture
+- **qa** — grounded Q&A over your workspace knowledge base, with citations
+- **graph** — dependencies, impact analysis, circular deps, unused code
+- **capsule** — portable, shareable context snapshots for agent handoffs
+- **entity** — tickets, incidents, releases, sprints, OKRs, risks
+- **project** / **workspace** — project indexing, scope, and workspace management
+- **skill** — reusable instruction + action bundles, portable across tools
+- **media** — index and search images, video, audio, and documents
+- **vcs** / **reminder** / **integration** / **help** — repo links, reminders, integrations, diagnostics
 
-Plus focused write tools (`capture_plan`, `memory_create_doc`, …) so agents that display tool names show *what* they're doing. Your AI uses all of this automatically — you just code.
+Plus focused write tools (`capture_plan`, `memory_create_doc`, `session_capture_lesson`, …) so agents that display tool names show *what* they're doing. Your AI uses all of this automatically — you just code.
 
 ---
 

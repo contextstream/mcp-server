@@ -42,4 +42,4 @@ jobs:
           ARGS=(--status "${{ inputs.status }}")
           if [ -n "${{ inputs.message }}" ]; then ARGS+=(--message "${{ inputs.message }}"); fi
           if [ "${{ inputs.all_versions }}" = "true" ]; then ARGS+=(--all-versions); fi
-          ./mcp-publisher status "${ARGS[@]}" "${{ inputs.server_name }}" ${{ inputs.version }}
+          echo y | ./mcp-publisher status "${ARGS[@]}" "${{ inputs.server_name }}" ${{ inputs.version }}

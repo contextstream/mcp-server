@@ -39,7 +39,7 @@ jobs:
 
       - name: Update status
         run: |
-          ARGS=(--status "${{ inputs.status }}")
+          ARGS=(--status "${{ inputs.status }}" --yes)
           if [ -n "${{ inputs.message }}" ]; then ARGS+=(--message "${{ inputs.message }}"); fi
           if [ "${{ inputs.all_versions }}" = "true" ]; then ARGS+=(--all-versions); fi
           echo y | ./mcp-publisher status "${ARGS[@]}" "${{ inputs.server_name }}" ${{ inputs.version }}

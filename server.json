@@ -32,17 +32,28 @@
       ]
     }
   ],
-  "remotes": [
+  "packages": [
     {
-      "type": "streamable-http",
-      "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast",
-      "headers": [
-        { "name": "X-ContextStream-Toolset", "value": "complete" },
-        { "name": "X-ContextStream-Output-Format", "value": "compact" },
-        { "name": "X-ContextStream-Search-Limit", "value": "15" },
-        { "name": "X-ContextStream-Search-Max-Chars", "value": "2400" },
-        { "name": "X-ContextStream-Transcripts-Enabled", "value": "true" },
-        { "name": "X-ContextStream-Consolidated", "value": "true" }
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@contextstream/mcp-server",
+      "version": "0.4.81",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "CONTEXTSTREAM_API_KEY",
+          "description": "ContextStream API key (create one at contextstream.io)",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "CONTEXTSTREAM_API_URL",
+          "description": "API base URL",
+          "isRequired": false,
+          "default": "https://api.contextstream.io"
+        }
       ]
     }
   ]

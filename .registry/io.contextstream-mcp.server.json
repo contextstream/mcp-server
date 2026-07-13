@@ -28,7 +28,7 @@
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
+      "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast&src=registry"
     }
   ]
 }

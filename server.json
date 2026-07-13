@@ -3,7 +3,7 @@
   "name": "io.github.contextstreamio/mcp-server",
   "title": "ContextStream MCP Server",
   "description": "ContextStream MCP server for code context, memory, search, and AI tools.",
-  "version": "0.4.70",
+  "version": "0.4.81",
   "repository": {
     "url": "https://github.com/contextstream/mcp-server",
     "source": "github"
@@ -36,14 +36,14 @@
     {
       "type": "streamable-http",
       "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast",
-      "headers": {
-        "X-ContextStream-Toolset": "complete",
-        "X-ContextStream-Output-Format": "compact",
-        "X-ContextStream-Search-Limit": "15",
-        "X-ContextStream-Search-Max-Chars": "2400",
-        "X-ContextStream-Transcripts-Enabled": "true",
-        "X-ContextStream-Consolidated": "true"
-      }
+      "headers": [
+        { "name": "X-ContextStream-Toolset", "value": "complete" },
+        { "name": "X-ContextStream-Output-Format", "value": "compact" },
+        { "name": "X-ContextStream-Search-Limit", "value": "15" },
+        { "name": "X-ContextStream-Search-Max-Chars", "value": "2400" },
+        { "name": "X-ContextStream-Transcripts-Enabled", "value": "true" },
+        { "name": "X-ContextStream-Consolidated", "value": "true" }
+      ]
     }
   ]
 }

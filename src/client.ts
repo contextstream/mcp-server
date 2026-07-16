@@ -7175,6 +7175,11 @@ export class ContextStreamClient {
     return request(this.config, `/tasks/${params.task_id}`, { method: "GET" });
   }
 
+  /** Get the latest public MCP release metadata. */
+  async getMcpVersion() {
+    return request(this.config, "/mcp/version", { method: "GET" });
+  }
+
   /**
    * Update an existing task
    */

@@ -76,6 +76,84 @@ type ToolTextResult = {
   isError?: boolean;
 };
 
+const MCP_RELEASES_URL = "https://github.com/contextstream/mcp-server/releases";
+
+type TaskUpdateShape = {
+  title?: unknown;
+  content?: unknown;
+  description?: unknown;
+  status?: unknown;
+  priority?: unknown;
+  order?: unknown;
+  plan_id?: unknown;
+  plan_step_id?: unknown;
+  code_refs?: unknown;
+  tags?: unknown;
+  blocked_reason?: unknown;
+};
+
+export function taskUpdateIsStatusOnly(update: TaskUpdateShape): boolean {
+  return typeof update.status === "string" &&
+    update.status.length > 0 &&
+    update.title === undefined &&
+    update.content === undefined &&
+    update.description === undefined &&
+    update.priority === undefined &&
+    update.order === undefined &&
+    update.plan_id === undefined &&
+    update.plan_step_id === undefined &&
+    update.code_refs === undefined &&
+    update.tags === undefined &&
+    update.blocked_reason === undefined;
+}
+
+export function extractTaskStatus(result: unknown): string | undefined {
+  if (!result || typeof result !== "object") return undefined;
+  const value = result as Record<string, any>;
+  const candidates = [
+    value.status,
+    value.task?.status,
+    value.data?.status,
+    value.data?.task?.status,
+  ];
+  return candidates.find((candidate) => typeof candidate === "string");
+}
+
+export function buildMcpVersionInfo(
+  currentVersion: string,
+  remote: unknown,
+): Record<string, unknown> {
+  const wrapped = remote && typeof remote === "object"
+    ? remote as Record<string, any>
+    : {};
+  const payload = wrapped.data && typeof wrapped.data === "object"
+    ? wrapped.data as Record<string, unknown>
+    : wrapped;
+
+  return {
+    ...payload,
+    name: "contextstream-mcp",
+    version: currentVersion,
+    latest_version: typeof payload.latest_version === "string"
+      ? payload.latest_version
+      : currentVersion,
+    release_url: typeof payload.release_url === "string"
+      ? payload.release_url
+      : MCP_RELEASES_URL,
+  };
+}
+
+async function loadMcpVersionInfo(
+  client: Pick<ContextStreamClient, "getMcpVersion">,
+): Promise<Record<string, unknown>> {
+  try {
+    return buildMcpVersionInfo(VERSION, await client.getMcpVersion());
+  } catch (error) {
+    logDebug(`MCP release metadata unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return buildMcpVersionInfo(VERSION, undefined);
+  }
+}
+
 /**
  * Zod schema that accepts either a real JSON array or a JSON-encoded string
  * of an array. LLMs sometimes serialize array parameters as strings like
@@ -6296,10 +6374,10 @@ export function registerTools(
       inputSchema: z.object({}),
     },
     async () => {
-      const result = { name: "contextstream-mcp", version: VERSION };
+      const result = await loadMcpVersionInfo(client);
       return {
         content: [{ type: "text" as const, text: formatContent(result) }],
-        
+        structuredContent: result,
       };
     }
   );
@@ -16857,8 +16935,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               return errorResult("update_task requires: task_id");
             }
             const requestedTaskStatus = input.task_status ?? input.status;
-            const result = await client.updateTask({
-              task_id: input.task_id,
+            const taskUpdate = {
               title: input.title,
               content: input.content,
               description: input.description,
@@ -16870,6 +16947,31 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               code_refs: input.code_refs,
               tags: input.tags,
               blocked_reason: input.blocked_reason,
+            };
+            if (taskUpdateIsStatusOnly(taskUpdate)) {
+              const current = await client.getTask({ task_id: input.task_id });
+              const currentStatus = extractTaskStatus(current);
+              if (currentStatus?.toLowerCase() === requestedTaskStatus?.toLowerCase()) {
+                const result = {
+                  ...(current as object),
+                  operation_status: {
+                    operation: "update_task",
+                    state: "completed",
+                    changed: false,
+                    reason: "already_in_target_status",
+                    status: requestedTaskStatus,
+                  },
+                  hint: `Task is already ${requestedTaskStatus}. No changes were needed.`,
+                };
+                return {
+                  content: [{ type: "text" as const, text: formatContent(result) }],
+                  structuredContent: result,
+                };
+              }
+            }
+            const result = await client.updateTask({
+              task_id: input.task_id,
+              ...taskUpdate,
             });
             // Add task lifecycle hint based on status
             let taskUpdateHint = "Task updated.";
@@ -20197,10 +20299,10 @@ Example workflow:
           }
 
           case "version": {
-            const result = { name: "contextstream-mcp", version: VERSION };
+            const result = await loadMcpVersionInfo(client);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
+              structuredContent: result,
             };
           }
 

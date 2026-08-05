@@ -43,7 +43,7 @@ npx --prefer-online -y @contextstream/mcp-server@latest setup --yes
 ```
 
 <p align="center">
-  <img src="compare1.gif" alt="Side-by-side comparison: an AI coding assistant with ContextStream memory and semantic search vs. without" width="700" />
+  <img src="contextstream-mcp-comparison.gif" alt="Animated comparison of an AI coding assistant working without ContextStream versus with ContextStream project memory, search, and graph context" width="600" />
 </p>
 
 ---

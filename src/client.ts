@@ -7175,6 +7175,23 @@ export class ContextStreamClient {
     return request(this.config, `/tasks/${params.task_id}`, { method: "GET" });
   }
 
+  /** List completed Daily Recaps for a workspace, newest first. */
+  async listDailyRecaps(params: { workspace_id: string; limit?: number }) {
+    uuidSchema.parse(params.workspace_id);
+    const query = new URLSearchParams({ workspace_id: params.workspace_id });
+    query.set("limit", String(Math.min(100, Math.max(1, params.limit ?? 30))));
+    return request(this.config, `/recap/history?${query.toString()}`, { method: "GET" });
+  }
+
+  /** Queue an asynchronous Daily Recap generation for a workspace. */
+  async triggerDailyRecap(params: { workspace_id: string }) {
+    uuidSchema.parse(params.workspace_id);
+    return request(this.config, "/recap/generate", {
+      method: "POST",
+      body: { workspace_id: params.workspace_id },
+    });
+  }
+
   /** Get the latest public MCP release metadata. */
   async getMcpVersion() {
     return request(this.config, "/mcp/version", { method: "GET" });

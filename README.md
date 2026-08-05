@@ -72,6 +72,21 @@ It works with any MCP client: Claude Code, Cursor, VS Code + GitHub Copilot, Win
 
 ---
 
+## Which ContextStream runtime am I using?
+
+ContextStream has independent release lines. A `0.5.x` hosted version and a `0.4.x` npm version are different runtimes, not evidence that either updater is broken.
+
+| Runtime | How to identify it | Version line | Canonical release metadata and notes |
+|---|---|---|---|
+| **Hosted MCP** | Your editor config uses `https://mcp.contextstream.io/mcp`. `help(action="version")` reports `runtime_type: rust-mcp`. | Rust MCP `0.5.x` | `help(action="version")` returns release notes inline when published and links the [machine-readable R2 manifest](https://pub-68429b9f7857416c9484b75bf1887b96.r2.dev/mcp/latest/version.json). |
+| **Installed Rust MCP** | Your editor launches a `contextstream-mcp` binary installed by `https://contextstream.io/scripts/mcp.sh`; run `contextstream-mcp --version`. | Rust MCP `0.5.x` | The same [machine-readable R2 manifest](https://pub-68429b9f7857416c9484b75bf1887b96.r2.dev/mcp/latest/version.json); `help(action="version")` maps this runtime to that manifest. |
+| **Legacy npm MCP (this repository)** | Your editor launches `npx ... @contextstream/mcp-server` or a global npm install. `help(action="version")` reports `runtime_type: legacy-typescript-mcp`; `npm list -g @contextstream/mcp-server` shows the installed package. | TypeScript MCP `0.4.x` | [GitHub releases](https://github.com/contextstream/mcp-server/releases) and this repository's [CHANGELOG.md](CHANGELOG.md). |
+| **ContextStream Desktop** | Check the app's About/update UI. Desktop may run the local sync bridge, but that does not change the MCP runtime configured in your editor. | Desktop `0.3.x` (independent) | The in-app updater and the public [Desktop version JSON](https://api.contextstream.io/api/v1/desktop/version), which includes `release_notes` and platform downloads. |
+
+The `version` reported by `help(action="version")` is always the MCP process serving that tool call. Desktop's version is separate, even when Desktop added or indexed the local repository.
+
+---
+
 ## Why do AI coding assistants forget everything?
 
 Because every conversation starts from zero. Your AI re-reads the same files, re-derives the same architecture, repeats last week's mistake, and loses the thread the moment the context window compacts. ContextStream fixes the whole class of problem:
@@ -148,6 +163,15 @@ Anything that speaks the Model Context Protocol can connect — the table just s
 - **vcs** / **reminder** / **integration** / **help** — repo links, reminders, integrations, diagnostics
 
 Plus focused write tools (`capture_plan`, `memory_create_doc`, `session_capture_lesson`, …) so agents that display tool names show *what* they're doing. Your AI uses all of this automatically — you just code.
+
+### Daily Recaps
+
+Daily Recaps are generated around **23:00 in your configured timezone** when there is enough activity. They are not triggered by closing an editor, changing an MCP `session_id`, or starting a new chat, so long-lived VS Code/Copilot connections do not suppress the nightly job.
+
+- `session(action="list_recaps", workspace_id="<uuid>", limit=30)` lists completed recaps newest-first with `recap_date` and `generated_at` timestamps.
+- `session(action="trigger_recap", workspace_id="<uuid>")` queues an asynchronous manual recap. Call `list_recaps` afterward to verify completion.
+
+These actions use the same recap history and generation service as the dashboard.
 
 ---
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Support and discovery
+
+- Documented the hosted Rust, installed Rust, legacy npm TypeScript, and Desktop release lines, including how `help(action="version")` maps each MCP runtime to its release metadata.
+- Added legacy parity for `session(action="list_recaps")` and `session(action="trigger_recap")`; recap history now exposes `recap_date` and `generated_at`, and the tool guidance correctly describes the nightly local-time schedule rather than a session-boundary trigger.
+- Added an explicit `runtime_type: legacy-typescript-mcp` field to legacy version output so agents can distinguish the npm runtime from the hosted Rust MCP.
+
 ## 0.4.81
 
 **Setup wizard: zero-prompt `--yes`, background project setup, doctor verification — plus cross-component interop fixes.**

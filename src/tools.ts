@@ -133,6 +133,7 @@ export function buildMcpVersionInfo(
   return {
     ...payload,
     name: "contextstream-mcp",
+    runtime_type: "legacy-typescript-mcp",
     version: currentVersion,
     latest_version: typeof payload.latest_version === "string"
       ? payload.latest_version
@@ -141,6 +142,37 @@ export function buildMcpVersionInfo(
       ? payload.release_url
       : MCP_RELEASES_URL,
   };
+}
+
+function dailyRecapItems(result: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(result)) return result as Array<Record<string, unknown>>;
+  if (!result || typeof result !== "object") return [];
+  const value = result as Record<string, any>;
+  const candidates = [
+    value.recaps,
+    value.items,
+    value.data,
+    value.data?.recaps,
+    value.data?.items,
+  ];
+  return (candidates.find(Array.isArray) || []) as Array<Record<string, unknown>>;
+}
+
+export function formatDailyRecaps(result: unknown): string {
+  const recaps = dailyRecapItems(result);
+  if (recaps.length === 0) {
+    return 'No completed Daily Recaps found for this workspace. Automatic recaps run around 23:00 in the user\'s configured timezone; use session(action="trigger_recap") to queue one now.';
+  }
+
+  const lines = recaps.map((recap) => {
+    const date = typeof recap.recap_date === "string" ? recap.recap_date : "unknown date";
+    const generatedAt = typeof recap.generated_at === "string"
+      ? recap.generated_at
+      : "generation timestamp unavailable";
+    const headline = typeof recap.headline === "string" ? recap.headline.trim() : "";
+    return `- ${date} — generated ${generatedAt}${headline ? ` — ${headline}` : ""}`;
+  });
+  return [`Daily Recaps (${recaps.length}), newest first:`, ...lines].join("\n");
 }
 
 async function loadMcpVersionInfo(
@@ -13938,7 +13970,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "session",
       {
         title: "Session",
-        description: `Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). PAST SESSIONS LIVE HERE: use action='recall' FIRST when the user references "last time", "previous", "yesterday", or is continuing prior work — full-text transcripts are indexed across every prior session. context() may surface [GROUNDING]; use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills) outside context(). Actions: capture (save decision/insight), retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance — title plus content and/or query/transcript_ids), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons (retrieve lessons), update_lesson / delete_lesson (maintain a saved lesson by lesson_id — UUID or lookup text), recall (retrieve past conversation context via ranked fusion of transcripts/snapshots/docs/decisions), ground (one-shot prior-work bundle), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (searches MEMORY/conversation history only, not code), decision_trace (trace decision provenance), restore_context (restore state after compaction). Plan actions: capture_plan, get_plan, update_plan, list_plans. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Team actions: team_decisions, team_lessons, team_plans. Team/personal mode: set_account_mode (team|personal|auto).`,
+        description: `Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). PAST SESSIONS LIVE HERE: use action='recall' FIRST when the user references "last time", "previous", "yesterday", or is continuing prior work — full-text transcripts are indexed across every prior session. context() may surface [GROUNDING]; use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills) outside context(). Actions: capture (save decision/insight), retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance — title plus content and/or query/transcript_ids), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons (retrieve lessons), update_lesson / delete_lesson (maintain a saved lesson by lesson_id — UUID or lookup text), recall (retrieve past conversation context via ranked fusion of transcripts/snapshots/docs/decisions), ground (one-shot prior-work bundle), remember (quick save), user_context (get preferences), summary (workspace summary), compress (compress chat), delta (changes since timestamp), smart_search (searches MEMORY/conversation history only, not code), decision_trace (trace decision provenance), list_recaps (timestamped Daily Recap history), trigger_recap (manual asynchronous Daily Recap generation), restore_context (restore state after compaction). Daily Recaps run around 23:00 in the user's timezone, not at MCP session boundaries. Plan actions: capture_plan, get_plan, update_plan, list_plans. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Team actions: team_decisions, team_lessons, team_plans. Team/personal mode: set_account_mode (team|personal|auto).`,
         inputSchema: z.object({
           action: z
             .enum([
@@ -13958,6 +13990,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               "delta",
               "smart_search",
               "decision_trace",
+              "list_recaps",
+              "trigger_recap",
               // Plan actions
               "capture_plan",
               "get_plan",
@@ -14865,6 +14899,34 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 }],
               };
             }
+          }
+
+          case "list_recaps": {
+            if (!workspaceId) {
+              return errorResult("list_recaps requires workspace_id. Call init first or pass workspace_id explicitly.");
+            }
+            const result = await client.listDailyRecaps({
+              workspace_id: workspaceId,
+              limit: input.limit,
+            });
+            return {
+              content: [{ type: "text" as const, text: formatDailyRecaps(result) }],
+              structuredContent: toStructured(result),
+            };
+          }
+
+          case "trigger_recap": {
+            if (!workspaceId) {
+              return errorResult("trigger_recap requires workspace_id. Call init first or pass workspace_id explicitly.");
+            }
+            const result = await client.triggerDailyRecap({ workspace_id: workspaceId });
+            return {
+              content: [{
+                type: "text" as const,
+                text: "Daily Recap generation queued. Automatic recaps also run around 23:00 in the user's configured timezone; generation is not tied to MCP session boundaries. Use session(action=\"list_recaps\") to verify the completed recap and its generated_at timestamp.",
+              }],
+              structuredContent: toStructured(result),
+            };
           }
 
           // Plan actions

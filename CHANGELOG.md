@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Rust MCP alignment
+
+- Hardened full and hook-time indexing against agent state, nested worktrees, credential stores, private keys, and environment files. Repository `.gitignore`, `.contextignore`, and `.contextstream/ignore` files are honored, while security exclusions cannot be negated.
+- Refused accidental filesystem-root or home-directory project ingestion unless explicitly opted in, and stopped reporting failed setup batches or failed changed-file uploads as successfully indexed.
+- Made hosted indexing degrade to structured `server_index_ready`, `server_indexing`, or `requires_sync_bridge` states instead of implying that a hosted process can read workstation paths. Non-loopback path delegation now requires explicit opt-in.
+- Bounded exact identifier and quoted-literal searches so authoritative misses do not fan out into unrelated semantic results; broad fallback remains available for auto-selected natural-language searches.
+- Aligned generated rules and tool metadata around grounding-first continuation, the narrow direct-read lane, and canonical durable handoff entities with optional capsules for portable sharing.
+
 ### Support and discovery
 
 - Documented the hosted Rust, installed Rust, legacy npm TypeScript, and Desktop release lines, including how `help(action="version")` maps each MCP runtime to its release metadata.

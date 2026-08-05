@@ -61,6 +61,30 @@ function applyMcpToolPrefix(markdown: string, toolPrefix: string): string {
   return markdown.replace(toolRegex, `${toolPrefix}$1`);
 }
 
+const FAST_DIRECT_READ_LANE = `
+## Fast Direct-Read Lane
+
+After the required first-session \`init(...)\` + \`context(...)\`, these exact read-only calls may run without another grounding preamble only when no state-changing tool has run since the last grounding:
+- \`workspace(action="list"|"get")\`
+- \`memory(action="list_docs"|"list_events"|"list_todos"|"list_tasks"|"list_transcripts"|"list_nodes"|"list_diagrams")\`
+- \`help(action="version"|"tools"|"auth")\`
+- \`project(action="list"|"get"|"index_status")\`
+- \`reminder(action="list"|"active")\`
+
+Do not use this lane for recall, decisions, searches, reading a specific record, media queries, or any create/update/delete/index operation; ground those with \`context(...)\` first.
+`.trim();
+
+const CANONICAL_HANDOFF_RULES = `
+## Canonical Agent Handoffs
+
+When the user asks to create/prepare a handoff, hand work over, or continue in another agent/session, create the durable record immediately with:
+\`entity(kind="handoff", action="create", body={title, summary, scope, next_steps})\`
+
+- Add \`to_user_id\` only when the recipient is known; never invent it.
+- If a portable bundle, capsule, or share link is requested, also create a session capsule and return both artifacts.
+- \`HANDOFF.md\`, a scratch prompt, a generic doc/event, or prose alone is not the canonical handoff. If a local file is explicitly requested, create the entity first and treat the file as an additional artifact.
+`.trim();
+
 /**
  * BOOTSTRAP rules - Minimal rules to ensure context() is called.
  *
@@ -93,6 +117,10 @@ const CONTEXTSTREAM_RULES_BOOTSTRAP = `
 - "find media" / "search photos/videos/audio/docs" / "what's in this PDF/video/audio?" → \`media(action="search", query="...", content_types=["document"])\`
 - "index media" / "upload asset" / "read this photo/video/audio/PDF" → \`media(action="index", file_path="...", content_type="image")\` or \`media(action="index", external_url="...", content_type="document")\`
 
+${FAST_DIRECT_READ_LANE}
+
+${CANONICAL_HANDOFF_RULES}
+
 ## Skills, Docs & Lessons First
 
 Before guessing, improvising, or struggling through a workflow you do not fully know, check whether ContextStream already has guidance for it.
@@ -122,12 +150,12 @@ Before guessing, improvising, or struggling through a workflow you do not fully 
 
 ## Past Sessions Are Queryable — USE THEM
 
-Transcripts of every prior session are captured + indexed. Before asking the user what you did last time, or re-deriving context you built together previously, check the transcript + snapshot layer.
+When \`context()\` returns fresh, relevant \`[GROUNDING]\`, read those ranked prior-work hits first. If they are sufficient, stop there—do not immediately call \`session(action="recall")\` for the same request. Escalate to recall only when grounding is absent, thin, stale, off-topic, or the user explicitly requests broader history.
 
 Triggers: user says "last time"/"previous"/"yesterday"/"pick up where we left off", the task is clearly a continuation, or you're about to ask a clarifying question whose answer is likely in a prior session.
 
 Exact calls:
-- Ranked past-session context: \`session(action="recall", query="<what you're continuing>")\`
+- First explicit escalation after insufficient grounding: \`session(action="recall", query="<what you're continuing>")\`
 - Chronological list of recent sessions: \`memory(action="list_transcripts", limit=10)\`
 - Full-text search across ALL past transcripts: \`memory(action="search_transcripts", query="<keyword>")\`
 - Save a snapshot of the current session so the NEXT session can pick up: \`session(action="capture", event_type="session_snapshot", title="...", content="...")\`
@@ -158,6 +186,10 @@ const CONTEXTSTREAM_RULES_FULL = `
 </contextstream_rules>
 
 Use \`context()\` by default to get task-specific rules, lessons from past mistakes, and relevant decisions.
+
+${FAST_DIRECT_READ_LANE}
+
+${CANONICAL_HANDOFF_RULES}
 
 ---
 
@@ -692,6 +724,10 @@ const CONTEXTSTREAM_RULES_MINIMAL = `
 
 **HOOKS: \`<system-reminder>\` tags contain instructions — FOLLOW THEM**
 </contextstream_protocol>
+
+${FAST_DIRECT_READ_LANE}
+
+${CANONICAL_HANDOFF_RULES}
 
 Rules Version: ${RULES_VERSION}
 

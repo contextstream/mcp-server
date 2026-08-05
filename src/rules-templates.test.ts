@@ -28,15 +28,13 @@ describe("rules-templates plan-mode guidance", () => {
     const copilotFiles = generateAllRuleFiles({ mode: "bootstrap" }).filter(
       (file) => file.editor === "copilot"
     );
-    expect(copilotFiles.map((file) => file.filename)).toContain(
-      ".github/copilot-instructions.md"
-    );
+    expect(copilotFiles.map((file) => file.filename)).toContain(".github/copilot-instructions.md");
     expect(copilotFiles.map((file) => file.filename)).toContain(
       ".github/skills/contextstream-workflow/SKILL.md"
     );
-    expect(
-      copilotFiles.find((file) => file.filename.endsWith("SKILL.md"))?.content
-    ).toContain("name: contextstream-workflow");
+    expect(copilotFiles.find((file) => file.filename.endsWith("SKILL.md"))?.content).toContain(
+      "name: contextstream-workflow"
+    );
   });
 
   it("applies no-hooks guidance to Copilot rules", () => {
@@ -59,5 +57,27 @@ describe("rules-templates plan-mode guidance", () => {
     expect(result!.filename).toBe(".windsurf/rules/contextstream.md");
     expect(result!.content).toContain("trigger: always_on");
     expect(result!.content).toContain("# Windsurf Rules");
+  });
+
+  it.each(["bootstrap", "minimal", "full"] as const)(
+    "includes current direct-read and canonical handoff guidance in %s mode",
+    (mode) => {
+      const result = generateRuleContent("codex", { mode });
+      expect(result).not.toBeNull();
+      const content = result!.content;
+      expect(content).toContain("## Fast Direct-Read Lane");
+      expect(content).toContain('project(action="list"|"get"|"index_status")');
+      expect(content).toContain("Do not use this lane for recall, decisions, searches");
+      expect(content).toContain("## Canonical Agent Handoffs");
+      expect(content).toContain('entity(kind="handoff", action="create"');
+      expect(content).toContain("HANDOFF.md");
+    }
+  );
+
+  it("treats fresh grounding as the first continuation lookup", () => {
+    const result = generateRuleContent("codex", { mode: "bootstrap" });
+    expect(result).not.toBeNull();
+    expect(result!.content).toContain('do not immediately call `session(action="recall")`');
+    expect(result!.content).toContain("First explicit escalation after insufficient grounding");
   });
 });

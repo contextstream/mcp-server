@@ -128,6 +128,8 @@ Environment variables:
   CONTEXTSTREAM_SEARCH_MAX_CHARS  Max chars per search result content (default: 400)
   CONTEXTSTREAM_CONSOLIDATED  Consolidated domain tools: true|false (default: true in v0.4.x, ~75% token reduction)
   CONTEXTSTREAM_CONTEXT_PACK  Enable Context Pack in context_smart: true|false (default: true)
+  CONTEXTSTREAM_ALLOW_BROAD_INGEST Allow filesystem-root/home indexing only when explicitly set to 1
+  CONTEXTSTREAM_ALLOW_API_PATH_INGEST Allow a non-loopback API to resolve local paths only when explicitly set to 1
   CONTEXTSTREAM_PRO_TOOLS     Optional comma-separated PRO tool names (default: AI tools)
   CONTEXTSTREAM_UPGRADE_URL   Optional upgrade URL shown for PRO tools on Free plan
   CONTEXTSTREAM_ENABLE_PROMPTS Enable MCP prompts list (default: true)

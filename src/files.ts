@@ -8,7 +8,7 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import * as os from "os";
 import * as crypto from "crypto";
-import { loadIgnorePatterns, IgnoreInstance } from "./ignore.js";
+import { isInvariantIgnoredPath, loadIgnorePatterns, IgnoreInstance } from "./ignore.js";
 
 const execAsync = promisify(exec);
 
@@ -109,6 +109,13 @@ const CODE_EXTENSIONS = new Set([
 const IGNORE_DIRS = new Set([
   "node_modules",
   ".git",
+  ".contextstream",
+  ".claude",
+  ".codex",
+  ".cursor",
+  ".windsurf",
+  ".roo",
+  ".kilocode",
   ".svn",
   ".hg",
   "target",
@@ -137,6 +144,17 @@ const IGNORE_DIRS = new Set([
   ".idea",
   ".vscode",
   ".vs",
+  ".npm",
+  ".yarn",
+  ".nyc_output",
+  // Credential directories are invariant exclusions. Their contents often
+  // have ordinary-looking names (config, credentials, known_hosts), so a
+  // filename-only filter is not sufficient.
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".kube",
+  ".docker",
 ]);
 
 // Files to ignore
@@ -153,6 +171,41 @@ const IGNORE_FILES = new Set([
   "Gemfile.lock",
   "composer.lock",
 ]);
+
+const SECRET_FILENAMES = new Set([
+  ".npmrc",
+  ".pypirc",
+  ".netrc",
+  ".pgpass",
+  ".git-credentials",
+  "id_rsa",
+  "id_ed25519",
+  "id_ecdsa",
+  "known_hosts",
+  "credentials.json",
+  "serviceaccountkey.json",
+  "auth.json",
+]);
+
+const SECRET_FILE_SUFFIXES = [".pem", ".key", ".p12", ".pfx", ".jks"];
+const ENV_TEMPLATE_ALLOWLIST = new Set([
+  ".env.example",
+  ".env.sample",
+  ".env.template",
+  ".env.dist",
+  ".env.defaults",
+]);
+
+/** Invariant credential filtering that user ignore negations cannot override. */
+function shouldSkipSensitiveFile(name: string): boolean {
+  const lower = name.toLowerCase();
+  if (SECRET_FILENAMES.has(lower)) return true;
+  if (SECRET_FILE_SUFFIXES.some((suffix) => lower.endsWith(suffix))) return true;
+  if ((lower === ".env" || lower.startsWith(".env.")) && !ENV_TEMPLATE_ALLOWLIST.has(lower)) {
+    return true;
+  }
+  return false;
+}
 
 // Max file size to index (5MB)
 const MAX_FILE_SIZE = 5 * 1024 * 1024;
@@ -366,6 +419,8 @@ export async function readFilesFromDirectory(
     ignoreInstance?: IgnoreInstance;
   } = {}
 ): Promise<FileToIngest[]> {
+  if (isInvariantIgnoredPath(path.resolve(rootPath))) return [];
+
   const maxFiles = options.maxFiles ?? MAX_FILES_PER_BATCH;
   const maxFileSize = options.maxFileSize ?? MAX_FILE_SIZE;
   const files: FileToIngest[] = [];
@@ -402,6 +457,7 @@ export async function readFilesFromDirectory(
       } else if (entry.isFile()) {
         // Skip ignored files (check both hardcoded and .contextstream/ignore)
         if (IGNORE_FILES.has(entry.name)) continue;
+        if (shouldSkipSensitiveFile(entry.name)) continue;
         if (ig.ignores(relPath)) continue;
 
         // Check extension
@@ -475,6 +531,8 @@ export async function* readAllFilesInBatches(
     ignoreInstance?: IgnoreInstance;
   } = {}
 ): AsyncGenerator<FileToIngest[], void, unknown> {
+  if (isInvariantIgnoredPath(path.resolve(rootPath))) return;
+
   const maxBatchBytes = options.maxBatchBytes ?? MAX_BATCH_BYTES;
   const largeFileThreshold = options.largeFileThreshold ?? LARGE_FILE_THRESHOLD;
   const maxFilesPerBatch = options.maxFilesPerBatch ?? options.batchSize ?? MAX_FILES_PER_BATCH;
@@ -512,6 +570,7 @@ export async function* readAllFilesInBatches(
         yield* walkDir(fullPath, relPath);
       } else if (entry.isFile()) {
         if (IGNORE_FILES.has(entry.name)) continue;
+        if (shouldSkipSensitiveFile(entry.name)) continue;
         if (ig.ignores(relPath)) continue;
 
         const ext = entry.name.split(".").pop()?.toLowerCase() ?? "";
@@ -611,6 +670,8 @@ export async function* readChangedFilesInBatches(
     ignoreInstance?: IgnoreInstance;
   } = {}
 ): AsyncGenerator<FileToIngest[], void, unknown> {
+  if (isInvariantIgnoredPath(path.resolve(rootPath))) return;
+
   const maxBatchBytes = options.maxBatchBytes ?? MAX_BATCH_BYTES;
   const largeFileThreshold = options.largeFileThreshold ?? LARGE_FILE_THRESHOLD;
   const maxFilesPerBatch = options.maxFilesPerBatch ?? options.batchSize ?? MAX_FILES_PER_BATCH;
@@ -651,6 +712,7 @@ export async function* readChangedFilesInBatches(
         yield* walkDir(fullPath, relPath);
       } else if (entry.isFile()) {
         if (IGNORE_FILES.has(entry.name)) continue;
+        if (shouldSkipSensitiveFile(entry.name)) continue;
         if (ig.ignores(relPath)) continue;
 
         const ext = entry.name.split(".").pop()?.toLowerCase() ?? "";
@@ -755,6 +817,8 @@ export async function countIndexableFiles(
     ignoreInstance?: IgnoreInstance;
   } = {}
 ): Promise<{ count: number; stopped: boolean }> {
+  if (isInvariantIgnoredPath(path.resolve(rootPath))) return { count: 0, stopped: false };
+
   const maxFiles = options.maxFiles ?? 1;
   const maxFileSize = options.maxFileSize ?? MAX_FILE_SIZE;
 
@@ -794,6 +858,7 @@ export async function countIndexableFiles(
         await walkDir(fullPath, relPath);
       } else if (entry.isFile()) {
         if (IGNORE_FILES.has(entry.name)) continue;
+        if (shouldSkipSensitiveFile(entry.name)) continue;
         if (ig.ignores(relPath)) continue;
 
         const ext = entry.name.split(".").pop()?.toLowerCase() ?? "";

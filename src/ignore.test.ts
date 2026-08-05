@@ -26,6 +26,9 @@ describe("ignore patterns", () => {
       expect(ig.ignores("node_modules/foo.js")).toBe(true);
       expect(ig.ignores(".git/config")).toBe(true);
       expect(ig.ignores("package-lock.json")).toBe(true);
+      expect(ig.ignores(".claude/worktrees/demo/src/main.ts")).toBe(true);
+      expect(ig.ignores(".codex/auth.json")).toBe(true);
+      expect(ig.ignores(".aws/credentials")).toBe(true);
     });
 
     it("should load user patterns from .contextstream/ignore", async () => {
@@ -66,6 +69,21 @@ src/legacy/
       expect(ig.ignores("node_modules/foo.js")).toBe(true);
     });
 
+    it("does not allow user negations to re-include agent state or credentials", async () => {
+      fs.writeFileSync(
+        path.join(tempDir, ".gitignore"),
+        "!.claude/**\n!.codex/**\n!.npmrc\n!.env.production\n"
+      );
+
+      const ig = await loadIgnorePatterns(tempDir);
+
+      expect(ig.ignores(".claude/worktrees/demo/main.ts")).toBe(true);
+      expect(ig.ignores(".codex/auth.json")).toBe(true);
+      expect(ig.ignores("packages/app/.npmrc")).toBe(true);
+      expect(ig.ignores("packages/app/.env.production")).toBe(true);
+      expect(ig.ignores("packages/app/.env.example")).toBe(false);
+    });
+
     it("should ignore comments in .contextstream/ignore", async () => {
       const csDir = path.join(tempDir, ".contextstream");
       fs.mkdirSync(csDir);
@@ -92,6 +110,16 @@ secret.txt
       expect(ig.hasUserPatterns).toBe(false);
       expect(ig.ignores("node_modules/foo.js")).toBe(true);
     });
+  });
+
+  it("loads repository and compatibility ignore files", async () => {
+    fs.writeFileSync(path.join(tempDir, ".gitignore"), "generated/\n");
+    fs.writeFileSync(path.join(tempDir, ".contextignore"), "private-notes/\n");
+
+    const ig = await loadIgnorePatterns(tempDir);
+    expect(ig.hasUserPatterns).toBe(true);
+    expect(ig.ignores("generated/output.ts")).toBe(true);
+    expect(ig.ignores("private-notes/todo.md")).toBe(true);
   });
 
   describe("default ignore patterns", () => {

@@ -54,11 +54,14 @@ import {
 } from "./microcopy.js";
 import {
   apiResultIsIndexing,
+  apiIndexResultIsSkipped,
   classifyGraphIngestIndexState,
+  classifyRemoteIndexState,
   apiResultReportsIndexed,
   classifyIndexConfidence,
   classifyIndexFreshness,
   extractPendingFilePaths,
+  extractIndexedFileCount,
   extractIndexTimestamp,
   indexHistoryEntryCount,
   readGitHead,
@@ -68,6 +71,8 @@ import {
 } from "./project-index-utils.js";
 import { resolveTodoCompletionUpdate } from "./todo-utils.js";
 import { globalHotPathStore } from "./hot-paths.js";
+import { isBroadProjectPath } from "./setup.js";
+import { isInvariantIgnoredPath } from "./ignore.js";
 
 type StructuredContent = { [x: string]: unknown } | undefined;
 type ToolTextResult = {
@@ -77,6 +82,12 @@ type ToolTextResult = {
 };
 
 const MCP_RELEASES_URL = "https://github.com/contextstream/mcp-server/releases";
+
+export const ENTITY_TOOL_DESCRIPTION =
+  "Structured taxonomy entities — tickets, handoffs, incidents, releases, experiments, goals, key_results, sprints, reviews, risks, and backlog views. Use kind=handoff with action=create when the user asks to create or prepare a handoff, hand work over, or continue in another agent/session; include title, summary, scope, and next_steps. Add to_user_id only when the recipient is known; omit to_user_id rather than inventing a recipient. A handoff entity is the canonical durable handoff. A capsule is an optional additional portable artifact when the user explicitly asks for a capsule, bundle, or share link. Never substitute HANDOFF.md, a scratch prompt, a generic document/event, or prose alone. Use memory(create_task) for lightweight tasks, memory(create_doc) for runbooks/docs, and session(capture) for timeline events.";
+
+export const CAPSULE_TOOL_DESCRIPTION =
+  "ContextCapsule creates portable, shareable, hydrate-on-demand context artifacts. Use it when the user explicitly asks for a capsule, portable bundle, share link, team link, external-agent link, bootstrap prompt, share-token graph, or capsule audit. For a generic handoff, first create entity(kind=handoff); if a portable bundle or link is also requested, create both the handoff entity and capsule. A capsule is the artifact, not a replacement for the canonical handoff. Do not use capsule for normal turn-by-turn retrieval; use context instead.";
 
 type TaskUpdateShape = {
   title?: unknown;
@@ -2979,6 +2990,32 @@ export function scoreConfidenceBand(score: unknown): "high" | "medium" | "low" |
   return "low";
 }
 
+export function isExactIdentifierQuery(query: string): boolean {
+  const trimmed = query.trim();
+  if (!trimmed || trimmed.length < 2 || trimmed.includes(" ")) return false;
+  if (!/^[A-Za-z0-9_:]+$/.test(trimmed)) return false;
+  const hasMixedCase = /[a-z]/.test(trimmed) && /[A-Z]/.test(trimmed);
+  const hasUnderscore = trimmed.includes("_");
+  const isAllCaps = trimmed.length >= 3 && /^[A-Z0-9_]+$/.test(trimmed);
+  return hasMixedCase || hasUnderscore || isAllCaps;
+}
+
+export function exactQuotedLiteral(query: string): string | undefined {
+  const trimmed = query.trim();
+  if (trimmed.length < 2) return undefined;
+  const isDoubleQuoted = trimmed.startsWith('"') && trimmed.endsWith('"');
+  const isSingleQuoted = trimmed.startsWith("'") && trimmed.endsWith("'");
+  if (!isDoubleQuoted && !isSingleQuoted) return undefined;
+  const literal = trimmed.slice(1, -1).trim();
+  return literal || undefined;
+}
+
+export function allowBroadSearchFallbacks(modeAutoSelected: boolean, query: string): boolean {
+  return (
+    modeAutoSelected && !isExactIdentifierQuery(query) && exactQuotedLiteral(query) === undefined
+  );
+}
+
 // Identifier-shaped queries are code intent even as a lone token: a symbol
 // lookup like `search_first_redirect_decision` must not blend memory/media
 // hits into workspace-scoped results. Conservative — prose and plain memory
@@ -5299,17 +5336,7 @@ export function registerTools(
   }
 
   function extractQuotedLiteral(query: string): string | undefined {
-    const trimmed = query.trim();
-    if (trimmed.length < 2) return undefined;
-    const isDoubleQuoted = trimmed.startsWith("\"") && trimmed.endsWith("\"");
-    const isSingleQuoted = trimmed.startsWith("'") && trimmed.endsWith("'");
-    if (!isDoubleQuoted && !isSingleQuoted) return undefined;
-    const literal = trimmed.slice(1, -1).trim();
-    return literal || undefined;
-  }
-
-  function escapeRegexLiteral(input: string): string {
-    return input.replace(/[\\.+*?()[\]{}|^$]/g, "\\$&");
+    return exactQuotedLiteral(query);
   }
 
   const COUNT_QUERY_PREFIXES = ["how many ", "count ", "count of ", "number of ", "total "];
@@ -5355,13 +5382,7 @@ export function registerTools(
   }
 
   function isIdentifierQuery(query: string): boolean {
-    const trimmed = query.trim();
-    if (!trimmed || trimmed.length < 2 || trimmed.includes(" ")) return false;
-    if (!/^[A-Za-z0-9_:]+$/.test(trimmed)) return false;
-    const hasMixedCase = /[a-z]/.test(trimmed) && /[A-Z]/.test(trimmed);
-    const hasUnderscore = trimmed.includes("_");
-    const isAllCaps = trimmed.length >= 3 && /^[A-Z0-9_]+$/.test(trimmed);
-    return hasMixedCase || hasUnderscore || isAllCaps;
+    return isExactIdentifierQuery(query);
   }
 
   function hasRegexCharacters(query: string): boolean {
@@ -5868,6 +5889,18 @@ export function registerTools(
     inputPath: string
   ): Promise<{ ok: true; resolvedPath: string } | { ok: false; error: string }> {
     const resolvedPath = path.resolve(inputPath);
+    if (isInvariantIgnoredPath(resolvedPath)) {
+      return {
+        ok: false,
+        error: `Error: refusing to index a path inside agent state or a credential store: ${inputPath}. Pass the actual repository checkout instead.`,
+      };
+    }
+    if (isBroadProjectPath(resolvedPath) && process.env.CONTEXTSTREAM_ALLOW_BROAD_INGEST !== "1") {
+      return {
+        ok: false,
+        error: `Error: refusing to index filesystem root or home directory: ${inputPath}. Pass a narrower project path, or set CONTEXTSTREAM_ALLOW_BROAD_INGEST=1 for an intentional broad ingest.`,
+      };
+    }
     let stats: fs.Stats;
     try {
       stats = await fs.promises.stat(resolvedPath);
@@ -5895,6 +5928,47 @@ export function registerTools(
     }
 
     return { ok: true, resolvedPath };
+  }
+
+  async function remoteIndexStateResult(
+    action: "index" | "ingest_local",
+    projectId: string,
+    requestedPath?: string
+  ): Promise<ToolTextResult> {
+    let statusResult: unknown = {};
+    try {
+      statusResult = await client.projectIndexStatus(projectId);
+    } catch (error) {
+      if (!isNotFoundError(error)) throw error;
+    }
+
+    const status = classifyRemoteIndexState(statusResult);
+    const filesIndexed = extractIndexedFileCount(statusResult);
+    const target = requestedPath ? `'${requestedPath}'` : "the project folder";
+    const remoteNote = `This MCP process cannot read ${target}; no workstation files were ingested by this call.`;
+    let message: string;
+    if (status === "server_index_ready") {
+      const countNote = filesIndexed !== undefined ? ` (${filesIndexed} files)` : "";
+      message = `Server-side index is ready for project ${projectId}${countNote}. ${remoteNote} Keep local changes current with the ContextStream sync bridge, editor hooks, or ContextStream Desktop, and verify freshness with project(action="index_status").`;
+    } else if (status === "server_indexing") {
+      message = `A server-side index run is already in progress for project ${projectId}. ${remoteNote} Monitor it with project(action="index_status").`;
+    } else {
+      message = `No exact-checkout content upload has completed for project ${projectId}. ${remoteNote} Keep hosted MCP configured and index from a process that can read the checkout, the ContextStream sync bridge, editor hooks, or ContextStream Desktop. Then retry project(action="index") and verify with project(action="index_status").`;
+    }
+
+    const structured = {
+      status,
+      invoked_action: action,
+      project_id: projectId,
+      path: requestedPath ?? null,
+      local_path_readable: false,
+      files_indexed: filesIndexed ?? null,
+      message,
+    };
+    return {
+      content: [{ type: "text" as const, text: message }],
+      structuredContent: structured,
+    };
   }
 
   function startBackgroundIngest(
@@ -5935,6 +6009,10 @@ export function registerTools(
           force: ingestOptions.force,
           ingestOptions,
         });
+
+        if (result.status === "error") {
+          throw new Error(result.lastError || "all changed-file ingest batches failed");
+        }
 
         logTool(
           "ingest",
@@ -9434,6 +9512,18 @@ Behavior:
         );
       }
 
+      if (isInvariantIgnoredPath(folderPath)) {
+        return errorResult(
+          `Refusing to bootstrap a path inside agent state or a credential store: ${folderPath}. Pass the actual repository checkout instead.`
+        );
+      }
+
+      if (isBroadProjectPath(folderPath) && process.env.CONTEXTSTREAM_ALLOW_BROAD_INGEST !== "1") {
+        return errorResult(
+          `Refusing to bootstrap filesystem root or home directory as a project: ${folderPath}. Pass a narrower repository/project path.`
+        );
+      }
+
       const folderName = path.basename(folderPath) || "My Project";
 
       let newWorkspace: { id?: string; name?: string };
@@ -12875,9 +12965,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           | "exhaustive"
           | "refactor"
           | "team"
-          | "crawl" = modeAutoSelected
-            ? modeRecommendation.mode
-            : modeInput;
+          | "crawl" = modeAutoSelected ? modeRecommendation.mode : modeInput;
+        const broadSearchFallbacksAllowed = allowBroadSearchFallbacks(
+          modeAutoSelected,
+          input.query
+        );
 
         let workspaceId = resolveWorkspaceId(input.workspace_id);
         const sessionProjectId = resolveProjectId(undefined);
@@ -12961,7 +13053,8 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             | "refactor"
             | "team"
             | "crawl",
-          baseParams: ReturnType<typeof normalizeSearchParams>
+          baseParams: ReturnType<typeof normalizeSearchParams>,
+          allowBroadFallbacks: boolean
         ): Promise<{ result: any; executedMode: typeof mode; fallbackNote?: string }> => {
           if (mode === "team") {
             const isTeamPlanForSearch = await client.isTeamPlan();
@@ -13024,15 +13117,41 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             | "pattern"
             | "exhaustive"
             | "refactor"
-            | "crawl" =
-            dispatchMode;
+            | "crawl" = dispatchMode;
           let fallbackNote: string | undefined;
+          const quotedLiteral =
+            dispatchMode === "keyword" ? extractQuotedLiteral(input.query) : undefined;
+          const identifierExhaustiveFastPath =
+            dispatchMode === "keyword" &&
+            quotedLiteral === undefined &&
+            baseParams.include_memory !== true &&
+            isIdentifierQuery(baseParams.query);
+          const primaryParams = quotedLiteral
+            ? { ...baseParams, query: quotedLiteral }
+            : baseParams;
 
           try {
-            result = await executeSearchMode(dispatchMode, baseParams);
+            if (identifierExhaustiveFastPath) {
+              try {
+                result = await executeSearchMode("exhaustive", baseParams);
+                executedMode = "exhaustive";
+                fallbackNote = "Exact identifier query used the exhaustive literal fast path.";
+              } catch {
+                result = await executeSearchMode("keyword", baseParams);
+                executedMode = "keyword";
+                fallbackNote =
+                  "Exact identifier exhaustive fast path was unavailable; used keyword search.";
+              }
+            } else {
+              result = await executeSearchMode(dispatchMode, primaryParams);
+              if (quotedLiteral) {
+                fallbackNote = "Normalized surrounding quotes before exact keyword search.";
+              }
+            }
           } catch (execError: any) {
             const execMsg = execError instanceof Error ? execError.message : String(execError);
-            const isEmbedTimeout = execMsg.toLowerCase().includes("embedding timed out") ||
+            const isEmbedTimeout =
+              execMsg.toLowerCase().includes("embedding timed out") ||
               execMsg.toLowerCase().includes("embedding timeout");
             if (isEmbedTimeout && dispatchMode !== "keyword" && dispatchMode !== "exhaustive") {
               result = await executeSearchMode("keyword", baseParams);
@@ -13043,7 +13162,10 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             }
           }
 
-          if (shouldRetrySemanticFallback(input.query, dispatchMode, result)) {
+          if (
+            allowBroadFallbacks &&
+            shouldRetrySemanticFallback(input.query, dispatchMode, result)
+          ) {
             try {
               const semanticResult = await executeSearchMode("semantic", baseParams);
               if (shouldPreferSemanticResults(input.query, result, semanticResult)) {
@@ -13061,69 +13183,46 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
 
           const currentResults = () => extractSearchEnvelope(result).results;
 
-          if (dispatchMode === "keyword" && currentResults().length === 0) {
-            const literal = extractQuotedLiteral(input.query);
-            if (literal) {
-              if (literal !== baseParams.query) {
-                try {
-                  const keywordUnquoted = await executeSearchMode("keyword", {
-                    ...baseParams,
-                    query: literal,
-                  });
-                  if (extractSearchEnvelope(keywordUnquoted).results.length > 0) {
-                    result = keywordUnquoted;
-                    executedMode = "keyword";
-                    fallbackNote = appendNote(
-                      fallbackNote,
-                      "Quoted keyword search returned no results; retried keyword search without quotes."
-                    );
-                  }
-                } catch {
-                  // Keep existing results.
-                }
+          if (quotedLiteral && currentResults().length === 0) {
+            try {
+              const exhaustiveResult = await executeSearchMode("exhaustive", {
+                ...baseParams,
+                query: quotedLiteral,
+              });
+              if (extractSearchEnvelope(exhaustiveResult).results.length > 0) {
+                result = exhaustiveResult;
+                executedMode = "exhaustive";
+                fallbackNote = appendNote(
+                  fallbackNote,
+                  "Exact keyword search returned no results; retried exhaustive search for complete literal coverage."
+                );
               }
-
-              if (currentResults().length === 0) {
-                try {
-                  const patternResult = await executeSearchMode("pattern", {
-                    ...baseParams,
-                    query: escapeRegexLiteral(literal),
-                  });
-                  if (extractSearchEnvelope(patternResult).results.length > 0) {
-                    result = patternResult;
-                    executedMode = "pattern";
-                    fallbackNote = appendNote(
-                      fallbackNote,
-                      "Quoted keyword search returned no results; retried literal pattern search."
-                    );
-                  }
-                } catch {
-                  // Keep existing results.
-                }
-              }
-
-              if (currentResults().length === 0) {
-                try {
-                  const exhaustiveResult = await executeSearchMode("exhaustive", {
-                    ...baseParams,
-                    query: literal,
-                  });
-                  if (extractSearchEnvelope(exhaustiveResult).results.length > 0) {
-                    result = exhaustiveResult;
-                    executedMode = "exhaustive";
-                    fallbackNote = appendNote(
-                      fallbackNote,
-                      "Quoted keyword search returned no results; retried exhaustive search for complete literal coverage."
-                    );
-                  }
-                } catch {
-                  // Keep existing results.
-                }
-              }
+            } catch {
+              // Keep the authoritative exact miss.
             }
           }
 
-          if ((dispatchMode === "refactor" || dispatchMode === "exhaustive") && currentResults().length === 0) {
+          if (identifierExhaustiveFastPath && currentResults().length === 0) {
+            try {
+              const keywordResult = await executeSearchMode("keyword", baseParams);
+              if (extractSearchEnvelope(keywordResult).results.length > 0) {
+                result = keywordResult;
+                executedMode = "keyword";
+                fallbackNote = appendNote(
+                  fallbackNote,
+                  "Exact identifier exhaustive lookup returned no results; keyword fallback found tokenized matches."
+                );
+              }
+            } catch {
+              // Keep the authoritative exact miss.
+            }
+          }
+
+          if (
+            allowBroadFallbacks &&
+            (dispatchMode === "refactor" || dispatchMode === "exhaustive") &&
+            currentResults().length === 0
+          ) {
             try {
               const keywordResult = await executeSearchMode("keyword", baseParams);
               if (extractSearchEnvelope(keywordResult).results.length > 0) {
@@ -13155,7 +13254,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 // Keep existing results.
               }
 
-              if (currentResults().length === 0) {
+              if (currentResults().length === 0 && !identifierExhaustiveFastPath) {
                 try {
                   const exhaustiveResult = await executeSearchMode("exhaustive", baseParams);
                   if (extractSearchEnvelope(exhaustiveResult).results.length > 0) {
@@ -13172,7 +13271,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               }
             }
 
-            if (currentResults().length === 0 && shouldRetryKeywordWithSemantic(input.query)) {
+            if (
+              allowBroadFallbacks &&
+              currentResults().length === 0 &&
+              shouldRetryKeywordWithSemantic(input.query)
+            ) {
               try {
                 const semanticResult = await executeSearchMode("semantic", baseParams);
                 if (extractSearchEnvelope(semanticResult).results.length > 0) {
@@ -13188,7 +13291,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               }
             }
 
-            if (currentResults().length === 0) {
+            if (allowBroadFallbacks && currentResults().length === 0) {
               try {
                 const hybridResult = await executeSearchMode("hybrid", baseParams);
                 if (extractSearchEnvelope(hybridResult).results.length > 0) {
@@ -13242,20 +13345,27 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           project_id: undefined,
           hot_paths_hint: hotPathsHint,
           output_format:
-            input.output_format || suggestOutputFormat(input.query, requestedMode === "team" ? "hybrid" : requestedMode),
+            input.output_format ||
+            suggestOutputFormat(input.query, requestedMode === "team" ? "hybrid" : requestedMode),
         });
 
-        let parallelRgPromise: Promise<Array<{ file_path: string; line: number; content: string; score: number }>> | undefined;
+        let parallelRgPromise:
+          | Promise<Array<{ file_path: string; line: number; content: string; score: number }>>
+          | undefined;
         if (containsCodeIdentifiers(input.query) && folderPath && requestedMode !== "pattern") {
           parallelRgPromise = runLocalRipgrep(input.query, folderPath, input.limit || 10);
         }
 
         if (requestedMode === "team") {
           try {
-            const teamResult = await runSearchForMode("team", {
-              ...baseParams,
-              project_id: undefined,
-            });
+            const teamResult = await runSearchForMode(
+              "team",
+              {
+                ...baseParams,
+                project_id: undefined,
+              },
+              broadSearchFallbacksAllowed
+            );
             selected = {
               index: 0,
               project_id: undefined,
@@ -13276,7 +13386,11 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             };
 
             try {
-              const modeResult = await runSearchForMode(requestedMode, paramsForCandidate);
+              const modeResult = await runSearchForMode(
+                requestedMode,
+                paramsForCandidate,
+                broadSearchFallbacksAllowed
+              );
               const envelope = extractSearchEnvelope(modeResult.result);
 
               if (isScopeInvalidResult(modeResult.result)) {
@@ -13321,11 +13435,20 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
                 continue;
               }
               const errMsg = error instanceof Error ? error.message : String(error);
-              const isEmbeddingTimeout = errMsg.toLowerCase().includes("embedding timed out") ||
+              const isEmbeddingTimeout =
+                errMsg.toLowerCase().includes("embedding timed out") ||
                 errMsg.toLowerCase().includes("embedding timeout");
-              if (isEmbeddingTimeout && requestedMode !== "keyword" && requestedMode !== "exhaustive") {
+              if (
+                isEmbeddingTimeout &&
+                requestedMode !== "keyword" &&
+                requestedMode !== "exhaustive"
+              ) {
                 try {
-                  const keywordFallback = await runSearchForMode("keyword", paramsForCandidate);
+                  const keywordFallback = await runSearchForMode(
+                    "keyword",
+                    paramsForCandidate,
+                    false
+                  );
                   const kwEnvelope = extractSearchEnvelope(keywordFallback.result);
                   selected = {
                     index,
@@ -13483,28 +13606,43 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
           }
         }
 
-        if (results.length === 0 && !scopeInvalid) {
+        if (results.length === 0 && !scopeInvalid && broadSearchFallbacksAllowed) {
           const escalationModes: Array<typeof selected.executedMode> = (() => {
             switch (selected.executedMode) {
-              case "semantic": return ["hybrid", "keyword"];
-              case "hybrid": return ["keyword"];
-              case "keyword": return ["hybrid"];
-              default: return [];
+              case "semantic":
+                return ["hybrid", "keyword"];
+              case "hybrid":
+                return ["keyword"];
+              case "keyword":
+                return ["hybrid"];
+              default:
+                return [];
             }
           })();
           for (const escMode of escalationModes) {
             try {
-              const escResult = await runSearchForMode(escMode, {
-                ...baseParams, workspace_id: workspaceId, project_id: selected.project_id,
-              });
+              const escResult = await runSearchForMode(
+                escMode,
+                {
+                  ...baseParams,
+                  workspace_id: workspaceId,
+                  project_id: selected.project_id,
+                },
+                false
+              );
               const escEnvelope = extractSearchEnvelope(escResult.result);
               if (escEnvelope.results.length > 0) {
                 results = escEnvelope.results;
                 total = escEnvelope.total;
-                modeFallbackNote = appendNote(modeFallbackNote, `${selected.executedMode} returned 0 results; escalated to ${escMode}.`);
+                modeFallbackNote = appendNote(
+                  modeFallbackNote,
+                  `${selected.executedMode} returned 0 results; escalated to ${escMode}.`
+                );
                 break;
               }
-            } catch { /* continue */ }
+            } catch {
+              /* continue */
+            }
           }
         }
 
@@ -14789,7 +14927,6 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
             };
           }
 
@@ -14805,7 +14942,6 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
             };
           }
 
@@ -15498,15 +15634,30 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
     registerTool(
       "entity",
       {
-        title: "Structured Entity Operations",
-        description: "Unified CRUD across taxonomy expansion entities. Kinds: ticket, handoff, backlog_view, incident, release, experiment, goal, key_result, sprint, review, risk. Actions: list, get, create, update, delete. Body is free-form JSON forwarded to the API; workspace_id/project_id default to active scope when omitted.",
+        title: "Structured Handoffs, Tickets, and Workflow Entities",
+        description: ENTITY_TOOL_DESCRIPTION,
         inputSchema: z.object({
-          kind: z.enum(VALID_ENTITY_KINDS).describe("Entity kind"),
-          action: z.enum(["list", "get", "create", "update", "delete"]).describe("Action to perform"),
-          id: z.string().uuid().optional().describe("Entity ID (required for get / update / delete)"),
+          kind: z
+            .enum(VALID_ENTITY_KINDS)
+            .describe(
+              "Entity kind. handoff is the canonical durable agent/session handoff; capsule is an optional additional portable artifact."
+            ),
+          action: z
+            .enum(["list", "get", "create", "update", "delete"])
+            .describe("Action to perform"),
+          id: z
+            .string()
+            .uuid()
+            .optional()
+            .describe("Entity ID (required for get / update / delete)"),
           workspace_id: z.string().uuid().optional(),
           project_id: z.string().uuid().optional(),
-          body: z.record(z.any()).optional().describe("JSON body for create / update"),
+          body: z
+            .record(z.any())
+            .optional()
+            .describe(
+              "JSON body for create/update. For handoff create, include title, summary, scope, and next_steps; omit to_user_id when the recipient is unknown."
+            ),
           query: z.record(z.any()).optional().describe("Filter params for list"),
         }),
       },
@@ -15579,7 +15730,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
       "capsule",
       {
         title: "ContextCapsule",
-        description: "ContextCapsule: portable, shareable, hydrate-on-demand snapshots of project context. Use capsule when the user pastes a /c/<token> link or capsule token, asks for a handoff/share/team/external-agent link, wants to bootstrap a fresh agent with project state, asks for a paste-ready handoff prompt (bootstrap prompt / prompt for another LLM), wants share-token graphs, or wants to list/audit capsules. Do not use capsule for normal turn-by-turn retrieval; use context instead. Team share links are authenticated and reusable by default; external_agent/public_link/support shares are token-gated and single-use by default.",
+        description: CAPSULE_TOOL_DESCRIPTION,
         inputSchema: z.object({
           action: z.enum(CAPSULE_ACTIONS).describe("Action to perform"),
           capsule_id: z.string().optional().describe("ContextCapsule ID"),
@@ -16529,7 +16680,6 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
             };
           }
 
@@ -16540,7 +16690,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             const result = await client.getMemoryEvent(input.event_id);
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
+
             };
           }
 
@@ -16555,7 +16705,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
+
             };
           }
 
@@ -17722,6 +17872,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
+
             };
           }
 
@@ -18025,6 +18176,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
+
             };
           }
 
@@ -18193,9 +18345,48 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             }
             try {
               const result = await client.indexProject(projectId);
+              if (apiIndexResultIsSkipped(result)) {
+                if (!folderPath) {
+                  return remoteIndexStateResult("index", projectId);
+                }
+                const validPath = await validateReadableDirectory(folderPath);
+                if (!validPath.ok) {
+                  if (
+                    isInvariantIgnoredPath(folderPath) ||
+                    (isBroadProjectPath(folderPath) &&
+                      process.env.CONTEXTSTREAM_ALLOW_BROAD_INGEST !== "1")
+                  ) {
+                    return errorResult(validPath.error);
+                  }
+                  return remoteIndexStateResult("index", projectId, folderPath);
+                }
+                const ingestOptions = {
+                  ...(input.write_to_disk !== undefined && { write_to_disk: input.write_to_disk }),
+                  ...(input.overwrite !== undefined && { overwrite: input.overwrite }),
+                  ...(input.force !== undefined && { force: input.force }),
+                };
+                startBackgroundIngest(projectId, validPath.resolvedPath, ingestOptions);
+                const response = {
+                  status: "started",
+                  message:
+                    "Index endpoint skipped this local project type; started local ingest in the background",
+                  project_id: projectId,
+                  path: validPath.resolvedPath,
+                  fallback_action: "ingest_local",
+                  note: "Use 'project' with action 'index_status' to monitor progress.",
+                };
+                return {
+                  content: [
+                    {
+                      type: "text" as const,
+                      text: `Index endpoint skipped this local project type. Started local ingest in the background for directory: ${validPath.resolvedPath}. Use 'project' with action 'index_status' to monitor progress.`,
+                    },
+                  ],
+                  structuredContent: response,
+                };
+              }
               return {
                 content: [{ type: "text" as const, text: formatContent(result) }],
-
               };
             } catch (error) {
               if (!isRequiresIngestEndpointError(error)) {
@@ -18203,16 +18394,19 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
               }
 
               if (!folderPath) {
-                return errorResult(
-                  "Index endpoint is unavailable for this local project type and no folder context is set. Run project(action=\"ingest_local\", path=\"<folder>\")."
-                );
+                return remoteIndexStateResult("index", projectId);
               }
 
               const validPath = await validateReadableDirectory(folderPath);
               if (!validPath.ok) {
-                return errorResult(
-                  `Index endpoint is unavailable for this project type and folder context path is invalid: ${folderPath}. ${validPath.error}`
-                );
+                if (
+                  isInvariantIgnoredPath(folderPath) ||
+                  (isBroadProjectPath(folderPath) &&
+                    process.env.CONTEXTSTREAM_ALLOW_BROAD_INGEST !== "1")
+                ) {
+                  return errorResult(validPath.error);
+                }
+                return remoteIndexStateResult("index", projectId, folderPath);
               }
 
               const ingestOptions = {
@@ -18526,18 +18720,29 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             }
             const validPath = await validateReadableDirectory(ingestPath);
             if (!validPath.ok) {
-              try {
-                const pathExists = await fs.promises.stat(ingestPath).then(() => true).catch(() => false);
-                if (!pathExists) {
-                  const apiResult = await client.ingestFromPath(projectId, ingestPath, {
-                    force: input.force,
-                  });
-                  return {
-                    content: [{ type: "text" as const, text: `Delegated ingest to API for path: ${ingestPath}\n${formatContent(apiResult)}` }],
-                  };
+              const pathExists = await fs.promises
+                .stat(ingestPath)
+                .then(() => true)
+                .catch(() => false);
+              if (!pathExists) {
+                if (client.canDelegatePathIngest()) {
+                  try {
+                    const apiResult = await client.ingestFromPath(projectId, ingestPath, {
+                      force: input.force,
+                    });
+                    return {
+                      content: [
+                        {
+                          type: "text" as const,
+                          text: `Delegated ingest to API for path: ${ingestPath}\n${formatContent(apiResult)}`,
+                        },
+                      ],
+                    };
+                  } catch {
+                    // Fall through to the structured remote-state response.
+                  }
                 }
-              } catch {
-                // fall through to original error
+                return remoteIndexStateResult("ingest_local", projectId, ingestPath);
               }
               return errorResult(validPath.error);
             }
@@ -18794,6 +18999,7 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
+
             };
           }
 
@@ -19045,7 +19251,6 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
             };
           }
 
@@ -19058,7 +19263,6 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
             };
           }
 
@@ -19071,7 +19275,6 @@ Output formats: full (default, includes content), paths (file paths only - 80% t
             });
             return {
               content: [{ type: "text" as const, text: formatContent(result) }],
-              
             };
           }
 

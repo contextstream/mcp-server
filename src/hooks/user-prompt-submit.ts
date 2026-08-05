@@ -39,9 +39,10 @@ let WORKSPACE_ID: string | null = null;
 let PROJECT_ID: string | null = null;
 
 // Compact reminder for Claude Code (full rules already in CLAUDE.md)
-const REMINDER = `[CONTEXTSTREAM] On the first message in every session call mcp__contextstream__init(...), then call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") FIRST before any other tool. On subsequent messages, default to context first. Narrow bypass is allowed only for immediate read-only ContextStream calls when prior context is fresh and no state-changing tool has run. Response contains dynamic rules, lessons, preferences.
+const REMINDER = `[CONTEXTSTREAM] On the first message in every session call mcp__contextstream__init(...), then call mcp__contextstream__context(user_message="...", save_exchange=true, session_id="<session-id>") FIRST before any other tool. On subsequent messages, default to context first. The fresh-context direct-read lane is limited to workspace list/get; memory list_*; help version/tools/auth; project list/get/index_status; and reminder list/active. Recall, decisions, searches, specific reads, writes, and indexing require context first. Fresh [GROUNDING] is the first continuation retrieval; do not immediately duplicate it with recall. Response contains dynamic rules, lessons, preferences.
 SEARCH-FIRST: Use mcp__contextstream__search(mode="auto") before Glob/Grep/Read/Explore/Task/EnterPlanMode. In planning, never use EnterPlanMode or Task(Explore) for file-by-file discovery.
 COMMON MEMORY CALLS: list docs via memory(action="list_docs"), list lessons via session(action="get_lessons"), list plans via session(action="list_plans"), list tasks/todos via memory(action="list_tasks"|"list_todos").
+HANDOFFS: A generic handoff must create entity(kind="handoff", action="create", body={title,summary,scope,next_steps}); add capsule only for a requested portable bundle/share link. HANDOFF.md or prose alone is not the canonical handoff.
 [END]`;
 
 // Full reminder for non-Claude editors that don't have CLAUDE.md context
@@ -52,7 +53,8 @@ const FULL_REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
    - Check response for: [LESSONS_WARNING], [RULES_NOTICE], preferences
    - save_exchange=true saves each conversation turn for later retrieval
    - Use a consistent session_id for the entire conversation (generate once on first message)
-   - On subsequent messages, default to context() first. Narrow bypass: immediate read-only ContextStream calls when context is fresh and no state-changing tool has run.
+   - On subsequent messages, default to context() first. Direct-read bypass is limited to workspace list/get; memory list_*; help version/tools/auth; project list/get/index_status; and reminder list/active when context is fresh and no state-changing tool has run.
+   - Fresh [GROUNDING] is the first continuation retrieval. Do not immediately duplicate sufficient grounding with session(action="recall").
 
 2. FOR CODE SEARCH: Check index status, then search appropriately
    ✅ Use mcp__contextstream__search(mode="auto", query="...") BEFORE Glob/Grep/Read/Explore/Task/EnterPlanMode
@@ -70,13 +72,18 @@ const FULL_REMINDER = `[CONTEXTSTREAM RULES - MANDATORY]
    ❌ DO NOT use EnterPlanMode or Task(subagent_type="Explore") for file-by-file discovery
    ✅ For planning discovery: mcp__contextstream__search(mode="auto", query="...", output_format="paths")
 
-5. CHECK THESE from context() response:
+5. FOR HANDOFFS: Create the canonical durable handoff entity
+   ✅ mcp__contextstream__entity(kind="handoff", action="create", body={title,summary,scope,next_steps})
+   ✅ Add a capsule only when a portable bundle or share link is requested
+   ❌ HANDOFF.md, a scratch prompt, or prose alone is not the canonical handoff
+
+6. CHECK THESE from context() response:
    - Lessons: Past mistakes to avoid (shown as warnings)
    - Reminders: Active reminders for this project
    - Preferences: User's coding style and preferences
    - Rules: Dynamic rules matched to current task
 
-6. SKIP CONTEXTSTREAM: If user preference says "skip contextstream", use local tools instead
+7. SKIP CONTEXTSTREAM: If user preference says "skip contextstream", use local tools instead
 [END]`;
 
 // Enhanced reminder for non-Claude editors (compensates for missing hooks)

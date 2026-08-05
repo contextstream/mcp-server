@@ -23,7 +23,7 @@ import {
 } from "./workspace-config.js";
 import { globalCache, CacheKeys, CacheTTL } from "./cache.js";
 import { markProjectIndexed, clearProjectIndex, readIndexStatus } from "./hooks-config.js";
-import { readGitHead, readGitRemoteIdentity, findTwinBindingByRemote } from "./project-index-utils.js";
+import { apiAllowsPathIngest, readGitHead, readGitRemoteIdentity, findTwinBindingByRemote } from "./project-index-utils.js";
 import { VERSION, getUpdateNotice, getVersionWarning, getVersionInstructions, type VersionNotice } from "./version.js";
 
 const uuidSchema = z.string().uuid();
@@ -440,6 +440,9 @@ interface IngestLocalResult {
   apiSkipped: number;
   status: "success" | "cooldown" | "daily_limit" | "partial" | "error";
   abortedEarly: boolean;
+  failedBatches: number;
+  failedFiles: number;
+  lastError?: string;
 }
 
 // Auto-index file cap (matches Rust client)
@@ -2598,6 +2601,11 @@ export class ContextStreamClient {
     include_media?: boolean;
     max_files?: number;
   }): Promise<any> {
+    if (!this.canDelegatePathIngest()) {
+      throw new Error(
+        "Hosted APIs cannot read workstation paths. Index from a process with local checkout access or use the ContextStream sync bridge/editor hooks."
+      );
+    }
     return request(this.config, `/projects/${projectId}/files/ingest-from-path`, {
       body: {
         path: pathStr,
@@ -2606,6 +2614,13 @@ export class ContextStreamClient {
         max_files: opts?.max_files,
       },
     });
+  }
+
+  canDelegatePathIngest(): boolean {
+    return apiAllowsPathIngest(
+      this.config.apiUrl,
+      process.env.CONTEXTSTREAM_ALLOW_API_PATH_INGEST === "1"
+    );
   }
 
   /**
@@ -2632,6 +2647,9 @@ export class ContextStreamClient {
     let apiSkipped = 0;
     let abortedEarly = false;
     let lastStatus: IngestApiData["status"] = "completed";
+    let failedBatches = 0;
+    let failedFiles = 0;
+    let lastError: string | undefined;
 
     const fileSource = sinceTimestamp
       ? readChangedFilesInBatches(rootPath, sinceTimestamp, {
@@ -2650,22 +2668,23 @@ export class ContextStreamClient {
 
       // Filter batch through content hashing
       const filteredBatch: FileToIngest[] = [];
+      const changedHashes = new Map<string, string>();
       for (const file of batch) {
         if (maxFiles !== undefined && totalFiles >= maxFiles) break;
         totalFiles++;
 
         const hash = sha256Hex(file.content);
-        newHashes.set(file.path, hash);
-
         if (!force) {
           const oldHash = oldHashes.get(file.path);
           if (oldHash === hash) {
+            newHashes.set(file.path, hash);
             filesSkippedByHash++;
             continue;
           }
         }
 
         filteredBatch.push(file);
+        changedHashes.set(file.path, hash);
       }
 
       if (filteredBatch.length === 0) continue;
@@ -2690,6 +2709,11 @@ export class ContextStreamClient {
             abortedEarly = true;
             break;
           }
+          if (data.status !== "partial") {
+            for (const [filePath, hash] of changedHashes) newHashes.set(filePath, hash);
+          }
+        } else {
+          for (const [filePath, hash] of changedHashes) newHashes.set(filePath, hash);
         }
       } catch (e) {
         console.error(`[ContextStream] Batch ingest error (attempt 1):`, e);
@@ -2706,21 +2730,34 @@ export class ContextStreamClient {
               abortedEarly = true;
               break;
             }
+            if (data.status !== "partial") {
+              for (const [filePath, hash] of changedHashes) newHashes.set(filePath, hash);
+            }
+          } else {
+            for (const [filePath, hash] of changedHashes) newHashes.set(filePath, hash);
           }
         } catch (retryErr) {
           console.error(`[ContextStream] Batch ingest retry failed:`, retryErr);
+          failedBatches++;
+          failedFiles += filteredBatch.length;
+          lastError = retryErr instanceof Error ? retryErr.message : String(retryErr);
         }
       }
     }
 
-    // Write updated hash manifest (hashes are valid even on cooldown)
+    // Persist only unchanged or successfully accepted files. Failed, partial,
+    // and terminal-status batches remain eligible for the next retry.
     writeHashManifest(projectId, newHashes);
 
     const status = abortedEarly
       ? lastStatus === "daily_limit_exceeded"
-        ? "daily_limit" as const
-        : "cooldown" as const
-      : "success" as const;
+        ? ("daily_limit" as const)
+        : ("cooldown" as const)
+      : failedBatches > 0 && filesIndexed === 0 && totalFiles - filesSkippedByHash > 0
+        ? ("error" as const)
+        : failedBatches > 0 || lastStatus === "partial"
+          ? ("partial" as const)
+          : ("success" as const);
 
     return {
       totalFiles,
@@ -2730,6 +2767,9 @@ export class ContextStreamClient {
       apiSkipped,
       status,
       abortedEarly,
+      failedBatches,
+      failedFiles,
+      lastError,
     };
   }
 
@@ -3548,6 +3588,9 @@ export class ContextStreamClient {
                     rootPath: rootPathCopy,
                     maxFiles: AUTO_INDEX_FILE_CAP,
                   });
+                  if (result.status === "error") {
+                    throw new Error(result.lastError || "all changed-file ingest batches failed");
+                  }
                   console.error(
                     `[ContextStream] Background indexing completed for ${rootPathCopy}: ${result.filesIndexed} indexed, ${result.filesSkipped} unchanged`
                   );
@@ -3783,6 +3826,9 @@ export class ContextStreamClient {
                 maxFiles: AUTO_INDEX_FILE_CAP,
                 sinceTimestamp: sinceDate,
               });
+              if (result.status === "error") {
+                throw new Error(result.lastError || "all changed-file ingest batches failed");
+              }
               console.error(
                 `[ContextStream] ${useIncremental ? "Incremental" : "Full"} index refresh completed for ${rootPathCopy}: ${result.filesIndexed} indexed, ${result.filesSkipped} unchanged`
               );
@@ -5059,6 +5105,9 @@ export class ContextStreamClient {
                 rootPath: rootPathCopy,
                 maxFiles: AUTO_INDEX_FILE_CAP,
               });
+              if (result.status === "error") {
+                throw new Error(result.lastError || "all changed-file ingest batches failed");
+              }
               console.error(
                 `[ContextStream] Auto-indexing completed for ${rootPathCopy}: ${result.filesIndexed} indexed, ${result.filesSkipped} unchanged`
               );

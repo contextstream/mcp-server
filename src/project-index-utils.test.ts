@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   apiResultIsIndexing,
+  apiIndexResultIsSkipped,
   apiResultReportsIndexed,
+  apiAllowsPathIngest,
+  classifyRemoteIndexState,
   classifyGraphIngestIndexState,
   classifyIndexConfidence,
   classifyIndexFreshness,
@@ -35,6 +38,16 @@ describe("apiResultReportsIndexed", () => {
     expect(apiResultReportsIndexed(payload)).toBe(false);
   });
 
+  it("preserves canonical readiness when checkout readiness is unconfirmed", () => {
+    expect(
+      apiResultReportsIndexed({
+        indexed: false,
+        project_index_state: "ready",
+        indexed_file_count: 886,
+      })
+    ).toBe(true);
+  });
+
   it("does not infer indexed from indexing status alone", () => {
     const payload = {
       status: "indexing",
@@ -51,6 +64,27 @@ describe("apiResultReportsIndexed", () => {
       },
     };
     expect(apiResultReportsIndexed(payload)).toBe(true);
+  });
+});
+
+describe("remote index helpers", () => {
+  it("classifies ready, indexing, and missing server state", () => {
+    expect(classifyRemoteIndexState({ indexed_files: 2 })).toBe("server_index_ready");
+    expect(classifyRemoteIndexState({ status: "processing" })).toBe("server_indexing");
+    expect(classifyRemoteIndexState({ indexed_files: 0 })).toBe("requires_sync_bridge");
+  });
+
+  it("detects skipped index acknowledgements", () => {
+    expect(apiIndexResultIsSkipped({ status: "skipped" })).toBe(true);
+    expect(apiIndexResultIsSkipped({ data: { status: "completed" } })).toBe(false);
+  });
+
+  it("only delegates workstation paths to loopback APIs without opt-in", () => {
+    expect(apiAllowsPathIngest("http://127.0.0.1:3000")).toBe(true);
+    expect(apiAllowsPathIngest("http://localhost:8787")).toBe(true);
+    expect(apiAllowsPathIngest("http://[::1]:8787")).toBe(true);
+    expect(apiAllowsPathIngest("https://api.contextstream.io")).toBe(false);
+    expect(apiAllowsPathIngest("https://api.contextstream.io", true)).toBe(true);
   });
 });
 

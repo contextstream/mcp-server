@@ -18,6 +18,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import { execFileSync } from "node:child_process";
+import { isInvariantIgnoredPath, loadIgnorePatternsSync } from "../ignore.js";
 
 // Environment variables (inherited from MCP server process)
 const API_URL = process.env.CONTEXTSTREAM_API_URL || "https://api.contextstream.io";
@@ -256,6 +258,38 @@ function shouldIndexFile(filePath: string): boolean {
 }
 
 /**
+ * Apply the same project exclusions to hook-time single-file pushes that the
+ * full ingest walker uses. Git performs the authoritative nested .gitignore
+ * check; the local matcher covers ContextStream defaults and product-specific
+ * ignore files even for non-Git projects.
+ */
+export function shouldIgnoreHookPath(projectRoot: string, filePath: string): boolean {
+  const root = path.resolve(projectRoot);
+  const absolutePath = path.resolve(filePath);
+  if (isInvariantIgnoredPath(absolutePath)) {
+    return true;
+  }
+  const relativePath = path.relative(root, absolutePath).replace(/\\/g, "/");
+  if (!relativePath || relativePath === ".." || relativePath.startsWith("../")) {
+    return true;
+  }
+
+  if (loadIgnorePatternsSync(root).ignores(relativePath)) {
+    return true;
+  }
+
+  try {
+    execFileSync("git", ["-C", root, "check-ignore", "-q", "--", relativePath], {
+      stdio: "ignore",
+      timeout: 2_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Detect language from file path.
  */
 function detectLanguage(filePath: string): string {
@@ -450,6 +484,9 @@ export async function runPostWriteHook(): Promise<void> {
   // Find project config
   const projectRoot = findProjectRoot(absolutePath);
   if (!projectRoot) {
+    process.exit(0);
+  }
+  if (shouldIgnoreHookPath(projectRoot, absolutePath)) {
     process.exit(0);
   }
 

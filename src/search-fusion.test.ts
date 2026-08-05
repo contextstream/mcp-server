@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { applyPostRankFusion, scoreConfidenceBand } from "./tools.js";
+import {
+  allowBroadSearchFallbacks,
+  applyPostRankFusion,
+  exactQuotedLiteral,
+  isExactIdentifierQuery,
+  scoreConfidenceBand,
+} from "./tools.js";
 import { findTwinBindingByRemote } from "./project-index-utils.js";
 
 describe("applyPostRankFusion", () => {
@@ -35,10 +41,32 @@ describe("scoreConfidenceBand", () => {
   });
 });
 
+describe("bounded exact-search routing", () => {
+  it("recognizes code identifiers and quoted literals", () => {
+    expect(isExactIdentifierQuery("resolveWriteScope")).toBe(true);
+    expect(isExactIdentifierQuery("SCOPE_INVALID")).toBe(true);
+    expect(isExactIdentifierQuery("where is scope resolved")).toBe(false);
+    expect(exactQuotedLiteral('"requires_sync_bridge"')).toBe("requires_sync_bridge");
+  });
+
+  it("only enables broad fallback for auto-selected non-exact queries", () => {
+    expect(allowBroadSearchFallbacks(true, "how does project routing work")).toBe(true);
+    expect(allowBroadSearchFallbacks(false, "how does project routing work")).toBe(false);
+    expect(allowBroadSearchFallbacks(true, "resolveWriteScope")).toBe(false);
+    expect(allowBroadSearchFallbacks(true, '"resolveWriteScope"')).toBe(false);
+  });
+});
+
 describe("findTwinBindingByRemote", () => {
   const entries: Array<[string, { project_id?: string; git_remote?: string }]> = [
-    ["/old/place/repo", { project_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", git_remote: "github.com/org/repo" }],
-    ["/other", { project_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", git_remote: "github.com/org/other" }],
+    [
+      "/old/place/repo",
+      { project_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", git_remote: "github.com/org/repo" },
+    ],
+    [
+      "/other",
+      { project_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", git_remote: "github.com/org/other" },
+    ],
     ["/no-identity", { project_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }],
   ];
 

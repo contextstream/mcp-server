@@ -27,6 +27,7 @@ import {
   type SupportedEditor,
 } from "./hooks-config.js";
 import { readAllFilesInBatches, countIndexableFiles } from "./files.js";
+import { isInvariantIgnoredPath } from "./ignore.js";
 import { readLocalConfig, writeLocalConfig } from "./workspace-config.js";
 
 type RuleMode = "dynamic" | "minimal" | "full" | "bootstrap";
@@ -1320,11 +1321,35 @@ async function selectProjectForCurrentDirectory(
  */
 export async function runIndexCommand(targetPath: string): Promise<void> {
   const resolvedPath = path.resolve(targetPath);
+  if (isInvariantIgnoredPath(resolvedPath)) {
+    throw new Error(invariantProjectPathMessage(resolvedPath));
+  }
+  if (isBroadProjectPath(resolvedPath) && !broadIngestAllowed()) {
+    throw new Error(broadProjectPathMessage(resolvedPath));
+  }
   const { loadConfig } = await import("./config.js");
   const config = loadConfig();
   const client = new ContextStreamClient(config);
   const localConfig = readLocalConfig(resolvedPath);
   await indexProjectWithProgress(client, resolvedPath, localConfig?.workspace_id);
+}
+
+/** Filesystem root and the user's home are never safe implicit project roots. */
+export function isBroadProjectPath(candidatePath: string, homePath = homedir()): boolean {
+  const resolved = path.resolve(candidatePath);
+  return resolved === path.parse(resolved).root || resolved === path.resolve(homePath);
+}
+
+function broadIngestAllowed(): boolean {
+  return process.env.CONTEXTSTREAM_ALLOW_BROAD_INGEST === "1";
+}
+
+function broadProjectPathMessage(candidatePath: string): string {
+  return `Refusing to use ${candidatePath} as a project root because it is the filesystem root or home directory. Run from a repository folder or pass a narrower project path. Set CONTEXTSTREAM_ALLOW_BROAD_INGEST=1 only for an intentional broad ingest.`;
+}
+
+function invariantProjectPathMessage(candidatePath: string): string {
+  return `Refusing to use ${candidatePath} as a project root because it is inside agent state or a credential store. Choose the actual repository checkout instead.`;
 }
 
 async function indexProjectWithProgress(
@@ -1469,6 +1494,7 @@ async function indexProjectWithProgress(
   };
 
   let failedBatches = 0;
+  let failedFiles = 0;
 
   try {
     // Use conservative request sizes to reduce 413 payload failures.
@@ -1483,9 +1509,9 @@ async function indexProjectWithProgress(
         bytesIndexed += batch.reduce((sum, f) => sum + f.content.length, 0);
         batchCount++;
       } catch {
-        // Continue on failure - don't stop the whole process
+        // Continue on failure, but never report failed files as indexed.
         failedBatches++;
-        filesIndexed += batch.length; // Count as processed even if failed
+        failedFiles += batch.length;
       }
 
       // Update total if we didn't get accurate count
@@ -1503,7 +1529,7 @@ async function indexProjectWithProgress(
     process.stdout.write("\r" + " ".repeat(120) + "\r");
     if (failedBatches > 0) {
       console.log(
-        `${colors.yellow}✓${colors.reset} Index update complete: ${colors.bright}${filesIndexed.toLocaleString()}${colors.reset} files indexed (${finalSize}) in ${elapsed}s (${failedBatches} batches had errors)`
+        `${colors.yellow}!${colors.reset} Index update incomplete: ${colors.bright}${filesIndexed.toLocaleString()}${colors.reset} files indexed, ${failedFiles.toLocaleString()} failed (${finalSize}) in ${elapsed}s (${failedBatches} batches had errors; retry the command)`
       );
     } else {
       console.log(
@@ -2405,11 +2431,18 @@ export async function runSetupWizard(args: string[]): Promise<void> {
     if (needsProjects) {
       console.log("\nProject setup...");
 
-      const addCwd = normalizeInput(
-        await question(`Add current folder as a project? [Y/n] (${process.cwd()}): `)
-      );
-      if (addCwd.toLowerCase() !== "n" && addCwd.toLowerCase() !== "no") {
-        projectPaths.add(path.resolve(process.cwd()));
+      const currentFolder = path.resolve(process.cwd());
+      if (isInvariantIgnoredPath(currentFolder)) {
+        console.log(`- ${invariantProjectPathMessage(currentFolder)}`);
+      } else if (isBroadProjectPath(currentFolder) && !broadIngestAllowed()) {
+        console.log(`- ${broadProjectPathMessage(currentFolder)}`);
+      } else {
+        const addCwd = normalizeInput(
+          await question(`Add current folder as a project? [Y/n] (${currentFolder}): `)
+        );
+        if (addCwd.toLowerCase() !== "n" && addCwd.toLowerCase() !== "no") {
+          projectPaths.add(currentFolder);
+        }
       }
 
       while (true) {
@@ -2421,7 +2454,16 @@ export async function runSetupWizard(args: string[]): Promise<void> {
 
         if (choice === "1") {
           const p = normalizeInput(await question("Project folder path: "));
-          if (p) projectPaths.add(path.resolve(p));
+          if (p) {
+            const resolved = path.resolve(p);
+            if (isInvariantIgnoredPath(resolved)) {
+              console.log(`- ${invariantProjectPathMessage(resolved)}`);
+            } else if (isBroadProjectPath(resolved) && !broadIngestAllowed()) {
+              console.log(`- ${broadProjectPathMessage(resolved)}`);
+            } else {
+              projectPaths.add(resolved);
+            }
+          }
           continue;
         }
 

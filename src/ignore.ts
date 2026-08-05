@@ -15,7 +15,61 @@ import * as fs from "fs";
 import * as path from "path";
 import ignore, { Ignore } from "ignore";
 
-const IGNORE_FILENAME = ".contextstream/ignore";
+const IGNORE_FILENAMES = [".gitignore", ".contextignore", ".contextstream/ignore"] as const;
+
+const INVARIANT_IGNORED_DIRECTORIES = new Set([
+  ".contextstream",
+  ".claude",
+  ".codex",
+  ".cursor",
+  ".windsurf",
+  ".roo",
+  ".kilocode",
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".kube",
+  ".docker",
+]);
+const INVARIANT_SECRET_FILENAMES = new Set([
+  ".npmrc",
+  ".pypirc",
+  ".netrc",
+  ".pgpass",
+  ".git-credentials",
+  "id_rsa",
+  "id_ed25519",
+  "id_ecdsa",
+  "known_hosts",
+  "credentials.json",
+  "serviceaccountkey.json",
+  "auth.json",
+]);
+const INVARIANT_SECRET_SUFFIXES = [".pem", ".key", ".p12", ".pfx", ".jks"];
+const ENV_TEMPLATE_ALLOWLIST = new Set([
+  ".env.example",
+  ".env.sample",
+  ".env.template",
+  ".env.dist",
+  ".env.defaults",
+]);
+
+/** Security exclusions cannot be negated by repository or user ignore rules. */
+export function isInvariantIgnoredPath(pathname: string): boolean {
+  const normalized = pathname.replace(/\\/g, "/").replace(/^\.\//, "");
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.some((segment) => INVARIANT_IGNORED_DIRECTORIES.has(segment.toLowerCase()))) {
+    return true;
+  }
+
+  const basename = (segments.at(-1) || "").toLowerCase();
+  if (INVARIANT_SECRET_FILENAMES.has(basename)) return true;
+  if (INVARIANT_SECRET_SUFFIXES.some((suffix) => basename.endsWith(suffix))) return true;
+  return (
+    (basename === ".env" || basename.startsWith(".env.")) &&
+    !ENV_TEMPLATE_ALLOWLIST.has(basename)
+  );
+}
 
 /**
  * Default patterns that are always ignored (in addition to user patterns).
@@ -26,6 +80,16 @@ const DEFAULT_IGNORE_PATTERNS = [
   ".git/",
   ".svn/",
   ".hg/",
+
+  // ContextStream and AI editor/agent state. These directories can contain
+  // credentials, generated rules, caches, and nested worktrees.
+  ".contextstream/",
+  ".claude/",
+  ".codex/",
+  ".cursor/",
+  ".windsurf/",
+  ".roo/",
+  ".kilocode/",
 
   // Package managers / dependencies
   "node_modules/",
@@ -61,6 +125,13 @@ const DEFAULT_IGNORE_PATTERNS = [
   ".vscode/",
   ".vs/",
 
+  // Credential stores
+  ".ssh/",
+  ".aws/",
+  ".gnupg/",
+  ".kube/",
+  ".docker/",
+
   // Coverage
   "coverage/",
   ".coverage/",
@@ -75,6 +146,22 @@ const DEFAULT_IGNORE_PATTERNS = [
   "composer.lock",
   "*.min.js",
   "*.min.css",
+  "*.pem",
+  "*.key",
+  "*.p12",
+  "*.pfx",
+  "*.jks",
+  ".npmrc",
+  ".pypirc",
+  ".netrc",
+  ".pgpass",
+  ".git-credentials",
+  "id_rsa",
+  "id_ed25519",
+  "id_ecdsa",
+  "credentials.json",
+  "serviceAccountKey.json",
+  "auth.json",
 
   // OS files
   ".DS_Store",
@@ -114,28 +201,31 @@ export async function loadIgnorePatterns(projectRoot: string): Promise<IgnoreIns
   // Add default patterns first
   ig.add(DEFAULT_IGNORE_PATTERNS);
 
-  // Try to load user patterns
-  const ignoreFilePath = path.join(projectRoot, IGNORE_FILENAME);
   let hasUserPatterns = false;
 
-  try {
-    const content = await fs.promises.readFile(ignoreFilePath, "utf-8");
-    const userPatterns = content
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#")); // Skip empty lines and comments
+  // Keep full and hook-time ingestion aligned with the repository's normal
+  // exclusions. .contextignore is accepted as a lightweight compatibility
+  // alias; .contextstream/ignore remains the product-specific override file.
+  for (const filename of IGNORE_FILENAMES) {
+    try {
+      const content = await fs.promises.readFile(path.join(projectRoot, filename), "utf-8");
+      const userPatterns = content
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith("#"));
 
-    if (userPatterns.length > 0) {
-      ig.add(userPatterns);
-      patterns.push(...userPatterns);
-      hasUserPatterns = true;
+      if (userPatterns.length > 0) {
+        ig.add(userPatterns);
+        patterns.push(...userPatterns);
+        hasUserPatterns = true;
+      }
+    } catch {
+      // Missing/unreadable ignore files are optional.
     }
-  } catch {
-    // No ignore file found, use defaults only
   }
 
   return {
-    ignores: (pathname: string) => ig.ignores(pathname),
+    ignores: (pathname: string) => isInvariantIgnoredPath(pathname) || ig.ignores(pathname),
     patterns,
     hasUserPatterns,
   };
@@ -151,28 +241,28 @@ export function loadIgnorePatternsSync(projectRoot: string): IgnoreInstance {
   // Add default patterns first
   ig.add(DEFAULT_IGNORE_PATTERNS);
 
-  // Try to load user patterns
-  const ignoreFilePath = path.join(projectRoot, IGNORE_FILENAME);
   let hasUserPatterns = false;
 
-  try {
-    const content = fs.readFileSync(ignoreFilePath, "utf-8");
-    const userPatterns = content
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#"));
+  for (const filename of IGNORE_FILENAMES) {
+    try {
+      const content = fs.readFileSync(path.join(projectRoot, filename), "utf-8");
+      const userPatterns = content
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith("#"));
 
-    if (userPatterns.length > 0) {
-      ig.add(userPatterns);
-      patterns.push(...userPatterns);
-      hasUserPatterns = true;
+      if (userPatterns.length > 0) {
+        ig.add(userPatterns);
+        patterns.push(...userPatterns);
+        hasUserPatterns = true;
+      }
+    } catch {
+      // Missing/unreadable ignore files are optional.
     }
-  } catch {
-    // No ignore file found, use defaults only
   }
 
   return {
-    ignores: (pathname: string) => ig.ignores(pathname),
+    ignores: (pathname: string) => isInvariantIgnoredPath(pathname) || ig.ignores(pathname),
     patterns,
     hasUserPatterns,
   };

@@ -123,13 +123,16 @@ export function findTwinBindingByRemote(
 export type IndexFreshness = "fresh" | "recent" | "aging" | "stale" | "missing" | "unknown";
 export type IndexConfidence = "high" | "medium" | "low";
 export type GraphIngestIndexState = "ready" | "indexing" | "stale" | "missing";
+export type RemoteIndexState = "server_index_ready" | "server_indexing" | "requires_sync_bridge";
 
 const INDEX_FRESH_HOURS = 1;
 const INDEX_RECENT_HOURS = 24;
 const INDEX_STALE_HOURS = 24 * 7;
 
 function asRecord(value: unknown): RecordValue | undefined {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as RecordValue) : undefined;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as RecordValue)
+    : undefined;
 }
 
 function candidateObjects(result: unknown): RecordValue[] {
@@ -210,11 +213,18 @@ export function apiResultReportsIndexed(result: unknown): boolean {
   const candidates = candidateObjects(result);
 
   const indexed = readBoolean(candidates, "indexed");
-  if (indexed !== undefined) {
-    return indexed;
+  if (indexed === true) {
+    return true;
   }
 
   const indexedFiles = readNumber(candidates, ["indexed_files", "indexed_file_count"]) ?? 0;
+  const projectIndexState = readString(candidates, "project_index_state")?.toLowerCase();
+  // Checkout-scoped APIs may report indexed=false while still returning a
+  // canonical project-wide generation. Preserve that readiness when both the
+  // canonical state and committed file count agree.
+  if (indexed === false && projectIndexState !== "ready" && projectIndexState !== "completed") {
+    return false;
+  }
   if (indexedFiles > 0) {
     return true;
   }
@@ -228,6 +238,38 @@ export function apiResultReportsIndexed(result: unknown): boolean {
   }
 
   return false;
+}
+
+export function apiIndexResultIsSkipped(result: unknown): boolean {
+  const status = readString(candidateObjects(result), "status")?.toLowerCase();
+  return status === "skipped";
+}
+
+export function extractIndexedFileCount(result: unknown): number | undefined {
+  const count = readNumber(candidateObjects(result), ["indexed_files", "indexed_file_count"]);
+  return count !== undefined && count > 0 ? count : undefined;
+}
+
+export function classifyRemoteIndexState(result: unknown): RemoteIndexState {
+  if (apiResultReportsIndexed(result)) return "server_index_ready";
+  if (apiResultIsIndexing(result)) return "server_indexing";
+  return "requires_sync_bridge";
+}
+
+/** Hosted APIs cannot read caller workstation paths; loopback APIs can. */
+export function apiAllowsPathIngest(apiUrl: string, explicitOptIn = false): boolean {
+  if (explicitOptIn) return true;
+  try {
+    const hostname = new URL(apiUrl).hostname.toLowerCase();
+    return (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "::1" ||
+      hostname === "[::1]"
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function apiResultIsIndexing(result: unknown): boolean {

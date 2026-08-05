@@ -7,7 +7,7 @@ ContextStream gives AI coding assistants persistent memory and cross-session lea
 ## Prerequisites
 
 - A ContextStream API key. The user can create a free account at <https://contextstream.io> and copy the key from the dashboard (Settings → API Keys). If the user does not have a key yet, pause and ask them to create one — do not invent a value.
-- For Option 1 (npx): Node.js 18+ available on PATH.
+- For Option 1 (npx): Node.js 20+ available on PATH.
 
 ## Option 1 — npx (stdio, recommended for Cline)
 

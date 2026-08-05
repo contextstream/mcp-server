@@ -1026,7 +1026,7 @@ curl -fsSL https://contextstream.io/scripts/setup.sh | bash
 irm https://contextstream.io/scripts/setup.ps1 | iex
 \`\`\`
 
-**npm (requires Node.js 18+):**
+**npm (requires Node.js 20+):**
 \`\`\`bash
 npm install -g @contextstream/mcp-server@latest
 \`\`\`

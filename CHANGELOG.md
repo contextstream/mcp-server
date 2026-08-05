@@ -8,6 +8,10 @@
 - Added legacy parity for `session(action="list_recaps")` and `session(action="trigger_recap")`; recap history now exposes `recap_date` and `generated_at`, and the tool guidance correctly describes the nightly local-time schedule rather than a session-boundary trigger.
 - Added an explicit `runtime_type: legacy-typescript-mcp` field to legacy version output so agents can distinguish the npm runtime from the hosted Rust MCP.
 
+### Security
+
+- Updated the MCP SDK, build tooling, and transitive dependency lockfile to patched versions for all current Dependabot advisories. The legacy npm runtime now requires Node.js 20+ because the patched Hono Node adapter no longer supports Node.js 18.
+
 ## 0.4.81
 
 **Setup wizard: zero-prompt `--yes`, background project setup, doctor verification — plus cross-component interop fixes.**

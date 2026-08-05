@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.82
+
+**Rust-aligned indexing and search safeguards, hosted-index resilience, support parity, dependency security fixes, and a refreshed README comparison.**
 
 ### Rust MCP alignment
 
@@ -15,6 +17,7 @@
 - Documented the hosted Rust, installed Rust, legacy npm TypeScript, and Desktop release lines, including how `help(action="version")` maps each MCP runtime to its release metadata.
 - Added legacy parity for `session(action="list_recaps")` and `session(action="trigger_recap")`; recap history now exposes `recap_date` and `generated_at`, and the tool guidance correctly describes the nightly local-time schedule rather than a session-boundary trigger.
 - Added an explicit `runtime_type: legacy-typescript-mcp` field to legacy version output so agents can distinguish the npm runtime from the hosted Rust MCP.
+- Replaced the README comparison animation with the new vertical ContextStream/no-ContextStream walkthrough.
 
 ### Security
 

@@ -1,7 +1,7 @@
 {
   "name": "@contextstream/mcp-server",
   "mcpName": "io.github.contextstreamio/mcp-server",
-  "version": "0.4.81",
+  "version": "0.4.82",
   "description": "MCP server that gives AI coding assistants persistent memory, semantic code search, a dependency graph, grounded Q&A, and team context (GitHub/Slack/Notion) — works with Claude Code, Cursor, VS Code Copilot, Windsurf, Cline, and any Model Context Protocol client.",
   "type": "module",
   "license": "MIT",

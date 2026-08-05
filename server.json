@@ -3,7 +3,7 @@
   "name": "io.github.contextstreamio/mcp-server",
   "title": "ContextStream MCP Server",
   "description": "ContextStream MCP server for code context, memory, search, and AI tools.",
-  "version": "0.4.81",
+  "version": "0.4.82",
   "repository": {
     "url": "https://github.com/contextstream/mcp-server",
     "source": "github"
@@ -37,7 +37,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@contextstream/mcp-server",
-      "version": "0.4.81",
+      "version": "0.4.82",
       "transport": {
         "type": "stdio"
       },

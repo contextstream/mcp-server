@@ -68,7 +68,7 @@ Full methodology, per-family breakdowns, and judge-comparability notes (competit
 
 **ContextStream is a Model Context Protocol (MCP) server that gives AI coding assistants long-term memory and deep codebase understanding.** It indexes your code for semantic search, records your decisions, lessons, and plans across sessions, maps your dependency graph, and pulls in team knowledge from GitHub, Slack, and Notion — then delivers exactly the right slice of all that to your AI on every message.
 
-It works with any MCP client: Claude Code, Cursor, VS Code + GitHub Copilot, Windsurf, Cline, Roo Code, Kilo Code, Codex CLI, OpenCode, Aider, Antigravity, and Claude Desktop.
+It works with any MCP client: Claude Code, Cursor, VS Code + GitHub Copilot, Windsurf, Cline, Roo Code, Kilo Code, Codex CLI, OpenCode, Aider, Antigravity, Gemini CLI, and Claude Desktop.
 
 ---
 
@@ -331,6 +331,19 @@ See the [GitHub Copilot CLI documentation](https://docs.github.com/en/copilot/co
 </details>
 
 <details>
+<summary><b>Gemini CLI</b></summary>
+
+Install the hosted MCP as a Gemini CLI extension (streamable-http):
+
+```bash
+gemini extensions install https://github.com/contextstream/mcp-server
+```
+
+The extension prompts for `CONTEXTSTREAM_API_KEY` and connects to `https://mcp.contextstream.io/mcp`. After the daily gallery crawl, it also appears at https://geminicli.com/extensions/.
+
+</details>
+
+<details>
 <summary><b>Unmapped folders (global fallback workspace)</b></summary>
 
 Folders that aren't associated with any project (your home directory, ad-hoc scratch dirs) still work: `init` falls back to a hidden catch-all workspace in workspace-only mode, memory/session/context tools keep functioning, and project-bound actions return guided remediation instead of raw errors. The moment you enter a mapped project folder, the real workspace/project takes over.
@@ -347,7 +360,7 @@ An MCP (Model Context Protocol) server exposes tools and context to AI assistant
 
 ### Does ContextStream work with Claude Code / Cursor / Copilot / Windsurf?
 
-Yes — all of them, plus Cline, Roo Code, Kilo Code, Codex CLI, OpenCode, Aider, Antigravity, and Claude Desktop. The setup wizard configures each editor's MCP config, managed rules, and (where the editor supports them) lifecycle hooks automatically.
+Yes — all of them, plus Cline, Roo Code, Kilo Code, Codex CLI, OpenCode, Aider, Antigravity, Gemini CLI, and Claude Desktop. The setup wizard configures each editor's MCP config, managed rules, and (where the editor supports them) lifecycle hooks automatically.
 
 ### Is my code private?
 

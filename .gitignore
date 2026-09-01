@@ -1,44 +1,36 @@
-# Dependencies
-node_modules/
+# Rust
+/target/
+Cargo.lock.tmp
 
-# Build output
-dist/
-
-# Environment files
-.env
-.env.local
-.env.*.local
-
-# Logs
-*.log
+# npm launcher cache/test output
+*.tgz
 npm-debug.log*
 
-# IDE
+# Credentials and local ContextStream/editor state
+.env
+.env.*
+!.env.example
+.mcp.json
+.contextstream/
+.codex/
+.cursor/mcp.json
+.antigravity/mcp.json
+credentials.json
+secrets.json
+*.pem
+*.key
+*.p12
+
+# Editors and operating systems
 .idea/
 .vscode/
 *.swp
 *.swo
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Test coverage
-coverage/
-.vite/
-
-# MCP config
-.mcp.json
-.cursor/mcp.json
-.claude/
-
-# Temp files
-*.tgz
-*.tmp
-
-# Local agent/config docs (keep local, do not commit)
-AGENTS.md
-CLAUDE.md
-GEMINI.md
-.contextstream.config.json
-.contextstream/config.json
+# Miscellaneous generated output
+__pycache__/
+*.pyc
+*.log
+*.bak

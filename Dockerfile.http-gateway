@@ -1,0 +1,125 @@
+# Dockerfile for the ContextStream MCP HTTP Gateway (Rust)
+#
+# Replaces the Node.js chatgpt-mcp-gateway proxy with the native Rust binary
+# running in HTTP mode. Provides per-request auth, direct tool execution, and
+# ~10x lower memory footprint.
+#
+# Build:
+#   docker build -f Dockerfile.http-gateway -t contextstream-mcp-http .
+#
+# Run:
+#   docker run -p 3001:3001 \
+#     -e CONTEXTSTREAM_ALLOW_HEADER_AUTH=true \
+#     -e CONTEXTSTREAM_API_URL=http://host.docker.internal:8080 \
+#     -e MCP_HTTP_REQUIRE_AUTH=true \
+#     contextstream-mcp-http
+
+# ── Build stage ──────────────────────────────────────────────────────────────
+
+FROM rust:1.95-bookworm AS builder
+
+WORKDIR /build
+
+ENV CARGO_INCREMENTAL=0
+
+# Install sccache BEFORE setting RUSTC_WRAPPER so cargo doesn't try to
+# invoke a not-yet-installed sccache to compile sccache.
+RUN cargo install sccache --locked
+
+ENV RUSTC_WRAPPER=sccache
+
+ARG CARGO_BUILD_JOBS=""
+ARG SCCACHE_BUCKET=""
+ARG SCCACHE_ENDPOINT=""
+ARG SCCACHE_REGION="auto"
+ARG SCCACHE_S3_KEY_PREFIX="sccache/amd64/"
+ENV SCCACHE_BUCKET=${SCCACHE_BUCKET} \
+    SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT} \
+    SCCACHE_REGION=${SCCACHE_REGION} \
+    SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX} \
+    SCCACHE_DIR=/root/.cache/sccache
+
+# Copy workspace manifests first for layer caching
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/mcp-types/Cargo.toml crates/mcp-types/Cargo.toml
+COPY crates/mcp-client/Cargo.toml crates/mcp-client/Cargo.toml
+COPY crates/mcp-session/Cargo.toml crates/mcp-session/Cargo.toml
+COPY crates/mcp-tools/Cargo.toml crates/mcp-tools/Cargo.toml
+COPY crates/mcp-server/Cargo.toml crates/mcp-server/Cargo.toml
+COPY crates/mcp-model-registry/Cargo.toml crates/mcp-model-registry/Cargo.toml
+# acceleration-products: optional crate compiled only into this remote-binary
+# image via `--features remote-acceleration`. Local stdio installer never
+# pulls it.
+COPY crates/mcp-acceleration-products/Cargo.toml crates/mcp-acceleration-products/Cargo.toml
+
+# Create dummy source files for dependency caching
+RUN mkdir -p crates/mcp-types/src && echo "pub mod config { pub const VERSION: &str = \"0.0.0\"; }" > crates/mcp-types/src/lib.rs \
+    && mkdir -p crates/mcp-client/src && echo "" > crates/mcp-client/src/lib.rs \
+    && mkdir -p crates/mcp-session/src && echo "" > crates/mcp-session/src/lib.rs \
+    && mkdir -p crates/mcp-tools/src && echo "" > crates/mcp-tools/src/lib.rs \
+    && mkdir -p crates/mcp-model-registry/src && echo "" > crates/mcp-model-registry/src/lib.rs \
+    && mkdir -p crates/mcp-acceleration-products/src && echo "" > crates/mcp-acceleration-products/src/lib.rs \
+    && mkdir -p crates/mcp-server/src && echo "fn main() {}" > crates/mcp-server/src/main.rs && echo "" > crates/mcp-server/src/lib.rs
+
+# Pre-build dependencies (cached unless Cargo.toml/lock change).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/root/.cache/sccache \
+    --mount=type=secret,id=aws_access_key_id \
+    --mount=type=secret,id=aws_secret_access_key \
+    if [ -n "$SCCACHE_BUCKET" ] && [ -s /run/secrets/aws_access_key_id ]; then \
+      export AWS_ACCESS_KEY_ID="$(cat /run/secrets/aws_access_key_id)"; \
+      export AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/aws_secret_access_key)"; \
+      echo "sccache: S3 backend at ${SCCACHE_ENDPOINT}/${SCCACHE_BUCKET}/${SCCACHE_S3_KEY_PREFIX}"; \
+    else \
+      unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX; \
+      echo "sccache: local cache only at ${SCCACHE_DIR}"; \
+    fi && \
+    JOBS=${CARGO_BUILD_JOBS:-$(nproc)} && \
+    cargo build --release --jobs ${JOBS} -p mcp-server --bin contextstream-mcp --features remote-acceleration 2>/dev/null || true
+
+# Copy actual sources
+COPY crates/ crates/
+
+# Touch source files to invalidate the dummy builds
+RUN find crates -name "*.rs" -exec touch {} +
+
+# Build the release binary with the MongoDB-free acceleration layer enabled.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/root/.cache/sccache \
+    --mount=type=secret,id=aws_access_key_id \
+    --mount=type=secret,id=aws_secret_access_key \
+    if [ -n "$SCCACHE_BUCKET" ] && [ -s /run/secrets/aws_access_key_id ]; then \
+      export AWS_ACCESS_KEY_ID="$(cat /run/secrets/aws_access_key_id)"; \
+      export AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/aws_secret_access_key)"; \
+    else \
+      unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX; \
+    fi && \
+    JOBS=${CARGO_BUILD_JOBS:-$(nproc)} && \
+    echo "Building contextstream-mcp remote HTTP gateway with ${JOBS} parallel jobs..." && \
+    cargo build --release --jobs ${JOBS} -p mcp-server --bin contextstream-mcp --features remote-acceleration && \
+    sccache --show-stats 2>/dev/null || true
+
+# ── Runtime stage ────────────────────────────────────────────────────────────
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/contextstream-mcp /usr/local/bin/contextstream-mcp
+
+# Default environment for the HTTP gateway
+ENV CONTEXTSTREAM_ALLOW_HEADER_AUTH=true \
+    CONTEXTSTREAM_LOG_LEVEL=quiet \
+    MCP_HTTP_REQUIRE_AUTH=true
+
+EXPOSE 3001
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:3001/health || exit 1
+
+ENTRYPOINT ["contextstream-mcp"]
+CMD ["http", "--host=0.0.0.0", "--port=3001"]

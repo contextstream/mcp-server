@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  public-contract:
+    name: Public package and boundary contract
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '20'
+      - name: Verify public source boundary
+        run: python3 .github/scripts/public_boundary.py .
+      - name: Test release contract
+        run: python3 .github/scripts/test_release_contract.py
+      - name: Test public boundary policy
+        run: python3 .github/scripts/test_public_boundary.py
+      - name: Test DCO policy
+        run: python3 .github/scripts/test_dco_check.py
+      - name: Test npm launcher
+        run: npm test
+      - name: Inspect npm package payload
+        run: npm pack --dry-run
+      - name: Parse public metadata
+        run: |
+          python3 -m json.tool package.json >/dev/null
+          python3 -m json.tool server.json >/dev/null
+      - name: Validate MCP Registry schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --location --proto '=https' --tlsv1.2 \
+            --output server.schema.json \
+            https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json
+          echo '3fba09590c99f61735d234822279f4223fab9e300c0a81e81c91ab62a4114de0  server.schema.json' | sha256sum --check --strict
+          npx --yes \
+            --package ajv-cli@5.0.0 \
+            --package ajv-formats@3.0.1 \
+            ajv validate --strict=false -c ajv-formats -s server.schema.json -d server.json
+
+  rust-quality:
+    name: Rust quality and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: public-ci
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint with warnings denied
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Run workspace tests
+        run: cargo test --locked --workspace --all-targets
+      - name: Prove excluded database clients are absent
+        shell: bash
+        run: |
+          tree="$(cargo tree --locked --workspace --all-features --target all)"
+          TREE="$tree" python3 - <<'PY'
+          import os
+          import re
+
+          tree = os.environ["TREE"]
+          forbidden = [name for name in ("mongodb", "bson") if re.search(rf"(?:^|[ ├└─]){name} v", tree, re.MULTILINE)]
+          if forbidden:
+              raise SystemExit(f"forbidden dependency packages present: {forbidden}")
+          PY
+
+  platform-check:
+    name: Platform check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: '1.95.0'
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: platform-${{ matrix.os }}
+      - name: Check all workspace targets
+        run: cargo check --locked --workspace --all-targets
+
+  supply-chain:
+    name: Supply-chain policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: '1.95.0'
+      - name: Install pinned Rust policy tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+      - name: Audit vulnerabilities and maintenance advisories
+        run: cargo audit --deny warnings
+      - name: Enforce license, source, and dependency policy
+        run: cargo deny --locked check
+      - name: Install verified Gitleaks
+        shell: bash
+        run: |
+          curl --fail --show-error --location --proto '=https' --tlsv1.2 \
+            --output gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz' | sha256sum --check --strict
+          tar --extract --gzip --file gitleaks.tar.gz gitleaks
+          ./gitleaks version
+      - name: Scan full Git history and candidate tree
+        run: |
+          ./gitleaks git . --redact --log-opts='--all'
+          ./gitleaks dir . --redact

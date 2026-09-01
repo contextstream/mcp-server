@@ -1,0 +1,6 @@
+* @contextstreamio
+
+/.github/ @contextstreamio
+/npm/ @contextstreamio
+/crates/mcp-client/ @contextstreamio
+/crates/mcp-server/ @contextstreamio

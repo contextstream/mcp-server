@@ -1,0 +1,16 @@
+[package]
+name = "mcp-model-registry"
+description = "Shared editor + model registry for ContextStream MCP. Strict alias matching, no fuzzy fallbacks."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mcp-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

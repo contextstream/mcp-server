@@ -1,0 +1,27 @@
+name: Developer Certificate of Origin
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dco-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
+jobs:
+  signoff:
+    name: Verify commit sign-offs
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out pull request history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify DCO trailers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/dco_check.py . "$BASE_SHA" "$HEAD_SHA"

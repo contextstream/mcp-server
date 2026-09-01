@@ -91,6 +91,16 @@ class WorkflowContractTest(unittest.TestCase):
             "github.event_name == 'push' && 'publication' || github.ref", release
         )
 
+        self.assertNotIn("ref: ${{ needs.prepare.outputs.source_commit }}", release)
+        self.assertEqual(release.count("ref: ${{ github.sha }}"), 6)
+
+    def test_codeql_covers_workflows_and_source_languages(self) -> None:
+        codeql = (WORKFLOWS / "codeql.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "language: [actions, javascript-typescript, python]",
+            codeql,
+        )
+
     def test_dco_workflow_checks_the_exact_pull_request_range(self) -> None:
         dco = (WORKFLOWS / "dco.yml").read_text(encoding="utf-8")
         for required in (

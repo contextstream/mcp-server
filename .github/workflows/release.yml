@@ -116,7 +116,7 @@ jobs:
       - name: Check out exact release commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ needs.prepare.outputs.source_commit }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
@@ -162,7 +162,7 @@ jobs:
       - name: Check out exact release commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ needs.prepare.outputs.source_commit }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Download all binaries
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -247,7 +247,7 @@ jobs:
       - name: Check out exact release commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ needs.prepare.outputs.source_commit }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Download canonical release bundle
@@ -330,7 +330,7 @@ jobs:
       - name: Check out exact release commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ needs.prepare.outputs.source_commit }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Download canonical release bundle
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -415,7 +415,7 @@ jobs:
       - name: Check out exact release commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ needs.prepare.outputs.source_commit }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Set up Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
@@ -465,7 +465,7 @@ jobs:
       - name: Check out exact release commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ needs.prepare.outputs.source_commit }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Install verified mcp-publisher
         shell: bash

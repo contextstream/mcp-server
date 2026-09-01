@@ -443,6 +443,7 @@ fn ensure_state_parent(path: &Path) -> std::io::Result<()> {
             format!("Harness readiness path has no parent: {}", path.display()),
         )
     })?;
+    #[cfg(unix)]
     let existed = parent.exists();
     std::fs::create_dir_all(parent)?;
     #[cfg(unix)]

@@ -19,7 +19,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  WRANGLER_VERSION: '4.127.1'
   MCP_PUBLISHER_VERSION: '1.8.1'
   MCP_REGISTRY_URL: https://registry.modelcontextprotocol.io
 
@@ -205,15 +204,26 @@ jobs:
           compression-level: 0
 
   approval-gates:
-    name: Verify external publication approvals
+    name: Approve and publish immutable R2 payload
     if: needs.prepare.outputs.publish == 'true'
     needs: [prepare, assemble]
     runs-on: ubuntu-24.04
     environment: public-release
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_EC2_METADATA_DISABLED: 'true'
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
     steps:
       - name: Require Privacy/Legal and initial rotation evidence
         env:
-          VERSION: ${{ needs.prepare.outputs.version }}
           PRIVACY_LEGAL_APPROVAL_EVIDENCE: ${{ secrets.PRIVACY_LEGAL_APPROVAL_EVIDENCE }}
           INITIAL_RELEASE_KEY_ROTATION_EVIDENCE: ${{ secrets.INITIAL_RELEASE_KEY_ROTATION_EVIDENCE }}
         shell: bash
@@ -229,21 +239,6 @@ jobs:
               exit 1
             }
           fi
-
-  publish-r2:
-    name: Publish immutable R2 payload and promote latest
-    needs: [prepare, assemble, approval-gates]
-    if: needs.prepare.outputs.publish == 'true'
-    runs-on: ubuntu-24.04
-    environment: public-release
-    env:
-      VERSION: ${{ needs.prepare.outputs.version }}
-      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
-      TAG: ${{ needs.prepare.outputs.tag }}
-      R2_BUCKET: ${{ vars.R2_BUCKET }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-    steps:
       - name: Check out exact release commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -259,19 +254,18 @@ jobs:
         run: |
           python3 .github/scripts/release_contract.py verify-remote-tag . "$TAG" "$SOURCE_COMMIT"
           python3 .github/scripts/release_contract.py verify-release release "$VERSION" "$SOURCE_COMMIT"
-      - name: Set up Node.js for the pinned R2 client
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
-        with:
-          node-version: '24'
-      - name: Install pinned Wrangler
-        run: |
-          npm install --global "wrangler@$WRANGLER_VERSION"
-          test "$(wrangler --version | awk '{print $1}')" = "$WRANGLER_VERSION"
-      - name: Publish without overwriting immutable bytes
-        shell: bash
+      - name: Require the bucket-scoped S3 credential
         run: |
           set -euo pipefail
           test -n "$R2_BUCKET"
+          test -n "$R2_ENDPOINT"
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          aws --version
+      - name: Publish through the least-privilege S3 API
+        shell: bash
+        run: |
+          set -euo pipefail
           payload=(
             contextstream-mcp-linux-x64
             contextstream-mcp-linux-x64-remote-acceleration
@@ -284,16 +278,30 @@ jobs:
             version.json
           )
           mkdir -p remote
+          s3_get() {
+            aws s3api get-object \
+              --endpoint-url "$R2_ENDPOINT" \
+              --bucket "$R2_BUCKET" \
+              --key "$1" \
+              "$2" >/dev/null
+          }
+          s3_put() {
+            aws s3api put-object \
+              --endpoint-url "$R2_ENDPOINT" \
+              --bucket "$R2_BUCKET" \
+              --key "$1" \
+              --body "$2" >/dev/null
+          }
           publish_exact() {
             local prefix="$1" name="$2" local_file="release/$2" remote_file="remote/$2"
-            if wrangler r2 object get "$R2_BUCKET/$prefix/$name" --remote --file "$remote_file" >/dev/null 2>&1; then
+            if s3_get "$prefix/$name" "$remote_file" 2>/dev/null; then
               cmp --silent "$local_file" "$remote_file" || {
                 echo "::error::Refusing to overwrite different bytes at $prefix/$name"
                 exit 1
               }
             else
-              wrangler r2 object put "$R2_BUCKET/$prefix/$name" --remote --file "$local_file" --force
-              wrangler r2 object get "$R2_BUCKET/$prefix/$name" --remote --file "$remote_file" >/dev/null
+              s3_put "$prefix/$name" "$local_file"
+              s3_get "$prefix/$name" "$remote_file"
               cmp --silent "$local_file" "$remote_file"
             fi
             rm -f "$remote_file"
@@ -301,7 +309,7 @@ jobs:
           for name in "${payload[@]}"; do publish_exact "mcp/v$VERSION" "$name"; done
 
           current_file="remote/current-version.json"
-          if wrangler r2 object get "$R2_BUCKET/mcp/latest/version.json" --remote --file "$current_file" >/dev/null 2>&1; then
+          if s3_get mcp/latest/version.json "$current_file" 2>/dev/null; then
             current="$(jq -er '.version' "$current_file")"
             relation="$(python3 .github/scripts/release_contract.py stable-version-relation "$VERSION" "$current")"
             if [ "$relation" = older ]; then
@@ -310,15 +318,18 @@ jobs:
             fi
           fi
           for name in "${payload[@]}"; do
-            wrangler r2 object put "$R2_BUCKET/mcp/latest/$name" --remote --file "release/$name" --force
+            remote_file="remote/latest-$name"
+            s3_put "mcp/latest/$name" "release/$name"
+            s3_get "mcp/latest/$name" "$remote_file"
+            cmp --silent "release/$name" "$remote_file"
+            rm -f "$remote_file"
           done
 
   draft-github-release:
     name: Create verified draft GitHub release
-    needs: [prepare, assemble, approval-gates, publish-r2]
+    needs: [prepare, assemble, approval-gates]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-24.04
-    environment: public-release
     permissions:
       contents: write
     env:
@@ -402,10 +413,9 @@ jobs:
 
   publish-npm:
     name: Publish verified npm launcher
-    needs: [prepare, approval-gates, publish-r2]
+    needs: [prepare, approval-gates]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-24.04
-    environment: public-release
     permissions:
       contents: read
       id-token: write
@@ -445,19 +455,44 @@ jobs:
           else
             npm publish "$tarball" --access public
           fi
+          registry_ready=false
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if remote_integrity="$(npm view "@contextstream/mcp-server@$VERSION" dist.integrity --json 2>/dev/null | jq -er '.')"; then
+              test "$remote_integrity" = "$local_integrity" || {
+                echo '::error::npm returned different bytes after publication.'
+                exit 1
+              }
+              registry_ready=true
+              break
+            fi
+            if [ "$attempt" -lt 10 ]; then sleep "$((attempt * 3))"; fi
+          done
+          if [ "$registry_ready" != true ]; then
+            echo '::error::Published npm version did not become readable.'
+            exit 1
+          fi
       - name: Verify npm registry signature and provenance
+        shell: bash
         run: |
-          npm install --prefix "$RUNNER_TEMP/npm-audit" \
-            --ignore-scripts --no-audit --no-fund \
-            "@contextstream/mcp-server@$VERSION"
-          npm --prefix "$RUNNER_TEMP/npm-audit" audit signatures
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            audit_dir="$RUNNER_TEMP/npm-audit-$attempt"
+            if npm install --prefix "$audit_dir" \
+                 --ignore-scripts --no-audit --no-fund \
+                 "@contextstream/mcp-server@$VERSION" \
+               && npm --prefix "$audit_dir" audit signatures; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 6 ]; then sleep "$((attempt * 5))"; fi
+          done
+          echo '::error::npm signature/provenance verification did not become readable.'
+          exit 1
 
   publish-mcp-registry:
     name: Publish dual remote and npm MCP metadata
     needs: [prepare, approval-gates, publish-npm]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-24.04
-    environment: public-release
     permissions:
       contents: read
       id-token: write
@@ -537,7 +572,6 @@ jobs:
     needs: [prepare, draft-github-release, publish-npm, publish-mcp-registry]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-24.04
-    environment: public-release
     permissions:
       contents: write
     env:
@@ -545,4 +579,4 @@ jobs:
       TAG: ${{ needs.prepare.outputs.tag }}
     steps:
       - name: Publish the verified draft as latest
-        run: gh release edit "$TAG" --draft=false --latest
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

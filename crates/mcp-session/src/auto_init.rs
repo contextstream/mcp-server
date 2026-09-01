@@ -11,11 +11,14 @@ use mcp_client::{
 };
 use mcp_types::Result;
 use std::{
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::{ErrorKind, Write},
     path::Path,
     sync::OnceLock,
 };
+
+#[cfg(unix)]
+use std::fs::File;
 use uuid::Uuid;
 
 fn global_mapping_write_lock() -> &'static tokio::sync::Mutex<()> {

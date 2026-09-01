@@ -6,6 +6,7 @@
   "type": "module",
   "license": "MIT",
   "files": [
+    "assets/contextstream-logo.png",
     "npm/bin",
     "npm/launcher.mjs",
     "README.md",

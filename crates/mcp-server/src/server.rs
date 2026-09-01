@@ -909,12 +909,12 @@ fn exec_updated_binary() {
         }
     }
 
-    let args: Vec<String> = std::env::args().collect();
     info!("Applying in-session update: exec {}", binary.display());
 
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        let args: Vec<String> = std::env::args().collect();
         let mut cmd = std::process::Command::new(&binary);
         if args.len() > 1 {
             cmd.args(&args[1..]);

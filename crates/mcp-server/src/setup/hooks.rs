@@ -489,14 +489,17 @@ fn replace_binary_atomically(staged: &Path, target: &Path) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn sync_binary_parent(path: &Path) {
-    #[cfg(unix)]
     if let Some(parent) = path.parent() {
         if let Ok(directory) = std::fs::File::open(parent) {
             let _ = directory.sync_all();
         }
     }
 }
+
+#[cfg(not(unix))]
+fn sync_binary_parent(_path: &Path) {}
 
 /// Managed helper-binary path used for local hook/thin-client execution.
 pub fn managed_binary_path() -> PathBuf {

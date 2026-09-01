@@ -65,15 +65,21 @@ class WorkflowContractTest(unittest.TestCase):
             "sbom.spdx.json",
             "mcp/v$VERSION",
             "mcp/latest",
+            "R2_ACCESS_KEY_ID",
+            "R2_SECRET_ACCESS_KEY",
+            "aws s3api get-object",
+            "aws s3api put-object",
             "npm install --global npm@11.12.1",
             "npm publish \"$tarball\" --access public",
+            "Published npm version did not become readable",
+            "npm signature/provenance verification did not become readable",
             "audit signatures",
             "./mcp-publisher login github-oidc",
             "./mcp-publisher validate server.json",
             "./mcp-publisher publish server.json",
             "MCP_REGISTRY_URL/v0.1/servers/",
             "release_contract.py verify-registry",
-            "gh release edit \"$TAG\" --draft=false --latest",
+            "gh release edit \"$TAG\" --repo \"$GITHUB_REPOSITORY\" --draft=false --latest",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, release)
@@ -93,6 +99,10 @@ class WorkflowContractTest(unittest.TestCase):
 
         self.assertNotIn("ref: ${{ needs.prepare.outputs.source_commit }}", release)
         self.assertEqual(release.count("ref: ${{ github.sha }}"), 6)
+        self.assertEqual(release.count("environment: public-release"), 1)
+        self.assertNotIn("wrangler r2 object", release)
+        self.assertNotIn("CLOUDFLARE_API_TOKEN", release)
+        self.assertNotIn("publish-r2:", release)
 
     def test_codeql_covers_workflows_and_source_languages(self) -> None:
         codeql = (WORKFLOWS / "codeql.yml").read_text(encoding="utf-8")

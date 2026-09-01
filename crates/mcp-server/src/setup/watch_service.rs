@@ -8,6 +8,7 @@
 //! when its complete content still matches what this version would generate.
 
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
@@ -293,6 +294,7 @@ pub fn sync_bridge_registration_status() -> Result<SyncBridgeServiceRegistration
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_silently(program: &str, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)

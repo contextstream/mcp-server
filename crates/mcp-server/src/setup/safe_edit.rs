@@ -632,6 +632,8 @@ pub(crate) fn read_recovery_file(path: &Path) -> Result<Option<String>> {
             );
         }
     }
+    #[cfg(not(unix))]
+    let _ = (before, after);
     Ok(Some(content))
 }
 
@@ -814,14 +816,17 @@ fn read_existing_text(path: &Path) -> Result<Option<String>> {
     }
 }
 
+#[cfg(unix)]
 fn sync_parent_directory(path: &Path) {
-    #[cfg(unix)]
     if let Some(parent) = path.parent() {
         if let Ok(directory) = File::open(parent) {
             let _ = directory.sync_all();
         }
     }
 }
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) {}
 
 #[cfg(not(windows))]
 fn replace_with_temp(path: &Path, tmp: &Path) -> Result<()> {
@@ -995,6 +1000,9 @@ fn write_if_changed_impl_with_permissions(
     force_private_permissions: bool,
     replacement_permissions: Option<std::fs::Permissions>,
 ) -> Result<bool> {
+    #[cfg(not(unix))]
+    let _ = force_private_permissions;
+
     let resolved_path = resolve_edit_path(path)?;
     let path = resolved_path.as_path();
     let existing = read_existing_text(path)?;

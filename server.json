@@ -1,35 +1,18 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.contextstreamio/mcp-server",
+  "name": "io.github.contextstream/mcp-server",
   "title": "ContextStream MCP Server",
-  "description": "ContextStream MCP server for code context, memory, search, and AI tools.",
-  "version": "0.4.82",
+  "description": "Project memory, semantic code search, and grounded agent context.",
+  "version": "1.0.0",
   "repository": {
     "url": "https://github.com/contextstream/mcp-server",
     "source": "github"
   },
   "websiteUrl": "https://contextstream.io/docs/mcp",
-  "tags": [
-    "code-context",
-    "memory",
-    "search",
-    "knowledge-graph",
-    "ai-tools"
-  ],
-  "icons": [
+  "remotes": [
     {
-      "src": "https://contextstream.io/favicon.svg",
-      "mimeType": "image/svg+xml",
-      "sizes": [
-        "any"
-      ]
-    },
-    {
-      "src": "https://contextstream.io/logo.png",
-      "mimeType": "image/png",
-      "sizes": [
-        "512x512"
-      ]
+      "type": "streamable-http",
+      "url": "https://mcp.contextstream.io/mcp"
     }
   ],
   "packages": [
@@ -37,20 +20,20 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@contextstream/mcp-server",
-      "version": "0.4.82",
+      "version": "1.0.0",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
           "name": "CONTEXTSTREAM_API_KEY",
-          "description": "ContextStream API key (create one at contextstream.io)",
+          "description": "ContextStream API key",
           "isRequired": true,
           "isSecret": true
         },
         {
           "name": "CONTEXTSTREAM_API_URL",
-          "description": "API base URL",
+          "description": "ContextStream API base URL",
           "isRequired": false,
           "default": "https://api.contextstream.io"
         }

@@ -1,146 +1,548 @@
 name: Release
 
 on:
-  release:
-    types: [created]
+  push:
+    tags: ['v*.*.*']
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version to build (e.g., 0.4.51)'
+      reason:
+        description: Reason for a main-branch dry-run validation
         required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: public-mcp-release-${{ github.event_name == 'push' && 'publication' || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  WRANGLER_VERSION: '4.127.1'
+  MCP_PUBLISHER_VERSION: '1.8.1'
+  MCP_REGISTRY_URL: https://registry.modelcontextprotocol.io
 
 jobs:
-  build-binaries:
+  prepare:
+    name: Resolve immutable release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      source_epoch: ${{ steps.identity.outputs.source_epoch }}
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+      tag: ${{ steps.identity.outputs.tag }}
+      publish: ${{ steps.identity.outputs.publish }}
+    steps:
+      - name: Check out full source history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the protected main reference
+        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+      - name: Resolve and verify identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 .github/scripts/release_contract.py resolve-version . "$GITHUB_EVENT_NAME" "$GITHUB_REF")"
+          source_epoch="$(python3 .github/scripts/release_contract.py source-epoch . "$GITHUB_EVENT_NAME" "$GITHUB_SHA")"
+          source_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            python3 .github/scripts/release_contract.py verify-remote-tag . "$tag" "$source_commit"
+            publish=true
+          else
+            tag="v$version"
+            publish=false
+          fi
+          {
+            echo "version=$version"
+            echo "source_epoch=$source_epoch"
+            echo "source_commit=$source_commit"
+            echo "tag=$tag"
+            echo "publish=$publish"
+          } >>"$GITHUB_OUTPUT"
+      - name: Re-run public metadata boundary
+        run: python3 .github/scripts/public_boundary.py .
+
+  build:
+    name: Build ${{ matrix.artifact }}
+    needs: prepare
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            target: darwin-arm64
-            artifact: contextstream-mcp-darwin-arm64
-          - os: macos-latest
-            target: darwin-x64
-            artifact: contextstream-mcp-darwin-x64
-          - os: ubuntu-latest
-            target: linux-x64
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
             artifact: contextstream-mcp-linux-x64
-          - os: ubuntu-24.04-arm
-            target: linux-arm64
+            suffix: ''
+            feature: ''
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: contextstream-mcp-linux-x64-remote-acceleration
+            suffix: ''
+            feature: 'remote-acceleration'
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
             artifact: contextstream-mcp-linux-arm64
-          - os: windows-latest
-            target: win-x64
+            suffix: ''
+            feature: ''
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: contextstream-mcp-darwin-x64
+            suffix: ''
+            feature: ''
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            artifact: contextstream-mcp-darwin-arm64
+            suffix: ''
+            feature: ''
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
             artifact: contextstream-mcp-win-x64.exe
-
-    runs-on: ${{ matrix.os }}
-
+            suffix: '.exe'
+            feature: ''
+    runs-on: ${{ matrix.runner }}
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_epoch }}
+      TARGET: ${{ matrix.target }}
+      ARTIFACT: ${{ matrix.artifact }}
+      BINARY_SUFFIX: ${{ matrix.suffix }}
+      FEATURE: ${{ matrix.feature }}
+      VERSION: ${{ needs.prepare.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Get version
-        id: version
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            VERSION="${{ github.event.release.tag_name }}"
-            VERSION="${VERSION#v}"  # Remove 'v' prefix if present
-          else
-            VERSION="${{ github.event.inputs.version }}"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Check out exact release commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          bun-version: latest
-
-      - name: Install dependencies
-        run: bun install
-
-      - name: Build binary
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: '1.95.0'
+          target: ${{ matrix.target }}
+      - name: Build locked release binary
         shell: bash
         run: |
-          bun build src/index.ts --compile --outfile=${{ matrix.artifact }} --target=bun-${{ matrix.target }} --define __CONTEXTSTREAM_VERSION__=\"${{ steps.version.outputs.version }}\"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          set -euo pipefail
+          if [ -n "$FEATURE" ]; then
+            cargo build --locked --release --package mcp-server --target "$TARGET" --features "$FEATURE"
+          else
+            cargo build --locked --release --package mcp-server --target "$TARGET"
+          fi
+      - name: Verify and name artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/contextstream-mcp$BINARY_SUFFIX"
+          python3 .github/scripts/release_contract.py verify-binary "$binary" "$VERSION"
+          mkdir -p out
+          cp "$binary" "out/$ARTIFACT"
+          if [ "$RUNNER_OS" != Windows ]; then chmod 0755 "out/$ARTIFACT"; fi
+      - name: Upload binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: out/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
 
-      - name: Upload to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ matrix.artifact }}
-
-  build-hooks:
-    runs-on: ubuntu-latest
-
+  assemble:
+    name: Assemble, verify, and attest release
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Get version
-        id: version
+      - name: Check out exact release commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+      - name: Download all binaries
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: contextstream-mcp-*
+          path: release
+          merge-multiple: true
+      - name: Install verified Syft
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            VERSION="${{ github.event.release.tag_name }}"
-            VERSION="${VERSION#v}"  # Remove 'v' prefix if present
-          else
-            VERSION="${{ github.event.inputs.version }}"
+          curl --fail --show-error --location --proto '=https' --tlsv1.2 \
+            --output syft.tar.gz \
+            https://github.com/anchore/syft/releases/download/v1.51.1/syft_1.51.1_linux_amd64.tar.gz
+          echo '8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3  syft.tar.gz' | sha256sum --check --strict
+          tar --extract --gzip --file syft.tar.gz syft
+          ./syft version
+      - name: Generate SBOM and canonical manifests
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod 0755 release/contextstream-mcp-* || true
+          ./syft scan dir:release --output spdx-json=release/sbom.spdx.json
+          python3 .github/scripts/release_contract.py generate-release-files release "$VERSION" "$SOURCE_COMMIT"
+          python3 .github/scripts/release_contract.py verify-release release "$VERSION" "$SOURCE_COMMIT"
+      - name: Attest the exact public payload
+        if: needs.prepare.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: release/*
+      - name: Upload canonical release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-bundle-${{ needs.prepare.outputs.version }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  approval-gates:
+    name: Verify external publication approvals
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, assemble]
+    runs-on: ubuntu-24.04
+    environment: public-release
+    steps:
+      - name: Require Privacy/Legal and initial rotation evidence
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRIVACY_LEGAL_APPROVAL_EVIDENCE: ${{ secrets.PRIVACY_LEGAL_APPROVAL_EVIDENCE }}
+          INITIAL_RELEASE_KEY_ROTATION_EVIDENCE: ${{ secrets.INITIAL_RELEASE_KEY_ROTATION_EVIDENCE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PRIVACY_LEGAL_APPROVAL_EVIDENCE" || {
+            echo '::error::Privacy/Legal approval evidence is required.'
+            exit 1
+          }
+          if [ "$VERSION" = 1.0.0 ]; then
+            test -n "$INITIAL_RELEASE_KEY_ROTATION_EVIDENCE" || {
+              echo '::error::Historical credential rotation/revocation evidence is required for v1.0.0.'
+              exit 1
+            }
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Install dependencies
-        run: bun install
-
-      - name: Build hook binaries
-        run: |
-          mkdir -p hooks-bin
-          VERSION="${{ steps.version.outputs.version }}"
-          bun build src/hooks/runner.ts --compile --outfile=hooks-bin/contextstream-hook-linux-x64 --target=bun-linux-x64 --define __CONTEXTSTREAM_VERSION__=\"$VERSION\"
-          bun build src/hooks/runner.ts --compile --outfile=hooks-bin/contextstream-hook-darwin-arm64 --target=bun-darwin-arm64 --define __CONTEXTSTREAM_VERSION__=\"$VERSION\"
-          bun build src/hooks/runner.ts --compile --outfile=hooks-bin/contextstream-hook-darwin-x64 --target=bun-darwin-x64 --define __CONTEXTSTREAM_VERSION__=\"$VERSION\"
-          bun build src/hooks/runner.ts --compile --outfile=hooks-bin/contextstream-hook-win-x64.exe --target=bun-windows-x64 --define __CONTEXTSTREAM_VERSION__=\"$VERSION\"
-
-      - name: Upload hook artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: hooks-bin
-          path: hooks-bin/
-
-      - name: Upload hooks to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: hooks-bin/*
-
-  update-checksums:
-    needs: [build-binaries, build-hooks]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'release'
-
+  publish-r2:
+    name: Publish immutable R2 payload and promote latest
+    needs: [prepare, assemble, approval-gates]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    environment: public-release
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - name: Check out exact release commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          path: artifacts
-
-      - name: Generate checksums
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download canonical release bundle
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-bundle-${{ needs.prepare.outputs.version }}
+          path: release
+      - name: Verify source, tag, and payload again
         run: |
-          cd artifacts
-          find . -type f -name "contextstream-*" -exec sha256sum {} \; > checksums.txt
-          cat checksums.txt
-
-      - name: Upload checksums
-        uses: softprops/action-gh-release@v2
+          python3 .github/scripts/release_contract.py verify-remote-tag . "$TAG" "$SOURCE_COMMIT"
+          python3 .github/scripts/release_contract.py verify-release release "$VERSION" "$SOURCE_COMMIT"
+      - name: Set up Node.js for the pinned R2 client
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          files: artifacts/checksums.txt
+          node-version: '24'
+      - name: Install pinned Wrangler
+        run: |
+          npm install --global "wrangler@$WRANGLER_VERSION"
+          test "$(wrangler --version | awk '{print $1}')" = "$WRANGLER_VERSION"
+      - name: Publish without overwriting immutable bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$R2_BUCKET"
+          payload=(
+            contextstream-mcp-linux-x64
+            contextstream-mcp-linux-x64-remote-acceleration
+            contextstream-mcp-linux-arm64
+            contextstream-mcp-darwin-x64
+            contextstream-mcp-darwin-arm64
+            contextstream-mcp-win-x64.exe
+            sbom.spdx.json
+            checksums.txt
+            version.json
+          )
+          mkdir -p remote
+          publish_exact() {
+            local prefix="$1" name="$2" local_file="release/$2" remote_file="remote/$2"
+            if wrangler r2 object get "$R2_BUCKET/$prefix/$name" --remote --file "$remote_file" >/dev/null 2>&1; then
+              cmp --silent "$local_file" "$remote_file" || {
+                echo "::error::Refusing to overwrite different bytes at $prefix/$name"
+                exit 1
+              }
+            else
+              wrangler r2 object put "$R2_BUCKET/$prefix/$name" --remote --file "$local_file" --force
+              wrangler r2 object get "$R2_BUCKET/$prefix/$name" --remote --file "$remote_file" >/dev/null
+              cmp --silent "$local_file" "$remote_file"
+            fi
+            rm -f "$remote_file"
+          }
+          for name in "${payload[@]}"; do publish_exact "mcp/v$VERSION" "$name"; done
+
+          current_file="remote/current-version.json"
+          if wrangler r2 object get "$R2_BUCKET/mcp/latest/version.json" --remote --file "$current_file" >/dev/null 2>&1; then
+            current="$(jq -er '.version' "$current_file")"
+            relation="$(python3 .github/scripts/release_contract.py stable-version-relation "$VERSION" "$current")"
+            if [ "$relation" = older ]; then
+              echo "::error::Refusing to regress latest from v$current to v$VERSION"
+              exit 1
+            fi
+          fi
+          for name in "${payload[@]}"; do
+            wrangler r2 object put "$R2_BUCKET/mcp/latest/$name" --remote --file "release/$name" --force
+          done
+
+  draft-github-release:
+    name: Create verified draft GitHub release
+    needs: [prepare, assemble, approval-gates, publish-r2]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    environment: public-release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Check out exact release commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+      - name: Download canonical release bundle
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-bundle-${{ needs.prepare.outputs.version }}
+          path: release
+      - name: Create draft release once
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            details="$(gh release view "$TAG" --json assets,isDraft,isPrerelease,tagName)"
+            jq -e --arg tag "$TAG" \
+              '.tagName == $tag and .isPrerelease == false' <<<"$details" >/dev/null
+            existing="$(mktemp -d)"
+            if [ "$(jq -r '.assets | length' <<<"$details")" -gt 0 ]; then
+              gh release download "$TAG" --dir "$existing"
+            fi
+            missing="$RUNNER_TEMP/missing-github-release-assets.txt"
+            python3 - "$existing" release >"$missing" <<'PY'
+          from pathlib import Path
+          import filecmp
+          import sys
+
+          existing = Path(sys.argv[1])
+          expected = Path(sys.argv[2])
+          existing_names = sorted(path.name for path in existing.iterdir() if path.is_file())
+          expected_names = sorted(path.name for path in expected.iterdir() if path.is_file())
+          if not set(existing_names).issubset(expected_names):
+              raise SystemExit(
+                  f"existing GitHub release contains unexpected assets: {existing_names}"
+              )
+          for name in existing_names:
+              if not filecmp.cmp(existing / name, expected / name, shallow=False):
+                  raise SystemExit(f"existing GitHub release asset has different bytes: {name}")
+          for name in sorted(set(expected_names) - set(existing_names)):
+              print(name)
+          PY
+            if [ -s "$missing" ] && [ "$(jq -r '.isDraft' <<<"$details")" != true ]; then
+              echo '::error::Published GitHub release is missing canonical assets.'
+              exit 1
+            fi
+            while IFS= read -r name; do
+              gh release upload "$TAG" "release/$name"
+            done <"$missing"
+            verified="$(mktemp -d)"
+            gh release download "$TAG" --dir "$verified"
+            python3 .github/scripts/release_contract.py verify-release \
+              "$verified" "$VERSION" "$SOURCE_COMMIT"
+            python3 - "$verified" release <<'PY'
+          from pathlib import Path
+          import filecmp
+          import sys
+
+          actual = Path(sys.argv[1])
+          expected = Path(sys.argv[2])
+          for path in expected.iterdir():
+              if path.is_file() and not filecmp.cmp(actual / path.name, path, shallow=False):
+                  raise SystemExit(f"GitHub release asset has different bytes: {path.name}")
+          PY
+            echo 'Existing release and every uploaded asset match the canonical payload.'
+          else
+            gh release create "$TAG" release/* \
+              --draft \
+              --verify-tag \
+              --title "ContextStream MCP v$VERSION" \
+              --notes-file CHANGELOG.md
+          fi
+
+  publish-npm:
+    name: Publish verified npm launcher
+    needs: [prepare, approval-gates, publish-r2]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    environment: public-release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Check out exact release commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - name: Require npm trusted-publishing support
+        run: |
+          npm install --global npm@11.12.1
+          test "$(npm --version)" = 11.12.1
+      - name: Test and pack exact npm payload
+        run: |
+          npm test
+          npm pack --dry-run
+      - name: Publish or verify an identical immutable package
+        shell: bash
+        run: |
+          set -euo pipefail
+          pack_json="$(npm pack --json)"
+          tarball="$(jq -er '.[0].filename' <<<"$pack_json")"
+          local_integrity="$(jq -er '.[0].integrity' <<<"$pack_json")"
+          if remote_integrity="$(npm view "@contextstream/mcp-server@$VERSION" dist.integrity --json 2>/dev/null | jq -er '.')"; then
+            test "$remote_integrity" = "$local_integrity" || {
+              echo '::error::npm already contains different bytes for this immutable version.'
+              exit 1
+            }
+          else
+            npm publish "$tarball" --access public
+          fi
+      - name: Verify npm registry signature and provenance
+        run: |
+          npm install --prefix "$RUNNER_TEMP/npm-audit" \
+            --ignore-scripts --no-audit --no-fund \
+            "@contextstream/mcp-server@$VERSION"
+          npm --prefix "$RUNNER_TEMP/npm-audit" audit signatures
+
+  publish-mcp-registry:
+    name: Publish dual remote and npm MCP metadata
+    needs: [prepare, approval-gates, publish-npm]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    environment: public-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out exact release commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+      - name: Install verified mcp-publisher
+        shell: bash
+        run: |
+          curl --fail --show-error --location --proto '=https' --tlsv1.2 \
+            --output mcp-publisher.tar.gz \
+            https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz
+          echo 'a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc  mcp-publisher.tar.gz' | sha256sum --check --strict
+          tar --extract --gzip --file mcp-publisher.tar.gz mcp-publisher
+          ./mcp-publisher validate server.json
+      - name: Publish once or verify identical active metadata
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          server_name="$(jq -er '.name' server.json)"
+          encoded_name="$(python3 - "$server_name" <<'PY'
+          import sys
+          from urllib.parse import quote
+
+          print(quote(sys.argv[1], safe=""))
+          PY
+          )"
+          endpoint="$MCP_REGISTRY_URL/v0.1/servers/$encoded_name/versions/$VERSION"
+          response="$RUNNER_TEMP/mcp-registry-response.json"
+
+          fetch_registry() {
+            curl --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              --output "$response" --write-out '%{http_code}' \
+              "$endpoint"
+          }
+
+          verify_registry() {
+            python3 .github/scripts/release_contract.py verify-registry \
+              server.json "$response"
+          }
+
+          status="$(fetch_registry)"
+          if [ "$status" = 200 ]; then
+            verify_registry
+            echo 'Existing MCP Registry version is active and identical.'
+          elif [ "$status" = 404 ]; then
+            ./mcp-publisher login github-oidc
+            ./mcp-publisher publish server.json
+          else
+            echo "::error::MCP Registry lookup failed with HTTP $status."
+            exit 1
+          fi
+
+          for attempt in 1 2 3 4 5; do
+            status="$(fetch_registry)"
+            if [ "$status" = 200 ]; then
+              verify_registry
+              exit 0
+            fi
+            if [ "$status" != 404 ]; then
+              echo "::error::MCP Registry verification failed with HTTP $status."
+              exit 1
+            fi
+            if [ "$attempt" -lt 5 ]; then sleep 2; fi
+          done
+          echo '::error::Published MCP Registry version did not become readable.'
+          exit 1
+
+  finalize-github-release:
+    name: Publish GitHub release after all channels succeed
+    needs: [prepare, draft-github-release, publish-npm, publish-mcp-registry]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    environment: public-release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Publish the verified draft as latest
+        run: gh release edit "$TAG" --draft=false --latest

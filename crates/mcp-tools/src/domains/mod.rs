@@ -1,0 +1,50 @@
+//! Domain-specific tool implementations.
+
+pub mod account_mode;
+pub mod atlas_jobs;
+pub mod atlas_warm_cache;
+pub mod capsule;
+pub mod charts;
+pub mod coordination;
+pub mod display_title;
+pub mod entity;
+pub mod flash;
+pub mod graph;
+pub mod grounding;
+pub mod help;
+pub mod index_keeper;
+pub mod integrations;
+pub mod media;
+pub mod memory;
+pub mod project;
+pub mod qa;
+pub mod reminder;
+pub(crate) mod result_cache;
+pub(crate) mod scope;
+pub mod search;
+pub mod session;
+pub mod skill;
+pub mod vcs;
+pub mod workspace;
+pub mod workspace_drift;
+
+// Re-export all domain tools
+pub use atlas_jobs::*;
+pub use capsule::*;
+pub use charts::*;
+pub use coordination::*;
+pub use entity::*;
+pub use flash::*;
+pub use graph::*;
+pub use help::*;
+pub use index_keeper::*;
+pub use integrations::*;
+pub use media::*;
+pub use memory::*;
+pub use project::*;
+pub use reminder::*;
+pub use search::*;
+pub use session::*;
+pub use skill::*;
+pub use vcs::*;
+pub use workspace::*;

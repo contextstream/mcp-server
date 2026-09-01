@@ -18,9 +18,8 @@ Use of these trademarks requires prior written permission.
 
 THIRD-PARTY LICENSES
 
-This software uses the following open-source packages:
-- @modelcontextprotocol/sdk (MIT)
-- zod (MIT)
-- Other dependencies listed in package.json
+This software uses open-source Rust crates recorded in Cargo.lock. The npm
+compatibility launcher has no runtime package dependencies. Release SBOMs and
+license reports provide the exact dependency inventory for each release.
 
 For questions about licensing or trademark usage, contact: legal@contextstream.io

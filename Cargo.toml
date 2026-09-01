@@ -1,0 +1,116 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mcp-server",
+    "crates/mcp-tools",
+    "crates/mcp-client",
+    "crates/mcp-session",
+    "crates/mcp-types",
+    "crates/mcp-model-registry",
+    "crates/mcp-acceleration-products",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/contextstream/mcp-server"
+publish = false
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml_edit = "0.22"
+
+# JSON Schema generation (Zod equivalent)
+schemars = "0.8"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics — recorder + exporter. Per-crate `metrics = "0.24"` pins
+# resolve to the same minor as this re-export, so the global recorder
+# installed in mcp-server catches every macro emission across the tree.
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
+# Concurrent data structures
+dashmap = "6.1"
+
+# UUID handling
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Async utilities
+futures = "0.3"
+async-trait = "0.1"
+
+# HTTP server
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+hyper = { version = "1.8", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+jsonwebtoken = "9.3"
+
+# Static hash maps
+phf = { version = "0.11", features = ["macros"] }
+
+# Regex (lightweight)
+regex-lite = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+tiktoken-rs = "=0.12.0"
+
+# Environment and config
+dotenvy = "0.15"
+directories = "5.0"
+ignore = "0.4"
+fs2 = "0.4"
+
+# Filesystem watching (content-freshness watcher: `contextstream-mcp watch`)
+notify = "6"
+
+# Workspace crates
+mcp-types = { version = "=1.0.0", path = "crates/mcp-types" }
+mcp-client = { version = "=1.0.0", path = "crates/mcp-client" }
+mcp-session = { version = "=1.0.0", path = "crates/mcp-session" }
+mcp-tools = { version = "=1.0.0", path = "crates/mcp-tools" }
+mcp-model-registry = { version = "=1.0.0", path = "crates/mcp-model-registry" }
+mcp-acceleration-products = { version = "=1.0.0", path = "crates/mcp-acceleration-products" }
+
+# Testing
+mockall = "0.13"
+tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+wiremock = "0.6"
+tempfile = "3.14"
+fake = { version = "3.0", features = ["derive"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 4

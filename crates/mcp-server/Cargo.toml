@@ -1,0 +1,100 @@
+[package]
+name = "mcp-server"
+description = "High-performance Rust MCP server for ContextStream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "mcp_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "contextstream-mcp"
+path = "src/main.rs"
+
+[dependencies]
+mcp-types = { workspace = true }
+mcp-client = { workspace = true }
+mcp-session = { workspace = true }
+mcp-tools = { workspace = true }
+mcp-model-registry = { workspace = true }
+# Optional: MongoDB-free acceleration providers for the remote HTTP gateway.
+mcp-acceleration-products = { workspace = true, optional = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml_edit = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Metrics exporter — installs the global Prometheus recorder so every
+# `metrics::counter!` / `metrics::histogram!` macro across the dependency
+# tree becomes scrapeable via /metrics.
+metrics-exporter-prometheus = { workspace = true }
+metrics = "0.24"
+uuid = { workspace = true }
+directories = { workspace = true }
+dotenvy = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+jsonwebtoken = { workspace = true }
+futures = { workspace = true }
+dialoguer = "0.11"
+console = "0.15"
+indicatif = "0.18"
+open = "5.0"
+dirs = "5.0"
+walkdir = "2.4"
+notify = { workspace = true }
+ignore = { workspace = true }
+fs2 = { workspace = true }
+which = "6.0"
+chrono = "0.4"
+base64 = "0.22"
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+
+[features]
+# Adds the MongoDB-free acceleration-layer foundation for the remote
+# HTTP gateway. Providers are wired incrementally through server APIs,
+# Redis, R2, Qdrant, Neo4j, and Cloudflare; this feature must not pull
+# `mongodb` or `bson` into the dependency tree.
+remote-acceleration = ["dep:mcp-acceleration-products"]
+
+[build-dependencies]
+chrono = "0.4"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3.10"
+criterion = { workspace = true }
+tokio-test = { workspace = true }
+http-body-util = "0.1"
+
+[[bench]]
+name = "tool_benchmarks"
+harness = false
+
+[[bench]]
+name = "json_benchmarks"
+harness = false
+
+[[bench]]
+name = "transport_benchmarks"
+harness = false

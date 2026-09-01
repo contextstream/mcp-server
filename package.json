@@ -1,84 +1,35 @@
 {
   "name": "@contextstream/mcp-server",
-  "mcpName": "io.github.contextstreamio/mcp-server",
-  "version": "0.4.82",
-  "description": "MCP server that gives AI coding assistants persistent memory, semantic code search, a dependency graph, grounded Q&A, and team context (GitHub/Slack/Notion) — works with Claude Code, Cursor, VS Code Copilot, Windsurf, Cline, and any Model Context Protocol client.",
+  "mcpName": "io.github.contextstream/mcp-server",
+  "version": "1.0.0",
+  "description": "Verified npm launcher for the open-source ContextStream Rust MCP server",
   "type": "module",
   "license": "MIT",
-  "main": "dist/index.js",
   "files": [
-    "dist",
-    "dist/hooks",
-    "scripts",
-    "README.md"
+    "npm/bin",
+    "npm/launcher.mjs",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "server.json"
   ],
   "bin": {
-    "mcp-server": "dist/index.js",
-    "contextstream-mcp": "dist/index.js",
-    "contextstream-hook": "dist/hooks/runner.js"
+    "mcp-server": "npm/bin/mcp-server.mjs",
+    "contextstream-mcp": "npm/bin/contextstream-mcp.mjs",
+    "contextstream-hook": "npm/bin/contextstream-hook.mjs"
   },
   "scripts": {
-    "dev": "tsx src/index.ts",
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --outfile=dist/index.js --format=esm --external:@modelcontextprotocol/sdk --banner:js=\"#!/usr/bin/env node\" && esbuild src/test-server.ts --bundle --platform=node --target=node18 --outfile=dist/test-server.js --format=esm --external:@modelcontextprotocol/sdk && esbuild src/hooks/runner.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/runner.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/post-write.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/post-write.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/pre-tool-use.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/pre-tool-use.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/post-tool-use-failure.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/post-tool-use-failure.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/user-prompt-submit.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/user-prompt-submit.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/media-aware.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/media-aware.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/pre-compact.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/pre-compact.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/post-compact.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/post-compact.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/notification.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/notification.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/permission-request.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/permission-request.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/subagent-start.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/subagent-start.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/subagent-stop.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/subagent-stop.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/task-completed.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/task-completed.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/teammate-idle.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/teammate-idle.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/stop.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/stop.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/auto-rules.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/auto-rules.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/on-bash.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/on-bash.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/on-task.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/on-task.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/on-read.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/on-read.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/on-web.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/on-web.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/session-init.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/session-init.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/session-end.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/session-end.js --format=esm --banner:js=\"#!/usr/bin/env node\" && esbuild src/hooks/on-save-intent.ts --bundle --platform=node --target=node18 --outfile=dist/hooks/on-save-intent.js --format=esm --banner:js=\"#!/usr/bin/env node\"",
-    "start": "node dist/index.js",
-    "test-server": "tsx src/test-server.ts",
-    "test-server:start": "node dist/test-server.js",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run --config vitest.config.cjs",
-    "test:watch": "vitest --config vitest.config.cjs",
-    "lint": "eslint src/",
-    "lint:fix": "eslint src/ --fix",
-    "format": "prettier --write src/",
-    "format:check": "prettier --check src/",
-    "prepublishOnly": "npm run build",
-    "postinstall": "node scripts/postinstall.js"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": ">=1.30.0 <1.31.0",
-    "ignore": "^7.0.5",
-    "zod": "^3.23.8"
-  },
-  "devDependencies": {
-    "@eslint/js": "^9.39.2",
-    "@types/node": "^20.10.0",
-    "@typescript-eslint/eslint-plugin": "^8.52.0",
-    "@typescript-eslint/parser": "^8.52.0",
-    "esbuild": "^0.28.1",
-    "eslint": "^9.39.2",
-    "prettier": "^3.7.4",
-    "tsx": "^4.15.4",
-    "typescript": "^5.6.3",
-    "typescript-eslint": "^8.52.0",
-    "vitest": "^4.1.9"
+    "test": "node --test npm/test/*.test.mjs",
+    "pack:check": "npm pack --dry-run",
+    "prepublishOnly": "npm test"
   },
   "engines": {
     "node": ">=20"
   },
-  "keywords": [
-    "mcp",
-    "mcp-server",
-    "model-context-protocol",
-    "contextstream",
-    "ai",
-    "ai-memory",
-    "ai-agent",
-    "ai-coding-assistant",
-    "claude",
-    "claude-code",
-    "cursor",
-    "copilot",
-    "windsurf",
-    "semantic-search",
-    "code-search",
-    "vector-search",
-    "code-context",
-    "context-engineering",
-    "memory",
-    "knowledge-graph",
-    "rag",
-    "llm",
-    "developer-tools"
-  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/contextstream/mcp-server.git"
@@ -87,8 +38,12 @@
   "bugs": {
     "url": "https://github.com/contextstream/mcp-server/issues"
   },
-  "overrides": {
-    "@hono/node-server": "^2.1.0",
-    "qs": "6.15.3"
-  }
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "contextstream",
+    "semantic-search",
+    "memory",
+    "developer-tools"
+  ]
 }

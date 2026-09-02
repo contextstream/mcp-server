@@ -13912,6 +13912,342 @@ impl ContextStreamClient {
     }
 
     // =========================================================================
+    // Context Feeds
+    // =========================================================================
+
+    /// List Context Feeds visible to the caller (owned, shared, or both).
+    ///
+    /// `workspace_id` / `project_id` fall back to the configured defaults.
+    pub async fn feeds_list(&self, params: FeedListParams) -> Result<serde_json::Value> {
+        let config = self.config.read().await;
+        let (workspace_id, project_id) =
+            scope_ids_with_defaults(params.workspace_id, params.project_id, &config);
+        drop(config);
+        let path = build_feed_list_path(workspace_id, project_id, &params);
+        self.get(&path)
+            .await
+            .map_err(|error| map_feed_error(error, "Context Feeds"))
+    }
+
+    /// Get-or-create the canonical `workspace` or `project` feed for a scope.
+    pub async fn feed_ensure(
+        &self,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        kind: &str,
+    ) -> Result<serde_json::Value> {
+        let config = self.config.read().await;
+        let (workspace_id, project_id) = scope_ids_with_defaults(workspace_id, project_id, &config);
+        drop(config);
+        let workspace_id = workspace_id.ok_or_else(|| {
+            Error::Validation(
+                "workspace_id is required to ensure a feed. Run init(folder_path=\"...\") or pass workspace_id."
+                    .to_string(),
+            )
+        })?;
+        let body = strip_nulls(serde_json::json!({
+            "workspace_id": workspace_id,
+            "project_id": if kind == "project" { project_id } else { None },
+            "kind": kind,
+        }));
+        self.post("/feeds/ensure", &body)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed scope"))
+    }
+
+    /// Create a feed (typically a `topic` feed; canonical feeds use `feed_ensure`).
+    pub async fn feed_create(&self, params: FeedCreateParams) -> Result<serde_json::Value> {
+        let config = self.config.read().await;
+        let (workspace_id, project_id) =
+            scope_ids_with_defaults(params.workspace_id, params.project_id, &config);
+        drop(config);
+        let workspace_id = workspace_id.ok_or_else(|| {
+            Error::Validation(
+                "workspace_id is required to create a feed. Run init(folder_path=\"...\") or pass workspace_id."
+                    .to_string(),
+            )
+        })?;
+        let body = strip_nulls(serde_json::json!({
+            "workspace_id": workspace_id,
+            "project_id": project_id,
+            "kind": params.kind,
+            "name": params.name,
+            "description": params.description,
+            "topic_spec": params.topic_spec,
+            "curation_settings": params.curation_settings,
+            "idempotency_key": params.idempotency_key,
+        }));
+        self.post("/feeds", &body)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed scope"))
+    }
+
+    /// Fetch one feed with the caller's follow state and counters.
+    pub async fn feed_get(&self, feed_id: Uuid) -> Result<serde_json::Value> {
+        self.get(&format!("/feeds/{}", feed_id))
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// Update feed metadata. `expected_revision` must match the current revision.
+    pub async fn feed_update(
+        &self,
+        feed_id: Uuid,
+        params: FeedUpdateParams,
+    ) -> Result<serde_json::Value> {
+        // The API carries revision numbers as strings so range errors name the field.
+        let body = strip_nulls(serde_json::json!({
+            "expected_revision": params.expected_revision.to_string(),
+            "idempotency_key": params.idempotency_key,
+            "name": params.name,
+            "description": params.description,
+            "topic_spec": params.topic_spec,
+            "curation_settings": params.curation_settings,
+        }));
+        self.patch(&format!("/feeds/{}", feed_id), &body)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// Archive a feed. `expected_revision` must match the current revision.
+    pub async fn feed_archive(
+        &self,
+        feed_id: Uuid,
+        expected_revision: i64,
+        idempotency_key: &str,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "expected_revision": expected_revision.to_string(),
+            "idempotency_key": idempotency_key,
+        });
+        self.post(&format!("/feeds/{}/archive", feed_id), &body)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// Page through feed items (`latest`, `unread`, `posts`, or `top`).
+    pub async fn feed_items(
+        &self,
+        feed_id: Uuid,
+        params: FeedItemsParams,
+    ) -> Result<serde_json::Value> {
+        let path = build_feed_items_path(feed_id, &params);
+        self.get(&path)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// Fetch one feed item with its citations.
+    pub async fn feed_item(&self, feed_id: Uuid, item_id: Uuid) -> Result<serde_json::Value> {
+        self.get(&format!("/feeds/{}/items/{}", feed_id, item_id))
+            .await
+            .map_err(|error| map_feed_error(error, "Feed item"))
+    }
+
+    /// Publish a human or agent post into a feed.
+    pub async fn feed_post(
+        &self,
+        feed_id: Uuid,
+        params: FeedPostParams,
+    ) -> Result<serde_json::Value> {
+        let body = strip_nulls(serde_json::json!({
+            "title": params.title,
+            "content": params.content,
+            "tags": params.tags,
+            "project_id": params.project_id,
+            "author_kind": params.author_kind,
+            "idempotency_key": params.idempotency_key,
+            "provenance": params.provenance,
+        }));
+        self.post(&format!("/feeds/{}/posts", feed_id), &body)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// Follow a feed (or update pin / mute / digest preferences).
+    pub async fn feed_follow(
+        &self,
+        feed_id: Uuid,
+        params: FeedFollowParams,
+    ) -> Result<serde_json::Value> {
+        let body = strip_nulls(serde_json::json!({
+            "pinned_to_sidebar": params.pinned_to_sidebar,
+            "muted_until": params.muted_until,
+            "digest_frequency": params.digest_frequency,
+        }));
+        self.put(&format!("/feeds/{}/follow", feed_id), &body)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// Unfollow a feed.
+    pub async fn feed_unfollow(&self, feed_id: Uuid) -> Result<serde_json::Value> {
+        self.delete(&format!("/feeds/{}/follow", feed_id))
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// Advance the caller's read cursor for a feed.
+    pub async fn feed_read(
+        &self,
+        feed_id: Uuid,
+        last_read_sequence: i64,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "last_read_sequence": last_read_sequence.to_string(),
+        });
+        self.post(&format!("/feeds/{}/read", feed_id), &body)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// List active share grants for a feed (owners only).
+    pub async fn feed_shares(&self, feed_id: Uuid) -> Result<serde_json::Value> {
+        self.get(&format!("/feeds/{}/shares", feed_id))
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// Share a feed with another workspace (or project) for agents or everyone.
+    pub async fn feed_share(
+        &self,
+        feed_id: Uuid,
+        params: FeedShareParams,
+    ) -> Result<serde_json::Value> {
+        let body = strip_nulls(serde_json::json!({
+            "target_workspace_id": params.target_workspace_id,
+            "target_project_id": params.target_project_id,
+            "audience": params.audience,
+            "idempotency_key": params.idempotency_key,
+        }));
+        self.post(&format!("/feeds/{}/shares", feed_id), &body)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// Revoke a share grant.
+    pub async fn feed_unshare(&self, feed_id: Uuid, share_id: Uuid) -> Result<serde_json::Value> {
+        self.delete(&format!("/feeds/{}/shares/{}", feed_id, share_id))
+            .await
+            .map_err(|error| map_feed_error(error, "Feed share"))
+    }
+
+    /// Record relevance feedback on a feed item.
+    pub async fn feed_feedback(
+        &self,
+        feed_id: Uuid,
+        item_id: Uuid,
+        feedback_type: &str,
+        note: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let body = strip_nulls(serde_json::json!({
+            "feedback_type": feedback_type,
+            "note": note,
+        }));
+        self.post(
+            &format!("/feeds/{}/items/{}/feedback", feed_id, item_id),
+            &body,
+        )
+        .await
+        .map_err(|error| map_feed_error(error, "Feed item"))
+    }
+
+    /// Request a manual curation run. Surfaces 429 as `Error::RateLimited`.
+    pub async fn feed_curate(&self, feed_id: Uuid) -> Result<serde_json::Value> {
+        self.post(
+            &format!("/feeds/{}/curate", feed_id),
+            &serde_json::json!({}),
+        )
+        .await
+        .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// List recent curation runs for a feed.
+    pub async fn feed_runs(&self, feed_id: Uuid, limit: Option<u16>) -> Result<serde_json::Value> {
+        let mut path = format!("/feeds/{}/runs", feed_id);
+        if let Some(limit) = limit {
+            path.push_str(&format!("?limit={}", limit.clamp(1, FEED_MAX_PAGE_SIZE)));
+        }
+        self.get(&path)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// List the workspace/project sources a feed curates from.
+    pub async fn feed_sources(&self, feed_id: Uuid) -> Result<serde_json::Value> {
+        self.get(&format!("/feeds/{}/sources", feed_id))
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// Add (or re-mark) an explicit or excluded source scope on a feed.
+    pub async fn feed_source_add(
+        &self,
+        feed_id: Uuid,
+        params: FeedSourceParams,
+    ) -> Result<serde_json::Value> {
+        let body = strip_nulls(serde_json::json!({
+            "source_workspace_id": params.source_workspace_id,
+            "source_project_id": params.source_project_id,
+            "origin": params.origin,
+        }));
+        self.post(&format!("/feeds/{}/sources", feed_id), &body)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed"))
+    }
+
+    /// Remove a source by key (`<workspace_uuid>:<project_uuid or ->`).
+    pub async fn feed_source_remove(
+        &self,
+        feed_id: Uuid,
+        source_key: &str,
+    ) -> Result<serde_json::Value> {
+        let source_key = source_key.trim();
+        if source_key.is_empty()
+            || source_key.len() > 80
+            || source_key.chars().any(char::is_whitespace)
+        {
+            return Err(Error::Validation(
+                "source_key must look like <workspace_uuid>:<project_uuid or ->".to_string(),
+            ));
+        }
+        self.delete(&format!(
+            "/feeds/{}/sources/{}",
+            feed_id,
+            Self::url_encode(source_key)
+        ))
+        .await
+        .map_err(|error| map_feed_error(error, "Feed source"))
+    }
+
+    /// Top feed items for grounding a task in a scope (bounded to 10).
+    pub async fn feed_ground(
+        &self,
+        workspace_id: Uuid,
+        project_id: Option<Uuid>,
+        limit: Option<u16>,
+        query: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let path = build_feed_ground_path(workspace_id, project_id, limit, query);
+        self.get(&path)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed grounding"))
+    }
+
+    /// Poll the feed change stream from a sequence cursor.
+    pub async fn feed_changes(
+        &self,
+        workspace_id: Option<Uuid>,
+        cursor: Option<i64>,
+        limit: Option<u16>,
+    ) -> Result<serde_json::Value> {
+        let path = build_feed_changes_path(workspace_id, cursor, limit);
+        self.get(&path)
+            .await
+            .map_err(|error| map_feed_error(error, "Feed changes"))
+    }
+
+    // =========================================================================
     // Media
     // =========================================================================
 
@@ -14346,6 +14682,7 @@ impl ContextStreamClient {
             serde_json::json!({"name":"workspace","category":"workspace","description":"List, inspect, create, and associate workspaces.","key_parameters":["action","workspace_id","folder_path"],"example":"workspace(action=\"list\")"}),
             serde_json::json!({"name":"reminder","category":"reminders","description":"List, create, snooze, complete, dismiss, and delete reminders.","key_parameters":["action","reminder_id","due_at"],"example":"reminder(action=\"active\")"}),
             serde_json::json!({"name":"coordination","category":"memory","description":"Coordinate live agents across workspaces and projects. Distinct from handoffs and capsules.","actions":["check_in","inbox","list","get","share","ack","dismiss","settings"],"key_parameters":["action","workspace_id","project_id","session_id","notice_id","title"],"example":"coordination(action=\"inbox\")"}),
+            serde_json::json!({"name":"feed","category":"memory","description":"Read, follow, post to, share, and curate Context Feeds: curated workspace, project, and topic activity streams.","actions":["list","ensure","get","update","archive","items","post","follow","unfollow","read","share","unshare","feedback","curate","runs","sources","ground"],"key_parameters":["action","feed_id","workspace_id","project_id","view","item_id","title","content"],"example":"feed(action=\"items\", feed_id=\"<uuid>\", view=\"unread\")"}),
             serde_json::json!({"name":"integration","category":"integrations","description":"Query and manage connected GitHub, Slack, Notion, Jira, and Linear data.","key_parameters":["action","workspace_id","project_id"],"example":"integration(action=\"status\", workspace_id=\"<uuid>\")"}),
             serde_json::json!({"name":"media","category":"memory","description":"Index, search, list, inspect, and clip images, video, audio, and documents.","key_parameters":["action","content_type","file_path","query"],"example":"media(action=\"search\", query=\"architecture diagram\", content_types=[\"image\"])"}),
             serde_json::json!({"name":"skill","category":"memory","description":"List, create, update, import, and run reusable instruction/action skills.","key_parameters":["action","name","project_id"],"example":"skill(action=\"list\")"}),
@@ -14617,6 +14954,109 @@ pub struct EditorRulesParams {
     pub include_pre_compact: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_post_write: Option<bool>,
+}
+
+// ============================================================================
+// Context Feed Parameter Structs
+// ============================================================================
+
+/// Largest page the Feeds API accepts for feed, item, and run listings.
+pub const FEED_MAX_PAGE_SIZE: u16 = 100;
+/// Largest page the Feeds API accepts for the change stream.
+pub const FEED_CHANGES_MAX_PAGE_SIZE: u16 = 200;
+/// Most grounding items the Feeds API returns per call.
+pub const FEED_GROUNDING_MAX_ITEMS: u16 = 10;
+
+/// Parameters for listing feeds.
+#[derive(Debug, Clone, Default)]
+pub struct FeedListParams {
+    pub workspace_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    /// `owned`, `shared`, or `all` (API default: `all`).
+    pub include: Option<String>,
+    pub include_archived: Option<bool>,
+    /// Offset cursor from a previous page's `next_cursor`.
+    pub cursor: Option<u32>,
+    pub limit: Option<u16>,
+}
+
+/// Parameters for creating a feed.
+#[derive(Debug, Clone, Default)]
+pub struct FeedCreateParams {
+    pub workspace_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    /// `workspace`, `project`, or `topic`.
+    pub kind: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub topic_spec: Option<serde_json::Value>,
+    pub curation_settings: Option<serde_json::Value>,
+    pub idempotency_key: String,
+}
+
+/// Parameters for updating feed metadata.
+#[derive(Debug, Clone, Default)]
+pub struct FeedUpdateParams {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub topic_spec: Option<serde_json::Value>,
+    pub curation_settings: Option<serde_json::Value>,
+    pub expected_revision: i64,
+    pub idempotency_key: String,
+}
+
+/// Parameters for paging feed items.
+#[derive(Debug, Clone, Default)]
+pub struct FeedItemsParams {
+    /// `latest`, `unread`, `posts`, or `top` (API default: `latest`).
+    pub view: Option<String>,
+    pub cursor: Option<u32>,
+    pub limit: Option<u16>,
+    /// RFC 3339 lower bound on `occurred_at`.
+    pub since: Option<String>,
+}
+
+/// Parameters for publishing a post into a feed.
+#[derive(Debug, Clone, Default)]
+pub struct FeedPostParams {
+    pub title: String,
+    pub content: String,
+    pub tags: Vec<String>,
+    pub project_id: Option<Uuid>,
+    /// `human` or `agent`.
+    pub author_kind: String,
+    pub idempotency_key: String,
+    /// Flat object of short strings describing where the post came from.
+    pub provenance: Option<serde_json::Value>,
+}
+
+/// Parameters for following a feed.
+#[derive(Debug, Clone, Default)]
+pub struct FeedFollowParams {
+    pub pinned_to_sidebar: Option<bool>,
+    /// RFC 3339 timestamp until which the feed is muted.
+    pub muted_until: Option<String>,
+    /// `realtime`, `daily`, or another server-recognised frequency.
+    pub digest_frequency: Option<String>,
+}
+
+/// Parameters for sharing a feed with another scope.
+#[derive(Debug, Clone)]
+pub struct FeedShareParams {
+    pub target_workspace_id: Uuid,
+    pub target_project_id: Option<Uuid>,
+    /// `agents` or `everyone` (API default: `agents`).
+    pub audience: Option<String>,
+    pub idempotency_key: String,
+}
+
+/// Parameters for adding a source scope to a feed.
+#[derive(Debug, Clone)]
+pub struct FeedSourceParams {
+    pub source_workspace_id: Uuid,
+    pub source_project_id: Option<Uuid>,
+    /// `explicit` or `excluded` (API default: `explicit`).
+    pub origin: Option<String>,
 }
 
 // ============================================================================
@@ -18070,6 +18510,162 @@ fn build_plan_list_path(
     }
 
     Ok(format!("/plans?{}", params.join("&")))
+}
+
+/// Build the `<workspace_uuid>:<project_uuid or ->` key the Feeds API uses to
+/// address a source scope.
+pub fn feed_source_key(workspace_id: Uuid, project_id: Option<Uuid>) -> String {
+    match project_id {
+        Some(project_id) => format!("{}:{}", workspace_id, project_id),
+        None => format!("{}:-", workspace_id),
+    }
+}
+
+fn build_feed_list_path(
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    params: &FeedListParams,
+) -> String {
+    let mut query = Vec::new();
+    if let Some(id) = workspace_id {
+        query.push(format!("workspace_id={}", id));
+    }
+    if let Some(id) = project_id {
+        query.push(format!("project_id={}", id));
+    }
+    if let Some(include) = params
+        .include
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(format!("include={}", urlencoding::encode(include)));
+    }
+    if let Some(include_archived) = params.include_archived {
+        query.push(format!("include_archived={}", include_archived));
+    }
+    if let Some(cursor) = params.cursor.filter(|value| *value > 0) {
+        query.push(format!("cursor={}", cursor));
+    }
+    if let Some(limit) = params.limit {
+        query.push(format!("limit={}", limit.clamp(1, FEED_MAX_PAGE_SIZE)));
+    }
+    if query.is_empty() {
+        "/feeds".to_string()
+    } else {
+        format!("/feeds?{}", query.join("&"))
+    }
+}
+
+fn build_feed_items_path(feed_id: Uuid, params: &FeedItemsParams) -> String {
+    let mut query = Vec::new();
+    if let Some(view) = params
+        .view
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(format!("view={}", urlencoding::encode(view)));
+    }
+    if let Some(since) = params
+        .since
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(format!("since={}", urlencoding::encode(since)));
+    }
+    if let Some(cursor) = params.cursor.filter(|value| *value > 0) {
+        query.push(format!("cursor={}", cursor));
+    }
+    if let Some(limit) = params.limit {
+        query.push(format!("limit={}", limit.clamp(1, FEED_MAX_PAGE_SIZE)));
+    }
+    if query.is_empty() {
+        format!("/feeds/{}/items", feed_id)
+    } else {
+        format!("/feeds/{}/items?{}", feed_id, query.join("&"))
+    }
+}
+
+fn build_feed_ground_path(
+    workspace_id: Uuid,
+    project_id: Option<Uuid>,
+    limit: Option<u16>,
+    query: Option<&str>,
+) -> String {
+    let mut params = vec![format!("workspace_id={}", workspace_id)];
+    if let Some(id) = project_id {
+        params.push(format!("project_id={}", id));
+    }
+    if let Some(limit) = limit {
+        params.push(format!(
+            "limit={}",
+            limit.clamp(1, FEED_GROUNDING_MAX_ITEMS)
+        ));
+    }
+    if let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) {
+        // The API only keeps the first few alphanumeric terms; keep the wire
+        // payload short so long user messages never bloat the query string.
+        let bounded: String = query.chars().take(240).collect();
+        params.push(format!("query={}", urlencoding::encode(&bounded)));
+    }
+    format!("/feeds/ground?{}", params.join("&"))
+}
+
+fn build_feed_changes_path(
+    workspace_id: Option<Uuid>,
+    cursor: Option<i64>,
+    limit: Option<u16>,
+) -> String {
+    let mut params = Vec::new();
+    if let Some(id) = workspace_id {
+        params.push(format!("workspace_id={}", id));
+    }
+    if let Some(cursor) = cursor.filter(|value| *value > 0) {
+        params.push(format!("cursor={}", cursor));
+    }
+    if let Some(limit) = limit {
+        params.push(format!(
+            "limit={}",
+            limit.clamp(1, FEED_CHANGES_MAX_PAGE_SIZE)
+        ));
+    }
+    if params.is_empty() {
+        "/feeds/changes".to_string()
+    } else {
+        format!("/feeds/changes?{}", params.join("&"))
+    }
+}
+
+/// Make Feeds API failures self-explanatory: a 404 usually means the feature
+/// gate (`CONTEXTSTREAM_FEEDS_API_ENABLED`) is off on this deployment rather
+/// than a bad id, and a 429 is the manual-curation rate limit.
+fn map_feed_error(error: Error, subject: &str) -> Error {
+    match error {
+        Error::Http {
+            status: 404,
+            message,
+            code,
+            source,
+        } => Error::Http {
+            status: 404,
+            message: format!(
+                "{subject} not found. Context Feeds may not be enabled on this deployment \
+                 (CONTEXTSTREAM_FEEDS_API_ENABLED) or the id does not exist: {message}"
+            ),
+            code,
+            source,
+        },
+        Error::RateLimited {
+            message,
+            retry_after,
+        } => Error::RateLimited {
+            message: format!("Context Feeds rate limited ({subject}): {message}"),
+            retry_after,
+        },
+        other => other,
+    }
 }
 
 fn unwrap_api_response(value: serde_json::Value) -> serde_json::Value {
@@ -22126,6 +22722,152 @@ mod tests {
     }
 
     #[test]
+    fn feed_list_path_encodes_scope_filters_and_clamps_limit() {
+        let workspace_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let params = FeedListParams {
+            workspace_id: Some(workspace_id),
+            project_id: Some(project_id),
+            include: Some("shared".to_string()),
+            include_archived: Some(true),
+            cursor: Some(50),
+            limit: Some(500),
+        };
+
+        assert_eq!(
+            build_feed_list_path(Some(workspace_id), Some(project_id), &params),
+            format!(
+                "/feeds?workspace_id={}&project_id={}&include=shared&include_archived=true&cursor=50&limit=100",
+                workspace_id, project_id
+            )
+        );
+        assert_eq!(
+            build_feed_list_path(None, None, &FeedListParams::default()),
+            "/feeds"
+        );
+    }
+
+    #[test]
+    fn feed_items_path_encodes_view_since_and_paging() {
+        let feed_id = Uuid::new_v4();
+        let params = FeedItemsParams {
+            view: Some("unread".to_string()),
+            cursor: Some(0),
+            limit: Some(0),
+            since: Some("2026-09-01T00:00:00Z".to_string()),
+        };
+
+        assert_eq!(
+            build_feed_items_path(feed_id, &params),
+            format!(
+                "/feeds/{}/items?view=unread&since=2026-09-01T00%3A00%3A00Z&limit=1",
+                feed_id
+            )
+        );
+        assert_eq!(
+            build_feed_items_path(feed_id, &FeedItemsParams::default()),
+            format!("/feeds/{}/items", feed_id)
+        );
+    }
+
+    #[test]
+    fn feed_ground_path_requires_workspace_and_bounds_limit_and_query() {
+        let workspace_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let long_query = "x".repeat(400);
+
+        let path = build_feed_ground_path(
+            workspace_id,
+            Some(project_id),
+            Some(50),
+            Some("fix the login regression"),
+        );
+        assert_eq!(
+            path,
+            format!(
+                "/feeds/ground?workspace_id={}&project_id={}&limit=10&query=fix%20the%20login%20regression",
+                workspace_id, project_id
+            )
+        );
+
+        let bounded = build_feed_ground_path(workspace_id, None, None, Some(&long_query));
+        assert_eq!(
+            bounded,
+            format!(
+                "/feeds/ground?workspace_id={}&query={}",
+                workspace_id,
+                "x".repeat(240)
+            )
+        );
+        assert_eq!(
+            build_feed_ground_path(workspace_id, None, None, Some("   ")),
+            format!("/feeds/ground?workspace_id={}", workspace_id)
+        );
+    }
+
+    #[test]
+    fn feed_changes_path_and_source_key_follow_the_wire_contract() {
+        let workspace_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        assert_eq!(build_feed_changes_path(None, None, None), "/feeds/changes");
+        assert_eq!(
+            build_feed_changes_path(Some(workspace_id), Some(42), Some(999)),
+            format!(
+                "/feeds/changes?workspace_id={}&cursor=42&limit=200",
+                workspace_id
+            )
+        );
+        assert_eq!(
+            feed_source_key(workspace_id, Some(project_id)),
+            format!("{}:{}", workspace_id, project_id)
+        );
+        assert_eq!(
+            feed_source_key(workspace_id, None),
+            format!("{}:-", workspace_id)
+        );
+    }
+
+    #[test]
+    fn feed_errors_explain_disabled_feature_and_rate_limits() {
+        let not_found = map_feed_error(
+            Error::http_with_code(404, "Feed not found", ErrorCode::NotFound),
+            "Feed",
+        );
+        match not_found {
+            Error::Http {
+                status, message, ..
+            } => {
+                assert_eq!(status, 404);
+                assert!(message.contains("CONTEXTSTREAM_FEEDS_API_ENABLED"));
+                assert!(message.contains("Feed not found"));
+            }
+            other => panic!("expected http error, got {other:?}"),
+        }
+
+        let limited = map_feed_error(
+            Error::RateLimited {
+                message: "manual runs exhausted".to_string(),
+                retry_after: Some(120),
+            },
+            "Feed",
+        );
+        match limited {
+            Error::RateLimited {
+                message,
+                retry_after,
+            } => {
+                assert!(message.starts_with("Context Feeds rate limited"));
+                assert_eq!(retry_after, Some(120));
+            }
+            other => panic!("expected rate limit error, got {other:?}"),
+        }
+
+        let untouched = map_feed_error(Error::Validation("bad".to_string()), "Feed");
+        assert!(matches!(untouched, Error::Validation(message) if message == "bad"));
+    }
+
+    #[test]
     fn external_media_filename_uses_url_basename_when_present() {
         assert_eq!(
             external_media_filename(
@@ -22793,17 +23535,19 @@ mod tests {
             })
             .unwrap_or_default();
 
-        // Canonical catalog: 21 tools (coordination added in v0.5.93).
+        // Canonical catalog: 22 tools (coordination added in v0.5.93, feed
+        // added with Context Feeds).
         // Aliases atlas_chart / atlas_job remain accepted at call-time for
         // back-compat but are intentionally absent. The dropped `ram` alias
         // must NOT reappear.
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 22);
         assert!(names.contains(&"instruct"));
         assert!(names.contains(&"skill"));
         assert!(names.contains(&"capsule"));
         assert!(names.contains(&"qa"));
         assert!(names.contains(&"entity"));
         assert!(names.contains(&"coordination"));
+        assert!(names.contains(&"feed"));
         assert!(names.contains(&"vcs"));
         assert!(names.contains(&"chart"));
         assert!(names.contains(&"async_job"));

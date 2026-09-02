@@ -243,7 +243,19 @@ fn age_days(timestamp: DateTime<Utc>) -> i64 {
         .max(0)
 }
 
+/// Context Feed items carry `feed_id` plus a feed name/item id; they are
+/// surfaced through the `feed` tool rather than memory lookups.
+fn is_feed_item(item: &Value) -> bool {
+    item.get("feed_id").and_then(Value::as_str).is_some()
+        && (item.get("feed_name").is_some()
+            || item.get("item_id").is_some()
+            || item.get("item_kind").is_some())
+}
+
 fn classify_kind(item: &Value) -> String {
+    if is_feed_item(item) {
+        return "feed_item".to_string();
+    }
     if let Some(ot) = original_type(item) {
         return ot;
     }
@@ -266,6 +278,7 @@ fn id_hint(item: &Value) -> (Option<String>, Option<String>) {
         "event_id",
         "memory_event_id",
         "doc_id",
+        "feed_id",
         "id",
     ] {
         if let Some(v) = metadata_str(item, key) {
@@ -400,6 +413,12 @@ fn action_hint(hit: &GroundingHit, search_keywords: &str) -> String {
     let id_field = hit.id_field.as_deref().unwrap_or("");
     let q = recall_hint_keywords(hit, search_keywords);
 
+    if k == "feed_item" || k.starts_with("feed_") {
+        if id_field == "feed_id" && !id.is_empty() {
+            return format!("feed(action=\"items\", feed_id=\"{id}\")");
+        }
+        return format!("feed(action=\"ground\", query=\"{q}\")");
+    }
     if is_transcript_id_field(id_field) && !id.is_empty() {
         return format!("memory(action=\"get_transcript\", transcript_id=\"{id}\")");
     }
@@ -921,5 +940,34 @@ mod tests {
         let s = format_grounding_block(&hits, true);
         assert!(s.contains("memory(action=\"get_event\", event_id=\"evt-2\")"));
         assert!(!s.contains("get_transcript"));
+    }
+
+    #[test]
+    fn feed_item_hits_route_to_the_feed_tool() {
+        let recall = json!({
+            "results": [
+                {
+                    "score": 0.95,
+                    "feed_id": "11111111-1111-1111-1111-111111111111",
+                    "feed_name": "Engineering",
+                    "item_id": "22222222-2222-2222-2222-222222222222",
+                    "item_kind": "decision",
+                    "title": "Auth refactor decided",
+                    "summary": "Rotating JWTs everywhere",
+                    "occurred_at": "2099-01-01T00:00:00Z"
+                },
+                { "title": "Feed digest", "score": 0.9, "kind": "feed_item" }
+            ]
+        });
+        let hits = parse_recall_results(&recall);
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| hit.kind == "feed_item"));
+        assert_eq!(hits[0].id_field.as_deref(), Some("feed_id"));
+
+        let block = format_grounding_block(&hits, true);
+        assert!(block
+            .contains("feed(action=\"items\", feed_id=\"11111111-1111-1111-1111-111111111111\")"));
+        assert!(block.contains("feed(action=\"ground\", query=\""));
+        assert!(!block.contains("get_event"));
     }
 }

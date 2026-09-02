@@ -723,7 +723,8 @@ mod constants_tests {
         assert!(VALID_BUNDLES.contains(&"project"));
         assert!(VALID_BUNDLES.contains(&"reminders"));
         assert!(VALID_BUNDLES.contains(&"integrations"));
-        assert_eq!(VALID_BUNDLES.len(), 8);
+        assert!(VALID_BUNDLES.contains(&"feeds"));
+        assert_eq!(VALID_BUNDLES.len(), 9);
     }
 
     #[test]

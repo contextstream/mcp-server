@@ -406,6 +406,7 @@ mod progressive_tests {
         assert!(bundle_names.contains(&"session"));
         assert!(bundle_names.contains(&"search"));
         assert!(bundle_names.contains(&"graph"));
+        assert!(bundle_names.contains(&"feeds"));
     }
 }
 
@@ -740,6 +741,8 @@ mod constants_tests {
         assert!(CONSOLIDATED_TOOLS.contains(&"project"));
         assert!(CONSOLIDATED_TOOLS.contains(&"coordination"));
         assert!(STANDARD_TOOLS.contains(&"coordination"));
+        assert!(CONSOLIDATED_TOOLS.contains(&"feed"));
+        assert!(STANDARD_TOOLS.contains(&"feed"));
     }
 
     #[test]
@@ -988,6 +991,30 @@ fn test_discovery_hints_lesson_and_preference_save_keywords() {
     let remember_hints = discovery_hints("session_remember", &remember_metadata);
     assert!(remember_hints.aliases.contains(&"save preference"));
     assert!(remember_hints.tags.contains(&"preferences"));
+}
+
+#[test]
+fn test_discovery_hints_feed_keywords() {
+    use super::*;
+    use mcp_types::tool::{ToolAnnotations, ToolCategory, ToolMetadata};
+
+    let metadata = ToolMetadata {
+        name: "feed".to_string(),
+        title: "Context Feeds".to_string(),
+        description: "Context Feeds".to_string(),
+        category: ToolCategory::Memory,
+        annotations: ToolAnnotations::destructive(),
+        is_pro: false,
+        required_tier: None,
+    };
+    let hints = discovery_hints("feed", &metadata);
+    assert!(hints.aliases.contains(&"context feed"));
+    assert!(hints.aliases.contains(&"what changed"));
+    assert!(hints.tags.contains(&"feed"));
+    assert!(hints.tags.contains(&"grounding"));
+    assert!(hints.when_to_use.contains("post agent findings"));
+    assert!(hints.avoid_when.contains("coordination"));
+    assert!(!hints.parallel_safe);
 }
 
 #[test]

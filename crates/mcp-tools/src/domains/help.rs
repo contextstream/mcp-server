@@ -66,6 +66,7 @@ const VALID_BUNDLES: &[&str] = &[
     "project",
     "reminders",
     "integrations",
+    "feeds",
 ];
 
 /// Valid editors.

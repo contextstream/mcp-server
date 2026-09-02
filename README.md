@@ -7,6 +7,11 @@
 <h1 align="center">ContextStream MCP Server</h1>
 
 <p align="center">
+  <em>Intelligence without context is unreliable. Autonomy without context is chaos.<br/>
+  And context without trust becomes surveillance.</em>
+</p>
+
+<p align="center">
   <strong>Give every coding agent persistent memory, semantic code search, and the right project context on every turn.</strong>
 </p>
 

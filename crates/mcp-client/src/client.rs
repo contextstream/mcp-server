@@ -3,6 +3,9 @@
 use chrono::Utc;
 use mcp_types::{
     agentic::{ComplianceEventRecorded, ComplianceEventRequest},
+    answer::{
+        AnswerFeedbackRequestV1, AnswerFeedbackResponseV1, AnswerRequestV1, AnswerResponseV1,
+    },
     api::*,
     AccountContextSnapshot, AccountContextSource, AuthOverride, Config, ConfigOverride, Error,
     ErrorCode, Result, SessionKey, TeamDiscussion, TeamPriorityItem, TrafficClass,
@@ -2502,6 +2505,23 @@ impl ContextStreamClient {
         self.request("GET", path, None::<()>, None).await
     }
 
+    /// Make exactly one GET request with no network/status retry and no
+    /// session-refresh replay. Receipt recovery must expose current authority
+    /// and availability rather than hiding either behind client behavior.
+    pub async fn get_once<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.request_with_replay(
+            "GET",
+            path,
+            None::<()>,
+            Some(RequestOptions {
+                retries: Some(0),
+                ..RequestOptions::default()
+            }),
+            false,
+        )
+        .await
+    }
+
     /// Make a GET request and return the raw response body as text.
     pub async fn get_text(&self, path: &str, accept: Option<&str>) -> Result<String> {
         self.request_text("GET", path, None::<()>, None, accept)
@@ -2522,6 +2542,26 @@ impl ContextStreamClient {
     /// Make a POST request.
     pub async fn post<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: B) -> Result<T> {
         self.request("POST", path, Some(body), None).await
+    }
+
+    /// Make exactly one POST request with no network/status retry and no
+    /// session-refresh replay. Use this for one-use execution authorities.
+    pub async fn post_once<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: B,
+    ) -> Result<T> {
+        self.request_with_replay(
+            "POST",
+            path,
+            Some(body),
+            Some(RequestOptions {
+                retries: Some(0),
+                ..RequestOptions::default()
+            }),
+            false,
+        )
+        .await
     }
 
     /// Make a POST request with options.
@@ -2939,6 +2979,18 @@ impl ContextStreamClient {
         body: Option<B>,
         options: Option<RequestOptions>,
     ) -> Result<T> {
+        self.request_with_replay(method, path, body, options, true)
+            .await
+    }
+
+    async fn request_with_replay<T: DeserializeOwned, B: Serialize>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<B>,
+        options: Option<RequestOptions>,
+        allow_auth_refresh_replay: bool,
+    ) -> Result<T> {
         let options = options.unwrap_or_default();
         let config = self.config().await;
 
@@ -3105,7 +3157,7 @@ impl ContextStreamClient {
             // A session refresh is an authentication repair, not a generic
             // endpoint retry. Preserve exactly one immediate replay even when
             // callers set `retries: 0` to suppress terminal 5xx/backoff.
-            if status.as_u16() == 403 && !auth_refresh_replayed {
+            if allow_auth_refresh_replay && status.as_u16() == 403 && !auth_refresh_replayed {
                 auth_refresh_replayed = true;
                 let hook = self.session_refresh_hook.read().await.clone();
                 if let Some(hook) = hook {
@@ -14691,6 +14743,7 @@ impl ContextStreamClient {
             serde_json::json!({"name":"init","category":"session","description":"Initialize session scope and return project context.","key_parameters":["folder_path","workspace_id","project_id","session_id"],"example":"init(folder_path=\"/path/to/project\", session_id=\"session-123\")"}),
             serde_json::json!({"name":"context","category":"session","description":"Get task-specific rules, lessons, preferences, and relevant prior work.","key_parameters":["user_message","session_id","mode","save_exchange"],"example":"context(user_message=\"fix the login regression\", session_id=\"session-123\")"}),
             serde_json::json!({"name":"search","category":"search","description":"Search indexed source code with keyword, semantic, pattern, refactor, and exhaustive modes.","key_parameters":["query","mode","project_id","workspace_id","include_content"],"example":"search(query=\"AuthService\", mode=\"refactor\", output_format=\"paths\")"}),
+            serde_json::json!({"name":"answer","category":"ai","description":"Ask a natural-language question across authorized ContextStream knowledge with current-truth, evidence, freshness, and coverage metadata.","actions":["query","recent_changes"],"key_parameters":["action","question","workspace_ids","project_ids","visibility","timezone"],"example":"answer(action=\"recent_changes\", question=\"What changed recently?\")"}),
             serde_json::json!({"name":"instruct","category":"session","description":"Read and acknowledge session-scoped injected instructions.","actions":["get","ack"],"key_parameters":["action","session_id","ids"],"example":"instruct(action=\"get\", session_id=\"session-123\")"}),
             serde_json::json!({"name":"session","category":"session","description":"Ground, capture, recall, and restore durable session context; manage lessons and plans; access Daily Recaps.","actions":["capture","retro_capture","capture_lesson","get_lessons","update_lesson","delete_lesson","recall","ground","set_account_mode","remember","user_context","summary","compress","delta","smart_search","decision_trace","restore_context","capture_plan","get_plan","update_plan","list_plans","list_recaps","trigger_recap","list_suggested_rules","suggested_rule_action","suggested_rules_stats"],"key_parameters":["action","workspace_id","project_id","session_id"],"example":"session(action=\"ground\", user_message=\"continue the refactor\")"}),
             serde_json::json!({"name":"memory","category":"memory","description":"Manage durable nodes, events, tasks, todos, docs, diagrams, and transcripts.","key_parameters":["action","workspace_id","project_id"],"example":"memory(action=\"list_docs\", doc_type=\"runbook\")"}),
@@ -14819,6 +14872,49 @@ impl ContextStreamClient {
     // project knowledge, answered by ContextCode (the upstream model
     // identifier is private to the API server's branding firewall).
     // ========================================================================
+
+    /// `POST /api/v1/answers` — execute one public natural-language Answer
+    /// request. This deliberately bypasses every client retry and auth-refresh
+    /// replay because the server binds execution to one-use durable authority.
+    pub async fn answer_query(&self, request: AnswerRequestV1) -> Result<AnswerResponseV1> {
+        self.post_once("/answers", request).await
+    }
+
+    /// `GET /api/v1/answers/receipts/:request_id` — recover one durable
+    /// terminal Answer without replaying the original execution.
+    pub async fn answer_receipt(&self, request_id: Uuid) -> Result<AnswerResponseV1> {
+        let response: AnswerResponseV1 = self
+            .get_once(&format!("/answers/receipts/{request_id}"))
+            .await?;
+        if response.request_id() != request_id {
+            return Err(Error::Validation(
+                "Answer receipt request_id does not match the request".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// `POST /api/v1/answers/feedback` — record one client-idempotent,
+    /// receipt-bound signal. This is one-shot even though an explicit caller
+    /// retry with the same feedback ID is safe at the server.
+    pub async fn answer_feedback(
+        &self,
+        request: AnswerFeedbackRequestV1,
+    ) -> Result<AnswerFeedbackResponseV1> {
+        let expected = request.clone();
+        let response: AnswerFeedbackResponseV1 =
+            self.post_once("/answers/feedback", request).await?;
+        if response.feedback_id != expected.feedback_id
+            || response.request_id != expected.request_id
+            || response.target != expected.target
+            || response.signal != expected.signal
+        {
+            return Err(Error::Validation(
+                "Answer feedback acknowledgement does not match the request".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
 
     /// `POST /v1/qa_agent/ask` — full retrieve-and-call flow. Persists
     /// question + answer, returns the answer text + citations + token
@@ -19964,6 +20060,311 @@ mod tests {
         (ContextStreamClient::new(config), server)
     }
 
+    fn answer_clarification_response() -> serde_json::Value {
+        serde_json::json!({
+            "status": "clarification_required",
+            "schema_version": "answer.v1",
+            "request_id": Uuid::from_u128(1),
+            "application_id": null,
+            "clarification": {
+                "clarification_id": Uuid::from_u128(2),
+                "kind": "scope_required",
+                "prompt": "Which workspace?",
+                "candidate_scopes": [],
+                "created_at": "2026-09-02T00:00:00Z"
+            }
+        })
+    }
+
+    fn answer_feedback_request() -> AnswerFeedbackRequestV1 {
+        AnswerFeedbackRequestV1 {
+            schema_version: mcp_types::AnswerFeedbackSchemaVersionV1::V1,
+            feedback_id: Uuid::from_u128(51),
+            request_id: Uuid::from_u128(1),
+            target: mcp_types::AnswerFeedbackTargetV1::Answer {},
+            signal: mcp_types::AnswerFeedbackSignalV1::Relevant,
+        }
+    }
+
+    fn answer_feedback_response(request: &AnswerFeedbackRequestV1) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "answer.feedback.v1",
+            "feedback_id": request.feedback_id,
+            "request_id": request.request_id,
+            "target": { "target": "answer" },
+            "signal": "relevant",
+            "status": "accepted",
+            "effect": "recorded_only",
+            "recorded_at": "2026-09-02T00:01:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn answer_query_posts_once_with_authority_free_wire_contract() {
+        let (client, server) = client_with_http_sequence(vec![(
+            "200 OK",
+            serde_json::json!({
+                "success": true,
+                "data": answer_clarification_response(),
+                "metadata": {
+                    "request_id": "request-envelope-id",
+                    "timestamp": "2026-09-02T00:00:00Z",
+                    "duration_ms": 4,
+                    "version": "v1"
+                }
+            })
+            .to_string(),
+        )])
+        .await;
+        let request =
+            AnswerRequestV1::coflow_recent_changes(None, "America/Los_Angeles", None, None, None);
+
+        let response = client.answer_query(request).await.expect("answer response");
+
+        assert!(matches!(
+            response,
+            AnswerResponseV1::ClarificationRequired { request_id, .. }
+                if request_id == Uuid::from_u128(1)
+        ));
+        let requests = server.await.expect("answer server task");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /api/v1/answers "));
+        let body = requests[0]
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("answer request body");
+        let wire: serde_json::Value = serde_json::from_str(body).expect("answer request JSON");
+        assert_eq!(wire["question"], "What changed recently?");
+        assert_eq!(wire["scope_mode"], "auto");
+        assert_eq!(wire["requested_scope"]["visibility"], "account");
+        assert_eq!(
+            wire["requested_scope"]["workspace_ids"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            wire["requested_scope"]["project_ids"],
+            serde_json::json!([])
+        );
+        for forbidden in [
+            "actor",
+            "application_id",
+            "authorization",
+            "effective_scopes",
+            "tenant_route",
+            "model",
+        ] {
+            assert!(
+                wire.get(forbidden).is_none(),
+                "forbidden field: {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn answer_query_does_not_retry_retryable_http_statuses() {
+        let (client, server) = client_with_http_sequence(vec![(
+            "503 Service Unavailable",
+            serde_json::json!({
+                "error": {"code": "unavailable", "message": "answer unavailable"}
+            })
+            .to_string(),
+        )])
+        .await;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(750),
+            client.answer_query(AnswerRequestV1::coflow_recent_changes(
+                None, "UTC", None, None, None,
+            )),
+        )
+        .await
+        .expect("one-shot Answer request must not enter retry backoff");
+
+        assert!(matches!(result, Err(Error::Http { status: 503, .. })));
+        let requests = server.await.expect("answer server task");
+        assert_eq!(
+            requests.len(),
+            1,
+            "Answer must make exactly one API attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_query_does_not_retry_transport_failures() {
+        let (client, shutdown, server) = client_with_counted_http_behavior(None).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(750),
+            client.answer_query(AnswerRequestV1::coflow_recent_changes(
+                None, "UTC", None, None, None,
+            )),
+        )
+        .await
+        .expect("one-shot Answer transport failure must not enter retry backoff");
+
+        assert!(
+            matches!(&result, Err(Error::Network(_))),
+            "the connection close must return a transport error, got {result:?}"
+        );
+        shutdown
+            .send(())
+            .expect("counted HTTP server must still be running");
+        let requests = server.await.expect("counted HTTP server task");
+        assert_eq!(
+            requests.len(),
+            1,
+            "Answer must make exactly one API attempt after a transport failure"
+        );
+        assert!(requests[0].starts_with("POST /api/v1/answers "));
+    }
+
+    #[tokio::test]
+    async fn answer_query_does_not_replay_after_session_refresh() {
+        let (client, server) = client_with_http_sequence(vec![(
+            "403 Forbidden",
+            serde_json::json!({
+                "error": {"code": "forbidden", "message": "authority rejected"}
+            })
+            .to_string(),
+        )])
+        .await;
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refreshes_for_hook = Arc::clone(&refreshes);
+        client
+            .set_session_refresh_hook(Arc::new(move || {
+                let refreshes = Arc::clone(&refreshes_for_hook);
+                Box::pin(async move {
+                    refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    true
+                })
+            }))
+            .await;
+
+        let result = client
+            .answer_query(AnswerRequestV1::coflow_recent_changes(
+                None, "UTC", None, None, None,
+            ))
+            .await;
+
+        assert!(matches!(result, Err(Error::Http { status: 403, .. })));
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let requests = server.await.expect("answer server task");
+        assert_eq!(requests.len(), 1, "Answer must not replay after a 403");
+    }
+
+    #[tokio::test]
+    async fn answer_receipt_gets_once_and_validates_request_identity() {
+        let request_id = Uuid::from_u128(1);
+        let (client, server) = client_with_http_sequence(vec![(
+            "200 OK",
+            serde_json::json!({
+                "success": true,
+                "data": answer_clarification_response(),
+                "metadata": {
+                    "request_id": "receipt-envelope-id",
+                    "timestamp": "2026-09-02T00:00:00Z",
+                    "duration_ms": 2,
+                    "version": "v1"
+                }
+            })
+            .to_string(),
+        )])
+        .await;
+
+        let response = client
+            .answer_receipt(request_id)
+            .await
+            .expect("Answer receipt");
+        assert_eq!(response.request_id(), request_id);
+        let requests = server.await.expect("receipt server task");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(&format!("GET /api/v1/answers/receipts/{request_id} ")));
+    }
+
+    #[tokio::test]
+    async fn answer_receipt_does_not_retry_retryable_http_statuses() {
+        let (client, server) = client_with_http_sequence(vec![(
+            "503 Service Unavailable",
+            serde_json::json!({
+                "error": {"code": "unavailable", "message": "receipt unavailable"}
+            })
+            .to_string(),
+        )])
+        .await;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(750),
+            client.answer_receipt(Uuid::from_u128(1)),
+        )
+        .await
+        .expect("one-shot receipt must not enter retry backoff");
+
+        assert!(matches!(result, Err(Error::Http { status: 503, .. })));
+        let requests = server.await.expect("receipt server task");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn answer_feedback_posts_once_and_validates_the_acknowledgement() {
+        let request = answer_feedback_request();
+        let (client, server) = client_with_http_sequence(vec![(
+            "200 OK",
+            serde_json::json!({
+                "success": true,
+                "data": answer_feedback_response(&request),
+                "metadata": {
+                    "request_id": "feedback-envelope-id",
+                    "timestamp": "2026-09-02T00:01:00Z",
+                    "duration_ms": 3,
+                    "version": "v1"
+                }
+            })
+            .to_string(),
+        )])
+        .await;
+
+        let response = client
+            .answer_feedback(request.clone())
+            .await
+            .expect("Answer feedback");
+        assert_eq!(response.feedback_id, request.feedback_id);
+        assert_eq!(response.request_id, request.request_id);
+        assert_eq!(
+            response.effect,
+            mcp_types::AnswerFeedbackEffectV1::RecordedOnly
+        );
+        let requests = server.await.expect("feedback server task");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /api/v1/answers/feedback "));
+    }
+
+    #[tokio::test]
+    async fn answer_feedback_does_not_retry_or_accept_identity_drift() {
+        let request = answer_feedback_request();
+        let mut drifted = answer_feedback_response(&request);
+        drifted["feedback_id"] = serde_json::json!(Uuid::from_u128(99));
+        let (client, server) = client_with_http_sequence(vec![(
+            "200 OK",
+            serde_json::json!({
+                "success": true,
+                "data": drifted,
+                "metadata": {
+                    "request_id": "feedback-envelope-id",
+                    "timestamp": "2026-09-02T00:01:00Z",
+                    "duration_ms": 3,
+                    "version": "v1"
+                }
+            })
+            .to_string(),
+        )])
+        .await;
+
+        let result = client.answer_feedback(request).await;
+        assert!(matches!(result, Err(Error::Validation(_))));
+        let requests = server.await.expect("feedback drift server task");
+        assert_eq!(requests.len(), 1);
+    }
+
     #[tokio::test]
     async fn flash_get_forwards_same_instruction_session_project_switch() {
         let (client, server) = client_with_http_sequence(vec![
@@ -23552,12 +23953,12 @@ mod tests {
             })
             .unwrap_or_default();
 
-        // Canonical catalog: 22 tools (coordination added in v0.5.93, feed
-        // added with Context Feeds).
+        // Canonical catalog: 23 tools (including Context Feeds and Answer).
         // Aliases atlas_chart / atlas_job remain accepted at call-time for
         // back-compat but are intentionally absent. The dropped `ram` alias
         // must NOT reappear.
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 23);
+        assert!(names.contains(&"answer"));
         assert!(names.contains(&"instruct"));
         assert!(names.contains(&"skill"));
         assert!(names.contains(&"capsule"));

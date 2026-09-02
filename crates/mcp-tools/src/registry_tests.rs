@@ -715,6 +715,7 @@ mod constants_tests {
         assert!(LIGHT_TOOLS.contains(&"context"));
         assert!(LIGHT_TOOLS.contains(&"session"));
         assert!(LIGHT_TOOLS.contains(&"search"));
+        assert!(LIGHT_TOOLS.contains(&"answer"));
     }
 
     #[test]
@@ -746,6 +747,7 @@ mod constants_tests {
         assert!(CONSOLIDATED_TOOLS.contains(&"context"));
         assert!(CONSOLIDATED_TOOLS.contains(&"session"));
         assert!(CONSOLIDATED_TOOLS.contains(&"search"));
+        assert!(CONSOLIDATED_TOOLS.contains(&"answer"));
         assert!(CONSOLIDATED_TOOLS.contains(&"memory"));
         assert!(CONSOLIDATED_TOOLS.contains(&"graph"));
         assert!(CONSOLIDATED_TOOLS.contains(&"workspace"));
@@ -762,6 +764,7 @@ mod constants_tests {
         assert!(CORE_BUNDLE.contains(&"context"));
         assert!(CORE_BUNDLE.contains(&"session"));
         assert!(CORE_BUNDLE.contains(&"search"));
+        assert!(CORE_BUNDLE.contains(&"answer"));
         assert!(CORE_BUNDLE.contains(&"help"));
     }
 }
@@ -1052,9 +1055,43 @@ fn test_discovery_hints_graph_code_health_keywords() {
 }
 
 #[test]
+fn test_discovery_hints_answer_recent_changes_and_safety() {
+    use mcp_types::tool::{ToolAnnotations, ToolCategory, ToolMetadata};
+
+    let metadata = ToolMetadata {
+        name: "answer".to_string(),
+        title: "Natural-Language Answer".to_string(),
+        description: "Answer authorized context questions".to_string(),
+        category: ToolCategory::Ai,
+        annotations: ToolAnnotations::default(),
+        is_pro: false,
+        required_tier: None,
+    };
+    let hints = discovery_hints("answer", &metadata);
+    assert!(hints.aliases.contains(&"what changed recently"));
+    assert!(hints.tags.contains(&"current truth"));
+    assert!(hints.tags.contains(&"cross-workspace"));
+    assert!(hints.tags.contains(&"receipt"));
+    assert!(hints.tags.contains(&"feedback"));
+    assert!(hints.avoid_when.contains("Do not retry"));
+    assert!(hints.avoid_when.contains("recorded_only"));
+    assert!(!hints.parallel_safe);
+    assert!(!hints.batch_safe);
+}
+
+#[test]
 fn test_capsule_is_direct_on_openai_surface_but_not_in_light_toolset() {
     assert!(!LIGHT_TOOLS.contains(&"capsule"));
     assert!(OPENAI_AGENTIC_CORE_TOOLS.contains(&"capsule"));
+}
+
+#[test]
+fn test_answer_is_direct_on_primary_agent_surfaces() {
+    assert!(LIGHT_TOOLS.contains(&"answer"));
+    assert!(OPENAI_AGENTIC_CORE_TOOLS.contains(&"answer"));
+    assert!(CONSOLIDATED_TOOLS.contains(&"answer"));
+    assert!(CORE_BUNDLE.contains(&"answer"));
+    assert!(TOOL_BUNDLES["core"].contains(&"answer"));
 }
 
 #[test]

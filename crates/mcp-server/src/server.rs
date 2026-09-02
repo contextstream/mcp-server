@@ -78,6 +78,7 @@ pub fn build_registry(
         session.clone(),
         index_keeper,
     );
+    domains::answer::register_answer_tools(&mut registry, client.clone());
     domains::memory::register_memory_tools(&mut registry, client.clone(), session.clone());
     domains::graph::register_graph_tools(&mut registry, client.clone(), session.clone());
     domains::workspace::register_workspace_tools(&mut registry, client.clone());
@@ -2336,6 +2337,7 @@ mod tests {
     }
 
     const V0_5_62_BROAD_TOOL_NAMES: &[&str] = &[
+        "answer",
         "capsule",
         "capture_plan",
         "context",
@@ -2377,6 +2379,7 @@ mod tests {
     const V0_5_62_ROUTER_TOOL_NAMES: &[&str] = &["execute_operation", "operations"];
 
     const V0_5_62_OPENAI_AGENTIC_TOOL_NAMES: &[&str] = &[
+        "answer",
         "batch_operations",
         "capsule",
         "context",
@@ -2401,6 +2404,10 @@ mod tests {
     // baseline; entries intentionally advance when an additive, versioned
     // input capability is added.
     const EXPECTED_BROAD_SCHEMA_CONTRACTS: &[(&str, &str)] = &[
+        (
+            "answer",
+            "47f91fa2cab8d8769f4940a23a714965f3abfbe9abf032237adb1b2fdec43f6a",
+        ),
         (
             "capsule",
             "c680655059bf1f41e916674fe9610f1e6947f7fdda1a833ac9624770eb6b015a",

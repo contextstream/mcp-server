@@ -120,6 +120,12 @@ fn acceleration_observation_action(name: &str, input: &Value) -> Option<&'static
         "search_semantic" => Some("semantic"),
         "search_hybrid" => Some("hybrid"),
         "search_keyword" => Some("keyword"),
+        "answer" => Some(match input_action(input) {
+            Some("recent_changes") => "recent_changes",
+            Some("receipt") => "receipt",
+            Some("feedback") => "feedback",
+            _ => "query",
+        }),
         "session_recall" => Some("recall"),
         "memory_search" => Some("search"),
         "session" => match input_action(input) {
@@ -282,6 +288,7 @@ fn acceleration_observation_request(
         "search_semantic" => "search_semantic",
         "search_hybrid" => "search_hybrid",
         "search_keyword" => "search_keyword",
+        "answer" => "answer",
         "session_recall" => "session_recall",
         "memory_search" => "memory_search",
         "session" => "session",
@@ -1514,6 +1521,35 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
             parallel_safe: true,
             batch_safe: true,
         },
+        "answer" => DiscoveryHints {
+            aliases: &[
+                "ask contextstream",
+                "natural language context query",
+                "what changed recently",
+                "recover answer receipt",
+                "answer feedback",
+            ],
+            tags: &[
+                "answer",
+                "current truth",
+                "recent changes",
+                "cross-workspace",
+                "evidence",
+                "receipt",
+                "feedback",
+            ],
+            when_to_use: "Synthesize one evidence-backed answer across the caller's authorized ContextStream knowledge, recover a durable Answer receipt without replay, or record explicit receipt-bound feedback.",
+            avoid_when: "Do not use for exact code/file discovery; use search. Do not retry a failed query, receipt, or feedback transport automatically; feedback acknowledgement means recorded_only.",
+            examples: &[
+                "what changed recently across my team's workspaces?",
+                "what is the current truth about our rollout?",
+                "recover the durable result for this Answer request ID",
+                "record that this Answer cited the wrong project",
+            ],
+            latency_class: "medium",
+            parallel_safe: false,
+            batch_safe: false,
+        },
         "memory" => DiscoveryHints {
             aliases: &[
                 "notes",
@@ -1818,6 +1854,8 @@ const LIGHT_TOOLS: &[&str] = &[
     "session_recall",
     // Search
     "search",
+    // Natural-language context answers
+    "answer",
     // Memory
     "memory",
     "memory_search",
@@ -1913,6 +1951,7 @@ const OPENAI_AGENTIC_CORE_TOOLS: &[&str] = &[
     "session",
     "instruct",
     "search",
+    "answer",
     "memory",
     "media",
     // Capsule creation must remain directly reachable on compact OpenAI/Codex
@@ -1935,6 +1974,7 @@ const CONSOLIDATED_TOOLS: &[&str] = &[
     "session",
     "instruct",
     "search",
+    "answer",
     "memory",
     "graph",
     "workspace",
@@ -1993,6 +2033,7 @@ const CORE_BUNDLE: &[&str] = &[
     "session",
     "instruct",
     "search",
+    "answer",
     "help",
     "generate_rules",
     "memory",
@@ -2002,7 +2043,7 @@ const CORE_BUNDLE: &[&str] = &[
 
 /// Tool bundles for progressive disclosure
 static TOOL_BUNDLES: phf::Map<&'static str, &'static [&'static str]> = phf::phf_map! {
-    "core" => &["init", "context", "session", "search", "help", "generate_rules", "media", "coordination"],
+    "core" => &["init", "context", "session", "search", "answer", "help", "generate_rules", "media", "coordination"],
     "session" => &["session_capture", "session_recall", "session_compress", "instruct"],
     "memory" => &["memory", "memory_search", "memory_decisions", "memory_timeline", "memory_create_node"],
     "search" => &["search", "search_semantic", "search_hybrid", "search_keyword"],

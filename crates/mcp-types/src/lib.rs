@@ -9,6 +9,7 @@
 pub mod acceleration_layer;
 pub mod account_mode;
 pub mod agentic;
+pub mod answer;
 pub mod api;
 pub mod atlas_layer;
 pub mod config;
@@ -29,6 +30,7 @@ pub use account_mode::{
     TeamDiscussion, TeamPriorityItem, TranscriptTopicSignal,
 };
 pub use agentic::{ComplianceEventRecorded, ComplianceEventRequest, RUNTIME_CONTEXTSTREAM_MCP};
+pub use answer::*;
 pub use atlas_layer::{
     noop_layer, AtlasArchiveError, AtlasArchiveHit, AtlasArchiveProvider, AtlasArchiveScope,
     AtlasFederationError, AtlasFederationProvider, AtlasFederationScope, AtlasLayer,

@@ -90,6 +90,7 @@ pub fn build_registry(
     domains::vcs::register_vcs_tools(&mut registry, client.clone());
     domains::reminder::register_reminder_tools(&mut registry, client.clone());
     domains::coordination::register_coordination_tools(&mut registry, client.clone());
+    domains::feed::register_feed_tools(&mut registry, client.clone(), session.clone());
     // Phase 1-3 taxonomy expansion: unified entity CRUD across tickets,
     // handoffs, backlog_views, incidents, releases, experiments, goals,
     // key_results, sprints, reviews, risks.
@@ -222,6 +223,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "reminder" => "Setting reminder in ContextStream".to_string(),
         "integration" => "Updating ContextStream integration".to_string(),
         "vcs" => "Linking VCS with ContextStream".to_string(),
+        "feed" => "Updating ContextStream feed".to_string(),
         "qa" => "Asking ContextStream Q&A".to_string(),
         "project" => "Updating ContextStream project".to_string(),
         "workspace" => "Updating ContextStream workspace".to_string(),
@@ -258,6 +260,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "reminder" => "Reminder saved to ContextStream".to_string(),
         "integration" => "ContextStream integration updated".to_string(),
         "vcs" => "VCS linked with ContextStream".to_string(),
+        "feed" => "ContextStream feed updated".to_string(),
         "qa" => "ContextStream Q&A complete".to_string(),
         "project" => "ContextStream project updated".to_string(),
         "workspace" => "ContextStream workspace updated".to_string(),
@@ -431,6 +434,26 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "get": "Loading ContextStream VCS link",
             "search": "Searching VCS in ContextStream",
             "sync": "Syncing VCS with ContextStream"
+        });
+    } else if name == "feed" {
+        metadata["actions"] = serde_json::json!({
+            "list": "Listing ContextStream feeds",
+            "ensure": "Preparing ContextStream feed",
+            "get": "Loading ContextStream feed",
+            "update": "Updating ContextStream feed",
+            "archive": "Archiving ContextStream feed",
+            "items": "Reading ContextStream feed",
+            "post": "Posting to ContextStream feed",
+            "follow": "Following ContextStream feed",
+            "unfollow": "Unfollowing ContextStream feed",
+            "read": "Marking ContextStream feed read",
+            "share": "Sharing ContextStream feed",
+            "unshare": "Revoking ContextStream feed share",
+            "feedback": "Rating ContextStream feed item",
+            "curate": "Curating ContextStream feed",
+            "runs": "Listing ContextStream feed runs",
+            "sources": "Updating ContextStream feed sources",
+            "ground": "Grounding from ContextStream feeds"
         });
     } else if name == "instruct" {
         metadata["actions"] = serde_json::json!({
@@ -2318,6 +2341,7 @@ mod tests {
         "context",
         "coordination",
         "entity",
+        "feed",
         "graph",
         "help",
         "init",
@@ -2394,12 +2418,18 @@ mod tests {
             "8d09ed3df23786cc510692f6d7be167c1836a2b52873f9ce7dc232870d52f0a9",
         ),
         (
+            "feed",
+            "41f7667c0adebc364cc56192933d2fa0384bad6d536b820fdf9955ccaeac5252",
+        ),
+        (
             "graph",
             "8badfe1e6b204a8ece5fc2f664aaa25a05c035841faf4dce63e2c49e5e742f76",
         ),
         (
+            // Advanced when the `feeds` bundle joined the `bundle` enum
+            // (additive; every earlier value is still accepted).
             "help",
-            "a74422b93ba5f0b6c7119bb62e601bcab5951f6a6a7c69d80d9a672c9b7aaaf3",
+            "77a129e3b652ddd319ebf992d5230bda949823b50f1d075936a0197190fe09cf",
         ),
         (
             "init",
@@ -2729,6 +2759,7 @@ mod tests {
         for name in [
             "capsule",
             "entity",
+            "feed",
             "integration",
             "memory",
             "media",
@@ -3565,6 +3596,7 @@ mod tests {
             "reminder",
             "integration",
             "vcs",
+            "feed",
             "qa",
             "project",
             "workspace",

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Added the `feed` tool for ContextStream Context Feeds (list, ensure, get,
+  update, archive, items, post, follow, unfollow, read, share, unshare,
+  feedback, curate, runs, sources, ground) with a `feeds` bundle, typed
+  client methods, and `[FEED]` lines plus structured `feed_items` in
+  `session(action="ground")`. Feeds require a ContextStream deployment with
+  `CONTEXTSTREAM_FEEDS_API_ENABLED`; the tool reports when the API is absent.
+
 ## 1.0.0
 
 - Replaced the legacy TypeScript implementation with the canonical Rust MCP

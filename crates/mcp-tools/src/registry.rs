@@ -166,6 +166,13 @@ fn acceleration_observation_action(name: &str, input: &Value) -> Option<&'static
             Some("inbox") | Some("list") | Some("get") | Some("settings") => Some("list"),
             _ => None,
         },
+        "feed" => match input_action(input) {
+            Some("list") | Some("get") | Some("items") | Some("runs") | Some("sources") => {
+                Some("list")
+            }
+            Some("ground") => Some("ground"),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1744,6 +1751,29 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
             parallel_safe: false,
             batch_safe: false,
         },
+        "feed" => DiscoveryHints {
+            aliases: &[
+                "context feed",
+                "context feeds",
+                "activity feed",
+                "what changed",
+                "workspace digest",
+                "project digest",
+                "post to feed",
+            ],
+            tags: &["feed", "digest", "activity", "curation", "grounding", "share"],
+            when_to_use: "Read curated workspace/project/topic activity (what changed and why it matters), post agent findings, follow or share feeds, tune sources, and trigger curation.",
+            avoid_when: "Do not use for durable notes or docs (memory), live agent notices (coordination), or ownership transfer (entity handoff).",
+            examples: &[
+                "what changed in this project this week",
+                "show unread items in the engineering feed",
+                "post these findings to the workspace feed",
+                "share this feed with the platform workspace",
+            ],
+            latency_class: "fast",
+            parallel_safe: false,
+            batch_safe: false,
+        },
         _ => DiscoveryHints {
             aliases: &[],
             tags: default_category_tags(metadata.category),
@@ -1824,6 +1854,8 @@ const STANDARD_TOOLS: &[&str] = &[
     "reminders_list",
     "reminders_active",
     "coordination",
+    // Context Feeds
+    "feed",
     // Integrations
     "integration",
     // Media
@@ -1913,6 +1945,7 @@ const CONSOLIDATED_TOOLS: &[&str] = &[
     "integration",
     "reminder",
     "coordination",
+    "feed",
     "media",
     "skill",
     "capsule",
@@ -1977,6 +2010,7 @@ static TOOL_BUNDLES: phf::Map<&'static str, &'static [&'static str]> = phf::phf_
     "media" => &["media"],
     "reminders" => &["reminders", "reminders_create", "reminders_list", "reminders_active"],
     "integrations" => &["github", "slack", "notion", "linear", "jira", "figma"],
+    "feeds" => &["feed"],
 };
 
 #[cfg(test)]

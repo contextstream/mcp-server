@@ -29,6 +29,7 @@ pub use client::SessionRefreshHook;
 pub use client::MEDIA_INDEX_MAX_BYTES;
 pub use client::{
     entity_kind_to_path,
+    feed_source_key,
     infer_memory_query_node_type,
     // Workspace params
     BootstrapWorkspaceParams,
@@ -69,6 +70,15 @@ pub use client::{
     // Help params
     EditorRulesParams,
     ExportSkillParams,
+    // Context Feed params
+    FeedCreateParams,
+    FeedFollowParams,
+    FeedItemsParams,
+    FeedListParams,
+    FeedPostParams,
+    FeedShareParams,
+    FeedSourceParams,
+    FeedUpdateParams,
     FlashAckParams,
     FlashBootstrapParams,
     FlashCheckpointParams,
@@ -161,6 +171,9 @@ pub use client::{
     UpdateSkillParams,
     UpdateTaskParams,
     UpdateTodoParams,
+    FEED_CHANGES_MAX_PAGE_SIZE,
+    FEED_GROUNDING_MAX_ITEMS,
+    FEED_MAX_PAGE_SIZE,
     VALID_ENTITY_KINDS,
 };
 pub use client::{

@@ -14303,6 +14303,9 @@ async fn consume_grounding_session(session: &Arc<SessionManager>) {
     }
 }
 
+/// Upper bound on the Context Feeds grounding read inside `session(ground)`.
+const FEED_GROUNDING_TIMEOUT_MS: u64 = 2_000;
+
 /// One-shot grounding bundle: recall + doc/decision augmentations + lessons + skills + git.
 async fn execute_session_ground(
     client: &ContextStreamClient,
@@ -14469,6 +14472,29 @@ async fn execute_session_ground(
             text.push('\n');
         }
     }
+    // Context Feeds grounding. Fail-open: a disabled feature gate, an error,
+    // or a slow backend simply yields no [FEED] lines.
+    let feed_items = match scope.workspace_id {
+        Some(workspace_id) => match tokio::time::timeout(
+            std::time::Duration::from_millis(FEED_GROUNDING_TIMEOUT_MS),
+            client.feed_ground(
+                workspace_id,
+                scope.project_id,
+                Some(crate::domains::feed::GROUNDING_MAX_ITEMS as u16),
+                Some(user_message),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(payload)) => crate::domains::feed::grounding_items(&payload),
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    if !feed_items.is_empty() {
+        text.push_str(&crate::domains::feed::format_feed_grounding(&feed_items));
+        text.push('\n');
+    }
     text.push_str(&crate::domains::grounding::format_grounding_block(
         &hits, false,
     ));
@@ -14491,7 +14517,7 @@ async fn execute_session_ground(
         ));
     }
     text.push_str(
-        "\nStructured fields: `lessons`, `skills`, `recent_media`, `recall`, `grounding_hits`.\n",
+        "\nStructured fields: `lessons`, `skills`, `recent_media`, `recall`, `grounding_hits`, `feed_items`.\n",
     );
     if let Some(note) = git_note {
         text.push_str(&note);
@@ -14510,6 +14536,7 @@ async fn execute_session_ground(
         "skills": skills,
         "recent_media": recent_media,
         "grounding_hits": serde_json::to_value(&hits).unwrap_or_else(|_| serde_json::json!([])),
+        "feed_items": feed_items,
     });
 
     if let Some(ref p) = fp {

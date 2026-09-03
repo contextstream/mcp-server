@@ -189,6 +189,13 @@ pub use ingest_guard::{
     IngestRootRejection, IngestRootRejectionReason, ALLOW_BROAD_INGEST_ENV, SENSITIVE_DIR_NAMES,
 };
 pub use mcp_types::agentic::{ComplianceEventRecorded, ComplianceEventRequest};
+pub use mcp_types::answer::{
+    AnswerContextScopeV1, AnswerFeedbackEffectV1, AnswerFeedbackRequestV1,
+    AnswerFeedbackResponseV1, AnswerFeedbackSchemaVersionV1, AnswerFeedbackSignalV1,
+    AnswerFeedbackStatusV1, AnswerFeedbackTargetV1, AnswerLatencyBudgetRequestV1,
+    AnswerPlanClientContextV1, AnswerRequestV1, AnswerResponseBudgetRequestV1,
+    AnswerResponseModeV1, AnswerResponseV1, AnswerScopeModeV1, AnswerVisibilityV1,
+};
 pub use parity::{
     normalize_decisions_envelope, CreateDecisionParams, CreateLessonParams, DecisionActionParams,
     ListDecisionsParams, ListLessonsParams, UpdateLessonParams, DECISION_ACTIONS,

@@ -15,7 +15,7 @@ use crate::registry::ToolHandler;
 use crate::schema::SchemaBuilder;
 
 const VALID_ACTIONS: &[&str] = &[
-    "check_in", "inbox", "list", "get", "share", "ack", "dismiss", "settings",
+    "check_in", "inbox", "list", "get", "share", "ack", "reply", "dismiss", "settings",
 ];
 
 /// Coordination item kinds accepted by `POST /coordinations`. Validated
@@ -52,6 +52,10 @@ pub struct CoordinationInput {
     pub target_project_ids: Option<Vec<String>>,
     pub enabled: Option<bool>,
     pub limit: Option<i64>,
+    /// Reply text for action=reply.
+    pub message: Option<String>,
+    /// Presence metadata for check_in, e.g. {"git": {"branch", "commit"}}.
+    pub metadata: Option<Value>,
 }
 
 pub struct CoordinationTool {
@@ -108,6 +112,7 @@ impl ToolHandler for CoordinationTool {
                         project_id,
                         &session_id,
                         input.task_summary.as_deref(),
+                        input.metadata.as_ref(),
                     )
                     .await?;
                 Ok(ToolResult::with_structured(
@@ -192,6 +197,25 @@ impl ToolHandler for CoordinationTool {
                     result,
                 ))
             }
+            "reply" => {
+                let notice_id = input
+                    .notice_id
+                    .or(input.id)
+                    .ok_or_else(|| Error::Validation("notice_id is required for reply".into()))?;
+                let uuid = Uuid::parse_str(&notice_id)
+                    .map_err(|_| Error::Validation("Invalid notice_id".into()))?;
+                let message = input
+                    .message
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .ok_or_else(|| Error::Validation("message is required for reply".into()))?;
+                let result = self.client.reply_coordination_notice(uuid, message).await?;
+                Ok(ToolResult::with_structured(
+                    format_reply(&result, &notice_id),
+                    result,
+                ))
+            }
             "dismiss" => {
                 let notice_id = input
                     .notice_id
@@ -237,8 +261,11 @@ impl ToolHandler for CoordinationTool {
                 coordination items when knowledge from one workspace/project is needed \
                 in another. Distinct from handoffs (ownership transfer) and capsules \
                 (portable bundles). Actions: check_in, inbox/list, get, share, ack, \
-                dismiss, settings. context() and init() already heartbeat presence. \
-                When [COORDINATION] appears, read it before continuing and ack after use."
+                reply, dismiss, settings. context() and init() already heartbeat presence. \
+                When [COORDINATION] appears, read it before continuing and ack after use. \
+                A (blocking) notice is a direct conflict with another session: read it \
+                before continuing, then ack or reply (action=reply, notice_id, message) so \
+                the other session sees your answer on its next turn."
                 .to_string(),
             category: ToolCategory::Memory,
             annotations: ToolAnnotations::destructive(),
@@ -259,8 +286,18 @@ impl ToolHandler for CoordinationTool {
             .uuid("project_id", "Project ID. Defaults to active scope.", false)
             .string("session_id", "Live session id for check_in / inbox.", false)
             .string("task_summary", "What this agent is working on.", false)
+            .object(
+                "metadata",
+                "Presence metadata for check_in shown to the judge as evidence, e.g. {\"git\": {\"branch\": \"...\", \"commit\": \"...\"}}.",
+                false,
+            )
             .string("id", "Coordination item id for get.", false)
-            .string("notice_id", "Notice id for ack / dismiss.", false)
+            .string("notice_id", "Notice id for ack / reply / dismiss.", false)
+            .string(
+                "message",
+                "Reply text for action=reply; delivered to the session that raised the notice.",
+                false,
+            )
             .string("title", "Title when sharing an item.", false)
             .string("summary", "Short summary of the shared knowledge.", false)
             .string(
@@ -438,6 +475,25 @@ fn format_item(result: &Value, id: &str) -> String {
     format!("Coordination item {id} ({kind}): {title}")
 }
 
+fn format_reply(result: &Value, notice_id: &str) -> String {
+    let payload = result.get("data").unwrap_or(result);
+    let created = payload
+        .get("created")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let to_session = payload
+        .pointer("/notice/to_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("the origin session");
+    if created {
+        format!(
+            "Replied to coordination notice {notice_id}; {to_session} sees it on its next turn. The original notice is still open — ack it when you are done."
+        )
+    } else {
+        format!("An identical reply to coordination notice {notice_id} already exists; nothing new was sent.")
+    }
+}
+
 fn format_notice(result: &Value, id: &str) -> String {
     let payload = result.get("data").unwrap_or(result);
     let reason = payload
@@ -552,6 +608,17 @@ mod tests {
         let err = validate_kind(Some("knowledge")).unwrap_err().to_string();
         assert!(err.contains("Invalid coordination kind"));
         assert!(err.contains("handoff"));
+    }
+
+    #[test]
+    fn reply_text_names_the_origin_session_and_dedup_outcome() {
+        let created = json!({"data": {"created": true, "notice": {"to_session_id": "origin-1"}, "reply_to": "n1"}});
+        let text = format_reply(&created, "n1");
+        assert!(text.contains("Replied to coordination notice n1"));
+        assert!(text.contains("origin-1 sees it on its next turn"));
+        let duplicate = json!({"created": false, "notice": {"to_session_id": "origin-1"}});
+        assert!(format_reply(&duplicate, "n1").contains("already exists"));
+        assert!(VALID_ACTIONS.contains(&"reply"));
     }
 
     #[test]

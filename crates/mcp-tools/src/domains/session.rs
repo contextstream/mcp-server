@@ -6450,6 +6450,7 @@ fn spawn_coordination_check_in(
                         project_id,
                         &session_id,
                         task_summary.as_deref(),
+                        None,
                     )
                     .await
             },

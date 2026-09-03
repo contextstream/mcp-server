@@ -13816,6 +13816,7 @@ impl ContextStreamClient {
         project_id: Option<Uuid>,
         session_id: &str,
         task_summary: Option<&str>,
+        metadata: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value> {
         let config = self.config.read().await;
         let ws_id = workspace_id.or(config.default_workspace_id);
@@ -13833,6 +13834,11 @@ impl ContextStreamClient {
         if let Some(summary) = task_summary {
             body["task_summary"] = serde_json::json!(summary);
         }
+        // Presence metadata (git branch/commit) is evidence for the
+        // coordination judge; only objects are forwarded.
+        if let Some(metadata) = metadata.filter(|value| value.is_object()) {
+            body["metadata"] = metadata.clone();
+        }
         self.post("/coordination/check-in", &body).await
     }
 
@@ -13847,6 +13853,19 @@ impl ContextStreamClient {
     pub async fn get_coordination_notice(&self, notice_id: Uuid) -> Result<serde_json::Value> {
         self.get(&format!("/coordination/notices/{}", notice_id))
             .await
+    }
+
+    /// Answer a coordination notice back to the session that raised it.
+    pub async fn reply_coordination_notice(
+        &self,
+        notice_id: Uuid,
+        message: &str,
+    ) -> Result<serde_json::Value> {
+        self.post(
+            &format!("/coordination/notices/{}/reply", notice_id),
+            &serde_json::json!({ "message": message }),
+        )
+        .await
     }
 
     pub async fn ack_coordination_notice(&self, notice_id: Uuid) -> Result<serde_json::Value> {

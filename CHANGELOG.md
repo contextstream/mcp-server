@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Decision conflicts: the API flags a decision capture that overlaps another
+  session's recent decision on the same subject (`possible_conflicts`, either
+  direction). `[DECISIONS]` / `[RECENT_DECISIONS]` lines carry a
+  `⚠️ possible conflict with "…"` note plus a `[DECISION_CONFLICT]` rule,
+  `[GROUNDING]` hits get a `conflict-check` label and a `DECISION_CONFLICT`
+  line naming the other decision, the session-start and subagent-start
+  briefings show the note, and `session(action="capture")` announces it so
+  the agent confirms with the user which decision stands and supersedes the
+  other. Older API builds render nothing extra.
+- Coordination v2: `coordination(action="reply", notice_id, message)` answers
+  a notice back to the session that raised it (identical replies dedup;
+  fan-in and ended-session notices have no origin and are reported as "ack or
+  dismiss instead"); `check_in` forwards an optional `metadata` object (git
+  branch/commit) as presence metadata the coordination judge sees as
+  evidence; a `(blocking)` notice is a direct conflict with another session,
+  to be read before continuing and then acked or replied to.
+
 - Wave 3b parity: `memory(action="decisions")` requests the typed
   `decisions.v1` envelope (query, category, sort, status, since, offset) and
   renders `[DECISIONS]` / `[DECISION]` lines with status, freshness, category,

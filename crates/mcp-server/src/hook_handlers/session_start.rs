@@ -454,7 +454,10 @@ async fn fetch_initial_context(config: &ApiConfig) -> Option<String> {
                     .and_then(|t| t.as_str())
                     .unwrap_or("Untitled");
                 let age = super::common::extract_age_suffix(decision, "captured_at");
-                text.push_str(&format!("- **{}**{}\n", title, age));
+                match mcp_tools::domains::grounding::decision_conflict_note(decision) {
+                    Some(note) => text.push_str(&format!("- **{}**{} {}\n", title, age, note)),
+                    None => text.push_str(&format!("- **{}**{}\n", title, age)),
+                }
             }
             sections.push(text);
         }

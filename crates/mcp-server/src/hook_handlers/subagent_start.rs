@@ -381,8 +381,11 @@ async fn fetch_plan_context(config: &ApiConfig) -> Option<String> {
                     .get("content")
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
+                let conflict = mcp_tools::domains::grounding::decision_conflict_note(decision)
+                    .map(|note| format!(" {}", note))
+                    .unwrap_or_default();
                 if content.is_empty() {
-                    text.push_str(&format!("- **{}**\n", title));
+                    text.push_str(&format!("- **{}**{}\n", title, conflict));
                 } else {
                     // Truncate long decision content for context efficiency
                     let truncated = if content.len() > 200 {
@@ -390,7 +393,7 @@ async fn fetch_plan_context(config: &ApiConfig) -> Option<String> {
                     } else {
                         content.to_string()
                     };
-                    text.push_str(&format!("- **{}**: {}\n", title, truncated));
+                    text.push_str(&format!("- **{}**: {}{}\n", title, truncated, conflict));
                 }
             }
             sections.push(text);

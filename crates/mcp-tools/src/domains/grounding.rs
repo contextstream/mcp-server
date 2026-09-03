@@ -38,6 +38,70 @@ pub struct GroundingHit {
     pub historical_status_claim: bool,
     /// Keywords for search/recall tool hints when title is generic.
     pub search_keywords: String,
+    /// Rendered note when the API flagged this decision as overlapping
+    /// another session's decision on the same subject (`possible_conflicts`).
+    pub conflict_note: Option<String>,
+}
+
+/// Appended to a compact decisions block when any entry carries a conflict flag.
+pub const DECISION_CONFLICT_RULE_COMPACT: &str = "\n  [DECISION_CONFLICT] A ⚠️ decision above overlaps another session's decision on the same subject. Do not pick one silently: confirm with the user which stands, then supersede the other (memory(action=\"decisions\") decision actions).";
+/// Verbose form of [`DECISION_CONFLICT_RULE_COMPACT`].
+pub const DECISION_CONFLICT_RULE_VERBOSE: &str = "⚠️ [DECISION_CONFLICT] A decision above overlaps another session's decision on the same subject. Do not pick one silently: confirm with the user which stands, then supersede the other via memory(action=\"decisions\") decision actions.\n";
+
+/// Render the API's `possible_conflicts` flag on a decision-shaped value
+/// (a recent-decision preview, a capture response, or a recall hit whose
+/// `metadata` carries the flag). `None` when there is nothing to warn about.
+pub fn decision_conflict_note(value: &Value) -> Option<String> {
+    let entries = value
+        .get("possible_conflicts")
+        .or_else(|| {
+            value
+                .get("metadata")
+                .and_then(|m| m.get("possible_conflicts"))
+        })
+        .and_then(Value::as_array)?;
+    let notes: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            let summary = entry.get("summary").and_then(Value::as_str)?.trim();
+            if summary.is_empty() {
+                return None;
+            }
+            let relation = entry
+                .get("relation")
+                .and_then(Value::as_str)
+                .filter(|r| !r.trim().is_empty())
+                .unwrap_or("earlier");
+            let mut qualifiers = vec![relation.to_string()];
+            if let Some(age) = entry
+                .get("captured_at")
+                .and_then(Value::as_str)
+                .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+                .map(|ts| age_days(ts.with_timezone(&Utc)))
+            {
+                qualifiers.push(match age {
+                    0 => "today".to_string(),
+                    1 => "1d old".to_string(),
+                    n => format!("{n}d old"),
+                });
+            }
+            Some(format!(
+                "\"{}\" ({})",
+                summary.chars().take(100).collect::<String>(),
+                qualifiers.join(", ")
+            ))
+        })
+        .collect();
+    if notes.is_empty() {
+        return None;
+    }
+    let shown = notes.iter().take(2).cloned().collect::<Vec<_>>().join("; ");
+    let extra = notes.len().saturating_sub(2);
+    Some(if extra > 0 {
+        format!("⚠️ possible conflict with {shown} (+{extra} more) from another session")
+    } else {
+        format!("⚠️ possible conflict with {shown} from another session")
+    })
 }
 
 pub fn grounding_enabled() -> bool {
@@ -359,6 +423,7 @@ pub fn parse_recall_results(recall: &Value) -> Vec<GroundingHit> {
             } else {
                 None
             };
+            let conflict_note = decision_conflict_note(item);
             Some(GroundingHit {
                 kind,
                 title,
@@ -372,6 +437,7 @@ pub fn parse_recall_results(recall: &Value) -> Vec<GroundingHit> {
                 stale,
                 stale_reason,
                 historical_status_claim,
+                conflict_note,
             })
         })
         .collect();
@@ -417,6 +483,9 @@ fn format_hit_label(hit: &GroundingHit) -> String {
     }
     if hit.historical_status_claim {
         append_label_part(&mut prefix, "historical-status");
+    }
+    if hit.conflict_note.is_some() {
+        append_label_part(&mut prefix, "conflict-check");
     }
     if prefix.is_empty() {
         hit.title.chars().take(120).collect()
@@ -582,6 +651,11 @@ pub fn format_grounding_block(hits: &[GroundingHit], compact: bool) -> String {
             } else if hit.stale {
                 out.push_str(" [verify freshness before relying]");
             }
+            if let Some(note) = hit.conflict_note.as_deref() {
+                out.push_str(&format!(
+                    " [DECISION_CONFLICT: {note}; confirm which stands before relying on either]"
+                ));
+            }
         }
         out.push_str("\n  RULE: if a hit answers a question you were about to ask the user (which env? which region? which DB? what's the deadline?), READ IT INSTEAD. Asking the user something a runbook/decision/doc/transcript already records is wasted turns.");
         out.push_str("\n  FRESHNESS: time-sensitive hits marked stale-check are evidence, not current truth; refresh with the suggested tool call before planning or implementing from them.");
@@ -607,6 +681,11 @@ pub fn format_grounding_block(hits: &[GroundingHit], compact: bool) -> String {
                 out.push_str("   ! Superseded: a newer item replaced this one. Use the successor, not this hit.\n");
             } else if hit.stale {
                 out.push_str("   ! Time-sensitive and stale: refresh this source before using it to plan or implement.\n");
+            }
+            if let Some(note) = hit.conflict_note.as_deref() {
+                out.push_str(&format!(
+                    "   ! Decision conflict: {note}. Confirm with the user which decision stands before relying on either; supersede the loser.\n"
+                ));
             }
         }
         out.push_str(
@@ -712,6 +791,70 @@ mod tests {
         let s = format_grounding_block(&hits, true);
         assert!(!s.contains("→ session(action=\"recall\", query=\"Untitled\")"));
         assert!(s.contains("preference"));
+    }
+
+    // The API flags a capture that overlaps another session's recent
+    // decision on the same subject. The note must name the other decision
+    // so the agent can ask the user which one stands.
+    #[test]
+    fn decision_conflict_note_names_the_other_decision() {
+        let preview = json!({
+            "title": "Remove the 9B model and keep only the 27B Qwen lane",
+            "possible_conflicts": [{
+                "id": "decision-earlier-1",
+                "source": "node",
+                "summary": "Fallbacks for everything should always be private Qwen 27B first and then private Qwen 9B",
+                "relation": "earlier",
+                "captured_at": Utc::now().to_rfc3339(),
+                "shared_terms": ["27b", "9b", "qwen"],
+                "overlap": 0.67
+            }]
+        });
+        let note = decision_conflict_note(&preview).expect("conflict note");
+        assert!(note.contains("possible conflict"), "{note}");
+        assert!(note.contains("Fallbacks for everything"), "{note}");
+        assert!(note.contains("earlier"), "{note}");
+        assert!(note.contains("today"), "{note}");
+        assert!(decision_conflict_note(&json!({"title": "clean"})).is_none());
+        assert!(decision_conflict_note(&json!({"possible_conflicts": []})).is_none());
+    }
+
+    #[test]
+    fn recall_hit_with_possible_conflicts_is_labelled_and_explained() {
+        let recall = json!({
+            "results": [{
+                "score": 0.9,
+                "metadata": {
+                    "title": "Remove the 9B model and keep only the 27B Qwen lane",
+                    "event_type": "decision",
+                    "occurred_at": Utc::now().to_rfc3339(),
+                    "possible_conflicts": [{
+                        "id": "decision-earlier-1",
+                        "source": "node",
+                        "summary": "Fallbacks are private Qwen 27B first and then Qwen 9B",
+                        "relation": "earlier",
+                        "captured_at": Utc::now().to_rfc3339(),
+                        "shared_terms": ["27b", "9b", "qwen"],
+                        "overlap": 0.67
+                    }]
+                }
+            }]
+        });
+        let hits = parse_recall_results_normalized(recall);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].conflict_note.is_some());
+        assert!(format_hit_label(&hits[0]).contains("conflict-check"));
+
+        let compact = format_grounding_block(&hits, true);
+        assert!(compact.contains("DECISION_CONFLICT"), "{compact}");
+        assert!(
+            compact.contains("Fallbacks are private Qwen 27B"),
+            "{compact}"
+        );
+
+        let verbose = format_grounding_block(&hits, false);
+        assert!(verbose.contains("Decision conflict"), "{verbose}");
+        assert!(verbose.contains("supersede the loser"), "{verbose}");
     }
 
     #[test]
@@ -927,6 +1070,7 @@ mod tests {
             stale: false,
             stale_reason: None,
             historical_status_claim: false,
+            conflict_note: None,
             search_keywords: "Fix auth".to_string(),
         }];
         let s = format_grounding_block(&hits, true);
@@ -974,6 +1118,7 @@ mod tests {
             stale: false,
             stale_reason: None,
             historical_status_claim: false,
+            conflict_note: None,
             search_keywords: "Prod DB migration runbook".to_string(),
         }];
 

@@ -8579,6 +8579,7 @@ impl ToolHandler for ContextTool {
             // Surface recent decisions from API
             if !result.recent_decisions.is_empty() {
                 text.push_str("\n[DECISIONS]");
+                let mut conflicts_seen = false;
                 for dec in result.recent_decisions.iter().take(5) {
                     let title = dec
                         .get("title")
@@ -8587,6 +8588,13 @@ impl ToolHandler for ContextTool {
                     let content = dec.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     let preview: String = content.chars().take(300).collect();
                     text.push_str(&format!("\n  📋 {}: {}", title, preview));
+                    if let Some(note) = crate::domains::grounding::decision_conflict_note(dec) {
+                        conflicts_seen = true;
+                        text.push_str(&format!(" {}", note));
+                    }
+                }
+                if conflicts_seen {
+                    text.push_str(crate::domains::grounding::DECISION_CONFLICT_RULE_COMPACT);
                 }
             }
 
@@ -8973,6 +8981,7 @@ impl ToolHandler for ContextTool {
             // Surface recent decisions from API
             if !result.recent_decisions.is_empty() {
                 text.push_str("📋 [RECENT_DECISIONS] Relevant past decisions:\n");
+                let mut conflicts_seen = false;
                 for (i, dec) in result.recent_decisions.iter().take(5).enumerate() {
                     let title = dec
                         .get("title")
@@ -8980,7 +8989,22 @@ impl ToolHandler for ContextTool {
                         .unwrap_or("Untitled");
                     let content = dec.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     let preview: String = content.chars().take(500).collect();
-                    text.push_str(&format!("{}. {} — {}\n", i + 1, title, preview));
+                    match crate::domains::grounding::decision_conflict_note(dec) {
+                        Some(note) => {
+                            conflicts_seen = true;
+                            text.push_str(&format!(
+                                "{}. {} — {} {}\n",
+                                i + 1,
+                                title,
+                                preview,
+                                note
+                            ));
+                        }
+                        None => text.push_str(&format!("{}. {} — {}\n", i + 1, title, preview)),
+                    }
+                }
+                if conflicts_seen {
+                    text.push_str(crate::domains::grounding::DECISION_CONFLICT_RULE_VERBOSE);
                 }
                 text.push('\n');
             }
@@ -9374,6 +9398,14 @@ impl ToolHandler for SessionCaptureTool {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
+        // The API flags a decision that overlaps another session's recent
+        // decision on the same subject (metadata.possible_conflicts). Say so
+        // now, while the user is still in the loop, instead of letting two
+        // contradictory decisions coexist silently.
+        let conflict_note = result
+            .get("metadata")
+            .or_else(|| result.get("data").and_then(|d| d.get("metadata")))
+            .and_then(crate::domains::grounding::decision_conflict_note);
         if let Some(obj) = result.as_object_mut() {
             obj.insert(
                 "operation_status".to_string(),
@@ -9382,18 +9414,31 @@ impl ToolHandler for SessionCaptureTool {
                     "state": "completed"
                 }),
             );
+            let announce = match conflict_note.as_deref() {
+                Some(note) => format!(
+                    "Session context saved. {} Confirm with the user which decision stands, then supersede the other (memory(action=\"decisions\") → decision actions).",
+                    note
+                ),
+                None => "Session context saved.".to_string(),
+            };
             obj.insert(
                 "user_visibility_hint".to_string(),
                 serde_json::json!({
-                    "announce_now": "Session context saved.",
+                    "announce_now": announce,
                     "note": "Capture is synchronous and complete when this response is returned."
                 }),
             );
         }
-        let text = format!(
-            "Captured: {} (ID: {}).\nProgress: completed.",
-            input.title, event_id
-        );
+        let text = match conflict_note.as_deref() {
+            Some(note) => format!(
+                "Captured: {} (ID: {}).\nProgress: completed.\n[DECISION_CONFLICT] {} Confirm with the user which decision stands before relying on either; supersede the loser.",
+                input.title, event_id, note
+            ),
+            None => format!(
+                "Captured: {} (ID: {}).\nProgress: completed.",
+                input.title, event_id
+            ),
+        };
         let mut output = ToolResult::with_structured(text, result);
         if let Some(note) = scope.note {
             output = output.with_prefix(format!("{}\n", note));

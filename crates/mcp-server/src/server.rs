@@ -2417,8 +2417,10 @@ mod tests {
             // Advanced in Wave 4b: `kind` became a validated enum
             // (decision|constraint|warning|insight|blocker|request|handoff|note)
             // so an invalid kind fails client-side instead of round-tripping.
+            // Coordination v2: action=reply with `message`, and `metadata`
+            // (git branch/commit) on check_in as judge evidence.
             "coordination",
-            "54c1a6f6df03f8c9d4c78538d7e4d82e24d61219eac2469d4add36ca9305a5ea",
+            "e43264391eb4844f2ee5d0255dae9d9808d290d4fecd3ac13c5427b5af04ddef",
         ),
         (
             "entity",

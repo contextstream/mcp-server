@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT"
@@ -89,12 +89,12 @@ fs2 = "0.4"
 notify = "6"
 
 # Workspace crates
-mcp-types = { version = "=1.0.0", path = "crates/mcp-types" }
-mcp-client = { version = "=1.0.0", path = "crates/mcp-client" }
-mcp-session = { version = "=1.0.0", path = "crates/mcp-session" }
-mcp-tools = { version = "=1.0.0", path = "crates/mcp-tools" }
-mcp-model-registry = { version = "=1.0.0", path = "crates/mcp-model-registry" }
-mcp-acceleration-products = { version = "=1.0.0", path = "crates/mcp-acceleration-products" }
+mcp-types = { version = "=1.0.1", path = "crates/mcp-types" }
+mcp-client = { version = "=1.0.1", path = "crates/mcp-client" }
+mcp-session = { version = "=1.0.1", path = "crates/mcp-session" }
+mcp-tools = { version = "=1.0.1", path = "crates/mcp-tools" }
+mcp-model-registry = { version = "=1.0.1", path = "crates/mcp-model-registry" }
+mcp-acceleration-products = { version = "=1.0.1", path = "crates/mcp-acceleration-products" }
 
 # Testing
 mockall = "0.13"

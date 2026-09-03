@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 1.0.1
+
+- Answer: `answer` actions for query, recent changes, receipt recovery, and
+  feedback against the ContextStream Answer API. Mutations are one-shot with
+  no retry or session-refresh replay; request and receipt identity are
+  validated with strict closed schemas, and recorded-only feedback is
+  reported as such (#83).
 
 - Decision conflicts: the API flags a decision capture that overlaps another
   session's recent decision on the same subject (`possible_conflicts`, either

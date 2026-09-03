@@ -123,7 +123,8 @@ impl Editor {
             HarnessId::OpenCode => Some(Editor::OpenCode),
             HarnessId::ChatGptGateway
             | HarnessId::OpenAiResponses
-            | HarnessId::ContextStreamCli => None,
+            | HarnessId::ContextStreamCli
+            | HarnessId::ContextCode => None,
         }
     }
 
@@ -1043,6 +1044,7 @@ mod tests {
             HarnessId::ChatGptGateway,
             HarnessId::OpenAiResponses,
             HarnessId::ContextStreamCli,
+            HarnessId::ContextCode,
         ] {
             assert_eq!(Editor::from_harness_id(harness), None);
         }

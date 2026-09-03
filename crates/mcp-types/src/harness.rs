@@ -52,6 +52,11 @@ pub enum HarnessId {
     OpenAiResponses,
     #[serde(rename = "contextstream-cli")]
     ContextStreamCli,
+    /// ContextCode — ContextStream's own agent harness (`csc`). Runtime-only:
+    /// it drives the hosted MCP surface directly and receives dynamic guidance
+    /// through tool results rather than installed rules files or hooks.
+    #[serde(rename = "contextcode")]
+    ContextCode,
 }
 
 impl HarnessId {
@@ -71,6 +76,7 @@ impl HarnessId {
         Self::ChatGptGateway,
         Self::OpenAiResponses,
         Self::ContextStreamCli,
+        Self::ContextCode,
     ];
 
     /// Harnesses that the local setup wizard can configure.
@@ -105,6 +111,7 @@ impl HarnessId {
             Self::ChatGptGateway => "chatgpt-gateway",
             Self::OpenAiResponses => "openai-responses",
             Self::ContextStreamCli => "contextstream-cli",
+            Self::ContextCode => "contextcode",
         }
     }
 
@@ -125,6 +132,7 @@ impl HarnessId {
             Self::ChatGptGateway => "ChatGPT Gateway",
             Self::OpenAiResponses => "OpenAI Responses",
             Self::ContextStreamCli => "ContextStream CLI",
+            Self::ContextCode => "ContextCode",
         }
     }
 
@@ -154,6 +162,8 @@ impl HarnessId {
                 Some(Self::OpenAiResponses)
             }
             "contextstream-cli" | "contextstream_cli" | "cli" => Some(Self::ContextStreamCli),
+            "contextcode" | "context-code" | "context_code" | "csc" | "contextcode-cli"
+            | "contextcode-engine" | "contextcode-vscode" => Some(Self::ContextCode),
             _ => None,
         }
     }
@@ -294,6 +304,16 @@ impl HarnessId {
                 TeachingLoadEvidence::BehavioralInference,
             ),
             Self::ContextStreamCli => HarnessProfile::runtime_only(
+                self,
+                McpTransportSupport::LocalAndRemote,
+                TeachingLoadEvidence::BehavioralInference,
+            ),
+            // ContextCode reaches the hosted MCP surface over both transports
+            // and re-reads tool-result guidance every turn, so it gets the
+            // capability-aware (MCP-tools) teaching path instead of the
+            // capability-free unknown-client path. No rules files, hooks, or
+            // hard first-call enforcement are claimed for it.
+            Self::ContextCode => HarnessProfile::runtime_only(
                 self,
                 McpTransportSupport::LocalAndRemote,
                 TeachingLoadEvidence::BehavioralInference,
@@ -633,6 +653,14 @@ mod tests {
             HarnessId::from_client_hint("openai-responses-e2e"),
             Some(HarnessId::OpenAiResponses)
         );
+        assert_eq!(
+            HarnessId::from_client_hint("contextcode-vscode/0.7.156"),
+            Some(HarnessId::ContextCode)
+        );
+        assert_eq!(
+            HarnessId::from_client_hint("csc 0.7"),
+            Some(HarnessId::ContextCode)
+        );
         assert_eq!(HarnessId::from_client_hint("my-cursor-proxy"), None);
         assert_eq!(HarnessId::from_client_hint("claude-code-wrapper"), None);
         assert_eq!(HarnessId::from_client_hint(""), None);
@@ -650,6 +678,24 @@ mod tests {
         assert_eq!(direct, vec![HarnessId::ClaudeCode]);
         assert!(HarnessId::ClaudeCode.profile().hooks.instructions_loaded);
         assert!(!HarnessId::Cursor.profile().hooks.instructions_loaded);
+    }
+
+    #[test]
+    fn contextcode_is_runtime_only_with_real_mcp_transport() {
+        let profile = HarnessId::ContextCode.profile();
+        assert!(!profile.installable);
+        assert!(!HarnessId::INSTALLABLE.contains(&HarnessId::ContextCode));
+        assert_eq!(profile.mcp_support, McpTransportSupport::LocalAndRemote);
+        assert_eq!(profile.rules_format, RulesFormat::None);
+        assert_eq!(profile.hooks, HookCapabilities::none());
+        assert!(!profile.hard_first_call_enforcement);
+        assert_eq!(
+            profile.teaching_load_evidence,
+            TeachingLoadEvidence::BehavioralInference
+        );
+        for alias in ["contextcode", "csc", "context-code", "contextcode-cli"] {
+            assert_eq!(HarnessId::from_alias(alias), Some(HarnessId::ContextCode));
+        }
     }
 
     #[test]

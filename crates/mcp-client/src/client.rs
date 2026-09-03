@@ -2910,7 +2910,7 @@ impl ContextStreamClient {
         );
     }
 
-    fn invalidate_memory_read_caches(&self) {
+    pub(crate) fn invalidate_memory_read_caches(&self) {
         self.invalidate_custom_cache_prefix(MEMORY_SEARCH_CACHE_PREFIX);
         self.invalidate_custom_cache_prefix(SESSION_RECALL_CACHE_PREFIX);
     }
@@ -11389,11 +11389,9 @@ impl ContextStreamClient {
         if let Some(c) = params.min_confidence {
             query_params.push(format!("min_confidence={}", c));
         }
-        let path = if query_params.is_empty() {
-            "/suggested-rules".to_string()
-        } else {
-            format!("/suggested-rules?{}", query_params.join("&"))
-        };
+        // Typed envelope: `source_lesson_ids` per rule plus `native_guidance`.
+        query_params.push("format=envelope".to_string());
+        let path = format!("/suggested-rules?{}", query_params.join("&"));
 
         match self.get::<serde_json::Value>(&path).await {
             Ok(result) => Ok(result),
@@ -18914,7 +18912,7 @@ fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Option<Rate
 /// The API interprets explicit `null` differently from an absent field —
 /// `null` can mean "explicitly unset" while absent falls back to headers/defaults.
 /// TypeScript omits `undefined` values from JSON.stringify; this matches that behavior.
-fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
+pub(crate) fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             serde_json::Value::Object(map.into_iter().filter(|(_, v)| !v.is_null()).collect())
@@ -18944,7 +18942,7 @@ fn project_id_with_default(
     })
 }
 
-fn scope_ids_with_defaults(
+pub(crate) fn scope_ids_with_defaults(
     workspace_id: Option<Uuid>,
     project_id: Option<Uuid>,
     config: &Config,

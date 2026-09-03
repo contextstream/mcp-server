@@ -26,8 +26,13 @@ pub struct GroundingHit {
     pub source_timestamp: Option<DateTime<Utc>>,
     /// Age in whole days at parse time when a source timestamp exists.
     pub age_days: Option<i64>,
-    /// Whether this hit is time-sensitive and older than the local freshness window.
+    /// Whether this hit is time-sensitive and older than the local freshness window,
+    /// or has been superseded by a newer item.
     pub stale: bool,
+    /// Why the hit is stale: `superseded` (a `superseded_by` link or
+    /// `status=superseded`), `historical_status`, or `aged`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
     /// Whether this hit is a prior snapshot/status claim about unfinished or failed work.
     /// These are useful evidence, but must never be treated as current truth without refresh.
     pub historical_status_claim: bool,
@@ -99,6 +104,17 @@ fn original_type(item: &Value) -> Option<String> {
 
 fn event_type(item: &Value) -> Option<String> {
     metadata_str(item, "event_type").map(|s| s.to_ascii_lowercase())
+}
+
+/// A hit whose source carries a `superseded_by` link (or `status=superseded`)
+/// is stale regardless of age: a newer decision/lesson replaced it.
+fn is_superseded(item: &Value) -> bool {
+    if metadata_str(item, "superseded_by").is_some() {
+        return true;
+    }
+    metadata_str(item, "status")
+        .map(|status| status.eq_ignore_ascii_case("superseded"))
+        .unwrap_or(false)
 }
 
 fn metadata_time(item: &Value) -> Option<DateTime<Utc>> {
@@ -332,7 +348,17 @@ pub fn parse_recall_results(recall: &Value) -> Vec<GroundingHit> {
                 .zip(stale_after_days(&kind))
                 .map(|(age, limit)| age > limit)
                 .unwrap_or(false);
-            let stale = historical_status_claim || aged_stale;
+            let superseded = is_superseded(item);
+            let stale = historical_status_claim || aged_stale || superseded;
+            let stale_reason = if superseded {
+                Some("superseded".to_string())
+            } else if historical_status_claim {
+                Some("historical_status".to_string())
+            } else if aged_stale {
+                Some("aged".to_string())
+            } else {
+                None
+            };
             Some(GroundingHit {
                 kind,
                 title,
@@ -344,6 +370,7 @@ pub fn parse_recall_results(recall: &Value) -> Vec<GroundingHit> {
                 source_timestamp,
                 age_days,
                 stale,
+                stale_reason,
                 historical_status_claim,
             })
         })
@@ -384,6 +411,9 @@ fn format_hit_label(hit: &GroundingHit) -> String {
     }
     if hit.stale {
         append_label_part(&mut prefix, "stale-check");
+    }
+    if hit.stale_reason.as_deref() == Some("superseded") {
+        append_label_part(&mut prefix, "superseded");
     }
     if hit.historical_status_claim {
         append_label_part(&mut prefix, "historical-status");
@@ -547,6 +577,8 @@ pub fn format_grounding_block(hits: &[GroundingHit], compact: bool) -> String {
                 out.push_str(
                     " [historical status claim; verify newer work before treating as current]",
                 );
+            } else if hit.stale_reason.as_deref() == Some("superseded") {
+                out.push_str(" [superseded; follow the successor instead]");
             } else if hit.stale {
                 out.push_str(" [verify freshness before relying]");
             }
@@ -571,6 +603,8 @@ pub fn format_grounding_block(hits: &[GroundingHit], compact: bool) -> String {
             ));
             if hit.historical_status_claim {
                 out.push_str("   ! Historical status claim: prior no-output/unexecuted/unanswered evidence only. Verify newer work before treating it as current.\n");
+            } else if hit.stale_reason.as_deref() == Some("superseded") {
+                out.push_str("   ! Superseded: a newer item replaced this one. Use the successor, not this hit.\n");
             } else if hit.stale {
                 out.push_str("   ! Time-sensitive and stale: refresh this source before using it to plan or implement.\n");
             }
@@ -814,6 +848,43 @@ mod tests {
     }
 
     #[test]
+    fn superseded_decision_is_stale_with_reason_even_when_recent() {
+        let today = Utc::now().format("%Y-%m-%dT00:00:00Z").to_string();
+        let recall = json!({
+            "results": [{
+                "score": 0.9,
+                "metadata": {
+                    "title": "Use Postgres for the ledger",
+                    "event_type": "decision",
+                    "occurred_at": today,
+                    "superseded_by": "11111111-1111-4111-8111-111111111111"
+                }
+            }, {
+                "score": 0.8,
+                "id": "22222222-2222-4222-8222-222222222222",
+                "status": "superseded",
+                "metadata": {
+                    "title": "Use Redis for the ledger",
+                    "event_type": "decision",
+                    "occurred_at": today
+                }
+            }]
+        });
+        let hits = parse_recall_results_normalized(recall);
+        assert_eq!(hits.len(), 2);
+        for hit in &hits {
+            assert!(hit.stale, "{hit:?}");
+            assert_eq!(hit.stale_reason.as_deref(), Some("superseded"));
+        }
+        let compact = format_grounding_block(&hits, true);
+        assert!(compact.contains("superseded"));
+        assert!(compact.contains("[superseded; follow the successor instead]"));
+        let serialized = serde_json::to_value(&hits[0]).unwrap();
+        assert_eq!(serialized["stale"], true);
+        assert_eq!(serialized["stale_reason"], "superseded");
+    }
+
+    #[test]
     fn durable_doc_with_old_date_is_not_marked_stale() {
         let recall = json!({
             "results": [{
@@ -854,6 +925,7 @@ mod tests {
             source_timestamp: None,
             age_days: None,
             stale: false,
+            stale_reason: None,
             historical_status_claim: false,
             search_keywords: "Fix auth".to_string(),
         }];
@@ -900,6 +972,7 @@ mod tests {
             source_timestamp: None,
             age_days: None,
             stale: false,
+            stale_reason: None,
             historical_status_claim: false,
             search_keywords: "Prod DB migration runbook".to_string(),
         }];

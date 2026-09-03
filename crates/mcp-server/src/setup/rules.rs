@@ -1410,7 +1410,7 @@ fn generate_bootstrap_rules(editor: &Editor, workspace_name: &str, workspace_id:
 
 **Indexing:** Keep the editor connected to hosted MCP. `project(action="index")` asks the hosted service to refresh the exact registered checkout through ContextStream's managed sync bridge; editor hooks and ContextStream Desktop are additional local-ingest paths. A `requires_sync_bridge` response means the bridge is offline, unregistered, or has no matching checkout — repair setup/bridge health and retry without switching the editor to a local MCP transport. `project(action="ingest_local", path="<folder>")` is an optional direct path only when this process can already read the folder. Check `project(action="index_status")` for checkout-aware freshness.
 
-**Notices:** [GROUNDING] → read ranked prior-work hits before code search and inspect freshness before relying on time-sensitive decisions/transcripts/plans | [GROUNDING_AVAILABLE] → hook reminder that unread grounding exists; inspect source age and refresh stale hits before planning or implementing | [PROJECT_ROUTING] → resolve ambiguous/missing project scope before project-scoped search, indexing, memory, session, skill, or capture writes | [MATCHED_SKILLS] → run surfaced skills before other work | [LESSONS_WARNING] → apply lessons immediately and keep them active for the turn | [COORDINATION] → read shared-awareness notices from other live agents before continuing; ack via `coordination(action="ack")`; do not treat as a handoff | [PREFERENCE] → follow user preferences | [RULES_NOTICE] → run `generate_rules()` | [VERSION_NOTICE/CRITICAL] → tell user about update
+**Notices:** [GROUNDING] → read ranked prior-work hits before code search and inspect freshness before relying on time-sensitive decisions/transcripts/plans | [GROUNDING_AVAILABLE] → hook reminder that unread grounding exists; inspect source age and refresh stale hits before planning or implementing | [PROJECT_ROUTING] → resolve ambiguous/missing project scope before project-scoped search, indexing, memory, session, skill, or capture writes | [MATCHED_SKILLS] → run surfaced skills before other work | [LESSONS_WARNING] → apply lessons immediately and keep them active for the turn | [COORDINATION] → read shared-awareness notices from other live agents before continuing; ack via `coordination(action="ack")`; do not treat as a handoff | [PREFERENCE] → follow user preferences | [RULES_NOTICE] → run `contextstream-mcp update` in a terminal to refresh installed rules (help(action="editor_rules") previews them) | [VERSION_NOTICE/CRITICAL] → tell user about update
 {end}
 "#,
         start = CONTEXTSTREAM_START,
@@ -1473,7 +1473,7 @@ fn generate_minimal_rules(editor: &Editor, workspace_name: &str, workspace_id: &
 - `[MATCHED_SKILLS]` → Run the surfaced skills before other work
 - `[LESSONS_WARNING]` → Apply the lessons shown immediately and keep them active for the current task
 - `[PREFERENCE]` → Follow user preferences exactly
-- `[RULES_NOTICE]` → Run `generate_rules()` to update rules
+- `[RULES_NOTICE]` → Run `contextstream-mcp update` in a terminal to refresh installed rules; `help(action="editor_rules")` previews the content
 - `[VERSION_NOTICE]` → Inform user about available updates
 
 ## System Reminders
@@ -1545,7 +1545,7 @@ fn generate_full_rules(editor: &Editor, workspace_name: &str, workspace_id: &str
 - `[MATCHED_SKILLS]` → Run the surfaced skills before other work
 - `[LESSONS_WARNING]` → Apply the lessons shown immediately and keep them active for the current task
 - `[PREFERENCE]` → Follow user preferences exactly
-- `[RULES_NOTICE]` → Run `generate_rules()` to update rules
+- `[RULES_NOTICE]` → Run `contextstream-mcp update` in a terminal to refresh installed rules; `help(action="editor_rules")` previews the content
 - `[VERSION_NOTICE]` → Inform user about available updates
 
 ## System Reminders

@@ -29,6 +29,9 @@ pub mod vcs;
 pub mod workspace;
 pub mod workspace_drift;
 
+#[cfg(test)]
+mod parity_eval_tests;
+
 // Re-export all domain tools
 pub use atlas_jobs::*;
 pub use capsule::*;

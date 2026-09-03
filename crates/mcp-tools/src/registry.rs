@@ -1825,7 +1825,6 @@ const LIGHT_TOOLS: &[&str] = &[
     // Graph
     "graph",
     "graph_related",
-    "graph_decisions",
     // Project
     "project",
     "projects_list",
@@ -1982,6 +1981,9 @@ const CONSOLIDATED_TOOLS: &[&str] = &[
     "memory_create_todo",
     "memory_complete_todo",
     "memory_create_event",
+    // Read alias for `memory(action="decisions")`; previously registered
+    // but unreachable in consolidated mode.
+    "memory_decisions",
 ];
 
 /// Core bundle (always enabled in progressive mode)

@@ -3186,7 +3186,7 @@ impl ToolHandler for InitTool {
         }
 
         if is_post_compact {
-            let restore_session_id = init_session_id;
+            let restore_session_id = init_session_id.clone();
             let restore = self
                 .client
                 .session_restore_context(SessionRestoreContextParams {
@@ -3220,6 +3220,23 @@ impl ToolHandler for InitTool {
                     text.push_str(&message);
                     result["post_compact_restore_error"] = Value::String(error.to_string());
                 }
+            }
+        }
+
+        // Wave 4b: presence check-in for cross-agent coordination. Best-effort
+        // and spawned; init never waits on it.
+        if let Some(session_id) = init_session_id.clone() {
+            if resolved_workspace_id.is_some() {
+                spawn_coordination_check_in(
+                    &self.client,
+                    resolved_workspace_id,
+                    resolved_project_id,
+                    session_id,
+                    input
+                        .context_hint
+                        .as_deref()
+                        .and_then(coordination_task_summary),
+                );
             }
         }
 
@@ -4116,6 +4133,8 @@ fn estimated_context_tool_wire_tokens(text: &str, structured: &Value) -> usize {
 fn context_wire_text_priority(line: &str) -> Option<u8> {
     let upper = line.to_ascii_uppercase();
     if upper.contains("[LESSONS_WARNING]")
+        || upper.contains("[COORDINATION]")
+        || upper.contains("[PARTIAL]")
         || upper.contains("[PREFERENCE]")
         || upper.contains("[PREFS]")
         || upper.contains("[ACTION_REQUIRED]")
@@ -4966,6 +4985,164 @@ const BOILERPLATE_RULE_PATTERNS: &[&str] = &[
 const BOILERPLATE_OCCURRENCE_THRESHOLD: i32 = 1000;
 const MIN_ACTIONABLE_INSTRUCTION_LEN: usize = 20;
 
+fn suggested_rules_payload(result: &Value) -> &Value {
+    match result.get("data") {
+        Some(data) if data.is_object() => data,
+        _ => result,
+    }
+}
+
+fn suggested_rule_items(result: &Value) -> Vec<Value> {
+    let payload = suggested_rules_payload(result);
+    payload
+        .get("rules")
+        .or_else(|| payload.get("items"))
+        .or_else(|| payload.get("suggested_rules"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn suggested_rules_message(result: &Value) -> Option<&str> {
+    suggested_rules_payload(result)
+        .get("message")
+        .or_else(|| result.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Typed `[SUGGESTED_RULES]` lines for `session(action="list_suggested_rules")`:
+/// one line per rule with its source lesson ids, then the server's native
+/// guidance snippet (an AGENTS.md-ready block) when present.
+pub(crate) fn render_suggested_rules_list(result: &Value) -> String {
+    let rules = suggested_rule_items(result);
+    let payload = suggested_rules_payload(result);
+    let mut text = String::new();
+    if rules.is_empty() {
+        match suggested_rules_message(result) {
+            Some(message) => text.push_str(&format!(
+                "[SUGGESTED_RULES] No pending rule suggestions.\n[PARTIAL] suggested rules: {message}"
+            )),
+            None => text.push_str("[SUGGESTED_RULES] No pending rule suggestions."),
+        }
+        let partial = crate::domains::memory::render_degraded_lines(result);
+        if !partial.is_empty() {
+            text.push('\n');
+            text.push_str(partial.trim_end());
+        }
+        return text;
+    }
+    text.push_str(crate::notices::SUGGESTED_RULES_HEADER);
+    text.push('\n');
+    for rule in rules.iter().take(10) {
+        let instruction = rule
+            .get("instruction")
+            .or_else(|| rule.get("rule"))
+            .and_then(Value::as_str)
+            .unwrap_or("(no instruction)");
+        let category = rule
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("general");
+        let confidence = rule
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .map(|value| format!("{:.0}%", value * 100.0))
+            .unwrap_or_else(|| "n/a".to_string());
+        let seen = rule
+            .get("occurrence_count")
+            .and_then(Value::as_i64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        let id = rule.get("id").and_then(Value::as_str).unwrap_or("unknown");
+        let sources = rule
+            .get("source_lesson_ids")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "none".to_string());
+        text.push_str(&format!(
+            "[SUGGESTED_RULES] [{category}] {instruction} (confidence: {confidence}, seen {seen}x) id={id} source_lesson_ids={sources}\n"
+        ));
+    }
+    if let Some(guidance) = payload
+        .get("native_guidance")
+        .filter(|value| value.is_object())
+    {
+        let heading = guidance
+            .get("heading")
+            .and_then(Value::as_str)
+            .unwrap_or("ContextStream rules");
+        if let Some(snippet) = guidance
+            .get("agents_md_snippet")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            text.push_str(&format!(
+                "[SUGGESTED_RULES] native_guidance heading=\"{heading}\" — paste into the rules file:\n{}\n",
+                snippet.trim_end()
+            ));
+        }
+    }
+    text.push_str(&crate::domains::memory::render_degraded_lines(result));
+    text.trim_end().to_string()
+}
+
+/// Typed line for `session(action="suggested_rule_action")`.
+pub(crate) fn render_suggested_rule_action(rule_id: &Uuid, action: &str, result: &Value) -> String {
+    let payload = suggested_rules_payload(result);
+    let success = payload
+        .get("success")
+        .and_then(Value::as_bool)
+        .or_else(|| payload.get("applied").and_then(Value::as_bool));
+    let mut text = format!(
+        "[SUGGESTED_RULES] action={action} rule_id={rule_id} success={}",
+        success
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    if let Some(status) = payload.get("status").and_then(Value::as_str) {
+        text.push_str(&format!(" status={status}"));
+    }
+    if let Some(message) = suggested_rules_message(result) {
+        if success == Some(false) {
+            text.push_str(&format!("\n[PARTIAL] {message}"));
+        } else {
+            text.push_str(&format!(" — {message}"));
+        }
+    }
+    text
+}
+
+/// Typed line for `session(action="suggested_rules_stats")`.
+pub(crate) fn render_suggested_rules_stats(result: &Value) -> String {
+    let payload = suggested_rules_payload(result);
+    let count = |key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_i64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    };
+    let mut text = format!(
+        "[SUGGESTED_RULES] stats total={} accepted={} rejected={} pending={}",
+        count("total_suggested"),
+        count("accepted"),
+        count("rejected"),
+        count("pending")
+    );
+    if let Some(message) = suggested_rules_message(result) {
+        text.push_str(&format!("\n[PARTIAL] suggested rules: {message}"));
+    }
+    text
+}
+
 fn is_boilerplate_suggested_rule(rule: &mcp_types::api::SuggestedRule) -> bool {
     let category = rule.category.as_deref().unwrap_or("").to_ascii_lowercase();
     if category.is_empty() || category == "general" {
@@ -5500,51 +5677,245 @@ fn format_typed_snapshots(items: &[&SmartContextItem], compact: bool) -> String 
     text
 }
 
-/// Format lesson items (L kind) from typed items, leveraging relevance scoring.
-fn format_typed_lessons(items: &[&SmartContextItem], compact: bool) -> String {
-    if items.is_empty() {
+/// One lesson ready for `[LESSONS_WARNING]` rendering.
+///
+/// `severity` is the *stored* severity (never derived from relevance);
+/// `relevance` is the retrieval score and is shown separately.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct LessonWarningLine {
+    pub title: String,
+    pub guidance: String,
+    pub severity: Option<String>,
+    pub relevance: Option<f32>,
+    pub id: Option<String>,
+    pub superseded: bool,
+}
+
+/// Maximum lessons rendered per `[LESSONS_WARNING]` block.
+pub(crate) const LESSONS_WARNING_MAX: usize = 5;
+
+/// Parse a stored severity out of free-form lesson text
+/// (`**Severity:** high`, `severity: high`, `severity=high`).
+fn severity_from_text(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let idx = lower.find("severity")?;
+    let rest = &lower[idx + "severity".len()..];
+    let rest = rest.trim_start_matches(['*', ':', '=', ' ']);
+    let token: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    match token.as_str() {
+        "low" | "medium" | "high" | "critical" => Some(token),
+        _ => None,
+    }
+}
+
+fn lesson_title_from_value(value: &str) -> String {
+    value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.trim_start_matches('#').trim().to_string())
+        .unwrap_or_else(|| "Untitled lesson".to_string())
+}
+
+fn lesson_guidance_from_value(value: &str) -> String {
+    if let Some(prevention) = extract_markdown_section(value, "Prevention") {
+        return prevention;
+    }
+    let title = lesson_title_from_value(value);
+    let rest: Vec<&str> = value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .skip_while(|line| line.trim_start_matches('#').trim() == title)
+        .filter(|line| !line.to_ascii_lowercase().starts_with("**severity"))
+        .collect();
+    if rest.is_empty() {
+        value.trim().to_string()
+    } else {
+        rest.join(" ")
+    }
+}
+
+/// Typed `L` items from `/context/smart`.
+pub(crate) fn lesson_lines_from_typed(items: &[&SmartContextItem]) -> Vec<LessonWarningLine> {
+    items
+        .iter()
+        .map(|item| LessonWarningLine {
+            title: lesson_title_from_value(&item.value),
+            guidance: lesson_guidance_from_value(&item.value),
+            severity: severity_from_text(&item.value),
+            relevance: Some(item.score),
+            id: item.item_id.map(|id| id.to_string()),
+            superseded: false,
+        })
+        .collect()
+}
+
+/// Legacy flat `lessons` array from `/context/smart`.
+pub(crate) fn lesson_lines_from_api(lessons: &[mcp_types::api::Lesson]) -> Vec<LessonWarningLine> {
+    lessons
+        .iter()
+        .map(|lesson| LessonWarningLine {
+            title: lesson
+                .title
+                .clone()
+                .unwrap_or_else(|| "Untitled".to_string()),
+            guidance: lesson
+                .prevention
+                .clone()
+                .or_else(|| lesson.trigger.clone())
+                .unwrap_or_default(),
+            severity: lesson.severity.clone(),
+            relevance: None,
+            id: None,
+            superseded: false,
+        })
+        .collect()
+}
+
+/// Lesson JSON values from `/lessons`, `/lessons/warnings`, or the events
+/// listing. `/lessons/warnings` items are `{lesson, relevance, reason}`.
+pub(crate) fn lesson_lines_from_values(items: &[Value]) -> Vec<LessonWarningLine> {
+    items
+        .iter()
+        .map(|item| {
+            let (lesson, relevance) = match item.get("lesson") {
+                Some(inner) if inner.is_object() => (
+                    inner,
+                    item.get("relevance")
+                        .and_then(Value::as_f64)
+                        .map(|value| value as f32),
+                ),
+                _ => (
+                    item,
+                    item.get("relevance")
+                        .or_else(|| item.get("score"))
+                        .and_then(Value::as_f64)
+                        .map(|value| value as f32),
+                ),
+            };
+            let stored_severity = lesson
+                .get("severity")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    lesson
+                        .get("metadata")
+                        .and_then(|meta| meta.get("severity"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    lesson
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .and_then(severity_from_text)
+                });
+            LessonWarningLine {
+                title: extract_lesson_title(lesson),
+                guidance: extract_lesson_prevention(lesson)
+                    .or_else(|| {
+                        lesson
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default(),
+                severity: stored_severity,
+                relevance,
+                id: lesson.get("id").and_then(Value::as_str).map(str::to_string),
+                superseded: lesson
+                    .get("superseded_by")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+                    || lesson
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .is_some_and(|status| status.eq_ignore_ascii_case("superseded")),
+            }
+        })
+        .collect()
+}
+
+fn lesson_line_body(line: &LessonWarningLine) -> String {
+    let guidance: String = line
+        .guidance
+        .chars()
+        .take(500)
+        .collect::<String>()
+        .replace('\n', " ");
+    let mut body = line.title.clone();
+    if !guidance.trim().is_empty() && guidance.trim() != line.title.trim() {
+        body.push_str(": ");
+        body.push_str(guidance.trim());
+    }
+    if let Some(id) = line.id.as_deref() {
+        body.push_str(&format!(" id={id}"));
+    }
+    if line.superseded {
+        body.push_str(" [superseded]");
+    }
+    body
+}
+
+/// The single `[LESSONS_WARNING]` renderer used by `context()` and
+/// `session(action="ground")`. Compact mode emits one marker line per lesson
+/// (so wire-budget trimming keeps each one); verbose mode emits a header and
+/// a numbered list. Severity is the stored value; relevance is shown
+/// separately and never converted into a severity.
+pub(crate) fn render_lessons_warning(lines: &[LessonWarningLine], compact: bool) -> String {
+    if lines.is_empty() {
         return String::new();
     }
+    let severity_label = |line: &LessonWarningLine| {
+        line.severity
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "unspecified".to_string())
+    };
+    let relevance_label = |line: &LessonWarningLine| match line.relevance {
+        Some(score) => format!("{score:.2}"),
+        None => "n/a".to_string(),
+    };
     let mut text = String::new();
     if compact {
-        for item in items.iter().take(5) {
-            let severity = if item.score >= 0.8 {
-                "CRIT"
-            } else if item.score >= 0.5 {
-                "HIGH"
-            } else {
-                "note"
-            };
-            let preview: String = item.value.chars().take(500).collect();
+        for line in lines.iter().take(LESSONS_WARNING_MAX) {
             text.push_str(&format!(
-                "\n[LESSONS_WARNING] severity={} relevance={:.2} {}",
-                severity, item.score, preview
+                "\n[LESSONS_WARNING] severity={} relevance={} {}",
+                severity_label(line),
+                relevance_label(line),
+                lesson_line_body(line)
             ));
         }
     } else {
-        text.push_str(
-            "🚨 [LESSONS_WARNING] Apply these lessons before proceeding; keep them active for this task.\n",
-        );
-        for (i, item) in items.iter().take(5).enumerate() {
-            let severity = if item.score >= 0.8 {
-                "🚨"
-            } else if item.score >= 0.5 {
-                "⚠️"
-            } else {
-                "📝"
-            };
-            let preview: String = item.value.chars().take(500).collect();
+        text.push_str("🚨 ");
+        text.push_str(crate::notices::LESSONS_WARNING_HEADER);
+        text.push('\n');
+        for (index, line) in lines.iter().take(LESSONS_WARNING_MAX).enumerate() {
             text.push_str(&format!(
-                "{}. {} {} (relevance: {:.2})\n",
-                i + 1,
-                severity,
-                preview,
-                item.score
+                "{}. [{}] {}",
+                index + 1,
+                severity_label(line).to_ascii_uppercase(),
+                lesson_line_body(line)
             ));
+            if line.relevance.is_some() {
+                text.push_str(&format!(" (relevance: {})", relevance_label(line)));
+            }
+            text.push('\n');
         }
         text.push('\n');
     }
     text
+}
+
+/// Format lesson items (L kind) from typed items through the shared renderer.
+fn format_typed_lessons(items: &[&SmartContextItem], compact: bool) -> String {
+    render_lessons_warning(&lesson_lines_from_typed(items), compact)
 }
 
 /// Check if server-side typed VCS items should supersede client-side VCS context.
@@ -6052,6 +6423,106 @@ where
 /// data in 50 ms — gating `context()`'s response time at p50 700 ms+
 /// despite the Context cache itself hitting in <50 ms. See lesson
 /// `53be7d19` (don't gate hot path on best-effort enrichment).
+/// Best-effort presence heartbeat for cross-agent coordination. Spawned so it
+/// never adds latency to `context()` / `init()`; failures are logged at debug.
+fn spawn_coordination_check_in(
+    client: &ContextStreamClient,
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    session_id: String,
+    task_summary: Option<String>,
+) {
+    let client = client.clone();
+    let session_key = mcp_client::get_task_session_key();
+    let caller_cache_identity = mcp_client::get_task_caller_cache_identity();
+    let auth_override = mcp_client::get_task_auth_override();
+    let config_override = mcp_client::get_task_config_override();
+    tokio::spawn(async move {
+        let result = with_caller_auth(
+            session_key,
+            caller_cache_identity,
+            auth_override,
+            config_override,
+            || async move {
+                client
+                    .coordination_check_in(
+                        workspace_id,
+                        project_id,
+                        &session_id,
+                        task_summary.as_deref(),
+                    )
+                    .await
+            },
+        )
+        .await;
+        if let Err(error) = result {
+            tracing::debug!("coordination check-in skipped: {}", error);
+        }
+    });
+}
+
+/// Short single-line task summary for the coordination check-in.
+fn coordination_task_summary(user_message: &str) -> Option<String> {
+    let collapsed = user_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(collapsed.chars().take(120).collect())
+}
+
+/// Lessons for `session(action="ground")`: typed `/lessons/warnings` first,
+/// events-based `session_get_lessons` when the server answers 404 (recorded
+/// in `degraded` so the text can say `[PARTIAL]`).
+async fn fetch_lessons_for_ground(
+    client: &ContextStreamClient,
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    user_message: &str,
+) -> Result<Value> {
+    match client
+        .lessons_warnings(workspace_id, project_id, user_message, Some(5))
+        .await
+    {
+        Ok(mut payload) => {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "source".to_string(),
+                    Value::String("lessons_warnings".to_string()),
+                );
+            }
+            Ok(payload)
+        }
+        Err(err) if is_not_found_error(&err) => {
+            let mut payload = client
+                .session_get_lessons(SessionGetLessonsParams {
+                    query: Some(user_message.to_string()),
+                    limit: Some(5),
+                    workspace_id,
+                    project_id,
+                })
+                .await?;
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "source".to_string(),
+                    Value::String("memory_events".to_string()),
+                );
+                obj.insert(
+                    "degraded".to_string(),
+                    serde_json::json!([{
+                        "source": "lessons_warnings",
+                        "detail": "GET /lessons/warnings returned 404; lessons listed from memory events"
+                    }]),
+                );
+            }
+            Ok(payload)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn proactive_grounding_recall(
     client: &ContextStreamClient,
     atlas_layer: &mcp_types::atlas_layer::AtlasLayer,
@@ -6548,8 +7019,7 @@ fn local_rules_content_drift_notice(folder_path: Option<&str>) -> Option<String>
     if installed == canonical {
         return None;
     }
-    Some(format!(
-        "[RULES_NOTICE] Rules content drifted ({} → {}). Run generate_rules(overwrite_existing=true) to refresh.",
+    Some(crate::notices::rules_notice_drift(
         &installed.chars().take(8).collect::<String>(),
         &canonical.chars().take(8).collect::<String>(),
     ))
@@ -7466,6 +7936,52 @@ impl ToolHandler for ContextTool {
             None
         };
 
+        // Coordination inbox (Wave 4b): fetched in parallel with the primary
+        // call and rendered as `[COORDINATION]` lines; never auto-acked. The
+        // fast route above skips it. The presence check-in is fire-and-forget.
+        let coordination_future = if workspace_id.is_some() {
+            let client_c = self.client.clone();
+            let session_key_c = mcp_client::get_task_session_key();
+            let caller_cache_identity_c = mcp_client::get_task_caller_cache_identity();
+            let auth_override_c = mcp_client::get_task_auth_override();
+            let config_override_c = mcp_client::get_task_config_override();
+            let ws_c = workspace_id;
+            let pid_c = project_id;
+            let sid_c = context_session_id.clone();
+            Some(tokio::spawn(async move {
+                with_caller_auth(
+                    session_key_c,
+                    caller_cache_identity_c,
+                    auth_override_c,
+                    config_override_c,
+                    || async move {
+                        client_c
+                            .coordination_inbox(
+                                ws_c,
+                                pid_c,
+                                sid_c.as_deref(),
+                                Some(
+                                    (crate::domains::coordination::NOTICE_RENDER_LIMIT + 1) as i64,
+                                ),
+                            )
+                            .await
+                    },
+                )
+                .await
+            }))
+        } else {
+            None
+        };
+        if let (Some(session_id), true) = (context_session_id.clone(), workspace_id.is_some()) {
+            spawn_coordination_check_in(
+                &self.client,
+                workspace_id,
+                project_id,
+                session_id,
+                coordination_task_summary(&user_message_for_relevance),
+            );
+        }
+
         // A8b: try the regional warm cache before the slow primary
         // call. If another pod in this region completed the same
         // coding-task scope within the last 5 min and deposited the
@@ -7773,6 +8289,29 @@ impl ToolHandler for ContextTool {
             Vec::new()
         };
 
+        let coordination_inbox: Option<Value> = if let Some(handle) = coordination_future {
+            match tokio::time::timeout(proactive_bound, handle).await {
+                Ok(Ok(Ok(inbox))) => Some(inbox),
+                Ok(Ok(Err(error))) => {
+                    tracing::debug!("coordination inbox unavailable: {}", error);
+                    None
+                }
+                _ => None, // join error or bound elapsed; task continues
+            }
+        } else {
+            None
+        };
+        let coordination_block = coordination_inbox
+            .as_ref()
+            .map(|inbox| {
+                crate::domains::coordination::format_coordination_notices(
+                    inbox,
+                    project_id,
+                    crate::domains::coordination::NOTICE_RENDER_LIMIT,
+                )
+            })
+            .unwrap_or_default();
+
         let post_compact_restore = if let Some(handle) = restore_context_future {
             match tokio::time::timeout(std::time::Duration::from_secs(4), handle).await {
                 Ok(Ok(Ok(value))) => {
@@ -7929,58 +8468,29 @@ impl ToolHandler for ContextTool {
                 // Text only shows critical alerts (only when no typed items already rendered).
                 if !has_typed {
                     if let Some(lessons) = &result.lessons {
-                        let important: Vec<_> = lessons
+                        // Structured mode: only critical/high lessons make the
+                        // text; the full list stays in structured_content.
+                        let important: Vec<mcp_types::api::Lesson> = lessons
                             .iter()
                             .filter(|l| {
                                 matches!(l.severity.as_deref(), Some("critical") | Some("high"))
                             })
+                            .cloned()
                             .collect();
-                        if !important.is_empty() {
-                            text.push_str(
-                                "\n[LESSONS_WARNING] Apply these lessons before proceeding; keep them active for this task.",
-                            );
-                            for l in important.iter().take(5) {
-                                let sev = if l.severity.as_deref() == Some("critical") {
-                                    "CRIT"
-                                } else {
-                                    "HIGH"
-                                };
-                                let title = l.title.as_deref().unwrap_or("Untitled");
-                                let prevention = l
-                                    .prevention
-                                    .as_deref()
-                                    .or(l.trigger.as_deref())
-                                    .unwrap_or("");
-                                let preview: String = prevention.chars().take(500).collect();
-                                text.push_str(&format!("\n [{}] {}: {}", sev, title, preview));
-                            }
-                        }
+                        text.push_str(&render_lessons_warning(
+                            &lesson_lines_from_api(&important),
+                            true,
+                        ));
                     }
                 }
             } else {
                 // No structured_content: condensed but complete text (fallback when no typed items)
                 if !has_typed {
                     if let Some(lessons) = &result.lessons {
-                        if !lessons.is_empty() {
-                            text.push_str(
-                                "\n[LESSONS_WARNING] Apply these lessons before proceeding; keep them active for this task.",
-                            );
-                            for l in lessons.iter().take(5) {
-                                let sev = match l.severity.as_deref() {
-                                    Some("critical") => "CRIT",
-                                    Some("high") => "HIGH",
-                                    _ => "note",
-                                };
-                                let title = l.title.as_deref().unwrap_or("Untitled");
-                                let prevention = l
-                                    .prevention
-                                    .as_deref()
-                                    .or(l.trigger.as_deref())
-                                    .unwrap_or("");
-                                let preview: String = prevention.chars().take(500).collect();
-                                text.push_str(&format!("\n [{}] {}: {}", sev, title, preview));
-                            }
-                        }
+                        text.push_str(&render_lessons_warning(
+                            &lesson_lines_from_api(lessons),
+                            true,
+                        ));
                     }
 
                     if let Some(items) = &result.remember_items {
@@ -8131,9 +8641,17 @@ impl ToolHandler for ContextTool {
             );
             if let Some(rules) = &result.rules_notice {
                 if rules.status == "missing" {
-                    text.push_str("\n[RULES_NOTICE] Run generate_rules()");
+                    text.push('\n');
+                    text.push_str(&crate::notices::rules_notice_missing(
+                        rules.update_command.as_deref(),
+                    ));
                 } else if rules.status == "behind" {
-                    text.push_str("\n[RULES_NOTICE] Run generate_rules(overwrite_existing=true)");
+                    text.push('\n');
+                    text.push_str(&crate::notices::rules_notice_behind(
+                        rules.current.as_deref().unwrap_or("none"),
+                        &rules.latest,
+                        rules.update_command.as_deref(),
+                    ));
                 }
             }
             // Content-drift fallback: if the server didn't already flag
@@ -8284,38 +8802,10 @@ impl ToolHandler for ContextTool {
             // Legacy fallback: lessons (when no typed L items)
             if !has_typed {
                 if let Some(lessons) = &result.lessons {
-                    if !lessons.is_empty() {
-                        text.push_str(
-                            "🚨 [LESSONS_WARNING] Past Mistakes Found - READ BEFORE PROCEEDING!\n",
-                        );
-                        text.push_str(
-                            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n",
-                        );
-                        for (i, lesson) in lessons.iter().take(5).enumerate() {
-                            let severity = match lesson.severity.as_deref() {
-                                Some("critical") => "🚨",
-                                Some("high") => "⚠️",
-                                _ => "📝",
-                            };
-                            let title = lesson.title.as_deref().unwrap_or("Untitled");
-                            let prevention = lesson
-                                .prevention
-                                .as_deref()
-                                .or(lesson.trigger.as_deref())
-                                .unwrap_or("");
-                            let preview: String = prevention.chars().take(500).collect();
-                            text.push_str(&format!(
-                                "{}. {} {}: {}\n",
-                                i + 1,
-                                severity,
-                                title,
-                                preview
-                            ));
-                        }
-                        text.push_str(
-                            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n",
-                        );
-                    }
+                    text.push_str(&render_lessons_warning(
+                        &lesson_lines_from_api(lessons),
+                        false,
+                    ));
                 }
             }
 
@@ -8347,14 +8837,17 @@ impl ToolHandler for ContextTool {
                 if rules.status == "behind" || rules.status == "missing" {
                     let current = rules.current.as_deref().unwrap_or("none");
                     if rules.status == "missing" {
-                        text.push_str(
-                            "[RULES_NOTICE] Rules missing. Run generate_rules() to install.\n\n",
-                        );
-                    } else {
-                        text.push_str(&format!(
-                            "[RULES_NOTICE] Rules {} → {}. Run generate_rules(overwrite_existing=true) to update.\n\n",
-                            current, rules.latest
+                        text.push_str(&crate::notices::rules_notice_missing(
+                            rules.update_command.as_deref(),
                         ));
+                        text.push_str("\n\n");
+                    } else {
+                        text.push_str(&crate::notices::rules_notice_behind(
+                            current,
+                            &rules.latest,
+                            rules.update_command.as_deref(),
+                        ));
+                        text.push_str("\n\n");
                     }
                 }
             }
@@ -8633,6 +9126,15 @@ impl ToolHandler for ContextTool {
             }
         }
 
+        // `[COORDINATION]` lines go after the warm-cache write so a later
+        // warm emit never replays stale notices.
+        if !coordination_block.is_empty() {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&coordination_block);
+        }
+
         let session_snap = self.session.state().await;
         let grounding_emit_path = session_snap
             .folder_path
@@ -8661,6 +9163,9 @@ impl ToolHandler for ContextTool {
                 "grounding_hits".to_string(),
                 serde_json::to_value(&grounding_hits).unwrap_or_else(|_| serde_json::json!([])),
             );
+            if let Some(inbox) = coordination_inbox {
+                obj.insert("coordination_inbox".to_string(), inbox);
+            }
             if let Some(restore) = post_compact_restore {
                 obj.insert("post_compact_restore".to_string(), restore);
             }
@@ -10507,6 +11012,72 @@ pub struct SessionCaptureLessonInput {
     pub project_id: Option<String>,
 }
 
+/// `[PARTIAL]` lines stated whenever the typed `/lessons` endpoints answer
+/// 404 and the events-based path is used instead.
+pub(crate) const LESSONS_CREATE_PARTIAL: &str = "[PARTIAL] /lessons endpoint unavailable (404); stored the lesson as a memory event via /memory/events.";
+pub(crate) const LESSONS_LIST_PARTIAL: &str =
+    "[PARTIAL] /lessons endpoint unavailable (404); listed lessons from memory events.";
+
+/// Where a lesson id was resolved and whether the typed endpoint exists.
+struct LessonTarget {
+    id: Uuid,
+    note: Option<String>,
+    /// `false` once `GET /lessons` answered 404 for this server.
+    lessons_api_available: bool,
+}
+
+/// Resolve a lesson from a UUID or lookup text: typed `/lessons` listing
+/// first, events-based search when the server answers 404.
+async fn resolve_lesson_target(
+    client: &ContextStreamClient,
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    lookup: &str,
+    limit: Option<i64>,
+) -> Result<LessonTarget> {
+    let lookup = lookup.trim();
+    if let Ok(id) = Uuid::parse_str(lookup) {
+        return Ok(LessonTarget {
+            id,
+            note: None,
+            lessons_api_available: true,
+        });
+    }
+    let search_limit = limit.unwrap_or(50).clamp(10, 100);
+    match client
+        .list_lessons(mcp_client::ListLessonsParams {
+            workspace_id,
+            project_id,
+            query: Some(lookup.to_string()),
+            include_superseded: Some(true),
+            limit: Some(search_limit),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(envelope) => {
+            let items = extract_result_items(&envelope);
+            let ranked = rank_lesson_matches(&items, lookup);
+            let (id, note) = pick_lesson_match(lookup, &ranked)?;
+            Ok(LessonTarget {
+                id,
+                note,
+                lessons_api_available: true,
+            })
+        }
+        Err(err) if is_not_found_error(&err) => {
+            let (id, note) =
+                resolve_lesson_event_id(client, workspace_id, project_id, lookup, limit).await?;
+            Ok(LessonTarget {
+                id,
+                note,
+                lessons_api_available: false,
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
 // Lesson deduplication: 2-minute window to prevent duplicate captures.
 const LESSON_DEDUP_WINDOW: Duration = Duration::from_secs(120);
 
@@ -10609,20 +11180,52 @@ impl ToolHandler for SessionCaptureLessonTool {
             ));
         }
 
-        let params = mcp_client::SessionCaptureLessonParams {
-            title: input.title.clone(),
-            trigger: input.trigger,
-            impact: input.impact,
-            prevention: input.prevention,
-            severity: input.severity,
-            category: input.category,
-            keywords: input.keywords,
+        // Typed `/lessons` first; the events path is only used when the
+        // server answers 404, and the tool text says so.
+        let typed = mcp_client::CreateLessonParams {
             workspace_id: scope.workspace_id,
             project_id: scope.project_id,
+            title: input.title.clone(),
+            trigger: input.trigger.clone(),
+            impact: input.impact.clone(),
+            prevention: input.prevention.clone(),
+            severity: input.severity.clone(),
+            category: input.category.clone(),
+            keywords: input.keywords.clone(),
         };
-        let mut params = params;
-        let mut result = match self.client.session_capture_lesson(params.clone()).await {
+        let mut partial_note: Option<&str> = None;
+        let mut result = match self.client.create_lesson(typed.clone()).await {
             Ok(result) => result,
+            Err(err) if is_not_found_error(&err) => {
+                partial_note = Some(LESSONS_CREATE_PARTIAL);
+                let mut params = mcp_client::SessionCaptureLessonParams {
+                    title: input.title.clone(),
+                    trigger: input.trigger.clone(),
+                    impact: input.impact.clone(),
+                    prevention: input.prevention.clone(),
+                    severity: input.severity.clone(),
+                    category: input.category.clone(),
+                    keywords: input.keywords.clone(),
+                    workspace_id: scope.workspace_id,
+                    project_id: scope.project_id,
+                };
+                match self.client.session_capture_lesson(params.clone()).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        scope = recover_write_scope_after_project_error(
+                            &self.client,
+                            self.session.as_ref(),
+                            input.workspace_id.as_deref(),
+                            input.project_id.as_deref(),
+                            err,
+                        )
+                        .await?;
+                        params.workspace_id = scope.workspace_id;
+                        params.project_id = scope.project_id;
+                        self.client.session_capture_lesson(params).await?
+                    }
+                }
+            }
             Err(err) => {
                 scope = recover_write_scope_after_project_error(
                     &self.client,
@@ -10632,12 +11235,26 @@ impl ToolHandler for SessionCaptureLessonTool {
                     err,
                 )
                 .await?;
-                params.workspace_id = scope.workspace_id;
-                params.project_id = scope.project_id;
-                self.client.session_capture_lesson(params).await?
+                let mut retry = typed;
+                retry.workspace_id = scope.workspace_id;
+                retry.project_id = scope.project_id;
+                self.client.create_lesson(retry).await?
             }
         };
         attach_scope_recovery_metadata(&mut result, &scope);
+        if let (Some(_), Some(obj)) = (partial_note, result.as_object_mut()) {
+            obj.insert(
+                "fallback".to_string(),
+                Value::String("memory_events".to_string()),
+            );
+            obj.insert(
+                "degraded".to_string(),
+                serde_json::json!([{
+                    "source": "lessons_create",
+                    "detail": "POST /lessons returned 404; lesson stored as a memory event"
+                }]),
+            );
+        }
         let event_id = result
             .get("id")
             .and_then(|v| v.as_str())
@@ -10659,10 +11276,14 @@ impl ToolHandler for SessionCaptureLessonTool {
                 }),
             );
         }
-        let text = format!(
+        let mut text = format!(
             "Lesson captured: {} (ID: {}).\nProgress: completed.",
             input.title, event_id
         );
+        if let Some(note) = partial_note {
+            text.push('\n');
+            text.push_str(note);
+        }
         let mut output = ToolResult::with_structured(text, result);
         if let Some(note) = scope.note {
             output = output.with_prefix(format!("{}\n", note));
@@ -10889,6 +11510,12 @@ async fn resolve_lesson_event_id(
     }
 
     let ranked = rank_lesson_matches(&lessons, lookup);
+    pick_lesson_match(lookup, &ranked)
+}
+
+/// Single high-confidence match wins; several close matches return the
+/// disambiguation list as a validation error.
+fn pick_lesson_match(lookup: &str, ranked: &[RankedLessonMatch]) -> Result<(Uuid, Option<String>)> {
     let best = ranked.first().ok_or_else(|| {
         Error::Validation(format!(
             "No lessons found matching \"{}\". Use session(action=\"get_lessons\", query=\"{}\") to inspect candidates.",
@@ -10898,7 +11525,7 @@ async fn resolve_lesson_event_id(
     let second_score = ranked.get(1).map(|m| m.score).unwrap_or_default();
     if !best.exact && second_score > 0 && best.score <= second_score + 200 {
         return Err(Error::Validation(format_lesson_disambiguation(
-            lookup, &ranked,
+            lookup, ranked,
         )));
     }
 
@@ -11202,6 +11829,95 @@ fn is_lesson_result(item: &Value) -> bool {
 /// Every-turn lesson warnings use a short-lived warm cache. Post-fetch
 /// severity, category, and deduplication filters remain request-local, so the
 /// cache key contains only `(workspace, project, query)`.
+/// Render a `lessons.v1` envelope from `GET /lessons` as a typed list.
+fn render_typed_lessons_result(envelope: Value, scope_note: Option<String>) -> ToolResult {
+    let items = extract_result_items(&envelope);
+    let total = envelope
+        .get("total")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(items.len());
+    let mut text = String::new();
+    if items.is_empty() {
+        text.push_str("No lessons found matching your criteria.");
+    } else {
+        text.push_str(&format!(
+            "Found {} of {} lesson(s).\n\n",
+            items.len(),
+            total
+        ));
+        for (index, lesson) in items.iter().enumerate() {
+            let title = extract_lesson_title(lesson);
+            let severity = extract_lesson_severity(lesson);
+            let id = lesson
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let mut labels = format!("id={id}");
+            if let Some(status) = lesson.get("status").and_then(Value::as_str) {
+                labels.push_str(&format!(" status={status}"));
+            }
+            if let Some(category) = extract_lesson_category(lesson) {
+                labels.push_str(&format!(" category={category}"));
+            }
+            let preview = extract_lesson_prevention(lesson)
+                .or_else(|| {
+                    lesson
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .map(|value| {
+                    let mut short = value.chars().take(1000).collect::<String>();
+                    if value.chars().count() > 1000 {
+                        short.push_str("...");
+                    }
+                    short.replace('\n', " ")
+                })
+                .unwrap_or_default();
+            text.push_str(&format!(
+                "{}. [{}] {} {}\n   {}\n",
+                index + 1,
+                severity.to_uppercase(),
+                title,
+                labels,
+                preview
+            ));
+            if let Some(successor) = lesson.get("superseded_by").and_then(Value::as_str) {
+                text.push_str(&format!("   superseded_by={successor}\n"));
+            }
+            text.push('\n');
+        }
+        if let Some(next_offset) = envelope.get("next_offset").and_then(Value::as_u64) {
+            text.push_str(&format!(
+                "Next offset: {next_offset} (pass offset={next_offset} to continue).\n"
+            ));
+        }
+    }
+    let partial = crate::domains::memory::render_degraded_lines(&envelope);
+    if !partial.is_empty() {
+        text.push('\n');
+        text.push_str(partial.trim_end());
+    }
+    let mut structured = envelope;
+    if let Some(obj) = structured.as_object_mut() {
+        obj.insert("lessons".to_string(), Value::Array(items.clone()));
+        obj.insert(
+            "lessons_count".to_string(),
+            Value::Number((items.len() as u64).into()),
+        );
+        obj.insert(
+            "source".to_string(),
+            Value::String("lessons_api".to_string()),
+        );
+    }
+    let mut output = ToolResult::with_structured(text, structured);
+    if let Some(note) = scope_note {
+        output = output.with_prefix(format!("{}\n", note));
+    }
+    output
+}
+
 pub struct SessionGetLessonsTool {
     client: ContextStreamClient,
     session: Arc<SessionManager>,
@@ -11251,6 +11967,25 @@ impl ToolHandler for SessionGetLessonsTool {
                     .to_string(),
             ));
         }
+
+        // Typed `/lessons` envelope first (server-side severity/category
+        // filters); the events-based path below only runs on 404.
+        let typed_params = mcp_client::ListLessonsParams {
+            workspace_id,
+            project_id,
+            query: input.query.clone(),
+            min_severity: input.severity.clone(),
+            category: input.category.clone(),
+            limit: input.limit.or(Some(10)),
+            ..Default::default()
+        };
+        let legacy_note: Option<&str> = match self.client.list_lessons(typed_params).await {
+            Ok(envelope) => {
+                return Ok(render_typed_lessons_result(envelope, scope.note.clone()));
+            }
+            Err(err) if is_not_found_error(&err) => Some(LESSONS_LIST_PARTIAL),
+            Err(err) => return Err(err),
+        };
 
         let params = mcp_client::SessionGetLessonsParams {
             query: input.query.clone(),
@@ -11441,6 +12176,10 @@ impl ToolHandler for SessionGetLessonsTool {
             out
         };
 
+        let text = match legacy_note {
+            Some(note) => format!("{}\n\n{}", text.trim_end(), note),
+            None => text,
+        };
         let structured = if let Some(obj) = result.as_object() {
             let mut enriched = obj.clone();
             enriched.insert("lessons".to_string(), Value::Array(lessons.clone()));
@@ -11471,6 +12210,22 @@ impl ToolHandler for SessionGetLessonsTool {
             obj
         };
 
+        let mut structured = structured;
+        if legacy_note.is_some() {
+            if let Some(obj) = structured.as_object_mut() {
+                obj.insert(
+                    "source".to_string(),
+                    Value::String("memory_events".to_string()),
+                );
+                obj.insert(
+                    "degraded".to_string(),
+                    serde_json::json!([{
+                        "source": "lessons_list",
+                        "detail": "GET /lessons returned 404; lessons listed from memory events"
+                    }]),
+                );
+            }
+        }
         let mut output = ToolResult::with_structured(text, structured);
         if let Some(note) = scope.note {
             output = output.with_prefix(format!("{}\n", note));
@@ -12083,6 +12838,107 @@ pub struct SessionDecisionTraceInput {
     pub project_id: Option<String>,
 }
 
+fn trace_payload(result: &Value) -> &Value {
+    match result.get("data") {
+        Some(data) if data.is_object() => data,
+        _ => result,
+    }
+}
+
+fn trace_answer(result: &Value) -> Option<String> {
+    result
+        .get("answer")
+        .or_else(|| trace_payload(result).get("answer"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn trace_decisions(result: &Value) -> Vec<Value> {
+    let payload = trace_payload(result);
+    if let Some(list) = result
+        .get("decisions")
+        .or_else(|| payload.get("decisions"))
+        .and_then(Value::as_array)
+    {
+        return list.clone();
+    }
+    match payload.get("decision") {
+        Some(decision) if decision.is_object() => vec![decision.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn first_decision_id(result: &Value) -> Option<Uuid> {
+    trace_decisions(result)
+        .first()
+        .and_then(|decision| decision.get("id").and_then(Value::as_str))
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+}
+
+/// `[DECISION_TRACE]` text: the server's answer first, then the matched
+/// decisions with their status, then any `[PARTIAL]` fallback note.
+pub(crate) fn render_decision_trace(query: &str, result: &Value) -> String {
+    let mut text = String::new();
+    match trace_answer(result) {
+        Some(answer) => text.push_str(&format!("[DECISION_TRACE] {answer}\n")),
+        None => text.push_str(
+            "[DECISION_TRACE] No synthesized answer from the server; matched decisions are listed below.\n",
+        ),
+    }
+    text.push_str(&format!("Decision trace for \"{query}\"\n\n"));
+    let decisions = trace_decisions(result);
+    if decisions.is_empty() {
+        text.push_str("No matching decisions.\n");
+    }
+    for (index, decision) in decisions.iter().take(5).enumerate() {
+        let title = decision
+            .get("title")
+            .or_else(|| decision.get("summary"))
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled");
+        let date = decision
+            .get("created_at")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let status = decision
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let id = decision
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        text.push_str(&format!(
+            "{}. {title} — status={status} ({date}) id={id}\n",
+            index + 1
+        ));
+        if let Some(rationale) = decision
+            .get("structured")
+            .and_then(|value| value.get("rationale"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            let preview: String = rationale.chars().take(160).collect();
+            text.push_str(&format!("   rationale: {}\n", preview.replace('\n', " ")));
+        }
+    }
+    if let Some(reason) = result.get("fallback_reason").and_then(Value::as_str) {
+        let hint = result
+            .get("hint")
+            .and_then(Value::as_str)
+            .map(|hint| format!(" — {hint}"))
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "[PARTIAL] decision trace fallback: {reason}{hint}\n"
+        ));
+    }
+    text.push_str(&crate::domains::memory::render_degraded_lines(result));
+    text.push_str(crate::notices::DECISION_TRACE_HINT);
+    text
+}
+
 /// Session decision trace tool handler.
 pub struct SessionDecisionTraceTool {
     client: ContextStreamClient,
@@ -12121,24 +12977,41 @@ impl ToolHandler for SessionDecisionTraceTool {
             project_id,
         };
 
-        let result = self.client.session_decision_trace(params).await?;
-
-        let mut text = format!("Decision trace for \"{}\"\n\n", input.query);
-
-        if let Some(decisions) = result.get("decisions").and_then(|v| v.as_array()) {
-            for (i, decision) in decisions.iter().take(5).enumerate() {
-                let title = decision
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Untitled");
-                let date = decision
-                    .get("created_at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                text.push_str(&format!("{}. {} ({})\n", i + 1, title, date));
+        // A UUID query traces one decision through the typed endpoint; text
+        // queries go through the search trace and are enriched with the typed
+        // answer of the top decision when the server exposes it.
+        let query_uuid = Uuid::parse_str(input.query.trim()).ok();
+        let mut result = match query_uuid {
+            Some(id) => match self.client.get_decision_trace(id).await {
+                Ok(trace) => trace,
+                Err(err) if is_not_found_error(&err) => {
+                    self.client.session_decision_trace(params).await?
+                }
+                Err(err) => return Err(err),
+            },
+            None => self.client.session_decision_trace(params).await?,
+        };
+        if trace_answer(&result).is_none() {
+            if let Some(id) = first_decision_id(&result) {
+                if let Ok(trace) = self.client.get_decision_trace(id).await {
+                    if let (Some(answer), Some(obj)) =
+                        (trace_answer(&trace), result.as_object_mut())
+                    {
+                        obj.insert("answer".to_string(), Value::String(answer));
+                        obj.insert(
+                            "markers".to_string(),
+                            trace
+                                .get("markers")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!(["[DECISION_TRACE]"])),
+                        );
+                        obj.insert("trace_decision_id".to_string(), serde_json::json!(id));
+                    }
+                }
             }
         }
 
+        let text = render_decision_trace(&input.query, &result);
         Ok(ToolResult::with_structured(text, result))
     }
 
@@ -14393,12 +15266,7 @@ async fn execute_session_ground(
             include_decisions,
             include_docs,
         ),
-        client.session_get_lessons(SessionGetLessonsParams {
-            query: Some(user_message.to_string()),
-            limit: Some(5),
-            workspace_id: scope.workspace_id,
-            project_id: scope.project_id,
-        }),
+        fetch_lessons_for_ground(client, scope.workspace_id, scope.project_id, user_message),
         client.list_skills(
             scope.workspace_id,
             scope.project_id,
@@ -14457,20 +15325,31 @@ async fn execute_session_ground(
         )
         .await
     {
-        let notices = crate::domains::coordination::inbox_notices(&inbox);
-        for notice in notices.iter().take(5) {
-            let reason = notice
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("shared context");
-            let id = notice.get("id").and_then(Value::as_str).unwrap_or_default();
-            text.push_str(&format!(
-                "[COORDINATION] {reason} — ack via coordination(action=\"ack\", notice_id=\"{id}\")\n"
-            ));
-        }
-        if !notices.is_empty() {
+        let block = crate::domains::coordination::format_coordination_notices(
+            &inbox,
+            scope.project_id,
+            crate::domains::coordination::NOTICE_RENDER_LIMIT,
+        );
+        if !block.is_empty() {
+            text.push_str(&block);
             text.push('\n');
         }
+    }
+    // `[LESSONS_WARNING]` through the same renderer `context()` uses:
+    // stored severity, relevance shown separately.
+    let lesson_values: Vec<Value> = extract_result_items(&lessons)
+        .into_iter()
+        .filter(|item| item.get("lesson").is_some() || is_lesson_result(item))
+        .collect();
+    let lesson_lines = lesson_lines_from_values(&lesson_values);
+    if !lesson_lines.is_empty() {
+        text.push_str(render_lessons_warning(&lesson_lines, true).trim_start_matches('\n'));
+        text.push_str("\n\n");
+    }
+    let lessons_partial = crate::domains::memory::render_degraded_lines(&lessons);
+    if !lessons_partial.is_empty() {
+        text.push_str(&lessons_partial);
+        text.push('\n');
     }
     // Context Feeds grounding. Fail-open: a disabled feature gate, an error,
     // or a slow backend simply yields no [FEED] lines.
@@ -14644,6 +15523,20 @@ pub struct SessionInput {
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub keywords: Option<Vec<String>>,
     pub lesson_id: Option<String>,
+    #[serde(default)]
+    pub successor_id: Option<String>,
+    // Decision fields: capture(event_type="decision") routes to the typed
+    // create when any of these is present.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub alternatives: Option<Vec<Value>>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub supersedes: Option<String>,
     // Query fields
     pub query: Option<String>,
     /// Natural-language anchor for `action="ground"` (falls back to `query`).
@@ -14742,6 +15635,41 @@ impl ToolHandler for SessionTool {
                     .unwrap_or_else(|| "uncategorized".to_string());
                 if is_reserved_plan_event_type(Some(&event_type)) {
                     return Err(reserved_plan_event_error());
+                }
+                // A decision with structured fields is a typed decision:
+                // route it to memory(create_decision) (typed endpoint first,
+                // events fallback on 404 with a [PARTIAL] line).
+                if event_type == "decision"
+                    && crate::domains::memory::has_structured_decision_fields(
+                        input.rationale.as_deref(),
+                        input.alternatives.as_deref(),
+                        input.scope.as_deref(),
+                        input.confidence,
+                    )
+                {
+                    let title = input
+                        .title
+                        .ok_or_else(|| Error::Validation("title is required".to_string()))?;
+                    let decision_input = crate::domains::memory::CreateDecisionInput {
+                        workspace_id: input.workspace_id,
+                        project_id: input.project_id,
+                        title,
+                        content: input.content,
+                        rationale: input.rationale,
+                        alternatives: input.alternatives,
+                        scope: input.scope,
+                        confidence: input.confidence,
+                        supersedes: input.supersedes,
+                        category: input.category,
+                        tags: input.tags,
+                        session_id: input.session_id,
+                    };
+                    return crate::domains::memory::execute_create_decision(
+                        &self.client,
+                        self.session.as_ref(),
+                        decision_input,
+                    )
+                    .await;
                 }
                 let title = input
                     .title
@@ -14958,7 +15886,7 @@ impl ToolHandler for SessionTool {
                     .project_id
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok());
-                let (lesson_id, resolution_note) = resolve_lesson_event_id(
+                let target = resolve_lesson_target(
                     &self.client,
                     workspace_id,
                     project_id,
@@ -14966,23 +15894,65 @@ impl ToolHandler for SessionTool {
                     input.limit,
                 )
                 .await?;
-                let result = self
-                    .client
-                    .update_memory_event(
-                        lesson_id,
-                        mcp_client::UpdateMemoryEventParams {
-                            title: input.title,
-                            content: input.content,
-                            metadata: None,
-                        },
-                    )
-                    .await?;
                 let mut text = String::new();
-                if let Some(note) = resolution_note {
+                if let Some(note) = target.note.as_deref() {
                     text.push_str(&format!("{}\n", note));
                 }
-                text.push_str(&format!("Lesson updated: {}.", lesson_id));
-                Ok(ToolResult::with_structured(text, result))
+                // Typed lessons have no free-form body: a bare `content` is
+                // applied to `prevention` (stated below) on the typed path.
+                let content_as_prevention =
+                    input.prevention.is_none() && input.content.is_some();
+                let typed = mcp_client::UpdateLessonParams {
+                    title: input.title.clone(),
+                    trigger: input.trigger.clone(),
+                    impact: input.impact.clone(),
+                    prevention: input.prevention.clone().or_else(|| input.content.clone()),
+                    severity: input.severity.clone(),
+                    category: input.category.clone(),
+                    keywords: input.keywords.clone(),
+                };
+                if typed.is_empty() {
+                    return Err(Error::Validation(
+                        "update_lesson needs at least one of: title, trigger, impact, prevention (or content), severity, category, keywords"
+                            .to_string(),
+                    ));
+                }
+                let typed_result = if target.lessons_api_available {
+                    match self.client.update_lesson(target.id, typed).await {
+                        Ok(result) => Some(result),
+                        Err(err) if is_not_found_error(&err) => None,
+                        Err(err) => return Err(err),
+                    }
+                } else {
+                    None
+                };
+                match typed_result {
+                    Some(result) => {
+                        text.push_str(&format!("Lesson updated: {}.", target.id));
+                        if content_as_prevention {
+                            text.push_str("\nnote: `content` was applied to the lesson's prevention field (typed lessons have no free-form body).");
+                        }
+                        Ok(ToolResult::with_structured(text, result))
+                    }
+                    None => {
+                        let result = self
+                            .client
+                            .update_memory_event(
+                                target.id,
+                                mcp_client::UpdateMemoryEventParams {
+                                    title: input.title,
+                                    content: input.content,
+                                    metadata: None,
+                                },
+                            )
+                            .await?;
+                        text.push_str(&format!(
+                            "Lesson updated: {id}.\n[PARTIAL] /lessons endpoint unavailable (404); updated the lesson event via PUT /memory/events/{id}.",
+                            id = target.id
+                        ));
+                        Ok(ToolResult::with_structured(text, result))
+                    }
+                }
             }
             "delete_lesson" => {
                 let lesson_lookup = input
@@ -14996,7 +15966,7 @@ impl ToolHandler for SessionTool {
                     .project_id
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok());
-                let (lesson_id, resolution_note) = resolve_lesson_event_id(
+                let target = resolve_lesson_target(
                     &self.client,
                     workspace_id,
                     project_id,
@@ -15004,13 +15974,115 @@ impl ToolHandler for SessionTool {
                     input.limit,
                 )
                 .await?;
-                let result = self.client.delete_memory_event(lesson_id).await?;
                 let mut text = String::new();
-                if let Some(note) = resolution_note {
+                if let Some(note) = target.note.as_deref() {
                     text.push_str(&format!("{}\n", note));
                 }
-                text.push_str(&format!("Lesson deleted: {}.", lesson_id));
-                Ok(ToolResult::with_structured(text, result))
+                let typed_result = if target.lessons_api_available {
+                    match self.client.delete_lesson(target.id).await {
+                        Ok(result) => Some(result),
+                        Err(err) if is_not_found_error(&err) => None,
+                        Err(err) => return Err(err),
+                    }
+                } else {
+                    None
+                };
+                match typed_result {
+                    Some(result) => {
+                        text.push_str(&format!("Lesson deleted: {}.", target.id));
+                        Ok(ToolResult::with_structured(text, result))
+                    }
+                    None => {
+                        let result = self.client.delete_memory_event(target.id).await?;
+                        text.push_str(&format!(
+                            "Lesson deleted: {id}.\n[PARTIAL] /lessons endpoint unavailable (404); deleted the lesson event via DELETE /memory/events/{id}.",
+                            id = target.id
+                        ));
+                        Ok(ToolResult::with_structured(text, result))
+                    }
+                }
+            }
+            "supersede_lesson" => {
+                let lesson_lookup = input
+                    .lesson_id
+                    .ok_or_else(|| Error::Validation("lesson_id is required".to_string()))?;
+                let workspace_id = input
+                    .workspace_id
+                    .as_deref()
+                    .and_then(|s| Uuid::parse_str(s).ok());
+                let project_id = input
+                    .project_id
+                    .as_deref()
+                    .and_then(|s| Uuid::parse_str(s).ok());
+                let target = resolve_lesson_target(
+                    &self.client,
+                    workspace_id,
+                    project_id,
+                    lesson_lookup.trim(),
+                    input.limit,
+                )
+                .await?;
+                let successor_id = match input
+                    .successor_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(lookup) => Some(
+                        resolve_lesson_target(
+                            &self.client,
+                            workspace_id,
+                            project_id,
+                            lookup,
+                            input.limit,
+                        )
+                        .await?
+                        .id,
+                    ),
+                    None => None,
+                };
+                if successor_id.is_none()
+                    && input.title.as_deref().map(str::trim).is_none_or(str::is_empty)
+                {
+                    return Err(Error::Validation(
+                        "supersede_lesson needs successor_id (an existing lesson) or the replacement lesson fields (title, trigger, impact, prevention)".to_string(),
+                    ));
+                }
+                let body = serde_json::json!({
+                    "successor_id": successor_id,
+                    "title": input.title,
+                    "trigger": input.trigger,
+                    "impact": input.impact,
+                    "prevention": input.prevention,
+                    "severity": input.severity,
+                    "category": input.category,
+                    "keywords": input.keywords,
+                });
+                match self.client.supersede_lesson(target.id, body).await {
+                    Ok(result) => {
+                        let mut text = String::new();
+                        if let Some(note) = target.note.as_deref() {
+                            text.push_str(&format!("{}\n", note));
+                        }
+                        let successor = successor_id
+                            .map(|id| id.to_string())
+                            .or_else(|| {
+                                result
+                                    .get("successor_id")
+                                    .or_else(|| result.get("successor").and_then(|s| s.get("id")))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_else(|| "new lesson".to_string());
+                        text.push_str(&format!("Lesson superseded: {} → {}.", target.id, successor));
+                        Ok(ToolResult::with_structured(text, result))
+                    }
+                    Err(err) if is_not_found_error(&err) => Err(Error::Validation(format!(
+                        "supersede_lesson needs POST /lessons/{}/supersede, which this server does not expose (404). No events-based fallback exists; use update_lesson or delete_lesson instead.",
+                        target.id
+                    ))),
+                    Err(err) => Err(err),
+                }
             }
             "ground" => {
                 execute_session_ground(&self.client, &self.session, &self.atlas_layer, &input).await
@@ -15353,7 +16425,10 @@ impl ToolHandler for SessionTool {
                     project_id: input.project_id.and_then(|s| Uuid::parse_str(&s).ok()),
                 };
                 let result = self.client.list_suggested_rules(params).await?;
-                Ok(ToolResult::text(serde_json::to_string_pretty(&result)?))
+                Ok(ToolResult::with_structured(
+                    render_suggested_rules_list(&result),
+                    result,
+                ))
             }
             "suggested_rule_action" => {
                 use mcp_client::SuggestedRuleActionParams;
@@ -15365,6 +16440,7 @@ impl ToolHandler for SessionTool {
                 let rule_action = input
                     .rule_action
                     .ok_or_else(|| Error::Validation("rule_action is required".to_string()))?;
+                let rule_action_label = rule_action.clone();
                 let params = SuggestedRuleActionParams {
                     rule_id,
                     rule_action,
@@ -15372,15 +16448,21 @@ impl ToolHandler for SessionTool {
                     modified_keywords: input.modified_keywords,
                 };
                 let result = self.client.suggested_rule_action(params).await?;
-                Ok(ToolResult::text(serde_json::to_string_pretty(&result)?))
+                Ok(ToolResult::with_structured(
+                    render_suggested_rule_action(&rule_id, &rule_action_label, &result),
+                    result,
+                ))
             }
             "suggested_rules_stats" => {
                 let workspace_id = input.workspace_id.and_then(|s| Uuid::parse_str(&s).ok());
                 let result = self.client.suggested_rules_stats(workspace_id).await?;
-                Ok(ToolResult::text(serde_json::to_string_pretty(&result)?))
+                Ok(ToolResult::with_structured(
+                    render_suggested_rules_stats(&result),
+                    result,
+                ))
             }
             _ => Err(Error::Validation(format!(
-                "Unknown action: {}. Use 'capture', 'retro_capture', 'capture_lesson', 'get_lessons', 'update_lesson', 'delete_lesson', 'recall', 'ground', 'set_account_mode', 'remember', 'user_context', 'summary', 'compress', 'delta', 'smart_search', 'decision_trace', 'list_recaps', 'trigger_recap', 'restore_context', 'capture_plan', 'get_plan', 'update_plan', 'list_plans', 'list_suggested_rules', 'suggested_rule_action', or 'suggested_rules_stats'.",
+                "Unknown action: {}. Use 'capture', 'retro_capture', 'capture_lesson', 'get_lessons', 'update_lesson', 'delete_lesson', 'supersede_lesson', 'recall', 'ground', 'set_account_mode', 'remember', 'user_context', 'summary', 'compress', 'delta', 'smart_search', 'decision_trace', 'list_recaps', 'trigger_recap', 'restore_context', 'capture_plan', 'get_plan', 'update_plan', 'list_plans', 'list_suggested_rules', 'suggested_rule_action', or 'suggested_rules_stats'.",
                 input.action
             ))),
         }
@@ -15391,7 +16473,7 @@ impl ToolHandler for SessionTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "session".to_string(),
             title: "Session Operations".to_string(),
-            description: "Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). Lesson maintenance is supported via action='update_lesson' and action='delete_lesson' with lesson_id (UUID or lookup text). PAST SESSIONS LIVE HERE: transcripts of every prior session are captured + indexed and are queryable. `context()` auto-surfaces `[GROUNDING]` prior-work hits; when that grounding is fresh, relevant, and sufficient, do not immediately call action='recall' for the same request. Call action='recall' as the first explicit escalation when `[GROUNDING]` is absent, thin, stale, off-topic, or when the user explicitly requests broader or session-specific history. For after-the-fact durable saves, use action='retro_capture' with title plus content and/or query/transcript_id; it stores the capture rationale, source query, transcript IDs, and source snippets in provenance. Use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills + git) outside context(). Also `memory(action=\"list_transcripts\"|\"search_transcripts\"|\"get_transcript\")` for chronological + full-text access. Save a session_snapshot at turning points so the NEXT session can pick up: action='capture', event_type='session_snapshot'. Daily Recaps run around 23:00 in the user's timezone, not at MCP session boundaries; use list_recaps for timestamped history and trigger_recap for a manual asynchronous run. Team/personal mode: action='set_account_mode' with account_mode=team|personal|auto. Actions: capture, retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons, update_lesson, delete_lesson, recall (retrieve past conversation context when auto-grounding is insufficient), ground (one-shot prior-work bundle — requires user_message or query), remember, user_context, summary, compress, delta, smart_search (searches MEMORY/conversation history only, not code), decision_trace, list_recaps, trigger_recap, restore_context, set_account_mode. Plan actions: capture_plan, get_plan, update_plan, list_plans. Use capture_plan for plans; do not use action='capture' with event_type='plan'. capture_plan requires structured steps and creates linked tasks by default with plan_id and plan_step_id. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats.".to_string(),
+            description: "Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). Lesson maintenance is supported via action='update_lesson', action='delete_lesson', and action='supersede_lesson' with lesson_id (UUID or lookup text); lessons go to the typed /lessons endpoints first and fall back to memory events only when the server answers 404 (stated with a [PARTIAL] line). DECISIONS: action='capture' with event_type='decision' plus rationale/alternatives/scope/confidence routes to the typed decision create (same as memory(action=\"create_decision\")). PAST SESSIONS LIVE HERE: transcripts of every prior session are captured + indexed and are queryable. `context()` auto-surfaces `[GROUNDING]` prior-work hits; when that grounding is fresh, relevant, and sufficient, do not immediately call action='recall' for the same request. Call action='recall' as the first explicit escalation when `[GROUNDING]` is absent, thin, stale, off-topic, or when the user explicitly requests broader or session-specific history. For after-the-fact durable saves, use action='retro_capture' with title plus content and/or query/transcript_id; it stores the capture rationale, source query, transcript IDs, and source snippets in provenance. Use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills + git) outside context(). Also `memory(action=\"list_transcripts\"|\"search_transcripts\"|\"get_transcript\")` for chronological + full-text access. Save a session_snapshot at turning points so the NEXT session can pick up: action='capture', event_type='session_snapshot'. Daily Recaps run around 23:00 in the user's timezone, not at MCP session boundaries; use list_recaps for timestamped history and trigger_recap for a manual asynchronous run. Team/personal mode: action='set_account_mode' with account_mode=team|personal|auto. Actions: capture, retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons, update_lesson, delete_lesson, supersede_lesson, recall (retrieve past conversation context when auto-grounding is insufficient), ground (one-shot prior-work bundle — requires user_message or query), remember, user_context, summary, compress, delta, smart_search (searches MEMORY/conversation history only, not code), decision_trace, list_recaps, trigger_recap, restore_context, set_account_mode. Plan actions: capture_plan, get_plan, update_plan, list_plans. Use capture_plan for plans; do not use action='capture' with event_type='plan'. capture_plan requires structured steps and creates linked tasks by default with plan_id and plan_step_id. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats.".to_string(),
             category: ToolCategory::Session,
             annotations: ToolAnnotations::destructive(),
             is_pro: false,
@@ -15412,6 +16494,7 @@ impl ToolHandler for SessionTool {
                     "get_lessons",
                     "update_lesson",
                     "delete_lesson",
+                    "supersede_lesson",
                     "recall",
                     "ground",
                     "set_account_mode",
@@ -15536,7 +16619,41 @@ impl ToolHandler for SessionTool {
             )
             .string(
                 "lesson_id",
-                "Lesson ID or lookup text (for update_lesson/delete_lesson)",
+                "Lesson ID or lookup text (for update_lesson/delete_lesson/supersede_lesson)",
+                false,
+            )
+            .string(
+                "successor_id",
+                "Successor lesson ID or lookup text (for supersede_lesson)",
+                false,
+            )
+            .string(
+                "rationale",
+                "Why the decision was made (capture with event_type=decision; routes to the typed decision create)",
+                false,
+            )
+            .property(
+                "alternatives",
+                serde_json::json!({
+                    "type": "array",
+                    "description": "Alternatives considered for a decision: strings or {option, rejected_reason} objects",
+                    "items": {"anyOf": [{"type": "string"}, {"type": "object"}]}
+                }),
+                false,
+            )
+            .string(
+                "scope",
+                "Scope of a decision (capture with event_type=decision)",
+                false,
+            )
+            .number(
+                "confidence",
+                "Confidence in a decision, 0.0-1.0 (capture with event_type=decision)",
+                false,
+            )
+            .string(
+                "supersedes",
+                "Decision id or lookup text this decision replaces (capture with event_type=decision)",
                 false,
             )
             .string("since", "ISO timestamp (for delta)", false)

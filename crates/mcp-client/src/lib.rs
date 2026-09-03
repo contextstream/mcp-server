@@ -20,6 +20,7 @@ pub mod harness_readiness;
 pub mod harness_remote;
 pub mod ingest_guard;
 pub mod json;
+pub mod parity;
 pub mod retry;
 pub mod ticket;
 
@@ -188,6 +189,10 @@ pub use ingest_guard::{
     IngestRootRejection, IngestRootRejectionReason, ALLOW_BROAD_INGEST_ENV, SENSITIVE_DIR_NAMES,
 };
 pub use mcp_types::agentic::{ComplianceEventRecorded, ComplianceEventRequest};
+pub use parity::{
+    normalize_decisions_envelope, CreateDecisionParams, CreateLessonParams, DecisionActionParams,
+    ListDecisionsParams, ListLessonsParams, UpdateLessonParams, DECISION_ACTIONS,
+};
 pub use ticket::{
     append_ticket_extras, canonical_linked_item_kind, enrich_ticket_result_from_request,
     format_linked_summary, format_ticket_assignee_summary, format_ticket_linked_summary,

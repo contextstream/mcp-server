@@ -693,6 +693,19 @@ mod read_scope_resolution_tests {
             events: None,
             new_content: None,
             reason: None,
+            category: None,
+            sort: None,
+            status: None,
+            since: None,
+            offset: None,
+            source: None,
+            rationale: None,
+            alternatives: None,
+            confidence: None,
+            supersedes: None,
+            decision_id: None,
+            decision_action: None,
+            successor_id: None,
             task_id: None,
             description: None,
             priority: None,
@@ -1502,9 +1515,11 @@ mod schema_tests {
                 assert!(values.contains(&"search_archive")); // A7
                 assert!(values.contains(&"delete_transcript"));
 
-                // Verify total action count: 10+7+6+6+5+6+5+4 = 49
-                // (transcript actions grew from 4 to 5 with A7's search_archive)
-                assert_eq!(values.len(), 51, "Expected 51 memory actions");
+                // Verify total action count. Wave 3b added the typed
+                // `create_decision` and `decision_action` node actions.
+                assert!(values.contains(&"create_decision"));
+                assert!(values.contains(&"decision_action"));
+                assert_eq!(values.len(), 53, "Expected 53 memory actions");
             }
         }
 
@@ -2616,16 +2631,16 @@ mod registration_tests {
 
         assert_eq!(expected_tools.len(), 4);
 
-        // Unified memory tool supports 42 actions:
-        // - Node actions (8): search, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, decisions
+        // Unified memory tool supports 44 actions:
+        // - Node actions (10): search, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, decisions, create_decision, decision_action
         // - Event actions (7): create_event, get_event, update_event, delete_event, distill_event, list_events, import_batch
         // - Task actions (6): create_task, get_task, update_task, delete_task, list_tasks, reorder_tasks
         // - Todo actions (6): create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo
         // - Diagram actions (5): create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram
         // - Doc actions (6): create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap
         // - Transcript actions (4): list_transcripts, get_transcript, search_transcripts, delete_transcript
-        let action_count = 8 + 7 + 6 + 6 + 5 + 6 + 4;
-        assert_eq!(action_count, 42);
+        let action_count = 10 + 7 + 6 + 6 + 5 + 6 + 4;
+        assert_eq!(action_count, 44);
     }
 
     #[test]

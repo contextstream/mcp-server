@@ -4383,6 +4383,12 @@ mod validation_tests {
         let lesson_id = "11111111-1111-4111-8111-111111111111";
         let (base_url, server_thread) = spawn_ordered_http_server(vec![
             (
+                "GET".to_string(),
+                "/api/v1/lessons?".to_string(),
+                404,
+                serde_json::json!({"error": "not found"}).to_string(),
+            ),
+            (
                 "POST".to_string(),
                 "/api/v1/memory/search".to_string(),
                 200,
@@ -4425,6 +4431,7 @@ mod validation_tests {
         let text = extract_text(&result);
         assert!(text.contains("Resolved lesson"));
         assert!(text.contains("Lesson updated"));
+        assert!(text.contains("[PARTIAL] /lessons endpoint unavailable (404)"));
         server_thread.join().expect("mock server should complete");
     }
 
@@ -4432,6 +4439,12 @@ mod validation_tests {
     async fn test_session_tool_delete_lesson_resolves_lookup_and_deletes_event() {
         let lesson_id = "22222222-2222-4222-8222-222222222222";
         let (base_url, server_thread) = spawn_ordered_http_server(vec![
+            (
+                "GET".to_string(),
+                "/api/v1/lessons?".to_string(),
+                404,
+                serde_json::json!({"error": "not found"}).to_string(),
+            ),
             (
                 "POST".to_string(),
                 "/api/v1/memory/search".to_string(),
@@ -4473,6 +4486,7 @@ mod validation_tests {
         let text = extract_text(&result);
         assert!(text.contains("Resolved lesson"));
         assert!(text.contains("Lesson deleted"));
+        assert!(text.contains("[PARTIAL] /lessons endpoint unavailable (404)"));
         server_thread.join().expect("mock server should complete");
     }
 
@@ -4481,8 +4495,8 @@ mod validation_tests {
         let lesson_a = "33333333-3333-4333-8333-333333333333";
         let lesson_b = "44444444-4444-4444-8444-444444444444";
         let (base_url, server_thread) = spawn_ordered_http_server(vec![(
-            "POST".to_string(),
-            "/api/v1/memory/search".to_string(),
+            "GET".to_string(),
+            "/api/v1/lessons?".to_string(),
             200,
             serde_json::json!({
                 "results": [
@@ -5514,8 +5528,16 @@ mod rules_content_drift_tests {
             "notice must be tagged so the agent recognizes it"
         );
         assert!(
-            notice.contains("generate_rules(overwrite_existing=true)"),
-            "notice must include the recovery command"
+            notice.contains(crate::notices::RULES_REFRESH_COMMAND),
+            "notice must include the real recovery command, not a phantom tool"
+        );
+        assert!(
+            !notice.contains("generate_rules("),
+            "notice must not name a tool that does not exist"
+        );
+        assert!(
+            notice.contains(crate::notices::RULES_PREVIEW_CALL),
+            "notice must point at the tool that previews the rules content"
         );
         assert!(
             notice.contains("drifted"),
@@ -5539,7 +5561,8 @@ mod rules_content_drift_tests {
         // We can't tell whether it's stale, so we stay silent rather
         // than spamming `[RULES_NOTICE]` indefinitely. The first
         // `generate_rules()` re-write will install a marker and the
-        // check starts working from there.
+        // check starts working from there (the next `contextstream-mcp
+        // update` re-write installs one).
         rules_hash::set_canonical_rules_hash("aabbccddeeff0011");
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("CLAUDE.md");
@@ -5674,17 +5697,24 @@ mod typed_item_formatting_tests {
     }
 
     #[test]
-    fn format_typed_lessons_compact_uses_score_severity() {
+    fn format_typed_lessons_compact_keeps_stored_severity_and_relevance_separate() {
         let items = [
-            make_item("L", "Always run tests before commit", 0.9),
+            make_item(
+                "L",
+                "## Always run tests before commit\n**Severity:** high\n### Prevention\nRun cargo test first.",
+                0.9,
+            ),
             make_item("L", "Minor style issue", 0.3),
         ];
         let refs: Vec<&SmartContextItem> = items.iter().collect();
         let result = format_typed_lessons(&refs, true);
-        assert!(result.contains("[LESSONS_WARNING]"));
-        assert!(result.contains("severity=CRIT"));
-        assert!(result.contains("severity=note"));
-        assert!(result.contains("relevance=0.90"));
+        assert_eq!(result.matches("[LESSONS_WARNING]").count(), 2);
+        // Stored severity is rendered; relevance never becomes a severity.
+        assert!(result.contains(
+            "severity=high relevance=0.90 Always run tests before commit: Run cargo test first."
+        ));
+        assert!(result.contains("severity=unspecified relevance=0.30 Minor style issue"));
+        assert!(!result.contains("severity=CRIT"));
     }
 
     #[test]
@@ -5692,8 +5722,53 @@ mod typed_item_formatting_tests {
         let items = [make_item("L", "Always run tests before commit", 0.9)];
         let refs: Vec<&SmartContextItem> = items.iter().collect();
         let result = format_typed_lessons(&refs, false);
-        assert!(result.contains("[LESSONS_WARNING]"));
-        assert!(result.contains("relevance: 0.90"));
+        assert!(result.contains(crate::notices::LESSONS_WARNING_HEADER));
+        assert!(
+            result.contains("1. [UNSPECIFIED] Always run tests before commit (relevance: 0.90)")
+        );
+    }
+
+    #[test]
+    fn one_lessons_renderer_serves_typed_api_and_json_sources() {
+        use super::{
+            lesson_lines_from_api, lesson_lines_from_values, render_lessons_warning,
+            LessonWarningLine,
+        };
+        let api = vec![mcp_types::api::Lesson {
+            title: Some("Quote shell paths".to_string()),
+            trigger: Some("spaces in paths".to_string()),
+            prevention: Some("Always quote paths.".to_string()),
+            severity: Some("critical".to_string()),
+        }];
+        let from_api = lesson_lines_from_api(&api);
+        assert_eq!(from_api[0].severity.as_deref(), Some("critical"));
+        assert_eq!(from_api[0].relevance, None);
+
+        let warnings = json!([{
+            "lesson": {"id": "l-1", "title": "Quote shell paths", "severity": "critical", "prevention": "Always quote paths."},
+            "relevance": 0.83,
+            "reason": "matched keyword shell"
+        }]);
+        let from_values = lesson_lines_from_values(warnings.as_array().unwrap());
+        assert_eq!(from_values[0].id.as_deref(), Some("l-1"));
+        assert_eq!(from_values[0].relevance, Some(0.83));
+        assert_eq!(from_values[0].severity.as_deref(), Some("critical"));
+
+        let compact_api = render_lessons_warning(&from_api, true);
+        let compact_values = render_lessons_warning(&from_values, true);
+        assert!(compact_api.contains("[LESSONS_WARNING] severity=critical relevance=n/a Quote shell paths: Always quote paths."));
+        assert!(compact_values.contains("[LESSONS_WARNING] severity=critical relevance=0.83 Quote shell paths: Always quote paths. id=l-1"));
+
+        let superseded = LessonWarningLine {
+            title: "Old rule".to_string(),
+            guidance: String::new(),
+            severity: None,
+            relevance: None,
+            id: None,
+            superseded: true,
+        };
+        assert!(render_lessons_warning(&[superseded], true).contains("Old rule [superseded]"));
+        assert!(render_lessons_warning(&[], true).is_empty());
     }
 
     #[test]

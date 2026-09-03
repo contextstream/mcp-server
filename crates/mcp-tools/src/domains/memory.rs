@@ -28,6 +28,7 @@ use crate::domains::scope::{
 use crate::domains::session::{deserialize_string_or_vec, is_not_found_error};
 use crate::registry::ToolHandler;
 use crate::schema::SchemaBuilder;
+use mcp_client::SessionCaptureParams;
 
 /// Per-process warm cache for `memory(action="search")`. The short TTL
 /// preserves freshness; per-caller and per-entry bounds keep a shared gateway
@@ -965,6 +966,52 @@ fn collect_bulk_delete_matches(
         .into_iter()
         .filter(|m| m.exact)
         .collect()
+}
+
+enum LookupResolution<'a> {
+    None,
+    Single(&'a LookupMatch),
+    Ambiguous,
+}
+
+/// One clear winner (exact id/title, or a score gap above the ambiguity
+/// window) resolves; several close matches are ambiguous.
+fn classify_lookup_resolution(ranked: &[LookupMatch]) -> LookupResolution<'_> {
+    let Some(best) = ranked.first() else {
+        return LookupResolution::None;
+    };
+    let second_score = ranked.get(1).map(|item| item.score).unwrap_or_default();
+    if !best.exact && second_score > 0 && best.score <= second_score + 200 {
+        LookupResolution::Ambiguous
+    } else {
+        LookupResolution::Single(best)
+    }
+}
+
+/// `[CANDIDATES]` result for an ambiguous `supersede_node` lookup. Nothing
+/// is superseded; the agent retries with one of the listed ids.
+fn supersede_candidates_result(lookup: &str, matches: &[LookupMatch]) -> ToolResult {
+    let mut text = format!(
+        "[CANDIDATES] Multiple nodes match \"{lookup}\"; nothing was superseded. Retry supersede_node with node_id set to one of:\n"
+    );
+    let candidates: Vec<Value> = matches
+        .iter()
+        .take(5)
+        .enumerate()
+        .map(|(index, item)| {
+            text.push_str(&format!(
+                "{}. **{}** (id: {})\n",
+                index + 1,
+                item.title,
+                item.id
+            ));
+            serde_json::json!({"id": item.id, "title": item.title, "score": item.score})
+        })
+        .collect();
+    ToolResult::with_structured(
+        text.trim_end().to_string(),
+        serde_json::json!({"resolved": false, "lookup": lookup, "candidates": candidates}),
+    )
 }
 
 fn format_lookup_ambiguity(entity_name: &str, lookup: &str, matches: &[LookupMatch]) -> String {
@@ -2164,6 +2211,672 @@ pub struct MemoryDecisionsInput {
     /// TypeScript uses `category` for filtering decisions; accept both.
     pub category: Option<String>,
     pub limit: Option<i64>,
+    /// `recency` | `relevance` (server default: relevance).
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// `active` | `superseded` | `disputed` | `verified` | `all` (server default: active).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// ISO-8601 lower bound on the decision timestamp.
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Valid `sort` values for the typed decisions listing.
+pub const DECISION_SORTS: &[&str] = &["recency", "relevance"];
+/// Valid `status` filters for the typed decisions listing.
+pub const DECISION_STATUSES: &[&str] = &["active", "superseded", "disputed", "verified", "all"];
+
+fn normalize_decision_sort(raw: Option<&str>) -> Result<Option<String>> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => {
+            let lower = value.to_ascii_lowercase();
+            if DECISION_SORTS.contains(&lower.as_str()) {
+                Ok(Some(lower))
+            } else {
+                Err(Error::Validation(format!(
+                    "Invalid sort '{value}'. Use one of: {}",
+                    DECISION_SORTS.join(", ")
+                )))
+            }
+        }
+    }
+}
+
+fn normalize_decision_status(raw: Option<&str>) -> Result<Option<String>> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => {
+            let lower = value.to_ascii_lowercase();
+            if DECISION_STATUSES.contains(&lower.as_str()) {
+                Ok(Some(lower))
+            } else {
+                Err(Error::Validation(format!(
+                    "Invalid status '{value}'. Use one of: {}",
+                    DECISION_STATUSES.join(", ")
+                )))
+            }
+        }
+    }
+}
+
+fn decision_str<'a>(node: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        node.get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                node.get("metadata")
+                    .and_then(|meta| meta.get(*key))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+    })
+}
+
+/// Render one `[PARTIAL]` line per `degraded` entry of a typed envelope.
+pub(crate) fn render_degraded_lines(envelope: &Value) -> String {
+    let mut text = String::new();
+    if let Some(entries) = envelope.get("degraded").and_then(Value::as_array) {
+        for entry in entries {
+            let source = entry
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("server");
+            let detail = entry
+                .get("detail")
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("reason").and_then(Value::as_str))
+                .unwrap_or("degraded");
+            text.push_str(&format!("[PARTIAL] {source}: {detail}\n"));
+        }
+    }
+    text
+}
+
+/// Render the `decisions.v1` envelope as typed `[DECISION]` lines.
+///
+/// Missing typed fields render as `unknown` / `none`; nothing is inferred.
+pub(crate) fn render_decisions_envelope(
+    envelope: &Value,
+    requested_sort: Option<&str>,
+    requested_status: Option<&str>,
+) -> String {
+    let items = envelope
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let total = envelope
+        .get("total")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(items.len());
+    let sort = envelope
+        .get("sort")
+        .and_then(Value::as_str)
+        .or(requested_sort)
+        .unwrap_or("relevance");
+    let status_filter = requested_status.unwrap_or("active");
+    let mut text = String::new();
+
+    if items.is_empty() {
+        text.push_str(&format!(
+            "No decisions recorded yet (status={status_filter}).\n"
+        ));
+    } else {
+        text.push_str(&format!(
+            "[DECISIONS] {} of {} decision(s) (sort={sort}, status={status_filter}):\n\n",
+            items.len(),
+            total
+        ));
+        for (index, node) in items.iter().enumerate() {
+            let title = extract_display_title(node);
+            let status = decision_str(node, &["status"]).unwrap_or("unknown");
+            let freshness = decision_str(node, &["freshness"]).unwrap_or("unknown");
+            let category = decision_str(node, &["category"]).unwrap_or("none");
+            let id = decision_str(node, &["id", "node_id", "decision_id"]).unwrap_or("unknown");
+            text.push_str(&format!(
+                "{}. [DECISION] {title} — status={status} freshness={freshness} category={category} id={id}\n",
+                index + 1
+            ));
+            if let Some(content) = node
+                .get("content")
+                .or_else(|| node.get("details"))
+                .or_else(|| node.get("description"))
+                .and_then(Value::as_str)
+            {
+                let preview: String = content.chars().take(200).collect();
+                text.push_str(&format!("   {}\n", preview.replace('\n', " ")));
+            }
+            if let Some(rationale) = node
+                .get("structured")
+                .and_then(|value| value.get("rationale"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                let preview: String = rationale.chars().take(160).collect();
+                text.push_str(&format!("   rationale: {}\n", preview.replace('\n', " ")));
+            }
+            let mut links = Vec::new();
+            if let Some(value) = decision_str(node, &["superseded_by"]) {
+                links.push(format!("superseded_by={value}"));
+            }
+            if let Some(value) = decision_str(node, &["supersedes"]) {
+                links.push(format!("supersedes={value}"));
+            }
+            if let Some(value) = decision_str(node, &["source"]) {
+                links.push(format!("source={value}"));
+            }
+            if let Some(score) = node.get("rank_score").and_then(Value::as_f64) {
+                links.push(format!("rank_score={score:.2}"));
+            }
+            if !links.is_empty() {
+                text.push_str(&format!("   {}\n", links.join(" ")));
+            }
+            let created_at = node
+                .get("created_at")
+                .or_else(|| node.get("createdAt"))
+                .or_else(|| node.get("timestamp"))
+                .or_else(|| node.get("date"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            text.push_str(&format!("   Created: {created_at}\n\n"));
+        }
+        if let Some(next_offset) = envelope.get("next_offset").and_then(Value::as_u64) {
+            text.push_str(&format!(
+                "Next offset: {next_offset} (pass offset={next_offset} to continue).\n"
+            ));
+        }
+    }
+    text.push_str(&render_degraded_lines(envelope));
+    text
+}
+
+// ============================================================================
+// Typed decision create / actions (shared by memory() and session(capture))
+// ============================================================================
+
+/// Input for `memory(action="create_decision")` and the structured route of
+/// `session(action="capture", event_type="decision")`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateDecisionInput {
+    pub workspace_id: Option<String>,
+    pub project_id: Option<String>,
+    pub title: String,
+    pub content: Option<String>,
+    pub rationale: Option<String>,
+    /// Strings or `{option, rejected_reason}` objects.
+    pub alternatives: Option<Vec<Value>>,
+    pub scope: Option<String>,
+    pub confidence: Option<f64>,
+    /// Decision id or lookup text of the decision this one replaces.
+    pub supersedes: Option<String>,
+    pub category: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub session_id: Option<String>,
+}
+
+/// Input for `memory(action="decision_action")`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DecisionActionInput {
+    pub workspace_id: Option<String>,
+    pub project_id: Option<String>,
+    /// Decision id or lookup text.
+    pub decision_id: String,
+    /// `supersede` | `dispute` | `verify` | `invalidate` | `choose_successor`
+    pub decision_action: String,
+    /// Successor decision id or lookup text (supersede / choose_successor).
+    pub successor_id: Option<String>,
+    pub reason: Option<String>,
+    /// Title for a successor created inline by the server.
+    pub title: Option<String>,
+}
+
+/// True when any typed decision field is present, which routes a plain
+/// `capture(event_type="decision")` to the typed create endpoint.
+pub fn has_structured_decision_fields(
+    rationale: Option<&str>,
+    alternatives: Option<&[Value]>,
+    scope: Option<&str>,
+    confidence: Option<f64>,
+) -> bool {
+    rationale
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || alternatives.is_some_and(|value| !value.is_empty())
+        || scope.map(str::trim).is_some_and(|value| !value.is_empty())
+        || confidence.is_some()
+}
+
+fn normalize_alternatives(raw: &[Value]) -> Vec<Value> {
+    raw.iter()
+        .filter_map(|entry| match entry {
+            Value::String(option) => {
+                let option = option.trim();
+                (!option.is_empty()).then(|| serde_json::json!({ "option": option }))
+            }
+            Value::Object(_) => Some(entry.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn compose_decision_content(
+    content: &str,
+    rationale: Option<&str>,
+    alternatives: &[Value],
+    scope: Option<&str>,
+    confidence: Option<f64>,
+) -> String {
+    let mut text = content.trim().to_string();
+    if let Some(rationale) = rationale.map(str::trim).filter(|value| !value.is_empty()) {
+        text.push_str(&format!("\n\n### Rationale\n{rationale}"));
+    }
+    if !alternatives.is_empty() {
+        text.push_str("\n\n### Alternatives considered");
+        for alternative in alternatives {
+            let option = alternative
+                .get("option")
+                .and_then(Value::as_str)
+                .unwrap_or("(unnamed)");
+            match alternative.get("rejected_reason").and_then(Value::as_str) {
+                Some(reason) if !reason.trim().is_empty() => {
+                    text.push_str(&format!("\n- {option} — rejected: {reason}"))
+                }
+                _ => text.push_str(&format!("\n- {option}")),
+            }
+        }
+    }
+    if let Some(scope) = scope.map(str::trim).filter(|value| !value.is_empty()) {
+        text.push_str(&format!("\n\n**Scope:** {scope}"));
+    }
+    if let Some(confidence) = confidence {
+        text.push_str(&format!("\n**Confidence:** {confidence}"));
+    }
+    text
+}
+
+fn format_decision_candidates(lookup: &str, matches: &[LookupMatch]) -> String {
+    let mut text = format!(
+        "Multiple decisions match \"{}\". Retry with an explicit decision id:\n\n",
+        lookup
+    );
+    for (index, item) in matches.iter().take(5).enumerate() {
+        text.push_str(&format!(
+            "{}. **{}** (id: {})\n",
+            index + 1,
+            item.title,
+            item.id
+        ));
+    }
+    text
+}
+
+/// Resolve a decision id from a UUID or lookup text against the typed
+/// decisions listing (all statuses). A single high-confidence match wins;
+/// several close matches return the candidate list as a validation error.
+pub(crate) async fn resolve_decision_id(
+    client: &ContextStreamClient,
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    lookup: &str,
+) -> Result<(Uuid, Option<String>)> {
+    let lookup = lookup.trim();
+    if let Ok(id) = Uuid::parse_str(lookup) {
+        return Ok((id, None));
+    }
+    if lookup.is_empty() {
+        return Err(Error::Validation("decision_id is required".to_string()));
+    }
+    let envelope = client
+        .list_decisions_envelope(mcp_client::ListDecisionsParams {
+            workspace_id,
+            project_id,
+            query: Some(lookup.to_string()),
+            status: Some("all".to_string()),
+            limit: Some(25),
+            ..Default::default()
+        })
+        .await?;
+    let items = envelope
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let ranked = rank_lookup_matches(&items, lookup, &["title", "summary", "name"], 8);
+    let best = ranked.first().ok_or_else(|| {
+        Error::Validation(format!(
+            "No decisions match \"{lookup}\". Use memory(action=\"decisions\", query=\"{lookup}\", status=\"all\") to inspect candidates."
+        ))
+    })?;
+    let second_score = ranked.get(1).map(|item| item.score).unwrap_or_default();
+    if !best.exact && second_score > 0 && best.score <= second_score + 200 {
+        return Err(Error::Validation(format_decision_candidates(
+            lookup, &ranked,
+        )));
+    }
+    let note = (!best.exact).then(|| {
+        format!(
+            "Resolved decision \"{}\" to **{}** (id: {}).",
+            lookup, best.title, best.id
+        )
+    });
+    Ok((best.id, note))
+}
+
+/// Create a typed decision (`POST /memory/decisions`). When the server
+/// answers 404 the decision is stored as a decision event through
+/// `/memory/events` with the structured fields kept in `provenance`, and the
+/// tool text says so with a `[PARTIAL]` line.
+pub async fn execute_create_decision(
+    client: &ContextStreamClient,
+    session: &mcp_session::SessionManager,
+    input: CreateDecisionInput,
+) -> Result<ToolResult> {
+    let title = input.title.trim().to_string();
+    if title.is_empty() {
+        return Err(Error::Validation("title is required".to_string()));
+    }
+    let content = input
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            input
+                .rationale
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| Error::Validation("content (or rationale) is required".to_string()))?
+        .to_string();
+
+    let scope = resolve_write_scope(
+        client,
+        session,
+        input.workspace_id.as_deref(),
+        input.project_id.as_deref(),
+    )
+    .await?;
+
+    let alternatives = input
+        .alternatives
+        .as_deref()
+        .map(normalize_alternatives)
+        .filter(|list| !list.is_empty());
+    let supersedes = match input
+        .supersedes
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(lookup) => Some(
+            resolve_decision_id(client, scope.workspace_id, scope.project_id, lookup)
+                .await?
+                .0,
+        ),
+        None => None,
+    };
+    let decision_scope = input
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let params = mcp_client::CreateDecisionParams {
+        workspace_id: scope.workspace_id,
+        project_id: scope.project_id,
+        title: title.clone(),
+        content: content.clone(),
+        rationale: input.rationale.clone(),
+        alternatives: alternatives.clone(),
+        scope: decision_scope.clone(),
+        confidence: input.confidence,
+        supersedes,
+        category: input.category.clone(),
+        tags: input.tags.clone(),
+        session_id: input.session_id.clone(),
+    };
+
+    match client.create_decision(params).await {
+        Ok(mut result) => {
+            let id = result
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let mut extras = Vec::new();
+            if let Some(node_id) = result.get("node_id").and_then(Value::as_str) {
+                extras.push(format!("node_id: {node_id}"));
+            }
+            if let Some(event_id) = result.get("event_id").and_then(Value::as_str) {
+                extras.push(format!("event_id: {event_id}"));
+            }
+            let deduplicated = result
+                .get("deduplicated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut text = format!("Decision recorded: {title} (id: {id}");
+            if !extras.is_empty() {
+                text.push_str(&format!(", {}", extras.join(", ")));
+            }
+            text.push(')');
+            if deduplicated {
+                text.push_str(" — deduplicated against an existing decision");
+            }
+            text.push_str(".\nProgress: completed.");
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert(
+                    "operation_status".to_string(),
+                    serde_json::json!({"operation": "create_decision", "state": "completed"}),
+                );
+            }
+            let mut output = ToolResult::with_structured(text, result);
+            if let Some(note) = scope.note {
+                output = output.with_prefix(format!("{note}\n"));
+            }
+            Ok(output)
+        }
+        Err(err) if is_not_found_error(&err) => {
+            let alternatives_list = alternatives.clone().unwrap_or_default();
+            let composed = compose_decision_content(
+                &content,
+                input.rationale.as_deref(),
+                &alternatives_list,
+                decision_scope.as_deref(),
+                input.confidence,
+            );
+            let structured = serde_json::json!({
+                "rationale": input.rationale,
+                "alternatives": alternatives,
+                "scope": decision_scope,
+                "confidence": input.confidence,
+                "supersedes": supersedes,
+                "category": input.category,
+            });
+            let capture = client
+                .session_capture(SessionCaptureParams {
+                    workspace_id: scope.workspace_id,
+                    project_id: scope.project_id,
+                    event_type: Some("decision".to_string()),
+                    title: title.clone(),
+                    content: composed,
+                    tags: input.tags.clone(),
+                    session_id: input.session_id.clone(),
+                    provenance: Some(serde_json::json!({
+                        "source": "create_decision_fallback",
+                        "structured": structured,
+                    })),
+                    ..Default::default()
+                })
+                .await?;
+            let event_id = capture
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let text = format!(
+                "Decision recorded as a memory event: {title} (ID: {event_id}).\n[PARTIAL] typed decision endpoint unavailable (404 on POST /memory/decisions); stored via /memory/events with the structured fields in provenance.\nProgress: completed."
+            );
+            let structured = serde_json::json!({
+                "id": event_id,
+                "event_id": event_id,
+                "node_id": Value::Null,
+                "deduplicated": false,
+                "fallback": "memory_events",
+                "degraded": [{
+                    "source": "decisions_create",
+                    "detail": "POST /memory/decisions returned 404; decision stored as a memory event"
+                }],
+                "raw": capture,
+                "operation_status": {"operation": "create_decision", "state": "completed"},
+            });
+            let mut output = ToolResult::with_structured(text, structured);
+            if let Some(note) = scope.note {
+                output = output.with_prefix(format!("{note}\n"));
+            }
+            Ok(output)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Apply a lifecycle action to a decision (`POST /memory/decisions/:id/actions`).
+///
+/// Only `supersede` with a successor has an events-era fallback
+/// (`/memory/nodes/:id/supersede`); every other action fails honestly when
+/// the typed endpoint is absent.
+pub async fn execute_decision_action(
+    client: &ContextStreamClient,
+    session: &mcp_session::SessionManager,
+    input: DecisionActionInput,
+) -> Result<ToolResult> {
+    let action = input.decision_action.trim().to_ascii_lowercase();
+    if !mcp_client::DECISION_ACTIONS.contains(&action.as_str()) {
+        return Err(Error::Validation(format!(
+            "Invalid decision_action '{}'. Use one of: {}",
+            input.decision_action,
+            mcp_client::DECISION_ACTIONS.join(", ")
+        )));
+    }
+    let scope = resolve_read_scope(
+        client,
+        session,
+        input.workspace_id.as_deref(),
+        input.project_id.as_deref(),
+    )
+    .await?;
+    let (decision_id, resolution_note) = resolve_decision_id(
+        client,
+        scope.workspace_id,
+        scope.project_id,
+        &input.decision_id,
+    )
+    .await?;
+    let successor = match input
+        .successor_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(lookup) => Some(
+            resolve_decision_id(client, scope.workspace_id, scope.project_id, lookup)
+                .await?
+                .0,
+        ),
+        None => None,
+    };
+    if matches!(action.as_str(), "supersede" | "choose_successor")
+        && successor.is_none()
+        && input
+            .title
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    {
+        return Err(Error::Validation(format!(
+            "successor_id (or title for a new successor) is required for decision_action=\"{action}\""
+        )));
+    }
+
+    let mut text = String::new();
+    if let Some(note) = resolution_note {
+        text.push_str(&note);
+        text.push('\n');
+    }
+    let params = mcp_client::DecisionActionParams {
+        action: action.clone(),
+        successor_id: successor,
+        reason: input.reason.clone(),
+        title: input.title.clone(),
+    };
+    match client.decision_action(decision_id, params).await {
+        Ok(result) => {
+            let applied = result
+                .get("applied")
+                .and_then(Value::as_bool)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let decision = result.get("decision").cloned().unwrap_or(Value::Null);
+            let title = if decision.is_object() {
+                extract_display_title(&decision)
+            } else {
+                decision_id.to_string()
+            };
+            let status = decision_str(&decision, &["status"]).unwrap_or("unknown");
+            text.push_str(&format!(
+                "[DECISION_ACTION] {action} applied={applied} — {title} (id={decision_id}) status={status}\n"
+            ));
+            if let Some(successor) = successor {
+                text.push_str(&format!("   successor={successor}\n"));
+            }
+            text.push_str(&render_degraded_lines(&result));
+            let mut output = ToolResult::with_structured(text.trim_end().to_string(), result);
+            if let Some(note) = scope.note {
+                output = output.with_prefix(format!("{note}\n"));
+            }
+            Ok(output)
+        }
+        Err(err) if is_not_found_error(&err) => {
+            if action == "supersede" {
+                if let Some(successor) = successor {
+                    let linked = client
+                        .link_node_superseded_by(decision_id, successor)
+                        .await?;
+                    text.push_str(&format!(
+                        "[DECISION_ACTION] supersede applied via /memory/nodes/{decision_id}/supersede — {decision_id} → {successor}\n[PARTIAL] typed decision actions unavailable (404 on POST /memory/decisions/{decision_id}/actions); only the supersede link was written, status/freshness were not updated."
+                    ));
+                    let structured = serde_json::json!({
+                        "applied": true,
+                        "action": action,
+                        "decision_id": decision_id,
+                        "successor_id": successor,
+                        "fallback": "memory_nodes_supersede",
+                        "degraded": [{
+                            "source": "decision_actions",
+                            "detail": "POST /memory/decisions/:id/actions returned 404; used /memory/nodes/:id/supersede"
+                        }],
+                        "raw": linked,
+                    });
+                    return Ok(ToolResult::with_structured(text, structured));
+                }
+            }
+            Err(Error::Validation(format!(
+                "decision_action \"{action}\" needs the typed decisions endpoint (POST /memory/decisions/{decision_id}/actions), which this server does not expose (404). No fallback exists for this action; nothing was changed."
+            )))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Memory decisions tool handler.
@@ -2243,49 +2956,62 @@ impl ToolHandler for MemoryDecisionsTool {
             return Ok(ToolResult::with_structured(text, structured));
         }
 
-        // P0 #4 — DecisionsHot warm cache. 60 s TTL. Cache key folds
-        // (workspace, project, query) only — category + limit are
-        // common-case unset; if specified they're rare enough that
-        // a collision is acceptable. If we observe collisions in
-        // metrics we'll widen the key.
+        let sort = normalize_decision_sort(input.sort.as_deref())?;
+        let status = normalize_decision_status(input.status.as_deref())?;
+        let offset = input.offset.filter(|value| *value > 0);
+        let limit = input.limit.or(Some(50));
+        // The DecisionsHot warm cache folds (workspace, project, query) only;
+        // any typed filter bypasses it so a filtered call never serves a
+        // differently-filtered payload.
+        let cacheable = input.category.is_none()
+            && input.since.is_none()
+            && input.source.is_none()
+            && offset.is_none()
+            && sort.is_none()
+            && status.is_none();
+
         let query_clone = input.query.clone();
         let user_scope_token = super::atlas_warm_cache::current_user_scope_token();
-        let cached_response = if let Some(ws) = scope.workspace_id {
-            let scope_obj = mcp_types::atlas_layer::AtlasFederationScope {
-                workspace_id: ws,
-                project_id: scope.project_id,
-                scope_hash: super::atlas_warm_cache::scope_hash_for_decisions_hot(
-                    ws,
-                    user_scope_token.as_deref(),
-                    scope.project_id,
-                    query_clone.as_deref(),
-                ),
-                user_scope: user_scope_token.clone(),
-            };
-            super::atlas_warm_cache::try_lookup(
-                &self.atlas_layer,
-                mcp_types::atlas_layer::AtlasWarmCacheKind::DecisionsHot,
-                scope_obj,
-                150, // primary baseline ms
-            )
-            .await
-        } else {
-            None
-        };
-        let response = if let Some(bundle) = cached_response {
-            bundle.payload
-        } else {
-            let r = self
-                .client
-                .list_memory_decisions(
-                    scope.workspace_id,
-                    scope.project_id,
-                    input.query,
-                    input.category,
-                    input.limit.or(Some(50)),
+        let cached_response = match (cacheable, scope.workspace_id) {
+            (true, Some(ws)) => {
+                let scope_obj = mcp_types::atlas_layer::AtlasFederationScope {
+                    workspace_id: ws,
+                    project_id: scope.project_id,
+                    scope_hash: super::atlas_warm_cache::scope_hash_for_decisions_hot(
+                        ws,
+                        user_scope_token.as_deref(),
+                        scope.project_id,
+                        query_clone.as_deref(),
+                    ),
+                    user_scope: user_scope_token.clone(),
+                };
+                super::atlas_warm_cache::try_lookup(
+                    &self.atlas_layer,
+                    mcp_types::atlas_layer::AtlasWarmCacheKind::DecisionsHot,
+                    scope_obj,
+                    150, // primary baseline ms
                 )
-                .await?;
-            if let Some(ws) = scope.workspace_id {
+                .await
+            }
+            _ => None,
+        };
+        let envelope = if let Some(bundle) = cached_response {
+            mcp_client::normalize_decisions_envelope(bundle.payload, sort.as_deref())
+        } else {
+            let params = mcp_client::ListDecisionsParams {
+                workspace_id: scope.workspace_id,
+                project_id: scope.project_id,
+                query: input.query.clone(),
+                category: input.category.clone(),
+                sort: sort.clone(),
+                status: status.clone(),
+                since: input.since.clone(),
+                offset,
+                limit,
+                source: input.source.clone(),
+            };
+            let envelope = self.client.list_decisions_envelope(params).await?;
+            if let (true, Some(ws)) = (cacheable, scope.workspace_id) {
                 let scope_obj = mcp_types::atlas_layer::AtlasFederationScope {
                     workspace_id: ws,
                     project_id: scope.project_id,
@@ -2301,57 +3027,14 @@ impl ToolHandler for MemoryDecisionsTool {
                     self.atlas_layer.clone(),
                     mcp_types::atlas_layer::AtlasWarmCacheKind::DecisionsHot,
                     scope_obj,
-                    r.clone(),
+                    envelope.clone(),
                 );
             }
-            r
+            envelope
         };
 
-        let mut text = String::new();
-
-        let results = response
-            .get("results")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        if results.is_empty() {
-            text.push_str("No decisions recorded yet.");
-        } else {
-            // Log first result shape for debugging field name mismatches
-            if let Some(first) = results.first() {
-                tracing::debug!("decisions result shape: {:?}", first);
-            }
-
-            text.push_str(&format!("Found {} decisions:\n\n", results.len()));
-
-            for (i, node) in results.iter().enumerate() {
-                let title = extract_display_title(node);
-
-                text.push_str(&format!("{}. **{}**\n", i + 1, title));
-
-                if let Some(content) = node
-                    .get("content")
-                    .or_else(|| node.get("details"))
-                    .or_else(|| node.get("description"))
-                    .and_then(|v| v.as_str())
-                {
-                    let preview: String = content.chars().take(200).collect();
-                    text.push_str(&format!("   {}\n", preview.replace('\n', " ")));
-                }
-
-                let created_at = node
-                    .get("created_at")
-                    .or_else(|| node.get("createdAt"))
-                    .or_else(|| node.get("timestamp"))
-                    .or_else(|| node.get("date"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                text.push_str(&format!("   Created: {}\n\n", created_at));
-            }
-        }
-
-        let mut output = ToolResult::with_structured(text, response);
+        let text = render_decisions_envelope(&envelope, sort.as_deref(), status.as_deref());
+        let mut output = ToolResult::with_structured(text, envelope);
         if let Some(note) = scope.note.as_deref() {
             output = output.with_prefix(format!("{}\n", note));
         }
@@ -2373,10 +3056,20 @@ impl ToolHandler for MemoryDecisionsTool {
 
     fn input_schema(&self) -> Value {
         SchemaBuilder::new()
-            .description("List decisions")
+            .description("List decisions (typed decisions.v1 envelope)")
             .uuid("workspace_id", "Workspace ID", false)
             .uuid("project_id", "Project ID", false)
             .string("query", "Optional search query to filter decisions", false)
+            .string("category", "Optional category filter", false)
+            .string_enum("sort", "recency or relevance", DECISION_SORTS, false)
+            .string_enum(
+                "status",
+                "active (default), superseded, disputed, verified, or all",
+                DECISION_STATUSES,
+                false,
+            )
+            .string("since", "ISO-8601 lower bound on decision time", false)
+            .integer("offset", "Pagination offset", false)
             .integer("limit", "Maximum results", false)
             .build()
     }
@@ -2536,6 +3229,33 @@ pub struct MemoryInput {
     // Node supersede fields
     pub new_content: Option<String>,
     pub reason: Option<String>,
+    // Decision fields (decisions / create_decision / decision_action)
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub sort: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub alternatives: Option<Vec<Value>>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub supersedes: Option<String>,
+    #[serde(default)]
+    pub decision_id: Option<String>,
+    #[serde(default)]
+    pub decision_action: Option<String>,
+    #[serde(default)]
+    pub successor_id: Option<String>,
     // Task fields
     pub task_id: Option<String>,
     pub description: Option<String>,
@@ -3101,28 +3821,123 @@ impl ToolHandler for MemoryTool {
                 let node_id = input
                     .node_id
                     .ok_or_else(|| Error::Validation("node_id is required".to_string()))?;
-                let id = Uuid::parse_str(&node_id)
-                    .map_err(|_| Error::Validation("Invalid node_id UUID".to_string()))?;
                 let new_content = input
                     .new_content
                     .ok_or_else(|| Error::Validation("new_content is required".to_string()))?;
+                let node_lookup = node_id.trim().to_string();
+                let (id, resolution_note) = match Uuid::parse_str(&node_lookup) {
+                    Ok(id) => (id, None),
+                    Err(_) => {
+                        let listing = self
+                            .client
+                            .list_memory_nodes(
+                                workspace_id,
+                                project_id,
+                                input.node_type.clone(),
+                                Some(100),
+                            )
+                            .await?;
+                        let items = extract_collection_array(&listing)
+                            .cloned()
+                            .unwrap_or_default();
+                        let ranked = rank_lookup_matches(
+                            &items,
+                            &node_lookup,
+                            &["title", "summary", "name"],
+                            8,
+                        );
+                        match classify_lookup_resolution(&ranked) {
+                            LookupResolution::None => {
+                                return Err(Error::Validation(format!(
+                                    "No nodes match \"{node_lookup}\". Use memory(action=\"list_nodes\") or memory(action=\"search\", query=\"{node_lookup}\") to find the node id."
+                                )));
+                            }
+                            LookupResolution::Single(best) => {
+                                let note = (!best.exact).then(|| {
+                                    format!(
+                                        "Resolved node \"{}\" to **{}** (id: {}).",
+                                        node_lookup, best.title, best.id
+                                    )
+                                });
+                                (best.id, note)
+                            }
+                            LookupResolution::Ambiguous => {
+                                return Ok(supersede_candidates_result(&node_lookup, &ranked));
+                            }
+                        }
+                    }
+                };
                 let params = SupersedeMemoryNodeParams {
                     new_content,
                     reason: input.reason,
                 };
                 let result = self.client.supersede_memory_node(id, params).await?;
-                Ok(ToolResult::with_structured(
-                    "Node superseded successfully.".to_string(),
-                    result,
-                ))
+                let mut text = String::new();
+                if let Some(note) = resolution_note {
+                    text.push_str(&note);
+                    text.push('\n');
+                }
+                let new_id = result
+                    .get("new_node_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                text.push_str(&format!("Node superseded: {id} → {new_id}."));
+                Ok(ToolResult::with_structured(text, result))
+            }
+            "create_decision" => {
+                let title = input
+                    .title
+                    .ok_or_else(|| Error::Validation("title is required".to_string()))?;
+                let decision_input = CreateDecisionInput {
+                    workspace_id: input.workspace_id,
+                    project_id: input.project_id,
+                    title,
+                    content: input.content,
+                    rationale: input.rationale,
+                    alternatives: input.alternatives,
+                    scope: input.scope,
+                    confidence: input.confidence,
+                    supersedes: input.supersedes,
+                    category: input.category,
+                    tags: input.tags,
+                    session_id: input.session_id,
+                };
+                execute_create_decision(&self.client, self.session.as_ref(), decision_input).await
+            }
+            "decision_action" => {
+                let decision_id = input
+                    .decision_id
+                    .or(input.node_id)
+                    .ok_or_else(|| Error::Validation("decision_id is required".to_string()))?;
+                let decision_action = input.decision_action.ok_or_else(|| {
+                    Error::Validation(format!(
+                        "decision_action is required (one of: {})",
+                        mcp_client::DECISION_ACTIONS.join(", ")
+                    ))
+                })?;
+                let action_input = DecisionActionInput {
+                    workspace_id: input.workspace_id,
+                    project_id: input.project_id,
+                    decision_id,
+                    decision_action,
+                    successor_id: input.successor_id,
+                    reason: input.reason,
+                    title: input.title,
+                };
+                execute_decision_action(&self.client, self.session.as_ref(), action_input).await
             }
             "decisions" => {
                 let decisions_input = MemoryDecisionsInput {
                     workspace_id: input.workspace_id,
                     project_id: input.project_id,
                     query: input.query,
-                    category: None, // category accepted on standalone tool
+                    category: input.category,
                     limit: input.limit,
+                    sort: input.sort,
+                    status: input.status,
+                    since: input.since,
+                    offset: input.offset,
+                    source: input.source,
                 };
                 let tool =
                     MemoryDecisionsTool::with_session_and_atlas(
@@ -5314,7 +6129,7 @@ impl ToolHandler for MemoryTool {
             }
 
             _ => Err(Error::Validation(format!(
-                "Unknown action: {}. Available actions: search, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, decisions, timeline, summary, create_event, get_event, update_event, delete_event, distill_event, list_events, import_batch, create_task, get_task, update_task, delete_task, list_tasks, reorder_tasks, create_todo, get_todo, update_todo, delete_todo, complete_todo, list_todos, create_diagram, get_diagram, update_diagram, delete_diagram, list_diagrams, create_doc, get_doc, update_doc, delete_doc, list_docs, create_roadmap, list_transcripts, get_transcript, search_transcripts, search_archive, delete_transcript, team_tasks, team_todos, team_diagrams, team_docs, team_discussions, team_transcript_topics.",
+                "Unknown action: {}. Available actions: search, create_node, get_node, update_node, delete_node, list_nodes, supersede_node, decisions, create_decision, decision_action, timeline, summary, create_event, get_event, update_event, delete_event, distill_event, list_events, import_batch, create_task, get_task, update_task, delete_task, list_tasks, reorder_tasks, create_todo, get_todo, update_todo, delete_todo, complete_todo, list_todos, create_diagram, get_diagram, update_diagram, delete_diagram, list_diagrams, create_doc, get_doc, update_doc, delete_doc, list_docs, create_roadmap, list_transcripts, get_transcript, search_transcripts, search_archive, delete_transcript, team_tasks, team_todos, team_diagrams, team_docs, team_discussions, team_transcript_topics.",
                 input.action
             ))),
         }
@@ -5325,7 +6140,7 @@ impl ToolHandler for MemoryTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "memory".to_string(),
             title: "Memory Operations".to_string(),
-            description: "Persistent memory storage — docs, runbooks, specs, ADRs, RFCs, decisions, lessons, preferences, tasks, todos, knowledge nodes, transcripts. NOT for codebase/file search.\n\n⚠️ FINDING A DOC, RUNBOOK, SPEC, OR ARCHITECTURE NOTE? USE THIS TOOL — NOT `find`, `ls`, `grep`, or filesystem searches. ContextStream docs/runbooks/specs/decisions/lessons live ONLY in this tool's storage (Postgres + indexes), NEVER on disk under ~/.claude, /tmp, or the project tree. If the user mentions 'the doc on X', 'our runbook for Y', 'the design spec', 'the ADR/RFC', 'a postmortem', 'the architecture note', 'why we decided Z' — go through:\n  · memory(action=\"search\", query=\"…\") — hybrid across docs + nodes (try this first when unsure)\n  · memory(action=\"list_docs\", query=\"…\") then memory(action=\"get_doc\", doc_id=\"<id-or-title>\")\n  · memory(action=\"decisions\", query=\"…\") for past architectural decisions\n  · session(action=\"recall\", query=\"…\") if it might be in past-session transcripts\nFalling back to filesystem tools to find a ContextStream doc is wrong — the doc is not on disk.\n\nCodebase / source / files? Use the `search` tool, not memory.\n\nPlans? Use session(action=\"capture_plan\") instead of memory(action=\"create_event\", event_type=\"plan\"). Plan tasks should be created with plan_id, plan_step_id, priority/status, and detailed descriptions.\n\nDISTINCT FROM (don't use memory for these):\n· entity(kind=ticket|handoff|incident|release|experiment|goal|key_result|sprint|review|risk|backlog_view) — structured taxonomy entities with their own status timelines and per-kind fields. When the user says 'create a ticket', 'file a bug', 'create a handoff', 'log an incident', 'track this release' — that's `entity`, not memory(create_task).\n· session(action=capture_lesson|capture|recall|capture_plan) — lessons / decisions / snapshots / plans tied to the current session.\n· capsule(...) — portable context bundles for cross-agent handoffs.\n\nThis tool's `create_task` is a lightweight project-tracking todo with priority/status — NOT a 'ticket'. This tool's `create_task` should include plan_id and plan_step_id when the task belongs to a plan. This tool's `create_doc(doc_type=runbook)` is a versioned markdown doc — NOT a 'handoff'.\n\nNode actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node. Query actions: search (searches memory nodes and relevant docs together, not code), decisions, timeline, summary. Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch. Task actions: create_task, get_task, update_task, delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram (diagram_type values: flowchart, sequence, class, er, gantt, mindmap, pie, other — use sequence for API/request flows and er for data models). Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap (doc_type values: roadmap, spec, runbook, adr, rfc, postmortem, retro, release_notes, playbook, prd, user_story, persona, interview, design_spec, critique, glossary, oncall_schedule, slo, q_and_a, changelog, style_guide, general — `get_doc` accepts ID or natural-language title query). Transcript actions: list_transcripts, get_transcript, search_transcripts, search_archive, delete_transcript. `search_archive` queries the cold storage tier for transcripts past the hot-retention window (remote/hosted deployments only). Team actions: team_tasks, team_todos, team_diagrams, team_docs.".to_string(),
+            description: "Persistent memory storage — docs, runbooks, specs, ADRs, RFCs, decisions, lessons, preferences, tasks, todos, knowledge nodes, transcripts. NOT for codebase/file search.\n\n⚠️ FINDING A DOC, RUNBOOK, SPEC, OR ARCHITECTURE NOTE? USE THIS TOOL — NOT `find`, `ls`, `grep`, or filesystem searches. ContextStream docs/runbooks/specs/decisions/lessons live ONLY in this tool's storage (Postgres + indexes), NEVER on disk under ~/.claude, /tmp, or the project tree. If the user mentions 'the doc on X', 'our runbook for Y', 'the design spec', 'the ADR/RFC', 'a postmortem', 'the architecture note', 'why we decided Z' — go through:\n  · memory(action=\"search\", query=\"…\") — hybrid across docs + nodes (try this first when unsure)\n  · memory(action=\"list_docs\", query=\"…\") then memory(action=\"get_doc\", doc_id=\"<id-or-title>\")\n  · memory(action=\"decisions\", query=\"…\") for past architectural decisions\n  · session(action=\"recall\", query=\"…\") if it might be in past-session transcripts\nFalling back to filesystem tools to find a ContextStream doc is wrong — the doc is not on disk.\n\nCodebase / source / files? Use the `search` tool, not memory.\n\nPlans? Use session(action=\"capture_plan\") instead of memory(action=\"create_event\", event_type=\"plan\"). Plan tasks should be created with plan_id, plan_step_id, priority/status, and detailed descriptions.\n\nDISTINCT FROM (don't use memory for these):\n· entity(kind=ticket|handoff|incident|release|experiment|goal|key_result|sprint|review|risk|backlog_view) — structured taxonomy entities with their own status timelines and per-kind fields. When the user says 'create a ticket', 'file a bug', 'create a handoff', 'log an incident', 'track this release' — that's `entity`, not memory(create_task).\n· session(action=capture_lesson|capture|recall|capture_plan) — lessons / decisions / snapshots / plans tied to the current session.\n· capsule(...) — portable context bundles for cross-agent handoffs.\n\nThis tool's `create_task` is a lightweight project-tracking todo with priority/status — NOT a 'ticket'. This tool's `create_task` should include plan_id and plan_step_id when the task belongs to a plan. This tool's `create_doc(doc_type=runbook)` is a versioned markdown doc — NOT a 'handoff'.\n\nNode actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node (node_id accepts an id or lookup text; ambiguous text returns a [CANDIDATES] list). Query actions: search (searches memory nodes and relevant docs together, not code), decisions (typed envelope: query, category, sort=recency|relevance, status=active|superseded|disputed|verified|all, since, offset, limit), timeline, summary. Decision actions: create_decision (title, content, rationale, alternatives, scope, confidence, supersedes, category, tags), decision_action (decision_id or lookup text + decision_action=supersede|dispute|verify|invalidate|choose_successor, successor_id, reason). Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch. Task actions: create_task, get_task, update_task, delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram (diagram_type values: flowchart, sequence, class, er, gantt, mindmap, pie, other — use sequence for API/request flows and er for data models). Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap (doc_type values: roadmap, spec, runbook, adr, rfc, postmortem, retro, release_notes, playbook, prd, user_story, persona, interview, design_spec, critique, glossary, oncall_schedule, slo, q_and_a, changelog, style_guide, general — `get_doc` accepts ID or natural-language title query). Transcript actions: list_transcripts, get_transcript, search_transcripts, search_archive, delete_transcript. `search_archive` queries the cold storage tier for transcripts past the hot-retention window (remote/hosted deployments only). Team actions: team_tasks, team_todos, team_diagrams, team_docs.".to_string(),
             category: ToolCategory::Memory,
             annotations: ToolAnnotations::destructive(),
             is_pro: false,
@@ -5344,6 +6159,8 @@ impl ToolHandler for MemoryTool {
             "list_nodes",
             "supersede_node",
             "decisions",
+            "create_decision",
+            "decision_action",
             "timeline",
             "summary",
             // Event actions
@@ -5407,7 +6224,7 @@ impl ToolHandler for MemoryTool {
             )
             .string(
                 "scope",
-                "Todo scope for list_todos: all, personal, or team",
+                "Todo scope for list_todos (all, personal, team) or the decision scope for create_decision (free text)",
                 false,
             )
             .uuid(
@@ -5445,7 +6262,72 @@ impl ToolHandler for MemoryTool {
                 "New content (for supersede_node; also accepted as the body for update_node)",
                 false,
             )
-            .string("reason", "Reason (for supersede_node)", false)
+            .string("reason", "Reason (for supersede_node, decision_action)", false)
+            // Decision fields
+            .string(
+                "category",
+                "Decision category filter (decisions) or category to store (create_decision)",
+                false,
+            )
+            .string_enum(
+                "sort",
+                "Decision ordering (decisions): recency or relevance",
+                DECISION_SORTS,
+                false,
+            )
+            .string_enum(
+                "status",
+                "Decision status filter (decisions): active (default), superseded, disputed, verified, or all",
+                DECISION_STATUSES,
+                false,
+            )
+            .string(
+                "since",
+                "ISO-8601 lower bound on decision time (decisions)",
+                false,
+            )
+            .integer("offset", "Pagination offset (decisions)", false)
+            .string("source", "Decision source filter (decisions)", false)
+            .string(
+                "rationale",
+                "Why this decision was made (create_decision)",
+                false,
+            )
+            .property(
+                "alternatives",
+                serde_json::json!({
+                    "type": "array",
+                    "description": "Alternatives considered (create_decision): strings or {option, rejected_reason} objects",
+                    "items": {"anyOf": [{"type": "string"}, {"type": "object"}]}
+                }),
+                false,
+            )
+            .number(
+                "confidence",
+                "Confidence in the decision, 0.0-1.0 (create_decision)",
+                false,
+            )
+            .string(
+                "supersedes",
+                "Decision id or lookup text this decision replaces (create_decision)",
+                false,
+            )
+            .string(
+                "decision_id",
+                "Decision id or lookup text (decision_action)",
+                false,
+            )
+            .string_enum(
+                "decision_action",
+                "Lifecycle action to apply (decision_action)",
+                mcp_client::DECISION_ACTIONS,
+                false,
+            )
+            .string(
+                "successor_id",
+                "Successor decision id or lookup text (decision_action=supersede|choose_successor)",
+                false,
+            )
             // Event fields
             .string_enum(
                 "event_type",

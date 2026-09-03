@@ -107,6 +107,7 @@ pub enum KnownEditor {
     ChatGPTGateway,
     OpenAIResponses,
     ContextStreamCli,
+    ContextCode,
     Other,
 }
 
@@ -127,6 +128,7 @@ impl KnownEditor {
             Self::ChatGPTGateway => Some(HarnessId::ChatGptGateway),
             Self::OpenAIResponses => Some(HarnessId::OpenAiResponses),
             Self::ContextStreamCli => Some(HarnessId::ContextStreamCli),
+            Self::ContextCode => Some(HarnessId::ContextCode),
             Self::Other => None,
         }
     }
@@ -153,6 +155,7 @@ impl From<HarnessId> for KnownEditor {
             HarnessId::ChatGptGateway => Self::ChatGPTGateway,
             HarnessId::OpenAiResponses => Self::OpenAIResponses,
             HarnessId::ContextStreamCli => Self::ContextStreamCli,
+            HarnessId::ContextCode => Self::ContextCode,
         }
     }
 }

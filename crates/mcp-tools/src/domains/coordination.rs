@@ -18,6 +18,23 @@ const VALID_ACTIONS: &[&str] = &[
     "check_in", "inbox", "list", "get", "share", "ack", "dismiss", "settings",
 ];
 
+/// Coordination item kinds accepted by `POST /coordinations`. Validated
+/// client-side so a typo fails fast instead of round-tripping a 4xx.
+pub const VALID_KINDS: &[&str] = &[
+    "decision",
+    "constraint",
+    "warning",
+    "insight",
+    "blocker",
+    "request",
+    "handoff",
+    "note",
+];
+
+/// Default number of `[COORDINATION]` lines rendered by `context()` /
+/// `session(action="ground")` before the `… N more` trailer.
+pub const NOTICE_RENDER_LIMIT: usize = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinationInput {
     pub action: String,
@@ -138,11 +155,12 @@ impl ToolHandler for CoordinationTool {
                 let title = input
                     .title
                     .ok_or_else(|| Error::Validation("title is required for share".into()))?;
+                let kind = validate_kind(input.kind.as_deref())?;
                 let mut body = serde_json::json!({
                     "title": title,
                     "summary": input.summary,
                     "why_it_matters": input.why_it_matters,
-                    "kind": input.kind.unwrap_or_else(|| "knowledge".into()),
+                    "kind": kind,
                     "workspace_id": workspace_id,
                     "project_id": project_id,
                     "created_by": "agent",
@@ -250,9 +268,10 @@ impl ToolHandler for CoordinationTool {
                 "Why another workspace/project needs this.",
                 false,
             )
-            .string(
+            .string_enum(
                 "kind",
-                "decision | constraint | api_contract | risk | status | knowledge",
+                "Kind of shared item (defaults to note).",
+                VALID_KINDS,
                 false,
             )
             .array(
@@ -293,6 +312,95 @@ fn coordination_id(value: &Value) -> Option<&str> {
     payload.get("id").and_then(Value::as_str)
 }
 
+/// Validate a `kind` for `share`; `None` defaults to `note`.
+pub fn validate_kind(kind: Option<&str>) -> Result<String> {
+    let kind = kind.map(str::trim).filter(|value| !value.is_empty());
+    match kind {
+        None => Ok("note".to_string()),
+        Some(value) => {
+            let normalized = value.to_ascii_lowercase();
+            if VALID_KINDS.contains(&normalized.as_str()) {
+                Ok(normalized)
+            } else {
+                Err(Error::Validation(format!(
+                    "Invalid coordination kind '{value}'. Use one of: {}",
+                    VALID_KINDS.join(", ")
+                )))
+            }
+        }
+    }
+}
+
+fn notice_project_id(notice: &Value) -> Option<Uuid> {
+    ["from_project_id", "project_id", "source_project_id"]
+        .iter()
+        .find_map(|field| notice.get(*field).and_then(Value::as_str))
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+}
+
+/// Render `[COORDINATION]` lines for an inbox payload.
+///
+/// * At most `limit` notices are rendered; the rest collapse into a
+///   `… N more` trailer (using `total_pending` when the server reports it).
+/// * Notices from another project are prefixed `[other project]`.
+/// * The lines only *describe* the manual ack call. Nothing here (or in any
+///   caller) acks a notice automatically.
+pub fn format_coordination_notices(
+    inbox: &Value,
+    current_project_id: Option<Uuid>,
+    limit: usize,
+) -> String {
+    let payload = inbox_payload(inbox);
+    let notices = inbox_notices(inbox);
+    if notices.is_empty() {
+        return String::new();
+    }
+    let limit = limit.max(1);
+    let mut text = String::new();
+    for notice in notices.iter().take(limit) {
+        let reason = notice
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| notice.get("title").and_then(Value::as_str))
+            .unwrap_or("shared context");
+        let id = notice.get("id").and_then(Value::as_str).unwrap_or_default();
+        let other_project = match (notice_project_id(notice), current_project_id) {
+            (Some(from), Some(current)) => from != current,
+            (Some(_), None) => false,
+            (None, _) => false,
+        };
+        text.push_str(&crate::notices::coordination_notice_line(
+            reason,
+            id,
+            other_project,
+            notice.get("urgency").and_then(Value::as_str),
+        ));
+        text.push('\n');
+    }
+    let shown = notices.len().min(limit);
+    let total_pending = payload
+        .get("total_pending")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let truncated = payload
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let remaining = match total_pending {
+        Some(total) if total > shown => total - shown,
+        _ if notices.len() > shown => notices.len() - shown,
+        _ if truncated => 1,
+        _ => 0,
+    };
+    if remaining > 0 {
+        text.push_str(&crate::notices::coordination_more_line(remaining));
+        text.push('\n');
+    }
+    text
+}
+
 fn format_inbox(result: &Value) -> String {
     let data = inbox_payload(result);
     let notices = inbox_notices(result);
@@ -305,15 +413,10 @@ fn format_inbox(result: &Value) -> String {
         "Coordination inbox: {} notice(s), {items} item(s).",
         notices.len()
     );
-    for notice in notices.iter().take(5) {
-        let reason = notice
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("shared context");
-        let id = notice.get("id").and_then(Value::as_str).unwrap_or_default();
-        text.push_str(&format!(
-            "\n[COORDINATION] {reason} — ack via coordination(action=\"ack\", notice_id=\"{id}\")"
-        ));
+    let rendered = format_coordination_notices(result, None, NOTICE_RENDER_LIMIT);
+    if !rendered.is_empty() {
+        text.push('\n');
+        text.push_str(rendered.trim_end());
     }
     text
 }
@@ -394,6 +497,61 @@ mod tests {
         });
         assert_eq!(inbox_notices(&inbox).len(), 1);
         assert!(format_inbox(&inbox).contains("notice_id=\"n2\""));
+    }
+
+    #[test]
+    fn other_project_notices_are_prefixed_and_never_auto_acked() {
+        let current = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let inbox = json!({
+            "notices": [
+                {"id": "n1", "reason": "Shared decision", "from_project_id": current.to_string()},
+                {"id": "n2", "reason": "Schema freeze", "from_project_id": other.to_string(), "urgency": "high"},
+                {"id": "n3", "reason": "No project on notice"}
+            ]
+        });
+        let text = format_coordination_notices(&inbox, Some(current), 5);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            "[COORDINATION] Shared decision — ack via coordination(action=\"ack\", notice_id=\"n1\")"
+        );
+        assert!(lines[1].starts_with("[COORDINATION] [other project] Schema freeze (urgency=high)"));
+        assert!(!lines[2].contains("[other project]"));
+        // Only the manual ack call is described; no line claims an ack happened.
+        assert!(!text.to_ascii_lowercase().contains("acked"));
+    }
+
+    #[test]
+    fn truncation_trailer_counts_remaining_notices() {
+        let notices: Vec<Value> = (0..7)
+            .map(|index| json!({"id": format!("n{index}"), "reason": format!("reason {index}")}))
+            .collect();
+        let inbox = json!({"notices": notices, "truncated": true, "total_pending": 12});
+        let text = format_coordination_notices(&inbox, None, 5);
+        assert_eq!(text.matches("[COORDINATION]").count(), 6);
+        assert!(text.contains("[COORDINATION] … 7 more"));
+
+        let inbox = json!({"notices": [{"id": "a", "reason": "r"}], "truncated": true});
+        let text = format_coordination_notices(&inbox, None, 5);
+        assert!(text.contains("… 1 more"));
+
+        let inbox = json!({"notices": [{"id": "a", "reason": "r"}]});
+        assert!(!format_coordination_notices(&inbox, None, 5).contains("more"));
+        assert!(format_coordination_notices(&json!({"notices": []}), None, 5).is_empty());
+    }
+
+    #[test]
+    fn share_kind_is_validated_client_side() {
+        assert_eq!(validate_kind(None).unwrap(), "note");
+        assert_eq!(validate_kind(Some("Decision")).unwrap(), "decision");
+        for kind in VALID_KINDS {
+            assert_eq!(validate_kind(Some(kind)).unwrap(), *kind);
+        }
+        let err = validate_kind(Some("knowledge")).unwrap_err().to_string();
+        assert!(err.contains("Invalid coordination kind"));
+        assert!(err.contains("handoff"));
     }
 
     #[test]

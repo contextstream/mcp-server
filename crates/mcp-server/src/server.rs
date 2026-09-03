@@ -2354,6 +2354,10 @@ mod tests {
         "memory_create_event",
         "memory_create_task",
         "memory_create_todo",
+        // Wave 3b: the typed decisions read alias joined the consolidated
+        // surface. It was already registered but unreachable in the default
+        // (consolidated) mode, so no client loses a tool by this addition.
+        "memory_decisions",
         "memory_delete_doc",
         "memory_update_doc",
         "memory_update_task",
@@ -2410,8 +2414,11 @@ mod tests {
             "30f657e3f262c2fde96ce544d7dc78e3446a51dce8eebe19c6f5051793ba62e9",
         ),
         (
+            // Advanced in Wave 4b: `kind` became a validated enum
+            // (decision|constraint|warning|insight|blocker|request|handoff|note)
+            // so an invalid kind fails client-side instead of round-tripping.
             "coordination",
-            "e943310bd255e0b99063e09c232fff3e6a00c537f4d0191eb2fc668f33f57934",
+            "54c1a6f6df03f8c9d4c78538d7e4d82e24d61219eac2469d4add36ca9305a5ea",
         ),
         (
             "entity",
@@ -2448,8 +2455,13 @@ mod tests {
             "00334ef5436ef083b374795f098791bb29e4fdffe7bf4bf252c92c05cf7ca13d",
         ),
         (
+            // Advanced in Wave 3b: additive typed-decision inputs (sort,
+            // status, since, offset, source, rationale, alternatives,
+            // confidence, supersedes, decision_id, decision_action,
+            // successor_id) plus the `create_decision` / `decision_action`
+            // enum values. Every earlier field and action still accepted.
             "memory",
-            "e2b4682203559a4240f4980ac2571a52edcbaaefee8adf575ba2510e2424b3f6",
+            "7375ce8d9fb71cdb92141dc119db3e765cca73118ec740a493487b73b55f850f",
         ),
         (
             "memory_complete_todo",
@@ -2470,6 +2482,12 @@ mod tests {
         (
             "memory_create_todo",
             "ecd98039e145cbc1dd0815eb506a8ad66216398e38b436c067ee556380cf18fa",
+        ),
+        (
+            // New row in Wave 3b: `memory_decisions` was registered but
+            // unreachable in consolidated mode; it now reaches the surface.
+            "memory_decisions",
+            "f06803e365519667ae3a0aadc7d99b5e66203eb7c1013cc2392f5529e7e2c377",
         ),
         (
             "memory_delete_doc",
@@ -2500,8 +2518,11 @@ mod tests {
             "2a4168ef3625b67f01478562408bdacb6400c66ee6a23d8cf6ecfb2df3dba336",
         ),
         (
+            // Advanced in Wave 3b: additive inputs (successor_id, rationale,
+            // alternatives, scope, confidence, supersedes) plus the
+            // `supersede_lesson` action value. Additive only.
             "session",
-            "eba8ac7837f0d9a82a13928ac4f893307a2c4cd579e82cbf53525eaa54a7dcda",
+            "88135dfe81003211efaba8987e9a29d80ba2666b46ce5625cad352c75beeef39",
         ),
         (
             "session_capture",
@@ -2646,7 +2667,12 @@ mod tests {
     #[test]
     fn surface_name_manifests_match_the_v0_5_62_compatibility_baseline() {
         let broad = contextstream_tools_list(&test_registry(Config::default()), None);
-        assert_eq!(listed_names(&broad), V0_5_62_BROAD_TOOL_NAMES);
+        let broad_names = listed_names(&broad);
+        if broad_names != V0_5_62_BROAD_TOOL_NAMES {
+            // Printed so a deliberate baseline update can be copied verbatim.
+            eprintln!("BROAD_TOOL_NAMES actual = {broad_names:#?}");
+        }
+        assert_eq!(broad_names, V0_5_62_BROAD_TOOL_NAMES);
 
         let router = contextstream_tools_list(
             &test_registry(Config {
@@ -2683,6 +2709,14 @@ mod tests {
             .iter()
             .map(|(name, hash)| (*name, (*hash).to_string()))
             .collect();
+        if actual != expected {
+            // Printed so a deliberate baseline update can be copied verbatim.
+            for (name, hash) in &actual {
+                if !expected.iter().any(|(n, h)| n == name && h == hash) {
+                    eprintln!("SCHEMA_CONTRACT changed: (\"{name}\", \"{hash}\"),");
+                }
+            }
+        }
         assert_eq!(actual, expected);
     }
 

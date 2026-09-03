@@ -718,6 +718,17 @@ mod constants_tests {
     }
 
     #[test]
+    fn toolset_lists_name_no_phantom_tools() {
+        // `graph_decisions` was listed in the light toolset but never
+        // registered by any domain; `memory_decisions` is registered and must
+        // stay reachable in consolidated mode.
+        assert!(!LIGHT_TOOLS.contains(&"graph_decisions"));
+        assert!(!STANDARD_TOOLS.contains(&"graph_decisions"));
+        assert!(CONSOLIDATED_TOOLS.contains(&"memory_decisions"));
+        assert!(LIGHT_TOOLS.contains(&"memory_decisions"));
+    }
+
+    #[test]
     fn test_standard_tools() {
         assert!(STANDARD_TOOLS.contains(&"workspaces_create"));
         assert!(STANDARD_TOOLS.contains(&"reminders_create"));

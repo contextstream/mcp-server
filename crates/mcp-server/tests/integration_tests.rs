@@ -177,6 +177,103 @@ fn create_test_registry() -> mcp_tools::ToolRegistry {
 }
 
 // ============================================================================
+// Notice conformance
+// ============================================================================
+
+mod notice_conformance_tests {
+    use super::*;
+
+    /// Every tool named in any `[NOTICE]` text must exist on the MCP surface.
+    /// Guards against phantom actions such as the former `generate_rules()`.
+    #[test]
+    fn every_tool_named_in_a_notice_is_registered() {
+        let config = mcp_types::config::Config {
+            api_url: "http://127.0.0.1:9".to_string(),
+            consolidated_mode: false,
+            toolset: mcp_types::config::Toolset::Complete,
+            ..Default::default()
+        };
+        let client = mcp_client::ContextStreamClient::new(config.clone());
+        let session = Arc::new(mcp_session::SessionManager::new(
+            client.clone(),
+            config.clone(),
+        ));
+        let mut registry = mcp_tools::ToolRegistry::new(&config);
+        let index_keeper = Arc::new(mcp_tools::domains::index_keeper::IndexKeeper::new(
+            client.clone(),
+            session.clone(),
+            mcp_types::atlas_layer::noop_layer(),
+            mcp_types::acceleration_layer::noop_acceleration_layer(),
+        ));
+        mcp_tools::domains::session::register_session_tools(
+            &mut registry,
+            client.clone(),
+            session.clone(),
+            index_keeper.clone(),
+        );
+        mcp_tools::domains::search::register_search_tools(
+            &mut registry,
+            client.clone(),
+            session.clone(),
+            index_keeper,
+        );
+        mcp_tools::domains::memory::register_memory_tools(
+            &mut registry,
+            client.clone(),
+            session.clone(),
+        );
+        mcp_tools::domains::graph::register_graph_tools(
+            &mut registry,
+            client.clone(),
+            session.clone(),
+        );
+        mcp_tools::domains::entity::register_entity_tools(
+            &mut registry,
+            client.clone(),
+            session.clone(),
+        );
+        mcp_tools::domains::capsule::register_capsule_tools(&mut registry, client.clone());
+        mcp_tools::domains::coordination::register_coordination_tools(
+            &mut registry,
+            client.clone(),
+        );
+        mcp_tools::domains::help::register_help_tools(&mut registry, client.clone());
+        let registered: std::collections::HashSet<String> =
+            registry.names().into_iter().map(str::to_string).collect();
+
+        let mut templates = mcp_tools::notices::notice_templates();
+        // Grounding hints reference tools too; render one hit of each kind.
+        let recall = serde_json::json!({"results": [
+            {"score": 0.9, "metadata": {"title": "Old target", "event_type": "decision", "occurred_at": "2000-01-01T00:00:00Z"}},
+            {"score": 0.9, "id": "11111111-1111-4111-8111-111111111111", "metadata": {"title": "Runbook", "original_type": "doc"}},
+            {"score": 0.9, "metadata": {"title": "Prior session", "original_type": "transcript", "transcript_id": "22222222-2222-4222-8222-222222222222"}}
+        ]});
+        let hits = mcp_tools::domains::grounding::parse_recall_results_normalized(recall);
+        templates.push(mcp_tools::domains::grounding::format_grounding_block(
+            &hits, true,
+        ));
+        templates.push(mcp_tools::domains::grounding::format_grounding_block(
+            &hits, false,
+        ));
+
+        let mut checked = 0;
+        for template in templates {
+            for tool in mcp_tools::notices::notice_tool_names(&template) {
+                checked += 1;
+                assert!(
+                    registered.contains(&tool),
+                    "notice names unregistered tool `{tool}` in: {template}"
+                );
+            }
+        }
+        assert!(
+            checked >= 6,
+            "expected notice tool references, checked {checked}"
+        );
+    }
+}
+
+// ============================================================================
 // Authentication Tests
 // ============================================================================
 

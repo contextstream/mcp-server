@@ -693,7 +693,7 @@ pub fn scope_hash_for_recall(
     query: &str,
 ) -> String {
     format!(
-        "{}:{}:{}:recall:{}",
+        "{}:{}:{}:recall-provenance-v1:{}",
         workspace_id,
         user_scope.unwrap_or("shared"),
         project_id
@@ -714,7 +714,7 @@ pub fn scope_hash_for_ground(
     user_message: &str,
 ) -> String {
     format!(
-        "{}:{}:{}:ground:{}",
+        "{}:{}:{}:ground-provenance-v1:{}",
         workspace_id,
         user_scope.unwrap_or("shared"),
         project_id

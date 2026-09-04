@@ -16,6 +16,12 @@ pub struct GroundingHit {
     pub kind: String,
     pub title: String,
     pub score: f64,
+    /// Evidence is separate from legacy ordinal scores. Missing means unknown,
+    /// not calibrated confidence (including responses from older servers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_provenance: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_project_id: Option<String>,
     /// UUID or natural key for follow-up tool calls.
     pub id_hint: Option<String>,
     /// Source field used for `id_hint`, when known.
@@ -41,6 +47,88 @@ pub struct GroundingHit {
     /// Rendered note when the API flagged this decision as overlapping
     /// another session's decision on the same subject (`possible_conflicts`).
     pub conflict_note: Option<String>,
+}
+
+/// Missing evidence and unavailable retrieval are intentionally different.
+/// Selection is evaluated after immutable recall-cache lookup; session state
+/// never contaminates another session's cached evidence bundle.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroundingRecall {
+    pub hits: Vec<GroundingHit>,
+    pub status: String,
+    pub selection_mode: &'static str,
+    pub shadow_hit_count: usize,
+}
+
+impl GroundingRecall {
+    pub fn unavailable() -> Self {
+        Self::empty("unavailable")
+    }
+    pub fn disabled() -> Self {
+        Self::empty("disabled")
+    }
+    fn empty(status: &str) -> Self {
+        Self {
+            hits: vec![],
+            status: status.to_string(),
+            selection_mode: "shadow",
+            shadow_hit_count: 0,
+        }
+    }
+}
+
+pub fn recall_with_shadow(mut recall: Value, session_id: Option<&str>) -> GroundingRecall {
+    normalize_recall_payload(&mut recall);
+    if !recall.get("results").is_some_and(Value::is_array) {
+        return GroundingRecall::unavailable();
+    }
+    let hits = parse_recall_results(&recall);
+    // Work on a private copy. Current-session evidence can break ties only
+    // after the candidate proves query relevance. No active directives are
+    // synthesized from recalled approvals or old permission requests.
+    let mut shadow_payload = recall.clone();
+    if let Some(results) = shadow_payload
+        .get_mut("results")
+        .and_then(Value::as_array_mut)
+    {
+        let mut seen = std::collections::HashSet::new();
+        results.retain(|item| {
+            let identity =
+                metadata_str(item, "source_entity_id").or_else(|| metadata_str(item, "id"));
+            identity
+                .map(|id| {
+                    seen.insert((
+                        metadata_str(item, "source_project_id")
+                            .or_else(|| metadata_str(item, "project_id")),
+                        id,
+                    ))
+                })
+                .unwrap_or(true)
+        });
+        if let Some(session) = session_id.filter(|s| !s.is_empty()) {
+            results.sort_by(|a, b| {
+                item_score(b)
+                    .partial_cmp(&item_score(a))
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| {
+                        (metadata_str(a, "session_id").as_deref() != Some(session))
+                            .cmp(&(metadata_str(b, "session_id").as_deref() != Some(session)))
+                    })
+            });
+        }
+    }
+    let shadow = parse_recall_results_with_policy(&shadow_payload, true);
+    GroundingRecall {
+        status: if hits.is_empty() {
+            "no_evidence"
+        } else {
+            "available"
+        }
+        .to_string(),
+        shadow_hit_count: shadow.len(),
+        hits,
+        selection_mode: "shadow",
+    }
 }
 
 /// Appended to a compact decisions block when any entry carries a conflict flag.
@@ -373,6 +461,16 @@ fn id_hint(item: &Value) -> (Option<String>, Option<String>) {
 
 /// Extract ranked hits from a `/session/recall` JSON body.
 pub fn parse_recall_results(recall: &Value) -> Vec<GroundingHit> {
+    parse_recall_results_with_policy(recall, false)
+}
+
+/// Candidate admission policy is shadow-only until held-out qualification.
+/// Rank positions never count as relevance in the candidate policy. The
+/// legacy selector is retained for rollout comparison, not called confidence.
+pub fn parse_recall_results_with_policy(
+    recall: &Value,
+    enforce_evidence: bool,
+) -> Vec<GroundingHit> {
     let Some(results) = recall.get("results").and_then(|r| r.as_array()) else {
         return Vec::new();
     };
@@ -382,7 +480,38 @@ pub fn parse_recall_results(recall: &Value) -> Vec<GroundingHit> {
         .iter()
         .filter_map(|item| {
             let score = item_score(item);
-            if score < min {
+            let provenance = item
+                .get("retrieval_provenance")
+                .or_else(|| {
+                    item.get("metadata")
+                        .and_then(|m| m.get("retrieval_provenance"))
+                })
+                .cloned();
+            let ordinal = provenance
+                .as_ref()
+                .and_then(|p| p.get("score_kind"))
+                .and_then(Value::as_str)
+                == Some("rank_decay");
+            let admitted = if enforce_evidence {
+                // Coverage is observable lexical evidence, not a probability.
+                // Similarity is deliberately not thresholded without calibration.
+                ordinal
+                    && provenance
+                        .as_ref()
+                        .and_then(|p| p.get("query_term_matches"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        > 0
+                    && provenance
+                        .as_ref()
+                        .and_then(|p| p.get("lexical_query_coverage"))
+                        .and_then(Value::as_f64)
+                        .map(|c| c.is_finite() && c >= 0.4 && c <= 1.0)
+                        .unwrap_or(false)
+            } else {
+                score.is_finite() && score >= min
+            };
+            if !admitted {
                 return None;
             }
             let (id_hint, id_field) = id_hint(item);
@@ -428,6 +557,9 @@ pub fn parse_recall_results(recall: &Value) -> Vec<GroundingHit> {
                 kind,
                 title,
                 score,
+                retrieval_provenance: provenance,
+                source_project_id: metadata_str(item, "source_project_id")
+                    .or_else(|| metadata_str(item, "project_id")),
                 search_keywords,
                 id_hint,
                 id_field,
@@ -442,12 +574,14 @@ pub fn parse_recall_results(recall: &Value) -> Vec<GroundingHit> {
         })
         .collect();
 
-    hits.sort_by(|a, b| {
-        a.historical_status_claim
-            .cmp(&b.historical_status_claim)
-            .then_with(|| a.stale.cmp(&b.stale))
-            .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
-    });
+    if !enforce_evidence {
+        hits.sort_by(|a, b| {
+            a.historical_status_claim
+                .cmp(&b.historical_status_claim)
+                .then_with(|| a.stale.cmp(&b.stale))
+                .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
+        });
+    }
     hits.truncate(grounding_max_hits());
     hits
 }
@@ -496,6 +630,18 @@ fn format_hit_label(hit: &GroundingHit) -> String {
             hit.title.chars().take(100).collect::<String>()
         )
     }
+}
+
+fn format_score_label(hit: &GroundingHit) -> String {
+    if let Some(provenance) = &hit.retrieval_provenance {
+        if provenance.get("score_kind").and_then(Value::as_str) == Some("rank_decay") {
+            return match provenance.get("rank").and_then(Value::as_u64) {
+                Some(rank) => format!("rank {rank}; relevance uncalibrated"),
+                None => "ranked; relevance uncalibrated".to_string(),
+            };
+        }
+    }
+    format!("score {:.2}; relevance uncalibrated", hit.score)
 }
 
 fn recall_hint_keywords(hit: &GroundingHit, item_keywords: &str) -> String {
@@ -636,10 +782,10 @@ pub fn format_grounding_block(hits: &[GroundingHit], compact: bool) -> String {
         for (i, hit) in hits.iter().enumerate() {
             let hint = action_hint(hit, &hit.search_keywords);
             out.push_str(&format!(
-                "\n  {}. {} (score {:.2}) → {}",
+                "\n  {}. {} ({}) → {}",
                 i + 1,
                 format_hit_label(hit),
-                hit.score,
+                format_score_label(hit),
                 hint
             ));
             if hit.historical_status_claim {
@@ -668,11 +814,11 @@ pub fn format_grounding_block(hits: &[GroundingHit], compact: bool) -> String {
         for (i, hit) in hits.iter().enumerate() {
             let hint = action_hint(hit, &hit.search_keywords);
             out.push_str(&format!(
-                "{}. **{}** (kind: `{}`, score: {:.2})\n   → {}\n",
+                "{}. **{}** (kind: `{}`, {})\n   → {}\n",
                 i + 1,
                 format_hit_label(hit),
                 hit.kind,
-                hit.score,
+                format_score_label(hit),
                 hint
             ));
             if hit.historical_status_claim {
@@ -1062,6 +1208,8 @@ mod tests {
             kind: "transcript".to_string(),
             title: "Fix auth".to_string(),
             score: 0.8,
+            retrieval_provenance: None,
+            source_project_id: None,
             id_hint: Some("abc".to_string()),
             id_field: Some("transcript_id".to_string()),
             date: None,
@@ -1110,6 +1258,8 @@ mod tests {
             kind: "doc".to_string(),
             title: "Prod DB migration runbook".to_string(),
             score: 0.95,
+            retrieval_provenance: None,
+            source_project_id: None,
             id_hint: Some("doc-1".to_string()),
             id_field: Some("doc_id".to_string()),
             date: Some("2026-05-10".to_string()),
@@ -1188,4 +1338,81 @@ mod tests {
         assert!(block.contains("feed(action=\"ground\", query=\""));
         assert!(!block.contains("get_event"));
     }
+}
+#[test]
+fn ordinal_rank_is_not_relevance_and_shadow_does_not_change_serving() {
+    let payload = serde_json::json!({"results":[{
+        "id":"unrelated", "title":"Old unrelated work", "score":0.95,
+        "metadata":{"retrieval_provenance":{"score_kind":"rank_decay","rank":1,
+            "query_term_matches":0,"lexical_query_coverage":0.0}}
+    }]});
+    let outcome = recall_with_shadow(payload.clone(), None);
+    assert_eq!(outcome.hits.len(), 1);
+    assert_eq!(outcome.shadow_hit_count, 0);
+    assert_eq!(outcome.selection_mode, "shadow");
+    let text = format_grounding_block(&outcome.hits, true);
+    assert!(text.contains("rank 1; relevance uncalibrated"));
+    assert!(!text.contains("score 0.95"));
+    assert!(parse_recall_results_with_policy(&payload, true).is_empty());
+}
+
+#[test]
+fn matching_historical_evidence_is_not_demoted_in_candidate_policy() {
+    let payload = serde_json::json!({"results":[
+        {"id":"old", "title":"Prior routing failure", "event_type":"session_snapshot", "score":0.95,
+         "content":"Work stopped, no output", "occurred_at":"2025-01-01T00:00:00Z",
+         "metadata":{"retrieval_provenance":{"score_kind":"rank_decay","rank":1,"query_term_matches":2,"lexical_query_coverage":1.0}}},
+        {"id":"new", "title":"Current routing", "score":0.92,
+         "metadata":{"retrieval_provenance":{"score_kind":"rank_decay","rank":2,"query_term_matches":1,"lexical_query_coverage":0.5}}}
+    ]});
+    let hits = parse_recall_results_with_policy(&payload, true);
+    assert_eq!(hits[0].id_hint.as_deref(), Some("old"));
+    assert!(hits[0].stale);
+}
+
+#[test]
+fn retrieval_outcomes_distinguish_empty_from_unavailable() {
+    let empty = recall_with_shadow(serde_json::json!({"results":[]}), None);
+    assert_eq!(empty.status, "no_evidence");
+    assert_eq!(GroundingRecall::unavailable().status, "unavailable");
+    assert_eq!(GroundingRecall::disabled().status, "disabled");
+}
+
+#[test]
+fn legacy_scores_are_served_compatibly_but_not_candidate_evidence() {
+    let payload =
+        serde_json::json!({"results":[{"id":"legacy","title":"Legacy hit","score":0.99}]});
+    let outcome = recall_with_shadow(payload, None);
+    assert_eq!(outcome.hits.len(), 1);
+    assert_eq!(outcome.shadow_hit_count, 0);
+    assert!(format_grounding_block(&outcome.hits, true).contains("relevance uncalibrated"));
+}
+
+#[test]
+fn candidate_deduplication_respects_source_project() {
+    let item = |project| {
+        serde_json::json!({"id":"projection","source_entity_id":"canonical","source_project_id":project,
+        "title":"Matching work","score":0.95,"metadata":{"retrieval_provenance":{
+            "score_kind":"rank_decay","query_term_matches":1,"lexical_query_coverage":1.0}}})
+    };
+    let outcome = recall_with_shadow(
+        serde_json::json!({"results":[item("a"),item("a"),item("b")]}),
+        None,
+    );
+    assert_eq!(outcome.hits.len(), 3);
+    assert_eq!(outcome.shadow_hit_count, 2);
+}
+
+#[test]
+fn session_selection_never_changes_cached_or_served_bundle() {
+    let payload = serde_json::json!({"results":[
+        {"id":"one", "title":"Same subject", "score":0.95,"session_id":"one",
+         "metadata":{"retrieval_provenance":{"score_kind":"rank_decay","query_term_matches":1,"lexical_query_coverage":1.0}}},
+        {"id":"two", "title":"Same subject", "score":0.92,"session_id":"two",
+         "metadata":{"retrieval_provenance":{"score_kind":"rank_decay","query_term_matches":1,"lexical_query_coverage":1.0}}}
+    ]});
+    let a = recall_with_shadow(payload.clone(), Some("one"));
+    let b = recall_with_shadow(payload.clone(), Some("two"));
+    assert_eq!(a.hits[0].id_hint, b.hits[0].id_hint);
+    assert_eq!(payload["results"][0]["id"], "one");
 }

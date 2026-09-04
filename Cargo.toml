@@ -28,10 +28,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml_edit = "0.22"
+toml_edit = "0.25"
 
 # JSON Schema generation (Zod equivalent)
-schemars = "0.8"
+schemars = "1.2"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -47,7 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Metrics — recorder + exporter. Per-crate `metrics = "0.24"` pins
 # resolve to the same minor as this re-export, so the global recorder
 # installed in mcp-server catches every macro emission across the tree.
-metrics-exporter-prometheus = { version = "0.16", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # Concurrent data structures
 dashmap = "6.1"
@@ -63,30 +63,30 @@ futures = "0.3"
 async-trait = "0.1"
 
 # HTTP server
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip"] }
 hyper = { version = "1.8", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
-jsonwebtoken = "9.3"
+jsonwebtoken = "11.0"
 
 # Static hash maps
-phf = { version = "0.11", features = ["macros"] }
+phf = { version = "0.14", features = ["macros"] }
 
 # Regex (lightweight)
 regex-lite = "0.1"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 tiktoken-rs = "=0.12.0"
 
 # Environment and config
 dotenvy = "0.15"
-directories = "5.0"
+directories = "6.0"
 ignore = "0.4"
 fs2 = "0.4"
 
 # Filesystem watching (content-freshness watcher: `contextstream-mcp watch`)
-notify = "6"
+notify = "8"
 
 # Workspace crates
 mcp-types = { version = "=1.0.2", path = "crates/mcp-types" }
@@ -97,12 +97,12 @@ mcp-model-registry = { version = "=1.0.2", path = "crates/mcp-model-registry" }
 mcp-acceleration-products = { version = "=1.0.2", path = "crates/mcp-acceleration-products" }
 
 # Testing
-mockall = "0.13"
+mockall = "0.15"
 tokio-test = "0.4"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 wiremock = "0.6"
 tempfile = "3.14"
-fake = { version = "3.0", features = ["derive"] }
+fake = { version = "5.1", features = ["derive"] }
 
 [profile.release]
 lto = true

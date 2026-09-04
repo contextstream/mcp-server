@@ -19,17 +19,22 @@ const VALID_ACTIONS: &[&str] = &[
 ];
 
 /// Coordination item kinds accepted by `POST /coordinations`. Validated
-/// client-side so a typo fails fast instead of round-tripping a 4xx.
+/// client-side so a typo fails fast instead of round-tripping a 4xx. This
+/// list must stay identical to the API's `coordination_kind_is_known`
+/// (decision, constraint, api_contract, risk, status, knowledge): 1.0.1
+/// shipped a divergent list and every `status`/`risk` share failed client-side
+/// while the only client-accepted default (`note`) was refused by the API.
 pub const VALID_KINDS: &[&str] = &[
     "decision",
     "constraint",
-    "warning",
-    "insight",
-    "blocker",
-    "request",
-    "handoff",
-    "note",
+    "api_contract",
+    "risk",
+    "status",
+    "knowledge",
 ];
+
+/// Kind applied when `share` omits one; matches the API default.
+pub const DEFAULT_KIND: &str = "knowledge";
 
 /// Default number of `[COORDINATION]` lines rendered by `context()` /
 /// `session(action="ground")` before the `… N more` trailer.
@@ -307,7 +312,7 @@ impl ToolHandler for CoordinationTool {
             )
             .string_enum(
                 "kind",
-                "Kind of shared item (defaults to note).",
+                "Kind of shared item: decision, constraint, api_contract, risk, status, or knowledge (defaults to knowledge; mirrors the API enum).",
                 VALID_KINDS,
                 false,
             )
@@ -349,11 +354,11 @@ fn coordination_id(value: &Value) -> Option<&str> {
     payload.get("id").and_then(Value::as_str)
 }
 
-/// Validate a `kind` for `share`; `None` defaults to `note`.
+/// Validate a `kind` for `share`; `None` defaults to [`DEFAULT_KIND`].
 pub fn validate_kind(kind: Option<&str>) -> Result<String> {
     let kind = kind.map(str::trim).filter(|value| !value.is_empty());
     match kind {
-        None => Ok("note".to_string()),
+        None => Ok(DEFAULT_KIND.to_string()),
         Some(value) => {
             let normalized = value.to_ascii_lowercase();
             if VALID_KINDS.contains(&normalized.as_str()) {
@@ -600,14 +605,31 @@ mod tests {
 
     #[test]
     fn share_kind_is_validated_client_side() {
-        assert_eq!(validate_kind(None).unwrap(), "note");
+        assert_eq!(validate_kind(None).unwrap(), "knowledge");
         assert_eq!(validate_kind(Some("Decision")).unwrap(), "decision");
+        assert_eq!(validate_kind(Some(" STATUS ")).unwrap(), "status");
         for kind in VALID_KINDS {
             assert_eq!(validate_kind(Some(kind)).unwrap(), *kind);
         }
-        let err = validate_kind(Some("knowledge")).unwrap_err().to_string();
-        assert!(err.contains("Invalid coordination kind"));
-        assert!(err.contains("handoff"));
+        // The API enum (handlers/coordination.rs coordination_kind_is_known).
+        assert_eq!(
+            VALID_KINDS,
+            &[
+                "decision",
+                "constraint",
+                "api_contract",
+                "risk",
+                "status",
+                "knowledge"
+            ]
+        );
+        for legacy in [
+            "note", "warning", "insight", "blocker", "request", "handoff",
+        ] {
+            let err = validate_kind(Some(legacy)).unwrap_err().to_string();
+            assert!(err.contains("Invalid coordination kind"), "{legacy}");
+            assert!(err.contains("knowledge"), "{legacy}");
+        }
     }
 
     #[test]

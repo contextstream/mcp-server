@@ -2427,7 +2427,7 @@ mod tests {
             // Coordination v2: action=reply with `message`, and `metadata`
             // (git branch/commit) on check_in as judge evidence.
             "coordination",
-            "e43264391eb4844f2ee5d0255dae9d9808d290d4fecd3ac13c5427b5af04ddef",
+            "63a765be22dd19970e1aed0999ea8befd851514cad42382deee364e808707c37",
         ),
         (
             "entity",

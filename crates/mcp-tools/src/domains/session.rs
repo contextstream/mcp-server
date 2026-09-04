@@ -3790,12 +3790,41 @@ fn routing_scope_key(
     project_id: Option<Uuid>,
     folder_path: Option<&str>,
 ) -> String {
-    format!(
-        "{}|{}|{}",
-        workspace_id.map(|id| id.to_string()).unwrap_or_default(),
-        project_id.map(|id| id.to_string()).unwrap_or_default(),
-        folder_path.unwrap_or_default()
+    routing_scope_key_for_caller(
+        workspace_id,
+        project_id,
+        folder_path,
+        super::atlas_warm_cache::current_user_scope_token().as_deref(),
     )
+}
+
+fn routing_scope_key_for_caller(
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    folder_path: Option<&str>,
+    caller: Option<&str>,
+) -> String {
+    // A shared hosted process must never let one caller silence another's
+    // grounding/setup warning. With no verified caller identity, do not damp.
+    let Some(caller) = caller.filter(|value| !value.is_empty()) else {
+        return format!("unscoped:{}", Uuid::new_v4());
+    };
+    serde_json::json!([caller, workspace_id, project_id, folder_path]).to_string()
+}
+
+#[test]
+fn routing_notices_are_caller_partitioned_and_anonymous_calls_are_not_damped() {
+    let ws = Some(Uuid::new_v4());
+    let first = routing_scope_key_for_caller(ws, None, Some("/checkout"), Some("caller-a"));
+    let second = routing_scope_key_for_caller(ws, None, Some("/checkout"), Some("caller-b"));
+    assert_ne!(first, second);
+    assert!(routing_notice_first_emission(&first, "notice", false));
+    assert!(!routing_notice_first_emission(&first, "notice", false));
+    assert!(routing_notice_first_emission(&second, "notice", false));
+    assert_ne!(
+        routing_scope_key_for_caller(ws, None, None, None),
+        routing_scope_key_for_caller(ws, None, None, None)
+    );
 }
 
 /// Records the notice for this scope and reports whether it should be shown.
@@ -6534,7 +6563,7 @@ async fn proactive_grounding_recall(
     session_id: Option<&str>,
 ) -> crate::domains::grounding::GroundingRecall {
     use crate::domains::grounding::{
-        grounding_enabled, grounding_timeout, recall_with_shadow, GroundingRecall,
+        grounding_enabled, grounding_timeout, recall_with_rollout, GroundingRecall,
     };
 
     if !grounding_enabled() || workspace_id.is_none() {
@@ -6573,7 +6602,13 @@ async fn proactive_grounding_recall(
     )
     .await
     {
-        return recall_with_shadow(bundle.payload.clone(), session_id);
+        return recall_with_rollout(
+            bundle.payload.clone(),
+            session_id,
+            user_scope,
+            Some(&ws.to_string()),
+            project_id.map(|p| p.to_string()).as_deref(),
+        );
     }
 
     // Cache miss: run the primary recall, then write back so the next
@@ -6593,7 +6628,13 @@ async fn proactive_grounding_recall(
                 scope_for_put,
                 value.clone(),
             );
-            recall_with_shadow(value, session_id)
+            recall_with_rollout(
+                value,
+                session_id,
+                user_scope,
+                Some(&ws.to_string()),
+                project_id.map(|p| p.to_string()).as_deref(),
+            )
         }
         _ => GroundingRecall::unavailable(),
     }
@@ -7514,6 +7555,7 @@ impl ToolHandler for ContextTool {
         // Saving an exchange is an API side effect; a cache hit would silently
         // skip transcript capture, so this lane is deliberately uncached.
         let context_cache_allowed = context_cache_identity.is_some()
+            && !crate::domains::grounding::rollout::configured()
             && !checkout_scope_unroutable
             && !should_save
             && context_cache_messages_admissible(
@@ -9184,11 +9226,10 @@ impl ToolHandler for ContextTool {
         let mut structured = serde_json::to_value(&result).unwrap_or_default();
         attach_scope_guidance(&mut structured, workspace_id, project_id);
         if let Some(obj) = structured.as_object_mut() {
-            obj.insert("grounding_retrieval".to_string(), serde_json::json!({
-                "status": grounding_recall.status,
-                "selection_mode": grounding_recall.selection_mode,
-                "shadow_hit_count": grounding_recall.shadow_hit_count,
-            }));
+            obj.insert(
+                "grounding_retrieval".to_string(),
+                grounding_recall.telemetry(),
+            );
             obj.insert(
                 "grounding_freshness".to_string(),
                 serde_json::to_value(crate::domains::grounding::grounding_summary(
@@ -15242,6 +15283,7 @@ fn composite_ground_cache_eligible(input: &SessionInput, has_checkout: bool) -> 
     // session-selected evidence. Only the default, workspace-only read is
     // shareable by its existing key. Raw recall remains independently cached.
     !has_checkout
+        && !crate::domains::grounding::rollout::configured()
         && input.session_id.is_none()
         && input.include_decisions.unwrap_or(true)
         && input.include_related.unwrap_or(true)
@@ -15249,12 +15291,20 @@ fn composite_ground_cache_eligible(input: &SessionInput, has_checkout: bool) -> 
 
 #[test]
 fn composite_ground_cache_never_reuses_checkout_or_session_state() {
-    let input: SessionInput = serde_json::from_value(serde_json::json!({"action":"ground"})).unwrap();
+    let input: SessionInput =
+        serde_json::from_value(serde_json::json!({"action":"ground"})).unwrap();
     assert!(composite_ground_cache_eligible(&input, false));
     assert!(!composite_ground_cache_eligible(&input, true));
-    for extra in [serde_json::json!({"session_id":"session-a"}), serde_json::json!({"include_decisions":false}), serde_json::json!({"include_related":false})] {
+    for extra in [
+        serde_json::json!({"session_id":"session-a"}),
+        serde_json::json!({"include_decisions":false}),
+        serde_json::json!({"include_related":false}),
+    ] {
         let mut value = serde_json::json!({"action":"ground"});
-        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         let input: SessionInput = serde_json::from_value(value).unwrap();
         assert!(!composite_ground_cache_eligible(&input, false));
     }
@@ -15285,7 +15335,8 @@ async fn execute_session_ground(
     )
     .await?;
 
-    let cache_eligible = composite_ground_cache_eligible(input, session.state().await.folder_path.is_some());
+    let cache_eligible =
+        composite_ground_cache_eligible(input, session.state().await.folder_path.is_some());
 
     // P0 #3 — Atlas regional warm cache for `session(ground)`. Ground
     // is a composite of recall + docs + decisions + lessons + skills
@@ -15395,7 +15446,13 @@ async fn execute_session_ground(
         .map(str::to_string)
         .or(session_state.session_id.clone());
 
-    let grounding_recall = crate::domains::grounding::recall_with_shadow(recall_val.clone(), session_id.as_deref());
+    let grounding_recall = crate::domains::grounding::recall_with_rollout(
+        recall_val.clone(),
+        session_id.as_deref(),
+        user_scope_token.as_deref(),
+        scope.workspace_id.map(|id| id.to_string()).as_deref(),
+        scope.project_id.map(|id| id.to_string()).as_deref(),
+    );
     let hits = &grounding_recall.hits;
 
     let mut text =
@@ -15496,7 +15553,7 @@ async fn execute_session_ground(
 
     let structured = serde_json::json!({
         "recall": recall_val,
-        "grounding_retrieval": {"status":grounding_recall.status,"selection_mode":grounding_recall.selection_mode,"shadow_hit_count":grounding_recall.shadow_hit_count},
+        "grounding_retrieval": grounding_recall.telemetry(),
         "decision_matches": decisions,
         "doc_matches": docs,
         "lessons": lessons,
@@ -15515,7 +15572,10 @@ async fn execute_session_ground(
     // P0 #3 — write-back: cache the formatted ToolResult so the same
     // user_message within the next 5 min serves from regional Atlas
     // instead of the ~1.5s composite. Idempotent per turn.
-    if let Some(ws) = scope.workspace_id.filter(|_| cache_eligible && grounding_recall.status != "unavailable") {
+    if let Some(ws) = scope
+        .workspace_id
+        .filter(|_| cache_eligible && grounding_recall.status != "unavailable")
+    {
         if let Ok(payload) = serde_json::to_value(&final_result) {
             let cache_scope = mcp_types::atlas_layer::AtlasFederationScope {
                 workspace_id: ws,

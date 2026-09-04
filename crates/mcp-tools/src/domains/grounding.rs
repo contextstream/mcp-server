@@ -10,6 +10,9 @@ use serde_json::Value;
 use std::cmp::Ordering;
 use std::time::Duration;
 
+#[path = "grounding_rollout.rs"]
+pub mod rollout;
+
 /// One ranked prior-work hit for display in `context()`.
 #[derive(Debug, Clone, Serialize)]
 pub struct GroundingHit {
@@ -58,6 +61,8 @@ pub struct GroundingRecall {
     pub status: String,
     pub selection_mode: &'static str,
     pub shadow_hit_count: usize,
+    pub legacy_hit_count: usize,
+    pub overlap_count: usize,
 }
 
 impl GroundingRecall {
@@ -73,11 +78,52 @@ impl GroundingRecall {
             status: status.to_string(),
             selection_mode: "shadow",
             shadow_hit_count: 0,
+            legacy_hit_count: 0,
+            overlap_count: 0,
         }
     }
 }
 
-pub fn recall_with_shadow(mut recall: Value, session_id: Option<&str>) -> GroundingRecall {
+pub fn recall_with_shadow(recall: Value, session_id: Option<&str>) -> GroundingRecall {
+    recall_with_mode(recall, session_id, "shadow")
+}
+
+pub fn recall_with_rollout(
+    recall: Value,
+    session_id: Option<&str>,
+    subject: Option<&str>,
+    workspace: Option<&str>,
+    project: Option<&str>,
+) -> GroundingRecall {
+    // A custom presentation threshold/cap has not passed the frozen evaluator.
+    let mode = if grounding_max_hits() == 5 && grounding_min_score() == 0.4 {
+        rollout::serving_mode(subject, workspace, project)
+    } else {
+        "shadow"
+    };
+    recall_with_mode(recall, session_id, mode)
+}
+
+/// Offline evaluator uses the exact runtime selector, not a reimplementation.
+/// This does not change the process-wide serving configuration.
+pub fn replay_selection(
+    recall: Value,
+    session_id: Option<&str>,
+    candidate: bool,
+) -> GroundingRecall {
+    recall_with_mode(
+        recall,
+        session_id,
+        if candidate { "evaluation" } else { "shadow" },
+    )
+}
+
+fn recall_with_mode(
+    mut recall: Value,
+    session_id: Option<&str>,
+    mode: &'static str,
+) -> GroundingRecall {
+    let started = std::time::Instant::now();
     normalize_recall_payload(&mut recall);
     if !recall.get("results").is_some_and(Value::is_array) {
         return GroundingRecall::unavailable();
@@ -123,6 +169,30 @@ pub fn recall_with_shadow(mut recall: Value, session_id: Option<&str>) -> Ground
         }
     }
     let shadow = parse_recall_results_with_policy(&shadow_payload, true);
+    let legacy_hit_count = hits.len();
+    let overlap_count = shadow
+        .iter()
+        .filter(|candidate| {
+            candidate.id_hint.is_some()
+                && hits.iter().any(|legacy| {
+                    legacy.id_hint == candidate.id_hint
+                        && legacy.source_project_id == candidate.source_project_id
+                })
+        })
+        .count();
+    let shadow_hit_count = shadow.len();
+    let hits = if mode == "shadow" { hits } else { shadow };
+    // Only closed labels and counts leave the selection layer as telemetry.
+    // No query, title, subject, project, source id or recalled content is logged.
+    tracing::debug!(
+        policy_revision = rollout::POLICY_REVISION,
+        selection_mode = mode,
+        legacy_hit_count,
+        candidate_hit_count = shadow_hit_count,
+        overlap_count,
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "grounding selection"
+    );
     GroundingRecall {
         status: if hits.is_empty() {
             "no_evidence"
@@ -130,9 +200,19 @@ pub fn recall_with_shadow(mut recall: Value, session_id: Option<&str>) -> Ground
             "available"
         }
         .to_string(),
-        shadow_hit_count: shadow.len(),
+        shadow_hit_count,
+        legacy_hit_count,
+        overlap_count,
         hits,
-        selection_mode: "shadow",
+        selection_mode: mode,
+    }
+}
+
+impl GroundingRecall {
+    pub fn telemetry(&self) -> Value {
+        serde_json::json!({"status":self.status,"selection_mode":self.selection_mode,
+            "policy_revision":rollout::POLICY_REVISION,"shadow_hit_count":self.shadow_hit_count,
+            "legacy_hit_count":self.legacy_hit_count,"overlap_count":self.overlap_count})
     }
 }
 
@@ -1432,4 +1512,30 @@ fn session_selection_never_changes_cached_or_served_bundle() {
     let b = recall_with_shadow(payload.clone(), Some("two"));
     assert_eq!(a.hits[0].id_hint, b.hits[0].id_hint);
     assert_eq!(payload["results"][0]["id"], "one");
+}
+
+#[test]
+fn candidate_rejects_priority_flooding_without_hiding_relevant_evidence() {
+    let mut results: Vec<Value> = (0..100).map(|i| serde_json::json!({
+        "id":format!("irrelevant-{i}"),"title":"Priority reminder","priority":"critical","score":0.99,
+        "retrieval_provenance":{"score_kind":"rank_decay","query_term_matches":0,"lexical_query_coverage":0.0}
+    })).collect();
+    results.push(serde_json::json!({"id":"relevant","title":"Matching current work","score":0.3,
+        "retrieval_provenance":{"score_kind":"rank_decay","query_term_matches":1,"lexical_query_coverage":1.0}}));
+    let selected = replay_selection(serde_json::json!({"results":results}), None, true);
+    assert_eq!(selected.hits.len(), 1);
+    assert_eq!(selected.hits[0].id_hint.as_deref(), Some("relevant"));
+    assert_eq!(selected.legacy_hit_count, 5);
+    assert_eq!(selected.overlap_count, 0);
+}
+
+#[test]
+fn selection_telemetry_cannot_export_query_or_source_identity() {
+    let outcome = recall_with_shadow(
+        serde_json::json!({"results":[{"id":"private-id","title":"private title","score":0.9,"project_id":"private-project"}]}),
+        None,
+    );
+    let metrics = outcome.telemetry().to_string();
+    assert!(!metrics.contains("private"));
+    assert!(metrics.contains(rollout::POLICY_REVISION));
 }

@@ -6531,13 +6531,14 @@ async fn proactive_grounding_recall(
     workspace_id: Option<Uuid>,
     project_id: Option<Uuid>,
     user_message: &str,
-) -> Vec<crate::domains::grounding::GroundingHit> {
+    session_id: Option<&str>,
+) -> crate::domains::grounding::GroundingRecall {
     use crate::domains::grounding::{
-        grounding_enabled, grounding_timeout, parse_recall_results_normalized,
+        grounding_enabled, grounding_timeout, recall_with_shadow, GroundingRecall,
     };
 
     if !grounding_enabled() || workspace_id.is_none() {
-        return Vec::new();
+        return GroundingRecall::disabled();
     }
     let ws = workspace_id.unwrap();
 
@@ -6572,7 +6573,7 @@ async fn proactive_grounding_recall(
     )
     .await
     {
-        return parse_recall_results_normalized(bundle.payload.clone());
+        return recall_with_shadow(bundle.payload.clone(), session_id);
     }
 
     // Cache miss: run the primary recall, then write back so the next
@@ -6592,9 +6593,9 @@ async fn proactive_grounding_recall(
                 scope_for_put,
                 value.clone(),
             );
-            parse_recall_results_normalized(value)
+            recall_with_shadow(value, session_id)
         }
-        _ => Vec::new(),
+        _ => GroundingRecall::unavailable(),
     }
 }
 
@@ -7879,6 +7880,7 @@ impl ToolHandler for ContextTool {
                 let ws_g = workspace_id;
                 let pid_g = project_id;
                 let q_g = user_message_for_relevance.clone();
+                let sid_g = context_session_id.clone();
                 Some(tokio::spawn(async move {
                     with_caller_auth(
                         session_key_g,
@@ -7893,6 +7895,7 @@ impl ToolHandler for ContextTool {
                                 ws_g,
                                 pid_g,
                                 &q_g,
+                                sid_g.as_deref(),
                             )
                             .await
                         },
@@ -8280,15 +8283,16 @@ impl ToolHandler for ContextTool {
             crate::domains::grounding::grounding_timeout()
         };
 
-        let grounding_hits = if let Some(handle) = grounding_future {
+        let grounding_recall = if let Some(handle) = grounding_future {
             match tokio::time::timeout(proactive_bound, handle).await {
                 Ok(Ok(hits)) => hits,
-                Ok(Err(_)) => Vec::new(), // join error / panic
-                Err(_) => Vec::new(),     // bound elapsed; task continues
+                Ok(Err(_)) => crate::domains::grounding::GroundingRecall::unavailable(),
+                Err(_) => crate::domains::grounding::GroundingRecall::unavailable(),
             }
         } else {
-            Vec::new()
+            crate::domains::grounding::GroundingRecall::disabled()
         };
+        let grounding_hits = &grounding_recall.hits;
 
         let coordination_inbox: Option<Value> = if let Some(handle) = coordination_future {
             match tokio::time::timeout(proactive_bound, handle).await {
@@ -8355,8 +8359,11 @@ impl ToolHandler for ContextTool {
         let openai_agentic_surface =
             config.tool_surface_profile == ToolSurfaceProfile::OpenaiAgentic;
 
-        let grounding_fragment =
+        let mut grounding_fragment =
             crate::domains::grounding::format_grounding_block(&grounding_hits, is_compact);
+        if grounding_recall.status == "unavailable" {
+            grounding_fragment.push_str("\n[GROUNDING_UNAVAILABLE] Prior-work retrieval did not complete. This is not evidence that no prior work exists. Preserve scope and read-before-edit requirements; use the authorized local-discovery fallback when applicable.\n");
+        }
 
         // Build response text
         let mut text = String::new();
@@ -9177,6 +9184,11 @@ impl ToolHandler for ContextTool {
         let mut structured = serde_json::to_value(&result).unwrap_or_default();
         attach_scope_guidance(&mut structured, workspace_id, project_id);
         if let Some(obj) = structured.as_object_mut() {
+            obj.insert("grounding_retrieval".to_string(), serde_json::json!({
+                "status": grounding_recall.status,
+                "selection_mode": grounding_recall.selection_mode,
+                "shadow_hit_count": grounding_recall.shadow_hit_count,
+            }));
             obj.insert(
                 "grounding_freshness".to_string(),
                 serde_json::to_value(crate::domains::grounding::grounding_summary(
@@ -15358,10 +15370,14 @@ async fn execute_session_ground(
         .map(str::to_string)
         .or(session_state.session_id.clone());
 
-    let hits = crate::domains::grounding::parse_recall_results_normalized(recall_val.clone());
+    let grounding_recall = crate::domains::grounding::recall_with_shadow(recall_val.clone(), session_id.as_deref());
+    let hits = &grounding_recall.hits;
 
     let mut text =
         String::from("[GROUNDING_BUNDLE] One-shot prior-work pack for this message.\n\n");
+    if grounding_recall.status == "unavailable" {
+        text.push_str("[GROUNDING_UNAVAILABLE] Prior-work retrieval was unavailable; do not interpret this as no prior work.\n\n");
+    }
     if let Ok(inbox) = client
         .coordination_inbox(
             scope.workspace_id,
@@ -15455,6 +15471,7 @@ async fn execute_session_ground(
 
     let structured = serde_json::json!({
         "recall": recall_val,
+        "grounding_retrieval": {"status":grounding_recall.status,"selection_mode":grounding_recall.selection_mode,"shadow_hit_count":grounding_recall.shadow_hit_count},
         "decision_matches": decisions,
         "doc_matches": docs,
         "lessons": lessons,
@@ -15473,7 +15490,7 @@ async fn execute_session_ground(
     // P0 #3 — write-back: cache the formatted ToolResult so the same
     // user_message within the next 5 min serves from regional Atlas
     // instead of the ~1.5s composite. Idempotent per turn.
-    if let Some(ws) = scope.workspace_id {
+    if let Some(ws) = scope.workspace_id.filter(|_| grounding_recall.status != "unavailable") {
         if let Ok(payload) = serde_json::to_value(&final_result) {
             let cache_scope = mcp_types::atlas_layer::AtlasFederationScope {
                 workspace_id: ws,

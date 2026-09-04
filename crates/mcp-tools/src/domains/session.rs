@@ -8402,7 +8402,7 @@ impl ToolHandler for ContextTool {
             config.tool_surface_profile == ToolSurfaceProfile::OpenaiAgentic;
 
         let mut grounding_fragment =
-            crate::domains::grounding::format_grounding_block(&grounding_hits, is_compact);
+            crate::domains::grounding::format_grounding_block(grounding_hits, is_compact);
         if grounding_recall.status == "unavailable" {
             grounding_fragment.push_str("\n[GROUNDING_UNAVAILABLE] Prior-work retrieval did not complete. This is not evidence that no prior work exists. Preserve scope and read-before-edit requirements; use the authorized local-discovery fallback when applicable.\n");
         }
@@ -9216,7 +9216,7 @@ impl ToolHandler for ContextTool {
             .or(folder_path_for_grounding.as_deref());
         if let Some(fp) = grounding_emit_path {
             let summary = if crate::domains::grounding::grounding_enabled() {
-                crate::domains::grounding::grounding_summary(&grounding_hits)
+                crate::domains::grounding::grounding_summary(grounding_hits)
             } else {
                 mcp_session::grounding_state::GroundingSummary::default()
             };
@@ -9232,14 +9232,12 @@ impl ToolHandler for ContextTool {
             );
             obj.insert(
                 "grounding_freshness".to_string(),
-                serde_json::to_value(crate::domains::grounding::grounding_summary(
-                    &grounding_hits,
-                ))
-                .unwrap_or_else(|_| serde_json::json!({})),
+                serde_json::to_value(crate::domains::grounding::grounding_summary(grounding_hits))
+                    .unwrap_or_else(|_| serde_json::json!({})),
             );
             obj.insert(
                 "grounding_hits".to_string(),
-                serde_json::to_value(&grounding_hits).unwrap_or_else(|_| serde_json::json!([])),
+                serde_json::to_value(grounding_hits).unwrap_or_else(|_| serde_json::json!([])),
             );
             if let Some(inbox) = coordination_inbox {
                 obj.insert("coordination_inbox".to_string(), inbox);
@@ -15519,7 +15517,7 @@ async fn execute_session_ground(
         text.push('\n');
     }
     text.push_str(&crate::domains::grounding::format_grounding_block(
-        &hits, false,
+        hits, false,
     ));
     if !decisions.is_empty() {
         text.push('\n');
@@ -15559,7 +15557,7 @@ async fn execute_session_ground(
         "lessons": lessons,
         "skills": skills,
         "recent_media": recent_media,
-        "grounding_hits": serde_json::to_value(&hits).unwrap_or_else(|_| serde_json::json!([])),
+        "grounding_hits": serde_json::to_value(hits).unwrap_or_else(|_| serde_json::json!([])),
         "feed_items": feed_items,
     });
 

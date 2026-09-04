@@ -93,6 +93,11 @@ pub fn recall_with_shadow(mut recall: Value, session_id: Option<&str>) -> Ground
     {
         let mut seen = std::collections::HashSet::new();
         results.retain(|item| {
+            // An irrelevant projection must not consume the canonical identity
+            // before a later projection proves query relevance.
+            if !candidate_evidence_admits(retrieval_provenance(item)) {
+                return false;
+            }
             let identity =
                 metadata_str(item, "source_entity_id").or_else(|| metadata_str(item, "id"));
             identity
@@ -464,6 +469,26 @@ pub fn parse_recall_results(recall: &Value) -> Vec<GroundingHit> {
     parse_recall_results_with_policy(recall, false)
 }
 
+fn retrieval_provenance(item: &Value) -> Option<&Value> {
+    item.get("retrieval_provenance").or_else(|| {
+        item.get("metadata")
+            .and_then(|m| m.get("retrieval_provenance"))
+    })
+}
+
+fn candidate_evidence_admits(provenance: Option<&Value>) -> bool {
+    provenance.is_some_and(|p| {
+        p.get("score_kind").and_then(Value::as_str) == Some("rank_decay")
+            && p.get("query_term_matches")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0
+            && p.get("lexical_query_coverage")
+                .and_then(Value::as_f64)
+                .is_some_and(|c| c.is_finite() && (0.4..=1.0).contains(&c))
+    })
+}
+
 /// Candidate admission policy is shadow-only until held-out qualification.
 /// Rank positions never count as relevance in the candidate policy. The
 /// legacy selector is retained for rollout comparison, not called confidence.
@@ -480,34 +505,11 @@ pub fn parse_recall_results_with_policy(
         .iter()
         .filter_map(|item| {
             let score = item_score(item);
-            let provenance = item
-                .get("retrieval_provenance")
-                .or_else(|| {
-                    item.get("metadata")
-                        .and_then(|m| m.get("retrieval_provenance"))
-                })
-                .cloned();
-            let ordinal = provenance
-                .as_ref()
-                .and_then(|p| p.get("score_kind"))
-                .and_then(Value::as_str)
-                == Some("rank_decay");
+            let provenance = retrieval_provenance(item).cloned();
             let admitted = if enforce_evidence {
                 // Coverage is observable lexical evidence, not a probability.
                 // Similarity is deliberately not thresholded without calibration.
-                ordinal
-                    && provenance
-                        .as_ref()
-                        .and_then(|p| p.get("query_term_matches"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        > 0
-                    && provenance
-                        .as_ref()
-                        .and_then(|p| p.get("lexical_query_coverage"))
-                        .and_then(Value::as_f64)
-                        .map(|c| c.is_finite() && c >= 0.4 && c <= 1.0)
-                        .unwrap_or(false)
+                candidate_evidence_admits(provenance.as_ref())
             } else {
                 score.is_finite() && score >= min
             };
@@ -1401,6 +1403,21 @@ fn candidate_deduplication_respects_source_project() {
     );
     assert_eq!(outcome.hits.len(), 3);
     assert_eq!(outcome.shadow_hit_count, 2);
+}
+
+#[test]
+fn irrelevant_projection_cannot_hide_a_relevant_canonical_hit() {
+    let item = |matches, coverage| {
+        serde_json::json!({"id":"projection","source_entity_id":"canonical",
+        "title":"Prior work","score":0.95,"metadata":{"retrieval_provenance":{
+            "score_kind":"rank_decay","query_term_matches":matches,"lexical_query_coverage":coverage}}})
+    };
+    let outcome = recall_with_shadow(
+        serde_json::json!({"results":[item(0, 0.0),item(1, 1.0)]}),
+        None,
+    );
+    assert_eq!(outcome.hits.len(), 2);
+    assert_eq!(outcome.shadow_hit_count, 1);
 }
 
 #[test]

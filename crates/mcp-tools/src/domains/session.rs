@@ -15237,6 +15237,29 @@ async fn consume_grounding_session(session: &Arc<SessionManager>) {
 /// Upper bound on the Context Feeds grounding read inside `session(ground)`.
 const FEED_GROUNDING_TIMEOUT_MS: u64 = 2_000;
 
+fn composite_ground_cache_eligible(input: &SessionInput, has_checkout: bool) -> bool {
+    // This cache contains a formatted bundle, including checkout state and
+    // session-selected evidence. Only the default, workspace-only read is
+    // shareable by its existing key. Raw recall remains independently cached.
+    !has_checkout
+        && input.session_id.is_none()
+        && input.include_decisions.unwrap_or(true)
+        && input.include_related.unwrap_or(true)
+}
+
+#[test]
+fn composite_ground_cache_never_reuses_checkout_or_session_state() {
+    let input: SessionInput = serde_json::from_value(serde_json::json!({"action":"ground"})).unwrap();
+    assert!(composite_ground_cache_eligible(&input, false));
+    assert!(!composite_ground_cache_eligible(&input, true));
+    for extra in [serde_json::json!({"session_id":"session-a"}), serde_json::json!({"include_decisions":false}), serde_json::json!({"include_related":false})] {
+        let mut value = serde_json::json!({"action":"ground"});
+        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let input: SessionInput = serde_json::from_value(value).unwrap();
+        assert!(!composite_ground_cache_eligible(&input, false));
+    }
+}
+
 /// One-shot grounding bundle: recall + doc/decision augmentations + lessons + skills + git.
 async fn execute_session_ground(
     client: &ContextStreamClient,
@@ -15262,6 +15285,8 @@ async fn execute_session_ground(
     )
     .await?;
 
+    let cache_eligible = composite_ground_cache_eligible(input, session.state().await.folder_path.is_some());
+
     // P0 #3 — Atlas regional warm cache for `session(ground)`. Ground
     // is a composite of recall + docs + decisions + lessons + skills
     // + git for a given user_message. The composite ToolResult is
@@ -15272,7 +15297,7 @@ async fn execute_session_ground(
     // cached via P0 #1 (lessons), P0 #2 (recall), P0 #4 (decisions),
     // so even cold-ground populates those downstream caches.
     let user_scope_token = super::atlas_warm_cache::current_user_scope_token();
-    if let Some(ws) = scope.workspace_id {
+    if let Some(ws) = scope.workspace_id.filter(|_| cache_eligible) {
         let cache_scope = mcp_types::atlas_layer::AtlasFederationScope {
             workspace_id: ws,
             project_id: scope.project_id,
@@ -15490,7 +15515,7 @@ async fn execute_session_ground(
     // P0 #3 — write-back: cache the formatted ToolResult so the same
     // user_message within the next 5 min serves from regional Atlas
     // instead of the ~1.5s composite. Idempotent per turn.
-    if let Some(ws) = scope.workspace_id.filter(|_| grounding_recall.status != "unavailable") {
+    if let Some(ws) = scope.workspace_id.filter(|_| cache_eligible && grounding_recall.status != "unavailable") {
         if let Ok(payload) = serde_json::to_value(&final_result) {
             let cache_scope = mcp_types::atlas_layer::AtlasFederationScope {
                 workspace_id: ws,

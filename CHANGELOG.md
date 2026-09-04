@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2
+
+- fix(coordination): `coordination(action=share)` validates `kind` against the API enum (decision, constraint, api_contract, risk, status, knowledge) and defaults an omitted kind to `knowledge` like the API; 1.0.1 rejected `status`/`risk` client-side and sent an API-refused `note` default (#88).
+
 ## 1.0.1
 
 - Answer: `answer` actions for query, recent changes, receipt recovery, and

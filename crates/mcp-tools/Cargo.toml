@@ -23,8 +23,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 phf = { workspace = true }
-dirs = "5.0"
-which = "6.0"
+dirs = "6.0"
+which = "8.0"
 globset = "0.4"
 ignore = "0.4"
 reqwest = { workspace = true }

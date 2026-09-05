@@ -1,7 +1,7 @@
 {
   "name": "@contextstream/mcp-server",
   "mcpName": "io.github.contextstream/mcp-server",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Verified npm launcher for the open-source ContextStream Rust MCP server",
   "type": "module",
   "license": "MIT",

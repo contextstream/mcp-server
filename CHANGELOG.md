@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.3
+
+- Grounding: preserve evidence provenance, distinguish ranking signals from
+  relevance, and admit relevant evidence before canonical deduplication.
+- Context caching: bypass composite cache reuse when checkout or session state
+  requires fresh grounding.
+- Add offline grounding replay and scoped qualification controls. Candidate
+  ranking remains shadow-only by default; serving changes require explicit
+  operator configuration and independently qualified evidence.
+
 ## 1.0.2
 
 - fix(coordination): `coordination(action=share)` validates `kind` against the API enum (decision, constraint, api_contract, risk, status, knowledge) and defaults an omitted kind to `knowledge` like the API; 1.0.1 rejected `status`/`risk` client-side and sent an API-refused `note` default (#88).

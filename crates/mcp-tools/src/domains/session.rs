@@ -14753,6 +14753,7 @@ pub struct UpdatePlanInput {
     pub description: Option<String>,
     pub status: Option<String>,
     pub goals: Option<Vec<String>>,
+    pub steps: Option<Vec<mcp_client::PlanStep>>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub linked_items: Option<Vec<serde_json::Value>>,
 }
@@ -14897,7 +14898,7 @@ impl ToolHandler for UpdatePlanTool {
             description: input.description,
             status: input.status,
             goals: input.goals,
-            steps: None,
+            steps: input.steps,
             linked_items: normalized_linked_items.clone(),
         };
 
@@ -14924,8 +14925,9 @@ impl ToolHandler for UpdatePlanTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "update_plan".to_string(),
             title: "Update Plan".to_string(),
-            description: "Update a plan's title, description, status, goals, or linked items."
-                .to_string(),
+            description:
+                "Update a plan's title, description, status, goals, steps, or linked items."
+                    .to_string(),
             category: ToolCategory::Session,
             annotations: ToolAnnotations::write(),
             is_pro: false,
@@ -14963,6 +14965,25 @@ impl ToolHandler for UpdatePlanTool {
                 false,
             )
             .array("goals", "Updated goals", "string", false)
+            .property(
+                "steps",
+                serde_json::json!({
+                    "type": "array",
+                    "description": "Replace the complete ordered step list. Omit to preserve existing steps; an explicit empty array clears steps. Preserve stable ids referenced by existing tasks. This does not create or relink tasks.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "title": { "type": "string" },
+                            "order": { "type": "integer" },
+                            "description": { "type": "string" },
+                            "estimated_effort": { "type": "string" }
+                        },
+                        "required": ["id", "title", "order"]
+                    }
+                }),
+                false,
+            )
             .property(
                 "linked_items",
                 serde_json::json!({
@@ -16515,6 +16536,7 @@ impl ToolHandler for SessionTool {
                     description: input.description,
                     status: input.status,
                     goals: input.goals,
+                    steps: input.steps,
                     linked_items: input.linked_items,
                 };
                 let tool = UpdatePlanTool::new(self.client.clone(), self.session.clone());
@@ -16823,7 +16845,7 @@ impl ToolHandler for SessionTool {
                 "steps",
                 serde_json::json!({
                     "type": "array",
-                    "description": "Structured plan steps (for capture_plan). Each step should include scope, concrete work, files/modules if known, acceptance criteria, and verification.",
+                    "description": "Structured plan steps (for capture_plan, update_plan). Each step should include scope, concrete work, files/modules if known, acceptance criteria, and verification. update_plan replaces the complete list: omit to preserve, [] to clear. Preserve stable ids used by existing tasks; updating steps does not create or relink tasks.",
                     "items": {
                         "type": "object",
                         "properties": {

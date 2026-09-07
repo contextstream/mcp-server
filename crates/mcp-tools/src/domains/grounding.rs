@@ -7,8 +7,10 @@ use crate::domains::display_title::{
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::time::Duration;
+use uuid::Uuid;
 
 #[path = "grounding_rollout.rs"]
 pub mod rollout;
@@ -129,6 +131,7 @@ fn recall_with_mode(
         return GroundingRecall::unavailable();
     }
     let hits = parse_recall_results(&recall);
+    let query_evidence = CandidateQueryEvidence::from_payload(&recall);
     // Work on a private copy. Current-session evidence can break ties only
     // after the candidate proves query relevance. No active directives are
     // synthesized from recalled approvals or old permission requests.
@@ -141,7 +144,7 @@ fn recall_with_mode(
         results.retain(|item| {
             // An irrelevant projection must not consume the canonical identity
             // before a later projection proves query relevance.
-            if !candidate_evidence_admits(retrieval_provenance(item)) {
+            if !candidate_evidence_admits(retrieval_provenance(item), query_evidence.as_ref()) {
                 return false;
             }
             let identity =
@@ -149,8 +152,9 @@ fn recall_with_mode(
             identity
                 .map(|id| {
                     seen.insert((
-                        metadata_str(item, "source_project_id")
-                            .or_else(|| metadata_str(item, "project_id")),
+                        query_evidence
+                            .as_ref()
+                            .and_then(|query| query.source_project(retrieval_provenance(item)?)),
                         id,
                     ))
                 })
@@ -556,17 +560,77 @@ fn retrieval_provenance(item: &Value) -> Option<&Value> {
     })
 }
 
-fn candidate_evidence_admits(provenance: Option<&Value>) -> bool {
-    provenance.is_some_and(|p| {
-        p.get("score_kind").and_then(Value::as_str) == Some("rank_decay")
-            && p.get("query_term_matches")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                > 0
-            && p.get("lexical_query_coverage")
-                .and_then(Value::as_f64)
-                .is_some_and(|c| c.is_finite() && (0.4..=1.0).contains(&c))
-    })
+struct CandidateQueryEvidence {
+    query_sha256: String,
+    workspace_id: Uuid,
+    project_id: Option<Uuid>,
+}
+
+fn explicit_project(value: &Value) -> Option<Option<Uuid>> {
+    if value.is_null() {
+        Some(None)
+    } else {
+        Uuid::parse_str(value.as_str()?).ok().map(Some)
+    }
+}
+
+impl CandidateQueryEvidence {
+    fn from_payload(recall: &Value) -> Option<Self> {
+        let query = recall.get("query")?.as_str()?;
+        if query.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            query_sha256: format!("{:x}", Sha256::digest(query.as_bytes())),
+            workspace_id: Uuid::parse_str(recall.get("workspace_id")?.as_str()?).ok()?,
+            project_id: explicit_project(recall.get("project_id")?)?,
+        })
+    }
+
+    // None is unknown/invalid; Some(None) is a verified workspace source.
+    fn source_project(&self, provenance: &Value) -> Option<Option<Uuid>> {
+        let scope = provenance.get("source_scope")?;
+        if Uuid::parse_str(scope.get("workspace_id")?.as_str()?).ok()? != self.workspace_id {
+            return None;
+        }
+        let source = explicit_project(scope.get("project_id")?)?;
+        if self
+            .project_id
+            .zip(source)
+            .is_some_and(|(requested, actual)| requested != actual)
+        {
+            return None;
+        }
+        Some(source)
+    }
+}
+
+fn candidate_evidence_admits(
+    provenance: Option<&Value>,
+    query: Option<&CandidateQueryEvidence>,
+) -> bool {
+    let (Some(p), Some(query)) = (provenance, query) else {
+        return false;
+    };
+    let (Some(matches), Some(count), Some(coverage)) = (
+        p.get("query_term_matches").and_then(Value::as_u64),
+        p.get("query_term_count").and_then(Value::as_u64),
+        p.get("lexical_query_coverage").and_then(Value::as_f64),
+    ) else {
+        return false;
+    };
+    p.get("version").and_then(Value::as_u64) == Some(2)
+        && p.get("evidence_source").and_then(Value::as_str) == Some("primary_authorized_display")
+        && p.get("score_kind").and_then(Value::as_str) == Some("uncalibrated")
+        && p.get("calibration").and_then(Value::as_str) == Some("uncalibrated")
+        && p.get("query_sha256").and_then(Value::as_str) == Some(query.query_sha256.as_str())
+        && query.source_project(p).is_some()
+        && count > 0
+        && matches > 0
+        && matches <= count
+        && coverage.is_finite()
+        && (0.4..=1.0).contains(&coverage)
+        && (coverage - matches as f64 / count as f64).abs() <= 1e-9
 }
 
 /// Candidate admission policy is shadow-only until held-out qualification.
@@ -581,6 +645,7 @@ pub fn parse_recall_results_with_policy(
     };
 
     let min = grounding_min_score();
+    let query_evidence = CandidateQueryEvidence::from_payload(recall);
     let mut hits: Vec<GroundingHit> = results
         .iter()
         .filter_map(|item| {
@@ -589,7 +654,7 @@ pub fn parse_recall_results_with_policy(
             let admitted = if enforce_evidence {
                 // Coverage is observable lexical evidence, not a probability.
                 // Similarity is deliberately not thresholded without calibration.
-                candidate_evidence_admits(provenance.as_ref())
+                candidate_evidence_admits(provenance.as_ref(), query_evidence.as_ref())
             } else {
                 score.is_finite() && score >= min
             };
@@ -640,8 +705,15 @@ pub fn parse_recall_results_with_policy(
                 title,
                 score,
                 retrieval_provenance: provenance,
-                source_project_id: metadata_str(item, "source_project_id")
-                    .or_else(|| metadata_str(item, "project_id")),
+                source_project_id: if enforce_evidence {
+                    query_evidence
+                        .as_ref()?
+                        .source_project(retrieval_provenance(item)?)?
+                        .map(|id| id.to_string())
+                } else {
+                    metadata_str(item, "source_project_id")
+                        .or_else(|| metadata_str(item, "project_id"))
+                },
                 search_keywords,
                 id_hint,
                 id_field,
@@ -1447,7 +1519,7 @@ fn matching_historical_evidence_is_not_demoted_in_candidate_policy() {
         {"id":"new", "title":"Current routing", "score":0.92,
          "metadata":{"retrieval_provenance":{"score_kind":"rank_decay","rank":2,"query_term_matches":1,"lexical_query_coverage":0.5}}}
     ]});
-    let hits = parse_recall_results_with_policy(&payload, true);
+    let hits = parse_recall_results_with_policy(&scoped_test_payload(payload), true);
     assert_eq!(hits[0].id_hint.as_deref(), Some("old"));
     assert!(hits[0].stale);
 }
@@ -1478,7 +1550,7 @@ fn candidate_deduplication_respects_source_project() {
             "score_kind":"rank_decay","query_term_matches":1,"lexical_query_coverage":1.0}}})
     };
     let outcome = recall_with_shadow(
-        serde_json::json!({"results":[item("a"),item("a"),item("b")]}),
+        scoped_test_payload(serde_json::json!({"results":[item("a"),item("a"),item("b")]})),
         None,
     );
     assert_eq!(outcome.hits.len(), 3);
@@ -1493,7 +1565,7 @@ fn irrelevant_projection_cannot_hide_a_relevant_canonical_hit() {
             "score_kind":"rank_decay","query_term_matches":matches,"lexical_query_coverage":coverage}}})
     };
     let outcome = recall_with_shadow(
-        serde_json::json!({"results":[item(0, 0.0),item(1, 1.0)]}),
+        scoped_test_payload(serde_json::json!({"results":[item(0, 0.0),item(1, 1.0)]})),
         None,
     );
     assert_eq!(outcome.hits.len(), 2);
@@ -1508,6 +1580,7 @@ fn session_selection_never_changes_cached_or_served_bundle() {
         {"id":"two", "title":"Same subject", "score":0.92,"session_id":"two",
          "metadata":{"retrieval_provenance":{"score_kind":"rank_decay","query_term_matches":1,"lexical_query_coverage":1.0}}}
     ]});
+    let payload = scoped_test_payload(payload);
     let a = recall_with_shadow(payload.clone(), Some("one"));
     let b = recall_with_shadow(payload.clone(), Some("two"));
     assert_eq!(a.hits[0].id_hint, b.hits[0].id_hint);
@@ -1522,7 +1595,11 @@ fn candidate_rejects_priority_flooding_without_hiding_relevant_evidence() {
     })).collect();
     results.push(serde_json::json!({"id":"relevant","title":"Matching current work","score":0.3,
         "retrieval_provenance":{"score_kind":"rank_decay","query_term_matches":1,"lexical_query_coverage":1.0}}));
-    let selected = replay_selection(serde_json::json!({"results":results}), None, true);
+    let selected = replay_selection(
+        scoped_test_payload(serde_json::json!({"results":results})),
+        None,
+        true,
+    );
     assert_eq!(selected.hits.len(), 1);
     assert_eq!(selected.hits[0].id_hint.as_deref(), Some("relevant"));
     assert_eq!(selected.legacy_hit_count, 5);
@@ -1538,4 +1615,99 @@ fn selection_telemetry_cannot_export_query_or_source_identity() {
     let metrics = outcome.telemetry().to_string();
     assert!(!metrics.contains("private"));
     assert!(metrics.contains(rollout::POLICY_REVISION));
+}
+
+#[cfg(test)]
+fn scoped_test_payload(mut payload: Value) -> Value {
+    payload["query"] = serde_json::json!("routing history");
+    payload["workspace_id"] = serde_json::json!("00000000-0000-0000-0000-000000000010");
+    payload["project_id"] = Value::Null;
+    for item in payload["results"].as_array_mut().unwrap() {
+        let matches = retrieval_provenance(item)
+            .and_then(|p| p.get("query_term_matches"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let source_project = match item.get("source_project_id").and_then(Value::as_str) {
+            Some("a") => serde_json::json!("00000000-0000-0000-0000-000000000020"),
+            Some("b") => serde_json::json!("00000000-0000-0000-0000-000000000030"),
+            _ => Value::Null,
+        };
+        item.as_object_mut().unwrap().remove("retrieval_provenance");
+        item["metadata"]["retrieval_provenance"] = serde_json::json!({
+            "version":2,"evidence_source":"primary_authorized_display",
+            "score_kind":"uncalibrated","calibration":"uncalibrated",
+            "query_sha256":format!("{:x}",Sha256::digest(b"routing history")),
+            "query_term_matches":matches,"query_term_count":2,"lexical_query_coverage":matches as f64/2.0,
+            "source_scope":{"workspace_id":"00000000-0000-0000-0000-000000000010","project_id":source_project}
+        });
+    }
+    payload
+}
+
+#[test]
+fn candidate_requires_query_bound_primary_evidence_and_explicit_source_scope() {
+    let payload = scoped_test_payload(serde_json::json!({"results":[{
+        "id":"current","title":"Routing history","score":0.95,"source_project_id":"a",
+        "metadata":{"retrieval_provenance":{"query_term_matches":1}}
+    }]}));
+    let selected = replay_selection(payload.clone(), None, true);
+    assert_eq!(selected.hits.len(), 1);
+    assert_eq!(
+        selected.hits[0].source_project_id.as_deref(),
+        Some("00000000-0000-0000-0000-000000000020")
+    );
+    for (field, value) in [
+        ("version", serde_json::json!(1)),
+        ("evidence_source", serde_json::json!("vector_payload")),
+        ("score_kind", serde_json::json!("rank_decay")),
+        ("calibration", Value::Null),
+        ("query_sha256", serde_json::json!("0".repeat(64))),
+        ("query_term_matches", serde_json::json!(3)),
+        ("query_term_count", serde_json::json!(0)),
+        ("lexical_query_coverage", serde_json::json!(1.0)),
+        ("source_scope", Value::Null),
+        (
+            "source_scope",
+            serde_json::json!({"workspace_id":"00000000-0000-0000-0000-000000000010"}),
+        ),
+        (
+            "source_scope",
+            serde_json::json!({"workspace_id":"00000000-0000-0000-0000-000000000011","project_id":null}),
+        ),
+    ] {
+        let mut invalid = payload.clone();
+        invalid["results"][0]["metadata"]["retrieval_provenance"][field] = value;
+        assert!(
+            replay_selection(invalid.clone(), None, true)
+                .hits
+                .is_empty(),
+            "accepted invalid {field}"
+        );
+        assert_eq!(
+            recall_with_shadow(invalid, None).hits.len(),
+            1,
+            "legacy serving changed"
+        );
+    }
+    for (field, value) in [
+        ("query", serde_json::json!("different request")),
+        (
+            "workspace_id",
+            serde_json::json!("00000000-0000-0000-0000-000000000011"),
+        ),
+        (
+            "project_id",
+            serde_json::json!("00000000-0000-0000-0000-000000000030"),
+        ),
+    ] {
+        let mut invalid = payload.clone();
+        invalid[field] = value;
+        assert!(
+            replay_selection(invalid, None, true).hits.is_empty(),
+            "accepted foreign {field}"
+        );
+    }
+    let mut no_scope = payload.clone();
+    no_scope.as_object_mut().unwrap().remove("project_id");
+    assert!(replay_selection(no_scope, None, true).hits.is_empty());
 }

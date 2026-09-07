@@ -13,7 +13,7 @@ from pathlib import Path
 import subprocess
 import time
 
-POLICY = "grounding-evidence-v1"
+POLICY = "grounding-evidence-v2"
 CATEGORIES = {"continuation", "paraphrase", "history", "supersession", "scope", "no_answer"}
 SPLITS = ("development", "holdout")
 

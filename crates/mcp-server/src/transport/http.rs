@@ -107,7 +107,7 @@ pub struct JsonRpcError {
 }
 
 /// JWT Claims.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct Claims {
     sub: String,
@@ -3672,6 +3672,107 @@ mod tests {
                 tools_list_cache: Arc::new(RwLock::new(HashMap::new())),
                 concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
                 metrics_handle: None,
+            }
+        }
+
+        const JWT_TEST_SECRET: &[u8] = b"transport-auth-regression-secret-32-bytes";
+
+        fn signed_test_jwt(claims: &Value, algorithm: Algorithm, secret: &[u8]) -> String {
+            jsonwebtoken::encode(
+                &jsonwebtoken::Header::new(algorithm),
+                claims,
+                &jsonwebtoken::EncodingKey::from_secret(secret),
+            )
+            .unwrap()
+        }
+
+        async fn jwt_auth_response(token: &str) -> Response {
+            // Exercise the real middleware without sending any upstream request.
+            let state =
+                create_auth_state(true, Some(std::str::from_utf8(JWT_TEST_SECRET).unwrap()));
+            let app = Router::new()
+                .route("/auth-probe", get(|| async { StatusCode::NO_CONTENT }))
+                .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
+            app.oneshot(
+                Request::builder()
+                    .uri("/auth-probe")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn signed_jwt_transport_preserves_required_claims_and_expiration() {
+            let future = chrono::Utc::now().timestamp() + 3600;
+            let valid = json!({"sub": "caller", "exp": future});
+            let token = signed_test_jwt(&valid, Algorithm::HS256, JWT_TEST_SECRET);
+            assert_eq!(
+                jwt_auth_response(&token).await.status(),
+                StatusCode::NO_CONTENT
+            );
+
+            let mut invalid = vec![
+                json!({"sub": "caller"}),
+                json!({"exp": future}),
+                json!({"sub": 123, "exp": future}),
+                json!({"sub": "caller", "exp": 1}),
+            ];
+            for exp in [
+                json!("never"),
+                json!(true),
+                json!([]),
+                json!({}),
+                Value::Null,
+            ] {
+                invalid.push(json!({"sub": "caller", "exp": exp}));
+            }
+            for claims in invalid {
+                let token = signed_test_jwt(&claims, Algorithm::HS256, JWT_TEST_SECRET);
+                let response = jwt_auth_response(&token).await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{claims}");
+                assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+            }
+        }
+
+        #[tokio::test]
+        async fn signed_jwt_transport_rejects_wrong_algorithm_and_signature() {
+            let claims = json!({"sub": "caller", "exp": chrono::Utc::now().timestamp() + 3600});
+            for token in [
+                signed_test_jwt(&claims, Algorithm::HS512, JWT_TEST_SECRET),
+                signed_test_jwt(&claims, Algorithm::HS256, b"different-signing-secret"),
+            ] {
+                assert_eq!(
+                    jwt_auth_response(&token).await.status(),
+                    StatusCode::UNAUTHORIZED
+                );
+            }
+        }
+
+        #[test]
+        fn enabled_optional_jwt_claim_validation_rejects_malformed_types() {
+            // GHSA-h395-gr6q-cpjc: enabled validation must not treat a malformed
+            // optional claim as absent. The transport currently requires exp
+            // and does not enable nbf; pin the patched library contract too.
+            let key = DecodingKey::from_secret(JWT_TEST_SECRET);
+            for claim in ["exp", "nbf"] {
+                let mut validation = Validation::new(Algorithm::HS256);
+                validation.required_spec_claims.clear();
+                validation.validate_nbf = true;
+                let absent =
+                    signed_test_jwt(&json!({"sub": "caller"}), Algorithm::HS256, JWT_TEST_SECRET);
+                assert!(decode::<Value>(&absent, &key, &validation).is_ok());
+                for malformed in [json!("invalid"), json!(true), json!([]), json!({})] {
+                    let mut claims = json!({"sub": "caller"});
+                    claims[claim] = malformed;
+                    let token = signed_test_jwt(&claims, Algorithm::HS256, JWT_TEST_SECRET);
+                    assert!(
+                        decode::<Value>(&token, &key, &validation).is_err(),
+                        "{claims}"
+                    );
+                }
             }
         }
 

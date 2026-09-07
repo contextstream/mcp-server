@@ -162,6 +162,16 @@ def build_selector():
             "binary":str(binary),"replay_binary_sha256":digest(binary),"profile":"debug","built_at_unix":int(time.time())}
 
 
+def validate_recall_query(row, query):
+    require(row.get("query_sha256") == hashlib.sha256(query["text"].encode()).hexdigest(),
+            "recall input belongs to a different query")
+    recall = row.get("recall")
+    # The sidecar fingerprint cannot relabel an internally consistent response
+    # for another query. Bind the actual selector input to the frozen corpus.
+    require(isinstance(recall, dict) and recall.get("query") == query["text"],
+            "recall payload query differs from frozen corpus")
+
+
 def collect(corpus_path, split, recalls_path, binary, build_receipt, development=None):
     corpus = read(corpus_path)
     queries = corpus_queries(corpus, split)
@@ -169,7 +179,7 @@ def collect(corpus_path, split, recalls_path, binary, build_receipt, development
     by_id = indexed(rows, "query_id")
     require(set(by_id) == set(queries), "exact split coverage required for recall input")
     for query_id, row in by_id.items():
-        require(row.get("query_sha256") == hashlib.sha256(queries[query_id]["text"].encode()).hexdigest(), "recall input belongs to a different query")
+        validate_recall_query(row, queries[query_id])
     root = Path(__file__).resolve().parents[2]
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=root).strip())

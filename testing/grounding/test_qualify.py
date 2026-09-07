@@ -1,12 +1,13 @@
 """Synthetic unit-test data only; never persisted as holdout evidence."""
 import copy
+import hashlib
 import json
 from pathlib import Path
 import tempfile
 import time
 import unittest
 
-from qualify import CATEGORIES, POLICY, corpus_queries, digest, evaluate, measure
+from qualify import CATEGORIES, POLICY, corpus_queries, digest, evaluate, measure, validate_recall_query
 
 
 class QualificationTests(unittest.TestCase):
@@ -33,6 +34,18 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(result["precision_at_5"], 1)
         self.assertEqual(result["false_grounding_rate"], 0)
         self.assertTrue(result["independent_labels"])
+
+    def test_query_sidecar_cannot_relabel_a_different_recall_payload(self):
+        query = {"text": "frozen query"}
+        row = {"query_sha256": hashlib.sha256(b"frozen query").hexdigest(),
+               "recall": {"query": "frozen query", "results": []}}
+        validate_recall_query(row, query)
+        for recall in ({"query": "different query"}, {"query": " frozen query"}, {}, None):
+            invalid = dict(row, recall=recall)
+            with self.assertRaises(ValueError):
+                validate_recall_query(invalid, query)
+        with self.assertRaises(ValueError):
+            validate_recall_query(dict(row, query_sha256="0" * 64), query)
 
     def test_author_is_not_an_independent_labeler(self):
         labels, replay = self.evidence("holdout")

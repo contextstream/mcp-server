@@ -19,6 +19,78 @@ fn create_mock_session() -> Arc<SessionManager> {
     Arc::new(SessionManager::new(client, TestFixtures::test_config()))
 }
 
+#[tokio::test]
+async fn update_plan_preserves_step_replacement_on_both_entry_points() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for consolidated in [false, true] {
+        for steps in [
+            None,
+            Some(json!([])),
+            Some(json!([
+                {"id":"verify", "title":"Verify saved bytes", "order":2,
+                 "description":"Run the exact check after the final edit", "estimated_effort":"short"},
+                {"id":"edit", "title":"Implement requested change", "order":1}
+            ])),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let plan_id = Uuid::new_v4();
+            let server = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let body = loop {
+                        let mut chunk = [0u8; 4096];
+                        let count = socket.read(&mut chunk).await.unwrap();
+                        assert!(count > 0, "request ended before body");
+                        request.extend_from_slice(&chunk[..count]);
+                        assert!(request.len() < 32768, "unexpected request size");
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            assert!(headers.starts_with(&format!("PATCH /api/v1/plans/{plan_id} ")));
+                            let length: usize = headers.lines().filter_map(|line| line.split_once(':'))
+                                .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                                .unwrap().1.trim().parse().unwrap();
+                            if request.len() >= end + 4 + length {
+                                break serde_json::from_slice::<Value>(&request[end+4..end+4+length]).unwrap();
+                            }
+                        }
+                    };
+                    let payload = json!({"id":plan_id, "title":"Plan", "steps":body.get("steps")}).to_string();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).as_bytes()).await.unwrap();
+                    body
+                }).await.expect("bounded plan request")
+            });
+            let mut config = TestFixtures::test_config();
+            config.api_url = format!("http://{address}");
+            let client = ContextStreamClient::new(config.clone());
+            let session = Arc::new(SessionManager::new(client.clone(), config));
+            let mut input = json!({"action":"update_plan", "plan_id":plan_id,
+                "workspace_id":Uuid::new_v4(), "project_id":Uuid::new_v4(), "status":"active"});
+            if let Some(value) = &steps {
+                input["steps"] = value.clone();
+            }
+            let result = if consolidated {
+                SessionTool::new(client, session, mcp_types::atlas_layer::noop_layer())
+                    .execute(input)
+                    .await
+            } else {
+                UpdatePlanTool::new(client, session).execute(input).await
+            };
+            result.expect("update plan");
+            let body = server.await.unwrap();
+            assert_eq!(
+                body.get("steps"),
+                steps.as_ref(),
+                "consolidated={consolidated}"
+            );
+            assert_eq!(body["status"], "active");
+        }
+    }
+}
+
 mod repository_project_resolution_tests {
     use super::*;
 
@@ -3321,6 +3393,15 @@ mod schema_tests {
         assert!(props.contains_key("plan_id"));
         assert!(props.contains_key("title"));
         assert!(props.contains_key("status"));
+        assert_eq!(props["steps"]["type"], "array");
+        assert_eq!(
+            props["steps"]["items"]["required"],
+            serde_json::json!(["id", "title", "order"])
+        );
+        assert!(props["steps"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Omit to preserve"));
 
         // Check status enum values
         if let Some(status) = props.get("status") {
@@ -5066,7 +5147,8 @@ mod input_struct_tests {
             "plan_id": "550e8400-e29b-41d4-a716-446655440000",
             "title": "Updated Title",
             "status": "active",
-            "goals": ["Goal 1", "Goal 2"]
+            "goals": ["Goal 1", "Goal 2"],
+            "steps": [{"id":"verify", "title":"Run checks", "order":1}]
         }))
         .unwrap();
 
@@ -5076,6 +5158,21 @@ mod input_struct_tests {
         );
         assert_eq!(input.title, Some("Updated Title".to_string()));
         assert_eq!(input.status, Some("active".to_string()));
+        assert_eq!(input.steps.unwrap()[0].id, "verify");
+    }
+
+    #[test]
+    fn test_update_plan_rejects_malformed_steps_instead_of_dropping_them() {
+        for steps in [
+            json!("not a step list"),
+            json!([{"title":"Missing id and order"}]),
+            json!([{"id":"x", "title":"Step", "order":"first"}]),
+        ] {
+            assert!(serde_json::from_value::<UpdatePlanInput>(
+                json!({"plan_id":"550e8400-e29b-41d4-a716-446655440000", "steps":steps})
+            )
+            .is_err());
+        }
     }
 
     #[test]

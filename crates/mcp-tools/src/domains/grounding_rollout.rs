@@ -2,7 +2,7 @@
 //! Default/invalid configuration and the independent kill switch serve legacy.
 use serde::Deserialize;
 
-pub const POLICY_REVISION: &str = "grounding-evidence-v1";
+pub const POLICY_REVISION: &str = "grounding-evidence-v2";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -248,6 +248,15 @@ mod tests {
         r.qualification.independent_labels = true;
         r.qualification.candidate_p95_ms = f64::NAN;
         assert_eq!(r.mode(Some("internal"), Some("ws"), None, 1), "shadow");
+    }
+    #[test]
+    fn superseded_evidence_policy_cannot_activate_the_new_selector() {
+        let mut r = config();
+        r.qualification.policy_revision = "grounding-evidence-v1".into();
+        for phase in ["internal", "canary", "general"] {
+            r.phase = phase.into();
+            assert_eq!(r.mode(Some("internal"), Some("ws"), None, 1), "shadow");
+        }
     }
     #[test]
     fn five_percent_is_sticky_and_scope_framed() {

@@ -1,5 +1,8 @@
 //! Session domain tools: init, context, capture, recall, compress.
 
+#[path = "recall_supplements.rs"]
+mod recall_supplements;
+
 use async_trait::async_trait;
 use mcp_client::{
     format_linked_summary, get_task_auth_override, normalize_linked_items_with_allowed_kinds,
@@ -6594,48 +6597,82 @@ async fn proactive_grounding_recall(
         user_scope: user_scope.map(|s| s.to_string()),
     };
 
-    if let Some(bundle) = crate::domains::atlas_warm_cache::try_lookup(
-        atlas_layer,
-        mcp_types::atlas_layer::AtlasWarmCacheKind::Recall,
-        scope,
-        1000, // primary baseline ms — recall p95 ≈ 1s
-    )
-    .await
-    {
-        return recall_with_rollout(
-            bundle.payload.clone(),
+    let primary = async {
+        if let Some(bundle) = crate::domains::atlas_warm_cache::try_lookup(
+            atlas_layer,
+            mcp_types::atlas_layer::AtlasWarmCacheKind::Recall,
+            scope,
+            1000, // primary baseline ms — recall p95 ≈ 1s
+        )
+        .await
+        {
+            return Some(bundle.payload);
+        }
+
+        // Cache miss: run the primary recall, then write back so the next
+        // `context()` turn (and any user-facing `session(recall)` call
+        // for the same scope) hits.
+        match tokio::time::timeout(grounding_timeout(), client.session_recall(params)).await {
+            Ok(Ok(value)) => {
+                let scope_for_put = mcp_types::atlas_layer::AtlasFederationScope {
+                    workspace_id: ws,
+                    project_id,
+                    scope_hash,
+                    user_scope: user_scope.map(|s| s.to_string()),
+                };
+                crate::domains::atlas_warm_cache::put_in_background(
+                    atlas_layer.clone(),
+                    mcp_types::atlas_layer::AtlasWarmCacheKind::Recall,
+                    scope_for_put,
+                    value.clone(),
+                );
+                Some(value)
+            }
+            _ => None,
+        }
+    };
+    // Atlas may reuse core recall, but never supplemental display bytes. Both
+    // cold and warm paths do fresh typed discovery and primary authorization.
+    let collect = async {
+        let (primary, (decisions, docs)) = tokio::join!(
+            primary,
+            search_recall_augmentations(
+                client,
+                workspace_id,
+                project_id,
+                user_message,
+                5,
+                5,
+                true,
+                true
+            )
+        );
+        let mut value = primary?;
+        match (decisions, docs) {
+            (Ok(decisions), Ok(docs)) => {
+                recall_supplements::attach(
+                    client,
+                    workspace_id,
+                    project_id,
+                    user_message,
+                    &decisions,
+                    &docs,
+                    &mut value,
+                )
+                .await
+            }
+            _ => recall_supplements::mark_unavailable(&mut value),
+        }
+        Some(value)
+    };
+    match tokio::time::timeout(grounding_timeout(), collect).await {
+        Ok(Some(value)) => recall_with_rollout(
+            value,
             session_id,
             user_scope,
             Some(&ws.to_string()),
             project_id.map(|p| p.to_string()).as_deref(),
-        );
-    }
-
-    // Cache miss: run the primary recall, then write back so the next
-    // `context()` turn (and any user-facing `session(recall)` call
-    // for the same scope) hits.
-    match tokio::time::timeout(grounding_timeout(), client.session_recall(params)).await {
-        Ok(Ok(value)) => {
-            let scope_for_put = mcp_types::atlas_layer::AtlasFederationScope {
-                workspace_id: ws,
-                project_id,
-                scope_hash,
-                user_scope: user_scope.map(|s| s.to_string()),
-            };
-            crate::domains::atlas_warm_cache::put_in_background(
-                atlas_layer.clone(),
-                mcp_types::atlas_layer::AtlasWarmCacheKind::Recall,
-                scope_for_put,
-                value.clone(),
-            );
-            recall_with_rollout(
-                value,
-                session_id,
-                user_scope,
-                Some(&ws.to_string()),
-                project_id.map(|p| p.to_string()).as_deref(),
-            )
-        }
+        ),
         _ => GroundingRecall::unavailable(),
     }
 }
@@ -9826,10 +9863,13 @@ where
         account_block
     );
 
-    let recall = recall.unwrap_or_else(|err| {
+    let mut recall = recall.unwrap_or_else(|err| {
         tracing::debug!("session ground: recall failed: {}", err);
         serde_json::json!({})
     });
+    if decisions.is_err() || docs.is_err() {
+        recall_supplements::mark_unavailable(&mut recall);
+    }
     let decisions = decisions.unwrap_or_else(|err| {
         tracing::debug!("session ground: decision augmentation failed: {}", err);
         Vec::new()
@@ -10827,15 +10867,20 @@ impl ToolHandler for SessionRecallTool {
             .flatten();
         if let Some(cache_key) = cache_key.as_deref() {
             if let Some((cached_text, cached_structured)) = recall_cache().get(cache_key) {
-                tracing::debug!("recall cache hit: key={}", cache_key);
-                let marked = format!(
+                if cached_structured.get("supplemental_results").is_none()
+                    && cached_structured.get("doc_matches").is_none()
+                    && cached_structured.get("decision_matches").is_none()
+                {
+                    tracing::debug!("recall cache hit: key={}", cache_key);
+                    let marked = format!(
                     "[RECALL_CACHED] Same recall query as the previous identical call (<{}s ago); \
                      returning cached result. Change the query/toggles to refresh.\n\n{}",
                     RECALL_CACHE_TTL.as_secs(),
                     cached_text
                 );
-                consume_grounding_session(&self.session).await;
-                return Ok(ToolResult::with_structured(marked, cached_structured));
+                    consume_grounding_session(&self.session).await;
+                    return Ok(ToolResult::with_structured(marked, cached_structured));
+                }
             }
         }
 
@@ -10933,6 +10978,7 @@ impl ToolHandler for SessionRecallTool {
             join_recall_with_augmentations(primary_recall, decision_search, doc_search).await?;
 
         let mut result = result;
+        let supplemental_discovery_failed = doc_matches.is_err();
         crate::domains::display_title::normalize_recall_payload(&mut result);
 
         let count = result
@@ -10955,6 +11001,20 @@ impl ToolHandler for SessionRecallTool {
         if count > 0 {
             doc_matches.truncate(3);
         }
+        recall_supplements::attach(
+            &self.client,
+            scope.workspace_id,
+            scope.project_id,
+            &input.query,
+            &decision_matches,
+            &doc_matches,
+            &mut result,
+        )
+        .await;
+        if supplemental_discovery_failed {
+            recall_supplements::mark_unavailable(&mut result);
+        }
+        let (decision_matches, doc_matches) = recall_supplements::display_views(&result);
         let project_matches = if !recall_checkout_scope_unroutable
             && input.include_related.unwrap_or(true)
             && (count == 0 || (decision_matches.is_empty() && doc_matches.is_empty()))
@@ -10981,6 +11041,14 @@ impl ToolHandler for SessionRecallTool {
         let has_decision_matches = !decision_matches.is_empty();
         let has_doc_matches = !doc_matches.is_empty();
         let has_project_matches = !project_matches.is_empty();
+        let selection_session = self.session.state().await.session_id;
+        let selection = crate::domains::grounding::recall_with_rollout(
+            result.clone(),
+            selection_session.as_deref(),
+            caller_cache_identity.as_deref(),
+            scope.workspace_id.map(|id| id.to_string()).as_deref(),
+            scope.project_id.map(|id| id.to_string()).as_deref(),
+        );
         let memory_items = result
             .get("results")
             .and_then(|v| v.as_array())
@@ -10993,6 +11061,12 @@ impl ToolHandler for SessionRecallTool {
             &doc_matches,
             &project_matches,
         );
+        if selection.selection_mode != "shadow" {
+            text = crate::domains::grounding::format_grounding_block(&selection.hits, false);
+        }
+        if result.get("supplemental_status").and_then(Value::as_str) == Some("unavailable") {
+            text = format!("[GROUNDING_UNAVAILABLE] Supplemental source validation was unavailable; do not interpret this as no prior documents or decisions.\n\n{text}");
+        }
         if recall_checkout_scope_unroutable {
             text = format!(
                 "[CHECKOUT_SCOPE] Recall used durable project memory, but skipped source-code augmentation because the MCP could not derive an exact active-checkout locator.\n\n{text}"
@@ -11000,6 +11074,13 @@ impl ToolHandler for SessionRecallTool {
         }
 
         let mut structured = result;
+        if selection.selection_mode != "shadow" {
+            crate::domains::grounding::retain_selected_payload(&mut structured, &selection.hits);
+        }
+        if let Some(object) = structured.as_object_mut() {
+            object.insert("grounding_retrieval".into(), selection.telemetry());
+            object.insert("grounding_hits".into(), serde_json::json!(selection.hits));
+        }
         if recall_checkout_scope_unroutable {
             if let Some(object) = structured.as_object_mut() {
                 object.insert("checkout_scope_unconfirmed".to_string(), Value::Bool(true));
@@ -11009,7 +11090,9 @@ impl ToolHandler for SessionRecallTool {
                 );
             }
         }
-        if has_decision_matches || has_doc_matches || has_project_matches {
+        if selection.selection_mode == "shadow"
+            && (has_decision_matches || has_doc_matches || has_project_matches)
+        {
             if let Some(obj) = structured.as_object_mut() {
                 if has_decision_matches {
                     obj.insert(
@@ -11050,7 +11133,9 @@ impl ToolHandler for SessionRecallTool {
         // Cache the rendered result for repeat recall calls inside the
         // warm window. Scope note is NOT included in the cached text so
         // the prefix stays consistent across calls with/without the note.
-        if let Some(cache_key) = cache_key {
+        if let Some(cache_key) =
+            cache_key.filter(|_| structured.get("supplemental_results").is_none())
+        {
             put_recall_cache(
                 caller_cache_identity.as_deref(),
                 cache_key,
@@ -15297,22 +15382,19 @@ async fn consume_grounding_session(session: &Arc<SessionManager>) {
 /// Upper bound on the Context Feeds grounding read inside `session(ground)`.
 const FEED_GROUNDING_TIMEOUT_MS: u64 = 2_000;
 
-fn composite_ground_cache_eligible(input: &SessionInput, has_checkout: bool) -> bool {
-    // This cache contains a formatted bundle, including checkout state and
-    // session-selected evidence. Only the default, workspace-only read is
-    // shareable by its existing key. Raw recall remains independently cached.
-    !has_checkout
-        && !crate::domains::grounding::rollout::configured()
-        && input.session_id.is_none()
-        && input.include_decisions.unwrap_or(true)
-        && input.include_related.unwrap_or(true)
+fn composite_ground_cache_eligible(_input: &SessionInput, _has_checkout: bool) -> bool {
+    // Persisted Ground entries can include document/decision display bytes,
+    // but their cache contract cannot re-authorize those sources. Even an
+    // explicit omission shares a key with older default bundles. Keep the
+    // individually guarded core-recall cache; do not reuse formatted Ground.
+    false
 }
 
 #[test]
 fn composite_ground_cache_never_reuses_checkout_or_session_state() {
     let input: SessionInput =
         serde_json::from_value(serde_json::json!({"action":"ground"})).unwrap();
-    assert!(composite_ground_cache_eligible(&input, false));
+    assert!(!composite_ground_cache_eligible(&input, false));
     assert!(!composite_ground_cache_eligible(&input, true));
     for extra in [
         serde_json::json!({"session_id":"session-a"}),
@@ -15441,7 +15523,7 @@ async fn execute_session_ground(
     )
     .await;
     let GroundingRemoteReads {
-        recall: recall_val,
+        recall: mut recall_val,
         decisions,
         docs,
         lessons,
@@ -15449,6 +15531,25 @@ async fn execute_session_ground(
         recent_media,
         account_block,
     } = remote_reads;
+
+    let supplemental_discovery_failed = recall_val
+        .get("supplemental_status")
+        .and_then(Value::as_str)
+        == Some("unavailable");
+    recall_supplements::attach(
+        client,
+        scope.workspace_id,
+        scope.project_id,
+        user_message,
+        &decisions,
+        &docs,
+        &mut recall_val,
+    )
+    .await;
+    if supplemental_discovery_failed {
+        recall_supplements::mark_unavailable(&mut recall_val);
+    }
+    let (decisions, docs) = recall_supplements::display_views(&recall_val);
 
     let session_state = session.state().await;
     let fp = session_state.folder_path.clone();
@@ -15540,11 +15641,11 @@ async fn execute_session_ground(
     text.push_str(&crate::domains::grounding::format_grounding_block(
         hits, false,
     ));
-    if !decisions.is_empty() {
+    if grounding_recall.selection_mode == "shadow" && !decisions.is_empty() {
         text.push('\n');
         text.push_str(&format_recall_decision_matches(&decisions));
     }
-    if !docs.is_empty() {
+    if grounding_recall.selection_mode == "shadow" && !docs.is_empty() {
         text.push('\n');
         text.push_str(&format_recall_doc_matches(&docs));
     }
@@ -15570,7 +15671,10 @@ async fn execute_session_ground(
         text.push_str(&account_block);
     }
 
-    let structured = serde_json::json!({
+    if grounding_recall.selection_mode != "shadow" {
+        crate::domains::grounding::retain_selected_payload(&mut recall_val, hits);
+    }
+    let mut structured = serde_json::json!({
         "recall": recall_val,
         "grounding_retrieval": grounding_recall.telemetry(),
         "decision_matches": decisions,
@@ -15581,6 +15685,12 @@ async fn execute_session_ground(
         "grounding_hits": serde_json::to_value(hits).unwrap_or_else(|_| serde_json::json!([])),
         "feed_items": feed_items,
     });
+    if grounding_recall.selection_mode != "shadow" {
+        if let Some(object) = structured.as_object_mut() {
+            object.remove("doc_matches");
+            object.remove("decision_matches");
+        }
+    }
 
     if let Some(ref p) = fp {
         grounding_state::clear_grounding_consumed(p);

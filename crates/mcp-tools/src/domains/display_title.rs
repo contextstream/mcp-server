@@ -214,6 +214,7 @@ pub fn normalize_recall_result_item(item: &mut Value) {
         ("event_id", "event_id"),
         ("transcript_id", "transcript_id"),
         ("doc_id", "doc_id"),
+        ("node_id", "node_id"),
         ("event_type", "event_type"),
         ("original_type", "kind"),
         ("node_type", "node_type"),
@@ -232,8 +233,24 @@ pub fn normalize_recall_result_item(item: &mut Value) {
         }
     }
 
-    // MemorySearchResult id is the event/node uuid; surface as event_id when missing.
-    if obj.get("event_id").is_none() {
+    // UUIDs are table-local identities, not evidence that a source is an event.
+    // In particular, promoting a doc/node UUID to event_id changes follow-up
+    // reads and can collide with a real event carrying that same UUID.
+    let source_kind = obj
+        .get("source_kind")
+        .or_else(|| obj.get("result_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if obj.get("event_id").is_none()
+        && obj.get("doc_id").is_none()
+        && obj.get("node_id").is_none()
+        && obj.get("transcript_id").is_none()
+        && !matches!(
+            source_kind.as_str(),
+            "doc" | "document" | "node" | "knowledge_node" | "knowledgenode" | "transcript"
+        )
+    {
         if let Some(id) = obj.get("id").cloned() {
             obj.insert("event_id".to_string(), id);
         }
@@ -281,6 +298,17 @@ mod tests {
         normalize_recall_result_item(&mut item);
         assert_eq!(item["title"], "Decision");
         assert_eq!(item["event_id"], "evt-uuid");
+    }
+
+    #[test]
+    fn normalization_preserves_document_and_node_identities() {
+        for (kind, field) in [("doc", "doc_id"), ("knowledge_node", "node_id")] {
+            let mut item = json!({"id":"same-uuid", "result_type":kind,
+                "metadata": {field:"same-uuid", "title":"stadium graphics"}});
+            normalize_recall_result_item(&mut item);
+            assert_eq!(item[field], "same-uuid");
+            assert!(item.get("event_id").is_none());
+        }
     }
 
     #[test]

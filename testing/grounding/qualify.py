@@ -14,7 +14,7 @@ from pathlib import Path
 import subprocess
 import time
 
-POLICY = "grounding-evidence-v2"
+POLICY = "grounding-evidence-v3"
 # Scoring evolves independently of selector policy and sticky cohort assignment.
 EVALUATION = "grounding-quality-v2"
 CATEGORIES = {"continuation", "paraphrase", "history", "supersession", "scope", "no_answer"}

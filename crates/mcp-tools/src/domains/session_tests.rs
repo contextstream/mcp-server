@@ -2617,7 +2617,9 @@ mod recall_augmentation_tests {
         )
         .await;
 
-        assert_eq!(result.recall, json!({}));
+        assert_eq!(result.recall["supplemental_status"], "unavailable");
+        assert_eq!(result.recall["degraded"], true);
+        assert!(result.recall.get("results").is_none());
         assert!(result.decisions.is_empty());
         assert!(result.docs.is_empty());
         assert_eq!(result.lessons, json!({}));

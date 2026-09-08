@@ -120,6 +120,57 @@ pub fn replay_selection(
     )
 }
 
+/// Candidate serving must not leak rejected supplements through the structured
+/// half of a response after its text has already used the qualified selector.
+pub fn retain_selected_payload(recall: &mut Value, hits: &[GroundingHit]) {
+    remove_superseded_core_projections(recall);
+    let query = CandidateQueryEvidence::from_payload(recall);
+    let mut seen = std::collections::HashSet::new();
+    for field in ["results", "supplemental_results"] {
+        if let Some(items) = recall.get_mut(field).and_then(Value::as_array_mut) {
+            items.retain(|item| {
+                let (id, id_field) = id_hint(item);
+                let project = retrieval_provenance(item)
+                    .and_then(|p| p.get("source_scope"))
+                    .and_then(|s| s.get("project_id"))
+                    .and_then(Value::as_str);
+                id.is_some()
+                    && candidate_evidence_admits(retrieval_provenance(item), query.as_ref())
+                    && hits.iter().any(|hit| {
+                        hit.id_hint == id
+                            && hit.id_field == id_field
+                            && hit.source_project_id.as_deref() == project
+                            && hit.retrieval_provenance.as_ref() == retrieval_provenance(item)
+                            && hit.title == extract_display_title(item)
+                    })
+                    && seen.insert((source_identity_kind(item), id, project.map(str::to_owned)))
+            });
+        }
+    }
+}
+
+fn remove_superseded_core_projections(recall: &mut Value) {
+    // A freshly authorized source (including a revoked/deleted source omitted
+    // by the authority) replaces its older core-cache projection BEFORE
+    // admission. Otherwise stale matching bytes could defeat a fresh miss.
+    let sources = recall
+        .get("supplemental_source_ids")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(results) = recall.get_mut("results").and_then(Value::as_array_mut) {
+        results.retain(|item| {
+            !sources.iter().any(|source| {
+                source["kind"].as_str() == Some(source_identity_kind(item).as_str())
+                    && source["id"].as_str()
+                        == metadata_str(item, "source_entity_id")
+                            .or_else(|| metadata_str(item, "id"))
+                            .as_deref()
+            })
+        });
+    }
+}
+
 fn recall_with_mode(
     mut recall: Value,
     session_id: Option<&str>,
@@ -130,16 +181,32 @@ fn recall_with_mode(
     if !recall.get("results").is_some_and(Value::is_array) {
         return GroundingRecall::unavailable();
     }
+    if mode != "shadow"
+        && recall.get("supplemental_status").and_then(Value::as_str) == Some("unavailable")
+    {
+        let mut unavailable = GroundingRecall::unavailable();
+        unavailable.selection_mode = mode;
+        return unavailable;
+    }
     let hits = parse_recall_results(&recall);
     let query_evidence = CandidateQueryEvidence::from_payload(&recall);
     // Work on a private copy. Current-session evidence can break ties only
     // after the candidate proves query relevance. No active directives are
     // synthesized from recalled approvals or old permission requests.
     let mut shadow_payload = recall.clone();
+    remove_superseded_core_projections(&mut shadow_payload);
+    // Only the dedicated primary-authority endpoint populates this field.
+    // Raw doc_matches/decision_matches remain legacy output, never evidence.
+    let supplemental = shadow_payload
+        .get("supplemental_results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     if let Some(results) = shadow_payload
         .get_mut("results")
         .and_then(Value::as_array_mut)
     {
+        results.extend(supplemental);
         let mut seen = std::collections::HashSet::new();
         results.retain(|item| {
             // An irrelevant projection must not consume the canonical identity
@@ -155,22 +222,34 @@ fn recall_with_mode(
                         query_evidence
                             .as_ref()
                             .and_then(|query| query.source_project(retrieval_provenance(item)?)),
+                        source_identity_kind(item),
                         id,
                     ))
                 })
                 .unwrap_or(true)
         });
-        if let Some(session) = session_id.filter(|s| !s.is_empty()) {
-            results.sort_by(|a, b| {
-                item_score(b)
-                    .partial_cmp(&item_score(a))
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| {
+        // Cross-source ordinal scores are not calibrated. Use the same final
+        // display evidence for all sources; stable sort retains discovery order
+        // on equal coverage, with current-session identity only a tie-breaker.
+        results.sort_by(|a, b| {
+            let coverage = |item: &Value| {
+                retrieval_provenance(item)
+                    .and_then(|e| e.get("lexical_query_coverage"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+            };
+            coverage(b)
+                .partial_cmp(&coverage(a))
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    if let Some(session) = session_id.filter(|s| !s.is_empty()) {
                         (metadata_str(a, "session_id").as_deref() != Some(session))
                             .cmp(&(metadata_str(b, "session_id").as_deref() != Some(session)))
-                    })
-            });
-        }
+                    } else {
+                        Ordering::Equal
+                    }
+                })
+        });
     }
     let shadow = parse_recall_results_with_policy(&shadow_payload, true);
     let legacy_hit_count = hits.len();
@@ -180,6 +259,7 @@ fn recall_with_mode(
             candidate.id_hint.is_some()
                 && hits.iter().any(|legacy| {
                     legacy.id_hint == candidate.id_hint
+                        && legacy.id_field == candidate.id_field
                         && legacy.source_project_id == candidate.source_project_id
                 })
         })
@@ -528,6 +608,96 @@ fn classify_kind(item: &Value) -> String {
         .unwrap_or_else(|| "hit".to_string())
 }
 
+fn source_identity_kind(item: &Value) -> String {
+    if let Some(kind) = metadata_str(item, "source_kind") {
+        return kind;
+    }
+    if metadata_str(item, "transcript_id").is_some() {
+        return "transcript".into();
+    }
+    if metadata_str(item, "doc_id").is_some() {
+        return "doc".into();
+    }
+    if metadata_str(item, "node_id").is_some() {
+        return "node".into();
+    }
+    match item
+        .get("result_type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "knowledge_node" | "knowledgenode" | "node" => "node".into(),
+        "doc" | "document" => "doc".into(),
+        _ => "event".into(),
+    }
+}
+
+#[test]
+fn supplemental_evidence_enters_candidate_only_and_keeps_typed_ids() {
+    let mut payload = scoped_test_payload(serde_json::json!({"results":[
+        {"id":"same","result_type":"event","score":0.99,"metadata":{"event_id":"same","title":"Routing","retrieval_provenance":{"query_term_matches":1}}},
+        {"id":"same","result_type":"doc","score":0.0,"metadata":{"doc_id":"same","title":"Routing history","retrieval_provenance":{"query_term_matches":2}}},
+        {"id":"same","result_type":"knowledge_node","score":0.0,"metadata":{"node_id":"same","summary":"Routing history","retrieval_provenance":{"query_term_matches":2}}}
+    ]}));
+    let supplements = payload["results"].as_array_mut().unwrap().split_off(1);
+    payload["supplemental_results"] = serde_json::json!(supplements);
+    let legacy = replay_selection(payload.clone(), None, false);
+    assert_eq!(legacy.hits.len(), 1);
+    let candidate = replay_selection(payload.clone(), None, true);
+    assert_eq!(candidate.hits.len(), 3);
+    assert_eq!(candidate.hits[0].id_field.as_deref(), Some("doc_id"));
+    assert_eq!(candidate.hits[1].id_field.as_deref(), Some("node_id"));
+    let text = format_grounding_block(&candidate.hits, true);
+    assert!(text.contains("get_doc"));
+    assert!(text.contains("get_node"));
+    payload["supplemental_results"][0]["metadata"]["retrieval_provenance"] = Value::Null;
+    let candidate = replay_selection(payload.clone(), None, true);
+    assert_eq!(candidate.hits.len(), 2);
+    let mut display = payload.clone();
+    retain_selected_payload(&mut display, &candidate.hits);
+    assert_eq!(display["supplemental_results"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        display["supplemental_results"][0]["metadata"]["node_id"],
+        "same"
+    );
+    payload["supplemental_status"] = serde_json::json!("unavailable");
+    assert_eq!(replay_selection(payload, None, true).status, "unavailable");
+}
+
+#[test]
+fn fresh_authority_replaces_stale_core_even_when_it_revokes_or_removes_relevance() {
+    let mut payload = scoped_test_payload(serde_json::json!({"results":[{
+        "id":"same","result_type":"event","score":0.99,
+        "metadata":{"event_id":"same","title":"Stale matching bytes","retrieval_provenance":{"query_term_matches":2}}
+    }]}));
+    payload["supplemental_source_ids"] = serde_json::json!([{"kind":"event","id":"same"}]);
+    payload["supplemental_results"] = serde_json::json!([]);
+    assert_eq!(replay_selection(payload.clone(), None, false).hits.len(), 1);
+    assert!(replay_selection(payload.clone(), None, true)
+        .hits
+        .is_empty());
+    let mut fresh = payload["results"][0].clone();
+    fresh["metadata"]["title"] = serde_json::json!("Fresh primary bytes");
+    payload["supplemental_results"] = serde_json::json!([fresh]);
+    let selected = replay_selection(payload.clone(), None, true);
+    assert_eq!(selected.hits.len(), 1);
+    assert_eq!(selected.hits[0].title, "Fresh primary bytes");
+    let mut displayed = payload.clone();
+    retain_selected_payload(&mut displayed, &selected.hits);
+    assert!(displayed["results"].as_array().unwrap().is_empty());
+    assert_eq!(
+        displayed["supplemental_results"].as_array().unwrap().len(),
+        1
+    );
+    payload["supplemental_results"][0]["metadata"]["retrieval_provenance"]["query_term_matches"] =
+        serde_json::json!(0);
+    payload["supplemental_results"][0]["metadata"]["retrieval_provenance"]
+        ["lexical_query_coverage"] = serde_json::json!(0.0);
+    assert!(replay_selection(payload, None, true).hits.is_empty());
+}
+
 fn id_hint(item: &Value) -> (Option<String>, Option<String>) {
     for key in [
         "transcript_id",
@@ -535,6 +705,7 @@ fn id_hint(item: &Value) -> (Option<String>, Option<String>) {
         "event_id",
         "memory_event_id",
         "doc_id",
+        "node_id",
         "feed_id",
         "id",
     ] {
@@ -823,6 +994,9 @@ fn action_hint(hit: &GroundingHit, search_keywords: &str) -> String {
     }
     if is_doc_id_field(id_field) && !id.is_empty() {
         return format!("memory(action=\"get_doc\", doc_id=\"{id}\")");
+    }
+    if id_field == "node_id" && !id.is_empty() {
+        return format!("memory(action=\"get_node\", node_id=\"{id}\")");
     }
 
     if (k.contains("transcript") || k.contains("conversation") || k == "session")

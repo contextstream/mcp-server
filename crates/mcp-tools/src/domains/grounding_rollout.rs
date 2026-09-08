@@ -2,7 +2,10 @@
 //! Default/invalid configuration and the independent kill switch serve legacy.
 use serde::Deserialize;
 
-pub const POLICY_REVISION: &str = "grounding-evidence-v2";
+pub const POLICY_REVISION: &str = "grounding-evidence-v3";
+// Freeze the existing population even when a new selector requires fresh
+// qualification. Changing policy must not silently move sticky cohorts.
+const COHORT_NAMESPACE: &str = "grounding-evidence-v2";
 // Independent of selector policy: changing scoring must not reshuffle cohorts.
 pub const EVALUATION_REVISION: &str = "grounding-quality-v2";
 
@@ -172,7 +175,7 @@ impl Rollout {
 fn cohort_bucket(salt: &str, subject: &str, workspace: &str, project: Option<&str>) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for field in [
-        POLICY_REVISION,
+        COHORT_NAMESPACE,
         salt,
         subject,
         workspace,

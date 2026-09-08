@@ -8,12 +8,15 @@ Selector timing is explicitly NOT end-to-end context latency or canary evidence.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
 import time
 
 POLICY = "grounding-evidence-v2"
+# Scoring evolves independently of selector policy and sticky cohort assignment.
+EVALUATION = "grounding-quality-v2"
 CATEGORIES = {"continuation", "paraphrase", "history", "supersession", "scope", "no_answer"}
 SPLITS = ("development", "holdout")
 
@@ -73,10 +76,12 @@ def measure(corpus, split, labels, replay):
     queries = corpus_queries(corpus, split)
     require(labels.get("split") == split and labels.get("schema_version") == 1, "labels have wrong split/schema")
     require(replay.get("split") == split and replay.get("policy_revision") == POLICY, "replay has wrong split/policy")
+    require(replay.get("evaluation_revision") == EVALUATION, "replay has wrong evaluation revision")
     label_map = indexed(labels.get("labels"), "query_id")
     runs = indexed(replay.get("results"), "query_id")
     require(set(queries) == set(label_map) == set(runs), "incomplete or foreign query coverage")
     known, top1, relevant_at_5, answerable, no_answer, false_ground, unavailable, scope_violations = (0,) * 8
+    ndcg, returned_precision = [], []
     independent = labels.get("provenance") == "independent_review"
     for query_id, query in queries.items():
         label, run = label_map[query_id], runs[query_id]
@@ -103,14 +108,21 @@ def measure(corpus, split, labels, replay):
             top1 += bool(ids and ids[0] == expected)
         if relevant:
             answerable += 1
-            relevant_at_5 += sum(item in relevant for item in ids)
+            relevant_count = sum(item in relevant for item in ids)
+            relevant_at_5 += relevant_count
+            dcg = math.fsum(1 / math.log2(rank + 2) for rank, item in enumerate(ids) if item in relevant)
+            ideal = math.fsum(1 / math.log2(rank + 2) for rank in range(min(5, len(relevant))))
+            ndcg.append(dcg / ideal)
+            returned_precision.append(relevant_count / len(ids) if ids else 0.0)
         else:
             no_answer += 1
             false_ground += bool(ids)
     require(known > 0 and answerable > 0 and no_answer >= 10, "known-item and no-answer coverage required")
     return {"query_count": len(queries), "known_item_queries": known, "known_item_top1": top1 / known,
-            # Fixed denominator: returning fewer hits cannot inflate precision@5.
+            # Fixed-denominator diagnostic, not a sparse-relevance quality gate.
             "precision_at_5": relevant_at_5 / (5 * answerable),
+            "ndcg_at_5": math.fsum(ndcg) / answerable,
+            "returned_precision_at_5": math.fsum(returned_precision) / answerable,
             "no_answer_queries": no_answer, "false_grounding_rate": false_ground / no_answer,
             "unavailable_queries": unavailable, "scope_violations": scope_violations,
             "independent_labels": bool(independent)}
@@ -122,7 +134,9 @@ def qualified_metrics(metrics):
     # Recheck reports as well as fresh measurements. A legacy safety-only seal
     # must not grant access to holdout, nor may malformed scores count as truth.
     for key, minimum, maximum in (("known_item_top1", 0.95, 1),
-                                  ("precision_at_5", 0.8, 1),
+                                  ("precision_at_5", 0, 1),
+                                  ("ndcg_at_5", 0.8, 1),
+                                  ("returned_precision_at_5", 0.8, 1),
                                   ("false_grounding_rate", 0, 0.05)):
         value = metrics.get(key)
         if type(value) not in (int, float) or not minimum <= value <= maximum:
@@ -139,6 +153,7 @@ def qualified_metrics(metrics):
 
 def approved_development(report):
     return (report.get("schema_version") == 1 and report.get("split") == "development"
+            and report.get("evaluation_revision") == EVALUATION
             and report.get("policy_revision") == POLICY and report.get("development_approved") is True
             and qualified_metrics(report.get("metrics"))
             and report.get("source_dirty") is False and type(report.get("sealed_at_unix")) is int
@@ -151,6 +166,7 @@ def evaluate(corpus_path, split, labels, replay, development=None):
     require(labels.get("corpus_sha256") == corpus_hash == replay.get("corpus_sha256"), "corpus/label/replay fingerprint mismatch")
     metrics = measure(corpus, split, labels, replay)
     result = {"schema_version": 1, "split": split, "policy_revision": POLICY, "minimum_lexical_coverage": 0.4,
+              "evaluation_revision": EVALUATION,
               "corpus_sha256": corpus_hash, "replay_binary_sha256": replay.get("replay_binary_sha256"),
               "source_commit": replay.get("source_commit"), "source_dirty": replay.get("source_dirty"),
               "sealed_at_unix": int(time.time()), "metrics": metrics,
@@ -164,7 +180,7 @@ def evaluate(corpus_path, split, labels, replay, development=None):
         result["development_approved"] = qualified
     else:
         require(isinstance(development, dict) and approved_development(development), "seal development before reading holdout labels")
-        require(all(development.get(k) == result.get(k) for k in ("corpus_sha256", "replay_binary_sha256", "source_commit", "policy_revision")), "holdout candidate differs from sealed development")
+        require(all(development.get(k) == result.get(k) for k in ("corpus_sha256", "replay_binary_sha256", "source_commit", "policy_revision", "evaluation_revision")), "holdout candidate differs from sealed development")
         require(type(replay.get("collected_at_unix")) is int and development["sealed_at_unix"] <= replay["collected_at_unix"] <= int(time.time()), "holdout collection time is outside the sealed evaluation window")
         result["retrieval_qualified"] = qualified
     return result
@@ -179,7 +195,7 @@ def build_selector():
     binary = Path(metadata["target_directory"]) / "debug" / "examples" / ("grounding_replay.exe" if os.name == "nt" else "grounding_replay")
     require(commit == subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
             and not subprocess.check_output(["git", "status", "--porcelain"], cwd=root).strip(), "source changed during build")
-    return {"schema_version":1,"policy_revision":POLICY,"source_commit":commit,"source_dirty":False,
+    return {"schema_version":1,"policy_revision":POLICY,"evaluation_revision":EVALUATION,"source_commit":commit,"source_dirty":False,
             "binary":str(binary),"replay_binary_sha256":digest(binary),"profile":"debug","built_at_unix":int(time.time())}
 
 
@@ -217,7 +233,8 @@ def collect(corpus_path, split, recalls_path, binary, build_receipt, development
     candidate = digest(binary)
     require(isinstance(build_receipt, dict) and build_receipt.get("source_dirty") is False
             and build_receipt.get("source_commit") == commit and build_receipt.get("replay_binary_sha256") == candidate
-            and build_receipt.get("policy_revision") == POLICY, "selector build receipt mismatch")
+            and build_receipt.get("policy_revision") == POLICY
+            and build_receipt.get("evaluation_revision") == EVALUATION, "selector build receipt mismatch")
     corpus_hash = digest(corpus_path)
     if split == "holdout":
         require(isinstance(development, dict) and approved_development(development), "development must be sealed first")
@@ -231,6 +248,7 @@ def collect(corpus_path, split, recalls_path, binary, build_receipt, development
     require(commit == subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(), "source changed during collection")
     dirty = dirty or bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=root).strip())
     return {"schema_version": 1, "split": split, "policy_revision": POLICY, "corpus_sha256": corpus_hash,
+            "evaluation_revision": EVALUATION,
             "replay_binary_sha256": candidate, "source_commit": commit, "source_dirty": dirty,
             "recalls_sha256": digest(recalls_path), "collected_at_unix": int(time.time()), "results": results,
             "timing_scope": "selector_only_not_end_to_end", "release_qualified": False}
@@ -266,7 +284,7 @@ def main():
         result = evaluate(args.corpus, args.split, read(args.labels), read(args.replay), development)
         passed = result["development_approved"] if args.split == "development" else result["retrieval_qualified"]
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps({k: result[k] for k in ("split", "policy_revision", "release_qualified")}))
+    print(json.dumps({k: result[k] for k in ("split", "policy_revision", "evaluation_revision", "release_qualified")}))
     return 0 if passed else 1
 
 

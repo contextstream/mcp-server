@@ -2,12 +2,17 @@
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
-from qualify import CATEGORIES, POLICY, approved_development, corpus_queries, digest, evaluate, measure, validate_recall_query
+import qualify
+from qualify import CATEGORIES, POLICY, approved_development, collect, corpus_queries, digest, evaluate, measure, qualified_metrics, validate_recall_query
+
+EVALUATION = "grounding-quality-v2"
 
 
 class QualificationTests(unittest.TestCase):
@@ -24,7 +29,7 @@ class QualificationTests(unittest.TestCase):
             labels.append({"query_id":q["id"],"reviewer_id":"unit-test-reviewer","relevant":hits,"known_item":hits[0] if hits else None})
             runs.append({"query_id":q["id"],"policy_revision":POLICY,"candidate":copy.deepcopy(hits),"retrieval_status":"available" if hits else "no_evidence"})
         return ({"schema_version":1,"split":split,"provenance":"independent_review","labels":labels},
-                {"schema_version":1,"split":split,"policy_revision":POLICY,"results":runs,
+                {"schema_version":1,"split":split,"policy_revision":POLICY,"evaluation_revision":EVALUATION,"results":runs,
                  "source_commit":"unit-test-commit","source_dirty":False,"replay_binary_sha256":"a"*64,"collected_at_unix":int(time.time())})
 
     def test_full_scoped_evidence_scores_exactly(self):
@@ -32,6 +37,8 @@ class QualificationTests(unittest.TestCase):
         result = measure(self.corpus, "holdout", labels, replay)
         self.assertEqual(result["known_item_top1"], 1)
         self.assertEqual(result["precision_at_5"], 1)
+        self.assertEqual(result["ndcg_at_5"], 1)
+        self.assertEqual(result["returned_precision_at_5"], 1)
         self.assertEqual(result["false_grounding_rate"], 0)
         self.assertTrue(result["independent_labels"])
 
@@ -116,6 +123,137 @@ class QualificationTests(unittest.TestCase):
         result = measure(self.corpus, "holdout", labels, replay)
         self.assertEqual(result["known_item_top1"], 1)
         self.assertEqual(result["precision_at_5"], 0.2)
+        self.assertEqual(result["returned_precision_at_5"], 1)
+        self.assertAlmostEqual(result["ndcg_at_5"], 1 / sum(1 / math.log2(i + 2) for i in range(5)))
+        self.assertFalse(qualified_metrics(result))
+
+    def test_sparse_exact_answers_qualify_without_padding(self):
+        labels, replay = self.evidence("development")
+        for label, row in zip(labels["labels"], replay["results"]):
+            label["relevant"] = label["relevant"][:1]
+            row["candidate"] = row["candidate"][:1]
+        result = measure(self.corpus, "development", labels, replay)
+        self.assertEqual(result["precision_at_5"], .2)
+        self.assertEqual(result["ndcg_at_5"], 1)
+        self.assertEqual(result["returned_precision_at_5"], 1)
+        self.assertTrue(qualified_metrics(result))
+        # A correct first result does not excuse four irrelevant extras.
+        for row in replay["results"]:
+            if row["candidate"]:
+                row["candidate"] += [{"id": f"noise-{i}", "project_id": "test-project"} for i in range(4)]
+        padded = measure(self.corpus, "development", labels, replay)
+        self.assertEqual(padded["ndcg_at_5"], 1)
+        self.assertEqual(padded["returned_precision_at_5"], .2)
+        self.assertFalse(qualified_metrics(padded))
+
+    def test_discount_ideal_normalization_and_empty_answers(self):
+        for gold_count in (1, 2, 5, 7):
+            for returned_count in (0, 1, 5):
+                with self.subTest(gold_count=gold_count, returned_count=returned_count):
+                    labels, replay = self.evidence("development")
+                    for label, row in zip(labels["labels"], replay["results"]):
+                        if label["relevant"]:
+                            hits = [{"id": f"gold-{i}", "project_id": "test-project"} for i in range(gold_count)]
+                            label.update(relevant=hits, known_item=hits[0])
+                            # Relevant only at the last returned rank.
+                            row["candidate"] = ([{"id": f"noise-{i}", "project_id": "test-project"}
+                                                 for i in range(returned_count - 1)] + hits[:1]) if returned_count else []
+                    result = measure(self.corpus, "development", labels, replay)
+                    ideal = sum(1 / math.log2(i + 2) for i in range(min(5, gold_count)))
+                    self.assertAlmostEqual(result["ndcg_at_5"], (1 / math.log2(returned_count + 1) / ideal) if returned_count else 0)
+                    self.assertAlmostEqual(result["returned_precision_at_5"], 1 / returned_count if returned_count else 0)
+
+    def test_metrics_are_macro_averaged_over_answerable_queries(self):
+        labels, replay = self.evidence("development")
+        # 25 exact singletons, 25 one-of-five returns: each query has equal weight.
+        positives = [(label, row) for label, row in zip(labels["labels"], replay["results"]) if label["relevant"]]
+        for i, (label, row) in enumerate(positives):
+            row["candidate"] = row["candidate"][:1]
+            if i < 25:
+                label["relevant"] = label["relevant"][:1]
+        result = measure(self.corpus, "development", labels, replay)
+        ideal = sum(1 / math.log2(i + 2) for i in range(5))
+        self.assertAlmostEqual(result["ndcg_at_5"], (1 + 1 / ideal) / 2)
+        self.assertEqual(result["returned_precision_at_5"], 1)
+        for i, (label, row) in enumerate(positives):
+            label["relevant"] = label["relevant"][:1]
+            if i >= 25:
+                row["candidate"] += [{"id": f"noise-{j}", "project_id": "test-project"} for j in range(4)]
+        result = measure(self.corpus, "development", labels, replay)
+        self.assertEqual(result["ndcg_at_5"], 1)
+        self.assertAlmostEqual(result["returned_precision_at_5"], .6)
+
+    def test_distinct_gold_identity_and_complete_ideal_ranking(self):
+        for gold_count in (1, 2, 5, 7):
+            labels, replay = self.evidence("development")
+            for label, row in zip(labels["labels"], replay["results"]):
+                if label["relevant"]:
+                    hits = [{"id": f"gold-{i}", "project_id": "test-project"} for i in range(gold_count)]
+                    label.update(relevant=hits, known_item=hits[0])
+                    row["candidate"] = hits[:5]
+            result = measure(self.corpus, "development", labels, replay)
+            self.assertEqual(result["ndcg_at_5"], 1)
+            self.assertEqual(result["returned_precision_at_5"], 1)
+            labels["labels"][0]["relevant"].append(labels["labels"][0]["relevant"][0])
+            with self.assertRaises(ValueError):
+                measure(self.corpus, "development", labels, replay)
+
+    def test_replay_requires_explicit_current_evaluation_revision(self):
+        for revision in (None, "grounding-quality-v1", "unknown", True):
+            labels, replay = self.evidence("development")
+            if revision is None:
+                del replay["evaluation_revision"]
+            else:
+                replay["evaluation_revision"] = revision
+            with self.subTest(revision=revision), self.assertRaises(ValueError):
+                measure(self.corpus, "development", labels, replay)
+
+    def test_build_receipt_and_collection_bind_evaluation_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            corpus_path = Path(directory) / "corpus.json"
+            corpus_path.write_text(json.dumps(self.corpus))
+            raw_path = Path(directory) / "recalls.jsonl"
+            rows = [{"query_id": q["id"], "query_sha256": hashlib.sha256(q["text"].encode()).hexdigest(),
+                     "recall": {"query": q["text"], "degraded": False, "errors": [], "results": []}}
+                    for q in corpus_queries(self.corpus, "development").values()]
+            raw_path.write_text("\n".join(json.dumps(row) for row in rows))
+            binary = Path(directory) / "synthetic-binary"
+            binary.write_bytes(b"unit test only")
+            receipt = {"source_dirty": False, "source_commit": "test-commit", "replay_binary_sha256": digest(binary),
+                       "policy_revision": POLICY, "evaluation_revision": EVALUATION}
+            _, replay = self.evidence("development")
+            with patch.object(qualify.subprocess, "check_output", side_effect=lambda args, **kwargs: "" if args[1] == "status" else "test-commit"), \
+                 patch.object(qualify.subprocess, "run") as run:
+                run.return_value.stdout = "\n".join(json.dumps(row) for row in replay["results"])
+                for revision in (None, "grounding-quality-v1", "unknown"):
+                    old = dict(receipt, evaluation_revision=revision)
+                    if revision is None:
+                        del old["evaluation_revision"]
+                    with self.subTest(revision=revision), self.assertRaises(ValueError):
+                        collect(corpus_path, "development", raw_path, binary, old)
+                run.assert_not_called()
+                collected = collect(corpus_path, "development", raw_path, binary, receipt)
+                self.assertEqual(collected["evaluation_revision"], EVALUATION)
+                self.assertFalse(collected["release_qualified"])
+
+    def test_old_seal_is_rejected_before_opening_holdout_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "corpus.json"
+            path.write_text(json.dumps(self.corpus))
+            labels, replay = self.evidence("development")
+            labels["corpus_sha256"] = replay["corpus_sha256"] = digest(path)
+            current = evaluate(path, "development", labels, replay)
+            for revision in (None, "grounding-quality-v1", "unknown"):
+                old = dict(current, evaluation_revision=revision)
+                if revision is None:
+                    del old["evaluation_revision"]
+                with patch.object(qualify, "read", return_value=old) as read_input, \
+                     patch("sys.argv", ["qualify.py", "evaluate", "--split", "holdout", "--corpus", "corpus",
+                                        "--development", "dev-seal", "--labels", "holdout-labels",
+                                        "--replay", "holdout-replay", "--output", "unused"]):
+                    with self.assertRaises(ValueError):
+                        qualify.main()
+                    read_input.assert_called_once_with(Path("dev-seal"))
 
     def test_sealed_candidate_identity_and_dirty_source_gates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,6 +263,12 @@ class QualificationTests(unittest.TestCase):
             labels["corpus_sha256"] = replay["corpus_sha256"] = digest(path)
             development = evaluate(path, "development", labels, replay)
             self.assertTrue(development["development_approved"])
+            self.assertEqual(development["evaluation_revision"], EVALUATION)
+            for revision in (None, "grounding-quality-v1", "unknown"):
+                stale = dict(development, evaluation_revision=revision)
+                if revision is None:
+                    del stale["evaluation_revision"]
+                self.assertFalse(approved_development(stale))
             labels, replay = self.evidence("holdout")
             labels["corpus_sha256"] = replay["corpus_sha256"] = digest(path)
             result = evaluate(path, "holdout", labels, replay, development)
@@ -173,7 +317,8 @@ class QualificationTests(unittest.TestCase):
             invalid_metrics = [None, [], {}, "approved"]
             mutations = [
                 ("independent_labels", False), ("independent_labels", 1),
-                ("known_item_top1", 0.949), ("precision_at_5", 0.799),
+                ("known_item_top1", 0.949), ("precision_at_5", -0.001),
+                ("ndcg_at_5", .799), ("returned_precision_at_5", .799),
                 ("false_grounding_rate", 0.051), ("unavailable_queries", 1),
                 ("scope_violations", 1), ("known_item_top1", True),
                 ("precision_at_5", "1.0"), ("precision_at_5", float("nan")),
@@ -182,6 +327,8 @@ class QualificationTests(unittest.TestCase):
                 ("known_item_queries", 51), ("no_answer_queries", 9),
                 ("no_answer_queries", 60), ("query_count", "60"),
             ]
+            for key in ("ndcg_at_5", "returned_precision_at_5", "precision_at_5"):
+                mutations.extend((key, value) for value in (True, False, "1", None, float("nan"), float("inf"), -float("inf"), 1.001))
             for key, value in mutations:
                 invalid_metrics.append(dict(development["metrics"], **{key: value}))
             for missing in development["metrics"]:
@@ -198,7 +345,8 @@ class QualificationTests(unittest.TestCase):
             del missing_metrics["metrics"]
             self.assertFalse(approved_development(missing_metrics))
             boundary = dict(development, metrics=dict(development["metrics"],
-                known_item_top1=0.95, precision_at_5=0.8, false_grounding_rate=0.05))
+                known_item_top1=0.95, precision_at_5=0.2, ndcg_at_5=.8,
+                returned_precision_at_5=.8, false_grounding_rate=0.05))
             self.assertTrue(approved_development(boundary))
 
 

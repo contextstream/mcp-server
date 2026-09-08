@@ -1,0 +1,5 @@
+# Reviewed false positive: the public metric name precision_at_5 in a Rust
+# comparison was classified as a generic API key. No credential is present.
+# The current test uses `metric`; retain only this exact historical fingerprint
+# because CI scans all commits. No rule, path, or future finding is excluded.
+c6958417fa68ab9407cc53fbd0595dd8f8447ba7:crates/mcp-tools/src/domains/grounding_rollout.rs:generic-api-key:303

@@ -276,12 +276,12 @@ mod tests {
             config().mode(Some("internal"), Some("ws"), None, 1),
             "internal"
         );
-        for key in ["ndcg_at_5", "returned_precision_at_5", "precision_at_5"] {
+        for metric in ["ndcg_at_5", "returned_precision_at_5", "precision_at_5"] {
             let mut missing = config_value();
             missing["qualification"]
                 .as_object_mut()
                 .unwrap()
-                .remove(key);
+                .remove(metric);
             assert!(serde_json::from_value::<Rollout>(missing).is_err());
             for invalid in [
                 serde_json::json!(true),
@@ -289,7 +289,7 @@ mod tests {
                 serde_json::Value::Null,
             ] {
                 let mut value = config_value();
-                value["qualification"][key] = invalid;
+                value["qualification"][metric] = invalid;
                 assert!(serde_json::from_value::<Rollout>(value).is_err());
             }
             for invalid in [
@@ -300,11 +300,11 @@ mod tests {
                 1.001,
                 0.799,
             ] {
-                if key == "precision_at_5" && invalid == 0.799 {
+                if metric == "precision_at_5" && invalid == 0.799 {
                     continue; // Fixed-denominator precision is diagnostic only.
                 }
                 let mut r = config();
-                match key {
+                match metric {
                     "ndcg_at_5" => r.qualification.ndcg_at_5 = invalid,
                     "returned_precision_at_5" => r.qualification.returned_precision_at_5 = invalid,
                     _ => r.qualification.precision_at_5 = invalid,
@@ -312,7 +312,7 @@ mod tests {
                 assert_eq!(
                     r.mode(Some("internal"), Some("ws"), None, 1),
                     "shadow",
-                    "{key}={invalid}"
+                    "{metric}={invalid}"
                 );
             }
         }

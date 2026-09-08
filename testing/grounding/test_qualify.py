@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 
-from qualify import CATEGORIES, POLICY, corpus_queries, digest, evaluate, measure, validate_recall_query
+from qualify import CATEGORIES, POLICY, approved_development, corpus_queries, digest, evaluate, measure, validate_recall_query
 
 
 class QualificationTests(unittest.TestCase):
@@ -38,7 +38,7 @@ class QualificationTests(unittest.TestCase):
     def test_query_sidecar_cannot_relabel_a_different_recall_payload(self):
         query = {"text": "frozen query"}
         row = {"query_sha256": hashlib.sha256(b"frozen query").hexdigest(),
-               "recall": {"query": "frozen query", "results": []}}
+               "recall": {"query": "frozen query", "results": [], "degraded": False, "errors": []}}
         validate_recall_query(row, query)
         for recall in ({"query": "different query"}, {"query": " frozen query"}, {}, None):
             invalid = dict(row, recall=recall)
@@ -46,6 +46,34 @@ class QualificationTests(unittest.TestCase):
                 validate_recall_query(invalid, query)
         with self.assertRaises(ValueError):
             validate_recall_query(dict(row, query_sha256="0" * 64), query)
+
+    def test_partial_recall_cannot_be_replayed_as_clean_evidence(self):
+        query = {"text": "frozen query"}
+        # Even usable hits do not make missing upstream coverage a clean run.
+        for results in ([], [{"id": "available-source"}]):
+            clean = {"query": query["text"], "results": results,
+                     "degraded": False, "errors": [], "degraded_reason": None}
+            row = {"query_sha256": hashlib.sha256(query["text"].encode()).hexdigest(),
+                   "recall": clean}
+            validate_recall_query(row, query)
+            mutations = [
+                {"degraded": True}, {"degraded": None}, {"degraded": 0},
+                {"degraded": "false"}, {"degraded": []},
+                {"errors": ["partial_retrieval_unavailable"]}, {"errors": None},
+                {"errors": ""}, {"errors": {}},
+                {"degraded_reason": "partial_retrieval_unavailable"},
+                {"results": None}, {"results": {}}, {"results": [None]},
+            ]
+            for mutation in mutations:
+                with self.subTest(results=results, mutation=mutation):
+                    with self.assertRaises(ValueError):
+                        validate_recall_query(dict(row, recall=dict(clean, **mutation)), query)
+            for missing in ("degraded", "errors", "results"):
+                incomplete = dict(clean)
+                del incomplete[missing]
+                with self.subTest(missing=missing):
+                    with self.assertRaises(ValueError):
+                        validate_recall_query(dict(row, recall=incomplete), query)
 
     def test_author_is_not_an_independent_labeler(self):
         labels, replay = self.evidence("holdout")
@@ -112,6 +140,66 @@ class QualificationTests(unittest.TestCase):
             self.assertFalse(evaluate(path, "holdout", labels, replay, development)["retrieval_qualified"])
             with self.assertRaises(ValueError):
                 evaluate(path, "holdout", labels, replay)
+
+    def test_development_requires_independent_quality_before_sealing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unit-test-corpus.json"
+            path.write_text(json.dumps(self.corpus))
+            for failure in ("author_labels", "low_top1", "low_precision"):
+                labels, replay = self.evidence("development")
+                labels["corpus_sha256"] = replay["corpus_sha256"] = digest(path)
+                if failure == "author_labels":
+                    labels["labels"][0]["reviewer_id"] = "unit-test-author"
+                else:
+                    for row in replay["results"]:
+                        if failure == "low_top1":
+                            row["candidate"].reverse()
+                        else:
+                            row["candidate"] = row["candidate"][:1]
+                with self.subTest(failure=failure):
+                    result = evaluate(path, "development", labels, replay)
+                    self.assertFalse(result["development_approved"])
+                    self.assertFalse(approved_development(result))
+
+    def test_holdout_rechecks_quality_in_existing_development_seals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unit-test-corpus.json"
+            path.write_text(json.dumps(self.corpus))
+            labels, replay = self.evidence("development")
+            labels["corpus_sha256"] = replay["corpus_sha256"] = digest(path)
+            development = evaluate(path, "development", labels, replay)
+            labels, replay = self.evidence("holdout")
+            labels["corpus_sha256"] = replay["corpus_sha256"] = digest(path)
+            invalid_metrics = [None, [], {}, "approved"]
+            mutations = [
+                ("independent_labels", False), ("independent_labels", 1),
+                ("known_item_top1", 0.949), ("precision_at_5", 0.799),
+                ("false_grounding_rate", 0.051), ("unavailable_queries", 1),
+                ("scope_violations", 1), ("known_item_top1", True),
+                ("precision_at_5", "1.0"), ("precision_at_5", float("nan")),
+                ("precision_at_5", float("inf")), ("unavailable_queries", False),
+                ("query_count", 59), ("known_item_queries", 0),
+                ("known_item_queries", 51), ("no_answer_queries", 9),
+                ("no_answer_queries", 60), ("query_count", "60"),
+            ]
+            for key, value in mutations:
+                invalid_metrics.append(dict(development["metrics"], **{key: value}))
+            for missing in development["metrics"]:
+                metrics = dict(development["metrics"])
+                del metrics[missing]
+                invalid_metrics.append(metrics)
+            for metrics in invalid_metrics:
+                with self.subTest(metrics=metrics):
+                    stale_seal = dict(development, metrics=metrics)
+                    self.assertFalse(approved_development(stale_seal))
+                    with self.assertRaises(ValueError):
+                        evaluate(path, "holdout", labels, replay, stale_seal)
+            missing_metrics = dict(development)
+            del missing_metrics["metrics"]
+            self.assertFalse(approved_development(missing_metrics))
+            boundary = dict(development, metrics=dict(development["metrics"],
+                known_item_top1=0.95, precision_at_5=0.8, false_grounding_rate=0.05))
+            self.assertTrue(approved_development(boundary))
 
 
 if __name__ == "__main__":

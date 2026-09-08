@@ -116,9 +116,31 @@ def measure(corpus, split, labels, replay):
             "independent_labels": bool(independent)}
 
 
+def qualified_metrics(metrics):
+    if not isinstance(metrics, dict) or metrics.get("independent_labels") is not True:
+        return False
+    # Recheck reports as well as fresh measurements. A legacy safety-only seal
+    # must not grant access to holdout, nor may malformed scores count as truth.
+    for key, minimum, maximum in (("known_item_top1", 0.95, 1),
+                                  ("precision_at_5", 0.8, 1),
+                                  ("false_grounding_rate", 0, 0.05)):
+        value = metrics.get(key)
+        if type(value) not in (int, float) or not minimum <= value <= maximum:
+            return False
+    for key in ("unavailable_queries", "scope_violations"):
+        if type(metrics.get(key)) is not int or metrics[key] != 0:
+            return False
+    for key in ("query_count", "known_item_queries", "no_answer_queries"):
+        if type(metrics.get(key)) is not int:
+            return False
+    return (metrics["query_count"] == 60 and 10 <= metrics["no_answer_queries"] < 60
+            and 0 < metrics["known_item_queries"] <= 60 - metrics["no_answer_queries"])
+
+
 def approved_development(report):
     return (report.get("schema_version") == 1 and report.get("split") == "development"
             and report.get("policy_revision") == POLICY and report.get("development_approved") is True
+            and qualified_metrics(report.get("metrics"))
             and report.get("source_dirty") is False and type(report.get("sealed_at_unix")) is int
             and 0 < report["sealed_at_unix"] <= int(time.time()))
 
@@ -135,17 +157,16 @@ def evaluate(corpus_path, split, labels, replay, development=None):
               "development_approved": False, "retrieval_qualified": False, "release_qualified": False}
     clean = replay.get("source_dirty") is False and isinstance(replay.get("source_commit"), str) and bool(replay["source_commit"])
     clean = clean and isinstance(replay.get("replay_binary_sha256"), str) and len(replay["replay_binary_sha256"]) == 64
-    safe = metrics["unavailable_queries"] == 0 and metrics["scope_violations"] == 0 and metrics["false_grounding_rate"] <= 0.05
+    qualified = bool(clean and qualified_metrics(metrics))
     if split == "development":
         # This revision has a fixed 0.4 policy. If it fails, change/calibrate on
         # development and collect a new source-bound report before holdout.
-        result["development_approved"] = bool(clean and safe)
+        result["development_approved"] = qualified
     else:
         require(isinstance(development, dict) and approved_development(development), "seal development before reading holdout labels")
         require(all(development.get(k) == result.get(k) for k in ("corpus_sha256", "replay_binary_sha256", "source_commit", "policy_revision")), "holdout candidate differs from sealed development")
         require(type(replay.get("collected_at_unix")) is int and development["sealed_at_unix"] <= replay["collected_at_unix"] <= int(time.time()), "holdout collection time is outside the sealed evaluation window")
-        result["retrieval_qualified"] = bool(clean and safe and metrics["independent_labels"]
-                                              and metrics["known_item_top1"] >= 0.95 and metrics["precision_at_5"] >= 0.8)
+        result["retrieval_qualified"] = qualified
     return result
 
 

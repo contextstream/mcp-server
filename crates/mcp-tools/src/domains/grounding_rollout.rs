@@ -3,11 +3,14 @@
 use serde::Deserialize;
 
 pub const POLICY_REVISION: &str = "grounding-evidence-v2";
+// Independent of selector policy: changing scoring must not reshuffle cohorts.
+pub const EVALUATION_REVISION: &str = "grounding-quality-v2";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Qualification {
     pub policy_revision: String,
+    pub evaluation_revision: String,
     pub corpus_sha256: String,
     pub candidate_sha256: String,
     pub development_queries: u64,
@@ -18,6 +21,8 @@ pub struct Qualification {
     pub false_grounding_rate: f64,
     pub known_item_top1: f64,
     pub precision_at_5: f64,
+    pub ndcg_at_5: f64,
+    pub returned_precision_at_5: f64,
     pub baseline_p95_ms: f64,
     pub candidate_p95_ms: f64,
     pub privacy_violations: u64,
@@ -29,6 +34,7 @@ impl Qualification {
     pub fn passes(&self, candidate: &str, corpus: &str) -> bool {
         let fraction = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
         self.policy_revision == POLICY_REVISION
+            && self.evaluation_revision == EVALUATION_REVISION
             && sha256(candidate)
             && sha256(corpus)
             && self.candidate_sha256 == candidate
@@ -42,7 +48,10 @@ impl Qualification {
             && fraction(self.known_item_top1)
             && self.known_item_top1 >= 0.95
             && fraction(self.precision_at_5)
-            && self.precision_at_5 >= 0.8
+            && fraction(self.ndcg_at_5)
+            && self.ndcg_at_5 >= 0.8
+            && fraction(self.returned_precision_at_5)
+            && self.returned_precision_at_5 >= 0.8
             && self.baseline_p95_ms.is_finite()
             && self.baseline_p95_ms > 0.0
             && self.candidate_p95_ms.is_finite()
@@ -62,6 +71,7 @@ fn sha256(value: &str) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct CanaryEvidence {
     pub policy_revision: String,
+    pub evaluation_revision: String,
     pub candidate_sha256: String,
     pub corpus_sha256: String,
     pub started_at_unix: i64,
@@ -77,6 +87,7 @@ pub struct CanaryEvidence {
 impl CanaryEvidence {
     fn passes(&self, now: i64, candidate: &str, corpus: &str) -> bool {
         self.policy_revision == POLICY_REVISION
+            && self.evaluation_revision == EVALUATION_REVISION
             && self.candidate_sha256 == candidate
             && self.corpus_sha256 == corpus
             && self.started_at_unix > 0
@@ -226,16 +237,95 @@ mod tests {
         }
         assert!(!force_shadow(None));
     }
-    fn config() -> Rollout {
-        serde_json::from_value(serde_json::json!({
+    fn config_value() -> serde_json::Value {
+        serde_json::json!({
             "phase":"internal", "candidate_sha256":"a".repeat(64), "corpus_sha256":"b".repeat(64),
             "cohort_salt":"fixed-sampling-salt", "internal_subjects":["internal"],
-            "qualification": {"policy_revision":POLICY_REVISION, "candidate_sha256":"a".repeat(64), "corpus_sha256":"b".repeat(64),
+            "qualification": {"policy_revision":POLICY_REVISION, "evaluation_revision":EVALUATION_REVISION, "candidate_sha256":"a".repeat(64), "corpus_sha256":"b".repeat(64),
                 "development_queries":60,"holdout_queries":60,"independent_labels":true,"coding_qualified":true,"evaluated_at_unix":1,
-                "false_grounding_rate":0.05,"known_item_top1":0.95,"precision_at_5":0.8,
+                "false_grounding_rate":0.05,"known_item_top1":0.95,"precision_at_5":0.2,
+                "ndcg_at_5":0.8,"returned_precision_at_5":0.8,
                 "baseline_p95_ms":100.0,"candidate_p95_ms":110.0,
                 "privacy_violations":0,"authority_violations":0,"false_completion_violations":0}
-        })).unwrap()
+        })
+    }
+    fn config() -> Rollout {
+        serde_json::from_value(config_value()).unwrap()
+    }
+    #[test]
+    fn scoring_revision_is_required_and_old_approvals_stay_shadow() {
+        let mut value = config_value();
+        value["qualification"]
+            .as_object_mut()
+            .unwrap()
+            .remove("evaluation_revision");
+        assert!(serde_json::from_value::<Rollout>(value).is_err());
+        for revision in ["grounding-quality-v1", "unknown", ""] {
+            let mut r = config();
+            r.qualification.evaluation_revision = revision.into();
+            for phase in ["internal", "canary", "general"] {
+                r.phase = phase.into();
+                assert_eq!(r.mode(Some("internal"), Some("ws"), None, 1), "shadow");
+            }
+        }
+    }
+    #[test]
+    fn sparse_quality_metrics_are_required_finite_and_independently_gated() {
+        // The diagnostic P@5 may be .2; both normalized gates must still pass.
+        assert_eq!(
+            config().mode(Some("internal"), Some("ws"), None, 1),
+            "internal"
+        );
+        for key in ["ndcg_at_5", "returned_precision_at_5", "precision_at_5"] {
+            let mut missing = config_value();
+            missing["qualification"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert!(serde_json::from_value::<Rollout>(missing).is_err());
+            for invalid in [
+                serde_json::json!(true),
+                serde_json::json!("1"),
+                serde_json::Value::Null,
+            ] {
+                let mut value = config_value();
+                value["qualification"][key] = invalid;
+                assert!(serde_json::from_value::<Rollout>(value).is_err());
+            }
+            for invalid in [
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                -0.001,
+                1.001,
+                0.799,
+            ] {
+                if key == "precision_at_5" && invalid == 0.799 {
+                    continue; // Fixed-denominator precision is diagnostic only.
+                }
+                let mut r = config();
+                match key {
+                    "ndcg_at_5" => r.qualification.ndcg_at_5 = invalid,
+                    "returned_precision_at_5" => r.qualification.returned_precision_at_5 = invalid,
+                    _ => r.qualification.precision_at_5 = invalid,
+                }
+                assert_eq!(
+                    r.mode(Some("internal"), Some("ws"), None, 1),
+                    "shadow",
+                    "{key}={invalid}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn legacy_canary_cannot_be_deserialized_into_current_evidence() {
+        let value = serde_json::json!({
+            "policy_revision": POLICY_REVISION, "candidate_sha256": "a".repeat(64),
+            "corpus_sha256": "b".repeat(64), "started_at_unix": 1, "observed_until_unix": 172801,
+            "eligible_operations": 1000, "privacy_violations": 0, "authority_violations": 0,
+            "false_completion_violations": 0, "baseline_p95_ms": 100, "candidate_p95_ms": 110
+        });
+        assert!(serde_json::from_value::<CanaryEvidence>(value).is_err());
     }
     #[test]
     fn internal_requires_explicit_subject_and_qualification() {
@@ -266,6 +356,8 @@ mod tests {
             .filter(|i| r.mode(Some(&i.to_string()), Some("ws"), Some("project"), 1) == "canary")
             .count();
         assert!((400..600).contains(&selected), "{selected}");
+        // Policy-v2 golden assignment remains unchanged by scoring revisions.
+        assert_eq!(cohort_bucket("salt", "one", "ws", None), 6089);
         assert_eq!(
             cohort_bucket("salt", "one", "ws", None),
             cohort_bucket("salt", "one", "ws", None)
@@ -282,6 +374,7 @@ mod tests {
         assert_eq!(r.mode(Some("u"), Some("ws"), None, 200_000), "shadow");
         r.canary = Some(CanaryEvidence {
             policy_revision: POLICY_REVISION.into(),
+            evaluation_revision: EVALUATION_REVISION.into(),
             candidate_sha256: "a".repeat(64),
             corpus_sha256: "b".repeat(64),
             started_at_unix: 1,
@@ -294,6 +387,9 @@ mod tests {
             candidate_p95_ms: 110.0,
         });
         assert_eq!(r.mode(Some("u"), Some("ws"), None, 200_000), "general");
+        r.canary.as_mut().unwrap().evaluation_revision = "grounding-quality-v1".into();
+        assert_eq!(r.mode(Some("u"), Some("ws"), None, 200_000), "shadow");
+        r.canary.as_mut().unwrap().evaluation_revision = EVALUATION_REVISION.into();
         r.canary.as_mut().unwrap().eligible_operations = 999;
         assert_eq!(r.mode(Some("u"), Some("ws"), None, 200_000), "shadow");
         r.canary.as_mut().unwrap().eligible_operations = 1000;

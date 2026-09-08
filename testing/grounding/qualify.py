@@ -170,6 +170,16 @@ def validate_recall_query(row, query):
     # for another query. Bind the actual selector input to the frozen corpus.
     require(isinstance(recall, dict) and recall.get("query") == query["text"],
             "recall payload query differs from frozen corpus")
+    # A partial upstream response can contain selectable hits (or an empty
+    # array). Neither proves complete retrieval or an honest no-answer. Require
+    # explicit healthy API evidence before running the selector; missing status
+    # from an older/hand-built envelope must not silently qualify either.
+    require(recall.get("degraded") is False and recall.get("errors") == []
+            and recall.get("degraded_reason") in (None, ""),
+            "recall retrieval is partial, unavailable or unverified")
+    results = recall.get("results")
+    require(isinstance(results, list) and all(isinstance(item, dict) for item in results),
+            "recall results are missing or malformed")
 
 
 def collect(corpus_path, split, recalls_path, binary, build_receipt, development=None):

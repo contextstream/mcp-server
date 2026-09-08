@@ -38,7 +38,7 @@ class QualificationTests(unittest.TestCase):
     def test_query_sidecar_cannot_relabel_a_different_recall_payload(self):
         query = {"text": "frozen query"}
         row = {"query_sha256": hashlib.sha256(b"frozen query").hexdigest(),
-               "recall": {"query": "frozen query", "results": []}}
+               "recall": {"query": "frozen query", "results": [], "degraded": False, "errors": []}}
         validate_recall_query(row, query)
         for recall in ({"query": "different query"}, {"query": " frozen query"}, {}, None):
             invalid = dict(row, recall=recall)
@@ -46,6 +46,34 @@ class QualificationTests(unittest.TestCase):
                 validate_recall_query(invalid, query)
         with self.assertRaises(ValueError):
             validate_recall_query(dict(row, query_sha256="0" * 64), query)
+
+    def test_partial_recall_cannot_be_replayed_as_clean_evidence(self):
+        query = {"text": "frozen query"}
+        # Even usable hits do not make missing upstream coverage a clean run.
+        for results in ([], [{"id": "available-source"}]):
+            clean = {"query": query["text"], "results": results,
+                     "degraded": False, "errors": [], "degraded_reason": None}
+            row = {"query_sha256": hashlib.sha256(query["text"].encode()).hexdigest(),
+                   "recall": clean}
+            validate_recall_query(row, query)
+            mutations = [
+                {"degraded": True}, {"degraded": None}, {"degraded": 0},
+                {"degraded": "false"}, {"degraded": []},
+                {"errors": ["partial_retrieval_unavailable"]}, {"errors": None},
+                {"errors": ""}, {"errors": {}},
+                {"degraded_reason": "partial_retrieval_unavailable"},
+                {"results": None}, {"results": {}}, {"results": [None]},
+            ]
+            for mutation in mutations:
+                with self.subTest(results=results, mutation=mutation):
+                    with self.assertRaises(ValueError):
+                        validate_recall_query(dict(row, recall=dict(clean, **mutation)), query)
+            for missing in ("degraded", "errors", "results"):
+                incomplete = dict(clean)
+                del incomplete[missing]
+                with self.subTest(missing=missing):
+                    with self.assertRaises(ValueError):
+                        validate_recall_query(dict(row, recall=incomplete), query)
 
     def test_author_is_not_an_independent_labeler(self):
         labels, replay = self.evidence("holdout")

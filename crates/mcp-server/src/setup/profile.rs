@@ -104,17 +104,19 @@ pub async fn run_setup_with_profile(
         }
     };
 
-    println!(
-        "{}Signed in as {}",
-        CHECK,
-        style(&payload.email).cyan().bold()
-    );
-
     // ------------------------------------------------------------------
     // Credentials: keep a valid same-user key, never clobber another user's.
     // ------------------------------------------------------------------
     let api_url = normalize_api_url(&payload.api_url);
     let (active_key, kept_existing) = resolve_credentials(&payload, &api_url).await?;
+
+    // A redeemed link identifies the requested account; only credential
+    // resolution establishes which account this machine can actually use.
+    println!(
+        "{}Signed in as {}",
+        CHECK,
+        style(&payload.email).cyan().bold()
+    );
 
     let config = Config {
         api_key: Some(active_key.clone()),
@@ -611,7 +613,13 @@ async fn resolve_credentials(
             } else {
                 return Err(anyhow!(
                     "This machine already has credentials for {} but the setup link belongs to {}. \
-                     Re-run in an interactive terminal to switch accounts.",
+                     Non-interactive setup cannot switch accounts; existing credentials were left untouched. \
+                     Open an interactive terminal, generate a fresh signed-in command in the dashboard \
+                     for the intended account, then run it and confirm the account switch. \
+                     If you used a signed-in link, it has already been redeemed. For CI or shared machines, \
+                     use an isolated OS user configured for the intended account. \
+                     Also remove conflicting CONTEXTSTREAM_API_KEY / CONTEXTSTREAM_TOKEN values \
+                     from that shell or CI job before retrying.",
                     user.email,
                     payload.email
                 ));

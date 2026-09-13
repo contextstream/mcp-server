@@ -1651,6 +1651,7 @@ name = "mcp-server"
 version = "1.0.6"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64",
  "chrono",

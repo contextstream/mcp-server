@@ -141,6 +141,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_a_private_file() {
+        let _guard = crate::env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
         let mut pending = PendingConnection::new("att-1".into(), "secret-xyz".into(), "a@b.c".into());
@@ -162,6 +163,7 @@ mod tests {
 
     #[test]
     fn expired_records_are_discarded_on_read() {
+        let _guard = crate::env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
         let mut pending = PendingConnection::new("att-2".into(), "secret".into(), "a@b.c".into());

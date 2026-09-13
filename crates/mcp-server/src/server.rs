@@ -2433,7 +2433,7 @@ mod tests {
     const EXPECTED_BROAD_SCHEMA_CONTRACTS: &[(&str, &str)] = &[
         (
             "account",
-            "ca11cc2e56f8841578bfdf71e590c0323cf4ee71b60e5ab2843efe7534043637",
+            "78d98c93e037399612ec80b4843598b1a738a4f800f0d0029881c358357907b4",
         ),
         (
             "answer",

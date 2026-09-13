@@ -365,7 +365,11 @@ async fn signup_post<T: for<'de> Deserialize<'de>>(
             message: parsed
                 .get("message")
                 .and_then(|m| m.as_str())
-                .unwrap_or(if text.is_empty() { "request failed" } else { text.as_str() })
+                .unwrap_or(if text.is_empty() {
+                    "request failed"
+                } else {
+                    text.as_str()
+                })
                 .to_string(),
         }
         .into());
@@ -415,7 +419,10 @@ pub async fn verify_signup_email(
     .await
 }
 
-pub async fn resend_signup_email(attempt_id: &str, client_secret: &str) -> Result<SignupResendResponse> {
+pub async fn resend_signup_email(
+    attempt_id: &str,
+    client_secret: &str,
+) -> Result<SignupResendResponse> {
     signup_post(
         "resend-email",
         serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret }),
@@ -455,7 +462,10 @@ pub async fn add_signup_phone(
     .await
 }
 
-pub async fn resend_signup_sms(attempt_id: &str, client_secret: &str) -> Result<SignupResendResponse> {
+pub async fn resend_signup_sms(
+    attempt_id: &str,
+    client_secret: &str,
+) -> Result<SignupResendResponse> {
     signup_post(
         "resend-sms",
         serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret }),
@@ -475,7 +485,10 @@ pub async fn verify_signup_phone(
     .await
 }
 
-pub async fn fetch_signup_credentials(attempt_id: &str, client_secret: &str) -> Result<SignupCompleteResponse> {
+pub async fn fetch_signup_credentials(
+    attempt_id: &str,
+    client_secret: &str,
+) -> Result<SignupCompleteResponse> {
     signup_post(
         "credentials",
         serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret }),
@@ -483,7 +496,10 @@ pub async fn fetch_signup_credentials(attempt_id: &str, client_secret: &str) -> 
     .await
 }
 
-pub async fn ack_signup_credentials(attempt_id: &str, client_secret: &str) -> Result<SignupStepResponse> {
+pub async fn ack_signup_credentials(
+    attempt_id: &str,
+    client_secret: &str,
+) -> Result<SignupStepResponse> {
     signup_post(
         "ack",
         serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret }),

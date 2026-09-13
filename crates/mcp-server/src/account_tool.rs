@@ -221,7 +221,8 @@ impl AccountTool {
                 }
             }
         }
-        match tokio::time::timeout(Duration::from_secs(8), client_auth::fetch_signup_config()).await {
+        match tokio::time::timeout(Duration::from_secs(8), client_auth::fetch_signup_config()).await
+        {
             Ok(Ok(config)) => {
                 *self.signup_config.lock().await = Some((Instant::now(), config.clone()));
                 Some(config)
@@ -457,18 +458,23 @@ impl AccountTool {
             "ContextStream MCP · {}",
             detect_hostname().unwrap_or_else(|| "this machine".to_string())
         );
-        let api_key = client
-            .create_api_key(&key_name)
-            .await
-            .map_err(|e| Error::Tool(format!("Signed in as {}, but could not create an API key: {e}", user.email)))?;
+        let api_key = client.create_api_key(&key_name).await.map_err(|e| {
+            Error::Tool(format!(
+                "Signed in as {}, but could not create an API key: {e}",
+                user.email
+            ))
+        })?;
         self.save_credentials(&api_key, &user.email)?;
         drop(api_key);
         Ok(self.connected_result(&user.email))
     }
 
     fn save_credentials(&self, api_key: &str, email: &str) -> Result<()> {
-        write_saved_credentials(api_key, None)
-            .map_err(|e| Error::Tool(format!("Signed in as {email}, but could not save credentials: {e}")))?;
+        write_saved_credentials(api_key, None).map_err(|e| {
+            Error::Tool(format!(
+                "Signed in as {email}, but could not save credentials: {e}"
+            ))
+        })?;
         std::env::set_var("CONTEXTSTREAM_API_KEY", api_key);
         Ok(())
     }
@@ -542,9 +548,13 @@ impl AccountTool {
             .as_deref()
             .map(str::trim)
             .filter(|e| e.contains('@'))
-            .ok_or_else(|| Error::Validation("signup_start requires the user's email address".to_string()))?;
+            .ok_or_else(|| {
+                Error::Validation("signup_start requires the user's email address".to_string())
+            })?;
         if let Some(existing) = self.current_inline().await {
-            if existing.email.eq_ignore_ascii_case(email) && existing.stage != PendingStage::Finalized {
+            if existing.email.eq_ignore_ascii_case(email)
+                && existing.stage != PendingStage::Finalized
+            {
                 return Ok(ToolResult::with_structured(
                     format!(
                         "{SETUP_REQUIRED_MARKER} An inline signup for {} is already in progress at stage {:?}. Continue with {}, or call account(action=\"cancel\") to start over.",
@@ -556,11 +566,21 @@ impl AccountTool {
             let _ = client_auth::cancel_signup(&existing.attempt_id, &existing.client_secret).await;
             self.clear_inline().await;
         }
-        let response = match client_auth::start_email_signup(email, input.full_name.as_deref(), client_metadata()).await {
+        let response = match client_auth::start_email_signup(
+            email,
+            input.full_name.as_deref(),
+            client_metadata(),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(error) => return Ok(self.signup_failure("Could not start the signup", error)),
         };
-        let pending = PendingConnection::new(response.attempt_id.clone(), response.client_secret.clone(), response.email.clone());
+        let pending = PendingConnection::new(
+            response.attempt_id.clone(),
+            response.client_secret.clone(),
+            response.email.clone(),
+        );
         self.persist_inline(&pending).await;
         *self.inline.lock().await = Some(pending);
         Ok(ToolResult::with_structured(
@@ -581,11 +601,23 @@ impl AccountTool {
 
     async fn signup_verify_email(&self, input: &AccountInput) -> Result<ToolResult> {
         let Some(mut pending) = self.current_inline().await else {
-            return Ok(ToolResult::error("No inline signup is in progress. Call account(action=\"signup_start\") first."));
+            return Ok(ToolResult::error(
+                "No inline signup is in progress. Call account(action=\"signup_start\") first.",
+            ));
         };
-        let code = input.code.as_deref().map(str::trim).filter(|c| !c.is_empty())
-            .ok_or_else(|| Error::Validation("signup_verify_email requires the code from the email".to_string()))?;
-        match client_auth::verify_signup_email(&pending.attempt_id, &pending.client_secret, code).await {
+        let code = input
+            .code
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "signup_verify_email requires the code from the email".to_string(),
+                )
+            })?;
+        match client_auth::verify_signup_email(&pending.attempt_id, &pending.client_secret, code)
+            .await
+        {
             Ok(_) => {
                 pending.stage = PendingStage::EmailVerified;
                 self.persist_inline(&pending).await;
@@ -604,11 +636,23 @@ impl AccountTool {
 
     async fn signup_request_sms_consent(&self, input: &AccountInput) -> Result<ToolResult> {
         let Some(mut pending) = self.current_inline().await else {
-            return Ok(ToolResult::error("No inline signup is in progress. Call account(action=\"signup_start\") first."));
+            return Ok(ToolResult::error(
+                "No inline signup is in progress. Call account(action=\"signup_start\") first.",
+            ));
         };
-        let phone = input.phone.as_deref().map(str::trim).filter(|p| !p.is_empty())
-            .ok_or_else(|| Error::Validation("signup_request_sms_consent requires the phone number".to_string()))?;
-        match client_auth::request_sms_consent(&pending.attempt_id, &pending.client_secret, phone).await {
+        let phone = input
+            .phone
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "signup_request_sms_consent requires the phone number".to_string(),
+                )
+            })?;
+        match client_auth::request_sms_consent(&pending.attempt_id, &pending.client_secret, phone)
+            .await
+        {
             Ok(response) => {
                 pending.stage = PendingStage::ConsentPending;
                 pending.phone_last4 = Some(response.phone_last4.clone());
@@ -637,7 +681,9 @@ impl AccountTool {
 
     async fn signup_confirm_sms_consent(&self, input: &AccountInput) -> Result<ToolResult> {
         let Some(mut pending) = self.current_inline().await else {
-            return Ok(ToolResult::error("No inline signup is in progress. Call account(action=\"signup_start\") first."));
+            return Ok(ToolResult::error(
+                "No inline signup is in progress. Call account(action=\"signup_start\") first.",
+            ));
         };
         let Some(consent_token) = pending.consent_token.clone() else {
             return Ok(ToolResult::error("Request the consent notice first with account(action=\"signup_request_sms_consent\", phone=...)."));
@@ -648,7 +694,15 @@ impl AccountTool {
                 "No text will be sent: the recorded reply is empty or declines the notice. If the user agreed, pass their exact affirmative reply in user_response; otherwise call account(action=\"cancel\").",
             ));
         }
-        match client_auth::add_signup_phone(&pending.attempt_id, &pending.client_secret, &consent_token, "mcp_chat", Some(reply)).await {
+        match client_auth::add_signup_phone(
+            &pending.attempt_id,
+            &pending.client_secret,
+            &consent_token,
+            "mcp_chat",
+            Some(reply),
+        )
+        .await
+        {
             Ok(response) => {
                 pending.stage = PendingStage::SmsSent;
                 pending.phone_last4 = Some(response.phone_last4.clone());
@@ -673,11 +727,23 @@ impl AccountTool {
 
     async fn signup_verify_phone(&self, input: &AccountInput) -> Result<ToolResult> {
         let Some(mut pending) = self.current_inline().await else {
-            return Ok(ToolResult::error("No inline signup is in progress. Call account(action=\"signup_start\") first."));
+            return Ok(ToolResult::error(
+                "No inline signup is in progress. Call account(action=\"signup_start\") first.",
+            ));
         };
-        let code = input.code.as_deref().map(str::trim).filter(|c| !c.is_empty())
-            .ok_or_else(|| Error::Validation("signup_verify_phone requires the code from the text message".to_string()))?;
-        match client_auth::verify_signup_phone(&pending.attempt_id, &pending.client_secret, code).await {
+        let code = input
+            .code
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "signup_verify_phone requires the code from the text message".to_string(),
+                )
+            })?;
+        match client_auth::verify_signup_phone(&pending.attempt_id, &pending.client_secret, code)
+            .await
+        {
             Ok(complete) => {
                 pending.mark_finalized();
                 self.persist_inline(&pending).await;
@@ -690,10 +756,15 @@ impl AccountTool {
 
     /// Save first, acknowledge second. An acknowledgement timeout after a
     /// successful save is still "connected".
-    async fn finish_inline(&self, pending: PendingConnection, complete: SignupCompleteResponse) -> Result<ToolResult> {
+    async fn finish_inline(
+        &self,
+        pending: PendingConnection,
+        complete: SignupCompleteResponse,
+    ) -> Result<ToolResult> {
         let api_url_override = (!complete.api_url.is_empty()
-            && complete.api_url.trim_end_matches('/') != mcp_types::config::DEFAULT_API_URL.trim_end_matches('/'))
-            .then(|| complete.api_url.trim_end_matches('/').to_string());
+            && complete.api_url.trim_end_matches('/')
+                != mcp_types::config::DEFAULT_API_URL.trim_end_matches('/'))
+        .then(|| complete.api_url.trim_end_matches('/').to_string());
         write_saved_credentials(&complete.api_key.secret, api_url_override.as_deref())
             .map_err(|e| Error::Tool(format!("Account created for {}, but credentials could not be saved: {e}. Call account(action=\"fetch_credentials\") to retry.", complete.email)))?;
         std::env::set_var("CONTEXTSTREAM_API_KEY", &complete.api_key.secret);
@@ -723,7 +794,9 @@ impl AccountTool {
                 "No pending signup to recover credentials for. If the account was created, use account(action=\"connect_browser\") to sign in and connect this device.",
             ));
         };
-        match client_auth::fetch_signup_credentials(&pending.attempt_id, &pending.client_secret).await {
+        match client_auth::fetch_signup_credentials(&pending.attempt_id, &pending.client_secret)
+            .await
+        {
             Ok(complete) => self.finish_inline(pending, complete).await,
             Err(error) => {
                 let (code, _) = signup_error_message(&error);
@@ -747,7 +820,9 @@ impl AccountTool {
             _ => "sms",
         });
         let result = match channel {
-            "email" => client_auth::resend_signup_email(&pending.attempt_id, &pending.client_secret).await,
+            "email" => {
+                client_auth::resend_signup_email(&pending.attempt_id, &pending.client_secret).await
+            }
             _ => client_auth::resend_signup_sms(&pending.attempt_id, &pending.client_secret).await,
         };
         match result {
@@ -764,7 +839,9 @@ fn next_inline_action(stage: &PendingStage) -> &'static str {
     match stage {
         PendingStage::EmailSent => "account(action=\"signup_verify_email\", code=...)",
         PendingStage::EmailVerified => "account(action=\"signup_request_sms_consent\", phone=...)",
-        PendingStage::ConsentPending => "account(action=\"signup_confirm_sms_consent\", user_response=...)",
+        PendingStage::ConsentPending => {
+            "account(action=\"signup_confirm_sms_consent\", user_response=...)"
+        }
         PendingStage::SmsSent => "account(action=\"signup_verify_phone\", code=...)",
         PendingStage::Finalized => "account(action=\"fetch_credentials\")",
     }
@@ -852,18 +929,6 @@ mod tests {
         AccountTool::new(&Config::default(), mode)
     }
 
-    fn text_of(result: &ToolResult) -> String {
-        result
-            .content
-            .iter()
-            .filter_map(|item| match item {
-                mcp_types::tool::ContentItem::Text { text } => Some(text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     #[tokio::test]
     async fn poll_without_a_flow_is_an_error_not_a_panic() {
         let result = tool(AccountToolMode::Limited).connect_poll().await.unwrap();
@@ -873,7 +938,13 @@ mod tests {
     #[tokio::test]
     async fn inline_steps_without_a_signup_are_errors() {
         let t = tool(AccountToolMode::Limited);
-        for action in ["signup_verify_email", "signup_request_sms_consent", "signup_confirm_sms_consent", "signup_verify_phone", "resend"] {
+        for action in [
+            "signup_verify_email",
+            "signup_request_sms_consent",
+            "signup_confirm_sms_consent",
+            "signup_verify_phone",
+            "resend",
+        ] {
             let result = t.execute(json!({"action": action, "code": "123456", "phone": "+15555550123", "user_response": "yes"})).await.unwrap();
             assert!(result.is_error, "{action}");
         }
@@ -884,7 +955,9 @@ mod tests {
     #[tokio::test]
     async fn missing_required_inputs_are_validation_errors() {
         let t = tool(AccountToolMode::Limited);
-        assert!(matches!(t.signup_verify_email(&AccountInput { action: None, email: None, full_name: None, phone: None, code: None, user_response: None, channel: None }).await, Ok(r) if r.is_error));
+        assert!(
+            matches!(t.signup_verify_email(&AccountInput { action: None, email: None, full_name: None, phone: None, code: None, user_response: None, channel: None }).await, Ok(r) if r.is_error)
+        );
     }
 
     #[test]
@@ -904,7 +977,14 @@ mod tests {
         assert!(t.metadata().annotations.requires_confirmation);
         assert_eq!(t.metadata().name, ACCOUNT_TOOL_NAME);
         let schema = t.input_schema();
-        for field in ["action", "email", "phone", "code", "user_response", "channel"] {
+        for field in [
+            "action",
+            "email",
+            "phone",
+            "code",
+            "user_response",
+            "channel",
+        ] {
             assert!(schema["properties"][field].is_object(), "{field}");
         }
         assert!(!t.metadata().description.contains("cbiq_"));
@@ -922,8 +1002,11 @@ mod tests {
     #[test]
     fn next_action_follows_the_stage_machine() {
         assert!(next_inline_action(&PendingStage::EmailSent).contains("signup_verify_email"));
-        assert!(next_inline_action(&PendingStage::EmailVerified).contains("signup_request_sms_consent"));
-        assert!(next_inline_action(&PendingStage::ConsentPending).contains("signup_confirm_sms_consent"));
+        assert!(
+            next_inline_action(&PendingStage::EmailVerified).contains("signup_request_sms_consent")
+        );
+        assert!(next_inline_action(&PendingStage::ConsentPending)
+            .contains("signup_confirm_sms_consent"));
         assert!(next_inline_action(&PendingStage::SmsSent).contains("signup_verify_phone"));
         assert!(next_inline_action(&PendingStage::Finalized).contains("fetch_credentials"));
     }

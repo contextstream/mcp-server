@@ -76,8 +76,8 @@ pub fn read_pending_connection() -> Result<Option<PendingConnection>> {
     if !path.try_exists()? {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let pending: PendingConnection = match serde_json::from_str(&content) {
         Ok(p) => p,
         Err(_) => {
@@ -121,8 +121,7 @@ pub fn write_pending_connection(pending: &PendingConnection) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("replacing {}", path.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }
 
@@ -141,17 +140,23 @@ mod tests {
 
     #[test]
     fn round_trips_through_a_private_file() {
-        let _guard = crate::env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
-        let mut pending = PendingConnection::new("att-1".into(), "secret-xyz".into(), "a@b.c".into());
+        let mut pending =
+            PendingConnection::new("att-1".into(), "secret-xyz".into(), "a@b.c".into());
         pending.stage = PendingStage::SmsSent;
         pending.phone_last4 = Some("1234".into());
         write_pending_connection(&pending).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(pending_connection_path()).unwrap().permissions().mode();
+            let mode = std::fs::metadata(pending_connection_path())
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
         let read = read_pending_connection().unwrap().unwrap();
@@ -163,7 +168,9 @@ mod tests {
 
     #[test]
     fn expired_records_are_discarded_on_read() {
-        let _guard = crate::env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
         let mut pending = PendingConnection::new("att-2".into(), "secret".into(), "a@b.c".into());

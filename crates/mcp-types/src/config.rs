@@ -458,6 +458,68 @@ impl TrafficClass {
     }
 }
 
+/// The region nearest to the caller, as the Cloudflare edge computed it from the
+/// request's geography (`X-ContextStream-Suggested-Home-Region`). The hosted
+/// gateway forwards it on every API call so the API records the client's
+/// nearest region per request and homes a NEW tenant there. Only the canonical
+/// region vocabulary crosses the boundary; anything else is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NearestRegion {
+    OvhWest,
+    OvhEast,
+    EuAms,
+}
+
+impl NearestRegion {
+    pub const HEADER_NAME: &'static str = "X-ContextStream-Suggested-Home-Region";
+
+    pub fn from_header_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ovh-west" => Some(Self::OvhWest),
+            "ovh-east" => Some(Self::OvhEast),
+            "eu-ams" => Some(Self::EuAms),
+            _ => None,
+        }
+    }
+
+    pub const fn as_header_value(self) -> &'static str {
+        match self {
+            Self::OvhWest => "ovh-west",
+            Self::OvhEast => "ovh-east",
+            Self::EuAms => "eu-ams",
+        }
+    }
+}
+
+/// What the edge knew about the caller's location, forwarded to the API on
+/// every request the gateway makes on the caller's behalf. Without it the API
+/// sees the gateway's own address and records nothing about where the user is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EdgeGeography {
+    pub nearest_region: Option<NearestRegion>,
+    /// Two-letter country code the edge saw (`CF-IPCountry`), telemetry only.
+    pub client_country: Option<String>,
+}
+
+impl EdgeGeography {
+    pub const COUNTRY_HEADER_NAME: &'static str = "CF-IPCountry";
+
+    pub fn is_empty(&self) -> bool {
+        self.nearest_region.is_none() && self.client_country.is_none()
+    }
+
+    /// A country code is two ASCII letters; anything else is dropped rather
+    /// than forwarded into telemetry.
+    pub fn parse_country(value: &str) -> Option<String> {
+        let value = value.trim();
+        if value.len() == 2 && value.bytes().all(|b| b.is_ascii_alphabetic()) {
+            Some(value.to_ascii_uppercase())
+        } else {
+            None
+        }
+    }
+}
+
 /// Per-request identity key used to partition `SessionState` so one caller's
 /// session fields (folder_path, workspace_id, project_id, etc.) can never be
 /// observed by another caller sharing the same MCP server process.

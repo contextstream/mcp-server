@@ -423,6 +423,71 @@ pub fn get_task_model_id() -> Option<String> {
 }
 
 tokio::task_local! {
+    /// What the edge knew about the caller's location, set by the HTTP
+    /// transport from the router's headers. `request()` / `request_text()`
+    /// forward it so the API records the caller's nearest region per request
+    /// and homes a new tenant there; the gateway's own address says nothing.
+    static TASK_EDGE_GEOGRAPHY: mcp_types::EdgeGeography;
+}
+
+/// Run a future scoped to the edge's view of the caller's location.
+pub async fn run_with_edge_geography<F, Fut>(
+    geography: mcp_types::EdgeGeography,
+    f: F,
+) -> Fut::Output
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future,
+{
+    TASK_EDGE_GEOGRAPHY.scope(geography, f()).await
+}
+
+/// Read the current task-local edge geography, if any.
+pub fn get_task_edge_geography() -> Option<mcp_types::EdgeGeography> {
+    TASK_EDGE_GEOGRAPHY.try_with(|g| g.clone()).ok()
+}
+
+tokio::task_local! {
+    /// The tenant home region the API named on the responses made inside the
+    /// current request (`x-contextstream-tenant-home-region`). The HTTP
+    /// transport publishes it on its own response so the Cloudflare MCP
+    /// gateway can remember the caller's home and lead the caller's next
+    /// calls with the origin holding the tenant's primary.
+    static TASK_TENANT_HOME: std::cell::RefCell<Option<String>>;
+}
+
+/// Run a future while capturing the tenant home the API names on any response
+/// made inside it. Returns the future's output and the last home seen.
+pub async fn run_capturing_tenant_home<F, Fut>(f: F) -> (Fut::Output, Option<String>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future,
+{
+    TASK_TENANT_HOME
+        .scope(std::cell::RefCell::new(None), async {
+            let output = f().await;
+            let home = TASK_TENANT_HOME.with(|cell| cell.borrow().clone());
+            (output, home)
+        })
+        .await
+}
+
+/// Record the tenant home named on an API response, when a capture scope is
+/// active. Only the canonical region vocabulary is kept.
+pub(crate) fn observe_tenant_home_header(headers: &reqwest::header::HeaderMap) {
+    let Some(home) = headers
+        .get("x-contextstream-tenant-home-region")
+        .and_then(|value| value.to_str().ok())
+        .and_then(mcp_types::NearestRegion::from_header_value)
+    else {
+        return;
+    };
+    let _ = TASK_TENANT_HOME.try_with(|cell| {
+        *cell.borrow_mut() = Some(home.as_header_value().to_string());
+    });
+}
+
+tokio::task_local! {
     /// Per-request MCP session id (`Mcp-Session-Id` header) set by the HTTP
     /// transport layer. Lets tools attach a durable session identity to
     /// backend calls (init scope persistence, search scope rehydration) so
@@ -3051,6 +3116,7 @@ impl ContextStreamClient {
         if let Some(traffic_class) = auth.and_then(|value| value.traffic_class) {
             req = req.header(TrafficClass::HEADER_NAME, traffic_class.as_header_value());
         }
+        req = with_edge_geography_headers(req);
 
         // Forward the agent's model so server-side compliance events attribute
         // to the real model instead of the `unknown` bucket. Set by the tool
@@ -3112,7 +3178,10 @@ impl ContextStreamClient {
             }
 
             let response = match req.try_clone().unwrap().send().await {
-                Ok(resp) => resp,
+                Ok(resp) => {
+                    observe_tenant_home_header(resp.headers());
+                    resp
+                }
                 Err(e) => {
                     let error = if e.is_timeout() {
                         Error::Timeout(timeout.as_secs())
@@ -3241,6 +3310,7 @@ impl ContextStreamClient {
         if let Some(traffic_class) = effective_auth.and_then(|value| value.traffic_class) {
             req = req.header(TrafficClass::HEADER_NAME, traffic_class.as_header_value());
         }
+        req = with_edge_geography_headers(req);
 
         // Forward the agent's model so server-side compliance events attribute
         // to the real model instead of the `unknown` bucket. Set by the tool
@@ -3280,6 +3350,7 @@ impl ContextStreamClient {
                 Error::Network(e.to_string())
             }
         })?;
+        observe_tenant_home_header(response.headers());
 
         if !response.status().is_success() {
             return Err(self.parse_error(response).await);
@@ -18982,6 +19053,24 @@ fn extract_error_code(body: &serde_json::Value) -> Option<String> {
 
     // Try top-level code
     body.get("code").and_then(|c| c.as_str()).map(String::from)
+}
+
+/// Forward what the edge knew about the caller's location, when the transport
+/// scoped it. The API keeps only the canonical values, so this never carries
+/// arbitrary caller text.
+fn with_edge_geography_headers(mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    if let Some(geography) = get_task_edge_geography() {
+        if let Some(region) = geography.nearest_region {
+            req = req.header(
+                mcp_types::NearestRegion::HEADER_NAME,
+                region.as_header_value(),
+            );
+        }
+        if let Some(country) = geography.client_country.as_deref() {
+            req = req.header(mcp_types::EdgeGeography::COUNTRY_HEADER_NAME, country);
+        }
+    }
+    req
 }
 
 fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Option<RateLimitInfo> {

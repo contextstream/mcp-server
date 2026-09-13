@@ -84,6 +84,10 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Run workspace tests
         run: cargo test --locked --workspace --all-targets
+      - name: Exercise account connection over stdio
+        run: |
+          cargo build --locked -p mcp-server --bin contextstream-mcp
+          python3 .github/scripts/account_connection_smoke.py target/debug/contextstream-mcp
       - name: Prove excluded database clients are absent
         shell: bash
         run: |

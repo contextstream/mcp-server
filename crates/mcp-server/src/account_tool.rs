@@ -140,13 +140,32 @@ pub struct AccountTool {
     flow: Arc<Mutex<Option<BrowserFlow>>>,
     inline: Arc<Mutex<Option<PendingConnection>>>,
     signup_config: Arc<Mutex<Option<(Instant, SignupConfig)>>>,
+    operation: Mutex<()>,
 }
 
 fn signup_error_message(error: &anyhow::Error) -> (String, String) {
-    match error.downcast_ref::<SignupApiError>() {
-        Some(api) => (api.code.clone(), api.message.clone()),
-        None => ("error".to_string(), error.to_string()),
-    }
+    // Remote response bodies and transport errors may echo credentials or
+    // verification inputs. Only known, non-secret codes cross the MCP boundary.
+    let code = error
+        .downcast_ref::<SignupApiError>()
+        .map(|api| api.code.as_str())
+        .unwrap_or("error");
+    let code = match code {
+        "account_exists"
+        | "account_exists_unverified"
+        | "verification_locked"
+        | "signup_attempt_expired"
+        | "NOT_CONFIGURED"
+        | "GONE"
+        | "invalid_code"
+        | "rate_limited"
+        | "phone_already_used"
+        | "phone_type_not_allowed"
+        | "country_not_allowed"
+        | "budget_exceeded" => code,
+        _ => "error",
+    };
+    (code.to_string(), "The signup request could not be completed. Check the supplied details or try again shortly.".to_string())
 }
 
 fn looks_negative(reply: &str) -> bool {
@@ -191,6 +210,7 @@ impl AccountTool {
             flow: Arc::new(Mutex::new(None)),
             inline: Arc::new(Mutex::new(inline)),
             signup_config: Arc::new(Mutex::new(None)),
+            operation: Mutex::new(()),
         }
     }
 
@@ -231,10 +251,10 @@ impl AccountTool {
         }
     }
 
-    async fn persist_inline(&self, pending: &PendingConnection) {
-        if let Err(error) = write_pending_connection(pending) {
-            tracing::warn!(error = %error, "could not persist pending connection");
-        }
+    async fn persist_inline(&self, pending: &PendingConnection) -> Result<()> {
+        write_pending_connection(pending).map_err(|_| Error::Tool(
+            "Could not save signup recovery state. Check the local configuration directory permissions and disk space before continuing.".to_string()
+        ))
     }
 
     async fn clear_inline(&self) {
@@ -352,9 +372,9 @@ impl AccountTool {
     // ----------------------------------------------------------------------
 
     async fn connect_browser(&self) -> Result<ToolResult> {
-        let response = start_device_login()
-            .await
-            .map_err(|e| Error::Tool(format!("Could not start browser sign-in: {e}")))?;
+        let response = start_device_login().await.map_err(|_| {
+            Error::Tool("Could not start browser sign-in. Try again shortly.".to_string())
+        })?;
         let flow = BrowserFlow {
             device_code: response.device_code.clone(),
             user_code: response.user_code.clone(),
@@ -403,7 +423,9 @@ impl AccountTool {
 
         let outcome = poll_device_login_once(&flow.device_code)
             .await
-            .map_err(|e| Error::Tool(format!("Browser sign-in check failed: {e}")))?;
+            .map_err(|_| {
+                Error::Tool("Browser sign-in check failed. Try again shortly.".to_string())
+            })?;
         match outcome {
             DevicePollOutcome::Pending { interval } => Ok(ToolResult::with_structured(
                 format!(
@@ -450,19 +472,17 @@ impl AccountTool {
             ..Config::default()
         };
         let client = ContextStreamClient::new(config);
-        let user = client
-            .me()
-            .await
-            .map_err(|e| Error::Tool(format!("Signed in, but could not load the account: {e}")))?;
+        let user = client.me().await.map_err(|_| {
+            Error::Tool("Signed in, but could not load the account. Try again shortly.".to_string())
+        })?;
         let key_name = format!(
             "ContextStream MCP · {}",
             detect_hostname().unwrap_or_else(|| "this machine".to_string())
         );
-        let api_key = client.create_api_key(&key_name).await.map_err(|e| {
-            Error::Tool(format!(
-                "Signed in as {}, but could not create an API key: {e}",
-                user.email
-            ))
+        let api_key = client.create_api_key(&key_name).await.map_err(|_| {
+            Error::Tool(
+                "Signed in, but could not create an API key. Try again shortly.".to_string(),
+            )
         })?;
         self.save_credentials(&api_key, &user.email)?;
         drop(api_key);
@@ -470,12 +490,14 @@ impl AccountTool {
     }
 
     fn save_credentials(&self, api_key: &str, email: &str) -> Result<()> {
-        write_saved_credentials(api_key, None).map_err(|e| {
+        let api_url_override = (self.api_url
+            != mcp_types::config::DEFAULT_API_URL.trim_end_matches('/'))
+        .then_some(self.api_url.as_str());
+        write_saved_credentials(api_key, api_url_override).map_err(|e| {
             Error::Tool(format!(
                 "Signed in as {email}, but could not save credentials: {e}"
             ))
         })?;
-        std::env::set_var("CONTEXTSTREAM_API_KEY", api_key);
         Ok(())
     }
 
@@ -531,10 +553,12 @@ impl AccountTool {
             }
             _ => "",
         };
-        ToolResult::with_structured(
+        let mut result = ToolResult::with_structured(
             format!("{context}: {message}{hint}"),
             json!({ "status": "error", "code": code, "message": message }),
-        )
+        );
+        result.is_error = true;
+        result
     }
 
     async fn signup_start(&self, input: &AccountInput) -> Result<ToolResult> {
@@ -552,9 +576,7 @@ impl AccountTool {
                 Error::Validation("signup_start requires the user's email address".to_string())
             })?;
         if let Some(existing) = self.current_inline().await {
-            if existing.email.eq_ignore_ascii_case(email)
-                && existing.stage != PendingStage::Finalized
-            {
+            if existing.email.eq_ignore_ascii_case(email) {
                 return Ok(ToolResult::with_structured(
                     format!(
                         "{SETUP_REQUIRED_MARKER} An inline signup for {} is already in progress at stage {:?}. Continue with {}, or call account(action=\"cancel\") to start over.",
@@ -581,7 +603,7 @@ impl AccountTool {
             response.client_secret.clone(),
             response.email.clone(),
         );
-        self.persist_inline(&pending).await;
+        self.persist_inline(&pending).await?;
         *self.inline.lock().await = Some(pending);
         Ok(ToolResult::with_structured(
             format!(
@@ -620,7 +642,7 @@ impl AccountTool {
         {
             Ok(_) => {
                 pending.stage = PendingStage::EmailVerified;
-                self.persist_inline(&pending).await;
+                self.persist_inline(&pending).await?;
                 *self.inline.lock().await = Some(pending.clone());
                 Ok(ToolResult::with_structured(
                     format!(
@@ -658,7 +680,7 @@ impl AccountTool {
                 pending.phone_last4 = Some(response.phone_last4.clone());
                 pending.consent_token = Some(response.consent_token.clone());
                 pending.consent_text = Some(response.consent_text.clone());
-                self.persist_inline(&pending).await;
+                self.persist_inline(&pending).await?;
                 *self.inline.lock().await = Some(pending);
                 Ok(ToolResult::with_structured(
                     format!(
@@ -706,7 +728,7 @@ impl AccountTool {
             Ok(response) => {
                 pending.stage = PendingStage::SmsSent;
                 pending.phone_last4 = Some(response.phone_last4.clone());
-                self.persist_inline(&pending).await;
+                self.persist_inline(&pending).await?;
                 *self.inline.lock().await = Some(pending);
                 Ok(ToolResult::with_structured(
                     format!(
@@ -746,7 +768,7 @@ impl AccountTool {
         {
             Ok(complete) => {
                 pending.mark_finalized();
-                self.persist_inline(&pending).await;
+                self.persist_inline(&pending).await?;
                 *self.inline.lock().await = Some(pending.clone());
                 self.finish_inline(pending, complete).await
             }
@@ -761,23 +783,8 @@ impl AccountTool {
         pending: PendingConnection,
         complete: SignupCompleteResponse,
     ) -> Result<ToolResult> {
-        let api_url_override = (!complete.api_url.is_empty()
-            && complete.api_url.trim_end_matches('/')
-                != mcp_types::config::DEFAULT_API_URL.trim_end_matches('/'))
-        .then(|| complete.api_url.trim_end_matches('/').to_string());
-        write_saved_credentials(&complete.api_key.secret, api_url_override.as_deref())
-            .map_err(|e| Error::Tool(format!("Account created for {}, but credentials could not be saved: {e}. Call account(action=\"fetch_credentials\") to retry.", complete.email)))?;
-        std::env::set_var("CONTEXTSTREAM_API_KEY", &complete.api_key.secret);
-        drop(complete.api_key);
-        let acked = match tokio::time::timeout(
-            Duration::from_secs(10),
-            client_auth::ack_signup_credentials(&pending.attempt_id, &pending.client_secret),
-        )
-        .await
-        {
-            Ok(Ok(_)) => true,
-            _ => false,
-        };
+        let acked = crate::setup::save_and_ack_signup(&pending, &complete).await
+            .map_err(|_| Error::Tool(format!("Account created for {}, but credentials could not be saved. Check local permissions and disk space, then call account(action=\"fetch_credentials\") to retry.", complete.email)))?;
         self.clear_inline().await;
         let mut result = self.connected_result(&complete.email);
         if !acked {
@@ -823,7 +830,10 @@ impl AccountTool {
             "email" => {
                 client_auth::resend_signup_email(&pending.attempt_id, &pending.client_secret).await
             }
-            _ => client_auth::resend_signup_sms(&pending.attempt_id, &pending.client_secret).await,
+            "sms" => {
+                client_auth::resend_signup_sms(&pending.attempt_id, &pending.client_secret).await
+            }
+            _ => return Ok(ToolResult::error("resend requires channel email or sms")),
         };
         match result {
             Ok(r) => Ok(ToolResult::with_structured(
@@ -865,6 +875,7 @@ fn detect_hostname() -> Option<String> {
 #[async_trait]
 impl ToolHandler for AccountTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let _operation = self.operation.lock().await;
         let input: AccountInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
         let action = input.action.clone().unwrap_or_else(|| "status".to_string());
@@ -926,7 +937,9 @@ mod tests {
     use super::*;
 
     fn tool(mode: AccountToolMode) -> AccountTool {
-        AccountTool::new(&Config::default(), mode)
+        let mut tool = AccountTool::new(&Config::default(), mode);
+        tool.inline = Arc::new(Mutex::new(None));
+        tool
     }
 
     #[tokio::test]
@@ -958,6 +971,22 @@ mod tests {
         assert!(
             matches!(t.signup_verify_email(&AccountInput { action: None, email: None, full_name: None, phone: None, code: None, user_response: None, channel: None }).await, Ok(r) if r.is_error)
         );
+    }
+
+    #[test]
+    fn signup_errors_never_echo_remote_secrets_and_are_errors() {
+        let error = SignupApiError {
+            status: 400,
+            code: "account_exists".into(),
+            message: "cbiq_fixture client-secret 112233".into(),
+        };
+        let result = tool(AccountToolMode::Limited).signup_failure("Rejected", error.into());
+        assert!(result.is_error);
+        let output = serde_json::to_string(&result).unwrap();
+        for secret in ["cbiq_fixture", "client-secret", "112233"] {
+            assert!(!output.contains(secret));
+        }
+        assert!(output.contains("connect_browser"));
     }
 
     #[test]

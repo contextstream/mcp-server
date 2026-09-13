@@ -72,22 +72,25 @@ pub fn pending_connection_path() -> PathBuf {
 }
 
 pub fn read_pending_connection() -> Result<Option<PendingConnection>> {
-    let path = pending_connection_path();
+    read_pending_connection_at(&pending_connection_path())
+}
+
+fn read_pending_connection_at(path: &std::path::Path) -> Result<Option<PendingConnection>> {
     if !path.try_exists()? {
         return Ok(None);
     }
     let content =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let pending: PendingConnection = match serde_json::from_str(&content) {
         Ok(p) => p,
         Err(_) => {
             // Corrupt or foreign file: discard rather than guess.
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path);
             return Ok(None);
         }
     };
     if pending.is_expired() {
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path);
         return Ok(None);
     }
     Ok(Some(pending))
@@ -95,34 +98,34 @@ pub fn read_pending_connection() -> Result<Option<PendingConnection>> {
 
 pub fn write_pending_connection(pending: &PendingConnection) -> Result<()> {
     let path = pending_connection_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let content = serde_json::to_string_pretty(pending)?;
-    {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&tmp)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+    write_pending_connection_at(&path, pending)
+}
+
+fn write_pending_connection_at(path: &std::path::Path, pending: &PendingConnection) -> Result<()> {
+    let loaded = super::safe_edit::read_for_edit(path, super::safe_edit::JsonDialect::Strict)?;
+    super::safe_edit::commit_private(path, &loaded, &serde_json::to_value(pending)?, &[])?;
     Ok(())
+}
+
+/// Shared by the chat tool and setup wizard. Never revoke server redelivery
+/// until the private credential file has been committed successfully.
+pub(crate) async fn save_and_ack_signup(
+    pending: &PendingConnection,
+    complete: &mcp_client::auth::SignupCompleteResponse,
+) -> Result<bool> {
+    let api_url = complete.api_url.trim_end_matches('/');
+    let api_url_override = (!api_url.is_empty()
+        && api_url != mcp_types::config::DEFAULT_API_URL.trim_end_matches('/'))
+    .then_some(api_url);
+    super::write_saved_credentials(&complete.api_key.secret, api_url_override)?;
+    Ok(matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            mcp_client::auth::ack_signup_credentials(&pending.attempt_id, &pending.client_secret),
+        )
+        .await,
+        Ok(Ok(_))
+    ))
 }
 
 pub fn clear_pending_connection() -> Result<()> {
@@ -140,43 +143,34 @@ mod tests {
 
     #[test]
     fn round_trips_through_a_private_file() {
-        let _guard = crate::env_test_mutex()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", dir.path());
+        let path = dir.path().join("pending-connection.json");
         let mut pending =
             PendingConnection::new("att-1".into(), "secret-xyz".into(), "a@b.c".into());
         pending.stage = PendingStage::SmsSent;
         pending.phone_last4 = Some("1234".into());
-        write_pending_connection(&pending).unwrap();
+        write_pending_connection_at(&path, &pending).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(pending_connection_path())
-                .unwrap()
-                .permissions()
-                .mode();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        let read = read_pending_connection().unwrap().unwrap();
+        let read = read_pending_connection_at(&path).unwrap().unwrap();
         assert_eq!(read.attempt_id, "att-1");
         assert_eq!(read.stage, PendingStage::SmsSent);
-        clear_pending_connection().unwrap();
-        assert!(read_pending_connection().unwrap().is_none());
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_pending_connection_at(&path).unwrap().is_none());
     }
 
     #[test]
     fn expired_records_are_discarded_on_read() {
-        let _guard = crate::env_test_mutex()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", dir.path());
+        let path = dir.path().join("pending-connection.json");
         let mut pending = PendingConnection::new("att-2".into(), "secret".into(), "a@b.c".into());
         pending.expires_at = Utc::now() - Duration::minutes(1);
-        write_pending_connection(&pending).unwrap();
-        assert!(read_pending_connection().unwrap().is_none());
-        assert!(!pending_connection_path().exists());
+        write_pending_connection_at(&path, &pending).unwrap();
+        assert!(read_pending_connection_at(&path).unwrap().is_none());
+        assert!(!path.exists());
     }
 }

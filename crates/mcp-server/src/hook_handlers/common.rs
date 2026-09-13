@@ -563,6 +563,31 @@ pub fn scrub_setup_secrets(text: &str) -> String {
     out
 }
 
+/// Detect account calls even in nested host transcript formats before text
+/// extraction drops tool-use blocks or their correlation identifiers.
+pub fn transcript_has_account_setup(text: &str) -> bool {
+    fn contains_call(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(object) => {
+                ["name", "tool_name", "toolName"].iter().any(|key| {
+                    object
+                        .get(*key)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(is_account_setup_tool)
+                }) || object.values().any(contains_call)
+            }
+            serde_json::Value::Array(values) => values.iter().any(contains_call),
+            _ => false,
+        }
+    }
+    text.lines().any(|line| {
+        serde_json::from_str(line)
+            .ok()
+            .as_ref()
+            .is_some_and(contains_call)
+    })
+}
+
 fn message_tool_name(message: &serde_json::Value) -> Option<&str> {
     message
         .get("tool_calls")
@@ -575,12 +600,18 @@ fn message_tool_name(message: &serde_json::Value) -> Option<&str> {
 /// results are replaced wholesale, and when such a call is present every
 /// message body is scrubbed of codes, phone numbers and credentials. Every
 /// session gets the credential-token scrub regardless.
-pub fn scrub_account_setup_messages(
+pub fn scrub_account_setup_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    scrub_account_setup_messages_with_hint(messages, false)
+}
+
+pub fn scrub_account_setup_messages_with_hint(
     mut messages: Vec<serde_json::Value>,
+    setup_hint: bool,
 ) -> Vec<serde_json::Value> {
-    let setup_flow_present = messages
-        .iter()
-        .any(|m| message_tool_name(m).is_some_and(is_account_setup_tool));
+    let setup_flow_present = setup_hint
+        || messages
+            .iter()
+            .any(|m| message_tool_name(m).is_some_and(is_account_setup_tool));
     for message in messages.iter_mut() {
         let is_setup_call = message_tool_name(message).is_some_and(is_account_setup_tool);
         if is_setup_call {
@@ -592,10 +623,13 @@ pub fn scrub_account_setup_messages(
                     );
                 }
             }
-            if message.get("tool_results").is_some() {
-                message["content"] =
-                    serde_json::Value::String("[account-setup result redacted]".to_string());
-            }
+        }
+        // Hosts may omit the result's tool name. During setup, withhold such
+        // payloads rather than relying on an unavailable name/id correlation.
+        if setup_flow_present && message.get("tool_results").is_some() {
+            message["content"] =
+                serde_json::Value::String("[account-setup result redacted]".to_string());
+            message["tool_results"] = serde_json::json!({"redacted": "account-setup"});
         }
         if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
             let scrubbed = if setup_flow_present {
@@ -651,6 +685,24 @@ mod account_scrub_tests {
         assert_eq!(out[0]["content"], "my code is [code]");
         assert_eq!(out[1]["tool_calls"]["input"]["redacted"], "account-setup");
         assert_eq!(out[2]["content"], "[account-setup result redacted]");
+    }
+
+    #[test]
+    fn nested_host_calls_scrub_codes_and_unnamed_results() {
+        let raw = json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "mcp__contextstream__account", "input": {"code": "112233"}}
+        ]}})
+        .to_string();
+        assert!(transcript_has_account_setup(&raw));
+        let messages = vec![
+            json!({"role": "user", "content": "112233"}),
+            json!({"role": "tool", "content": "arbitrary-client-secret", "tool_results": {"name": ""}}),
+        ];
+        let result =
+            scrub_account_setup_messages_with_hint(messages, transcript_has_account_setup(&raw));
+        let output = serde_json::to_string(&result).unwrap();
+        assert!(!output.contains("112233"));
+        assert!(!output.contains("arbitrary-client-secret"));
     }
 
     #[test]

@@ -3822,7 +3822,7 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
         started.client_secret.clone(),
         started.email.clone(),
     );
-    let _ = write_pending_connection(&pending);
+    write_pending_connection(&pending)?;
     println!(
         "{} We emailed a 6-digit code to {}.",
         CHECK,
@@ -3856,7 +3856,7 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
         }
     }
     pending.stage = PendingStage::EmailVerified;
-    let _ = write_pending_connection(&pending);
+    write_pending_connection(&pending)?;
     println!("{} Email verified.", CHECK);
 
     let consent = loop {
@@ -3883,7 +3883,7 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
     pending.stage = PendingStage::ConsentPending;
     pending.phone_last4 = Some(consent.phone_last4.clone());
     pending.consent_token = Some(consent.consent_token.clone());
-    let _ = write_pending_connection(&pending);
+    write_pending_connection(&pending)?;
 
     println!();
     println!("{}", consent.consent_text);
@@ -3914,7 +3914,7 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
         )
     })?;
     pending.stage = PendingStage::SmsSent;
-    let _ = write_pending_connection(&pending);
+    write_pending_connection(&pending)?;
     println!(
         "{} Code texted to the number ending in {}.",
         CHECK, sent.phone_last4
@@ -3947,14 +3947,10 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
         }
     };
     pending.mark_finalized();
-    let _ = write_pending_connection(&pending);
+    write_pending_connection(&pending)?;
 
-    // The caller persists the key; acknowledge delivery on a best-effort basis.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        signup::ack_signup_credentials(&pending.attempt_id, &pending.client_secret),
-    )
-    .await;
+    // Persist before acknowledging: a crash or failed write must leave redelivery available.
+    save_and_ack_signup(&pending, &complete).await?;
     let _ = clear_pending_connection();
     println!(
         "{} Account created for {}. We emailed you a link to set a password for the web dashboard.",

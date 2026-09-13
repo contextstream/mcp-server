@@ -159,6 +159,7 @@ fn parse_transcript(path: &str) -> ParsedTranscript {
         Err(_) => return ParsedTranscript::default(),
     };
 
+    let setup_flow = super::common::transcript_has_account_setup(&content);
     let mut assistant_messages = Vec::new();
     let mut tool_call_count = 0usize;
 
@@ -189,7 +190,11 @@ fn parse_transcript(path: &str) -> ParsedTranscript {
             if let Some(text) = extract_text(entry.get("content")) {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
-                    assistant_messages.push(super::common::scrub_credential_tokens(trimmed));
+                    assistant_messages.push(if setup_flow {
+                        super::common::scrub_setup_secrets(trimmed)
+                    } else {
+                        super::common::scrub_credential_tokens(trimmed)
+                    });
                 }
             }
         }
@@ -384,6 +389,25 @@ fn truncate(value: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn account_setup_codes_are_removed_from_subagent_summaries() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type": "tool_use", "name": "mcp__contextstream__account"})
+        )
+        .unwrap();
+        writeln!(file, "{}", serde_json::json!({"type": "assistant", "content": "Code 445566 at +15555550123 with cbiq_fixture"})).unwrap();
+        let parsed = super::parse_transcript(file.path().to_str().unwrap());
+        assert_eq!(parsed.tool_call_count, 1);
+        let text = parsed.assistant_messages.join(" ");
+        for secret in ["445566", "+15555550123", "cbiq_fixture"] {
+            assert!(!text.contains(secret));
+        }
+        assert!(text.contains("[code]"));
+    }
     use super::*;
 
     #[test]

@@ -189,7 +189,7 @@ fn parse_transcript(path: &str) -> ParsedTranscript {
             if let Some(text) = extract_text(entry.get("content")) {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
-                    assistant_messages.push(trimmed.to_string());
+                    assistant_messages.push(super::common::scrub_credential_tokens(trimmed));
                 }
             }
         }

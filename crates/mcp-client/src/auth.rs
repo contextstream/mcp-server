@@ -163,6 +163,70 @@ pub async fn poll_device_login(device_code: &str, interval: u64) -> Result<Token
     }
 }
 
+/// Outcome of a single device-login poll (no sleeping, no looping), for
+/// callers that are themselves polled by a host (MCP tool calls).
+#[derive(Debug, Clone)]
+pub enum DevicePollOutcome {
+    Pending { interval: u64 },
+    Authorized(TokenResponse),
+    Expired,
+    Denied,
+}
+
+/// Poll the device-login endpoint exactly once.
+pub async fn poll_device_login_once(device_code: &str) -> Result<DevicePollOutcome> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let url = format!("{}/api/v1/auth/device/token", api_url());
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "device_code": device_code }))
+        .send()
+        .await?;
+
+    let status_code = response.status();
+    if status_code.as_u16() == 404 || status_code.as_u16() == 410 {
+        return Ok(DevicePollOutcome::Expired);
+    }
+    if !status_code.is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("Device login poll failed: {}", error_text));
+    }
+
+    let body: serde_json::Value = response.json().await?;
+    let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    match status {
+        "authorized" => {
+            let access_token = body
+                .get("access_token")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing access_token in authorized response"))?
+                .to_string();
+            Ok(DevicePollOutcome::Authorized(TokenResponse {
+                access_token,
+                token_type: "Bearer".to_string(),
+                expires_in: body.get("expires_in").and_then(|v| v.as_u64()),
+                refresh_token: body
+                    .get("refresh_token")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            }))
+        }
+        "pending" => Ok(DevicePollOutcome::Pending {
+            interval: body
+                .get("interval")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(default_interval),
+        }),
+        "expired" => Ok(DevicePollOutcome::Expired),
+        "denied" => Ok(DevicePollOutcome::Denied),
+        other => Err(anyhow::anyhow!("Unexpected device login status: {}", other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

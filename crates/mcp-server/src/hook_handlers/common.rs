@@ -450,3 +450,192 @@ pub async fn list_pending_tasks(config: &ApiConfig, limit: usize) -> Vec<Value> 
 
     extract_items(&value)
 }
+
+
+// ---------------------------------------------------------------------------
+// Account-setup secret scrubbing for captured transcripts
+// ---------------------------------------------------------------------------
+
+/// Tool names (bare and host-prefixed) whose calls carry account-setup data.
+pub const ACCOUNT_SETUP_TOOL_NAMES: [&str; 2] = ["account", "mcp__contextstream__account"];
+
+pub fn is_account_setup_tool(name: &str) -> bool {
+    let name = name.trim();
+    ACCOUNT_SETUP_TOOL_NAMES.contains(&name) || name.ends_with("__account")
+}
+
+const DEVICE_CODE_ALPHABET: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+fn is_boundary(c: Option<char>) -> bool {
+    match c {
+        None => true,
+        Some(c) => !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '+',
+    }
+}
+
+/// Redact credential-shaped tokens that must never be persisted anywhere:
+/// API keys (`cbiq_…`) and setup tokens (`cbst_…`).
+pub fn scrub_credential_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let rest: String = chars[i..chars.len().min(i + 5)].iter().collect();
+        if (rest == "cbiq_" || rest == "cbst_") && is_boundary(chars.get(i.wrapping_sub(1)).copied().filter(|_| i > 0)) {
+            let mut j = i + 5;
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '-') {
+                j += 1;
+            }
+            out.push_str("[redacted-credential]");
+            i = j;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Full scrub for sessions that contain an account-setup flow: credential
+/// tokens, standalone 6-digit verification codes, device user codes
+/// (`ABCD-EFGH`), and phone numbers (`+` followed by 8-15 digits).
+pub fn scrub_setup_secrets(text: &str) -> String {
+    let text = scrub_credential_tokens(text);
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let prev = if i == 0 { None } else { Some(chars[i - 1]) };
+        // Phone number: + then 8-15 digits (spaces/dashes allowed between).
+        if chars[i] == '+' && is_boundary(prev) {
+            let mut j = i + 1;
+            let mut digits = 0;
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == ' ' || chars[j] == '-' || chars[j] == '(' || chars[j] == ')') {
+                if chars[j].is_ascii_digit() {
+                    digits += 1;
+                }
+                j += 1;
+            }
+            if (8..=15).contains(&digits) {
+                out.push_str("[phone]");
+                i = j;
+                continue;
+            }
+        }
+        // Six-digit code.
+        if chars[i].is_ascii_digit() && is_boundary(prev) {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j - i == 6 && is_boundary(chars.get(j).copied()) {
+                out.push_str("[code]");
+                i = j;
+                continue;
+            }
+        }
+        // Device user code ABCD-EFGH.
+        if i + 9 <= chars.len()
+            && is_boundary(prev)
+            && chars[i + 4] == '-'
+            && chars[i..i + 4].iter().chain(chars[i + 5..i + 9].iter()).all(|c| DEVICE_CODE_ALPHABET.contains(*c))
+            && is_boundary(chars.get(i + 9).copied())
+        {
+            out.push_str("[device-code]");
+            i += 9;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn message_tool_name(message: &serde_json::Value) -> Option<&str> {
+    message
+        .get("tool_calls")
+        .and_then(|t| t.get("name"))
+        .or_else(|| message.get("tool_results").and_then(|t| t.get("name")))
+        .and_then(|n| n.as_str())
+}
+
+/// Post-process captured transcript messages: account-tool inputs and
+/// results are replaced wholesale, and when such a call is present every
+/// message body is scrubbed of codes, phone numbers and credentials. Every
+/// session gets the credential-token scrub regardless.
+pub fn scrub_account_setup_messages(mut messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let setup_flow_present = messages
+        .iter()
+        .any(|m| message_tool_name(m).is_some_and(is_account_setup_tool));
+    for message in messages.iter_mut() {
+        let is_setup_call = message_tool_name(message).is_some_and(is_account_setup_tool);
+        if is_setup_call {
+            if let Some(calls) = message.get_mut("tool_calls") {
+                if let Some(obj) = calls.as_object_mut() {
+                    obj.insert("input".to_string(), serde_json::json!({"redacted": "account-setup"}));
+                }
+            }
+            if message.get("tool_results").is_some() {
+                message["content"] = serde_json::Value::String("[account-setup result redacted]".to_string());
+            }
+        }
+        if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
+            let scrubbed = if setup_flow_present {
+                scrub_setup_secrets(content)
+            } else {
+                scrub_credential_tokens(content)
+            };
+            if scrubbed != content {
+                message["content"] = serde_json::Value::String(scrubbed);
+            }
+        }
+    }
+    messages
+}
+
+#[cfg(test)]
+mod account_scrub_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn credential_tokens_are_always_redacted() {
+        let text = "key cbiq_abcDEF123-_x and token cbst_zzz end";
+        assert_eq!(
+            scrub_credential_tokens(text),
+            "key [redacted-credential] and token [redacted-credential] end"
+        );
+        assert_eq!(scrub_credential_tokens("no secrets 123456"), "no secrets 123456");
+    }
+
+    #[test]
+    fn full_scrub_covers_codes_phones_and_device_codes() {
+        let text = "code is 483920, phone +1 (555) 010-1234, device ABCD-EFGH, id 1234567 keeps";
+        let scrubbed = scrub_setup_secrets(text);
+        assert!(scrubbed.contains("[code]"), "{scrubbed}");
+        assert!(scrubbed.contains("[phone]"), "{scrubbed}");
+        assert!(scrubbed.contains("[device-code]"), "{scrubbed}");
+        assert!(scrubbed.contains("1234567 keeps"), "{scrubbed}");
+    }
+
+    #[test]
+    fn account_tool_messages_are_redacted_and_session_is_scrubbed() {
+        let messages = vec![
+            json!({"role": "user", "content": "my code is 112233"}),
+            json!({"role": "assistant", "content": "[Tool: mcp__contextstream__account]",
+                   "tool_calls": {"name": "mcp__contextstream__account", "input": {"action": "signup_verify_phone", "code": "112233"}}}),
+            json!({"role": "tool", "content": "{\"status\":\"connected\"}", "tool_results": {"name": "mcp__contextstream__account"}}),
+        ];
+        let out = scrub_account_setup_messages(messages);
+        assert_eq!(out[0]["content"], "my code is [code]");
+        assert_eq!(out[1]["tool_calls"]["input"]["redacted"], "account-setup");
+        assert_eq!(out[2]["content"], "[account-setup result redacted]");
+    }
+
+    #[test]
+    fn sessions_without_setup_flow_keep_six_digit_numbers() {
+        let messages = vec![json!({"role": "user", "content": "issue 123456 and cbiq_secret"})];
+        let out = scrub_account_setup_messages(messages);
+        assert_eq!(out[0]["content"], "issue 123456 and [redacted-credential]");
+    }
+}

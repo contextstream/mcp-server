@@ -91,13 +91,17 @@ pub fn build_registry(
     domains::vcs::register_vcs_tools(&mut registry, client.clone());
     // Account connection tool (browser device login, credential status). In
     // full mode it lets a revoked or expired key be repaired from chat.
-    registry.register(
-        crate::account_tool::ACCOUNT_TOOL_NAME,
-        Arc::new(crate::account_tool::AccountTool::new(
-            config,
-            crate::account_tool::AccountToolMode::Full,
-        )),
-    );
+    // Stdio only: the hosted HTTP gateway keeps bearer auth and never
+    // exposes local credential handling.
+    if !config.is_http_transport {
+        registry.register(
+            crate::account_tool::ACCOUNT_TOOL_NAME,
+            Arc::new(crate::account_tool::AccountTool::new(
+                config,
+                crate::account_tool::AccountToolMode::Full,
+            )),
+        );
+    }
     domains::reminder::register_reminder_tools(&mut registry, client.clone());
     domains::coordination::register_coordination_tools(&mut registry, client.clone());
     domains::feed::register_feed_tools(&mut registry, client.clone(), session.clone());
@@ -2359,6 +2363,7 @@ mod tests {
     }
 
     const V0_5_62_BROAD_TOOL_NAMES: &[&str] = &[
+        "account",
         "answer",
         "capsule",
         "capture_plan",
@@ -2398,7 +2403,7 @@ mod tests {
         "workspace",
     ];
 
-    const V0_5_62_ROUTER_TOOL_NAMES: &[&str] = &["execute_operation", "operations"];
+    const V0_5_62_ROUTER_TOOL_NAMES: &[&str] = &["account", "execute_operation", "operations"];
 
     const V0_5_62_OPENAI_AGENTIC_TOOL_NAMES: &[&str] = &[
         "answer",
@@ -2426,6 +2431,10 @@ mod tests {
     // baseline; entries intentionally advance when an additive, versioned
     // input capability is added.
     const EXPECTED_BROAD_SCHEMA_CONTRACTS: &[(&str, &str)] = &[
+        (
+            "account",
+            "ca11cc2e56f8841578bfdf71e590c0323cf4ee71b60e5ab2843efe7534043637",
+        ),
         (
             "answer",
             "47f91fa2cab8d8769f4940a23a714965f3abfbe9abf032237adb1b2fdec43f6a",

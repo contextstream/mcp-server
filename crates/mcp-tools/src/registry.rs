@@ -1948,7 +1948,6 @@ const STANDARD_TOOLS: &[&str] = &[
 /// Compact default tools for OpenAI/GPT agentic tool calling.
 const OPENAI_AGENTIC_CORE_TOOLS: &[&str] = &[
     "init",
-    "account",
     "context",
     "session",
     "instruct",

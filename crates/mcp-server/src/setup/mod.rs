@@ -7,12 +7,12 @@
 //! - AI rules generation
 
 mod credentials;
-mod pending_connection;
 pub mod doctor;
 pub mod editors;
 pub mod git_hooks;
 mod hooks;
 mod mcp_config;
+mod pending_connection;
 pub mod profile;
 mod prompts;
 mod rules;
@@ -22,10 +22,10 @@ mod watch_service;
 mod wizard_config;
 
 pub use credentials::*;
-pub use pending_connection::*;
 pub use hooks::install_binary;
 pub use hooks::managed_binary_path;
 pub use hooks::MANAGED_HOOK_ARGUMENT;
+pub use pending_connection::*;
 pub use prompts::*;
 pub use watch_service::{
     register_managed_sync_bridge, sync_bridge_registration_status, unregister_managed_sync_bridge,
@@ -3773,7 +3773,11 @@ fn signup_error_parts(error: &anyhow::Error) -> (String, String) {
 fn signup_error_is_fatal(code: &str) -> bool {
     matches!(
         code,
-        "verification_locked" | "signup_attempt_expired" | "account_exists" | "account_exists_unverified" | "NOT_CONFIGURED"
+        "verification_locked"
+            | "signup_attempt_expired"
+            | "account_exists"
+            | "account_exists_unverified"
+            | "NOT_CONFIGURED"
     )
 }
 
@@ -3819,7 +3823,11 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
         started.email.clone(),
     );
     let _ = write_pending_connection(&pending);
-    println!("{} We emailed a 6-digit code to {}.", CHECK, style(&started.email).cyan());
+    println!(
+        "{} We emailed a 6-digit code to {}.",
+        CHECK,
+        style(&started.email).cyan()
+    );
 
     loop {
         let entered = prompts::input("Email code (or 'r' to resend):", None)?;
@@ -3831,14 +3839,18 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
             }
             continue;
         }
-        match signup::verify_signup_email(&pending.attempt_id, &pending.client_secret, &entered).await {
+        match signup::verify_signup_email(&pending.attempt_id, &pending.client_secret, &entered)
+            .await
+        {
             Ok(_) => break,
             Err(error) => {
                 let (code, message) = signup_error_parts(&error);
                 println!("{} {}", CROSS, message);
                 if signup_error_is_fatal(&code) {
                     let _ = clear_pending_connection();
-                    anyhow::bail!("Signup cancelled. Re-run `contextstream-mcp setup` to try again.");
+                    anyhow::bail!(
+                        "Signup cancelled. Re-run `contextstream-mcp setup` to try again."
+                    );
                 }
             }
         }
@@ -3852,14 +3864,18 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
             "Mobile number (international format, e.g. +1 555 123 4567):",
             None,
         )?;
-        match signup::request_sms_consent(&pending.attempt_id, &pending.client_secret, phone.trim()).await {
+        match signup::request_sms_consent(&pending.attempt_id, &pending.client_secret, phone.trim())
+            .await
+        {
             Ok(consent) => break consent,
             Err(error) => {
                 let (code, message) = signup_error_parts(&error);
                 println!("{} {}", CROSS, message);
                 if signup_error_is_fatal(&code) {
                     let _ = clear_pending_connection();
-                    anyhow::bail!("Signup cancelled. Re-run `contextstream-mcp setup` to try again.");
+                    anyhow::bail!(
+                        "Signup cancelled. Re-run `contextstream-mcp setup` to try again."
+                    );
                 }
             }
         }
@@ -3891,10 +3907,18 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
         Some("yes"),
     )
     .await
-    .map_err(|error| anyhow::anyhow!("Could not send the verification text: {}", signup_error_parts(&error).1))?;
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "Could not send the verification text: {}",
+            signup_error_parts(&error).1
+        )
+    })?;
     pending.stage = PendingStage::SmsSent;
     let _ = write_pending_connection(&pending);
-    println!("{} Code texted to the number ending in {}.", CHECK, sent.phone_last4);
+    println!(
+        "{} Code texted to the number ending in {}.",
+        CHECK, sent.phone_last4
+    );
 
     let complete = loop {
         let entered = prompts::input("SMS code (or 'r' to resend):", None)?;
@@ -3906,14 +3930,18 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
             }
             continue;
         }
-        match signup::verify_signup_phone(&pending.attempt_id, &pending.client_secret, &entered).await {
+        match signup::verify_signup_phone(&pending.attempt_id, &pending.client_secret, &entered)
+            .await
+        {
             Ok(complete) => break complete,
             Err(error) => {
                 let (code, message) = signup_error_parts(&error);
                 println!("{} {}", CROSS, message);
                 if signup_error_is_fatal(&code) {
                     let _ = clear_pending_connection();
-                    anyhow::bail!("Signup cancelled. Re-run `contextstream-mcp setup` to try again.");
+                    anyhow::bail!(
+                        "Signup cancelled. Re-run `contextstream-mcp setup` to try again."
+                    );
                 }
             }
         }

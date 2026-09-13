@@ -20,7 +20,8 @@ use mcp_types::{
 use serde_json::{json, Value};
 
 use crate::account_tool::{
-    detect_credentials_source, AccountTool, AccountToolMode, ACCOUNT_TOOL_NAME, SETUP_REQUIRED_MARKER,
+    detect_credentials_source, AccountTool, AccountToolMode, ACCOUNT_TOOL_NAME,
+    SETUP_REQUIRED_MARKER,
 };
 
 pub const LIMITED_MODE_TOOLS: [&str; 2] = ["init", ACCOUNT_TOOL_NAME];
@@ -150,7 +151,10 @@ mod tests {
     #[tokio::test]
     async fn limited_init_is_an_access_gate_with_both_routes() {
         let tool = LimitedInitTool::new(&limited_config());
-        let result = tool.execute(json!({"folder_path": "/tmp/x"})).await.unwrap();
+        let result = tool
+            .execute(json!({"folder_path": "/tmp/x"}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(mcp_tools::registry::tool_result_is_access_gate(&result));
         let text = result

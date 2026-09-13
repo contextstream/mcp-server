@@ -451,7 +451,6 @@ pub async fn list_pending_tasks(config: &ApiConfig, limit: usize) -> Vec<Value> 
     extract_items(&value)
 }
 
-
 // ---------------------------------------------------------------------------
 // Account-setup secret scrubbing for captured transcripts
 // ---------------------------------------------------------------------------
@@ -481,9 +480,13 @@ pub fn scrub_credential_tokens(text: &str) -> String {
     let mut i = 0;
     while i < chars.len() {
         let rest: String = chars[i..chars.len().min(i + 5)].iter().collect();
-        if (rest == "cbiq_" || rest == "cbst_") && is_boundary(chars.get(i.wrapping_sub(1)).copied().filter(|_| i > 0)) {
+        if (rest == "cbiq_" || rest == "cbst_")
+            && is_boundary(chars.get(i.wrapping_sub(1)).copied().filter(|_| i > 0))
+        {
             let mut j = i + 5;
-            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '-') {
+            while j < chars.len()
+                && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '-')
+            {
                 j += 1;
             }
             out.push_str("[redacted-credential]");
@@ -510,7 +513,13 @@ pub fn scrub_setup_secrets(text: &str) -> String {
         if chars[i] == '+' && is_boundary(prev) {
             let mut j = i + 1;
             let mut digits = 0;
-            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == ' ' || chars[j] == '-' || chars[j] == '(' || chars[j] == ')') {
+            while j < chars.len()
+                && (chars[j].is_ascii_digit()
+                    || chars[j] == ' '
+                    || chars[j] == '-'
+                    || chars[j] == '('
+                    || chars[j] == ')')
+            {
                 if chars[j].is_ascii_digit() {
                     digits += 1;
                 }
@@ -538,7 +547,10 @@ pub fn scrub_setup_secrets(text: &str) -> String {
         if i + 9 <= chars.len()
             && is_boundary(prev)
             && chars[i + 4] == '-'
-            && chars[i..i + 4].iter().chain(chars[i + 5..i + 9].iter()).all(|c| DEVICE_CODE_ALPHABET.contains(*c))
+            && chars[i..i + 4]
+                .iter()
+                .chain(chars[i + 5..i + 9].iter())
+                .all(|c| DEVICE_CODE_ALPHABET.contains(*c))
             && is_boundary(chars.get(i + 9).copied())
         {
             out.push_str("[device-code]");
@@ -563,7 +575,9 @@ fn message_tool_name(message: &serde_json::Value) -> Option<&str> {
 /// results are replaced wholesale, and when such a call is present every
 /// message body is scrubbed of codes, phone numbers and credentials. Every
 /// session gets the credential-token scrub regardless.
-pub fn scrub_account_setup_messages(mut messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+pub fn scrub_account_setup_messages(
+    mut messages: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
     let setup_flow_present = messages
         .iter()
         .any(|m| message_tool_name(m).is_some_and(is_account_setup_tool));
@@ -572,11 +586,15 @@ pub fn scrub_account_setup_messages(mut messages: Vec<serde_json::Value>) -> Vec
         if is_setup_call {
             if let Some(calls) = message.get_mut("tool_calls") {
                 if let Some(obj) = calls.as_object_mut() {
-                    obj.insert("input".to_string(), serde_json::json!({"redacted": "account-setup"}));
+                    obj.insert(
+                        "input".to_string(),
+                        serde_json::json!({"redacted": "account-setup"}),
+                    );
                 }
             }
             if message.get("tool_results").is_some() {
-                message["content"] = serde_json::Value::String("[account-setup result redacted]".to_string());
+                message["content"] =
+                    serde_json::Value::String("[account-setup result redacted]".to_string());
             }
         }
         if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
@@ -605,7 +623,10 @@ mod account_scrub_tests {
             scrub_credential_tokens(text),
             "key [redacted-credential] and token [redacted-credential] end"
         );
-        assert_eq!(scrub_credential_tokens("no secrets 123456"), "no secrets 123456");
+        assert_eq!(
+            scrub_credential_tokens("no secrets 123456"),
+            "no secrets 123456"
+        );
     }
 
     #[test]

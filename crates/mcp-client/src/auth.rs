@@ -227,6 +227,278 @@ pub async fn poll_device_login_once(device_code: &str) -> Result<DevicePollOutco
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inline email + SMS signup (server family: /api/v1/auth/mcp-signup/*)
+// ---------------------------------------------------------------------------
+
+/// Public signup requirements published by the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignupConfig {
+    #[serde(default)]
+    pub phone_required: bool,
+    #[serde(default)]
+    pub inline_signup_available: bool,
+    #[serde(default)]
+    pub sms_consent_text: String,
+    #[serde(default)]
+    pub consent_version: String,
+    #[serde(default)]
+    pub email_first_passwordless: bool,
+}
+
+/// Error surfaced by the signup endpoints, with the server's error code so
+/// callers can branch (account_exists, verification_locked, ...).
+#[derive(Debug, Clone)]
+pub struct SignupApiError {
+    pub status: u16,
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for SignupApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message, self.code)
+    }
+}
+
+impl std::error::Error for SignupApiError {}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignupStartResponse {
+    pub attempt_id: String,
+    pub client_secret: String,
+    pub email: String,
+    #[serde(default)]
+    pub email_code_expires_in: i64,
+    #[serde(default)]
+    pub resend_after: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignupStepResponse {
+    pub status: String,
+    #[serde(default)]
+    pub next: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignupConsentResponse {
+    pub status: String,
+    pub phone_last4: String,
+    #[serde(default)]
+    pub line_type: String,
+    #[serde(default)]
+    pub country_code: Option<String>,
+    pub consent_text: String,
+    pub consent_version: String,
+    pub consent_token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignupSmsSentResponse {
+    pub status: String,
+    pub phone_last4: String,
+    #[serde(default)]
+    pub code_expires_in: Option<i64>,
+    #[serde(default)]
+    pub resend_after: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignupResendResponse {
+    pub status: String,
+    #[serde(default)]
+    pub code_expires_in: Option<i64>,
+    #[serde(default)]
+    pub resend_after: i64,
+    #[serde(default)]
+    pub sends_remaining: i16,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignupApiKey {
+    pub id: String,
+    pub secret: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignupCompleteResponse {
+    pub status: String,
+    pub user_id: String,
+    pub email: String,
+    pub api_key: SignupApiKey,
+    pub api_url: String,
+    #[serde(default)]
+    pub dashboard_url: String,
+}
+
+fn signup_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(25))
+        .build()?)
+}
+
+async fn signup_post<T: for<'de> Deserialize<'de>>(
+    path: &str,
+    body: serde_json::Value,
+) -> Result<T> {
+    let url = format!("{}/api/v1/auth/mcp-signup/{}", api_url(), path);
+    let response = signup_client()?
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        return Err(SignupApiError {
+            status,
+            code: parsed
+                .get("code")
+                .and_then(|c| c.as_str())
+                .unwrap_or("error")
+                .to_string(),
+            message: parsed
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or(if text.is_empty() { "request failed" } else { text.as_str() })
+                .to_string(),
+        }
+        .into());
+    }
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// `GET /api/v1/auth/signup-config`.
+pub async fn fetch_signup_config() -> Result<SignupConfig> {
+    let url = format!("{}/api/v1/auth/signup-config", api_url());
+    let response = signup_client()?.get(&url).send().await?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "signup-config request failed: {}",
+            response.status()
+        ));
+    }
+    Ok(response.json().await?)
+}
+
+pub async fn start_email_signup(
+    email: &str,
+    full_name: Option<&str>,
+    client: serde_json::Value,
+) -> Result<SignupStartResponse> {
+    signup_post(
+        "start",
+        serde_json::json!({
+            "email": email,
+            "full_name": full_name,
+            "signup_source": "mcp_inline",
+            "client": client,
+        }),
+    )
+    .await
+}
+
+pub async fn verify_signup_email(
+    attempt_id: &str,
+    client_secret: &str,
+    code: &str,
+) -> Result<SignupStepResponse> {
+    signup_post(
+        "verify-email",
+        serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret, "code": code }),
+    )
+    .await
+}
+
+pub async fn resend_signup_email(attempt_id: &str, client_secret: &str) -> Result<SignupResendResponse> {
+    signup_post(
+        "resend-email",
+        serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret }),
+    )
+    .await
+}
+
+pub async fn request_sms_consent(
+    attempt_id: &str,
+    client_secret: &str,
+    phone: &str,
+) -> Result<SignupConsentResponse> {
+    signup_post(
+        "request-sms-consent",
+        serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret, "phone": phone }),
+    )
+    .await
+}
+
+pub async fn add_signup_phone(
+    attempt_id: &str,
+    client_secret: &str,
+    consent_token: &str,
+    surface: &str,
+    user_response: Option<&str>,
+) -> Result<SignupSmsSentResponse> {
+    signup_post(
+        "add-phone",
+        serde_json::json!({
+            "attempt_id": attempt_id,
+            "client_secret": client_secret,
+            "consent_token": consent_token,
+            "surface": surface,
+            "user_response": user_response,
+        }),
+    )
+    .await
+}
+
+pub async fn resend_signup_sms(attempt_id: &str, client_secret: &str) -> Result<SignupResendResponse> {
+    signup_post(
+        "resend-sms",
+        serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret }),
+    )
+    .await
+}
+
+pub async fn verify_signup_phone(
+    attempt_id: &str,
+    client_secret: &str,
+    code: &str,
+) -> Result<SignupCompleteResponse> {
+    signup_post(
+        "verify-phone",
+        serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret, "code": code }),
+    )
+    .await
+}
+
+pub async fn fetch_signup_credentials(attempt_id: &str, client_secret: &str) -> Result<SignupCompleteResponse> {
+    signup_post(
+        "credentials",
+        serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret }),
+    )
+    .await
+}
+
+pub async fn ack_signup_credentials(attempt_id: &str, client_secret: &str) -> Result<SignupStepResponse> {
+    signup_post(
+        "ack",
+        serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret }),
+    )
+    .await
+}
+
+pub async fn cancel_signup(attempt_id: &str, client_secret: &str) -> Result<SignupStepResponse> {
+    signup_post(
+        "cancel",
+        serde_json::json!({ "attempt_id": attempt_id, "client_secret": client_secret }),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

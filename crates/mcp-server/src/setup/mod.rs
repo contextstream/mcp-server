@@ -7,6 +7,7 @@
 //! - AI rules generation
 
 mod credentials;
+mod pending_connection;
 pub mod doctor;
 pub mod editors;
 pub mod git_hooks;
@@ -21,6 +22,7 @@ mod watch_service;
 mod wizard_config;
 
 pub use credentials::*;
+pub use pending_connection::*;
 pub use hooks::install_binary;
 pub use hooks::managed_binary_path;
 pub use hooks::MANAGED_HOOK_ARGUMENT;
@@ -3735,16 +3737,203 @@ pub async fn authenticate() -> Result<(String, String)> {
         }
     }
 
-    // Choose authentication method
-    let auth_choices = vec!["Login with browser (recommended)", "Paste API key"];
+    // Choose authentication method. The inline email + SMS signup is offered
+    // only when the server publishes it as available.
+    let inline_signup_available = tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        mcp_client::auth::fetch_signup_config(),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .map(|config| config.inline_signup_available)
+    .unwrap_or(false);
+    let mut auth_choices = vec!["Login with browser (recommended)", "Paste API key"];
+    if inline_signup_available {
+        auth_choices.push("Create a new account (email + phone)");
+    }
 
     let choice = prompts::select("How would you like to authenticate?", &auth_choices)?;
 
     match choice {
         0 => authenticate_browser().await,
         1 => authenticate_api_key().await,
+        2 => authenticate_email_signup().await,
         _ => unreachable!(),
     }
+}
+
+fn signup_error_parts(error: &anyhow::Error) -> (String, String) {
+    match error.downcast_ref::<mcp_client::auth::SignupApiError>() {
+        Some(api) => (api.code.clone(), api.message.clone()),
+        None => ("error".to_string(), error.to_string()),
+    }
+}
+
+fn signup_error_is_fatal(code: &str) -> bool {
+    matches!(
+        code,
+        "verification_locked" | "signup_attempt_expired" | "account_exists" | "account_exists_unverified" | "NOT_CONFIGURED"
+    )
+}
+
+/// Create a new account inline: email code, then the phone with the SMS
+/// consent notice and an explicit yes, then the SMS code. The server mints
+/// the API key; the wizard's caller saves it like any other credential.
+async fn authenticate_email_signup() -> Result<(String, String)> {
+    use mcp_client::auth as signup;
+
+    println!();
+    println!("{}", style("Create a ContextStream account").bold());
+    let email = loop {
+        let entered = prompts::input("Email address:", None)?;
+        let trimmed = entered.trim().to_lowercase();
+        if trimmed.contains('@') && trimmed.len() >= 5 {
+            break trimmed;
+        }
+        println!("{} Enter a valid email address", CROSS);
+    };
+    let full_name = prompts::input("Your name (optional):", Some(""))?;
+    let full_name = {
+        let trimmed = full_name.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+
+    let started = signup::start_email_signup(
+        &email,
+        full_name.as_deref(),
+        crate::account_tool::client_metadata(),
+    )
+    .await
+    .map_err(|error| {
+        let (code, message) = signup_error_parts(&error);
+        if code == "account_exists" || code == "account_exists_unverified" {
+            anyhow::anyhow!("{message} Choose \"Login with browser\" instead.")
+        } else {
+            anyhow::anyhow!("Could not start the signup: {message}")
+        }
+    })?;
+    let mut pending = PendingConnection::new(
+        started.attempt_id.clone(),
+        started.client_secret.clone(),
+        started.email.clone(),
+    );
+    let _ = write_pending_connection(&pending);
+    println!("{} We emailed a 6-digit code to {}.", CHECK, style(&started.email).cyan());
+
+    loop {
+        let entered = prompts::input("Email code (or 'r' to resend):", None)?;
+        let entered = entered.trim().to_string();
+        if entered.eq_ignore_ascii_case("r") {
+            match signup::resend_signup_email(&pending.attempt_id, &pending.client_secret).await {
+                Ok(_) => println!("{} A new code was sent.", CHECK),
+                Err(error) => println!("{} {}", CROSS, signup_error_parts(&error).1),
+            }
+            continue;
+        }
+        match signup::verify_signup_email(&pending.attempt_id, &pending.client_secret, &entered).await {
+            Ok(_) => break,
+            Err(error) => {
+                let (code, message) = signup_error_parts(&error);
+                println!("{} {}", CROSS, message);
+                if signup_error_is_fatal(&code) {
+                    let _ = clear_pending_connection();
+                    anyhow::bail!("Signup cancelled. Re-run `contextstream-mcp setup` to try again.");
+                }
+            }
+        }
+    }
+    pending.stage = PendingStage::EmailVerified;
+    let _ = write_pending_connection(&pending);
+    println!("{} Email verified.", CHECK);
+
+    let consent = loop {
+        let phone = prompts::input(
+            "Mobile number (international format, e.g. +1 555 123 4567):",
+            None,
+        )?;
+        match signup::request_sms_consent(&pending.attempt_id, &pending.client_secret, phone.trim()).await {
+            Ok(consent) => break consent,
+            Err(error) => {
+                let (code, message) = signup_error_parts(&error);
+                println!("{} {}", CROSS, message);
+                if signup_error_is_fatal(&code) {
+                    let _ = clear_pending_connection();
+                    anyhow::bail!("Signup cancelled. Re-run `contextstream-mcp setup` to try again.");
+                }
+            }
+        }
+    };
+    pending.stage = PendingStage::ConsentPending;
+    pending.phone_last4 = Some(consent.phone_last4.clone());
+    pending.consent_token = Some(consent.consent_token.clone());
+    let _ = write_pending_connection(&pending);
+
+    println!();
+    println!("{}", consent.consent_text);
+    println!();
+    if !prompts::confirm(
+        &format!(
+            "Do you agree to receive a one-time verification text at the number ending in {}?",
+            consent.phone_last4
+        ),
+        false,
+    )? {
+        let _ = signup::cancel_signup(&pending.attempt_id, &pending.client_secret).await;
+        let _ = clear_pending_connection();
+        anyhow::bail!("No text was sent. You can choose \"Login with browser\" instead.");
+    }
+    let sent = signup::add_signup_phone(
+        &pending.attempt_id,
+        &pending.client_secret,
+        &consent.consent_token,
+        "wizard",
+        Some("yes"),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("Could not send the verification text: {}", signup_error_parts(&error).1))?;
+    pending.stage = PendingStage::SmsSent;
+    let _ = write_pending_connection(&pending);
+    println!("{} Code texted to the number ending in {}.", CHECK, sent.phone_last4);
+
+    let complete = loop {
+        let entered = prompts::input("SMS code (or 'r' to resend):", None)?;
+        let entered = entered.trim().to_string();
+        if entered.eq_ignore_ascii_case("r") {
+            match signup::resend_signup_sms(&pending.attempt_id, &pending.client_secret).await {
+                Ok(_) => println!("{} A new code was sent.", CHECK),
+                Err(error) => println!("{} {}", CROSS, signup_error_parts(&error).1),
+            }
+            continue;
+        }
+        match signup::verify_signup_phone(&pending.attempt_id, &pending.client_secret, &entered).await {
+            Ok(complete) => break complete,
+            Err(error) => {
+                let (code, message) = signup_error_parts(&error);
+                println!("{} {}", CROSS, message);
+                if signup_error_is_fatal(&code) {
+                    let _ = clear_pending_connection();
+                    anyhow::bail!("Signup cancelled. Re-run `contextstream-mcp setup` to try again.");
+                }
+            }
+        }
+    };
+    pending.mark_finalized();
+    let _ = write_pending_connection(&pending);
+
+    // The caller persists the key; acknowledge delivery on a best-effort basis.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        signup::ack_signup_credentials(&pending.attempt_id, &pending.client_secret),
+    )
+    .await;
+    let _ = clear_pending_connection();
+    println!(
+        "{} Account created for {}. We emailed you a link to set a password for the web dashboard.",
+        CHECK,
+        style(&complete.email).cyan()
+    );
+    Ok((complete.api_key.secret, complete.email))
 }
 
 /// Authenticate via browser (device flow).

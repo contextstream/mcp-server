@@ -168,17 +168,13 @@ fn signup_error_message(error: &anyhow::Error) -> (String, String) {
     (code.to_string(), "The signup request could not be completed. Check the supplied details or try again shortly.".to_string())
 }
 
-fn looks_negative(reply: &str) -> bool {
-    let lower = reply.trim().to_ascii_lowercase();
-    lower.is_empty()
-        || lower == "no"
-        || lower.starts_with("no ")
-        || lower.starts_with("no,")
-        || lower.starts_with("nope")
-        || lower.starts_with("stop")
-        || lower.starts_with("cancel")
-        || lower.starts_with("don't")
-        || lower.starts_with("do not")
+fn has_sms_consent(reply: &str) -> bool {
+    let normalized = reply.trim().to_ascii_lowercase();
+    let normalized = normalized.trim_end_matches(['.', '!']).replace(',', "");
+    matches!(
+        normalized.as_str(),
+        "yes" | "yes please" | "yes i agree" | "yes that's fine" | "ok go ahead" | "i agree"
+    )
 }
 
 impl AccountTool {
@@ -493,9 +489,9 @@ impl AccountTool {
         let api_url_override = (self.api_url
             != mcp_types::config::DEFAULT_API_URL.trim_end_matches('/'))
         .then_some(self.api_url.as_str());
-        write_saved_credentials(api_key, api_url_override).map_err(|e| {
+        write_saved_credentials(api_key, api_url_override).map_err(|_| {
             Error::Tool(format!(
-                "Signed in as {email}, but could not save credentials: {e}"
+                "Signed in as {email}, but could not save credentials. Check local permissions and disk space."
             ))
         })?;
         Ok(())
@@ -711,9 +707,9 @@ impl AccountTool {
             return Ok(ToolResult::error("Request the consent notice first with account(action=\"signup_request_sms_consent\", phone=...)."));
         };
         let reply = input.user_response.as_deref().map(str::trim).unwrap_or("");
-        if looks_negative(reply) {
+        if !has_sms_consent(reply) {
             return Ok(ToolResult::error(
-                "No text will be sent: the recorded reply is empty or declines the notice. If the user agreed, pass their exact affirmative reply in user_response; otherwise call account(action=\"cancel\").",
+                "No text will be sent: the recorded reply does not explicitly agree to the notice. If the user agreed, pass their exact affirmative reply in user_response; otherwise call account(action=\"cancel\").",
             ));
         }
         match client_auth::add_signup_phone(
@@ -991,13 +987,15 @@ mod tests {
 
     #[test]
     fn negative_replies_never_send_a_text() {
-        assert!(looks_negative(""));
-        assert!(looks_negative("no"));
-        assert!(looks_negative("No, don't text me"));
-        assert!(looks_negative("stop"));
-        assert!(!looks_negative("yes"));
-        assert!(!looks_negative("Yes, that's fine"));
-        assert!(!looks_negative("ok go ahead"));
+        assert!(!has_sms_consent(""));
+        assert!(!has_sms_consent("no"));
+        assert!(!has_sms_consent("No, don't text me"));
+        assert!(!has_sms_consent("stop"));
+        assert!(!has_sms_consent("maybe"));
+        assert!(!has_sms_consent("yes, but do not send anything"));
+        assert!(has_sms_consent("yes"));
+        assert!(has_sms_consent("Yes, that's fine"));
+        assert!(has_sms_consent("ok go ahead"));
     }
 
     #[test]

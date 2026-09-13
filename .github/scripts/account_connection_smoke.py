@@ -205,8 +205,9 @@ class ConnectionTests(unittest.TestCase):
         self.start_inline()
         self.account('signup_verify_email', code='112233')
         self.account('signup_request_sms_consent', phone='+15555550123')
-        result = self.account('signup_confirm_sms_consent', user_response='No, do not text me')
-        self.assertTrue(result.get('isError'), result)
+        for reply in ('No, do not text me', 'maybe', 'yes, but do not send anything'):
+            result = self.account('signup_confirm_sms_consent', user_response=reply)
+            self.assertTrue(result.get('isError'), result)
         self.assertFalse(any(p.endswith('/add-phone') for p, _ in self.requests))
 
     def test_server_rejection_is_mcp_error(self):

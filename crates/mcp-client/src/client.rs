@@ -19061,7 +19061,10 @@ fn extract_error_code(body: &serde_json::Value) -> Option<String> {
 fn with_edge_geography_headers(mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     if let Some(geography) = get_task_edge_geography() {
         if let Some(region) = geography.nearest_region {
-            req = req.header(mcp_types::NearestRegion::HEADER_NAME, region.as_header_value());
+            req = req.header(
+                mcp_types::NearestRegion::HEADER_NAME,
+                region.as_header_value(),
+            );
         }
         if let Some(country) = geography.client_country.as_deref() {
             req = req.header(mcp_types::EdgeGeography::COUNTRY_HEADER_NAME, country);

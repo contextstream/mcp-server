@@ -42,7 +42,9 @@ pub use atlas_layer::{
     AtlasVectorProvider, AtlasVectorScope, AtlasVectorWrite, AtlasWarmCacheKind, CachedBundle,
     FederatedHit, NoopAtlasLayer,
 };
-pub use config::{AuthOverride, Config, ConfigOverride, SessionKey, TrafficClass};
+pub use config::{
+    AuthOverride, Config, ConfigOverride, EdgeGeography, NearestRegion, SessionKey, TrafficClass,
+};
 pub use error::{is_non_blocking_parser_error_message, Error, ErrorCode, Result};
 pub use harness::{
     HarnessId, HarnessProfile, HarnessReadinessEvidence, HarnessReadinessStage, HookCapabilities,

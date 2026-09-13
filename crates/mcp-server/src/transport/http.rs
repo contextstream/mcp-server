@@ -37,7 +37,8 @@ use mcp_types::{
     has_stateless_protocol_metadata, stateless_protocol_version,
     validate_stateless_jsonrpc_envelope, validate_stateless_method_params,
     validate_stateless_request, AuthOverride, Config, HarnessId, McpCacheScope, McpProtocolError,
-    SessionKey, StatelessRequestMetadata, TrafficClass, MCP_PROTOCOL_2026_07_28,
+    EdgeGeography, NearestRegion, SessionKey, StatelessRequestMetadata, TrafficClass,
+    MCP_PROTOCOL_2026_07_28,
     MCP_TOOLS_LIST_TTL_MS,
 };
 use serde::{Deserialize, Serialize};
@@ -2447,6 +2448,7 @@ pub async fn auth_middleware(
 
     let auth = extract_auth_override(&headers);
     let config_override = extract_config_override(&headers);
+    let edge_geography = extract_edge_geography(&headers);
     let request_installation_id = headers
         .get("x-contextstream-installation-id")
         .and_then(|value| value.to_str().ok())
@@ -2592,14 +2594,57 @@ pub async fn auth_middleware(
     };
     // Expose the transport-level MCP session id to tools so backend calls can
     // carry a durable session identity (scope persistence + rehydration).
-    let response = match effective_mcp_session_id {
-        Some(sid) => mcp_client::run_with_mcp_session_id(sid, exec_with_caller_cache).await,
-        None => exec_with_caller_cache().await,
+    let exec_with_session = || async move {
+        match effective_mcp_session_id {
+            Some(sid) => mcp_client::run_with_mcp_session_id(sid, exec_with_caller_cache).await,
+            None => exec_with_caller_cache().await,
+        }
     };
+    // The edge's view of the caller's location rides every API call made for
+    // this request, and the tenant home the API names on those calls comes
+    // back on this response so the Cloudflare MCP gateway can remember it.
+    let (mut response, tenant_home) = mcp_client::run_capturing_tenant_home(|| async move {
+        match edge_geography {
+            Some(geography) => {
+                mcp_client::run_with_edge_geography(geography, exec_with_session).await
+            }
+            None => exec_with_session().await,
+        }
+    })
+    .await;
+    if let Some(home) = tenant_home {
+        if let Ok(value) = header::HeaderValue::from_str(&home) {
+            response
+                .headers_mut()
+                .insert(TENANT_HOME_REGION_HEADER, value);
+        }
+    }
     if let Some(key) = transient_session_key {
         state.session.discard_transient_state(&key);
     }
     Ok(response)
+}
+
+/// Name of the response header the API sets once a request identified its
+/// tenant; mirrored onto the gateway's response. Must match
+/// TENANT_HOME_REGION_HEADER in the API's region module.
+const TENANT_HOME_REGION_HEADER: &str = "x-contextstream-tenant-home-region";
+
+/// What the Cloudflare router said about the caller's location. Both values
+/// are validated to their canonical shapes; anything else is dropped so no
+/// caller text reaches API telemetry through this path.
+fn extract_edge_geography(headers: &HeaderMap) -> Option<EdgeGeography> {
+    let geography = EdgeGeography {
+        nearest_region: header_str(headers, NearestRegion::HEADER_NAME)
+            .and_then(NearestRegion::from_header_value),
+        client_country: header_str(headers, EdgeGeography::COUNTRY_HEADER_NAME)
+            .and_then(EdgeGeography::parse_country),
+    };
+    if geography.is_empty() {
+        None
+    } else {
+        Some(geography)
+    }
 }
 
 /// Build a stable, secret-free cache identity for an authenticated principal.
@@ -3786,6 +3831,24 @@ mod tests {
             );
             let auth = extract_auth_override(&headers).expect("authenticated override");
             assert_eq!(auth.traffic_class, Some(TrafficClass::SyntheticProbe));
+            // The edge's geography is carried whatever the credential says, in
+            // canonical form only.
+            let mut geo_headers = HeaderMap::new();
+            geo_headers.insert(
+                "x-contextstream-suggested-home-region",
+                axum::http::HeaderValue::from_static(" EU-AMS "),
+            );
+            geo_headers.insert("cf-ipcountry", axum::http::HeaderValue::from_static("nl"));
+            let geography = extract_edge_geography(&geo_headers).expect("geography");
+            assert_eq!(geography.nearest_region, Some(NearestRegion::EuAms));
+            assert_eq!(geography.client_country.as_deref(), Some("NL"));
+            let mut forged = HeaderMap::new();
+            forged.insert(
+                "x-contextstream-suggested-home-region",
+                axum::http::HeaderValue::from_static("amsterdam"),
+            );
+            forged.insert("cf-ipcountry", axum::http::HeaderValue::from_static("NLD"));
+            assert!(extract_edge_geography(&forged).is_none());
 
             for rejected in ["customer", "Synthetic-Probe", "synthetic-probe,customer"] {
                 headers.insert(TrafficClass::HEADER_NAME, rejected.parse().unwrap());

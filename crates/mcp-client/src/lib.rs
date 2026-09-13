@@ -180,7 +180,8 @@ pub use client::{
 pub use client::{
     get_task_auth_override, get_task_caller_cache_identity, get_task_config_override,
     get_task_installation_id, get_task_mcp_session_id, get_task_model_id, get_task_session_key,
-    run_with_auth_override, run_with_caller_cache_identity, run_with_config_override,
+    get_task_edge_geography, run_capturing_tenant_home, run_with_auth_override,
+    run_with_caller_cache_identity, run_with_config_override, run_with_edge_geography,
     run_with_installation_id, run_with_mcp_session_id, run_with_model_id, run_with_session_key,
     spawn_with_task_context, TaskContextSnapshot,
 };

@@ -1848,6 +1848,7 @@ fn default_category_tags(category: ToolCategory) -> &'static [&'static str] {
 const LIGHT_TOOLS: &[&str] = &[
     // Session
     "init",
+    "account",
     "context",
     "session",
     "session_capture",
@@ -1947,6 +1948,7 @@ const STANDARD_TOOLS: &[&str] = &[
 /// Compact default tools for OpenAI/GPT agentic tool calling.
 const OPENAI_AGENTIC_CORE_TOOLS: &[&str] = &[
     "init",
+    "account",
     "context",
     "session",
     "instruct",
@@ -1965,11 +1967,12 @@ const OPENAI_AGENTIC_CORE_TOOLS: &[&str] = &[
 ];
 
 /// Tools exposed in router mode
-const ROUTER_DIRECT_TOOLS: &[&str] = &["operations", "execute_operation"];
+const ROUTER_DIRECT_TOOLS: &[&str] = &["operations", "execute_operation", "account"];
 
 /// Consolidated domain tools (v0.4.x default)
 const CONSOLIDATED_TOOLS: &[&str] = &[
     "init",
+    "account",
     "context",
     "session",
     "instruct",

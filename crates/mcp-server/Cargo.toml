@@ -20,6 +20,7 @@ mcp-types = { workspace = true }
 mcp-client = { workspace = true }
 mcp-session = { workspace = true }
 mcp-tools = { workspace = true }
+async-trait = { workspace = true }
 mcp-model-registry = { workspace = true }
 # Optional: MongoDB-free acceleration providers for the remote HTTP gateway.
 mcp-acceleration-products = { workspace = true, optional = true }

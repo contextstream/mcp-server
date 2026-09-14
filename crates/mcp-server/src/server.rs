@@ -89,6 +89,19 @@ pub fn build_registry(
         session.clone(),
     );
     domains::vcs::register_vcs_tools(&mut registry, client.clone());
+    // Account connection tool (browser device login, credential status). In
+    // full mode it lets a revoked or expired key be repaired from chat.
+    // Stdio only: the hosted HTTP gateway keeps bearer auth and never
+    // exposes local credential handling.
+    if !config.is_http_transport {
+        registry.register(
+            crate::account_tool::ACCOUNT_TOOL_NAME,
+            Arc::new(crate::account_tool::AccountTool::new(
+                config,
+                crate::account_tool::AccountToolMode::Full,
+            )),
+        );
+    }
     domains::reminder::register_reminder_tools(&mut registry, client.clone());
     domains::coordination::register_coordination_tools(&mut registry, client.clone());
     domains::feed::register_feed_tools(&mut registry, client.clone(), session.clone());
@@ -757,14 +770,25 @@ pub async fn run_server(
     client: ContextStreamClient,
     session: Arc<SessionManager>,
 ) -> Result<()> {
+    let registry = build_registry(&config, client.clone(), session.clone());
+    run_server_with_registry(config, client, session, registry).await
+}
+
+/// Run the stdio transport with a caller-supplied registry. Limited mode
+/// (no credentials) passes a two-tool registry; the normal path passes the
+/// full `build_registry` output.
+pub async fn run_server_with_registry(
+    config: Config,
+    client: ContextStreamClient,
+    session: Arc<SessionManager>,
+    registry: ToolRegistry,
+) -> Result<()> {
     // Record process start time for binary mtime comparison during auto-update exec
     record_process_start();
 
     // Load the pinned vocabulary before registry readiness or the first
     // request. This is synchronous and idempotent; request paths never load it.
     mcp_tools::wire_tokens::warm_o200k();
-
-    let registry = build_registry(&config, client.clone(), session.clone());
 
     let tool_count = registry.len();
     let op_count = registry.operation_count();
@@ -805,7 +829,9 @@ pub async fn run_server(
     // re-ingest. Stdio (single-tenant) only — deliberately NOT started on the
     // shared HTTP gateway, which serves many tenants and has no single local
     // filesystem of user projects to enumerate.
-    domains::index_keeper::spawn_keep_warm_daemon(client.clone());
+    if config.api_key.is_some() || config.jwt.is_some() {
+        domains::index_keeper::spawn_keep_warm_daemon(client.clone());
+    }
 
     // Stdio is the only single-user local lane. Install its marker explicitly
     // so missing/lost task-local identity can fail closed instead of being
@@ -2337,6 +2363,7 @@ mod tests {
     }
 
     const V0_5_62_BROAD_TOOL_NAMES: &[&str] = &[
+        "account",
         "answer",
         "capsule",
         "capture_plan",
@@ -2376,7 +2403,7 @@ mod tests {
         "workspace",
     ];
 
-    const V0_5_62_ROUTER_TOOL_NAMES: &[&str] = &["execute_operation", "operations"];
+    const V0_5_62_ROUTER_TOOL_NAMES: &[&str] = &["account", "execute_operation", "operations"];
 
     const V0_5_62_OPENAI_AGENTIC_TOOL_NAMES: &[&str] = &[
         "answer",
@@ -2404,6 +2431,10 @@ mod tests {
     // baseline; entries intentionally advance when an additive, versioned
     // input capability is added.
     const EXPECTED_BROAD_SCHEMA_CONTRACTS: &[(&str, &str)] = &[
+        (
+            "account",
+            "78d98c93e037399612ec80b4843598b1a738a4f800f0d0029881c358357907b4",
+        ),
         (
             "answer",
             "47f91fa2cab8d8769f4940a23a714965f3abfbe9abf032237adb1b2fdec43f6a",

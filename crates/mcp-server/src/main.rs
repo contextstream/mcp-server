@@ -3260,13 +3260,19 @@ async fn run_stdio_server() -> Result<()> {
 }
 
 async fn run_limited_mode_server() -> Result<()> {
-    // In limited mode, we just expose a help tool
-    eprintln!("Limited mode: Only help tool available.");
-    eprintln!("Configure authentication to enable all tools.");
-
-    // For now, just wait forever (in a real implementation, this would run an MCP server with limited tools)
-    tokio::signal::ctrl_c().await?;
-    Ok(())
+    // No credentials: serve a real MCP session with exactly two tools so the
+    // agent can explain the state and connect an account (browser device
+    // login, or inline email signup when the server offers it). Stdio only;
+    // the hosted HTTP gateway keeps requiring bearer auth.
+    let config = mcp_server::config::load_limited_config()?;
+    eprintln!("Limited mode: `init` and `account` tools only until an account is connected.");
+    let client = mcp_client::ContextStreamClient::new(config.clone());
+    let session = std::sync::Arc::new(mcp_session::SessionManager::new(
+        client.clone(),
+        config.clone(),
+    ));
+    let registry = mcp_server::limited_mode::build_limited_registry(&config, session.clone());
+    server::run_server_with_registry(config, client, session, registry).await
 }
 
 const MCP_WIRE_TOKENIZER_WARM_LATENCY_MS_BUCKETS: [f64; 13] = [

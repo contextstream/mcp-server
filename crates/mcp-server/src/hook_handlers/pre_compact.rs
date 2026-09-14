@@ -459,6 +459,12 @@ fn parse_transcript(transcript_path: &str) -> TranscriptData {
         .rev()
         .collect();
 
+    // See session_end: never persist account-setup secrets.
+    let messages = super::common::scrub_account_setup_messages_with_hint(
+        messages,
+        super::common::transcript_has_account_setup(&content),
+    );
+
     TranscriptData {
         active_files: sorted_files,
         tool_call_count: tool_calls.len(),

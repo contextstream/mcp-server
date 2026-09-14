@@ -11,6 +11,22 @@ use uuid::Uuid;
 
 /// Load configuration from environment variables and config files.
 pub fn load_config() -> Result<Config> {
+    load_config_with_credentials(true)
+}
+
+/// Configuration for limited mode: identical resolution (API URL, toolset,
+/// logging) but no credentials are required. Used when the stdio server
+/// starts without an API key so the `init`/`account` tools can connect one.
+pub fn load_limited_config() -> Result<Config> {
+    let mut config = load_config_with_credentials(false)?;
+    config.api_key = None;
+    config.jwt = None;
+    config.transcripts_enabled = false;
+    config.hook_transcripts_enabled = false;
+    Ok(config)
+}
+
+fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
     let saved_credentials = if std::env::var("CONTEXTSTREAM_API_KEY").is_err()
         && std::env::var("CONTEXTSTREAM_JWT").is_err()
     {
@@ -36,7 +52,7 @@ pub fn load_config() -> Result<Config> {
     let allow_header_auth = parse_bool_env("CONTEXTSTREAM_ALLOW_HEADER_AUTH");
 
     // Check for credentials
-    if api_key.is_none() && jwt.is_none() && !allow_header_auth {
+    if require_credentials && api_key.is_none() && jwt.is_none() && !allow_header_auth {
         return Err(anyhow!(
             "Missing credentials: Set CONTEXTSTREAM_API_KEY or CONTEXTSTREAM_JWT for authentication"
         ));

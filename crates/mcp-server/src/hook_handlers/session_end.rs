@@ -401,6 +401,13 @@ fn parse_transcript_stats(transcript_path: &str) -> TranscriptStats {
         started_at = chrono::Utc::now().to_rfc3339();
     }
 
+    // Account-setup secrets (codes, phone numbers, keys) never enter a
+    // transcript; account tool inputs/results are redacted wholesale.
+    let messages = super::common::scrub_account_setup_messages_with_hint(
+        messages,
+        super::common::transcript_has_account_setup(&content),
+    );
+
     TranscriptStats {
         message_count,
         tool_call_count,

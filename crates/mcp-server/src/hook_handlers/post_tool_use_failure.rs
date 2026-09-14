@@ -27,6 +27,13 @@ pub async fn handle() -> Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
+    // Account calls contain verification codes and personal data. Do not persist
+    // their inputs, raw errors, or failure-counter samples.
+    if super::common::is_account_setup_tool(tool_name) {
+        write_stdout_json(&HookOutput::empty())?;
+        return Ok(());
+    }
+
     let error_text = extract_error_text(&input);
     let tool_use_id = input
         .get("tool_use_id")

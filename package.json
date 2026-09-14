@@ -45,6 +45,13 @@
     "contextstream",
     "semantic-search",
     "memory",
-    "developer-tools"
+    "developer-tools",
+    "cursor",
+    "claude-code",
+    "codex",
+    "shared-context",
+    "project-context",
+    "mcp-server",
+    "ai-coding"
   ]
 }

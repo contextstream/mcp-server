@@ -2054,7 +2054,7 @@ If the response includes [VERSION_NOTICE] or [VERSION_CRITICAL], tell the user a
 ### Update Commands:
 ```bash
 # macOS/Linux
-curl -fsSL https://contextstream.io/scripts/setup.sh | bash
+curl -fsSL https://contextstream.io/scripts/mcp.sh | bash
 # npm
 npm install -g @contextstream/mcp-server@latest
 ```
@@ -2889,7 +2889,7 @@ mod tests {
     #[test]
     fn test_full_mode_uses_stable_update_script() {
         let rules = generate_rule_content(&Editor::Codex, None, None, RulesMode::Full);
-        assert!(rules.contains("https://contextstream.io/scripts/setup.sh"));
+        assert!(rules.contains("https://contextstream.io/scripts/mcp.sh"));
         assert!(!rules.contains("setup-beta.sh"));
     }
 

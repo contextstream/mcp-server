@@ -19781,13 +19781,22 @@ pub struct QaAskResult {
     #[serde(default)]
     pub source_refs: serde_json::Value,
     pub model_name: String,
-    pub friendli_request_id: Option<String>,
+    /// The API renamed `friendli_*` to `upstream_*` when the Q&A model
+    /// provider changed; the aliases keep older API builds readable.
+    #[serde(default, alias = "friendli_request_id")]
+    pub upstream_request_id: Option<String>,
     pub prompt_token_count: Option<i32>,
     pub completion_token_count: Option<i32>,
     pub total_token_count: Option<i32>,
+    /// Latency breakdown is telemetry: a missing field must never fail an
+    /// otherwise complete answer.
+    #[serde(default)]
     pub embed_latency_ms: i32,
+    #[serde(default)]
     pub search_latency_ms: i32,
-    pub friendli_latency_ms: i32,
+    #[serde(default, alias = "friendli_latency_ms")]
+    pub upstream_latency_ms: i32,
+    #[serde(default)]
     pub total_latency_ms: i32,
     #[serde(default)]
     pub tier1_count: usize,

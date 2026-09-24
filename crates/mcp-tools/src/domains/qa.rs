@@ -528,7 +528,7 @@ fn format_ask_response(response: &QaAskResult) -> String {
             response.tier2_count,
             response.embed_latency_ms,
             response.search_latency_ms,
-            response.friendli_latency_ms
+            response.upstream_latency_ms
         ));
     }
     if let (Some(p), Some(c)) = (response.prompt_token_count, response.completion_token_count) {
@@ -789,13 +789,13 @@ mod tests {
             confidence: Some(0.85),
             source_refs: serde_json::json!([{"kind": "decision", "id": "abc"}]),
             model_name: "ContextCode".to_string(),
-            friendli_request_id: Some("chatcmpl-x".to_string()),
+            upstream_request_id: Some("chatcmpl-x".to_string()),
             prompt_token_count: Some(123),
             completion_token_count: Some(456),
             total_token_count: Some(579),
             embed_latency_ms: 50,
             search_latency_ms: 80,
-            friendli_latency_ms: 600,
+            upstream_latency_ms: 600,
             total_latency_ms: 750,
             tier1_count: 3,
             tier2_count: 2,
@@ -811,6 +811,59 @@ mod tests {
         assert!(text.contains("Tier 1"));
     }
 
+    /// Production `/v1/qa_agent/ask` renamed `friendli_*` to `upstream_*`;
+    /// requiring the old name failed every ask (issue #107).
+    #[test]
+    fn ask_result_reads_current_legacy_and_sparse_latency_shapes() {
+        let base = serde_json::json!({
+            "question_id": Uuid::nil(),
+            "answer_id": Uuid::nil(),
+            "answer_text": "ok",
+            "confidence": null,
+            "source_refs": [],
+            "model_name": "ContextCode",
+            "prompt_token_count": null,
+            "completion_token_count": null,
+            "total_token_count": null,
+            "tier1_count": 0,
+            "tier2_count": 0,
+            "cached": false,
+        });
+        let with = |extra: serde_json::Value| {
+            let mut body = base.clone();
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<QaAskResult>(body)
+        };
+
+        let current = with(serde_json::json!({
+            "upstream_request_id": "req-1",
+            "embed_latency_ms": 1,
+            "search_latency_ms": 2,
+            "upstream_latency_ms": 3,
+            "total_latency_ms": 6,
+        }))
+        .expect("current API shape");
+        assert_eq!(current.upstream_request_id.as_deref(), Some("req-1"));
+        assert_eq!(current.upstream_latency_ms, 3);
+
+        let legacy = with(serde_json::json!({
+            "friendli_request_id": "req-0",
+            "embed_latency_ms": 1,
+            "search_latency_ms": 2,
+            "friendli_latency_ms": 4,
+            "total_latency_ms": 7,
+        }))
+        .expect("legacy API shape");
+        assert_eq!(legacy.upstream_request_id.as_deref(), Some("req-0"));
+        assert_eq!(legacy.upstream_latency_ms, 4);
+
+        let sparse = with(serde_json::json!({})).expect("latency telemetry is optional");
+        assert_eq!(sparse.upstream_latency_ms, 0);
+        assert_eq!(sparse.total_latency_ms, 0);
+    }
+
     #[test]
     fn format_ask_response_marks_cached_in_headline() {
         let response = QaAskResult {
@@ -820,13 +873,13 @@ mod tests {
             confidence: Some(0.9),
             source_refs: serde_json::json!([]),
             model_name: "ContextCode".to_string(),
-            friendli_request_id: None,
+            upstream_request_id: None,
             prompt_token_count: None,
             completion_token_count: None,
             total_token_count: None,
             embed_latency_ms: 0,
             search_latency_ms: 0,
-            friendli_latency_ms: 0,
+            upstream_latency_ms: 0,
             total_latency_ms: 5,
             tier1_count: 0,
             tier2_count: 0,

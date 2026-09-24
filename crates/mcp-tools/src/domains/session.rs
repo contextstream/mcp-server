@@ -1501,7 +1501,8 @@ fn normalize_upgrade_command(command: Option<&str>) -> Option<String> {
     let is_npm_update = cmd.starts_with("npm ")
         && cmd.contains("@contextstream/mcp-server")
         && (cmd.contains(" install ") || cmd.contains(" update "));
-    let is_setup_script = cmd.starts_with("curl -fsSL https://contextstream.io/scripts/setup")
+    let is_setup_script = (cmd.starts_with("curl -fsSL https://contextstream.io/scripts/setup")
+        || cmd.starts_with("curl -fsSL https://contextstream.io/scripts/mcp.sh"))
         && cmd.contains("| bash");
     let is_self_update = cmd.contains("contextstream-mcp") && cmd.contains("update");
 

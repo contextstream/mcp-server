@@ -2885,6 +2885,10 @@ mod auto_update_command_tests {
             "curl -fsSL https://contextstream.io/scripts/setup.sh | bash",
         ));
         assert_eq!(command.as_deref(), Some(DEFAULT_AUTO_UPDATE_COMMAND));
+        let command = normalize_upgrade_command(Some(
+            "curl -fsSL https://contextstream.io/scripts/mcp.sh | bash",
+        ));
+        assert_eq!(command.as_deref(), Some(DEFAULT_AUTO_UPDATE_COMMAND));
     }
 
     #[test]

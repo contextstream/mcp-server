@@ -38,6 +38,8 @@ Non-interactive shortcuts (CI, scripts, refresh after login):
   contextstream-mcp detect-editors --format=json
   contextstream-mcp generate-configs --transport=remote --preauth
   contextstream-mcp configure --transcripts=on|off --scope=all
+  printf %s "$KEY" | contextstream-mcp configure --api-key-stdin
+  contextstream-mcp setup --yes --workspace-id=<UUID> --editors=claude
 
   Use update-hooks/update-rules after upgrading or joining a team workspace.
   migrate-remote converts legacy local MCP configs to hosted remote (default).
@@ -101,7 +103,7 @@ enum Commands {
     /// Guided account, editor, workspace, project, and indexing setup
     #[command(
         about = "Run the guided ContextStream MCP setup wizard",
-        long_about = "Run the guided ContextStream MCP setup wizard.\n\nThe wizard authenticates your account, detects supported editors, links an exact folder to a canonical workspace/project, writes hosted MCP configs and rules, registers the managed local sync bridge, and offers foreground or background indexing when files already exist. Empty folders are valid new projects: setup links them immediately and the bridge syncs files as they appear. The bridge is not a local MCP transport; it keeps machine-local folders, checkouts, and Git worktrees fresh for hosted MCP. A review step lets you go back before setup continues.\n\nWith --yes, setup runs non-interactively using saved credentials, selected or auto-detected editors, and the hosted remote gateway. Pass --project-path to link and index an exact folder. Without it, setup uses the current directory when it is safely scoped; HOME and filesystem roots are rejected, while ordinary empty folders are allowed. Use --account-only to intentionally skip project linking.\n\nTeam accounts: after login the wizard surfaces team workspace tips, shared skill discovery, and non-interactive refresh commands you can run later."
+        long_about = "Run the guided ContextStream MCP setup wizard.\n\nThe wizard authenticates your account, detects supported editors, links an exact folder to a canonical workspace/project, writes hosted MCP configs and rules, registers the managed local sync bridge, and offers foreground or background indexing when files already exist. Empty folders are valid new projects: setup links them immediately and the bridge syncs files as they appear. The bridge is not a local MCP transport; it keeps machine-local folders, checkouts, and Git worktrees fresh for hosted MCP. A review step lets you go back before setup continues.\n\nWith --yes, setup runs non-interactively using saved credentials (or CONTEXTSTREAM_API_KEY), selected or auto-detected editors, and the hosted remote gateway. On accounts with several workspaces, pass --workspace-id (or set CONTEXTSTREAM_WORKSPACE_ID) unless the folder is already linked. Pass --project-path to link and index an exact folder. Without it, setup uses the current directory when it is safely scoped; HOME and filesystem roots are rejected, while ordinary empty folders are allowed. Use --account-only to intentionally skip project linking.\n\nTeam accounts: after login the wizard surfaces team workspace tips, shared skill discovery, and non-interactive refresh commands you can run later."
     )]
     Setup {
         /// Run non-interactively with defaults (saved credentials required)
@@ -133,6 +135,12 @@ enum Commands {
         /// or indexing a project. This is an explicit partial setup state.
         #[arg(long, conflicts_with = "project_path")]
         account_only: bool,
+
+        /// Workspace to use with --yes. Needed when the account has more than
+        /// one workspace and the folder is not linked yet; without it, --yes
+        /// uses the folder's link, then CONTEXTSTREAM_WORKSPACE_ID.
+        #[arg(long, value_name = "UUID", requires = "yes")]
+        workspace_id: Option<String>,
 
         /// Show every file that would change, without writing anything.
         #[arg(long)]
@@ -365,12 +373,18 @@ enum Commands {
     /// Configure editors, credentials, workspace, and transcript defaults
     #[command(
         hide = true,
-        long_about = "Non-interactive configuration for transcript capture defaults and related settings.\n\nExample: contextstream-mcp configure --transcripts=on --scope=all"
+        long_about = "Configure editors, credentials, workspace, and transcript defaults. With no flags, opens an interactive menu.\n\nNon-interactive examples:\n  contextstream-mcp configure --transcripts=on --scope=all\n  printf %s \"$KEY\" | contextstream-mcp configure --api-key-stdin"
     )]
     Configure {
         /// Print configurable options and exit
         #[arg(long)]
         list_options: bool,
+
+        /// Verify an API key read from stdin and save it to the credentials
+        /// file. Prompts without echo on a terminal. Reading stdin keeps the
+        /// key out of the process list and shell history.
+        #[arg(long, conflicts_with_all = ["list_options", "transcripts", "hook_transcripts"])]
+        api_key_stdin: bool,
 
         /// Set default transcript capture for context() calls: on|off
         #[arg(long, value_enum)]
@@ -532,7 +546,7 @@ enum Commands {
         editors: Option<String>,
 
         /// API key to embed in configs
-        #[arg(long, env = "CONTEXTSTREAM_API_KEY")]
+        #[arg(long, env = "CONTEXTSTREAM_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
 
         /// Workspace ID to embed in configs
@@ -793,6 +807,7 @@ async fn main() -> Result<()> {
             editors,
             project_path,
             account_only,
+            workspace_id,
             dry_run,
         }) => {
             setup::safe_edit::set_dry_run(dry_run);
@@ -826,6 +841,7 @@ async fn main() -> Result<()> {
                     explicit.as_deref(),
                     project_path.as_deref(),
                     account_only,
+                    workspace_id.as_deref(),
                 )
                 .await
             };
@@ -1056,6 +1072,7 @@ async fn main() -> Result<()> {
 
         Some(Commands::Configure {
             list_options,
+            api_key_stdin,
             transcripts,
             hook_transcripts,
             scope,
@@ -1071,6 +1088,20 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             };
+            if api_key_stdin {
+                if explicit.is_some() || only_configured || dry_run {
+                    eprintln!(
+                        "--api-key-stdin cannot be combined with --editors, --only-configured, \
+                         or --dry-run"
+                    );
+                    std::process::exit(1);
+                }
+                if let Err(e) = run_configure_api_key_from_stdin().await {
+                    eprintln!("Configure failed: {}", e);
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             if transcripts.is_none()
                 && hook_transcripts.is_none()
                 && !list_options
@@ -2115,20 +2146,84 @@ async fn run_configure(
 }
 
 fn print_configure_options() {
-    eprintln!("Configurable options:");
+    eprintln!("Configurable options (run `contextstream-mcp configure` for the interactive menu):");
     eprintln!("  - editors: editor integrations, hooks, rules, and MCP configs");
-    eprintln!("  - api-key: authentication credentials");
+    eprintln!("  - api-key: authentication credentials (non-interactive: --api-key-stdin)");
     eprintln!("  - workspace: select/create default workspace");
     eprintln!("  - hooks: reinstall hook scripts");
     eprintln!("  - rules: regenerate AI rule files");
     eprintln!("  - mcp-configs: regenerate MCP config files");
-    eprintln!("  - transcripts: default transcript policy for new chats");
+    eprintln!("  - transcripts: default transcript policy for new chats (--transcripts on|off)");
+    eprintln!();
+    eprintln!("Save an existing API key without the browser flow:");
+    eprintln!(
+        "  printf %s \"$CONTEXTSTREAM_API_KEY\" | contextstream-mcp configure --api-key-stdin"
+    );
     eprintln!();
     eprintln!("Quick transcript commands:");
     eprintln!("  contextstream-mcp configure --transcripts off");
     eprintln!("  contextstream-mcp configure --transcripts on");
     eprintln!("  contextstream-mcp configure --transcripts on --hook-transcripts off");
     eprintln!("  contextstream-mcp configure --transcripts on --scope global");
+}
+
+/// `configure --api-key-stdin`: the non-interactive way to save an existing
+/// key, so `setup --yes` and scripts do not need the browser flow.
+async fn run_configure_api_key_from_stdin() -> Result<()> {
+    use anyhow::Context;
+    use std::io::{IsTerminal, Read};
+
+    let input = if std::io::stdin().is_terminal() {
+        dialoguer::Password::new()
+            .with_prompt("ContextStream API key")
+            .interact()?
+    } else {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .context("Could not read the API key from stdin")?;
+        input
+    };
+    let api_key = parse_api_key_input(&input)?;
+
+    let client = mcp_client::ContextStreamClient::new(mcp_types::Config {
+        api_key: Some(api_key.to_string()),
+        ..Default::default()
+    });
+    let user = tokio::time::timeout(std::time::Duration::from_secs(10), client.me())
+        .await
+        .map_err(|_| anyhow::anyhow!("Key verification timed out; check connectivity and re-run."))?
+        .map_err(|e| anyhow::anyhow!("The API key was not accepted ({}); nothing was saved.", e))?;
+
+    setup::write_saved_credentials(api_key, None)?;
+    eprintln!(
+        "Credentials saved to {}. Authenticated as {}.",
+        setup::credentials_file_path().display(),
+        user.email
+    );
+    if std::env::var("CONTEXTSTREAM_API_KEY").is_ok_and(|env| env.trim() != api_key) {
+        eprintln!(
+            "Note: CONTEXTSTREAM_API_KEY is set in this environment and takes precedence \
+             over the saved key."
+        );
+    }
+    Ok(())
+}
+
+/// Accept exactly one key: surrounding whitespace and a trailing newline are
+/// normal for piped input, but anything else means the wrong thing was piped.
+fn parse_api_key_input(input: &str) -> Result<&str> {
+    let api_key = input.trim();
+    if api_key.is_empty() {
+        anyhow::bail!(
+            "No API key received. Pipe one in, e.g. \
+             printf %s \"$CONTEXTSTREAM_API_KEY\" | contextstream-mcp configure --api-key-stdin"
+        );
+    }
+    if api_key.chars().any(char::is_whitespace) {
+        anyhow::bail!("Expected a single API key on stdin, but the input contains whitespace.");
+    }
+    Ok(api_key)
 }
 
 async fn run_configure_transcript_defaults() -> Result<()> {
@@ -2506,7 +2601,7 @@ fn query_binary_version(binary_path: &str) -> Option<String> {
 async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
     const LATEST_VERSION_URL: &str =
         "https://pub-68429b9f7857416c9484b75bf1887b96.r2.dev/mcp/latest/version.json";
-    const SETUP_URL: &str = "https://contextstream.io/scripts/setup.sh";
+    const SETUP_URL: &str = "https://contextstream.io/scripts/mcp.sh";
 
     let launcher_managed = std::env::var("CONTEXTSTREAM_DISABLE_SELF_UPDATE")
         .ok()
@@ -2606,10 +2701,14 @@ async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
         // Windows: download binary directly from CDN
         download_and_install_binary(&client, &latest).await?;
     } else {
-        // Unix: use setup shell script
+        // Unix: use setup shell script. Without pipefail a failed download
+        // pipes nothing into bash, which exits 0 and reports a false success.
         let mut cmd = std::process::Command::new("bash");
         cmd.arg("-c")
-            .arg(format!("curl -fsSL '{}' | bash", SETUP_URL))
+            .arg(format!(
+                "set -o pipefail; curl -fsSL '{}' | bash",
+                SETUP_URL
+            ))
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -3542,6 +3641,54 @@ mod tests {
         assert!(parse_editor_ids(&["not-an-editor".to_string()]).is_err());
     }
 
+    /// `--help` renders `[env: NAME=value]` for env-backed args unless the
+    /// value is hidden, so any credential-shaped env var would print the
+    /// caller's secret (issue #105). Walk every subcommand so a new arg
+    /// cannot regress this.
+    #[test]
+    fn credential_env_args_never_render_their_values_in_help() {
+        use clap::CommandFactory;
+
+        fn visit(command: &clap::Command, path: &str, offenders: &mut Vec<String>) {
+            for arg in command.get_arguments() {
+                let Some(env) = arg.get_env().and_then(|env| env.to_str()) else {
+                    continue;
+                };
+                let upper = env.to_ascii_uppercase();
+                let credential = ["KEY", "TOKEN", "SECRET", "JWT", "PASSWORD"]
+                    .iter()
+                    .any(|marker| upper.contains(marker));
+                if credential && !arg.is_hide_env_values_set() {
+                    offenders.push(format!("{path} --{} ({env})", arg.get_id()));
+                }
+            }
+            for sub in command.get_subcommands() {
+                visit(sub, &format!("{path} {}", sub.get_name()), offenders);
+            }
+        }
+
+        let mut offenders = Vec::new();
+        visit(&Cli::command(), "contextstream-mcp", &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "credential env args must set hide_env_values: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn generate_configs_help_names_the_api_key_env_var_without_its_value() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("generate-configs")
+            .expect("generate-configs subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("[env: CONTEXTSTREAM_API_KEY]"), "{help}");
+        assert!(!help.contains("CONTEXTSTREAM_API_KEY="), "{help}");
+    }
+
     #[test]
     fn setup_cli_accepts_explicit_project_path_and_rejects_account_only_conflict() {
         let cli = Cli::try_parse_from([
@@ -3581,6 +3728,69 @@ mod tests {
             "--account-only",
         ]);
         assert!(conflict.is_err());
+    }
+
+    #[test]
+    fn api_key_input_accepts_one_trimmed_key_only() {
+        assert_eq!(parse_api_key_input("cs_key\n").unwrap(), "cs_key");
+        assert_eq!(parse_api_key_input("  cs_key  ").unwrap(), "cs_key");
+        assert!(parse_api_key_input("").is_err());
+        assert!(parse_api_key_input(" \n").is_err());
+        assert!(parse_api_key_input("cs_key other").is_err());
+        assert!(parse_api_key_input("cs_key\ncs_other\n").is_err());
+    }
+
+    #[test]
+    fn configure_cli_api_key_stdin_conflicts_with_other_modes() {
+        assert!(Cli::try_parse_from(["contextstream-mcp", "configure", "--api-key-stdin"]).is_ok());
+        for other in [["--list-options", ""], ["--transcripts", "on"]] {
+            let mut argv = vec![
+                "contextstream-mcp",
+                "configure",
+                "--api-key-stdin",
+                other[0],
+            ];
+            if !other[1].is_empty() {
+                argv.push(other[1]);
+            }
+            assert!(Cli::try_parse_from(argv).is_err(), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn setup_cli_accepts_workspace_id_only_for_non_interactive_runs() {
+        let cli = Cli::try_parse_from([
+            "contextstream-mcp",
+            "setup",
+            "--yes",
+            "--account-only",
+            "--workspace-id",
+            "11111111-1111-1111-1111-111111111111",
+        ])
+        .expect("--yes --workspace-id should parse");
+        match cli.command {
+            Some(Commands::Setup {
+                workspace_id,
+                account_only,
+                ..
+            }) => {
+                assert_eq!(
+                    workspace_id.as_deref(),
+                    Some("11111111-1111-1111-1111-111111111111")
+                );
+                assert!(account_only);
+            }
+            _ => panic!("expected setup command"),
+        }
+
+        // The interactive wizard asks for the workspace itself.
+        assert!(Cli::try_parse_from([
+            "contextstream-mcp",
+            "setup",
+            "--workspace-id",
+            "11111111-1111-1111-1111-111111111111",
+        ])
+        .is_err());
     }
 
     #[test]

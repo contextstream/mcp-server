@@ -2,7 +2,7 @@
 # Install the latest published ContextStream MCP release and verify PATH/version.
 set -euo pipefail
 
-SETUP_URL="https://contextstream.io/scripts/setup.sh"
+SETUP_URL="https://contextstream.io/scripts/mcp.sh"
 LATEST_VERSION_URL="https://pub-68429b9f7857416c9484b75bf1887b96.r2.dev/mcp/latest/version.json"
 EXPECTED_PATH="/usr/local/bin/contextstream-mcp"
 BINARY_NAME="contextstream-mcp"

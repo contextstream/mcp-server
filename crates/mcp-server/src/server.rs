@@ -786,9 +786,9 @@ pub async fn run_server_with_registry(
     // Record process start time for binary mtime comparison during auto-update exec
     record_process_start();
 
-    // Load the pinned vocabulary before registry readiness or the first
-    // request. This is synchronous and idempotent; request paths never load it.
-    mcp_tools::wire_tokens::warm_o200k();
+    // The pinned vocabulary is warmed by the transport loop (see
+    // `TokenizerWarmup`): off the handshake's critical path, and only in the
+    // rollout modes that consult it. Request paths never load it.
 
     let tool_count = registry.len();
     let op_count = registry.operation_count();
@@ -842,6 +842,53 @@ pub async fn run_server_with_registry(
     .await
 }
 
+/// Pinned-vocabulary warm-up for exact whole-wire token accounting.
+///
+/// Only the non-default shadow/enforce rollout modes ever consult the
+/// vocabulary, so proxy mode never loads it. Otherwise it loads on a blocking
+/// thread once the `initialize` reply has been written, and every later
+/// request that can produce a tool result waits for it first. Those modes
+/// therefore see a warm tokenizer on exactly the requests they did when it
+/// was loaded before serving, without the load delaying the handshake.
+enum TokenizerWarmup {
+    NotNeeded,
+    Pending,
+    Loading(tokio::task::JoinHandle<std::time::Duration>),
+    Ready,
+}
+
+impl TokenizerWarmup {
+    fn new() -> Self {
+        if mcp_tools::wire_tokens::exact_tokenizer_required() {
+            Self::Pending
+        } else {
+            Self::NotNeeded
+        }
+    }
+
+    /// Begin loading in the background if it has not started yet.
+    fn start(&mut self) {
+        if matches!(self, Self::Pending) {
+            *self = Self::Loading(tokio::task::spawn_blocking(
+                mcp_tools::wire_tokens::warm_o200k,
+            ));
+        }
+    }
+
+    /// Ensure loading has finished (starting it if the client skipped
+    /// `initialize`). If loading failed, request paths keep their existing
+    /// proxy fallback for a cold vocabulary.
+    async fn wait(&mut self) {
+        self.start();
+        if let Self::Loading(handle) = self {
+            if let Err(error) = handle.await {
+                tracing::warn!(%error, "MCP whole-wire tokenizer warm-up failed; proxy accounting retained");
+            }
+            *self = Self::Ready;
+        }
+    }
+}
+
 /// Run the stdio transport for JSON-RPC.
 async fn run_stdio_transport(
     registry: ToolRegistry,
@@ -857,6 +904,7 @@ async fn run_stdio_transport(
 
     let registry = Arc::new(registry);
     let client = Arc::new(client);
+    let mut tokenizer_warmup = TokenizerWarmup::new();
 
     let mut line = String::new();
     loop {
@@ -886,6 +934,14 @@ async fn run_stdio_transport(
             }
         };
 
+        let method = request.get("method").and_then(serde_json::Value::as_str);
+        let is_initialize = method == Some("initialize");
+        if !is_initialize && !method.is_some_and(|method| method.starts_with("notifications/")) {
+            // Anything that can produce a tool result observes a warm
+            // vocabulary, exactly as when it was loaded before serving.
+            tokenizer_warmup.wait().await;
+        }
+
         let wire_observation = mcp_tools::wire_tokens::WireTokenObservation::default();
         let response = handle_request(
             &registry,
@@ -909,6 +965,12 @@ async fn run_stdio_transport(
             stdout.write_all(response.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
             stdout.flush().await?;
+        }
+
+        if is_initialize {
+            // The handshake reply is out; load the vocabulary while the
+            // client processes it.
+            tokenizer_warmup.start();
         }
 
         // After flushing the response, check if a background auto-update completed.
@@ -3402,6 +3464,30 @@ mod tests {
             ..Config::default()
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn tokenizer_warmup_starts_after_initialize_and_completes_before_requests() {
+        // Shadow/enforce: loading starts once the handshake reply is out, and
+        // the next request waits until the vocabulary is warm.
+        let mut warmup = TokenizerWarmup::Pending;
+        warmup.start();
+        assert!(matches!(warmup, TokenizerWarmup::Loading(_)));
+        warmup.wait().await;
+        assert!(matches!(warmup, TokenizerWarmup::Ready));
+        assert!(mcp_tools::wire_tokens::o200k_is_warm());
+
+        // A client that skips `initialize` still gets a warm vocabulary
+        // before its first request.
+        let mut no_handshake = TokenizerWarmup::Pending;
+        no_handshake.wait().await;
+        assert!(matches!(no_handshake, TokenizerWarmup::Ready));
+
+        // Proxy mode never loads it.
+        let mut proxy = TokenizerWarmup::NotNeeded;
+        proxy.start();
+        proxy.wait().await;
+        assert!(matches!(proxy, TokenizerWarmup::NotNeeded));
     }
 
     #[test]

@@ -965,6 +965,10 @@ pub struct ProjectInput {
     pub generate_editor_rules: Option<bool>,
     /// When true, `ingest_local` / folder `index` do not auto-create a project if scope is missing.
     pub skip_project_creation: Option<bool>,
+    /// Brief version the update was based on (for brief_update; sent as If-Match).
+    pub expected_version: Option<i64>,
+    /// Brief sections to store (for brief_update).
+    pub sections: Option<Value>,
 }
 
 /// Unified project tool handler.
@@ -1100,6 +1104,78 @@ fn refresh_endpoint_is_unsupported(error: &Error) -> bool {
 }
 
 impl ProjectTool {
+    /// `brief`, `brief_update`, and `brief_refresh` for one project.
+    async fn project_brief_action(
+        &self,
+        input: &ProjectInput,
+        project_id: Uuid,
+    ) -> Result<ToolResult> {
+        use super::project_brief::{render_block, ProjectBriefInit, STORED_BRIEF_CHAR_CAP};
+
+        match input.action.as_str() {
+            "brief_update" => {
+                let expected_version = input.expected_version.ok_or_else(|| {
+                    Error::Validation(
+                        "expected_version is required for brief_update. Use the version in the \
+                         brief header or from project(action=\"brief\"); it stops an edit from \
+                         overwriting someone else's."
+                            .to_string(),
+                    )
+                })?;
+                let sections =
+                    input
+                        .sections
+                        .clone()
+                        .filter(Value::is_object)
+                        .ok_or_else(|| {
+                            Error::Validation(
+                                "sections must be an object, e.g. {\"what\": …, \"commands\": […]}"
+                                    .to_string(),
+                            )
+                        })?;
+                let body = serde_json::json!({ "sections": sections, "origin": "agent" });
+                match self
+                    .client
+                    .update_project_brief(project_id, expected_version, body)
+                    .await
+                {
+                    Ok(result) => {
+                        let version = result
+                            .get("version")
+                            .and_then(Value::as_i64)
+                            .map(|version| format!(" (v{version})"))
+                            .unwrap_or_default();
+                        Ok(ToolResult::with_structured(
+                            format!("Project brief saved{version}."),
+                            result,
+                        ))
+                    }
+                    Err(Error::Http { status: 409, .. }) => Ok(ToolResult::error(format!(
+                        "The project brief changed after version {expected_version}. Read the \
+                         current one with project(action=\"brief\") and apply your edit to it."
+                    ))),
+                    Err(error) => Err(error),
+                }
+            }
+            "brief_refresh" => {
+                let result = self.client.refresh_project_brief(project_id).await?;
+                Ok(ToolResult::with_structured(
+                    "Brief rebuild queued; the new version appears in the next session."
+                        .to_string(),
+                    result,
+                ))
+            }
+            _ => {
+                let result = self.client.project_brief(project_id).await?;
+                let text = serde_json::from_value::<ProjectBriefInit>(result.clone())
+                    .ok()
+                    .and_then(|brief| render_block(&brief, STORED_BRIEF_CHAR_CAP))
+                    .unwrap_or_else(|| "This project has no brief yet.".to_string());
+                Ok(ToolResult::with_structured(text, result))
+            }
+        }
+    }
+
     pub fn new(client: ContextStreamClient, session: Arc<SessionManager>) -> Self {
         Self { client, session }
     }
@@ -2034,6 +2110,20 @@ impl ToolHandler for ProjectTool {
                     result,
                 ))
             }
+            "brief" | "brief_update" | "brief_refresh" => {
+                let id = resolve_read_project(
+                    &self.client,
+                    &self.session,
+                    input.action.as_str(),
+                    workspace_id,
+                    explicit_project_id,
+                    project_id,
+                    folder,
+                )
+                .await?
+                .project_id;
+                self.project_brief_action(&input, id).await
+            }
             "overview" => {
                 let id = resolve_read_project(
                     &self.client,
@@ -2553,7 +2643,7 @@ impl ToolHandler for ProjectTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "project".to_string(),
             title: "Project Operations".to_string(),
-            description: "Project management. Actions: list, get, create, update, merge/combine duplicate projects, index (preferred hosted workflow: requests the registered managed sync bridge for the exact checkout, or ingests directly only when this process already has disk access; requires_sync_bridge means repair bridge/hooks/Desktop while keeping hosted MCP), delete (remove the project), purge (completely de-index a project — removes file_indices, code chunks, search vectors, and stored files but keeps the project record), forget_local (stop this machine from re-indexing a folder: removes its local mapping/registry entry and drops the active session's project scope; server data untouched), remove_paths (de-index specific files by exact path — deletes their vectors, indexed rows, and stored files server-side, but keeps the project; pass paths=[...]), overview, statistics, files, index_status, index_history (audit trail of indexed files), ingest_local (optional direct indexing only when this process can read the folder; reuses a unique credential-free Git repository match across machines/worktrees, otherwise creates a project and records that identity — pass skip_project_creation=true to disable creation), team_projects (list all team projects - team plans only), recent_changes (git log/diff for recent file changes).".to_string(),
+            description: "Project management. Actions: list, get, create, update, merge/combine duplicate projects, index (preferred hosted workflow: requests the registered managed sync bridge for the exact checkout, or ingests directly only when this process already has disk access; requires_sync_bridge means repair bridge/hooks/Desktop while keeping hosted MCP), delete (remove the project), purge (completely de-index a project — removes file_indices, code chunks, search vectors, and stored files but keeps the project record), forget_local (stop this machine from re-indexing a folder: removes its local mapping/registry entry and drops the active session's project scope; server data untouched), remove_paths (de-index specific files by exact path — deletes their vectors, indexed rows, and stored files server-side, but keeps the project; pass paths=[...]), overview, statistics, files, index_status, index_history (audit trail of indexed files), ingest_local (optional direct indexing only when this process can read the folder; reuses a unique credential-free Git repository match across machines/worktrees, otherwise creates a project and records that identity — pass skip_project_creation=true to disable creation), team_projects (list all team projects - team plans only), recent_changes (git log/diff for recent file changes), brief (the project brief every session starts with), brief_update (store brief sections; pass expected_version from the brief header), brief_refresh (rebuild the brief from the index).".to_string(),
             category: ToolCategory::Project,
             annotations: ToolAnnotations::destructive(),
             is_pro: false,
@@ -2582,6 +2672,9 @@ impl ToolHandler for ProjectTool {
             "ingest_local",
             "team_projects",
             "recent_changes",
+            "brief",
+            "brief_update",
+            "brief_refresh",
         ];
 
         SchemaBuilder::new()
@@ -2607,6 +2700,17 @@ impl ToolHandler for ProjectTool {
                 false,
             )
             .integer("page_size", "Results per page", false)
+            // Project brief fields
+            .integer(
+                "expected_version",
+                "Brief version your edit is based on (for brief_update); a newer version returns a conflict instead of being overwritten",
+                false,
+            )
+            .object(
+                "sections",
+                "Brief sections to store (for brief_update): what, stack, entry_points, commands, guardrails. Cite the file each fact comes from.",
+                false,
+            )
             // Files fields
             .string(
                 "path_pattern",

@@ -19,6 +19,7 @@ pub mod integrations;
 pub mod media;
 pub mod memory;
 pub mod project;
+pub mod project_brief;
 pub mod qa;
 pub mod reminder;
 pub(crate) mod result_cache;

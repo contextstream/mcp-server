@@ -3244,6 +3244,16 @@ impl ToolHandler for InitTool {
             }
         }
 
+        // The project brief arrives inside the init response, so showing it
+        // adds no round trip; it sits next to the map status it complements.
+        if let Some(block) = super::project_brief::ProjectBriefInit::from_init_response(&result)
+            .as_ref()
+            .and_then(super::project_brief::render_init_block)
+        {
+            text.push_str("\n\n");
+            text.push_str(&block);
+        }
+
         if let Some(delta) = local_delta.as_ref() {
             text.push_str("\n\n");
             text.push_str(

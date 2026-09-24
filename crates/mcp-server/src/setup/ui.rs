@@ -179,6 +179,9 @@ struct Probe {
     term: Option<String>,
     colorterm: Option<String>,
     windows_terminal: bool,
+    /// Legacy Windows consoles (conhost with raster or Consolas fonts) lack
+    /// glyphs like ✓ and ╭; modern hosts announce themselves.
+    windows_legacy_console: bool,
     theme_override: Option<String>,
     ascii: bool,
 }
@@ -193,6 +196,11 @@ impl Probe {
             term: var("TERM"),
             colorterm: var("COLORTERM"),
             windows_terminal: var("WT_SESSION").is_some(),
+            windows_legacy_console: cfg!(windows)
+                && var("WT_SESSION").is_none()
+                && var("TERM_PROGRAM").is_none()
+                && var("ConEmuANSI").is_none()
+                && var("TERM").is_none(),
             theme_override: var("CONTEXTSTREAM_THEME"),
             ascii: var("CONTEXTSTREAM_ASCII").is_some_and(|value| truthy(&value)),
         }
@@ -226,7 +234,7 @@ impl Probe {
     }
 
     fn unicode(&self) -> bool {
-        !self.ascii && self.term.as_deref() != Some("linux")
+        !self.ascii && !self.windows_legacy_console && self.term.as_deref() != Some("linux")
     }
 }
 
@@ -936,6 +944,26 @@ mod tests {
             ..probe(true)
         };
         assert_eq!(opted_out.depth(), ColorDepth::Plain);
+    }
+
+    #[test]
+    fn glyphs_fall_back_to_ascii_where_fonts_lack_them() {
+        assert!(probe(true).unicode());
+        let legacy_windows = Probe {
+            windows_legacy_console: true,
+            ..probe(true)
+        };
+        assert!(!legacy_windows.unicode());
+        let linux_console = Probe {
+            term: Some("linux".into()),
+            ..probe(true)
+        };
+        assert!(!linux_console.unicode());
+        let opted_out = Probe {
+            ascii: true,
+            ..probe(true)
+        };
+        assert!(!opted_out.unicode());
     }
 
     #[test]

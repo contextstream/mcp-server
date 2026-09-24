@@ -735,10 +735,11 @@ Non-interactive shortcuts (CI, scripts, refresh after login):
     );
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Process-environment writes happen here, before any runtime (and so any
+    // other thread) exists.
     if let Some(mode) = cli.account_mode {
         std::env::set_var(
             "CONTEXTSTREAM_ACCOUNT_MODE",
@@ -748,12 +749,72 @@ async fn main() -> Result<()> {
 
     setup_logging(cli.verbose, cli.quiet);
 
-    // Stamp the process-global teaching-bundle fingerprint so request bodies,
-    // readiness, doctor, runtime staleness checks, and every editor writer
-    // share one contract. It is cached, idempotent, and runs before tools.
+    // Register the process-global teaching-bundle fingerprint so request
+    // bodies, readiness, doctor, runtime staleness checks, and every editor
+    // writer share one contract. Registration is cheap; the bundle is rendered
+    // once, on first read.
     mcp_server::setup::install_canonical_rules_hash();
 
     match cli.command {
+        Some(Commands::Hook { name, args }) => {
+            prepare_hook_environment(&name, &args);
+            // Editor hooks are one-shot processes that fire on every tool call.
+            // A current-thread runtime avoids spawning (and joining) one worker
+            // thread per CPU just to read stdin, decide, and print one line.
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(run_hook(&name));
+            Ok(())
+        }
+        command => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_command(command)),
+    }
+}
+
+/// Export the hook's event name and host arguments for the handlers.
+///
+/// Must run before the hook runtime is built: `std::env::set_var` is only
+/// sound while no other thread can read the environment concurrently.
+fn prepare_hook_environment(name: &str, args: &[String]) {
+    // SAFETY: called from `main` before any tokio runtime or other thread
+    // exists, so nothing can read the environment concurrently.
+    unsafe { std::env::set_var("HOOK_EVENT_NAME", hook_event_name(name)) };
+    // Forward host hook argv (git hooks) to handlers via env; values are
+    // Unit-Separator joined and read by hook_handlers::git_common::hook_args().
+    // Editor hooks append an ownership marker to the command. It is
+    // consumed here rather than exposed to event handlers as host data.
+    let is_managed_hook = args
+        .last()
+        .is_some_and(|arg| arg == setup::MANAGED_HOOK_ARGUMENT);
+    if is_managed_hook {
+        unsafe { std::env::set_var("CONTEXTSTREAM_MANAGED_HOOK_INVOCATION", "1") };
+    } else {
+        unsafe { std::env::remove_var("CONTEXTSTREAM_MANAGED_HOOK_INVOCATION") };
+    }
+    let forwarded_len = args.len().saturating_sub(is_managed_hook as usize);
+    let forwarded_args = &args[..forwarded_len];
+    if !forwarded_args.is_empty() {
+        unsafe { std::env::set_var("CONTEXTSTREAM_HOOK_ARGS", forwarded_args.join("\u{1f}")) };
+    } else {
+        // Do not let a caller-provided or inherited value masquerade
+        // as host hook arguments when the managed marker is the only
+        // command-line argument.
+        unsafe { std::env::remove_var("CONTEXTSTREAM_HOOK_ARGS") };
+    }
+}
+
+async fn run_hook(name: &str) {
+    if let Err(e) = mcp_server::hook_handlers::dispatch_hook(name).await {
+        eprintln!("Hook error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+async fn run_command(command: Option<Commands>) -> Result<()> {
+    match command {
         Some(Commands::Doctor {
             json,
             support,
@@ -874,37 +935,8 @@ async fn main() -> Result<()> {
             run_verify_key(json).await?;
         }
 
-        Some(Commands::Hook { name, args }) => {
-            // SAFETY: hook dispatch is single-threaded at this point (before tokio runtime).
-            unsafe { std::env::set_var("HOOK_EVENT_NAME", hook_event_name(&name)) };
-            // Forward host hook argv (git hooks) to handlers via env; values are
-            // Unit-Separator joined and read by hook_handlers::git_common::hook_args().
-            // Editor hooks append an ownership marker to the command. It is
-            // consumed here rather than exposed to event handlers as host data.
-            let is_managed_hook = args
-                .last()
-                .is_some_and(|arg| arg == setup::MANAGED_HOOK_ARGUMENT);
-            if is_managed_hook {
-                unsafe { std::env::set_var("CONTEXTSTREAM_MANAGED_HOOK_INVOCATION", "1") };
-            } else {
-                unsafe { std::env::remove_var("CONTEXTSTREAM_MANAGED_HOOK_INVOCATION") };
-            }
-            let forwarded_len = args.len().saturating_sub(is_managed_hook as usize);
-            let forwarded_args = &args[..forwarded_len];
-            if !forwarded_args.is_empty() {
-                unsafe {
-                    std::env::set_var("CONTEXTSTREAM_HOOK_ARGS", forwarded_args.join("\u{1f}"))
-                };
-            } else {
-                // Do not let a caller-provided or inherited value masquerade
-                // as host hook arguments when the managed marker is the only
-                // command-line argument.
-                unsafe { std::env::remove_var("CONTEXTSTREAM_HOOK_ARGS") };
-            }
-            if let Err(e) = mcp_server::hook_handlers::dispatch_hook(&name).await {
-                eprintln!("Hook error: {}", e);
-                std::process::exit(1);
-            }
+        Some(Commands::Hook { .. }) => {
+            unreachable!("`main` dispatches hooks on their own current-thread runtime")
         }
 
         Some(Commands::GitHooks { path, uninstall }) => {

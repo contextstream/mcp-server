@@ -658,8 +658,18 @@ fn record_taught_evidence(editor: &Editor) {
 /// binary's complete teaching bundle. Producers call this once during startup
 /// so request bodies, doctor, runtime drift checks, file markers, and readiness
 /// evidence all use exactly the same value.
+///
+/// Rendering and hashing every editor's teaching surface costs milliseconds,
+/// and most short-lived processes (editor `hook` invocations fire on every
+/// tool call) never read the hash. Registration is therefore lazy: the bundle
+/// is rendered once, on the first read, from the same deterministic inputs, so
+/// every reader observes the identical value an eager install produced.
 pub fn install_canonical_rules_hash() {
-    mcp_types::rules_hash::set_canonical_rules_hash(canonical_rules_bundle_hash());
+    mcp_types::rules_hash::set_canonical_rules_hash_provider(owned_canonical_rules_bundle_hash);
+}
+
+fn owned_canonical_rules_bundle_hash() -> String {
+    canonical_rules_bundle_hash().to_owned()
 }
 
 fn shared_rules_content(
@@ -3027,6 +3037,28 @@ mod tests {
         let h2 = mcp_types::rules_hash::extract_hash_marker(&restamped).unwrap();
         assert_eq!(h1, h2, "stamping must be idempotent on identical content");
         assert_eq!(h1, canonical_rules_bundle_hash());
+    }
+
+    #[test]
+    fn lazily_installed_canonical_rules_hash_equals_the_full_bundle_render() {
+        // `install_canonical_rules_hash` only registers a provider; the first
+        // reader renders the bundle. Pin that the lazily produced process-wide
+        // value is exactly the eager, from-scratch render of every editor
+        // surface, so deferring the work can never change a request body,
+        // doctor verdict, or file marker.
+        install_canonical_rules_hash();
+        let full_render = compute_canonical_rules_bundle_hash();
+        assert_eq!(
+            mcp_types::rules_hash::canonical_rules_hash(),
+            Some(full_render.as_str())
+        );
+        assert_eq!(canonical_rules_bundle_hash(), full_render);
+        // Re-installing is a no-op and the value stays fixed.
+        install_canonical_rules_hash();
+        assert_eq!(
+            mcp_types::rules_hash::canonical_rules_hash(),
+            Some(full_render.as_str())
+        );
     }
 
     #[test]

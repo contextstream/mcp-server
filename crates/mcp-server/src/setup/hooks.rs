@@ -154,6 +154,8 @@ pub struct ClaudeHooksConfig {
     )]
     pub permission_request: Vec<HookEntry>,
 
+    // The events below are no longer generated (their handlers are no-ops);
+    // the fields remain so existing settings still deserialize and round-trip.
     #[serde(
         rename = "ConfigChange",
         skip_serializing_if = "Vec::is_empty",
@@ -1077,13 +1079,6 @@ enum ClaudeHookEvent {
     TeammateIdle,
     Notification,
     PermissionRequest,
-    ConfigChange,
-    CwdChanged,
-    FileChanged,
-    WorktreeCreate,
-    WorktreeRemove,
-    Elicitation,
-    ElicitationResult,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1229,48 +1224,13 @@ const CLAUDE_HOOK_SPECS: &[ClaudeHookSpec] = &[
         hook_name: "permission-request",
         timeout: 10,
     },
-    ClaudeHookSpec {
-        event: ClaudeHookEvent::ConfigChange,
-        matcher: None,
-        hook_name: "config-change",
-        timeout: 10,
-    },
-    ClaudeHookSpec {
-        event: ClaudeHookEvent::CwdChanged,
-        matcher: None,
-        hook_name: "cwd-changed",
-        timeout: 10,
-    },
-    ClaudeHookSpec {
-        event: ClaudeHookEvent::FileChanged,
-        matcher: Some(".*"),
-        hook_name: "file-changed",
-        timeout: 10,
-    },
-    ClaudeHookSpec {
-        event: ClaudeHookEvent::WorktreeCreate,
-        matcher: None,
-        hook_name: "worktree-create",
-        timeout: 15,
-    },
-    ClaudeHookSpec {
-        event: ClaudeHookEvent::WorktreeRemove,
-        matcher: None,
-        hook_name: "worktree-remove",
-        timeout: 15,
-    },
-    ClaudeHookSpec {
-        event: ClaudeHookEvent::Elicitation,
-        matcher: Some(".*"),
-        hook_name: "elicitation",
-        timeout: 10,
-    },
-    ClaudeHookSpec {
-        event: ClaudeHookEvent::ElicitationResult,
-        matcher: Some(".*"),
-        hook_name: "elicitation-result",
-        timeout: 10,
-    },
+    // ConfigChange, CwdChanged, FileChanged, WorktreeCreate, WorktreeRemove,
+    // Elicitation, and ElicitationResult are intentionally not installed: their
+    // handlers are no-ops, so each firing only cost a process spawn (FileChanged
+    // with a `.*` matcher fired on every watched file change). Reinstalling
+    // (`update-hooks`) strips entries earlier versions wrote for them, via the
+    // ownership marker, and `hook_handlers::dispatch_hook` keeps answering them
+    // so configs that still list them keep working.
 ];
 
 const CURSOR_HOOK_SPECS: &[JsonHookSpec] = &[
@@ -1543,13 +1503,6 @@ fn push_claude_hook(config: &mut ClaudeHooksConfig, spec: ClaudeHookSpec, binary
         ClaudeHookEvent::TeammateIdle => config.teammate_idle.push(entry),
         ClaudeHookEvent::Notification => config.notification.push(entry),
         ClaudeHookEvent::PermissionRequest => config.permission_request.push(entry),
-        ClaudeHookEvent::ConfigChange => config.config_change.push(entry),
-        ClaudeHookEvent::CwdChanged => config.cwd_changed.push(entry),
-        ClaudeHookEvent::FileChanged => config.file_changed.push(entry),
-        ClaudeHookEvent::WorktreeCreate => config.worktree_create.push(entry),
-        ClaudeHookEvent::WorktreeRemove => config.worktree_remove.push(entry),
-        ClaudeHookEvent::Elicitation => config.elicitation.push(entry),
-        ClaudeHookEvent::ElicitationResult => config.elicitation_result.push(entry),
     }
 }
 
@@ -1910,13 +1863,6 @@ const fn claude_hook_event_name(event: ClaudeHookEvent) -> &'static str {
         ClaudeHookEvent::TeammateIdle => "TeammateIdle",
         ClaudeHookEvent::Notification => "Notification",
         ClaudeHookEvent::PermissionRequest => "PermissionRequest",
-        ClaudeHookEvent::ConfigChange => "ConfigChange",
-        ClaudeHookEvent::CwdChanged => "CwdChanged",
-        ClaudeHookEvent::FileChanged => "FileChanged",
-        ClaudeHookEvent::WorktreeCreate => "WorktreeCreate",
-        ClaudeHookEvent::WorktreeRemove => "WorktreeRemove",
-        ClaudeHookEvent::Elicitation => "Elicitation",
-        ClaudeHookEvent::ElicitationResult => "ElicitationResult",
     }
 }
 
@@ -2518,13 +2464,14 @@ mod tests {
         assert!(!hooks.teammate_idle.is_empty());
         assert!(!hooks.notification.is_empty());
         assert!(!hooks.permission_request.is_empty());
-        assert!(!hooks.config_change.is_empty());
-        assert!(!hooks.cwd_changed.is_empty());
-        assert!(!hooks.file_changed.is_empty());
-        assert!(!hooks.worktree_create.is_empty());
-        assert!(!hooks.worktree_remove.is_empty());
-        assert!(!hooks.elicitation.is_empty());
-        assert!(!hooks.elicitation_result.is_empty());
+        // No-op events are not installed.
+        assert!(hooks.config_change.is_empty());
+        assert!(hooks.cwd_changed.is_empty());
+        assert!(hooks.file_changed.is_empty());
+        assert!(hooks.worktree_create.is_empty());
+        assert!(hooks.worktree_remove.is_empty());
+        assert!(hooks.elicitation.is_empty());
+        assert!(hooks.elicitation_result.is_empty());
         assert!(!hooks.user_prompt_submit[0].hooks.is_empty());
     }
 
@@ -2713,13 +2660,12 @@ mod tests {
         assert!(json.contains("\"TeammateIdle\""));
         assert!(json.contains("\"Notification\""));
         assert!(json.contains("\"PermissionRequest\""));
-        assert!(json.contains("\"ConfigChange\""));
-        assert!(json.contains("\"CwdChanged\""));
-        assert!(json.contains("\"FileChanged\""));
-        assert!(json.contains("\"WorktreeCreate\""));
-        assert!(json.contains("\"WorktreeRemove\""));
-        assert!(json.contains("\"Elicitation\""));
-        assert!(json.contains("\"ElicitationResult\""));
+        for event in NO_OP_CLAUDE_HOOK_EVENTS {
+            assert!(
+                !json.contains(&format!("\"{event}\"")),
+                "{event} has a no-op handler and must not be installed"
+            );
+        }
     }
 
     fn merged_hooks_object(existing: Value) -> serde_json::Map<String, Value> {
@@ -2776,13 +2722,6 @@ mod tests {
             "InstructionsLoaded",
             "StopFailure",
             "PostCompact",
-            "ConfigChange",
-            "CwdChanged",
-            "FileChanged",
-            "WorktreeCreate",
-            "WorktreeRemove",
-            "Elicitation",
-            "ElicitationResult",
         ] {
             assert!(
                 hooks
@@ -2792,6 +2731,122 @@ mod tests {
                 "expected generated hooks for {event}"
             );
         }
+        for event in NO_OP_CLAUDE_HOOK_EVENTS {
+            assert!(
+                hooks.get(event).is_none(),
+                "{event} has a no-op handler and must not be installed"
+            );
+        }
+    }
+
+    /// Events whose handlers are no-ops, paired with the hook names that
+    /// earlier versions installed for them.
+    const NO_OP_CLAUDE_HOOK_EVENTS: [&str; 7] = [
+        "ConfigChange",
+        "CwdChanged",
+        "FileChanged",
+        "WorktreeCreate",
+        "WorktreeRemove",
+        "Elicitation",
+        "ElicitationResult",
+    ];
+    const NO_OP_CLAUDE_HOOKS: [(&str, &str, Option<&str>); 7] = [
+        ("ConfigChange", "config-change", None),
+        ("CwdChanged", "cwd-changed", None),
+        ("FileChanged", "file-changed", Some(".*")),
+        ("WorktreeCreate", "worktree-create", None),
+        ("WorktreeRemove", "worktree-remove", None),
+        ("Elicitation", "elicitation", Some(".*")),
+        ("ElicitationResult", "elicitation-result", Some(".*")),
+    ];
+
+    #[test]
+    fn update_hooks_removes_previously_installed_no_op_entries_but_keeps_user_hooks() {
+        // A settings file written by an earlier version: one managed entry per
+        // no-op event (in the exact shape it used to generate), plus user hooks
+        // on the same events, including a group mixing a user command with a
+        // managed one.
+        let binary = find_binary_path();
+        let mut existing = serde_json::to_value(generate_contextstream_hooks(None))
+            .unwrap()
+            .as_object()
+            .cloned()
+            .unwrap();
+        for (event, hook_name, matcher) in NO_OP_CLAUDE_HOOKS {
+            let mut managed = json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_command(&binary, hook_name),
+                    "timeout": 10
+                }]
+            });
+            if let Some(matcher) = matcher {
+                managed["matcher"] = json!(matcher);
+            }
+            existing.insert(event.to_string(), json!([managed]));
+        }
+        existing
+            .get_mut("FileChanged")
+            .and_then(Value::as_array_mut)
+            .unwrap()
+            .push(json!({
+                "matcher": "Cargo.toml",
+                "hooks": [{ "type": "command", "command": "echo user file hook" }]
+            }));
+        existing.insert(
+            "CwdChanged".to_string(),
+            json!([{
+                "hooks": [
+                    { "type": "command", "command": "echo user cwd hook" },
+                    {
+                        "type": "command",
+                        "command": hook_command(&binary, "cwd-changed"),
+                        "timeout": 10
+                    }
+                ]
+            }]),
+        );
+        let before = json!({ "hooks": Value::Object(existing.clone()) });
+        assert!(
+            validate_managed_hook_config(&Editor::ClaudeCode, &before).is_err(),
+            "an install carrying retired managed entries must read as stale"
+        );
+
+        let hooks = merged_hooks_object(Value::Object(existing));
+
+        for (event, hook_name, _) in NO_OP_CLAUDE_HOOKS {
+            assert!(
+                !event_commands(&hooks, event)
+                    .iter()
+                    .any(|command| command.contains(&format!("hook {hook_name} "))),
+                "managed {hook_name} entry must be removed from {event}"
+            );
+        }
+        assert_eq!(
+            event_commands(&hooks, "FileChanged"),
+            vec!["echo user file hook".to_string()]
+        );
+        assert_eq!(
+            event_commands(&hooks, "CwdChanged"),
+            vec!["echo user cwd hook".to_string()]
+        );
+        for event in [
+            "ConfigChange",
+            "WorktreeCreate",
+            "WorktreeRemove",
+            "Elicitation",
+            "ElicitationResult",
+        ] {
+            assert!(
+                hooks.get(event).is_none(),
+                "{event} held only a managed entry, so the key must be dropped"
+            );
+        }
+        let after = json!({ "hooks": Value::Object(hooks) });
+        assert_eq!(
+            validate_managed_hook_config(&Editor::ClaudeCode, &after).unwrap(),
+            CLAUDE_HOOK_SPECS.len()
+        );
     }
 
     #[test]

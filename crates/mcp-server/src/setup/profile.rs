@@ -797,21 +797,15 @@ async fn report_completion(
 }
 
 fn print_engine_banner() {
+    let ui = super::ui::ui();
+    let rows = vec![
+        ui.paint("CONTEXTSTREAM SETUP", Some(super::ui::Tok::AccentInk), true),
+        String::new(),
+        ui.strong("Building your context engine"),
+        ui.muted("Applying the editors and project you chose on the web."),
+    ];
     println!();
-    println!(
-        "{}",
-        style("╭──────────────────────────────────────────╮").blue()
-    );
-    println!(
-        "{}  {}  {}",
-        style("│").blue(),
-        style("Building your context engine").bold(),
-        style("        │").blue()
-    );
-    println!(
-        "{}",
-        style("╰──────────────────────────────────────────╯").blue()
-    );
+    println!("{}", ui.card(&rows));
     println!();
 }
 
@@ -823,258 +817,26 @@ fn print_engine_outcome(
     project_path: Option<&Path>,
     outcome: &super::SetupCompletionEvidence,
 ) {
-    println!();
-    match outcome.state {
-        super::SetupCompletionState::RestartRequired => println!(
-            "{}{}",
-            style("✦ ").green(),
-            style("Configuration verified — restart your editor to connect.").bold()
-        ),
-        super::SetupCompletionState::DryRunPreview => println!(
-            "{}{}",
-            style("◇ ").cyan(),
-            style("Setup preview finished — no local files were changed.").bold()
-        ),
-        super::SetupCompletionState::NoClientConfigured => println!(
-            "{}{}",
-            style("○ ").yellow(),
-            style("Account saved, but no coding harness was configured.").bold()
-        ),
-        super::SetupCompletionState::RulesOnlyReady => println!(
-            "{}{}",
-            style("○ ").yellow(),
-            style("Rules refreshed; select an MCP-capable harness to connect.").bold()
-        ),
-        super::SetupCompletionState::RepairRequired => println!(
-            "{}{}",
-            style("⚠ ").yellow(),
-            style("Configuration needs repair before restart.").bold()
-        ),
-        super::SetupCompletionState::AccountOnly => println!(
-            "{}{}",
-            style("○ ").yellow(),
-            style("Account-only setup saved; no project was linked.").bold()
-        ),
-        super::SetupCompletionState::ProjectRequired => println!(
-            "{}{}",
-            style("○ ").yellow(),
-            style("Editor setup saved; project setup is incomplete.").bold()
-        ),
-        super::SetupCompletionState::IndexRequired => println!(
-            "{}{}",
-            style("○ ").yellow(),
-            style("Project linked; indexing still needs to start.").bold()
-        ),
-    }
-    println!();
-    println!("   Account   {}", style(&payload.email).cyan());
-    if let Some(ws) = workspace {
-        println!("   Workspace {}", style(&ws.name).cyan());
-    }
-    if !configured.is_empty() {
-        println!(
-            "   Agents    {}",
-            configured
-                .iter()
-                .map(|e| e.display_name())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    let teaching_contracts = super::setup_teaching_contracts(configured);
-    let teaching_version = teaching_contracts
-        .first()
-        .map(|contract| contract.teaching_version.as_str())
-        .unwrap_or(mcp_types::HARNESS_TEACHING_VERSION);
-    debug_assert!(teaching_contracts
-        .iter()
-        .all(|contract| { contract.teaching_version == mcp_types::HARNESS_TEACHING_VERSION }));
-    if !configured.is_empty() {
-        println!("   Workflow  {}", style(teaching_version).cyan());
-    }
-    if outcome.binding_established {
-        if let Some(path) = project_path {
-            println!("   Project   {}", style(path.display()).cyan());
-        }
-    }
-    if outcome.awaiting_first_files {
-        if crate::watch::watch_enabled() {
-            println!("   Index     Ready; files sync automatically when added");
-        } else {
-            println!("   Index     Ready; automatic sync is disabled on this machine");
-        }
-    }
+    super::print_setup_outcome(
+        &payload.email,
+        false,
+        configured,
+        workspace,
+        project_path,
+        outcome,
+    );
+    let ui = super::ui::ui();
+    let mut notes = Vec::new();
     if let Some(kit) = payload.profile.kit_version.as_deref() {
-        println!("   Starter kit {}", style(kit).dim());
+        notes.push(format!("starter kit {kit}"));
     }
     if kept_existing {
-        println!(
-            "   {}",
-            style("Existing credentials kept — no duplicate keys were left behind.").dim()
-        );
+        notes.push("existing credentials kept, no duplicate keys left behind".to_string());
     }
-    println!();
-    let editor_ids = configured
-        .iter()
-        .map(Editor::id)
-        .collect::<Vec<_>>()
-        .join(",");
-    match outcome.state {
-        super::SetupCompletionState::DryRunPreview => {
-            println!("   Run the same command without --dry-run to apply it.");
-        }
-        super::SetupCompletionState::NoClientConfigured => {
-            println!("   No coding harness can use ContextStream yet.");
-            println!(
-                "   Run {}.",
-                style(
-                    "contextstream-mcp setup --editors <editor-id> --project-path /path/to/project"
-                )
-                .cyan()
-            );
-        }
-        super::SetupCompletionState::RulesOnlyReady => {
-            println!(
-                "   The selected harness rules were refreshed, but no selected harness has an MCP transport."
-            );
-            for editor in configured {
-                println!(
-                    "   {}: {}",
-                    style(editor.display_name()).bold(),
-                    editor.activation_reload_instruction()
-                );
-            }
-            println!(
-                "   Add an MCP-capable harness with {}.",
-                style(
-                    "contextstream-mcp setup --editors <editor-id> --project-path /path/to/project"
-                )
-                .cyan()
-            );
-        }
-        super::SetupCompletionState::RepairRequired => {
-            let scope = if outcome.binding_established {
-                "all"
-            } else {
-                "global"
-            };
-            println!(
-                "   Repair with {}.",
-                style(format!(
-                    "contextstream-mcp doctor --repair --scope {scope} --editors {editor_ids}"
-                ))
-                .cyan()
-            );
-        }
-        super::SetupCompletionState::AccountOnly => {
-            println!("   No project was linked or indexed, as requested.");
-            println!(
-                "   Finish later with {}.",
-                style(format!(
-                    "contextstream-mcp setup --project-path /path/to/project --editors {editor_ids}"
-                ))
-                .cyan()
-            );
-        }
-        super::SetupCompletionState::ProjectRequired => {
-            let project = project_path
-                .map(|path| format!("{path:?}"))
-                .unwrap_or_else(|| "/path/to/project".to_string());
-            println!(
-                "   Finish project setup with {}.",
-                style(format!(
-                    "contextstream-mcp setup --project-path {project} --editors {editor_ids}"
-                ))
-                .cyan()
-            );
-        }
-        super::SetupCompletionState::IndexRequired => {
-            println!(
-                "   After restarting, ask the editor to run {} for this checkout.",
-                style("project(action=\"index\")").cyan()
-            );
-        }
-        super::SetupCompletionState::RestartRequired => {
-            println!("   1. Reload each configured harness:");
-            for editor in configured
-                .iter()
-                .filter(|editor| editor.has_mcp_transport())
-            {
-                println!(
-                    "      {}: {}",
-                    style(editor.display_name()).bold(),
-                    editor.activation_reload_instruction()
-                );
-            }
-            if outcome.awaiting_first_files {
-                if crate::watch::watch_enabled() {
-                    println!(
-                        "   2. Add or generate the first project file; the managed sync bridge will index it automatically."
-                    );
-                } else {
-                    println!(
-                        "   2. Add or generate the first project file, then run {}.",
-                        style("project(action=\"index\")").cyan()
-                    );
-                }
-                println!(
-                    "   3. Ask the harness to run {} for this exact folder.",
-                    style("project(action=\"index_status\")").cyan()
-                );
-            } else {
-                println!(
-                    "   2. Ask the harness to run {} for this exact checkout.",
-                    style("project(action=\"index_status\")").cyan()
-                );
-            }
-            println!(
-                "      If the checkout is unconfirmed or the bridge is offline, keep hosted MCP configured and run:"
-            );
-            println!(
-                "      {}",
-                style(format!(
-                    "contextstream-mcp doctor --repair --scope global --editors {editor_ids}"
-                ))
-                .cyan()
-            );
-            let prompt_step = if outcome.awaiting_first_files { 4 } else { 3 };
-            println!(
-                "   {prompt_step}. When checkout readiness and indexed coverage are confirmed, ask:"
-            );
-            println!("      {}", style(super::first_value_prompt()).cyan());
-            let doctor_step = prompt_step + 1;
-            println!(
-                "   {doctor_step}. Verify the handshake and grounding evidence with {}.",
-                style(format!(
-                    "contextstream-mcp doctor --scope all --editors {editor_ids}"
-                ))
-                .cyan()
-            );
-            let workflow_step = doctor_step + 1;
-            println!(
-                "   {workflow_step}. Inspect the workflow with {}.",
-                style("help(action=\"workflow\", client_name=\"<editor-id>\")").cyan()
-            );
-        }
-    }
-    if outcome.mcp_editor_count > 0 {
+    if !notes.is_empty() {
+        println!("{}{}", super::ui::GUTTER, ui.faint(&notes.join(" · ")));
         println!();
-        println!("   Connection is still pending. The dashboard should show connected only after");
-        println!("   the editor completes a real MCP handshake.");
-    } else if !configured.is_empty() {
-        println!();
-        println!(
-            "   No runtime connection is pending because the selected integration is rules-only."
-        );
     }
-    println!();
-    println!(
-        "   Dashboard: {}",
-        style("https://app.contextstream.io/dashboard-v2")
-            .cyan()
-            .underlined()
-    );
-    println!();
 }
 
 #[cfg(test)]

@@ -1746,10 +1746,11 @@ fn activation_guidance_lines(report: &DoctorReport, project_path: Option<&Path>)
 }
 
 fn print_activation_guidance(report: &DoctorReport, project_path: Option<&Path>) {
+    let ui = super::ui::ui();
     println!();
-    println!("{}", style("Activation path").bold());
+    println!("{}{}", super::ui::GUTTER, ui.kicker("Activation path"));
     for line in activation_guidance_lines(report, project_path) {
-        println!("  {line}");
+        println!("{}  {line}", super::ui::GUTTER);
     }
 }
 
@@ -2486,29 +2487,36 @@ pub async fn build_report(project_path: Option<&Path>, targets: &[Editor]) -> Do
     build_report_for_targets(&options, targets, "configured by setup", false, None).await
 }
 
-fn status_glyph(status: CheckStatus) -> console::StyledObject<&'static str> {
+fn status_glyph(status: CheckStatus) -> String {
+    let ui = super::ui::ui();
     match status {
-        CheckStatus::Pass => style("✓").green(),
-        CheckStatus::Warn => style("⚠").yellow(),
-        CheckStatus::Fail => style("✗").red(),
-        CheckStatus::Skipped => style("·").dim(),
+        CheckStatus::Pass => ui.mark(super::ui::Mark::Ok),
+        CheckStatus::Warn => ui.mark(super::ui::Mark::Warn),
+        CheckStatus::Fail => ui.mark(super::ui::Mark::Fail),
+        CheckStatus::Skipped => ui.mark(super::ui::Mark::Pending),
     }
 }
 
 fn print_check(check: &SurfaceCheck, indent: &str) {
+    let ui = super::ui::ui();
     let mut line = format!(
-        "{}{} {:<13} {}",
-        indent,
+        "{}{indent}{} {:<13} {}",
+        super::ui::GUTTER,
         status_glyph(check.status),
         check.surface.replace('_', " "),
         check.detail
     );
     if let Some(path) = &check.path {
-        line.push_str(&format!("  {}", style(path).dim()));
+        line.push_str(&format!("  {}", ui.faint(path)));
     }
     println!("{}", line);
     if let Some(fix) = &check.fix {
-        println!("{}    → {}", indent, style(fix).cyan());
+        println!(
+            "{}{indent}    {} {}",
+            super::ui::GUTTER,
+            ui.accent("→"),
+            ui.path(fix)
+        );
     }
 }
 
@@ -2581,24 +2589,43 @@ pub async fn run_doctor(options: DoctorOptions, json: bool, support: bool) -> Re
         return Ok(report.has_failures());
     }
 
-    println!("{}", style("ContextStream Doctor").bold());
+    let ui = super::ui::ui();
     let target_names = if report.targeting.editors.is_empty() {
         "none".to_string()
     } else {
         report.targeting.editors.join(", ")
     };
+    println!();
     println!(
-        "Scope: {} · targets: {} ({})",
-        report.targeting.scope.as_cli_value(),
-        target_names,
-        report.targeting.source
+        "{}{}  {}",
+        super::ui::GUTTER,
+        ui.paint(
+            "CONTEXTSTREAM DOCTOR",
+            Some(super::ui::Tok::AccentInk),
+            true
+        ),
+        ui.faint(&format!("v{}", mcp_types::config::VERSION))
+    );
+    println!(
+        "{}{}",
+        super::ui::GUTTER,
+        ui.muted(&format!(
+            "scope {} · {} ({})",
+            report.targeting.scope.as_cli_value(),
+            target_names,
+            report.targeting.source
+        ))
     );
     println!();
     print_check(&report.installation, "");
     print_check(&report.credentials, "");
     println!();
     for editor_report in &report.editors {
-        println!("{}", style(editor_report.editor_name).bold());
+        println!(
+            "{}{}",
+            super::ui::GUTTER,
+            ui.kicker(editor_report.editor_name)
+        );
         for check in &editor_report.checks {
             print_check(check, "  ");
         }
@@ -2606,48 +2633,69 @@ pub async fn run_doctor(options: DoctorOptions, json: bool, support: bool) -> Re
     }
     if let Some(repair) = &report.repair {
         println!(
-            "{}: {}",
-            style("Repair").bold(),
-            if repair.mode == "dry_run" {
-                "preview only"
+            "{}{}",
+            super::ui::GUTTER,
+            ui.kicker(if repair.mode == "dry_run" {
+                "Repair · preview only"
             } else {
-                "applied"
-            }
+                "Repair · applied"
+            })
         );
         if repair.changes.is_empty() && repair.failures.is_empty() {
             println!(
-                "  {} No managed changes were needed.",
+                "{}{} No managed changes were needed.",
+                super::ui::GUTTER,
                 status_glyph(CheckStatus::Pass)
             );
         }
         for change in &repair.changes {
-            println!("  {} {} {}", style("→").cyan(), change.action, change.path);
+            println!(
+                "{}{} {} {}",
+                super::ui::GUTTER,
+                ui.accent("→"),
+                change.action,
+                ui.faint(&change.path)
+            );
         }
         for failure in &repair.failures {
-            println!("  {} {}", status_glyph(CheckStatus::Fail), failure);
+            println!(
+                "{}{} {}",
+                super::ui::GUTTER,
+                status_glyph(CheckStatus::Fail),
+                failure
+            );
         }
         println!();
     }
+    let badge = if report.has_failures() {
+        "needs attention"
+    } else {
+        "healthy"
+    };
     println!(
-        "Summary: {} pass, {} warn, {} fail, {} skipped",
-        style(report.pass).green(),
-        style(report.warn).yellow(),
-        style(report.fail).red(),
-        style(report.skipped).dim()
+        "{}",
+        ui.status_bar(
+            badge,
+            &[
+                ui.success(&format!("{} pass", report.pass)),
+                ui.warning(&format!("{} warn", report.warn)),
+                ui.error(&format!("{} fail", report.fail)),
+                ui.faint(&format!("{} skipped", report.skipped)),
+            ],
+            if report.has_failures() {
+                "fixes are listed under each failing check"
+            } else {
+                ""
+            },
+        )
     );
-    if report.has_failures() {
-        println!(
-            "{}",
-            style("Fix commands are listed under each failing check; re-run doctor to verify.")
-                .dim()
-        );
-    }
     print_activation_guidance(&report, options.project_path.as_deref());
     println!();
     println!(
-        "{} {}",
-        style("Shareable support report (no credentials or local paths):").dim(),
-        style(support_command(&report)).cyan()
+        "{}{} {}",
+        super::ui::GUTTER,
+        ui.faint("Shareable support report (no credentials or local paths) ·"),
+        ui.path(&support_command(&report))
     );
 
     Ok(report.has_failures())
@@ -2716,29 +2764,42 @@ pub fn print_setup_health_report(report: &DoctorReport) {
         }
     }
 
+    let ui = super::ui::ui();
     if problems.is_empty() {
-        println!(
-            "  {} Required setup surfaces verified. Runtime connection is verified separately after your editor starts.",
-            style("✓").green()
+        super::ui::say(
+            super::ui::Mark::Ok,
+            "Everything checks out",
+            (!report.editors.is_empty()).then_some("your editor connects the next time it starts"),
         );
         return;
     }
 
-    println!(
-        "  {} {} required surface(s) still need attention:",
-        style("⚠").yellow(),
-        problems.len()
+    super::ui::say(
+        super::ui::Mark::Warn,
+        &format!(
+            "{} thing{} still need{} attention",
+            problems.len(),
+            if problems.len() == 1 { "" } else { "s" },
+            if problems.len() == 1 { "s" } else { "" }
+        ),
+        None,
     );
     for (owner, check) in problems {
         println!(
-            "    {} {} {}: {}",
-            style("✗").red(),
+            "{}    {} {} {}: {}",
+            super::ui::GUTTER,
+            ui.mark(super::ui::Mark::Fail),
             owner,
             check.surface.replace('_', " "),
             check.detail
         );
         if let Some(fix) = &check.fix {
-            println!("      → {}", style(fix).cyan());
+            println!(
+                "{}      {} {}",
+                super::ui::GUTTER,
+                ui.accent("→"),
+                ui.path(fix)
+            );
         }
     }
 }

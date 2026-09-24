@@ -1,99 +1,81 @@
 //! Team-aware setup guidance and tips for the setup wizard.
 
-use console::style;
 use mcp_types::AccountContextSnapshot;
 
-use super::CHECK;
+use super::ui::{self, ui, Mark, GUTTER};
 
 /// Print team capability guidance immediately after successful authentication.
 pub fn print_post_auth_team_guidance(ctx: &AccountContextSnapshot) {
     if !ctx.team_features_available() {
         return;
     }
+    let ui = ui();
 
-    println!();
-    println!(
-        "{} {}",
-        style("Team account detected").bold().cyan(),
-        style("(shared workspace memory, skills, tickets, and context surfacing)").dim()
-    );
+    let mut detail = Vec::new();
+    if let Some(name) = ctx.team_name.as_deref() {
+        detail.push(name.to_string());
+    }
+    if let Some(plan) = ctx.effective_plan.as_deref() {
+        detail.push(format!("{plan} plan"));
+    }
+    detail.push("shared memory, skills, and tickets".to_string());
+    ui::say(Mark::Tip, "Team account", Some(&detail.join(" · ")));
 
     if ctx.is_dual_context() {
         println!(
-            "  {} Dual-context account: switch between team and personal mode in your editor via",
-            CHECK
+            "{GUTTER}    {} {} {} {}",
+            ui.muted("Switch between team and personal mode with"),
+            ui.path("session(action=\"set_account_mode\")"),
+            ui.muted("or"),
+            ui.path("CONTEXTSTREAM_ACCOUNT_MODE=team|personal|auto")
         );
-        println!(
-            "     {} or {}",
-            style("session(action=\"set_account_mode\", account_mode=\"team|personal|auto\")")
-                .cyan(),
-            style("CONTEXTSTREAM_ACCOUNT_MODE=team|personal|auto").cyan()
-        );
-    } else if let Some(name) = ctx.team_name.as_deref() {
-        println!("  {} Team: {}", CHECK, style(name).cyan());
     }
-
-    if let Some(plan) = ctx.effective_plan.as_deref() {
-        println!("  {} Plan: {}", CHECK, style(plan).dim());
-    }
-
-    println!();
-    println!("  {}", style("Team setup tips:").bold());
     println!(
-        "    • Link this folder to your {} workspace (step 3)",
-        style("shared team").cyan()
+        "{GUTTER}    {} {}",
+        ui.muted("Team guide ·"),
+        ui.path("https://contextstream.io/docs/team")
     );
-    println!("    • Team skills surface in context via matched skills + governance cues");
-    println!("    • Assign tickets, link docs/plans/handoffs with indexed refs (no URLs)");
-    println!(
-        "    • Docs: {}",
-        style("https://contextstream.io/docs/team")
-            .cyan()
-            .underlined()
-    );
-    println!();
 }
 
 /// Tips shown during workspace/project selection for team-capable accounts.
 pub fn print_workspace_step_team_tips() {
-    println!();
-    println!(
-        "  {} {}",
-        style("Team tip:").yellow().bold(),
-        style("Pick the workspace your teammates share — decisions, skills, and tickets stay in sync.")
-            .dim()
+    ui::say(
+        Mark::Tip,
+        "Use the workspace your teammates share",
+        Some("and the project that maps to this repo, so everyone gets the same context"),
     );
-    println!(
-        "  {} Prefer the project that maps to this repo so everyone gets the same indexed context.",
-        style("→").dim()
-    );
-    println!();
 }
 
 /// Team-specific next steps appended to the setup success banner.
 pub fn print_team_success_next_steps() {
-    println!("  {}", style("Team power-ups:").bold());
-    println!("    • Share team skills: skill(action=\"share\", scope=\"team\")");
-    println!("    • Discover shared skills: skill(action=\"list\", scope=\"team\")");
-    println!("    • Team context each turn: session(action=\"context\")");
-    println!("    • File/assign tickets: entity(kind=\"ticket\", action=\"create\", ...)");
+    let ui = ui();
+    println!("{GUTTER}{}", ui.kicker("Team"));
+    for (text, command) in [
+        (
+            "Share a skill with your team",
+            "skill(action=\"share\", scope=\"team\")",
+        ),
+        (
+            "Find shared skills",
+            "skill(action=\"list\", scope=\"team\")",
+        ),
+        ("Pull team context each turn", "session(action=\"context\")"),
+        (
+            "File or assign a ticket",
+            "entity(kind=\"ticket\", action=\"create\", ...)",
+        ),
+    ] {
+        println!("{GUTTER}{} {} {}", ui.faint("·"), text, ui.path(command));
+    }
     println!();
-    println!(
-        "  {}",
-        style("Non-interactive refresh (CI/scripts):").bold()
-    );
-    println!(
-        "    {}",
-        style("contextstream-mcp update-hooks --scope=global").cyan()
-    );
-    println!(
-        "    {}",
-        style("contextstream-mcp update-rules --scope=all").cyan()
-    );
-    println!(
-        "    {}",
-        style("contextstream-mcp migrate-remote --scope=all").cyan()
-    );
+    println!("{GUTTER}{}", ui.kicker("Refresh from CI or scripts"));
+    for command in [
+        "contextstream-mcp update-hooks --scope=global",
+        "contextstream-mcp update-rules --scope=all",
+        "contextstream-mcp migrate-remote --scope=all",
+    ] {
+        println!("{GUTTER}{}", ui.path(command));
+    }
     println!();
 }
 

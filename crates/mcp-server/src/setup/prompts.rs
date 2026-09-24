@@ -1,23 +1,17 @@
 //! Interactive CLI prompts for the setup wizard.
 //!
-//! Provides reusable prompt functions using dialoguer.
+//! Provides reusable prompt functions using dialoguer, styled with the
+//! ContextCode terminal theme in [`super::ui`].
 
 use anyhow::Result;
-use console::{style, Style};
-use dialoguer::{theme::ColorfulTheme, Input, MultiSelect, Password, Select};
+use dialoguer::{Input, MultiSelect, Password, Select};
 
 use super::editors::Editor;
+use super::ui::{self, Mark, PromptTheme};
 
-/// Get the colorful theme for prompts.
-fn theme() -> ColorfulTheme {
-    ColorfulTheme {
-        success_prefix: style("✓ ".to_string()).for_stderr().green(),
-        active_item_style: Style::new().for_stderr().cyan(),
-        inactive_item_style: Style::new().for_stderr(),
-        checked_item_prefix: style("● ".to_string()).for_stderr().cyan(),
-        unchecked_item_prefix: style("○ ".to_string()).for_stderr().black().bright(),
-        ..ColorfulTheme::default()
-    }
+/// The prompt theme for this terminal.
+fn theme() -> PromptTheme {
+    PromptTheme::new(*ui::ui())
 }
 
 /// Ask for text input.
@@ -56,12 +50,6 @@ pub fn password(prompt: &str) -> Result<String> {
 
 /// Ask a yes/no question with arrow key navigation.
 pub fn confirm(prompt: &str, default: bool) -> Result<bool> {
-    // Print usage hint
-    println!(
-        "{}",
-        style("  ↑/↓ move • Enter confirm • Ctrl+C exits").dim()
-    );
-
     let options = &["Yes", "No"];
     let default_idx = if default { 0 } else { 1 };
 
@@ -77,16 +65,15 @@ pub fn confirm(prompt: &str, default: bool) -> Result<bool> {
 
 /// Select one option from a list.
 pub fn select(prompt: &str, options: &[&str]) -> Result<usize> {
-    // Print usage hint
-    println!(
-        "{}",
-        style("  ↑/↓ move • Enter select • Ctrl+C exits").dim()
-    );
+    select_with_default(prompt, options, 0)
+}
 
+/// Select one option from a list, starting on `default`.
+pub fn select_with_default(prompt: &str, options: &[&str], default: usize) -> Result<usize> {
     Ok(Select::with_theme(&theme())
         .with_prompt(prompt)
         .items(options)
-        .default(0)
+        .default(default.min(options.len().saturating_sub(1)))
         .interact()?)
 }
 
@@ -96,12 +83,6 @@ pub fn multi_select(
     options: &[&str],
     defaults: Option<&[bool]>,
 ) -> Result<Vec<usize>> {
-    // Print usage hint
-    println!(
-        "{}",
-        style("  ↑/↓ move • Space toggle • Enter confirm • Ctrl+C exits").dim()
-    );
-
     let t = theme();
     let mut builder = MultiSelect::with_theme(&t)
         .with_prompt(prompt)
@@ -114,24 +95,31 @@ pub fn multi_select(
     Ok(builder.interact()?)
 }
 
-/// Select which editors to configure.
+/// Select which editors to configure; detected editors start checked.
 pub fn select_editors(detected: &[Editor]) -> Result<Vec<Editor>> {
-    let (all_editors, options, defaults) = build_editor_selection_model(detected);
+    select_editors_with_defaults(detected, detected)
+}
+
+/// Select which editors to configure, starting from `current`.
+pub fn select_editors_with_defaults(
+    detected: &[Editor],
+    current: &[Editor],
+) -> Result<Vec<Editor>> {
+    let (all_editors, options, _) = build_editor_selection_model(detected);
+    let defaults: Vec<bool> = all_editors
+        .iter()
+        .map(|editor| current.contains(editor))
+        .collect();
     let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
 
-    println!(
-        "{}",
-        style("  Tip: Detected editors are preselected; the review step lets you come back and change this.").dim()
-    );
-
-    let indices = multi_select(
-        "Select editors to configure:",
-        &option_refs,
-        Some(&defaults),
-    )?;
+    let indices = multi_select("Editors to connect", &option_refs, Some(&defaults))?;
 
     if indices.is_empty() {
-        println!("{}", style("  Skipping editor configuration.").dim());
+        say(
+            Mark::Pending,
+            "No editors selected",
+            Some("nothing will be configured"),
+        );
     }
 
     Ok(indices.into_iter().map(|i| all_editors[i]).collect())
@@ -145,9 +133,9 @@ fn build_editor_selection_model(detected: &[Editor]) -> (Vec<Editor>, Vec<String
     for editor in &all_editors {
         let is_detected = detected.contains(editor);
         if is_detected {
-            options.push(format!("{} [detected]", editor.display_name()));
+            options.push(format!("{} · detected", editor.display_name()));
         } else {
-            options.push(format!("{} [manual setup]", editor.display_name()));
+            options.push(editor.display_name().to_string());
         }
         defaults.push(is_detected);
     }
@@ -183,42 +171,32 @@ pub async fn with_spinner<F, T>(message: &str, future: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
 {
-    use indicatif::{ProgressBar, ProgressStyle};
+    ui::spin(message, future).await
+}
 
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    pb.set_message(message.to_string());
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    let result = future.await;
-
-    pb.finish_and_clear();
-
-    result
+/// Print an activity line with a mark, head, and optional faint detail.
+pub fn say(mark: Mark, head: &str, detail: Option<&str>) {
+    ui::say(mark, head, detail);
 }
 
 /// Print an info message.
 pub fn info(message: &str) {
-    println!("{}{}", style("ℹ  ").blue(), message);
+    say(Mark::Info, message, None);
 }
 
 /// Print a success message.
 pub fn success(message: &str) {
-    println!("{} {}", style("✓").green(), message);
+    say(Mark::Ok, message, None);
 }
 
 /// Print a warning message.
 pub fn warning(message: &str) {
-    println!("{} {}", style("⚠").yellow(), message);
+    say(Mark::Warn, message, None);
 }
 
 /// Print an error message.
 pub fn error(message: &str) {
-    println!("{} {}", style("✗").red(), message);
+    say(Mark::Fail, message, None);
 }
 
 #[cfg(test)]
@@ -259,7 +237,7 @@ mod tests {
         assert!(defaults[codex_idx]);
         assert!(!defaults[cursor_idx]);
 
-        assert!(options[claude_idx].contains("[detected]"));
-        assert!(options[cursor_idx].contains("[manual setup]"));
+        assert!(options[claude_idx].ends_with(" · detected"));
+        assert_eq!(options[cursor_idx], Editor::Cursor.display_name());
     }
 }

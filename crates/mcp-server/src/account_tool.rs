@@ -45,6 +45,21 @@ pub const ACCOUNT_TOOL_NAME: &str = "account";
 pub const SETUP_REQUIRED_MARKER: &str = "[setup_required]";
 
 const DEVICE_FLOW_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+/// How long one `connect_poll` call waits for the browser approval.
+const CONNECT_POLL_WAIT: Duration = Duration::from_secs(20);
+
+/// Open the sign-in page locally unless this is CI, the user opted out, or a
+/// Linux session has no display to open it on.
+fn should_open_browser() -> bool {
+    let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    if set("CI") || set("CONTEXTSTREAM_NO_BROWSER") {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        return set("DISPLAY") || set("WAYLAND_DISPLAY");
+    }
+    true
+}
 const SIGNUP_CONFIG_CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub const RECONNECT_INSTRUCTIONS: &str = "Reconnect the ContextStream MCP server to enable all tools (Claude Code: run /mcp and choose reconnect; other editors: restart the MCP server or the editor).";
@@ -379,15 +394,23 @@ impl AccountTool {
             started_at: Instant::now(),
         };
         *self.flow.lock().await = Some(flow.clone());
+        // This stdio server runs on the user's machine, so it can open the
+        // page itself; the agent still relays the link for other devices.
+        let browser_opened = should_open_browser() && open::that(&flow.verification_uri).is_ok();
+        let opened_note = if browser_opened {
+            "The sign-in page is already open in the user's browser. "
+        } else {
+            ""
+        };
         let text = format!(
-            "{SETUP_REQUIRED_MARKER} Browser sign-in started. Show the user this link and code exactly:\n\n\
+            "{SETUP_REQUIRED_MARKER} Browser sign-in started. {opened_note}Show the user this link and code exactly:\n\n\
              Open: {uri}\nCode: {code}\n\n\
              They can sign in to an existing account or create a new one there; the pending connection \
-             is preserved. When the user says they have approved it (or after about {interval} seconds), \
-             call account(action=\"connect_poll\"). The code expires in {expires} seconds.",
+             is preserved. Call account(action=\"connect_poll\") now: it waits up to {wait} seconds \
+             for the approval. The code expires in {expires} seconds.",
             uri = flow.verification_uri,
             code = flow.user_code,
-            interval = flow.interval.max(5),
+            wait = CONNECT_POLL_WAIT.as_secs(),
             expires = response.expires_in,
         );
         Ok(ToolResult::with_structured(
@@ -398,6 +421,7 @@ impl AccountTool {
                 "user_code": flow.user_code,
                 "expires_in": response.expires_in,
                 "interval": flow.interval,
+                "browser_opened": browser_opened,
                 "next": "account(action=\"connect_poll\")",
             }),
         ))
@@ -417,11 +441,27 @@ impl AccountTool {
             ));
         }
 
-        let outcome = poll_device_login_once(&flow.device_code)
-            .await
-            .map_err(|_| {
-                Error::Tool("Browser sign-in check failed. Try again shortly.".to_string())
-            })?;
+        // Wait for the approval within one call (bounded well inside MCP
+        // tool timeouts) so the agent does not have to re-poll every few
+        // seconds while the user is still in the browser.
+        let deadline = Instant::now() + CONNECT_POLL_WAIT;
+        let outcome = loop {
+            let outcome = poll_device_login_once(&flow.device_code)
+                .await
+                .map_err(|_| {
+                    Error::Tool("Browser sign-in check failed. Try again shortly.".to_string())
+                })?;
+            match outcome {
+                DevicePollOutcome::Pending { interval } => {
+                    let pause = Duration::from_secs(interval.max(2));
+                    if Instant::now() + pause >= deadline {
+                        break DevicePollOutcome::Pending { interval };
+                    }
+                    tokio::time::sleep(pause).await;
+                }
+                other => break other,
+            }
+        };
         match outcome {
             DevicePollOutcome::Pending { interval } => Ok(ToolResult::with_structured(
                 format!(

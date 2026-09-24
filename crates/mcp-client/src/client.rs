@@ -2676,7 +2676,10 @@ impl ContextStreamClient {
             Some(body),
             Some(RequestOptions {
                 retries: Some(0),
-                extra_headers: Some(vec![("If-Match".to_string(), expected_version.to_string())]),
+                extra_headers: Some(vec![(
+                    "If-Match".to_string(),
+                    format!("\"{expected_version}\""),
+                )]),
                 ..RequestOptions::default()
             }),
         )

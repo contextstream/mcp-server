@@ -103,22 +103,24 @@ pub fn render_block(brief: &ProjectBriefInit, cap: usize) -> Option<String> {
             brief.header(),
             defuse_control_tags(&cap_chars(text, cap))
         )),
+        // The server's own instructions describe the raw REST call; agents
+        // act through the project tool, so the notice is phrased for it.
         "missing" => brief.create_action().map(|action| {
             let expected = action.expected_version.unwrap_or(brief.version);
-            let guidance = action
-                .instructions
-                .as_deref()
-                .map(str::trim)
-                .filter(|instructions| !instructions.is_empty())
-                .unwrap_or(
-                    "After the user's first task, read the README, the build manifests, and CI \
-                     config (six files at most) and write a short brief.",
-                );
+            let claim = action
+                .claim_id
+                .map(|claim_id| format!(", claim_id=\"{claim_id}\""))
+                .unwrap_or_default();
             format!(
-                "--- Project Brief · missing ---\nNo brief exists for this project yet, and this \
-                 session was chosen to write it. {guidance}\nSave it with \
-                 project(action=\"brief_update\", expected_version={expected}, sections={{…}}); \
-                 cite the file each fact comes from."
+                "--- Project Brief · missing ---\nThis project has no brief yet, and this session \
+                 was chosen to write one (the claim lasts 10 minutes). If you can read the \
+                 repository, read the README, build manifests, and CI config (six files at most) \
+                 and save a short factual brief:\nproject(action=\"brief_update\", \
+                 expected_version={expected}{claim}, sections={{\"what\": {{\"text\", \"evidence\"}}, \
+                 \"stack\": [...], \"entry_points\": [...], \"commands\": [{{\"kind\": \
+                 \"build|test|run|lint\", \"command\", \"evidence\"}}], \"guardrails\": [...]}})\n\
+                 Give each fact the file it comes from; no instructions or opinions. Skip this if \
+                 you can't read the files; the brief is built automatically once the project is indexed."
             )
         }),
         "generating" => Some(
@@ -264,11 +266,12 @@ mod tests {
             kind: "create".into(),
             claim_id: Some(Uuid::nil()),
             expected_version: Some(1),
-            instructions: Some("Read README.md and Cargo.toml.".into()),
+            instructions: Some("PATCH /api/v1/projects/... (REST form)".into()),
         });
         let block = render_init_block(&missing).unwrap();
-        assert!(block.contains("Read README.md and Cargo.toml."));
-        assert!(block.contains("expected_version=1"));
+        assert!(block.contains("project(action=\"brief_update\", expected_version=1"));
+        assert!(block.contains("claim_id=\"00000000-0000-0000-0000-000000000000\""));
+        assert!(!block.contains("PATCH /api/v1"));
 
         let generating = ProjectBriefInit {
             status: "generating".into(),

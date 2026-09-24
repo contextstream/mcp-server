@@ -969,6 +969,8 @@ pub struct ProjectInput {
     pub expected_version: Option<i64>,
     /// Brief sections to store (for brief_update).
     pub sections: Option<Value>,
+    /// Claim from init's "write the brief" notice (for brief_update).
+    pub claim_id: Option<String>,
 }
 
 /// Unified project tool handler.
@@ -1133,7 +1135,18 @@ impl ProjectTool {
                                     .to_string(),
                             )
                         })?;
-                let body = serde_json::json!({ "sections": sections, "origin": "agent" });
+                let mut body = serde_json::json!({
+                    "expected_version": expected_version,
+                    "origin": "agent",
+                    "sections": sections,
+                });
+                if let Some(claim_id) = input
+                    .claim_id
+                    .as_deref()
+                    .and_then(|value| Uuid::parse_str(value.trim()).ok())
+                {
+                    body["claim_id"] = Value::String(claim_id.to_string());
+                }
                 match self
                     .client
                     .update_project_brief(project_id, expected_version, body)
@@ -1151,8 +1164,9 @@ impl ProjectTool {
                         ))
                     }
                     Err(Error::Http { status: 409, .. }) => Ok(ToolResult::error(format!(
-                        "The project brief changed after version {expected_version}. Read the \
-                         current one with project(action=\"brief\") and apply your edit to it."
+                        "The project brief changed after version {expected_version}, or a person \
+                         wrote it (agents don't replace those). Read the current one with \
+                         project(action=\"brief\") before editing."
                     ))),
                     Err(error) => Err(error),
                 }
@@ -2708,7 +2722,12 @@ impl ToolHandler for ProjectTool {
             )
             .object(
                 "sections",
-                "Brief sections to store (for brief_update): what, stack, entry_points, commands, guardrails. Cite the file each fact comes from.",
+                "Brief sections to store (for brief_update): {\"what\": {\"text\", \"evidence\"}, \"stack\" / \"entry_points\" / \"guardrails\": [{\"text\", \"evidence\"}], \"commands\": [{\"kind\": \"build|test|run|lint\", \"command\", \"evidence\"}]}. evidence is the file each fact comes from; copy facts, no instructions or opinions.",
+                false,
+            )
+            .uuid(
+                "claim_id",
+                "Claim id from init's brief notice (for brief_update), if one was given",
                 false,
             )
             // Files fields

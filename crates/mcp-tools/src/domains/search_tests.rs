@@ -4224,6 +4224,78 @@ mod auto_mode_tests {
         assert!(hint.indicates_ready);
     }
 
+    fn trust_indexed(hours_ago: i64) -> Option<SearchIndexTrustEnvelope> {
+        Some(SearchIndexTrustEnvelope {
+            indexed_at: Some(
+                (chrono::Utc::now() - chrono::Duration::hours(hours_ago)).to_rfc3339(),
+            ),
+            ..SearchIndexTrustEnvelope::default()
+        })
+    }
+
+    #[test]
+    fn test_extract_api_index_hint_falls_back_to_trust_envelope_timestamp() {
+        // A ready index whose rows carry no ingest time used to read as
+        // "recent" even when the trust envelope said it was 42 hours old.
+        let response = SearchResponse {
+            project_index_state: Some("ready".to_string()),
+            index_generation: Some(13657),
+            index_trust: trust_indexed(42),
+            ..SearchResponse::default()
+        };
+        let hint = extract_api_index_hint(&response, Some("/repo"), None).unwrap();
+        assert_eq!(hint.freshness, "aging");
+        assert_eq!(hint.confidence, "high");
+        assert!(
+            matches!(hint.age_hours, Some(41..=42)),
+            "{:?}",
+            hint.age_hours
+        );
+        assert!(hint.indexed_at.is_some());
+
+        let health = build_index_health(
+            Some("/repo"),
+            Some(uuid::Uuid::nil()),
+            None,
+            None,
+            Some(hint),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(health.freshness, "aging");
+        assert!(health.indexed_at.is_some());
+    }
+
+    #[test]
+    fn test_extract_api_index_hint_prefers_result_ingest_time_over_trust() {
+        let response = SearchResponse {
+            project_index_state: Some("ready".to_string()),
+            ingested_at_max: Some((chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339()),
+            index_trust: trust_indexed(100),
+            ..SearchResponse::default()
+        };
+        let hint = extract_api_index_hint(&response, Some("/repo"), None).unwrap();
+        assert_eq!(hint.freshness, "recent");
+        assert!(
+            matches!(hint.age_hours, Some(1..=2)),
+            "{:?}",
+            hint.age_hours
+        );
+    }
+
+    #[test]
+    fn test_extract_api_index_hint_skips_unparseable_ingest_time() {
+        let response = SearchResponse {
+            project_index_state: Some("ready".to_string()),
+            ingested_at_max: Some("not-a-timestamp".to_string()),
+            index_trust: trust_indexed(100),
+            ..SearchResponse::default()
+        };
+        let hint = extract_api_index_hint(&response, Some("/repo"), None).unwrap();
+        assert_eq!(hint.freshness, "stale");
+        assert!(hint.recommendation.is_some());
+    }
+
     #[test]
     fn test_build_index_health_uses_api_hint_when_local_missing() {
         let response = SearchResponse {

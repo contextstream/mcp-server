@@ -4010,11 +4010,21 @@ fn extract_api_index_hint(
     folder_path: Option<&str>,
     local_probe: Option<&LocalPathProbe>,
 ) -> Option<ApiIndexHint> {
-    let indexed_at = result
-        .ingested_at_max
-        .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc));
+    // Prefer the newest ingest time among the results. When the rows carry
+    // none (e.g. a canonical index built on another machine), fall back to
+    // the committed-index time in the trust envelope, so an index that is
+    // days old is not reported as recent just because its rows are unstamped.
+    let indexed_at = [
+        result.ingested_at_max.as_deref(),
+        result
+            .index_trust
+            .as_ref()
+            .and_then(|trust| trust.indexed_at.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+    .map(|dt| dt.with_timezone(&chrono::Utc));
     let age_hours = indexed_at.map(|ts| chrono::Utc::now().signed_duration_since(ts).num_hours());
     let state = result
         .project_index_state

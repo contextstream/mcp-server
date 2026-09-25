@@ -4608,12 +4608,27 @@ impl ContextStreamClient {
     /// authorized by stale process-local ownership data.
     pub async fn get_project_fresh(&self, id: Uuid) -> Result<Project> {
         let result: Project = self.get(&format!("/projects/{}", id)).await?;
+        self.cache_fresh_project(id, &result);
+        Ok(result)
+    }
+
+    /// Single-attempt [`Self::get_project_fresh`]: no status retry and no
+    /// session-refresh replay, so it has no side effects beyond the read and
+    /// the same cache fill on success. For speculative lookups issued ahead
+    /// of need, whose callers answer any failure by running the regular
+    /// lookup at the original point.
+    pub async fn get_project_fresh_once(&self, id: Uuid) -> Result<Project> {
+        let result: Project = self.get_once(&format!("/projects/{}", id)).await?;
+        self.cache_fresh_project(id, &result);
+        Ok(result)
+    }
+
+    fn cache_fresh_project(&self, id: Uuid, project: &Project) {
         let cache_key =
             current_client_cache_identity().map(|caller| Self::project_cache_key(&caller, id));
-        if let Ok(value) = serde_json::to_value(&result) {
+        if let Ok(value) = serde_json::to_value(project) {
             self.cache_response(cache_key, value, ttl::PROJECT);
         }
-        Ok(result)
     }
 
     async fn require_fresh_project_workspace(
@@ -20348,6 +20363,40 @@ mod tests {
         assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 0);
         let requests = server.await.expect("answer server task");
         assert_eq!(requests.len(), 1, "Answer must not replay after a 403");
+    }
+
+    #[tokio::test]
+    async fn speculative_project_lookup_makes_one_attempt_without_session_refresh() {
+        let (client, server) = client_with_http_sequence(vec![(
+            "403 Forbidden",
+            serde_json::json!({
+                "error": {"code": "forbidden", "message": "project not accessible"}
+            })
+            .to_string(),
+        )])
+        .await;
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refreshes_for_hook = Arc::clone(&refreshes);
+        client
+            .set_session_refresh_hook(Arc::new(move || {
+                let refreshes = Arc::clone(&refreshes_for_hook);
+                Box::pin(async move {
+                    refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    true
+                })
+            }))
+            .await;
+
+        let result = client.get_project_fresh_once(Uuid::from_u128(7)).await;
+
+        assert!(matches!(result, Err(Error::Http { status: 403, .. })));
+        assert_eq!(
+            refreshes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a speculative lookup must never trigger a session refresh"
+        );
+        let requests = server.await.expect("project server task");
+        assert_eq!(requests.len(), 1, "a speculative lookup must not retry");
     }
 
     #[tokio::test]

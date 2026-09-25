@@ -3,8 +3,10 @@
 //! The byte proxy remains the default guard. Shadow mode measures the exact
 //! serialized response, while enforce mode switches only a deterministic
 //! canary of registry-verified `o200k_base` requests to exact accounting.
-//! Vocabulary initialization is startup-only: request paths fail closed to the
-//! proxy if the singleton was not warmed.
+//! Vocabulary initialization never happens on a request path: transports warm
+//! it outside requests, and only when [`exact_tokenizer_required`] (the default
+//! proxy mode never consults it). Request paths fail closed to the proxy if
+//! the singleton was not warmed.
 
 use mcp_types::tool::{as_structured_object, structured_content_enabled, ContentItem, ToolResult};
 use metrics::{counter, histogram};
@@ -300,6 +302,18 @@ pub fn warm_o200k() -> Duration {
 
 pub fn o200k_is_warm() -> bool {
     O200K.get().is_some()
+}
+
+/// Whether the configured rollout can ever consult the pinned vocabulary.
+///
+/// Proxy mode (the default) never measures or enforces exact counts for any
+/// request, so warming the vocabulary there would only add startup latency.
+pub fn exact_tokenizer_required() -> bool {
+    exact_tokenizer_required_for(rollout_config().mode)
+}
+
+const fn exact_tokenizer_required_for(mode: RolloutMode) -> bool {
+    !matches!(mode, RolloutMode::Proxy)
 }
 
 pub fn byte_proxy_tokens(bytes: &[u8]) -> usize {
@@ -954,6 +968,31 @@ mod tests {
         assert!(!body.measure_exact);
         assert!(!body.enforce_exact);
         assert!(!body.canary_selected);
+    }
+
+    #[test]
+    fn only_non_proxy_modes_require_the_exact_tokenizer() {
+        // Startup skips the vocabulary warm in proxy mode. That is only sound
+        // because a proxy decision never measures or enforces exact counts,
+        // whatever the tokenizer hint, canary share, or cohort key.
+        assert!(!exact_tokenizer_required_for(RolloutMode::Proxy));
+        assert!(exact_tokenizer_required_for(RolloutMode::Shadow));
+        assert!(exact_tokenizer_required_for(RolloutMode::Enforce));
+        for canary_basis_points in [0, 5_000, 10_000] {
+            let config = RolloutConfig {
+                mode: RolloutMode::Proxy,
+                canary_basis_points,
+            };
+            for hint in [None, Some("o200k_base"), Some("o200k"), Some("claude")] {
+                for key in ["key", "stable", ""] {
+                    let decision = rollout_decision_with_config(hint, key, config);
+                    assert!(!decision.measure_exact);
+                    assert!(!decision.enforce_exact);
+                    assert!(!decision.canary_selected);
+                    assert_eq!(decision.budget_basis(), "serialized_wire_proxy");
+                }
+            }
+        }
     }
 
     #[test]

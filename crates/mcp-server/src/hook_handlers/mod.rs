@@ -395,8 +395,9 @@ pub async fn dispatch_hook(name: &str) -> Result<()> {
         "pre-compact" => pre_compact::handle().await,
         "post-compact" => post_compact::handle().await,
         "on-save-intent" => on_save_intent::handle().await,
-        // Additional lifecycle hooks currently used for observability and
-        // compatibility with newer editor hook surfaces.
+        // Lifecycle events earlier versions installed with no-op handlers.
+        // `update-hooks` no longer installs them (and removes the managed
+        // entries), but configs that still list them must keep working.
         "config-change" | "cwd-changed" | "file-changed" | "worktree-create"
         | "worktree-remove" | "elicitation" | "elicitation-result" => handle_legacy_noop_hook(),
         // Backward compatibility for legacy hook names still present in

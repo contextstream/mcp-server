@@ -1253,13 +1253,44 @@ pub(crate) async fn validate_project_for_workspace(
     project_id: Uuid,
 ) -> Result<bool> {
     match client.get_project_fresh(project_id).await {
-        Ok(project) => Ok(match (workspace_id, project.workspace_id) {
-            (Some(expected), Some(actual)) => expected == actual,
-            (Some(_), None) => false,
-            (None, _) => true,
-        }),
+        Ok(project) => Ok(project_belongs_to_workspace(&project, workspace_id)),
         Err(err) if is_not_found_error(&err) => Ok(false),
         Err(err) => Err(err),
+    }
+}
+
+fn project_belongs_to_workspace(project: &Project, workspace_id: Option<Uuid>) -> bool {
+    match (workspace_id, project.workspace_id) {
+        (Some(expected), Some(actual)) => expected == actual,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+/// Drive `primary` to completion while also making progress on `secondary`.
+///
+/// Returns the primary output, plus the secondary output when it finished
+/// first. An unfinished `secondary` is left untouched for the caller to await
+/// or drop; one that finished must not be polled again. Both run on the
+/// calling task, so task-local caller identity and auth scope apply to both.
+async fn drive_alongside<P, S>(
+    primary: P,
+    mut secondary: std::pin::Pin<&mut S>,
+) -> (P::Output, Option<S::Output>)
+where
+    P: std::future::Future,
+    S: std::future::Future,
+{
+    tokio::pin!(primary);
+    let mut secondary_output = None;
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut primary => return (output, secondary_output),
+            output = secondary.as_mut(), if secondary_output.is_none() => {
+                secondary_output = Some(output);
+            }
+        }
     }
 }
 
@@ -2378,8 +2409,31 @@ impl ToolHandler for InitTool {
             }
         }
 
+        // The workspace lookup and the project ownership check below are
+        // independent reads, so when both ids are known the project is fetched
+        // while the workspace lookup is in flight. The prefetch is a single
+        // attempt (no retry, no session-refresh replay) and only its success
+        // is used, and only if the ownership check still runs for that
+        // project. Otherwise the check performs exactly the sequential lookup,
+        // so errors, retries, and scope repair are unchanged. A prefetch the
+        // check no longer needs is dropped (cancelled) right after this step.
+        let project_prefetch_id = workspace_id.and(project_id);
+        let mut project_prefetch = Box::pin(async {
+            match project_prefetch_id {
+                Some(id) => self.client.get_project_fresh_once(id).await.ok(),
+                None => None,
+            }
+        });
+        let mut prefetched_project: Option<Option<Project>> = None;
+
         if let Some(candidate_workspace_id) = workspace_id {
-            match self.client.get_workspace(candidate_workspace_id).await {
+            let (workspace_lookup, prefetched) = drive_alongside(
+                self.client.get_workspace(candidate_workspace_id),
+                project_prefetch.as_mut(),
+            )
+            .await;
+            prefetched_project = prefetched;
+            match workspace_lookup {
                 Ok(workspace) => {
                     if local_workspace_name.is_none() {
                         local_workspace_name = Some(workspace.name);
@@ -2405,9 +2459,21 @@ impl ToolHandler for InitTool {
         }
 
         if let Some(candidate_project_id) = project_id {
-            let valid_for_workspace =
-                validate_project_for_workspace(&self.client, workspace_id, candidate_project_id)
-                    .await?;
+            let prefetched = if project_prefetch_id == Some(candidate_project_id) {
+                match prefetched_project.take() {
+                    Some(prefetched) => prefetched,
+                    None => project_prefetch.as_mut().await,
+                }
+            } else {
+                None
+            };
+            let valid_for_workspace = match prefetched {
+                Some(project) => project_belongs_to_workspace(&project, workspace_id),
+                None => {
+                    validate_project_for_workspace(&self.client, workspace_id, candidate_project_id)
+                        .await?
+                }
+            };
             if !valid_for_workspace {
                 scope_repair_note = Some(format!(
                     "Local folder mapping project_id {} was stale; resolved current project from workspace data.",
@@ -2438,6 +2504,7 @@ impl ToolHandler for InitTool {
                 }
             }
         }
+        drop(project_prefetch);
 
         tracing::debug!(
             target: "init_diag",
@@ -2823,7 +2890,23 @@ impl ToolHandler for InitTool {
             }
         }
 
-        let local_delta = local_delta_summary(folder_path_owned.as_deref()).await;
+        // The local git scan and the account surfaces are independent of each
+        // other and of everything between here and where the account block is
+        // appended below: the scan reads only the working tree and local index
+        // metadata, the surfaces read account/team state that nothing in
+        // between reads or writes, and neither can return early. Running them
+        // together takes the scan (up to ~1.2s) off the account lookups'
+        // critical path without changing either result or the text order.
+        let (local_delta, account_block) = tokio::join!(
+            local_delta_summary(folder_path_owned.as_deref()),
+            build_account_mode_surfaces(
+                &self.client,
+                self.session.as_ref(),
+                input.account_mode.as_deref(),
+                input.context_hint.as_deref(),
+                concise_text,
+            ),
+        );
 
         // Auto-index: trigger background ingest when index is missing, aging, stale,
         // or the local worktree has changes newer than the last local ingest.
@@ -3168,14 +3251,6 @@ impl ToolHandler for InitTool {
             );
         }
 
-        let account_block = build_account_mode_surfaces(
-            &self.client,
-            self.session.as_ref(),
-            input.account_mode.as_deref(),
-            input.context_hint.as_deref(),
-            concise_text,
-        )
-        .await;
         if !account_block.is_empty() {
             text.push_str("\n\n");
             text.push_str(&account_block);

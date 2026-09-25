@@ -18,13 +18,15 @@
 //!   marker embedded into every `<contextstream>` block so the binary can
 //!   later read which canonical teaching bundle wrote the file.
 //!
-//! Producers (`mcp-server`) call [`set_canonical_rules_hash`] at startup
-//! with a deterministic fingerprint covering every supported editor's
-//! bundled teaching surfaces. Consumers (`mcp-client`, `mcp-tools`) read it
-//! via [`canonical_rules_hash`] to send up to the server and compare against
-//! locally-installed files. A single bundle fingerprint is intentional:
-//! editor formatting and workspace identity must not make a just-written
-//! file disagree with the process-global staleness check.
+//! Producers (`mcp-server`) register [`set_canonical_rules_hash_provider`]
+//! at startup: a deterministic fingerprint covering every supported editor's
+//! bundled teaching surfaces, computed on first read rather than on every
+//! process start (short-lived `hook` processes never read it). Consumers
+//! (`mcp-client`, `mcp-tools`) read it via [`canonical_rules_hash`] to send
+//! up to the server and compare against locally-installed files. A single
+//! bundle fingerprint is intentional: editor formatting and workspace
+//! identity must not make a just-written file disagree with the
+//! process-global staleness check.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -140,6 +142,7 @@ pub fn strip_hash_marker(text: &str) -> String {
 }
 
 static CANONICAL_RULES_HASH: OnceLock<String> = OnceLock::new();
+static CANONICAL_RULES_HASH_PROVIDER: OnceLock<fn() -> String> = OnceLock::new();
 
 /// Record the canonical teaching-bundle fingerprint this binary would
 /// produce. Idempotent — first call wins; subsequent calls are no-ops.
@@ -149,12 +152,28 @@ pub fn set_canonical_rules_hash(hash: impl Into<String>) {
     let _ = CANONICAL_RULES_HASH.set(hash.into());
 }
 
+/// Register the producer of the canonical teaching-bundle fingerprint
+/// without computing it. The provider runs at most once, on the first
+/// [`canonical_rules_hash`] read, and its value is then fixed for the life
+/// of the process exactly as if it had been passed to
+/// [`set_canonical_rules_hash`] at startup. Idempotent — first registration
+/// wins. The provider must be deterministic and must not itself read
+/// [`canonical_rules_hash`].
+pub fn set_canonical_rules_hash_provider(provider: fn() -> String) {
+    let _ = CANONICAL_RULES_HASH_PROVIDER.set(provider);
+}
+
 /// Read back the canonical rules hash recorded by
-/// [`set_canonical_rules_hash`], if any. Returns `None` before the
+/// [`set_canonical_rules_hash`] or produced by the provider registered with
+/// [`set_canonical_rules_hash_provider`], if any. Returns `None` before the
 /// startup hook has run (e.g. in unit tests that exercise types
 /// without bringing up the server).
 pub fn canonical_rules_hash() -> Option<&'static str> {
-    CANONICAL_RULES_HASH.get().map(String::as_str)
+    if let Some(hash) = CANONICAL_RULES_HASH.get() {
+        return Some(hash.as_str());
+    }
+    let provider = *CANONICAL_RULES_HASH_PROVIDER.get()?;
+    Some(CANONICAL_RULES_HASH.get_or_init(provider).as_str())
 }
 
 /// Scan `project_root` for the first known rules file that carries an

@@ -536,8 +536,11 @@ pub async fn run_http_server(
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> anyhow::Result<()> {
     // Warm before router construction/listener binding so no request can pay
-    // vocabulary initialization latency.
-    mcp_tools::wire_tokens::warm_o200k();
+    // vocabulary initialization latency. Proxy mode (the default) never
+    // consults the vocabulary, so it skips the load entirely.
+    if mcp_tools::wire_tokens::exact_tokenizer_required() {
+        mcp_tools::wire_tokens::warm_o200k();
+    }
 
     let state = HttpState {
         registry,

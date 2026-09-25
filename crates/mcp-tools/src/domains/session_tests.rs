@@ -6034,3 +6034,75 @@ mod typed_item_formatting_tests {
         assert_ne!(user_facing, other_query);
     }
 }
+
+// ============================================================================
+// Init prefetch Tests
+// ============================================================================
+
+mod init_prefetch_tests {
+    use super::{drive_alongside, project_belongs_to_workspace};
+    use mcp_types::api::Project;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn drive_alongside_keeps_a_secondary_that_finished_first() {
+        let mut secondary = Box::pin(async { "project" });
+        let (primary, secondary_output) = drive_alongside(
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                "workspace"
+            },
+            secondary.as_mut(),
+        )
+        .await;
+        assert_eq!(primary, "workspace");
+        assert_eq!(secondary_output, Some("project"));
+    }
+
+    #[tokio::test]
+    async fn drive_alongside_leaves_an_unfinished_secondary_for_the_caller() {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let mut secondary = Box::pin(async move {
+            released.await.expect("release");
+            "project"
+        });
+        let (primary, secondary_output) =
+            drive_alongside(async { "workspace" }, secondary.as_mut()).await;
+        assert_eq!(primary, "workspace");
+        assert_eq!(secondary_output, None);
+        // The caller can still finish (or drop) the in-flight secondary.
+        release.send(()).expect("send");
+        assert_eq!(secondary.as_mut().await, "project");
+    }
+
+    #[test]
+    fn project_ownership_check_is_unchanged() {
+        let workspace = Uuid::from_u128(1);
+        let project = |workspace_id: Option<Uuid>| -> Project {
+            serde_json::from_value(serde_json::json!({
+                "id": Uuid::from_u128(2),
+                "name": "ledger",
+                "workspace_id": workspace_id,
+            }))
+            .expect("project")
+        };
+        assert!(project_belongs_to_workspace(
+            &project(Some(workspace)),
+            Some(workspace)
+        ));
+        assert!(!project_belongs_to_workspace(
+            &project(Some(Uuid::from_u128(3))),
+            Some(workspace)
+        ));
+        assert!(!project_belongs_to_workspace(
+            &project(None),
+            Some(workspace)
+        ));
+        assert!(project_belongs_to_workspace(&project(None), None));
+        assert!(project_belongs_to_workspace(
+            &project(Some(workspace)),
+            None
+        ));
+    }
+}

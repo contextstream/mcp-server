@@ -118,7 +118,11 @@ impl ToolHandler for AnswerTool {
             }
             "query" | "recent_changes" => {
                 let request = build_request(input)?;
-                let response = self.client.answer_query(request).await?;
+                let response = self
+                    .client
+                    .answer_query(request)
+                    .await
+                    .map_err(explain_unanswerable_request)?;
                 let text = format_response(&response);
                 let structured = serde_json::to_value(&response).unwrap_or_default();
                 Ok(ToolResult::with_structured(text, structured))
@@ -615,6 +619,41 @@ fn format_feedback_response(response: &AnswerFeedbackResponseV1) -> String {
     )
 }
 
+/// Appended when the Answer API refuses a request for reasons a retry cannot
+/// fix, so agents fall back instead of re-sending it.
+const ANSWER_FALLBACK_HINT: &str = "The Answer API cannot serve this request right now; do not \
+     retry it unchanged. Use search for code and files, and session(action=\"recall\") or \
+     memory(action=\"search\") for saved decisions and history.";
+
+/// The Answer API rejects every default request with a bare scope error
+/// (issue #110), and narrower requests with lane or authority errors. Keep
+/// the server's status and wording, and add what the caller can do instead.
+fn explain_unanswerable_request(error: Error) -> Error {
+    match error {
+        Error::Http {
+            status,
+            message,
+            code,
+            source,
+        } if is_unanswerable_request(status, &message) => Error::Http {
+            status,
+            message: format!("{message}. {ANSWER_FALLBACK_HINT}"),
+            code,
+            source,
+        },
+        other => other,
+    }
+}
+
+fn is_unanswerable_request(status: u16, message: &str) -> bool {
+    match status {
+        403 => message.contains("requested scope is not authorized"),
+        409 => message.contains("Answer authority changed"),
+        422 => message.contains("Answer execution lane"),
+        _ => false,
+    }
+}
+
 pub fn register_answer_tools(
     registry: &mut crate::registry::ToolRegistry,
     client: ContextStreamClient,
@@ -629,6 +668,39 @@ mod tests {
 
     fn tool() -> AnswerTool {
         AnswerTool::new(ContextStreamClient::new(TestFixtures::test_config()))
+    }
+
+    #[test]
+    fn unanswerable_request_errors_keep_status_and_add_a_fallback() {
+        for (status, message) in [
+            (
+                403,
+                "Forbidden: requested scope is not authorized or unavailable",
+            ),
+            (409, "Answer authority changed during execution"),
+            (
+                422,
+                "The resolved scope is not supported by the active Answer execution lane",
+            ),
+        ] {
+            let error = explain_unanswerable_request(Error::http(status, message));
+            let text = error.to_string();
+            assert!(
+                text.starts_with(&format!("HTTP error ({status}): {message}")),
+                "{text}"
+            );
+            assert!(text.contains("do not retry it unchanged"), "{text}");
+            assert!(text.contains("search"), "{text}");
+        }
+
+        for error in [
+            Error::http(403, "Forbidden: plan does not include this feature"),
+            Error::http(500, "Answer execution lane crashed"),
+            Error::Validation("question is required".to_owned()),
+        ] {
+            let before = error.to_string();
+            assert_eq!(explain_unanswerable_request(error).to_string(), before);
+        }
     }
 
     #[test]

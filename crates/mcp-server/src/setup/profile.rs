@@ -744,7 +744,7 @@ async fn resolve_profile_workspace(
         }));
     }
 
-    super::resolve_workspace_noninteractive(client, workspace_lookup_path)
+    super::resolve_workspace_noninteractive(client, workspace_lookup_path, None)
         .await
         .context("resolving a workspace for profile setup")
 }

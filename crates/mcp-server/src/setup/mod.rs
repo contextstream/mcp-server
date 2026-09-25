@@ -2522,18 +2522,20 @@ pub async fn run_setup_wizard_with_editors(
     non_interactive: bool,
     only: Option<&[editors::Editor]>,
 ) -> Result<()> {
-    run_setup_wizard_with_options(non_interactive, only, None, false).await
+    run_setup_wizard_with_options(non_interactive, only, None, false, None).await
 }
 
-/// Setup wizard with explicit project/account-only scope.
+/// Setup wizard with explicit project/account-only scope. `workspace_id`
+/// only applies to the non-interactive path, where nothing can prompt.
 pub async fn run_setup_wizard_with_options(
     non_interactive: bool,
     only: Option<&[editors::Editor]>,
     project_path: Option<&Path>,
     account_only: bool,
+    workspace_id: Option<&str>,
 ) -> Result<()> {
     if non_interactive {
-        run_setup_noninteractive(only, project_path, account_only).await
+        run_setup_noninteractive(only, project_path, account_only, workspace_id).await
     } else {
         run_setup_interactive(only, project_path, account_only).await
     }
@@ -2547,6 +2549,7 @@ async fn run_setup_noninteractive(
     only: Option<&[editors::Editor]>,
     explicit_project_path: Option<&Path>,
     account_only: bool,
+    explicit_workspace_id: Option<&str>,
 ) -> Result<()> {
     print_welcome_banner();
     print_data_collection_disclosure(true);
@@ -2557,8 +2560,9 @@ async fn run_setup_noninteractive(
 
     let api_key = get_api_key_result()?.ok_or_else(|| {
         anyhow::anyhow!(
-            "--yes requires saved credentials. Run `contextstream-mcp setup` interactively once, \
-                 or save a key with `contextstream-mcp configure`."
+            "--yes requires an API key. Set CONTEXTSTREAM_API_KEY, save one with \
+             `contextstream-mcp configure --api-key-stdin`, or run `contextstream-mcp setup` \
+             interactively once."
         )
     })?;
 
@@ -2637,7 +2641,9 @@ async fn run_setup_noninteractive(
     // runs must not silently fall back to a different transport.
     write_setup_transport_marker(transport_preference)?;
     let workspace_lookup_path = project_path.as_deref().unwrap_or(cwd.as_path());
-    let workspace = resolve_workspace_noninteractive(&client, workspace_lookup_path).await?;
+    let workspace =
+        resolve_workspace_noninteractive(&client, workspace_lookup_path, explicit_workspace_id)
+            .await?;
     let selected_project = if let Some(project_path) = project_path.as_deref() {
         select_project_for_current_directory(
             &client,
@@ -2757,14 +2763,24 @@ async fn run_setup_noninteractive(
     Ok(())
 }
 
-/// Resolve the workspace for `--yes` without prompting: the folder's existing
-/// link wins, then a single account workspace, then auto-create the default.
-/// Multiple workspaces with no folder link is ambiguous — fail with guidance
-/// rather than silently picking one.
+/// Resolve the workspace for `--yes` without prompting: an explicit
+/// `--workspace-id` wins, then the folder's existing link, then the
+/// `CONTEXTSTREAM_WORKSPACE_ID` default, then a single account workspace, then
+/// auto-create the default. The environment default ranks below the folder
+/// link so an ambient variable can never silently relink a folder. Multiple
+/// workspaces with none of those is ambiguous — fail with the choices rather
+/// than silently picking one.
 async fn resolve_workspace_noninteractive(
     client: &ContextStreamClient,
     cwd: &std::path::Path,
+    explicit_workspace_id: Option<&str>,
 ) -> Result<Option<WorkspaceInfo>> {
+    if let Some(id) = explicit_workspace_id {
+        return resolve_requested_workspace(client, id, "--workspace-id")
+            .await
+            .map(Some);
+    }
+
     let previous = read_project_config(cwd)?;
     let workspaces = client.list_workspaces(None, None).await?;
 
@@ -2775,6 +2791,15 @@ async fn resolve_workspace_noninteractive(
                 name: ws.name.clone(),
             }));
         }
+    }
+
+    if let Some(id) = std::env::var(WORKSPACE_ID_ENV)
+        .ok()
+        .filter(|id| !id.trim().is_empty())
+    {
+        return resolve_requested_workspace(client, &id, WORKSPACE_ID_ENV)
+            .await
+            .map(Some);
     }
 
     match workspaces.len() {
@@ -2800,13 +2825,60 @@ async fn resolve_workspace_noninteractive(
             id: workspaces[0].id.to_string(),
             name: workspaces[0].name.clone(),
         })),
-        n => Err(anyhow::anyhow!(
-            "--yes needs an unambiguous workspace, but your account has {}. Run \
-             `contextstream-mcp setup` interactively once from this folder to link it; \
-             later --yes runs will reuse that link.",
-            n
-        )),
+        _ => Err(anyhow::anyhow!(ambiguous_workspace_message(
+            workspaces
+                .iter()
+                .map(|w| (w.id.to_string(), w.name.as_str()))
+        ))),
     }
+}
+
+const WORKSPACE_ID_ENV: &str = "CONTEXTSTREAM_WORKSPACE_ID";
+
+/// Validate a caller-named workspace against the account instead of trusting
+/// it: a typo or a workspace the key cannot reach must fail before any editor
+/// config embeds it.
+async fn resolve_requested_workspace(
+    client: &ContextStreamClient,
+    id: &str,
+    source: &str,
+) -> Result<WorkspaceInfo> {
+    let id = id.trim();
+    let workspace_id = uuid::Uuid::parse_str(id)
+        .map_err(|_| anyhow::anyhow!("{source} must be a workspace UUID, got {id:?}."))?;
+    let workspace = client.get_workspace(workspace_id).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Workspace {workspace_id} (from {source}) is not available to this account: {e}"
+        )
+    })?;
+    println!(
+        "{} Using workspace {} (from {})",
+        CHECK,
+        style(&workspace.name).cyan(),
+        source
+    );
+    Ok(WorkspaceInfo {
+        id: workspace.id.to_string(),
+        name: workspace.name,
+    })
+}
+
+fn ambiguous_workspace_message<'a>(
+    workspaces: impl ExactSizeIterator<Item = (String, &'a str)>,
+) -> String {
+    let mut message = format!(
+        "--yes needs an unambiguous workspace, but your account has {}:\n",
+        workspaces.len()
+    );
+    for (id, name) in workspaces {
+        message.push_str(&format!("  {id}  {name}\n"));
+    }
+    message.push_str(&format!(
+        "Re-run with --workspace-id <UUID> (or set {WORKSPACE_ID_ENV}), or run \
+         `contextstream-mcp setup` interactively once from this folder to link it; \
+         later --yes runs will reuse that link."
+    ));
+    message
 }
 
 async fn run_setup_interactive(
@@ -5545,9 +5617,9 @@ fn parse_setup_ingest_job_progress(
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_checkout_root, classify_project_workspace, data_collection_disclosure,
-        editor_needs_managed_helper, format_index_completion_message, format_setup_step_progress,
-        linked_project_name_matches_checkout, local_mcp_allowed,
+        ambiguous_workspace_message, canonical_checkout_root, classify_project_workspace,
+        data_collection_disclosure, editor_needs_managed_helper, format_index_completion_message,
+        format_setup_step_progress, linked_project_name_matches_checkout, local_mcp_allowed,
         local_mcp_override_allowed_from_env_value, no_target_editors_message,
         parse_setup_ingest_job_progress, parse_setup_transport_preference,
         project_workspace_is_verified, read_setup_transport_marker,
@@ -5565,6 +5637,33 @@ mod tests {
 
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `setup --yes` on a multi-workspace account must say how to choose one
+    /// non-interactively (issue #106), not only point at the interactive wizard.
+    #[test]
+    fn ambiguous_workspace_message_lists_choices_and_the_non_interactive_selectors() {
+        let message = ambiguous_workspace_message(
+            [
+                (
+                    "11111111-1111-1111-1111-111111111111".to_string(),
+                    "Personal",
+                ),
+                ("22222222-2222-2222-2222-222222222222".to_string(), "Team"),
+            ]
+            .into_iter(),
+        );
+        assert!(message.contains("your account has 2:"), "{message}");
+        assert!(
+            message.contains("11111111-1111-1111-1111-111111111111  Personal"),
+            "{message}"
+        );
+        assert!(
+            message.contains("22222222-2222-2222-2222-222222222222  Team"),
+            "{message}"
+        );
+        assert!(message.contains("--workspace-id <UUID>"), "{message}");
+        assert!(message.contains("CONTEXTSTREAM_WORKSPACE_ID"), "{message}");
     }
 
     #[test]

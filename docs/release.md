@@ -16,7 +16,12 @@ after the immutable artifacts verify byte-for-byte.
 Protect `main` and the `v*` tag namespace. Require CI, CodeQL, DCO, review, and
 conversation resolution on `main`; do not allow force pushes or tag deletion.
 Release tags are annotated and must point to a commit already reachable from
-the protected `main` branch.
+the protected `main` branch. The repository owner `escott-` is exempt from
+waiting on another approver: configure the `main` protection so `escott-` can
+bypass required pull request reviews (all other contributors keep the review
+requirement). Because `contextstream` is an organization, express the bypass
+either through the branch ruleset bypass list (via a team or role containing
+only `escott-`) or the classic branch-protection equivalent.
 
 For the initial Rust replacement, preserve the existing TypeScript line in this
 same repository. Before merging the replacement commit, publish and protect
@@ -26,7 +31,13 @@ delete existing tags/releases, or force-push `main`; the Rust tree lands as a
 normal descendant commit.
 
 Create a protected GitHub environment named `public-release` with required
-maintainer reviewers and no self-approval. Configure these environment values:
+maintainer reviewers and no self-approval. Create a companion environment named
+`public-release-owner` with no required reviewers and no wait timer; the
+release workflow selects it only when the release tag was pushed by the
+repository owner `escott-`, so every other actor still waits on
+`public-release` reviewer approval. Both environments must hold identical
+copies of the values below — the evidence secrets stay hard gates on every
+release regardless of which environment served it:
 
 - secret `PRIVACY_LEGAL_APPROVAL_EVIDENCE` — reference to the approval record;
 - secret `INITIAL_RELEASE_KEY_ROTATION_EVIDENCE` — required specifically for
@@ -42,9 +53,11 @@ runner and intentionally has no npm token. Once trusted publishing is tested,
 disallow token publishing for the package and revoke the former automation
 token. MCP Registry publication likewise uses GitHub OIDC.
 
-The `public-release` environment and both evidence secrets are hard gates, not
-places to paste approval prose created by the release run itself. Evidence must
-exist before the annotated 1.0.0 tag is created.
+The release environments and both evidence secrets are hard gates, not places
+to paste approval prose created by the release run itself. Evidence must exist
+before the annotated 1.0.0 tag is created. The owner path removes only the
+human reviewer wait; every checksum, immutability, evidence, and provenance
+check runs identically in both environments.
 
 ## Release sequence
 
@@ -58,7 +71,8 @@ exist before the annotated 1.0.0 tag is created.
    dispatch is validation-only.
 4. The workflow builds six binaries, generates an SBOM and checksums, and
    attests the exact payload.
-5. After environment approval, it publishes immutable R2 bytes, a verified
+5. After environment approval (immediate for tags pushed by `escott-` through
+   `public-release-owner`), it publishes immutable R2 bytes, a verified
    GitHub release, the OIDC-authenticated npm launcher, and dual remote/npm MCP
    Registry metadata. GitHub release finalization happens only after every
    channel succeeds.

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use mcp_client::{
     client::{HotPathHintEntry, HotPathsHint},
-    CheckoutRoutingScope, ContextStreamClient, GraphDependenciesParams, GraphTarget,
+    CheckoutRoutingScope, ContextStreamClient, GraphDependenciesParams, GraphTarget, IngestFailure,
     IngestLocalParams, RequestOptions, SearchParams, TargetedFileDecision,
 };
 use mcp_session::{auto_init::resolve_workspace, SessionManager};
@@ -67,6 +67,8 @@ const SEARCH_CACHE_MAX_ENTRIES_PER_CALLER: usize = 16;
 static SEARCH_RESULT_CACHE: OnceLock<crate::domains::result_cache::ResultCache<(String, Value)>> =
     OnceLock::new();
 static INDEX_SCOPE_WARNINGS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static ACTIVE_INDEX_INGEST_HOLDS: OnceLock<Mutex<HashMap<(Uuid, String), Instant>>> =
+    OnceLock::new();
 
 fn mark_checkout_scope_unconfirmed(mut result: ToolResult) -> ToolResult {
     const NOTE: &str = "[CHECKOUT_SCOPE] Search used canonical project evidence, but the MCP could not derive an exact active-checkout locator. Do not infer that uncommitted worktree changes were included.";
@@ -727,6 +729,12 @@ const DRIFT_BACKGROUND_TOTAL_MAX_FILES: usize = 512;
 const ACTIVE_INDEX_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 const ACTIVE_INDEX_PREFLIGHT_MAX_FILES: usize = 20_000;
 const ACTIVE_INDEX_IN_PROGRESS_GRACE_SECS: i64 = 15;
+/// After the API refuses a search-triggered ingest (403/401), search stops
+/// sending more for that checkout this long; it keeps answering from the
+/// existing index. A 429 holds for its `Retry-After`, capped.
+const ACTIVE_INDEX_REFUSED_HOLD: Duration = Duration::from_secs(10 * 60);
+const ACTIVE_INDEX_RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(120);
+const ACTIVE_INDEX_HOLD_MAX: Duration = Duration::from_secs(30 * 60);
 const HOT_PATH_HINT_LIMIT: usize = 8;
 // v2 intentionally stops treating unvalidated search results as activity.
 // Only live editor/dirty-file evidence may shape this advisory hint.
@@ -5403,6 +5411,9 @@ async fn maybe_repair_active_index_before_search(
         }
     };
 
+    if active_index_ingest_held(project_id, folder_path) {
+        return status;
+    }
     let Some(bound_workspace_id) = validated_checkout_content_workspace(
         client,
         folder_path,
@@ -5535,15 +5546,17 @@ async fn maybe_repair_active_index_before_search(
         Ok(Err(err)) => {
             status.elapsed_ms = Some(started.elapsed().as_millis() as u64);
             status.error = Some(err.to_string());
-            spawn_active_index_background_retry(
-                client.clone(),
-                bound_workspace_id,
-                project_id,
-                folder_path.to_string(),
-                "search_preflight_error",
-                targeted_hints,
-                targeted_all_known,
-            );
+            if !hold_active_index_ingest(project_id, folder_path, &err) {
+                spawn_active_index_background_retry(
+                    client.clone(),
+                    bound_workspace_id,
+                    project_id,
+                    folder_path.to_string(),
+                    "search_preflight_error",
+                    targeted_hints,
+                    targeted_all_known,
+                );
+            }
         }
         Err(_) => {
             status.elapsed_ms = Some(started.elapsed().as_millis() as u64);
@@ -5563,6 +5576,44 @@ async fn maybe_repair_active_index_before_search(
     status
 }
 
+fn active_index_ingest_holds() -> &'static Mutex<HashMap<(Uuid, String), Instant>> {
+    ACTIVE_INDEX_INGEST_HOLDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn active_index_ingest_held(project_id: Uuid, folder_path: &str) -> bool {
+    let mut holds = active_index_ingest_holds()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = (project_id, folder_path.to_string());
+    match holds.get(&key) {
+        Some(until) if *until > Instant::now() => true,
+        Some(_) => {
+            holds.remove(&key);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Hold search-triggered ingest for a checkout after a failure that covers the
+/// whole project. Returns whether a hold was set, in which case the caller
+/// must not retry in the background either.
+fn hold_active_index_ingest(project_id: Uuid, folder_path: &str, error: &Error) -> bool {
+    let wait = match IngestFailure::classify(error) {
+        IngestFailure::Denied | IngestFailure::Unauthorized => ACTIVE_INDEX_REFUSED_HOLD,
+        IngestFailure::RateLimited { retry_after } => retry_after
+            .map(Duration::from_secs)
+            .unwrap_or(ACTIVE_INDEX_RATE_LIMIT_FALLBACK)
+            .min(ACTIVE_INDEX_HOLD_MAX),
+        IngestFailure::Transient => return false,
+    };
+    active_index_ingest_holds()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert((project_id, folder_path.to_string()), Instant::now() + wait);
+    true
+}
+
 fn spawn_active_index_background_retry(
     client: ContextStreamClient,
     workspace_id: Uuid,
@@ -5573,6 +5624,9 @@ fn spawn_active_index_background_retry(
     targeted_all_known: bool,
 ) {
     tokio::spawn(async move {
+        if active_index_ingest_held(project_id, &folder_path) {
+            return;
+        }
         let Some(validated_workspace_id) = validated_checkout_content_workspace(
             &client,
             &folder_path,
@@ -5610,12 +5664,15 @@ fn spawn_active_index_background_retry(
                     ContextStreamClient::write_index_status(&folder_path, project_id);
                 }
                 Ok(Ok(_)) => {}
-                Ok(Err(err)) => tracing::debug!(
-                    error = %err,
-                    path = %folder_path,
-                    origin,
-                    "active index background full repair failed"
-                ),
+                Ok(Err(err)) => {
+                    hold_active_index_ingest(project_id, &folder_path, &err);
+                    tracing::debug!(
+                        error = %err,
+                        path = %folder_path,
+                        origin,
+                        "active index background full repair failed"
+                    )
+                }
                 Err(err) => tracing::debug!(
                     error = %err,
                     path = %folder_path,
@@ -5675,6 +5732,7 @@ fn spawn_active_index_background_retry(
                     complete &= result.committed;
                 }
                 Err(err) => {
+                    hold_active_index_ingest(project_id, &folder_path, &err);
                     tracing::debug!(
                         error = %err,
                         path = %folder_path,

@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use mcp_client::{
-    ContextStreamClient, IngestLocalParams, SyncBridgeCheckoutRegistration, SyncBridgeRefreshClaim,
-    TargetedFileDecision,
+    ContextStreamClient, IngestFailure, IngestLocalParams, SyncBridgeCheckoutRegistration,
+    SyncBridgeRefreshClaim, TargetedFileDecision,
 };
 use mcp_types::config::VERSION;
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,20 @@ const REENUMERATE_INTERVAL: Duration = Duration::from_secs(120);
 
 /// How often the singleton lock's heartbeat timestamp is refreshed.
 const LOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A checkout whose ingest was refused (403: no write access; 401: rejected
+/// credentials) is rechecked after this long, then at the slower ceiling.
+/// A managed reload rechecks at once.
+const INGEST_DENIED_RECHECK: Duration = Duration::from_secs(10 * 60);
+const INGEST_DENIED_RECHECK_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// Pause after a 429 that carried no usable `Retry-After`.
+const INGEST_RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(120);
+
+/// Exponential backoff for timeouts, network errors and 5xx, reset by the
+/// next accepted ingest.
+const INGEST_TRANSIENT_BACKOFF_MIN: Duration = Duration::from_secs(2);
+const INGEST_TRANSIENT_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// Upper bound on the number of files the bulk fallback ingest will consider.
 /// The ingest path's mtime/hash pre-filter means only *changed* files are
@@ -1031,6 +1045,47 @@ struct PendingProject {
     force_full: bool,
 }
 
+/// Why a checkout's ingest is paused, and until when.
+///
+/// Kept beside the pending queue rather than inside `PendingProject`, because
+/// that entry leaves the queue while its flush is in flight. The hold has to
+/// outlive it so every path that re-queues work (edits, job reconciliation,
+/// dirty snapshots, re-enumeration) meets the same gate in
+/// `take_due_watch_projects`. Queued paths and full-scan obligations are kept
+/// while held and flush together once the hold ends.
+#[derive(Debug, Clone, Copy)]
+struct IngestHold {
+    failure: IngestFailure,
+    until: Instant,
+    /// Consecutive failures of this kind, driving the backoff.
+    streak: u32,
+    /// The mapping the failure was seen under; a new mapping is retried at once.
+    workspace_id: Option<Uuid>,
+}
+
+impl IngestHold {
+    fn refused(&self) -> bool {
+        matches!(
+            self.failure,
+            IngestFailure::Denied | IngestFailure::Unauthorized
+        )
+    }
+}
+
+type IngestHolds = Arc<Mutex<HashMap<WatchTargetKey, IngestHold>>>;
+
+/// What one flush attempt did, so the scheduler can tell a request the API
+/// refused from work that simply was not sent yet.
+#[derive(Debug)]
+enum WatchFlushOutcome {
+    /// No ingest request was made; `Some` work waits for the next debounce.
+    NotSent(Option<WatchSubmissionRetry>),
+    /// The API accepted the ingest; `Some` work still needs another pass.
+    Sent(Option<WatchSubmissionRetry>),
+    /// The ingest request failed; the work is retried per `IngestFailure`.
+    Failed(WatchSubmissionRetry, IngestFailure),
+}
+
 /// In-memory scheduling key for one mutable checkout.
 ///
 /// The project UUID alone is deliberately insufficient: one project may have
@@ -1139,7 +1194,7 @@ async fn flush_project(
     target: &WatchTarget,
     changed: HashSet<PathBuf>,
     force_full: bool,
-) -> Option<WatchSubmissionRetry> {
+) -> WatchFlushOutcome {
     if !validate_watch_root(Path::new(&target.folder_path))
         || !watch_target_matches_checkout_config(target)
     {
@@ -1147,9 +1202,11 @@ async fn flush_project(
             "watch: skipped {} because its root, checkout binding, or API ownership is not current",
             target.folder_path
         );
-        return None;
+        return WatchFlushOutcome::NotSent(None);
     }
-    let workspace_id = target.workspace_id?;
+    let Some(workspace_id) = target.workspace_id else {
+        return WatchFlushOutcome::NotSent(None);
+    };
     let initial_snapshot = dirty_drain::snapshot_watch_dirty(&target.folder_path);
     let mode = watch_submission_mode(force_full, initial_snapshot.force_full, changed.len());
     let retry = || WatchSubmissionRetry {
@@ -1168,7 +1225,7 @@ async fn flush_project(
         target.project_id,
         workspace_id,
     ) {
-        return Some(retry());
+        return WatchFlushOutcome::NotSent(Some(retry()));
     }
 
     // A full scan owns a durable epoch even when overflow/error recovery has
@@ -1202,7 +1259,7 @@ async fn flush_project(
             project_id = %target.project_id,
             "watch: durable path-version snapshot unavailable; deferring submission"
         );
-        return Some(retry());
+        return WatchFlushOutcome::NotSent(Some(retry()));
     }
 
     let checkout_guard = match ContextStreamClient::checkout_guard_for_scope(
@@ -1217,7 +1274,7 @@ async fn flush_project(
                 %error,
                 "watch: could not bind submission to the current checkout; deferring"
             );
-            return Some(retry());
+            return WatchFlushOutcome::NotSent(Some(retry()));
         }
     };
     let Some(reservation) = dirty_drain::reserve_pending_submission(
@@ -1231,7 +1288,7 @@ async fn flush_project(
         checkout_guard.as_deref(),
         mode == PendingSubmissionMode::Targeted,
     ) else {
-        return Some(retry());
+        return WatchFlushOutcome::NotSent(Some(retry()));
     };
 
     if mode == PendingSubmissionMode::Full {
@@ -1282,7 +1339,7 @@ async fn flush_project_full(
     target: &WatchTarget,
     submitted_versions: std::collections::BTreeMap<String, String>,
     reservation: PendingSubmissionReservation,
-) -> Option<WatchSubmissionRetry> {
+) -> WatchFlushOutcome {
     let retry = || WatchSubmissionRetry {
         paths: submitted_versions.keys().cloned().collect(),
         mode: PendingSubmissionMode::Full,
@@ -1314,9 +1371,9 @@ async fn flush_project_full(
                 &job_ids,
                 Some(scan_complete),
             ) {
-                None
+                WatchFlushOutcome::Sent(None)
             } else {
-                Some(retry())
+                WatchFlushOutcome::Sent(Some(retry()))
             }
         }
         Err(e) => {
@@ -1326,7 +1383,7 @@ async fn flush_project_full(
                 e
             );
             let _ = dirty_drain::cancel_pending_submission(&target.folder_path, &reservation);
-            Some(retry())
+            WatchFlushOutcome::Failed(retry(), IngestFailure::classify(&e))
         }
     }
 }
@@ -1340,11 +1397,11 @@ async fn flush_project_targeted(
     changed: HashSet<PathBuf>,
     observed_versions: std::collections::BTreeMap<String, String>,
     reservation: PendingSubmissionReservation,
-) -> Option<WatchSubmissionRetry> {
+) -> WatchFlushOutcome {
     let root = Path::new(&target.folder_path);
     if !validate_watch_root(root) {
         let _ = dirty_drain::cancel_pending_submission(&target.folder_path, &reservation);
-        return None;
+        return WatchFlushOutcome::NotSent(None);
     }
     let delta = targeted_watch_delta(root, &changed);
 
@@ -1363,13 +1420,13 @@ async fn flush_project_targeted(
     {
         let _ = dirty_drain::cancel_pending_submission(&target.folder_path, &reservation);
         let _ = dirty_drain::mark_watch_force_full(&target.folder_path);
-        return Some(WatchSubmissionRetry {
+        return WatchFlushOutcome::NotSent(Some(WatchSubmissionRetry {
             paths: changed
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
             mode: PendingSubmissionMode::Full,
-        });
+        }));
     }
     let retry = || WatchSubmissionRetry {
         paths: delta.completed_paths.clone(),
@@ -1385,11 +1442,11 @@ async fn flush_project_targeted(
             target.folder_path
         );
         let _ = dirty_drain::cancel_pending_submission(&target.folder_path, &reservation);
-        return None;
+        return WatchFlushOutcome::NotSent(None);
     }
     let Some(expected_workspace_id) = target.workspace_id else {
         let _ = dirty_drain::cancel_pending_submission(&target.folder_path, &reservation);
-        return None;
+        return WatchFlushOutcome::NotSent(None);
     };
 
     let uploaded = delta.files.len();
@@ -1425,9 +1482,9 @@ async fn flush_project_targeted(
                 &outcome.job_ids,
                 Some(true),
             ) {
-                None
+                WatchFlushOutcome::Sent(None)
             } else {
-                Some(retry())
+                WatchFlushOutcome::Sent(Some(retry()))
             }
         }
         Err(e) => {
@@ -1437,7 +1494,7 @@ async fn flush_project_targeted(
                 e
             );
             let _ = dirty_drain::cancel_pending_submission(&target.folder_path, &reservation);
-            Some(retry())
+            WatchFlushOutcome::Failed(retry(), IngestFailure::classify(&e))
         }
     }
 }
@@ -1493,12 +1550,21 @@ fn enqueue_watch_snapshot(
 fn take_due_watch_projects(
     pending: &Arc<Mutex<HashMap<WatchTargetKey, PendingProject>>>,
     inflight: &Arc<Mutex<HashSet<WatchTargetKey>>>,
+    holds: &IngestHolds,
     now: Instant,
 ) -> Vec<(WatchTarget, HashSet<PathBuf>, bool)> {
+    // A held checkout keeps its queued work untouched until the hold ends.
+    let held: HashSet<WatchTargetKey> = holds
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .filter(|(_, hold)| hold.until > now)
+        .map(|(key, _)| key.clone())
+        .collect();
     let mut guard = pending.lock().unwrap_or_else(|error| error.into_inner());
     let ready: Vec<WatchTargetKey> = guard
         .iter()
-        .filter(|(_, entry)| entry.deadline <= now)
+        .filter(|(key, entry)| entry.deadline <= now && !held.contains(*key))
         .map(|(key, _)| key.clone())
         .collect();
     let mut due = Vec::new();
@@ -1520,6 +1586,150 @@ fn take_due_watch_projects(
         }
     }
     due
+}
+
+/// Apply one flush result: re-queue its remaining work and update the
+/// checkout's hold. An accepted ingest ends any hold; a failed one starts or
+/// extends it according to the failure. `jitter` in [0, 1] spreads clients
+/// that failed together.
+fn record_watch_flush_outcome(
+    pending: &Arc<Mutex<HashMap<WatchTargetKey, PendingProject>>>,
+    holds: &IngestHolds,
+    target: &WatchTarget,
+    outcome: WatchFlushOutcome,
+    now: Instant,
+    jitter: f64,
+) {
+    let key = watch_target_key(target);
+    let retry = match outcome {
+        WatchFlushOutcome::NotSent(retry) => retry,
+        WatchFlushOutcome::Sent(retry) => {
+            let released = holds
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
+            if released.is_some_and(|hold| hold.refused()) {
+                tracing::info!(
+                    project_id = %target.project_id,
+                    path = %target.folder_path,
+                    "watch: ingest accepted again; sync resumed for this checkout"
+                );
+            }
+            retry
+        }
+        WatchFlushOutcome::Failed(retry, failure) => {
+            let mut guard = holds.lock().unwrap_or_else(|error| error.into_inner());
+            let streak = match guard.get(&key) {
+                Some(previous)
+                    if std::mem::discriminant(&previous.failure)
+                        == std::mem::discriminant(&failure) =>
+                {
+                    previous.streak.saturating_add(1)
+                }
+                _ => 1,
+            };
+            let delay = ingest_hold_delay(failure, streak, jitter);
+            guard.insert(
+                key,
+                IngestHold {
+                    failure,
+                    until: now + delay,
+                    streak,
+                    workspace_id: target.workspace_id,
+                },
+            );
+            drop(guard);
+            log_ingest_hold(target, failure, streak, delay);
+            Some(retry)
+        }
+    };
+    if let Some(retry) = retry {
+        enqueue_watch_retry(pending, target, retry);
+    }
+}
+
+/// How long a checkout waits after its `streak`-th consecutive failure of one
+/// kind. Jitter only lengthens the wait, by up to a tenth.
+fn ingest_hold_delay(failure: IngestFailure, streak: u32, jitter: f64) -> Duration {
+    let base = match failure {
+        IngestFailure::Denied | IngestFailure::Unauthorized => {
+            if streak <= 1 {
+                INGEST_DENIED_RECHECK
+            } else {
+                INGEST_DENIED_RECHECK_MAX
+            }
+        }
+        // The server's instruction wins, bounded by the slowest recheck.
+        IngestFailure::RateLimited { retry_after } => retry_after
+            .map(Duration::from_secs)
+            .unwrap_or(INGEST_RATE_LIMIT_FALLBACK)
+            .min(INGEST_DENIED_RECHECK_MAX),
+        IngestFailure::Transient => {
+            let doublings = streak.saturating_sub(1).min(16);
+            INGEST_TRANSIENT_BACKOFF_MIN
+                .saturating_mul(1 << doublings)
+                .min(INGEST_TRANSIENT_BACKOFF_MAX)
+        }
+    };
+    let jitter = if jitter.is_finite() {
+        jitter.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    base + base.mul_f64(0.1 * jitter)
+}
+
+fn ingest_hold_jitter() -> f64 {
+    (Uuid::new_v4().as_u128() as u64) as f64 / u64::MAX as f64
+}
+
+fn log_ingest_hold(target: &WatchTarget, failure: IngestFailure, streak: u32, delay: Duration) {
+    let minutes = delay.as_secs().div_ceil(60);
+    match failure {
+        IngestFailure::Denied if streak == 1 => tracing::warn!(
+            project_id = %target.project_id,
+            path = %target.folder_path,
+            "watch: this account has no write access to the project, so sync for this checkout is paused. Local changes stay queued; rechecking in {minutes} min or after a bridge reload"
+        ),
+        IngestFailure::Unauthorized if streak == 1 => tracing::warn!(
+            project_id = %target.project_id,
+            path = %target.folder_path,
+            "watch: the API rejected the saved credentials, so sync is paused. Run `contextstream-mcp setup` to sign in again; rechecking in {minutes} min"
+        ),
+        IngestFailure::RateLimited { .. } => tracing::info!(
+            project_id = %target.project_id,
+            "watch: the server paused ingest for this checkout; next attempt in {}s",
+            delay.as_secs()
+        ),
+        _ => tracing::debug!(
+            project_id = %target.project_id,
+            ?failure,
+            streak,
+            "watch: ingest failed; next attempt in {}s",
+            delay.as_secs()
+        ),
+    }
+}
+
+/// Keep holds only for checkouts still mapped under the same binding: a
+/// removed or re-bound checkout starts fresh. With `recheck_refused` (a
+/// managed reload, e.g. after setup changed access or sign-in), refused
+/// checkouts are retried at once; server-requested pauses and transient
+/// backoff still run out.
+fn refresh_ingest_holds(holds: &IngestHolds, targets: &[WatchTarget], recheck_refused: bool) {
+    let mapped: HashMap<WatchTargetKey, Option<Uuid>> = targets
+        .iter()
+        .map(|target| (watch_target_key(target), target.workspace_id))
+        .collect();
+    holds
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|key, hold| {
+            mapped
+                .get(key)
+                .is_some_and(|workspace_id| *workspace_id == hold.workspace_id)
+                && !(recheck_refused && hold.refused())
+        });
 }
 
 async fn reconcile_watch_targets(
@@ -1694,6 +1904,7 @@ pub async fn run_watch() -> Result<()> {
     let pending: Arc<Mutex<HashMap<WatchTargetKey, PendingProject>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let inflight: Arc<Mutex<HashSet<WatchTargetKey>>> = Arc::new(Mutex::new(HashSet::new()));
+    let holds = IngestHolds::default();
     let reconcile_running = Arc::new(AtomicBool::new(false));
 
     // Restore durable 202/attestation-only receipts before the normal debounce
@@ -1775,6 +1986,7 @@ pub async fn run_watch() -> Result<()> {
                     }
                     if consume_sync_bridge_reload_request_at(&dir) {
                         targets = enumerate_targets();
+                        refresh_ingest_holds(&holds, &targets, true);
                         *notify_roots
                             .lock()
                             .unwrap_or_else(|error| error.into_inner()) = watch_roots(&targets);
@@ -1787,7 +1999,7 @@ pub async fn run_watch() -> Result<()> {
                     }
                 }
                 let now = Instant::now();
-                let due = take_due_watch_projects(&pending, &inflight, now);
+                let due = take_due_watch_projects(&pending, &inflight, &holds, now);
 
                 for (target, changed, force_full) in due {
                     let key = watch_target_key(&target);
@@ -1795,12 +2007,17 @@ pub async fn run_watch() -> Result<()> {
                     let client = client.clone();
                     let inflight = inflight.clone();
                     let pending = pending.clone();
+                    let holds = holds.clone();
                     tokio::spawn(async move {
-                        if let Some(retry) =
-                            flush_project(client, &target, changed, force_full).await
-                        {
-                            enqueue_watch_retry(&pending, &target, retry);
-                        }
+                        let outcome = flush_project(client, &target, changed, force_full).await;
+                        record_watch_flush_outcome(
+                            &pending,
+                            &holds,
+                            &target,
+                            outcome,
+                            Instant::now(),
+                            ingest_hold_jitter(),
+                        );
                         inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
                     });
                 }
@@ -1822,6 +2039,7 @@ pub async fn run_watch() -> Result<()> {
             }
             _ = reenumerate_tick.tick() => {
                 targets = enumerate_targets();
+                refresh_ingest_holds(&holds, &targets, false);
                 *notify_roots
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = watch_roots(&targets);
@@ -2316,6 +2534,7 @@ mod tests {
         let due = take_due_watch_projects(
             &pending,
             &Arc::new(Mutex::new(HashSet::new())),
+            &IngestHolds::default(),
             Instant::now(),
         );
         assert_eq!(due.len(), 1);
@@ -2360,7 +2579,8 @@ mod tests {
         }
 
         let inflight = Arc::new(Mutex::new(HashSet::from([watch_target_key(&first)])));
-        let due = take_due_watch_projects(&pending, &inflight, Instant::now());
+        let due =
+            take_due_watch_projects(&pending, &inflight, &IngestHolds::default(), Instant::now());
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].0, second);
         assert!(
@@ -2370,6 +2590,364 @@ mod tests {
                 .contains_key(&watch_target_key(&first)),
             "an in-flight worktree must retain only its own obligation"
         );
+    }
+
+    /// Drives the real queue, hold and outcome code on a virtual clock. The
+    /// `api` closure stands in for the ingest endpoint and answers each
+    /// submission the way the client reports it.
+    struct WatchSim {
+        target: WatchTarget,
+        pending: Arc<Mutex<HashMap<WatchTargetKey, PendingProject>>>,
+        inflight: Arc<Mutex<HashSet<WatchTargetKey>>>,
+        holds: IngestHolds,
+        start: Instant,
+        now: Instant,
+        /// Re-queued on every job-reconcile tick while set, like durable
+        /// dirty paths re-seeded by `reconcile_watch_targets`.
+        reseed: Option<WatchSubmissionRetry>,
+        submissions: Vec<(Duration, HashSet<PathBuf>, bool)>,
+    }
+
+    impl WatchSim {
+        fn new() -> Self {
+            let start = Instant::now();
+            Self {
+                target: WatchTarget {
+                    folder_path: "/repo/held-checkout".to_string(),
+                    project_id: pid_a(),
+                    workspace_id: Some(ws()),
+                },
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                inflight: Arc::new(Mutex::new(HashSet::new())),
+                holds: IngestHolds::default(),
+                start,
+                now: start,
+                reseed: None,
+                submissions: Vec::new(),
+            }
+        }
+
+        fn edit(&self, path: &str, mode: PendingSubmissionMode) {
+            enqueue_watch_retry(
+                &self.pending,
+                &self.target,
+                WatchSubmissionRetry {
+                    paths: vec![path.to_string()],
+                    mode,
+                },
+            );
+        }
+
+        fn run_until<F>(&mut self, elapsed: Duration, api: &mut F)
+        where
+            F: FnMut(usize) -> std::result::Result<(), mcp_types::Error>,
+        {
+            let reconcile_ticks = JOB_RECONCILE_INTERVAL.as_millis() / FLUSH_TICK.as_millis();
+            while self.now < self.start + elapsed {
+                self.now += FLUSH_TICK;
+                let tick = (self.now - self.start).as_millis() / FLUSH_TICK.as_millis();
+                if tick.is_multiple_of(reconcile_ticks) {
+                    if let Some(retry) = self.reseed.clone() {
+                        enqueue_watch_retry(&self.pending, &self.target, retry);
+                    }
+                }
+                for (target, changed, force_full) in
+                    take_due_watch_projects(&self.pending, &self.inflight, &self.holds, self.now)
+                {
+                    self.submissions
+                        .push((self.now - self.start, changed.clone(), force_full));
+                    let outcome = match api(self.submissions.len()) {
+                        Ok(()) => {
+                            self.reseed = None;
+                            WatchFlushOutcome::Sent(None)
+                        }
+                        Err(error) => WatchFlushOutcome::Failed(
+                            WatchSubmissionRetry {
+                                paths: changed
+                                    .iter()
+                                    .map(|path| path.to_string_lossy().into_owned())
+                                    .collect(),
+                                mode: if force_full {
+                                    PendingSubmissionMode::Full
+                                } else {
+                                    PendingSubmissionMode::Targeted
+                                },
+                            },
+                            IngestFailure::classify(&error),
+                        ),
+                    };
+                    record_watch_flush_outcome(
+                        &self.pending,
+                        &self.holds,
+                        &target,
+                        outcome,
+                        self.now,
+                        0.0,
+                    );
+                }
+            }
+        }
+
+        fn submission_times(&self) -> Vec<Duration> {
+            self.submissions.iter().map(|(at, _, _)| *at).collect()
+        }
+    }
+
+    fn secs(value: u64) -> Duration {
+        Duration::from_secs(value)
+    }
+
+    fn rate_limited(retry_after: u64) -> mcp_types::Error {
+        mcp_types::Error::RateLimited {
+            message: "ingest paused".to_string(),
+            retry_after: Some(retry_after),
+        }
+    }
+
+    #[test]
+    fn refused_ingest_is_sent_once_then_held_until_the_slow_recheck() {
+        for status in [403, 401] {
+            let mut sim = WatchSim::new();
+            sim.edit(
+                "/repo/held-checkout/src/lib.rs",
+                PendingSubmissionMode::Targeted,
+            );
+            sim.reseed = Some(WatchSubmissionRetry {
+                paths: vec!["/repo/held-checkout/src/lib.rs".to_string()],
+                mode: PendingSubmissionMode::Targeted,
+            });
+            let mut refuse = |_| Err(mcp_types::Error::http(status, "refused"));
+
+            // Edits and the 5 s reconcile keep re-queuing the path; none of
+            // them may send it again before the recheck.
+            sim.run_until(INGEST_DENIED_RECHECK - secs(1), &mut refuse);
+            assert_eq!(
+                sim.submissions.len(),
+                1,
+                "HTTP {status}: one attempt, then held"
+            );
+            let first = sim.submission_times()[0];
+            assert!(
+                first <= secs(2),
+                "HTTP {status}: first attempt after the debounce"
+            );
+
+            sim.run_until(first + INGEST_DENIED_RECHECK + secs(1), &mut refuse);
+            assert_eq!(sim.submissions.len(), 2, "HTTP {status}: the recheck");
+
+            // Still refused: the next recheck is the slow ceiling.
+            let second = sim.submission_times()[1];
+            sim.run_until(second + INGEST_DENIED_RECHECK_MAX - secs(1), &mut refuse);
+            assert_eq!(sim.submissions.len(), 2, "HTTP {status}: slow recheck");
+            sim.run_until(second + INGEST_DENIED_RECHECK_MAX + secs(1), &mut refuse);
+            assert_eq!(sim.submissions.len(), 3, "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_after_denials_holds_for_the_full_retry_after() {
+        let mut sim = WatchSim::new();
+        sim.edit(
+            "/repo/held-checkout/src/lib.rs",
+            PendingSubmissionMode::Targeted,
+        );
+        let mut api = |attempt: usize| match attempt {
+            1..=3 => Err(mcp_types::Error::http(403, "no write role")),
+            4 => Err(rate_limited(120)),
+            _ => Ok(()),
+        };
+        sim.run_until(secs(3 * 60 * 60), &mut api);
+
+        let times = sim.submission_times();
+        assert_eq!(times.len(), 5, "three denials, one 429, one accepted");
+        let wait_after_429 = times[4] - times[3];
+        assert!(
+            wait_after_429 >= secs(120),
+            "no request inside Retry-After: {wait_after_429:?}"
+        );
+        assert!(wait_after_429 <= secs(121), "{wait_after_429:?}");
+        assert!(
+            sim.holds.lock().unwrap().is_empty(),
+            "an accepted ingest ends the hold"
+        );
+    }
+
+    #[test]
+    fn restored_access_flushes_preserved_paths_and_full_scan_once() {
+        let mut sim = WatchSim::new();
+        sim.edit(
+            "/repo/held-checkout/src/a.rs",
+            PendingSubmissionMode::Targeted,
+        );
+        let mut denied = |_: usize| Err(mcp_types::Error::http(403, "no write role"));
+        sim.run_until(secs(5), &mut denied);
+        assert_eq!(sim.submissions.len(), 1);
+
+        // While held: another edit, and a lost-event full-scan obligation.
+        sim.edit(
+            "/repo/held-checkout/src/b.rs",
+            PendingSubmissionMode::Targeted,
+        );
+        sim.reseed = Some(WatchSubmissionRetry {
+            paths: Vec::new(),
+            mode: PendingSubmissionMode::Full,
+        });
+        sim.run_until(secs(3 * 60), &mut denied);
+        assert_eq!(sim.submissions.len(), 1, "nothing is sent while denied");
+
+        // Access is granted and setup asks the bridge to reload.
+        let mut accepted = |_: usize| Ok(());
+        refresh_ingest_holds(&sim.holds, std::slice::from_ref(&sim.target), true);
+        sim.run_until(secs(60 * 60), &mut accepted);
+
+        assert_eq!(sim.submissions.len(), 2, "one flush once access returns");
+        let (_, changed, force_full) = &sim.submissions[1];
+        assert!(changed.contains(Path::new("/repo/held-checkout/src/a.rs")));
+        assert!(changed.contains(Path::new("/repo/held-checkout/src/b.rs")));
+        assert!(*force_full, "the full-scan obligation survives the hold");
+        assert!(sim.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn transient_backoff_grows_and_resets_after_an_accepted_ingest() {
+        let mut sim = WatchSim::new();
+        sim.edit(
+            "/repo/held-checkout/src/lib.rs",
+            PendingSubmissionMode::Targeted,
+        );
+        let mut api = |attempt: usize| match attempt {
+            1..=3 => Err(mcp_types::Error::http(503, "unavailable")),
+            4 => Ok(()),
+            _ => Err(mcp_types::Error::Timeout(60)),
+        };
+        sim.run_until(secs(60), &mut api);
+        let times = sim.submission_times();
+        assert_eq!(times.len(), 4);
+        let gaps = times
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>();
+        for (gap, expected) in gaps.iter().zip([2, 4, 8]) {
+            assert!(
+                *gap >= secs(expected) && *gap <= secs(expected) + FLUSH_TICK,
+                "gap {gap:?}, expected about {expected}s"
+            );
+        }
+
+        sim.edit(
+            "/repo/held-checkout/src/lib.rs",
+            PendingSubmissionMode::Targeted,
+        );
+        sim.run_until(secs(64), &mut api);
+        let times = sim.submission_times();
+        assert_eq!(
+            times.len(),
+            6,
+            "a fresh failure streak after the accepted ingest"
+        );
+        let reset_gap = times[5] - times[4];
+        assert!(
+            reset_gap >= secs(2) && reset_gap <= secs(2) + FLUSH_TICK,
+            "backoff restarts at the minimum: {reset_gap:?}"
+        );
+    }
+
+    #[test]
+    fn hold_schedule_honours_the_server_and_caps_every_wait() {
+        let denied = IngestFailure::Denied;
+        assert_eq!(ingest_hold_delay(denied, 1, 0.0), INGEST_DENIED_RECHECK);
+        assert_eq!(ingest_hold_delay(denied, 2, 0.0), INGEST_DENIED_RECHECK_MAX);
+        assert_eq!(ingest_hold_delay(denied, 9, 0.0), INGEST_DENIED_RECHECK_MAX);
+        assert_eq!(
+            ingest_hold_delay(IngestFailure::Unauthorized, 1, 0.0),
+            INGEST_DENIED_RECHECK
+        );
+        let limited = |retry_after| IngestFailure::RateLimited { retry_after };
+        assert_eq!(ingest_hold_delay(limited(Some(120)), 1, 0.0), secs(120));
+        assert_eq!(
+            ingest_hold_delay(limited(None), 1, 0.0),
+            INGEST_RATE_LIMIT_FALLBACK
+        );
+        assert_eq!(
+            ingest_hold_delay(limited(Some(86_400)), 1, 0.0),
+            INGEST_DENIED_RECHECK_MAX
+        );
+        let transient = (1..=12)
+            .map(|streak| ingest_hold_delay(IngestFailure::Transient, streak, 0.0))
+            .collect::<Vec<_>>();
+        assert_eq!(transient[0], INGEST_TRANSIENT_BACKOFF_MIN);
+        assert!(transient.windows(2).all(|pair| pair[1] >= pair[0]));
+        assert_eq!(transient[11], INGEST_TRANSIENT_BACKOFF_MAX);
+        // Jitter only ever lengthens a wait, by at most a tenth.
+        assert_eq!(ingest_hold_delay(limited(Some(120)), 1, 1.0), secs(132));
+        assert_eq!(
+            ingest_hold_delay(limited(Some(120)), 1, f64::NAN),
+            secs(120)
+        );
+        let sampled = ingest_hold_jitter();
+        assert!((0.0..=1.0).contains(&sampled));
+    }
+
+    #[test]
+    fn remapped_or_removed_checkouts_drop_their_holds() {
+        let target = WatchTarget {
+            folder_path: "/repo/remapped".to_string(),
+            project_id: pid_a(),
+            workspace_id: Some(ws()),
+        };
+        let other = WatchTarget {
+            folder_path: "/repo/paused".to_string(),
+            project_id: pid_b(),
+            workspace_id: Some(ws()),
+        };
+        let holds = IngestHolds::default();
+        let hold = |failure, workspace_id| IngestHold {
+            failure,
+            until: Instant::now() + INGEST_DENIED_RECHECK,
+            streak: 1,
+            workspace_id,
+        };
+        let seed = || {
+            let mut guard = holds.lock().unwrap();
+            guard.clear();
+            guard.insert(
+                watch_target_key(&target),
+                hold(IngestFailure::Denied, target.workspace_id),
+            );
+            guard.insert(
+                watch_target_key(&other),
+                hold(
+                    IngestFailure::RateLimited {
+                        retry_after: Some(120),
+                    },
+                    other.workspace_id,
+                ),
+            );
+        };
+
+        seed();
+        refresh_ingest_holds(&holds, &[target.clone(), other.clone()], false);
+        assert_eq!(
+            holds.lock().unwrap().len(),
+            2,
+            "unchanged mappings keep holds"
+        );
+
+        // A reload rechecks refusals but keeps the server-requested pause.
+        refresh_ingest_holds(&holds, &[target.clone(), other.clone()], true);
+        let guard = holds.lock().unwrap();
+        assert!(!guard.contains_key(&watch_target_key(&target)));
+        assert!(guard.contains_key(&watch_target_key(&other)));
+        drop(guard);
+
+        // A new workspace binding, or an unmapped checkout, starts fresh.
+        seed();
+        let rebound = WatchTarget {
+            workspace_id: Some(Uuid::new_v4()),
+            ..target.clone()
+        };
+        refresh_ingest_holds(&holds, &[rebound], false);
+        assert!(holds.lock().unwrap().is_empty());
     }
 
     #[test]

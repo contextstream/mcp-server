@@ -2654,6 +2654,47 @@ impl ContextStreamClient {
         self.request("PATCH", path, Some(body), None).await
     }
 
+    /// `GET /projects/:id/brief?format=init`: the project brief exactly as
+    /// session init returns it.
+    pub async fn project_brief(&self, project_id: Uuid) -> Result<serde_json::Value> {
+        self.get(&format!("/projects/{project_id}/brief?format=init"))
+            .await
+    }
+
+    /// `PATCH /projects/:id/brief` guarded by `If-Match: <expected_version>`.
+    /// A concurrent writer produces 409 instead of a lost update, so this is
+    /// never retried automatically.
+    pub async fn update_project_brief(
+        &self,
+        project_id: Uuid,
+        expected_version: i64,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.request(
+            "PATCH",
+            &format!("/projects/{project_id}/brief"),
+            Some(body),
+            Some(RequestOptions {
+                retries: Some(0),
+                extra_headers: Some(vec![(
+                    "If-Match".to_string(),
+                    format!("\"{expected_version}\""),
+                )]),
+                ..RequestOptions::default()
+            }),
+        )
+        .await
+    }
+
+    /// `POST /projects/:id/brief/refresh`: queue a rebuild (202).
+    pub async fn refresh_project_brief(&self, project_id: Uuid) -> Result<serde_json::Value> {
+        self.post(
+            &format!("/projects/{project_id}/brief/refresh"),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
     /// Track a compliance event for analytics and agentic telemetry.
     pub async fn track_compliance_event(
         &self,

@@ -1014,7 +1014,7 @@ mod tests {
             "Sign in to ContextStream",
             "Your agents' memory lives in your ContextStream account.",
         );
-        ui::say(Mark::Ok, "Signed in", Some("erik@contextstream.io"));
+        ui::say(Mark::Ok, "Signed in", Some("you@example.com"));
         print_step(
             2,
             "Connect your editors",
@@ -1030,7 +1030,7 @@ mod tests {
         ui::say(
             Mark::Ok,
             "Project",
-            Some("contextadmin · matches this Git repository"),
+            Some("acme-web · matches this Git repository"),
         );
         print_step(
             4,
@@ -1040,19 +1040,19 @@ mod tests {
 
         let choices = Choices {
             api_key: String::new(),
-            email: "erik@contextstream.io".into(),
+            email: "you@example.com".into(),
             client: client_for("test"),
             team_capable: true,
             editors: vec![editors::Editor::ClaudeCode, editors::Editor::Cursor],
             transport: SetupTransportPreference::HostedRemote,
-            project_path: dirs::home_dir().map(|home| home.join("code").join("contextadmin")),
+            project_path: dirs::home_dir().map(|home| home.join("code").join("acme-web")),
             account_only: false,
             workspace: Some(WorkspaceInfo {
                 id: uuid::Uuid::nil().to_string(),
                 name: "Personal".into(),
             }),
             project: ProjectPlan::Create {
-                name: "contextadmin".into(),
+                name: "acme-web".into(),
                 workspace_id: None,
                 repository_url: None,
             },
@@ -1084,7 +1084,7 @@ mod tests {
         println!("{answered}");
 
         print_step(5, "Finishing setup", "");
-        ui::say(Mark::Ok, "Project created", Some("contextadmin"));
+        ui::say(Mark::Ok, "Project created", Some("acme-web"));
         ui::say(
             Mark::Ok,
             "Claude Code",
@@ -1096,7 +1096,7 @@ mod tests {
             ui::GUTTER,
             ui.mark(Mark::Fail)
         );
-        ui::say(Mark::Ok, "Project linked", Some("~/code/contextadmin"));
+        ui::say(Mark::Ok, "Project linked", Some("~/code/acme-web"));
         ui::say(
             Mark::Ok,
             "Git capture on",
@@ -1117,7 +1117,7 @@ mod tests {
             2, 2, true, true, true, true, false, true, false, false,
         );
         super::super::print_setup_outcome(
-            "erik@contextstream.io",
+            "you@example.com",
             false,
             &[editors::Editor::ClaudeCode, editors::Editor::Cursor],
             choices.workspace.as_ref(),

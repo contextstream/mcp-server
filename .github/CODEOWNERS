@@ -1,6 +1,6 @@
-* @contextstreamio
+* @contextstreamio @escott-
 
-/.github/ @contextstreamio
-/npm/ @contextstreamio
-/crates/mcp-client/ @contextstreamio
-/crates/mcp-server/ @contextstreamio
+/.github/ @contextstreamio @escott-
+/npm/ @contextstreamio @escott-
+/crates/mcp-client/ @contextstreamio @escott-
+/crates/mcp-server/ @contextstreamio @escott-

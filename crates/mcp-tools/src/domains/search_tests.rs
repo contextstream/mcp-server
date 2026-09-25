@@ -7165,3 +7165,49 @@ fn search_text_output_budget_has_sane_default() {
     let budget = search_text_output_budget();
     assert!((4_000..=200_000).contains(&budget));
 }
+
+#[test]
+fn refused_or_paused_search_ingest_holds_that_checkout_only() {
+    let folder = "/repo/search-held";
+    let denied = Uuid::new_v4();
+    assert!(!active_index_ingest_held(denied, folder));
+    assert!(hold_active_index_ingest(
+        denied,
+        folder,
+        &Error::http(403, "no write role")
+    ));
+    assert!(active_index_ingest_held(denied, folder));
+    assert!(
+        !active_index_ingest_held(denied, "/repo/other-checkout"),
+        "the hold is per checkout"
+    );
+
+    let paused = Uuid::new_v4();
+    assert!(hold_active_index_ingest(
+        paused,
+        folder,
+        &Error::RateLimited {
+            message: "ingest paused".to_string(),
+            retry_after: Some(120),
+        }
+    ));
+    assert!(active_index_ingest_held(paused, folder));
+
+    let transient = Uuid::new_v4();
+    assert!(
+        !hold_active_index_ingest(transient, folder, &Error::http(503, "unavailable")),
+        "transient failures keep the existing background retry"
+    );
+    assert!(!active_index_ingest_held(transient, folder));
+
+    let expired = Uuid::new_v4();
+    active_index_ingest_holds()
+        .lock()
+        .unwrap()
+        .insert((expired, folder.to_string()), Instant::now());
+    assert!(!active_index_ingest_held(expired, folder));
+    assert!(!active_index_ingest_holds()
+        .lock()
+        .unwrap()
+        .contains_key(&(expired, folder.to_string())));
+}

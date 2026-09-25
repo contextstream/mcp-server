@@ -51,6 +51,19 @@ impl RetryConfig {
         error.is_retryable()
     }
 
+    /// How long to wait before retrying `error` inside the current request,
+    /// or `None` when the server asked for a longer wait than a request
+    /// should block for. The caller then gets the `RateLimited` error and
+    /// schedules the retry itself (a sync loop must not sleep for minutes
+    /// inside one HTTP call, nor ignore the server's instruction).
+    pub fn delay_before_retry(&self, error: &Error, attempt: u32) -> Option<Duration> {
+        match Self::retry_after(error) {
+            Some(wait) if wait > self.max_delay => None,
+            Some(wait) => Some(wait),
+            None => Some(self.delay_for_attempt(attempt)),
+        }
+    }
+
     /// Get retry-after duration from error, if available.
     pub fn retry_after(error: &Error) -> Option<Duration> {
         match error {
@@ -60,6 +73,42 @@ impl RetryConfig {
             } => Some(Duration::from_secs(*secs)),
             _ => None,
         }
+    }
+}
+
+/// How a caller that schedules its own ingest retries (the sync bridge, the
+/// background index repair) should treat a failed ingest request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestFailure {
+    /// 403: the caller has no write access to the project. Every retry gets
+    /// the same answer until access, the checkout mapping or the credentials
+    /// change.
+    Denied,
+    /// 401: the credentials were rejected; the user has to sign in again.
+    Unauthorized,
+    /// 429: the server asked for a pause, in seconds when it said how long.
+    RateLimited { retry_after: Option<u64> },
+    /// Timeouts, network failures, 5xx and anything else.
+    Transient,
+}
+
+impl IngestFailure {
+    pub fn classify(error: &Error) -> Self {
+        match error {
+            Error::Http { status: 403, .. } | Error::PlanRestriction(_) => Self::Denied,
+            Error::Http { status: 401, .. } | Error::MissingCredentials => Self::Unauthorized,
+            Error::RateLimited { retry_after, .. } => Self::RateLimited {
+                retry_after: *retry_after,
+            },
+            Error::Http { status: 429, .. } => Self::RateLimited { retry_after: None },
+            _ => Self::Transient,
+        }
+    }
+
+    /// Whether the failure covers the whole project rather than one request,
+    /// so the remaining batches of an upload would only repeat it.
+    pub fn halts_project(self) -> bool {
+        !matches!(self, Self::Transient)
     }
 }
 
@@ -85,6 +134,65 @@ pub fn is_retryable_status(status: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_retry_after_is_returned_to_the_caller_instead_of_slept() {
+        let config = RetryConfig::default();
+        let rate_limited = |secs| Error::RateLimited {
+            message: "slow down".into(),
+            retry_after: Some(secs),
+        };
+        assert_eq!(
+            config.delay_before_retry(&rate_limited(2), 0),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            config.delay_before_retry(&rate_limited(30), 0),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(config.delay_before_retry(&rate_limited(120), 0), None);
+        // Without a server hint the usual exponential backoff applies.
+        assert!(config
+            .delay_before_retry(&Error::http(503, "unavailable"), 0)
+            .is_some());
+    }
+
+    #[test]
+    fn ingest_failures_are_classified_for_caller_scheduling() {
+        assert_eq!(
+            IngestFailure::classify(&Error::http(403, "no write role")),
+            IngestFailure::Denied
+        );
+        assert_eq!(
+            IngestFailure::classify(&Error::http(401, "expired")),
+            IngestFailure::Unauthorized
+        );
+        assert_eq!(
+            IngestFailure::classify(&Error::RateLimited {
+                message: "hold".into(),
+                retry_after: Some(120),
+            }),
+            IngestFailure::RateLimited {
+                retry_after: Some(120)
+            }
+        );
+        assert_eq!(
+            IngestFailure::classify(&Error::http(429, "hold")),
+            IngestFailure::RateLimited { retry_after: None }
+        );
+        for transient in [
+            Error::http(503, "unavailable"),
+            Error::Timeout(60),
+            Error::Network("reset".into()),
+        ] {
+            let failure = IngestFailure::classify(&transient);
+            assert_eq!(failure, IngestFailure::Transient);
+            assert!(!failure.halts_project());
+        }
+        assert!(IngestFailure::Denied.halts_project());
+        assert!(IngestFailure::Unauthorized.halts_project());
+        assert!(IngestFailure::RateLimited { retry_after: None }.halts_project());
+    }
 
     #[test]
     fn test_delay_calculation() {

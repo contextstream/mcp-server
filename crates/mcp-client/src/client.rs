@@ -3233,12 +3233,11 @@ impl ContextStreamClient {
                     };
 
                     if error.is_retryable() && attempt < max_retries {
-                        retry_delay = Some(
-                            RetryConfig::retry_after(&error)
-                                .unwrap_or_else(|| self.retry_config.delay_for_attempt(attempt)),
-                        );
-                        attempt += 1;
-                        continue;
+                        if let Some(delay) = self.retry_config.delay_before_retry(&error, attempt) {
+                            retry_delay = Some(delay);
+                            attempt += 1;
+                            continue;
+                        }
                     }
                     return Err(error);
                 }
@@ -3256,12 +3255,14 @@ impl ContextStreamClient {
             debug!("Error response: {:?}", error);
 
             if is_retryable_status(status.as_u16()) && attempt < max_retries {
-                retry_delay = Some(
-                    RetryConfig::retry_after(&error)
-                        .unwrap_or_else(|| self.retry_config.delay_for_attempt(attempt)),
-                );
-                attempt += 1;
-                continue;
+                // A server-requested wait beyond the in-request cap is handed
+                // back to the caller as RateLimited instead of slept here.
+                if let Some(delay) = self.retry_config.delay_before_retry(&error, attempt) {
+                    retry_delay = Some(delay);
+                    attempt += 1;
+                    continue;
+                }
+                return Err(error);
             }
 
             // A session refresh is an authentication repair, not a generic
@@ -3477,11 +3478,15 @@ impl ContextStreamClient {
         }
 
         if status == 429 {
+            // Retry-After stands on its own: the files/ingest denial backoff
+            // sends it without any X-RateLimit-* headers.
             return Error::RateLimited {
                 message,
-                retry_after: rate_limit
-                    .as_ref()
-                    .and_then(|r| r.retry_after.map(|s| s as u64)),
+                retry_after: parse_retry_after(&headers, chrono::Utc::now()).or_else(|| {
+                    rate_limit
+                        .as_ref()
+                        .and_then(|r| r.retry_after.map(|s| s as u64))
+                }),
             };
         }
 
@@ -6158,6 +6163,10 @@ impl ContextStreamClient {
 
         let mut total_uploaded = 0i64;
         let mut files_failed = 0i64;
+        // A denial, rejected credentials or a server-requested pause covers
+        // the whole project: stop at the first one instead of sending every
+        // remaining batch into the same answer, and return it to the caller.
+        let mut halted: Option<Error> = None;
         let mut uploaded_batches: Vec<BatchUploadResult> = Vec::new();
         let mut current_batch: Vec<&serde_json::Value> = Vec::new();
         let mut current_batch_size: usize = 0;
@@ -6206,10 +6215,16 @@ impl ContextStreamClient {
                     Err(e) => {
                         tracing::warn!("Batch ingest error ({} files): {}", current_batch.len(), e);
                         files_failed += current_batch.len() as i64;
+                        if crate::IngestFailure::classify(&e).halts_project() {
+                            halted = Some(e);
+                        }
                     }
                 }
                 current_batch.clear();
                 current_batch_size = 0;
+                if halted.is_some() {
+                    break;
+                }
             }
 
             current_batch.push(file.as_ref());
@@ -6217,7 +6232,9 @@ impl ContextStreamClient {
         }
 
         // Send remaining files
-        if !current_batch.is_empty() {
+        if halted.is_some() {
+            // Nothing more is sent once the project refused a batch.
+        } else if !current_batch.is_empty() {
             let deleted_payload = deleted_paths_payload.take();
             match self
                 .send_ingest_batch_adaptive(
@@ -6253,6 +6270,9 @@ impl ContextStreamClient {
                         e
                     );
                     files_failed += current_batch.len() as i64;
+                    if crate::IngestFailure::classify(&e).halts_project() {
+                        halted = Some(e);
+                    }
                 }
             }
         } else if deleted_paths_payload.is_some() || reroot {
@@ -6286,6 +6306,9 @@ impl ContextStreamClient {
                 Err(e) => {
                     tracing::warn!("Deletion-only ingest error: {}", e);
                     files_failed += 1;
+                    if crate::IngestFailure::classify(&e).halts_project() {
+                        halted = Some(e);
+                    }
                 }
             }
         }
@@ -6371,6 +6394,9 @@ impl ContextStreamClient {
             Self::clear_index_status(&params.path);
             let _ =
                 Self::invalidate_hash_manifest_data_three_way(&manifest_scope, &manifest_base_data);
+            if let Some(error) = halted {
+                return Err(error);
+            }
             return Err(Error::http(
                 500,
                 format!(
@@ -19161,11 +19187,24 @@ fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Option<Rate
             .get("X-RateLimit-Group")
             .and_then(|v| v.to_str().ok())
             .map(String::from),
-        retry_after: headers
-            .get("Retry-After")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse().ok()),
+        retry_after: parse_retry_after(headers, chrono::Utc::now())
+            .and_then(|secs| i64::try_from(secs).ok()),
     })
+}
+
+/// Seconds to wait from a `Retry-After` header, in either RFC 9110 form:
+/// delta-seconds (`120`) or an HTTP-date (`Sun, 06 Nov 1994 08:49:37 GMT`).
+/// A date in the past means "now" (0).
+fn parse_retry_after(
+    headers: &reqwest::header::HeaderMap,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u64> {
+    let raw = headers.get("Retry-After")?.to_str().ok()?.trim();
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(seconds);
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
+    Some((at.with_timezone(&chrono::Utc) - now).num_seconds().max(0) as u64)
 }
 
 /// Strip null values from a JSON object's top-level keys.
@@ -20212,6 +20251,125 @@ mod tests {
         config.api_url = format!("http://{addr}");
         config.api_key = Some("test-key".to_string());
         (ContextStreamClient::new(config), server)
+    }
+
+    /// Serve raw HTTP responses in order and report how many requests
+    /// arrived within `window`, so tests can prove a call was not retried.
+    async fn client_with_raw_responses(
+        responses: Vec<String>,
+        window: Duration,
+    ) -> (ContextStreamClient, tokio::task::JoinHandle<usize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw response listener");
+        let addr = listener.local_addr().expect("raw response listener addr");
+        let server = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + window;
+            let mut served = 0usize;
+            let mut responses = responses.into_iter();
+            while let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout_at(deadline, listener.accept()).await
+            {
+                let mut buffer = vec![0u8; 64 * 1024];
+                let _ = socket.read(&mut buffer).await;
+                served += 1;
+                let response = responses.next().unwrap_or_else(|| {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                });
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+            served
+        });
+
+        let mut config = Config::default();
+        config.api_url = format!("http://{addr}");
+        config.api_key = Some("test-key".to_string());
+        (ContextStreamClient::new(config), server)
+    }
+
+    fn raw_response(status: &str, extra_headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn retry_after_alone_is_honoured_and_long_waits_return_to_the_caller() {
+        // The files/ingest denial backoff sends Retry-After without any
+        // X-RateLimit-* headers; it used to be dropped and retried in ~1 s.
+        let (client, server) = client_with_raw_responses(
+            vec![raw_response(
+                "429 Too Many Requests",
+                "Retry-After: 120\r\n",
+                r#"{"error":{"message":"project write access denied"}}"#,
+            )],
+            Duration::from_millis(2_500),
+        )
+        .await;
+
+        let error = client
+            .post::<serde_json::Value, _>("/projects/p/files/ingest", serde_json::json!({}))
+            .await
+            .expect_err("429 must surface");
+        assert!(
+            matches!(
+                error,
+                Error::RateLimited {
+                    retry_after: Some(120),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(server.await.expect("server"), 1, "no in-request retry");
+    }
+
+    #[tokio::test]
+    async fn short_retry_after_is_still_retried_inside_the_request() {
+        let (client, server) = client_with_raw_responses(
+            vec![
+                raw_response("429 Too Many Requests", "Retry-After: 0\r\n", "{}"),
+                raw_response("200 OK", "", r#"{"ok":true}"#),
+            ],
+            Duration::from_millis(1_500),
+        )
+        .await;
+
+        let value = client
+            .post::<serde_json::Value, _>("/projects/p/files/ingest", serde_json::json!({}))
+            .await
+            .expect("retried after the short wait");
+        assert_eq!(value["ok"], true);
+        assert_eq!(server.await.expect("server"), 2);
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-25T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("Retry-After", HeaderValue::from_str(value).unwrap());
+            headers
+        };
+        assert_eq!(parse_retry_after(&with("120"), now), Some(120));
+        assert_eq!(parse_retry_after(&with(" 7 "), now), Some(7));
+        assert_eq!(
+            parse_retry_after(&with("Fri, 25 Sep 2026 00:02:00 GMT"), now),
+            Some(120)
+        );
+        assert_eq!(
+            parse_retry_after(&with("Thu, 24 Sep 2026 23:00:00 GMT"), now),
+            Some(0)
+        );
+        assert_eq!(parse_retry_after(&with("soon"), now), None);
+        assert_eq!(parse_retry_after(&HeaderMap::new(), now), None);
     }
 
     fn answer_clarification_response() -> serde_json::Value {
@@ -22472,6 +22630,70 @@ mod tests {
         assert!(requests[1].contains(&workspace_id.to_string()));
         let scope = bound_manifest_scope(&root, project_id, workspace_id);
         assert!(ContextStreamClient::read_hash_manifest(&scope).is_empty());
+
+        let _ = std::fs::remove_dir_all(temp_home);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn denied_scan_stops_at_the_first_refused_batch_and_returns_the_403() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-denied-scan-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("create temp home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let root = initialize_bound_ingest_fixture(&temp_home, project_id, workspace_id)
+            .expect("initialize checkout");
+        // Enough new files for three upload batches.
+        for index in 0..45 {
+            std::fs::write(
+                root.join(format!("module_{index}.rs")),
+                format!("pub fn module_{index}() {{}}\n"),
+            )
+            .expect("write module");
+        }
+        let rebuilt_status = primary_attestation_fixture(project_id, workspace_id, 99, 'b');
+        let denied = raw_response(
+            "403 Forbidden",
+            "",
+            r#"{"error":{"message":"project write access required"}}"#,
+        );
+        let (client, server) = client_with_raw_responses(
+            vec![
+                raw_response("200 OK", "", &rebuilt_status.to_string()),
+                denied.clone(),
+                denied.clone(),
+                denied,
+            ],
+            Duration::from_millis(2_000),
+        )
+        .await;
+
+        let error = client
+            .ingest_local(IngestLocalParams {
+                path: root.to_string_lossy().to_string(),
+                workspace_id: Some(workspace_id),
+                project_id: Some(project_id),
+                force: Some(false),
+                include_media: Some(false),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a denied scan must fail");
+        assert!(
+            matches!(error, Error::Http { status: 403, .. }),
+            "the caller needs the denial, not a generic incomplete-scan error: {error:?}"
+        );
+        assert_eq!(
+            server.await.expect("server"),
+            2,
+            "status probe plus one refused batch; the other batches are not sent"
+        );
 
         let _ = std::fs::remove_dir_all(temp_home);
     }

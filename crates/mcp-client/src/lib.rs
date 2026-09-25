@@ -201,6 +201,7 @@ pub use parity::{
     normalize_decisions_envelope, CreateDecisionParams, CreateLessonParams, DecisionActionParams,
     ListDecisionsParams, ListLessonsParams, UpdateLessonParams, DECISION_ACTIONS,
 };
+pub use retry::IngestFailure;
 pub use ticket::{
     append_ticket_extras, canonical_linked_item_kind, enrich_ticket_result_from_request,
     format_linked_summary, format_ticket_assignee_summary, format_ticket_linked_summary,

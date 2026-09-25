@@ -18,7 +18,9 @@ mod prompts;
 mod rules;
 pub mod safe_edit;
 mod team_guidance;
+pub mod ui;
 mod watch_service;
+mod wizard;
 mod wizard_config;
 
 pub use credentials::*;
@@ -38,7 +40,7 @@ pub use mcp_config::generate_config_json;
 pub use rules::install_canonical_rules_hash;
 
 use anyhow::{Context, Result};
-use console::{style, Emoji};
+use console::style;
 use mcp_client::{ContextParams, ContextStreamClient, IngestLocalParams, IngestProgressEvent};
 use mcp_types::{
     build_harness_teaching, Config, HarnessTeachingContract, HarnessTeachingDelivery,
@@ -51,19 +53,33 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tracing::warn;
 
-// Emojis for visual feedback
-static SPARKLES: Emoji<'_, '_> = Emoji("✨ ", "");
-static CHECK: Emoji<'_, '_> = Emoji("✓ ", "[OK] ");
-static CROSS: Emoji<'_, '_> = Emoji("✗ ", "[X] ");
-static ROCKET: Emoji<'_, '_> = Emoji("🚀 ", "");
-static KEY: Emoji<'_, '_> = Emoji("🔑 ", "");
-static FOLDER: Emoji<'_, '_> = Emoji("📁 ", "");
-#[allow(dead_code)] // formerly used as the "Updating index" header glyph;
-                    // the new single-line spinner UI doesn't print a header.
-                    // Kept exported for any downstream that imports it.
-static BOOK: Emoji<'_, '_> = Emoji("📖 ", "");
+/// Activity marks in the ContextCode style (see [`ui::Mark`]), carrying the
+/// trailing space the old emoji constants had so existing format strings
+/// keep their alignment.
+struct MarkPrefix(ui::Mark);
 
-const SETUP_TOTAL_STEPS: usize = 6;
+impl std::fmt::Display for MarkPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ", ui::ui().mark(self.0))
+    }
+}
+
+static CHECK: MarkPrefix = MarkPrefix(ui::Mark::Ok);
+static CROSS: MarkPrefix = MarkPrefix(ui::Mark::Fail);
+
+/// Set while setup's final hook refresh runs: setup already reported what it
+/// configured, so the refresh prints only problems.
+static QUIET_HOOK_REFRESH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Progress notes from `update-hooks`, silenced during setup's own refresh.
+macro_rules! refresh_note {
+    ($($arg:tt)*) => {
+        if !QUIET_HOOK_REFRESH.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 /// Truthful terminal/API outcome for a setup invocation.
 ///
@@ -462,11 +478,10 @@ enum SetupIndexChoice {
     Foreground,
     Background,
     Skip,
-    BackToReview,
 }
 
-fn info_label() -> impl std::fmt::Display {
-    style("ℹ  ").blue()
+fn info_label() -> String {
+    format!("{} ", ui::ui().mark(ui::Mark::Info))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1080,6 +1095,15 @@ pub async fn update_hooks(scope: &str, only: Option<&[editors::Editor]>) -> Resu
     update_hooks_scoped(scope, only, false).await
 }
 
+/// Setup's closing hook refresh: the same idempotent validation as
+/// `update-hooks --only-configured`, printing only problems.
+pub async fn refresh_hooks_after_setup() -> Result<()> {
+    QUIET_HOOK_REFRESH.store(true, std::sync::atomic::Ordering::Relaxed);
+    let result = update_hooks_scoped("global", None, true).await;
+    QUIET_HOOK_REFRESH.store(false, std::sync::atomic::Ordering::Relaxed);
+    result
+}
+
 /// Non-interactive hook update, scoped to the editors the user opted into.
 pub async fn update_hooks_scoped(
     scope: &str,
@@ -1088,7 +1112,7 @@ pub async fn update_hooks_scoped(
 ) -> Result<()> {
     validate_editor_scope(scope, "update-hooks")?;
     if matches!(scope, "project" | "all") {
-        eprintln!(
+        refresh_note!(
             "{} update-hooks currently installs global hook files only; project scope is ignored.",
             info_label()
         );
@@ -1096,7 +1120,7 @@ pub async fn update_hooks_scoped(
 
     let (targets, provenance) = resolve_hook_refresh_editors(only, only_configured)?;
     if targets.is_empty() {
-        eprintln!("{}", no_target_editors_message(only_configured));
+        refresh_note!("{}", no_target_editors_message(only_configured));
         return Ok(());
     }
     let mut failures = Vec::new();
@@ -1121,7 +1145,7 @@ pub async fn update_hooks_scoped(
     } else {
         true
     };
-    eprintln!(
+    refresh_note!(
         "{} Updating hooks for {} editor(s) ({}): {}",
         info_label(),
         targets.len(),
@@ -1132,7 +1156,7 @@ pub async fn update_hooks_scoped(
     for editor in &targets {
         if !editor.has_hooks() {
             if matches!(editor, editors::Editor::KiloCode) {
-                eprintln!(
+                refresh_note!(
                     "{} {} does not support filesystem hooks; skipping.",
                     info_label(),
                     editor.display_name()
@@ -1149,7 +1173,7 @@ pub async fn update_hooks_scoped(
         // original recovery backup and makes refreshes true no-ops.
         match hooks::install_hooks(editor, None) {
             Ok(()) => {
-                eprintln!("{} Hooks updated for {}", CHECK, editor.display_name());
+                refresh_note!("{} Hooks updated for {}", CHECK, editor.display_name());
                 updated_count += 1;
             }
             Err(e) => {
@@ -1165,7 +1189,7 @@ pub async fn update_hooks_scoped(
     }
 
     if updated_count == 0 && hook_target_count == 0 {
-        eprintln!("No editors with hook support found.");
+        refresh_note!("No editors with hook support found.");
     }
 
     // Hosted MCP remains the editor transport. The managed helper is a
@@ -1177,9 +1201,10 @@ pub async fn update_hooks_scoped(
     {
         match register_managed_sync_bridge() {
             Ok(registration) => {
-                eprintln!(
+                refresh_note!(
                     "{} Hosted sync bridge registration: {}",
-                    CHECK, registration.platform
+                    CHECK,
+                    registration.platform
                 );
                 if !safe_edit::is_dry_run() {
                     crate::watch::spawn_watch_helper();
@@ -1201,7 +1226,7 @@ pub async fn update_hooks_scoped(
         // directory happened to launch it.
         match mcp_config::repair_deleted_binary_path_configs(&targets, None) {
             Ok(repaired) if repaired > 0 => {
-                eprintln!(
+                refresh_note!(
                     "{} Repaired {} stale local MCP config path{}",
                     CHECK,
                     repaired,
@@ -2018,84 +2043,28 @@ pub fn prompt_setup_transport_preference(
         if matches!(preselected, SetupTransportPreference::LocalBinary)
             && !local_mcp_override_allowed()
         {
-            println!();
-            println!(
-                "{}Ignoring local MCP transport override; using {}.",
-                style("⚠  ").yellow(),
-                style("hosted remote MCP gateway").cyan().bold()
-            );
-            println!(
-                "  {}",
-                style(format!(
-                    "Local binary mode requires {}=1 with {}=local and should only be used for recovery or local development.",
+            ui::say(
+                ui::Mark::Warn,
+                "Ignoring the local connection override",
+                Some(&format!(
+                    "local mode needs {}=1 with {}=local and is only for recovery or development",
                     ENV_ALLOW_LOCAL_MCP, ENV_SETUP_TRANSPORT
-                ))
-                .dim()
+                )),
             );
         } else {
-            println!();
-            println!(
-                "{}Preselected MCP connection mode: {}{}",
-                info_label(),
-                match preselected {
-                    SetupTransportPreference::HostedRemote => {
-                        style("Hosted remote gateway").cyan().bold()
-                    }
-                    SetupTransportPreference::LocalBinary => {
-                        style("Local binary").cyan().bold()
-                    }
-                },
-                match preselected {
-                    SetupTransportPreference::HostedRemote => "".to_string(),
-                    SetupTransportPreference::LocalBinary => {
-                        format!(" {}", style("(explicit recovery override)").yellow())
-                    }
-                },
-            );
+            // The hosted connection is the default and needs no mention.
+            if matches!(preselected, SetupTransportPreference::LocalBinary) {
+                ui::say(
+                    ui::Mark::Warn,
+                    "Using the local binary connection",
+                    Some("recovery mode, requested by the installer environment"),
+                );
+            }
             return Ok(preselected);
         }
     }
 
     Ok(SetupTransportPreference::HostedRemote)
-}
-
-fn format_setup_step_progress(current_step: usize, total_steps: usize) -> String {
-    let total_steps = total_steps.max(1);
-    let current_step = current_step.clamp(1, total_steps);
-
-    (1..=total_steps)
-        .map(|step| {
-            if step < current_step {
-                "●"
-            } else if step == current_step {
-                "◆"
-            } else {
-                "○"
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn print_setup_step_header(step: usize, title: &str, detail: &str) {
-    println!();
-    println!(
-        "{}",
-        style("────────────────────────────────────────────────────").cyan()
-    );
-    println!(
-        "{}  {}  {}",
-        style(format!("Step {}/{}", step, SETUP_TOTAL_STEPS))
-            .cyan()
-            .bold(),
-        style(title).bold(),
-        style(format_setup_step_progress(step, SETUP_TOTAL_STEPS)).dim()
-    );
-    println!("  {}", style(detail).dim());
-    println!(
-        "{}",
-        style("────────────────────────────────────────────────────").dim()
-    );
 }
 
 fn selected_editors_summary(editors_to_configure: &[editors::Editor]) -> String {
@@ -2122,141 +2091,40 @@ pub fn persist_setup_editor_selection(editors_to_configure: &[editors::Editor]) 
         .context("Could not save the selected editors; no editor files were changed")
 }
 
-fn transport_preference_label(transport_preference: SetupTransportPreference) -> &'static str {
-    match transport_preference {
-        SetupTransportPreference::HostedRemote => "Hosted remote gateway",
-        SetupTransportPreference::LocalBinary => "Local binary (recovery override)",
-    }
-}
-
-fn print_setup_review(
-    workspace: Option<&WorkspaceInfo>,
-    selected_project: Option<&ProjectInfo>,
-    project_path: Option<&Path>,
-    account_only_requested: bool,
-    editors_to_configure: &[editors::Editor],
-    transport_preference: SetupTransportPreference,
-    team_capable: bool,
-) {
-    let workspace_summary = workspace
-        .map(|ws| format!("{} ({})", ws.name, ws.id))
-        .unwrap_or_else(|| "None selected".to_string());
-    let project_summary = selected_project
-        .map(|project| format!("{} ({})", project.name, project.id))
-        .unwrap_or_else(|| {
-            if account_only_requested {
-                "Account/editor setup only".to_string()
-            } else {
-                "None selected (setup will remain incomplete)".to_string()
-            }
-        });
-    let folder_summary = project_path
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "None selected".to_string());
-
-    println!("{}", style("  Setup summary").bold());
-    println!(
-        "    {:<16} {}",
-        style("Workspace").dim(),
-        style(workspace_summary).cyan()
-    );
-    println!(
-        "    {:<16} {}",
-        style("Project folder").dim(),
-        style(folder_summary).cyan()
-    );
-    println!(
-        "    {:<16} {}",
-        style("Project").dim(),
-        style(project_summary).cyan()
-    );
-    println!(
-        "    {:<16} {}",
-        style("Editors").dim(),
-        selected_editors_summary(editors_to_configure)
-    );
-    println!(
-        "    {:<16} {}",
-        style("Connection").dim(),
-        transport_preference_label(transport_preference)
-    );
-    if team_capable {
-        println!(
-            "    {:<16} {}",
-            style("Team mode").dim(),
-            style("shared workspace memory + skills enabled").cyan()
-        );
-    }
-    println!();
-    println!(
-        "  {}",
-        style("Use Back options here to revise any earlier step before setup continues.").dim()
-    );
-}
-
-fn print_index_intro() {
-    println!();
-    println!(
-        "  {}",
-        style("Indexing scans your project files, generates embeddings, and builds").dim()
-    );
-    println!(
-        "  {}",
-        style("a searchable code graph for semantic search, impact analysis,").dim()
-    );
-    println!("  {}", style("and context packs.").dim());
-    println!();
-    println!(
-        "  {} {}",
-        style("Recommended:").yellow().bold(),
-        style("Index in the background — setup finishes now, search fills in as it builds.").dim()
-    );
-    println!();
-}
-
-fn setup_index_choices() -> [&'static str; 4] {
+fn setup_index_choices() -> [&'static str; 3] {
     [
-        "Update index in background (recommended)   — finish setup immediately",
-        "Update index now (wait for completion)     — watch progress before first use",
-        "Skip indexing                              — run it later from your editor",
-        "Back to review setup selections",
+        "In the background · finish now, search fills in as it builds (recommended)",
+        "Now · wait here until the first index finishes",
+        "Skip for now · index later from your editor",
     ]
 }
 
 fn prompt_setup_index_choice(cwd: &std::path::Path) -> Result<SetupIndexChoice> {
     let choices = setup_index_choices();
     let choice = prompts::select(
-        &format!("Index current directory? ({})", cwd.display()),
+        &format!("When should {} be indexed?", wizard::display_path(cwd)),
         &choices,
     )?;
 
     Ok(match choice {
         0 => SetupIndexChoice::Background,
         1 => SetupIndexChoice::Foreground,
-        2 => SetupIndexChoice::Skip,
-        3 => SetupIndexChoice::BackToReview,
-        _ => unreachable!(),
+        _ => SetupIndexChoice::Skip,
     })
-}
-
-fn print_project_setup_running() {
-    println!(
-        "  {}{}",
-        SPARKLES,
-        style("Project setup running to connect everything, takes just a sec").bold()
-    );
 }
 
 fn print_empty_project_ready() {
     if crate::watch::watch_enabled() {
-        println!(
-            "  {}Project is ready; the managed sync bridge will index files as they are added",
-            CHECK
+        ui::say(
+            ui::Mark::Ok,
+            "Project ready",
+            Some("it's empty for now; files are indexed as you add them"),
         );
     } else {
-        println!(
-            "  {}Project is ready; add files, then start indexing with project(action=\"index\")",
-            CHECK
+        ui::say(
+            ui::Mark::Ok,
+            "Project ready",
+            Some("add files, then ask your agent to run project(action=\"index\")"),
         );
     }
 }
@@ -2363,45 +2231,6 @@ pub(crate) fn resolve_setup_project_path(
             .map(Some);
     }
     Ok(None)
-}
-
-fn prompt_setup_project_path(cwd: &Path) -> Result<(Option<PathBuf>, bool)> {
-    println!(
-        "{} Setup will not treat {} as a project automatically.",
-        style("Warning:").yellow(),
-        style(cwd.display()).dim()
-    );
-    println!("  HOME and filesystem roots are too broad to link or index safely.");
-    let choice = prompts::select(
-        "Choose project scope:",
-        &[
-            "Enter the project checkout folder",
-            "Continue with account/editor setup only (no project or index)",
-        ],
-    )?;
-    if choice == 1 {
-        return Ok((None, true));
-    }
-
-    loop {
-        let raw = prompts::input("Project checkout folder:", None)?;
-        match canonical_setup_project_path(Path::new(raw.trim()), cwd) {
-            Ok(path) => return Ok((Some(path), false)),
-            Err(error) => {
-                warning(&error.to_string());
-                let retry = prompts::select(
-                    "Project folder was not accepted:",
-                    &[
-                        "Try another project folder",
-                        "Continue with account/editor setup only",
-                    ],
-                )?;
-                if retry == 1 {
-                    return Ok((None, true));
-                }
-            }
-        }
-    }
 }
 
 fn setup_should_scan_entry(entry: &walkdir::DirEntry) -> bool {
@@ -2537,7 +2366,7 @@ pub async fn run_setup_wizard_with_options(
     if non_interactive {
         run_setup_noninteractive(only, project_path, account_only, workspace_id).await
     } else {
-        run_setup_interactive(only, project_path, account_only).await
+        wizard::run(only, project_path, account_only).await
     }
 }
 
@@ -2553,9 +2382,10 @@ async fn run_setup_noninteractive(
 ) -> Result<()> {
     print_welcome_banner();
     print_data_collection_disclosure(true);
-    println!(
-        "{}Non-interactive setup (--yes): saved credentials, detected editors, hosted remote, background index.",
-        info_label()
+    ui::say(
+        ui::Mark::Info,
+        "Unattended setup",
+        Some("saved sign-in · detected editors · background index"),
     );
 
     let api_key = get_api_key_result()?.ok_or_else(|| {
@@ -2582,7 +2412,7 @@ async fn run_setup_noninteractive(
                 e
             )
         })?;
-    println!("{} Authenticated as {}", CHECK, style(&user.email).cyan());
+    ui::say(ui::Mark::Ok, "Signed in", Some(&user.email));
 
     // An explicit --editors list wins; otherwise fall back to detection, which
     // is the documented behaviour of `setup --yes`.
@@ -2595,9 +2425,10 @@ async fn run_setup_noninteractive(
     persist_setup_editor_selection(&editors_to_configure)?;
 
     if editors_to_configure.is_empty() {
-        println!(
-            "{} No editors selected or detected; no coding harness was configured.",
-            style("Warning:").yellow()
+        ui::say(
+            ui::Mark::Warn,
+            "No editors selected or detected",
+            Some("nothing was configured"),
         );
         let report = doctor::build_report(None, &editors_to_configure).await;
         doctor::print_setup_health_report(&report);
@@ -2623,16 +2454,18 @@ async fn run_setup_noninteractive(
         );
         return Ok(());
     }
-    println!(
-        "{} Configuring {} editor(s) ({}): {}",
-        CHECK,
-        editors_to_configure.len(),
-        if only.is_some() {
-            "requested"
-        } else {
-            "detected"
-        },
-        selected_editors_summary(&editors_to_configure)
+    ui::say(
+        ui::Mark::Ok,
+        "Editors",
+        Some(&format!(
+            "{} · {}",
+            selected_editors_summary(&editors_to_configure),
+            if only.is_some() {
+                "requested"
+            } else {
+                "detected"
+            }
+        )),
     );
 
     let transport_preference = prompt_setup_transport_preference(&editors_to_configure)?;
@@ -2656,9 +2489,10 @@ async fn run_setup_noninteractive(
         .await?
     } else {
         if !account_only {
-            println!(
-                "{} No safe project folder was selected. Editor-global setup will continue, but project binding and indexing will remain incomplete.",
-                style("Warning:").yellow()
+            ui::say(
+                ui::Mark::Warn,
+                "No safe project folder",
+                Some("editors are set up; link a project later with --project-path"),
             );
         }
         None
@@ -2881,508 +2715,22 @@ fn ambiguous_workspace_message<'a>(
     message
 }
 
-async fn run_setup_interactive(
-    only: Option<&[editors::Editor]>,
-    explicit_project_path: Option<&Path>,
-    account_only: bool,
-) -> Result<()> {
-    print_welcome_banner();
-    print_data_collection_disclosure(false);
-
-    // Returning users get a pointer to the zero-prompt path. Local check only —
-    // nothing hits the network before the first interaction (the auth step
-    // validates keys), and rules are no longer refreshed up front: step 5
-    // rewrites them for the selected editors anyway.
-    if get_api_key_result()?.is_some() {
-        println!(
-            "{}Saved credentials found. Tip: {} re-runs setup with no prompts.",
-            info_label(),
-            style("contextstream-mcp setup --yes").cyan()
-        );
-        println!();
-    }
-
-    print_setup_step_header(
-        1,
-        "Authentication",
-        "Connect the CLI to the ContextStream account that owns this workspace.",
-    );
-    let (api_key, user_email) = if safe_edit::is_dry_run() {
-        let api_key = get_api_key_result()?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Dry-run requires existing credentials because browser authentication would \
-                 create server-side state. Authenticate once, then re-run --dry-run."
-            )
-        })?;
-        let client = ContextStreamClient::new(Config {
-            api_key: Some(api_key.clone()),
-            ..Default::default()
-        });
-        let user = client
-            .me()
-            .await
-            .context("Dry-run could not validate the existing credentials")?;
-        (api_key, user.email)
-    } else {
-        authenticate().await?
-    };
-    println!(
-        "{}{} Authenticated as {}",
-        CHECK,
-        style("Success!").green(),
-        style(&user_email).cyan()
-    );
-
-    // Save credentials
-    write_saved_credentials(&api_key, None)?;
-    println!(
-        "{} Credentials saved to {}",
-        CHECK,
-        style(credentials_file_path().display()).dim()
-    );
-
-    // Create client with the new credentials
-    let config = Config {
-        api_key: Some(api_key.clone()),
-        ..Default::default()
-    };
-    let client = ContextStreamClient::new(config);
-
-    let team_capable = client
-        .get_account_context()
-        .await
-        .ok()
-        .flatten()
-        .filter(|ctx| ctx.team_features_available())
-        .inspect(team_guidance::print_post_auth_team_guidance)
-        .is_some();
-
-    print_setup_step_header(
-        2,
-        "Editors & Connection",
-        "Choose which coding environments get MCP config, rules, and hooks.",
-    );
-    let detected_editors = editors::detect_installed_editors();
-
-    if detected_editors.is_empty() {
-        println!(
-            "{} No editors were auto-detected.",
-            style("Warning:").yellow()
-        );
-        println!("  You can still select editors for manual setup.");
-    } else {
-        println!("{} Found {} editor(s):", CHECK, detected_editors.len());
-        for editor in &detected_editors {
-            println!("    {} {}", style("•").dim(), editor.display_name());
-        }
-    }
-
-    // An explicit CLI selection is authoritative. Interactive prompts may
-    // choose editors only when the caller did not provide --editors.
-    let mut editors_to_configure = match only {
-        Some(requested) => {
-            println!(
-                "{} Using requested editor selection: {}",
-                CHECK,
-                selected_editors_summary(requested)
-            );
-            requested.to_vec()
-        }
-        None => prompts::select_editors(&detected_editors)?,
-    };
-    let mut transport_preference = prompt_setup_transport_preference(&editors_to_configure)?;
-
-    print_setup_step_header(
-        3,
-        "Workspace & Project",
-        "Link this folder to the right ContextStream workspace and project.",
-    );
-    if team_capable {
-        team_guidance::print_workspace_step_team_tips();
-    }
-    let cwd = std::env::current_dir()?;
-    let mut account_only_requested = account_only;
-    let mut project_path =
-        resolve_setup_project_path(&cwd, explicit_project_path, account_only_requested)?;
-    if project_path.is_none() && !account_only_requested {
-        let (selected_path, selected_account_only) = prompt_setup_project_path(&cwd)?;
-        project_path = selected_path;
-        account_only_requested = selected_account_only;
-    }
-    let mut workspace = setup_workspace_for_path(&client, project_path.as_deref()).await?;
-    let mut selected_project = if let Some(project_path) = project_path.as_deref() {
-        select_project_for_current_directory(
-            &client,
-            project_path,
-            workspace.as_ref(),
-            true,
-            true,
-            true,
-        )
-        .await?
-    } else {
-        None
-    };
-    if project_path.is_some() && selected_project.is_none() {
-        // The interactive project picker names its skip choice explicitly.
-        account_only_requested = true;
-    }
-
-    let (binding_established, index_started, awaiting_first_files) = 'configure_and_index: loop {
-        loop {
-            print_setup_step_header(
-                4,
-                "Review & Backtrack",
-                "Confirm the plan or jump back to any setup step before continuing.",
-            );
-            print_setup_review(
-                workspace.as_ref(),
-                selected_project.as_ref(),
-                project_path.as_deref(),
-                account_only_requested,
-                &editors_to_configure,
-                transport_preference,
-                team_capable,
-            );
-
-            let review_choice = prompts::select(
-                "Review setup selections:",
-                &[
-                    "Save configuration",
-                    "Back: change editors and connection mode",
-                    "Back: change workspace",
-                    "Back: change project for the selected folder",
-                    "Exit setup",
-                ],
-            )?;
-
-            match review_choice {
-                0 => break,
-                1 => {
-                    print_setup_step_header(
-                        2,
-                        "Editors & Connection",
-                        "Revise the editors and MCP transport mode for this install.",
-                    );
-                    editors_to_configure = match only {
-                        Some(requested) => requested.to_vec(),
-                        None => prompts::select_editors(&detected_editors)?,
-                    };
-                    transport_preference =
-                        prompt_setup_transport_preference(&editors_to_configure)?;
-                }
-                2 => {
-                    print_setup_step_header(
-                        3,
-                        "Workspace & Project",
-                        "Choose a different workspace, then relink this folder to a project.",
-                    );
-                    workspace = setup_workspace_for_path(&client, project_path.as_deref()).await?;
-                    selected_project = if let Some(project_path) = project_path.as_deref() {
-                        select_project_for_current_directory(
-                            &client,
-                            project_path,
-                            workspace.as_ref(),
-                            true,
-                            true,
-                            true,
-                        )
-                        .await?
-                    } else {
-                        None
-                    };
-                    account_only_requested = project_path.is_none() || selected_project.is_none();
-                }
-                3 => {
-                    print_setup_step_header(
-                        3,
-                        "Workspace & Project",
-                        "Choose a different project for this folder.",
-                    );
-                    selected_project = if let Some(project_path) = project_path.as_deref() {
-                        select_project_for_current_directory(
-                            &client,
-                            project_path,
-                            workspace.as_ref(),
-                            true,
-                            true,
-                            true,
-                        )
-                        .await?
-                    } else {
-                        None
-                    };
-                    account_only_requested = project_path.is_none() || selected_project.is_none();
-                }
-                4 => {
-                    println!("{}Setup cancelled.", info_label());
-                    return Ok(());
-                }
-                _ => unreachable!(),
-            }
-        }
-
-        let preauth_remote_configs =
-            matches!(transport_preference, SetupTransportPreference::HostedRemote)
-                && editors_to_configure
-                    .iter()
-                    .any(mcp_config::editor_supports_remote_mcp);
-
-        print_setup_step_header(
-            5,
-            "Save Editor Configs",
-            "Saving MCP configs, project rules, workspace links, and hooks.",
-        );
-
-        if preauth_remote_configs {
-            println!("{}{}", KEY, style("Editor Authentication").bold());
-            println!(
-                "  {}",
-                style(
-                    "Generated hosted MCP configs are pre-authenticated for the editor's first connection after reload."
-                )
-                .dim()
-            );
-            println!();
-        }
-
-        if !editors_to_configure.is_empty() {
-            persist_setup_editor_selection(&editors_to_configure)?;
-            // Persist transport intent before the first editor mutation so a
-            // partial setup remains repairable with the same connection mode.
-            write_setup_transport_marker(transport_preference)?;
-            let configured_project_path = selected_project.as_ref().and(project_path.as_deref());
-            for editor in &editors_to_configure {
-                configure_editor_with_workspace(
-                    &client,
-                    editor,
-                    &api_key,
-                    workspace.as_ref(),
-                    selected_project.as_ref().map(|p| p.id.as_str()),
-                    configured_project_path,
-                    transport_preference,
-                    preauth_remote_configs,
-                )
-                .await?;
-            }
-        } else {
-            persist_setup_editor_selection(&editors_to_configure)?;
-            println!(
-                "  {}No editors selected; skipping editor config writes.",
-                info_label()
-            );
-        }
-
-        let configured_project_path = selected_project.as_ref().and(project_path.as_deref());
-        let binding_established = if let Some(configured_project_path) = configured_project_path {
-            if let Some(ref workspace) = workspace {
-                establish_validated_setup_binding(
-                    &client,
-                    configured_project_path,
-                    workspace,
-                    selected_project.as_ref(),
-                )
-                .await?
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        // Install managed git hooks for local VCS capture (best-effort). Honors
-        // the capture kill-switch / per-repo policy; no-op outside a git repo.
-        if binding_established {
-            if let Some(repo_root) = configured_project_path.and_then(git_hooks::resolve_repo_root)
-            {
-                let root_str = repo_root.to_string_lossy().to_string();
-                if crate::hook_handlers::git_common::capture_disabled(&root_str) {
-                    println!(
-                        "  {}Git capture is disabled for this repo; skipping git hooks.",
-                        info_label()
-                    );
-                } else {
-                    match git_hooks::install_git_hooks(&repo_root) {
-                    Ok(()) => println!(
-                        "  {}Git capture: hooks installed (post-commit, pre-push, post-checkout, post-merge)",
-                        CHECK
-                    ),
-                    Err(e) => warning(&format!("Could not install git hooks: {}", e)),
-                }
-                }
-            }
-        }
-
-        print_setup_step_header(
-            6,
-            "Index & Ingest",
-            "Build the first searchable code graph for this project.",
-        );
-        print_index_intro();
-
-        // Fire latency telemetry silently in the background so the user
-        // never waits on it. This reports transport choice + edge latency.
-        if !safe_edit::is_dry_run() {
-            let telemetry_client = client.clone();
-            let telemetry_transport = transport_preference;
-            let _telemetry = tokio::spawn(async move {
-                report_setup_telemetry(&telemetry_client, telemetry_transport).await;
-            });
-        }
-
-        let Some(index_project_path) = configured_project_path.filter(|_| binding_established)
-        else {
-            println!(
-                "  {} Indexing was not started because no validated project binding exists.",
-                style("⚠").yellow()
-            );
-            println!(
-                "    Finish later with {}.",
-                style("contextstream-mcp setup --project-path /path/to/project").cyan()
-            );
-            spawn_warmup(&client, workspace.as_ref().map(|w| &w.id));
-            break 'configure_and_index (binding_established, false, false);
-        };
-
-        if !setup_path_has_project_content_files(index_project_path, false) {
-            println!(
-                "  {}This project has no files yet, so there is nothing to index now.",
-                info_label()
-            );
-            print_empty_project_ready();
-            spawn_warmup(&client, workspace.as_ref().map(|w| &w.id));
-            break 'configure_and_index (binding_established, false, true);
-        }
-
-        let index_choice = prompt_setup_index_choice(index_project_path)?;
-        if matches!(index_choice, SetupIndexChoice::BackToReview) {
-            println!(
-                "  {} Returning to setup review. Editor files will be refreshed if you continue again.",
-                style("↩").cyan()
-            );
-            continue 'configure_and_index;
-        }
-
-        let index_started = match index_choice {
-            SetupIndexChoice::Foreground => {
-                let resolved_pid = selected_project
-                    .as_ref()
-                    .and_then(|project| uuid::Uuid::parse_str(&project.id).ok());
-
-                print_project_setup_running();
-                match index_project(
-                    &client,
-                    index_project_path,
-                    workspace.as_ref().map(|w| &w.id),
-                    resolved_pid,
-                    false,
-                    false,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        // Warm up the context API concurrently so the
-                        // success banner isn't blocked on it.
-                        spawn_warmup(&client, workspace.as_ref().map(|w| &w.id));
-                        true
-                    }
-                    Err(e) => {
-                        warning(&format!(
-                            "Could not index project: {}",
-                            sanitize_index_error(&e)
-                        ));
-                        println!(
-                            "  You can index later using: {}",
-                            style("project(action=\"index\")").cyan()
-                        );
-                        false
-                    }
-                }
-            }
-            SetupIndexChoice::Background => {
-                print_project_setup_running();
-                let bg_project_id = selected_project
-                    .as_ref()
-                    .and_then(|project| uuid::Uuid::parse_str(&project.id).ok());
-                spawn_background_index(
-                    client.clone(),
-                    index_project_path.to_path_buf(),
-                    workspace.as_ref().map(|w| w.id.clone()),
-                    bg_project_id,
-                    false,
-                );
-                true
-            }
-            SetupIndexChoice::Skip => {
-                println!(
-                    "  {}Indexing skipped for now. Start it later with:",
-                    info_label()
-                );
-                println!("    {}", style("project(action=\"index\")").cyan());
-                false
-            }
-            SetupIndexChoice::BackToReview => unreachable!(),
-        };
-
-        break (binding_established, index_started, false);
-    };
-
-    let configured_project_path = selected_project.as_ref().and(project_path.as_deref());
-    let report = doctor::build_report(configured_project_path, &editors_to_configure).await;
-    doctor::print_setup_health_report(&report);
-    let outcome = setup_completion_evidence(
-        editors_to_configure.len(),
-        editors_to_configure
-            .iter()
-            .filter(|editor| editor.has_mcp_transport())
-            .count(),
-        project_path.is_some(),
-        selected_project.is_some(),
-        binding_established,
-        index_started,
-        awaiting_first_files,
-        !report.has_setup_failures(),
-        account_only_requested,
-        safe_edit::is_dry_run(),
-    );
-    print_setup_outcome(
-        &user_email,
-        team_capable,
-        &editors_to_configure,
-        workspace.as_ref(),
-        project_path.as_deref(),
-        &outcome,
-    );
-
-    Ok(())
-}
-
 fn print_welcome_banner() {
+    let ui = ui::ui();
+    let title = ui.paint("CONTEXTSTREAM SETUP", Some(ui::Tok::AccentInk), true);
+    let version = format!("v{}", mcp_types::config::VERSION);
+    let inner = ui.card_width().saturating_sub(ui::GUTTER.len() + 6);
+    let gap = inner
+        .saturating_sub(console::measure_text_width(&title) + version.len())
+        .max(2);
+    let rows = vec![
+        format!("{title}{}{}", " ".repeat(gap), ui.faint(&version)),
+        String::new(),
+        ui.strong("Give your agents memory of this project."),
+        ui.muted("Sign in, confirm one review screen, and you're done."),
+    ];
     println!();
-    println!(
-        "{}",
-        style("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").cyan()
-    );
-    println!(
-        "{} {} {}",
-        SPARKLES,
-        style("ContextStream MCP Setup").bold().cyan(),
-        SPARKLES
-    );
-    println!(
-        "{}",
-        style("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").cyan()
-    );
-    println!();
-    println!(
-        "{}",
-        style("Guided account, editor, workspace, project, and indexing setup.").dim()
-    );
-    println!(
-        "{}",
-        style("Use the review step to go back before continuing. Press Ctrl+C to exit.").dim()
-    );
-    println!();
+    println!("{}", ui.card(&rows));
 }
 
 fn disclosure_env_bool(name: &str, default: bool) -> bool {
@@ -3396,30 +2744,53 @@ fn disclosure_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn data_collection_disclosure(non_interactive: bool) -> String {
+fn data_collection_points(non_interactive: bool) -> [String; 5] {
     let transcripts = disclosure_env_bool("CONTEXTSTREAM_TRANSCRIPTS_ENABLED", true);
     let hook_transcripts = disclosure_env_bool("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED", true);
     let git_capture = crate::config::git_capture_default_enabled();
     let index_behavior = if non_interactive {
         "starts in the background after a validated project binding"
     } else {
-        "starts only after your choice in the Index & Ingest step"
+        "starts only after you save the review screen"
     };
 
-    format!(
-        "Data handling before setup changes anything:\n\
-  • Transcript exchange saving default: {transcripts}. Change with `contextstream-mcp configure --transcripts on|off`.\n\
-  • Hook transcript saving default: {hook_transcripts}. Change with `contextstream-mcp configure --hook-transcripts on|off`.\n\
-  • Project indexing {index_behavior}; matched source files are sent to your ContextStream workspace. Exclude files with `.contextstream/ignore`; de-index with `project(action=\"purge\")`.\n\
-  • Editor lifecycle hooks are installed for selected supported editors. Disable with `CONTEXTSTREAM_HOOK_ENABLED=false` or remove them with the setup/uninstall flow.\n\
-  • Local Git capture default: {git_capture}. Managed hooks send event type, commit SHA/time, branch/ref names, aggregate line/file counts, a 256-character redacted commit subject, an opaque checkout ID, and a credential-free canonical remote. Absolute paths, commit bodies, and author name/email are not sent. Disable with `CONTEXTSTREAM_GIT_CAPTURE=off` or `.contextstream/config.json` `git_capture.enabled=false`."
-    )
+    [
+        format!("Transcript exchange saving default: {transcripts}. Change with `contextstream-mcp configure --transcripts on|off`."),
+        format!("Hook transcript saving default: {hook_transcripts}. Change with `contextstream-mcp configure --hook-transcripts on|off`."),
+        format!("Project indexing {index_behavior}; matched source files are sent to your ContextStream workspace. Exclude files with `.contextstream/ignore`; de-index with `project(action=\"purge\")`."),
+        "Editor lifecycle hooks are installed for selected supported editors. Disable with `CONTEXTSTREAM_HOOK_ENABLED=false` or remove them with the setup/uninstall flow.".to_string(),
+        format!("Local Git capture default: {git_capture}. Managed hooks send event type, commit SHA/time, branch/ref names, aggregate line/file counts, a 256-character redacted commit subject, an opaque checkout ID, and a credential-free canonical remote. Absolute paths, commit bodies, and author name/email are not sent. Disable with `CONTEXTSTREAM_GIT_CAPTURE=off` or `.contextstream/config.json` `git_capture.enabled=false`."),
+    ]
 }
 
+#[cfg(test)]
+fn data_collection_disclosure(non_interactive: bool) -> String {
+    let mut disclosure = "Data handling before setup changes anything:".to_string();
+    for point in data_collection_points(non_interactive) {
+        disclosure.push_str("\n  • ");
+        disclosure.push_str(&point);
+    }
+    disclosure
+}
+
+/// The data-handling notice, shown before setup changes anything. The
+/// facts are complete; they are set as muted fine print so they inform
+/// without crowding the flow.
 fn print_data_collection_disclosure(non_interactive: bool) {
-    println!("{}", style("Data & privacy").bold());
-    println!("{}", data_collection_disclosure(non_interactive));
+    let ui = ui::ui();
+    let width = ui.card_width().saturating_sub(ui::GUTTER.len() + 2);
     println!();
+    println!("{}{}", ui::GUTTER, ui.kicker("Data and privacy"));
+    for point in data_collection_points(non_interactive) {
+        for (index, line) in ui::wrap(&point, width).into_iter().enumerate() {
+            let bullet = if index == 0 {
+                ui.faint("·")
+            } else {
+                " ".to_string()
+            };
+            println!("{}{bullet} {}", ui::GUTTER, ui.muted(&line));
+        }
+    }
 }
 
 fn setup_teaching_contracts(editors: &[editors::Editor]) -> Vec<HarnessTeachingContract> {
@@ -3442,11 +2813,8 @@ fn print_setup_outcome(
     project_path: Option<&Path>,
     outcome: &SetupCompletionEvidence,
 ) {
+    let ui = ui::ui();
     let teaching_contracts = setup_teaching_contracts(editors);
-    let teaching_version = teaching_contracts
-        .first()
-        .map(|contract| contract.teaching_version.as_str())
-        .unwrap_or(HARNESS_TEACHING_VERSION);
     debug_assert!(teaching_contracts
         .iter()
         .all(|contract| contract.teaching_version == HARNESS_TEACHING_VERSION));
@@ -3459,185 +2827,120 @@ fn print_setup_outcome(
         .map(|path| format!("{path:?}"))
         .unwrap_or_else(|| "/path/to/project".to_string());
 
-    println!();
-    match outcome.state {
-        SetupCompletionState::RestartRequired => {
-            println!(
-                "{}",
-                style("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").green()
-            );
-            println!(
-                "{} {}",
-                ROCKET,
-                style("Configuration verified — restart your editor")
-                    .bold()
-                    .green()
-            );
-            println!(
-                "{}",
-                style("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").green()
-            );
-        }
+    let (badge, title) = match outcome.state {
+        SetupCompletionState::RestartRequired => ("ready", "ContextStream is set up"),
         SetupCompletionState::DryRunPreview => {
-            println!(
-                "{}",
-                style("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").cyan()
-            );
-            println!(
-                "{}",
-                style("Setup preview finished — no local files were changed")
-                    .bold()
-                    .cyan()
-            );
-            println!(
-                "{}",
-                style("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").cyan()
-            );
+            ("preview", "Preview finished · nothing was changed")
         }
-        _ => {
-            println!(
-                "{}",
-                style("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").yellow()
-            );
-            println!(
-                "{}",
-                style(match outcome.state {
-                    SetupCompletionState::NoClientConfigured =>
-                        "Setup paused — choose a coding harness",
-                    SetupCompletionState::RulesOnlyReady =>
-                        "Rules refreshed — select an MCP-capable harness to connect",
-                    SetupCompletionState::RepairRequired =>
-                        "Configuration needs repair before restart",
-                    SetupCompletionState::AccountOnly => "Account-only setup saved",
-                    SetupCompletionState::ProjectRequired =>
-                        "Editor setup saved — project setup is incomplete",
-                    SetupCompletionState::IndexRequired =>
-                        "Project linked — indexing still needs to start",
-                    SetupCompletionState::DryRunPreview | SetupCompletionState::RestartRequired =>
-                        unreachable!(),
-                })
-                .bold()
-                .yellow()
-            );
-            println!(
-                "{}",
-                style("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").yellow()
-            );
+        SetupCompletionState::NoClientConfigured => ("paused", "Choose an editor to finish setup"),
+        SetupCompletionState::RulesOnlyReady => {
+            ("rules", "Rules updated · these editors can't run MCP")
         }
+        SetupCompletionState::RepairRequired => ("repair", "Some editor settings need a repair"),
+        SetupCompletionState::AccountOnly => ("saved", "Account and editors are set up"),
+        SetupCompletionState::ProjectRequired => {
+            ("almost", "Editors are set up · link a project to finish")
+        }
+        SetupCompletionState::IndexRequired => {
+            ("almost", "Project linked · indexing hasn't started")
+        }
+    };
+
+    let mut account = email.to_string();
+    if team_capable {
+        account.push_str(&ui.faint(" · team"));
     }
-    println!();
-    println!("  {} Logged in as: {}", CHECK, style(email).cyan());
-    println!("  {} Credentials saved", CHECK);
+    let mut rows = vec![
+        format!("{}  {}", ui.badge(badge), ui.strong(title)),
+        String::new(),
+        ui.row("Account", &account),
+    ];
+    if !editors.is_empty() {
+        rows.push(ui.row("Editors", &selected_editors_summary(editors)));
+    }
     if let Some(workspace) = workspace {
-        println!(
-            "  {} Workspace selected: {}",
-            CHECK,
-            style(&workspace.name).cyan()
-        );
-    }
-    if editors.is_empty() {
-        println!("  {} No coding harness configured", style("○").yellow());
-    } else {
-        println!(
-            "  {} Editor configuration refreshed: {}",
-            CHECK,
-            selected_editors_summary(editors)
-        );
-        println!(
-            "  {} Harness workflow contract: {}",
-            CHECK,
-            style(teaching_version).cyan()
-        );
+        rows.push(ui.row("Workspace", &workspace.name));
     }
     if outcome.binding_established {
-        println!(
-            "  {} Project linked: {}",
-            CHECK,
-            style(
-                project_path
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "validated checkout".to_string())
-            )
-            .cyan()
-        );
-    } else if !outcome.account_only_requested {
-        println!("  {} Project not linked", style("○").yellow());
-    }
-    if outcome.index_started {
-        println!("  {} Initial project indexing started", CHECK);
-    } else if outcome.awaiting_first_files {
-        if crate::watch::watch_enabled() {
-            println!(
-                "  {} Empty project ready — files will sync automatically when added",
-                CHECK
-            );
+        let folder = project_path
+            .map(wizard::display_path)
+            .unwrap_or_else(|| "linked checkout".to_string());
+        let status = if outcome.index_started {
+            "indexing"
+        } else if outcome.awaiting_first_files {
+            "empty · indexed as files appear"
         } else {
-            println!(
-                "  {} Empty project ready — automatic sync is disabled on this machine",
-                CHECK
-            );
-        }
+            "not indexed yet"
+        };
+        rows.push(ui.row(
+            "Project",
+            &format!("{} {}", ui.path(&folder), ui.faint(&format!("· {status}"))),
+        ));
+    } else if !outcome.account_only_requested {
+        rows.push(ui.row("Project", &ui.muted("Not linked")));
     }
-    if outcome.doctor_healthy {
-        println!("  {} Required configuration checks passed", CHECK);
-    } else {
-        println!(
-            "  {} Required configuration checks failed",
-            style("✗").red()
-        );
-    }
-    println!(
-        "  {} End-to-end HTTPS encryption on all remote connections",
-        CHECK
-    );
-    if outcome.mcp_editor_count > 0 {
-        println!(
-            "  {} Runtime connection pending — setup does not claim a connection until the server observes an editor MCP handshake.",
-            style("○").yellow()
-        );
-    } else if !editors.is_empty() {
-        println!(
-            "  {} No MCP runtime was configured — the selected harness integration is rules-only.",
-            style("○").yellow()
-        );
+    if !outcome.doctor_healthy {
+        rows.push(ui.row("Checks", &ui.error("some checks failed · see below")));
     }
     println!();
+    println!("{}", ui.card(&rows));
+    println!();
+
+    let step = |number: usize, text: &str| {
+        println!(
+            "{}{} {}",
+            ui::GUTTER,
+            ui.paint(&format!("{number:02}"), Some(ui::Tok::Accent), true),
+            text
+        );
+    };
+    let detail = |text: &str| println!("{}   {}", ui::GUTTER, text);
+    // Long guidance wraps under its step instead of running off the card.
+    let wrap_width = ui.card_width().saturating_sub(ui::GUTTER.len() + 3);
+    let wrapped = |text: &str, style: &dyn Fn(&str) -> String| {
+        for line in ui::wrap(text, wrap_width) {
+            detail(&style(&line));
+        }
+    };
+    let editor_detail = |editor: &editors::Editor| {
+        let name = editor.display_name();
+        let text = format!("{name} {}", editor.activation_reload_instruction());
+        for (index, line) in ui::wrap(&text, wrap_width).into_iter().enumerate() {
+            match line.strip_prefix(name).filter(|_| index == 0) {
+                Some(rest) => detail(&format!("{}{}", ui.strong(name), ui.muted(rest))),
+                None => detail(&ui.muted(&line)),
+            }
+        }
+    };
+    println!("{}{}", ui::GUTTER, ui.kicker("Next"));
 
     match outcome.state {
         SetupCompletionState::DryRunPreview => {
-            println!(
-                "Run the same command without {} to apply it.",
-                style("--dry-run").cyan()
+            step(
+                1,
+                &format!(
+                    "Run the same command without {} to apply it.",
+                    ui.path("--dry-run")
+                ),
             );
         }
         SetupCompletionState::NoClientConfigured => {
-            println!("No coding harness can use ContextStream yet.");
-            println!(
-                "Run: {}",
-                style(
-                    "contextstream-mcp setup --editors <editor-id> --project-path /path/to/project"
-                )
-                .cyan()
-            );
+            step(1, "Pick an editor and the project folder to connect:");
+            detail(&ui.path(
+                "contextstream-mcp setup --editors <editor-id> --project-path /path/to/project",
+            ));
         }
         SetupCompletionState::RulesOnlyReady => {
-            println!(
-                "The selected harness rules were refreshed, but none of those harnesses supports an MCP transport."
-            );
             for editor in editors {
-                println!(
-                    "  {}: {}",
-                    style(editor.display_name()).bold(),
-                    editor.activation_reload_instruction()
-                );
+                editor_detail(editor);
             }
-            println!(
-                "To use ContextStream tools, add an MCP-capable harness with: {}",
-                style(
-                    "contextstream-mcp setup --editors <editor-id> --project-path /path/to/project"
-                )
-                .cyan()
+            step(
+                1,
+                "Add an editor that supports MCP to use ContextStream tools:",
             );
+            detail(&ui.path(
+                "contextstream-mcp setup --editors <editor-id> --project-path /path/to/project",
+            ));
         }
         SetupCompletionState::RepairRequired => {
             let scope = if outcome.binding_established {
@@ -3645,118 +2948,85 @@ fn print_setup_outcome(
             } else {
                 "global"
             };
-            println!("Repair only the selected managed surfaces, then verify:");
-            println!(
-                "  {}",
-                style(format!(
-                    "contextstream-mcp doctor --repair --scope {scope} --editors {editor_ids}"
-                ))
-                .cyan()
-            );
-            println!(
-                "  {}",
-                style(format!(
-                    "contextstream-mcp doctor --scope {scope} --editors {editor_ids}"
-                ))
-                .cyan()
-            );
+            step(1, "Repair the editor settings setup manages:");
+            detail(&ui.path(&format!(
+                "contextstream-mcp doctor --repair --scope {scope} --editors {editor_ids}"
+            )));
+            step(2, "Then confirm everything passes:");
+            detail(&ui.path(&format!(
+                "contextstream-mcp doctor --scope {scope} --editors {editor_ids}"
+            )));
         }
         SetupCompletionState::AccountOnly => {
-            println!("No project was linked or indexed, as requested.");
-            println!(
-                "When ready, finish project setup with: {}",
-                style(format!(
-                    "contextstream-mcp setup --project-path /path/to/project --editors {editor_ids}"
-                ))
-                .cyan()
-            );
+            step(1, "When you're ready, link a project:");
+            detail(&ui.path(&format!(
+                "contextstream-mcp setup --project-path /path/to/project --editors {editor_ids}"
+            )));
         }
         SetupCompletionState::ProjectRequired => {
-            println!("Choose the checkout you want ContextStream to understand:");
-            println!(
-                "  {}",
-                style(format!(
-                    "contextstream-mcp setup --project-path {resume_project} --editors {editor_ids}"
-                ))
-                .cyan()
-            );
-            println!("Nothing outside that validated checkout will be indexed by setup.");
+            step(1, "Link the checkout ContextStream should learn:");
+            detail(&ui.path(&format!(
+                "contextstream-mcp setup --project-path {resume_project} --editors {editor_ids}"
+            )));
+            detail(&ui.faint("Nothing outside that folder is indexed."));
         }
         SetupCompletionState::IndexRequired => {
-            println!("Start project ingestion before expecting repository-grounded answers.");
-            println!(
-                "After restarting the editor, ask it to run {} for this checkout.",
-                style("project(action=\"index\")").cyan()
+            step(
+                1,
+                &format!(
+                    "Restart your editor, then ask it to run {}.",
+                    ui.path("project(action=\"index\")")
+                ),
             );
-            println!(
-                "Or re-run {} and choose foreground/background indexing.",
-                style(format!(
-                    "contextstream-mcp setup --project-path {resume_project} --editors {editor_ids}"
-                ))
-                .cyan()
-            );
+            detail(&ui.faint(&format!(
+                "Or re-run setup --project-path {resume_project} and choose when to index."
+            )));
         }
         SetupCompletionState::RestartRequired => {
-            println!("Next steps:");
-            println!("  1. Reload each configured harness:");
-            for editor in editors.iter().filter(|editor| editor.has_mcp_transport()) {
-                println!(
-                    "     {}: {}",
-                    style(editor.display_name()).bold(),
-                    editor.activation_reload_instruction()
+            let mcp_editors: Vec<_> = editors
+                .iter()
+                .filter(|editor| editor.has_mcp_transport())
+                .collect();
+            if let [editor] = mcp_editors.as_slice() {
+                step(
+                    1,
+                    &format!("Restart {} so it connects.", editor.display_name()),
                 );
+                wrapped(editor.activation_reload_instruction(), &|line| {
+                    ui.muted(line)
+                });
+            } else {
+                step(1, "Restart your editors so they connect:");
+                for editor in &mcp_editors {
+                    editor_detail(editor);
+                }
             }
+            let mut next = 2;
             if outcome.awaiting_first_files {
                 if crate::watch::watch_enabled() {
-                    println!(
-                        "  2. Add or generate the first project file. The managed sync bridge will index it automatically."
-                    );
+                    step(next, "Add your first file · it's indexed automatically.");
                 } else {
-                    println!(
-                        "  2. Add or generate the first project file, then run {}.",
-                        style("project(action=\"index\")").cyan()
+                    step(
+                        next,
+                        &format!(
+                            "Add your first file, then ask your agent to run {}.",
+                            ui.path("project(action=\"index\")")
+                        ),
                     );
                 }
-                println!(
-                    "  3. Ask the harness to run {} for this exact folder.",
-                    style("project(action=\"index_status\")").cyan()
-                );
-            } else {
-                println!(
-                    "  2. Ask the harness to run {} for this exact checkout.",
-                    style("project(action=\"index_status\")").cyan()
-                );
+                next += 1;
             }
+            step(next, "Then ask your agent:");
+            wrapped(&format!("\"{}\"", first_value_prompt()), &|line| {
+                ui.accent(line)
+            });
+            println!();
             println!(
-                "     If the checkout is unconfirmed or the bridge is offline, keep hosted MCP configured and run:"
-            );
-            println!(
-                "     {}",
-                style(format!(
-                    "contextstream-mcp doctor --repair --scope global --editors {editor_ids}"
+                "{}{}",
+                ui::GUTTER,
+                ui.faint(&format!(
+                    "Check the connection anytime · contextstream-mcp doctor --scope all --editors {editor_ids}"
                 ))
-                .cyan()
-            );
-            let prompt_step = if outcome.awaiting_first_files { 4 } else { 3 };
-            println!(
-                "  {prompt_step}. When checkout readiness and indexed coverage are confirmed, ask:"
-            );
-            println!("     {}", style(first_value_prompt()).cyan());
-            let doctor_step = prompt_step + 1;
-            println!(
-                "  {doctor_step}. Verify the handshake and grounding evidence with {}",
-                style(format!(
-                    "contextstream-mcp doctor --scope all --editors {editor_ids}"
-                ))
-                .cyan()
-            );
-            let workflow_step = doctor_step + 1;
-            println!(
-                "  {workflow_step}. Inspect the workflow anytime with {}",
-                style("help(action=\"workflow\", client_name=\"<editor-id>\")").cyan()
-            );
-            println!(
-                "The dashboard should show connected only after that editor completes a real MCP handshake."
             );
             if team_capable {
                 println!();
@@ -3767,51 +3037,52 @@ fn print_setup_outcome(
     println!();
 }
 
-/// Return the user email if saved credentials exist and are valid.
-/// Authenticate the user via browser login or API key paste.
+/// Authenticate via browser login, API key paste, or inline signup, offering
+/// to keep working saved credentials first (used by `configure`).
 pub async fn authenticate() -> Result<(String, String)> {
-    println!("{}{}", KEY, style("Authentication").bold());
-    println!();
-
-    // Check for existing credentials
     if let Ok(creds) = read_saved_credentials() {
         if let Some(api_key) = creds.api_key {
-            let masked = mask_api_key(&api_key);
-            println!("Found existing credentials: {}", style(&masked).dim());
-
-            if prompts::confirm("Use existing credentials?", true)? {
-                // Validate the key with a short timeout
-                print!("Validating credentials... ");
-                let config = Config {
+            ui::say(
+                ui::Mark::Info,
+                "Saved sign-in found",
+                Some(&mask_api_key(&api_key)),
+            );
+            if prompts::confirm("Keep using it?", true)? {
+                let client = ContextStreamClient::new(Config {
                     api_key: Some(api_key.clone()),
                     ..Default::default()
-                };
-                let client = ContextStreamClient::new(config);
-
-                match tokio::time::timeout(std::time::Duration::from_secs(10), client.me()).await {
+                });
+                let check = ui::spin(
+                    "Checking your saved sign-in",
+                    tokio::time::timeout(std::time::Duration::from_secs(10), client.me()),
+                )
+                .await;
+                match check {
                     Ok(Ok(user)) => {
-                        println!("{}", style("OK").green());
+                        ui::say(ui::Mark::Ok, "Signed in", Some(&user.email));
                         return Ok((api_key, user.email));
                     }
-                    Ok(Err(e)) => {
-                        println!();
-                        println!("{} Existing credentials are invalid: {}", CROSS, e);
-                    }
-                    Err(_) => {
-                        println!();
-                        println!(
-                            "{} Credential validation timed out. Continuing with new login...",
-                            CROSS
-                        );
-                    }
+                    Ok(Err(e)) => ui::say(
+                        ui::Mark::Warn,
+                        "Your saved sign-in no longer works",
+                        Some(&e.to_string()),
+                    ),
+                    Err(_) => ui::say(
+                        ui::Mark::Warn,
+                        "Couldn't check your saved sign-in",
+                        Some("continuing with a new sign-in"),
+                    ),
                 }
             }
         }
     }
 
-    // Choose authentication method. The inline email + SMS signup is offered
-    // only when the server publishes it as available.
-    let inline_signup_available = tokio::time::timeout(
+    authenticate_fresh(inline_signup_available().await).await
+}
+
+/// Whether the server offers inline email + SMS signup (bounded wait).
+async fn inline_signup_available() -> bool {
+    tokio::time::timeout(
         std::time::Duration::from_secs(6),
         mcp_client::auth::fetch_signup_config(),
     )
@@ -3819,19 +3090,20 @@ pub async fn authenticate() -> Result<(String, String)> {
     .ok()
     .and_then(|result| result.ok())
     .map(|config| config.inline_signup_available)
-    .unwrap_or(false);
-    let mut auth_choices = vec!["Login with browser (recommended)", "Paste API key"];
+    .unwrap_or(false)
+}
+
+/// Sign in without reusing saved credentials.
+async fn authenticate_fresh(inline_signup_available: bool) -> Result<(String, String)> {
+    let mut choices = vec!["Continue in your browser (recommended)", "Paste an API key"];
     if inline_signup_available {
-        auth_choices.push("Create a new account (email + phone)");
+        choices.push("Create an account with email and phone");
     }
 
-    let choice = prompts::select("How would you like to authenticate?", &auth_choices)?;
-
-    match choice {
+    match prompts::select("How do you want to sign in?", &choices)? {
         0 => authenticate_browser().await,
         1 => authenticate_api_key().await,
-        2 => authenticate_email_signup().await,
-        _ => unreachable!(),
+        _ => authenticate_email_signup().await,
     }
 }
 
@@ -3860,7 +3132,11 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
     use mcp_client::auth as signup;
 
     println!();
-    println!("{}", style("Create a ContextStream account").bold());
+    println!(
+        "{}{}",
+        ui::GUTTER,
+        ui::ui().heading("Create your ContextStream account")
+    );
     let email = loop {
         let entered = prompts::input("Email address:", None)?;
         let trimmed = entered.trim().to_lowercase();
@@ -3884,7 +3160,7 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
     .map_err(|error| {
         let (code, message) = signup_error_parts(&error);
         if code == "account_exists" || code == "account_exists_unverified" {
-            anyhow::anyhow!("{message} Choose \"Login with browser\" instead.")
+            anyhow::anyhow!("{message} Choose \"Continue in your browser\" instead.")
         } else {
             anyhow::anyhow!("Could not start the signup: {message}")
         }
@@ -3969,7 +3245,7 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
     )? {
         let _ = signup::cancel_signup(&pending.attempt_id, &pending.client_secret).await;
         let _ = clear_pending_connection();
-        anyhow::bail!("No text was sent. You can choose \"Login with browser\" instead.");
+        anyhow::bail!("No text was sent. You can choose \"Continue in your browser\" instead.");
     }
     let sent = signup::add_signup_phone(
         &pending.attempt_id,
@@ -4036,94 +3312,89 @@ async fn authenticate_email_signup() -> Result<(String, String)> {
 async fn authenticate_browser() -> Result<(String, String)> {
     use mcp_client::auth::{poll_device_login, start_device_login};
 
-    println!("\nStarting browser authentication...");
-
-    // Start device flow
-    let device_response = start_device_login().await?;
-
+    let ui = ui::ui();
+    let device_response = ui::spin("Starting browser sign-in", start_device_login()).await?;
+    let opened = open::that(&device_response.verification_uri).is_ok();
+    let rows = vec![
+        ui.kicker("Confirm in your browser"),
+        String::new(),
+        ui.row(
+            "Code",
+            &ui.paint(&device_response.user_code, Some(ui::Tok::Accent), true),
+        ),
+        ui.row("Link", &ui.path(&device_response.verification_uri)),
+        String::new(),
+        ui.muted(if opened {
+            "Your browser opened this page. Check that the code matches, then approve."
+        } else {
+            "Open the link, check that the code matches, then approve."
+        }),
+    ];
     println!();
-    println!(
-        "Please visit: {}",
-        style(&device_response.verification_uri).cyan().underlined()
-    );
-    println!(
-        "And enter code: {}",
-        style(&device_response.user_code).bold().yellow()
-    );
-    println!();
-
-    // Try to open browser
-    if open::that(&device_response.verification_uri).is_ok() {
-        println!("{}", style("(Browser opened automatically)").dim());
-    }
-
-    println!("Waiting for authentication...");
+    println!("{}", ui.card(&rows));
 
     // Poll for completion, but never hang setup forever on an abandoned
     // browser tab — bail with guidance after 5 minutes.
     const DEVICE_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-    let token = match tokio::time::timeout(
-        DEVICE_LOGIN_TIMEOUT,
-        poll_device_login(&device_response.device_code, device_response.interval),
+    let token = match ui::spin(
+        "Waiting for you to approve",
+        tokio::time::timeout(
+            DEVICE_LOGIN_TIMEOUT,
+            poll_device_login(&device_response.device_code, device_response.interval),
+        ),
     )
     .await
     {
         Ok(result) => result?,
         Err(_) => {
             return Err(anyhow::anyhow!(
-                "Browser authentication timed out after 5 minutes. Re-run `contextstream-mcp setup` \
-                 and finish the browser step, or choose \"Paste API key\" instead."
+                "Browser sign-in timed out after 5 minutes. Re-run `contextstream-mcp setup` \
+                 and approve in the browser, or choose \"Paste an API key\" instead."
             ));
         }
     };
 
-    // Create API key from JWT
-    let config = Config {
+    // Exchange the browser session for a persistent API key.
+    let client = ContextStreamClient::new(Config {
         jwt: Some(token.access_token.clone()),
         ..Default::default()
-    };
-    let client = ContextStreamClient::new(config);
-
-    // Get user info
-    let user = client.me().await?;
-
-    // Create persistent API key
-    let api_key = client.create_api_key("ContextStream CLI").await?;
-
-    Ok((api_key, user.email))
+    });
+    ui::spin("Finishing sign-in", async {
+        let user = client.me().await?;
+        let api_key = client.create_api_key("ContextStream CLI").await?;
+        Ok::<_, anyhow::Error>((api_key, user.email))
+    })
+    .await
 }
 
 /// Authenticate via pasted API key.
 async fn authenticate_api_key() -> Result<(String, String)> {
-    println!(
-        "\nGet your API key from: {}",
-        style("https://contextstream.io/settings/api-keys")
-            .cyan()
-            .underlined()
+    ui::say(
+        ui::Mark::Info,
+        "Create or copy a key",
+        Some("https://contextstream.io/settings/api-keys"),
     );
-    println!();
 
     loop {
-        let api_key = prompts::password("Paste your API key:")?;
+        let api_key = prompts::password("Paste your API key")?;
+        let api_key = api_key.trim().to_string();
 
         if api_key.is_empty() {
-            println!("{} API key cannot be empty", CROSS);
+            ui::say(ui::Mark::Fail, "The key can't be empty", None);
             continue;
         }
 
-        // Validate the key
-        let config = Config {
+        let client = ContextStreamClient::new(Config {
             api_key: Some(api_key.clone()),
             ..Default::default()
-        };
-        let client = ContextStreamClient::new(config);
+        });
 
-        match client.me().await {
+        match ui::spin("Checking the key", client.me()).await {
             Ok(user) => {
                 return Ok((api_key, user.email));
             }
             Err(e) => {
-                println!("{} Invalid API key: {}", CROSS, e);
+                ui::say(ui::Mark::Fail, "That key didn't work", Some(&e.to_string()));
                 if !prompts::confirm("Try again?", true)? {
                     return Err(anyhow::anyhow!("Authentication cancelled"));
                 }
@@ -4415,26 +3686,41 @@ pub async fn configure_editor_with_workspace(
     }
 
     let had_issues = !issues.is_empty();
-    if issues.is_empty() {
-        println!("  {} {}", CHECK, style(editor.display_name()).bold());
-    } else {
-        println!(
-            "  {}{}",
-            style("⚠  ").yellow(),
-            style(editor.display_name()).bold()
-        );
-    }
+    let mut parts = Vec::new();
     if !mcp_targets.is_empty() {
-        print_editor_config_row("MCP", &mcp_targets.join(", "));
+        parts.push(format!("MCP {}", mcp_targets.join(" + ")));
     }
     if !rules_targets.is_empty() {
-        print_editor_config_row("Rules", &rules_targets.join(", "));
+        parts.push(format!("rules {}", rules_targets.join(" + ")));
     }
-    if !saved_items.is_empty() {
-        print_editor_config_row("Saved", &saved_items.join(", "));
-    }
-    for issue in issues {
-        println!("      {}{}", CROSS, issue);
+    parts.extend(saved_items.iter().map(|item| match *item {
+        "hosted sync bridge" => "sync".to_string(),
+        other => other.to_string(),
+    }));
+    let summary = parts.join(" · ");
+    if issues.is_empty() {
+        ui::say(ui::Mark::Ok, editor.display_name(), Some(&summary));
+    } else {
+        let ui = ui::ui();
+        ui::say(
+            ui::Mark::Warn,
+            editor.display_name(),
+            Some(&format!(
+                "{} problem{}",
+                issues.len(),
+                if issues.len() == 1 { "" } else { "s" }
+            )),
+        );
+        if !summary.is_empty() {
+            println!(
+                "{}    {}",
+                ui::GUTTER,
+                ui.faint(&format!("saved: {summary}"))
+            );
+        }
+        for issue in &issues {
+            println!("{}    {} {}", ui::GUTTER, ui.mark(ui::Mark::Fail), issue);
+        }
     }
 
     if had_issues && !safe_edit::is_dry_run() {
@@ -4455,10 +3741,6 @@ pub async fn configure_editor_with_workspace(
     }
 
     Ok(())
-}
-
-fn print_editor_config_row(label: &str, value: &str) {
-    println!("      {}{}", style(format!("{:<8}", label)).dim(), value);
 }
 
 /// Set up workspace.
@@ -4570,6 +3852,142 @@ async fn setup_workspace_for_path(
     Ok(None)
 }
 
+/// Everything project selection knows about this checkout and workspace.
+pub(crate) struct ProjectCandidates {
+    pub(crate) ws_id: Option<uuid::Uuid>,
+    pub(crate) folder_project_name: String,
+    pub(crate) existing_projects: Vec<mcp_types::api::Project>,
+    pub(crate) checkout_repository_identity: Option<mcp_session::RepositoryRemoteIdentity>,
+    pub(crate) checkout_repository_url: Option<String>,
+    /// Projects bound to this checkout's Git remote.
+    pub(crate) repository_matches: Vec<mcp_types::api::Project>,
+    /// The folder's saved project, only when it still validates.
+    pub(crate) linked_project: Option<mcp_types::api::Project>,
+    pub(crate) legacy_folder_matches: Vec<mcp_types::api::Project>,
+    /// The single project named like the folder (a display name, never identity).
+    pub(crate) folder_match: Option<mcp_types::api::Project>,
+}
+
+/// List the workspace's projects and classify them against `cwd`.
+pub(crate) async fn gather_project_candidates(
+    client: &ContextStreamClient,
+    cwd: &std::path::Path,
+    ws: &WorkspaceInfo,
+) -> Result<ProjectCandidates> {
+    let ws_id = uuid::Uuid::parse_str(&ws.id).ok();
+    let folder_project_name = cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_string();
+
+    let mut existing_projects = Vec::new();
+    let mut page = 1_i64;
+    loop {
+        let batch = client.list_projects(ws_id, Some(page), Some(200)).await?;
+        // The API may clamp the requested page size to a lower server-side
+        // maximum. A short page therefore does not prove that pagination is
+        // complete: large workspaces used to hide older projects from this
+        // picker, then offer to create a duplicate with the same name. Only
+        // an empty page is an unambiguous end-of-list signal.
+        if batch.is_empty() {
+            break;
+        }
+        existing_projects.extend(batch);
+        page += 1;
+        if page > 500 {
+            anyhow::bail!(
+                "Project selection exceeded 100,000 projects; narrow the workspace or pass an explicit project binding."
+            );
+        }
+    }
+    existing_projects.sort_by_key(|a| a.name.to_lowercase());
+
+    // A normalized Git remote is the only portable checkout signal available
+    // before this machine has a local binding. It lets an unattended setup on
+    // machine B or in a new worktree select the same canonical project created
+    // on machine A. Folder basenames are display names, never identity.
+    let checkout_repository_identity = checkout_repository_identity(cwd)?;
+    let checkout_repository_url = checkout_repository_identity
+        .as_ref()
+        .map(mcp_session::RepositoryRemoteIdentity::canonical_https_url);
+    let repository_matches = checkout_repository_identity
+        .as_ref()
+        .map(|identity| {
+            existing_projects
+                .iter()
+                .filter(|project| project_repository_identity(project).as_ref() == Some(identity))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let linked_project_config = read_project_config(cwd).ok().flatten();
+    let linked_project_id = linked_project_config
+        .as_ref()
+        .and_then(|cfg| cfg.project_id.clone());
+    let configured_project_name = linked_project_config
+        .as_ref()
+        .and_then(|cfg| cfg.project_name.as_deref());
+    let configured_checkout_root = linked_project_config
+        .as_ref()
+        .and_then(|cfg| cfg.checkout_root.as_deref());
+
+    let linked_project = linked_project_id.as_deref().and_then(|id| {
+        existing_projects
+            .iter()
+            .find(|project| project.id.to_string() == id)
+            // A UUID can remain syntactically valid after a project was
+            // renamed, repurposed, or copied from another checkout. Never let
+            // that stale local binding outrank the current folder identity:
+            // doing so uploads one repository into another project's index.
+            .filter(|project| {
+                linked_project_name_matches_checkout(
+                    &project.name,
+                    configured_project_name,
+                    configured_checkout_root,
+                    cwd,
+                )
+            })
+            .filter(|project| {
+                linked_project_repository_is_compatible(
+                    project,
+                    checkout_repository_identity.as_ref(),
+                )
+            })
+            .cloned()
+    });
+    let folder_matches: Vec<_> = existing_projects
+        .iter()
+        .filter(|project| project.name.eq_ignore_ascii_case(&folder_project_name))
+        .cloned()
+        .collect();
+    let legacy_folder_matches = folder_matches
+        .iter()
+        .filter(|project| project_repository_identity(project).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    let folder_match = (folder_matches.len() == 1).then(|| folder_matches[0].clone());
+
+    if linked_project.is_none() && linked_project_id.is_some() {
+        warning(
+            "The project UUID saved in this directory is unavailable or does not match this checkout. Ignoring the stale binding to prevent cross-project indexing.",
+        );
+    }
+
+    Ok(ProjectCandidates {
+        ws_id,
+        folder_project_name,
+        existing_projects,
+        checkout_repository_identity,
+        checkout_repository_url,
+        repository_matches,
+        linked_project,
+        legacy_folder_matches,
+        folder_match,
+    })
+}
+
 /// Resolve/select a project for the current directory.
 ///
 /// When `prompt_user` is true, this shows an interactive selector. Otherwise it
@@ -4656,105 +4074,18 @@ pub async fn select_project_for_current_directory(
         return Ok(None);
     };
 
-    let ws_id = uuid::Uuid::parse_str(&ws.id).ok();
-    let folder_project_name = cwd
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("project");
-
-    let mut existing_projects = Vec::new();
-    let mut page = 1_i64;
-    loop {
-        let batch = client.list_projects(ws_id, Some(page), Some(200)).await?;
-        // The API may clamp the requested page size to a lower server-side
-        // maximum. A short page therefore does not prove that pagination is
-        // complete: large workspaces used to hide older projects from this
-        // picker, then offer to create a duplicate with the same name. Only
-        // an empty page is an unambiguous end-of-list signal.
-        if batch.is_empty() {
-            break;
-        }
-        existing_projects.extend(batch);
-        page += 1;
-        if page > 500 {
-            anyhow::bail!(
-                "Project selection exceeded 100,000 projects; narrow the workspace or pass an explicit project binding."
-            );
-        }
-    }
-    existing_projects.sort_by_key(|a| a.name.to_lowercase());
-
-    // A normalized Git remote is the only portable checkout signal available
-    // before this machine has a local binding. It lets an unattended setup on
-    // machine B or in a new worktree select the same canonical project created
-    // on machine A. Folder basenames are display names, never identity.
-    let checkout_repository_identity = checkout_repository_identity(cwd)?;
-    let checkout_repository_url = checkout_repository_identity
-        .as_ref()
-        .map(mcp_session::RepositoryRemoteIdentity::canonical_https_url);
-    let repository_matches = checkout_repository_identity
-        .as_ref()
-        .map(|identity| {
-            existing_projects
-                .iter()
-                .filter(|project| project_repository_identity(project).as_ref() == Some(identity))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let linked_project_config = read_project_config(cwd).ok().flatten();
-    let linked_project_id = linked_project_config
-        .as_ref()
-        .and_then(|cfg| cfg.project_id.clone());
-    let configured_project_name = linked_project_config
-        .as_ref()
-        .and_then(|cfg| cfg.project_name.as_deref());
-    let configured_checkout_root = linked_project_config
-        .as_ref()
-        .and_then(|cfg| cfg.checkout_root.as_deref());
-
-    let linked_project = linked_project_id.as_deref().and_then(|id| {
-        existing_projects
-            .iter()
-            .find(|project| project.id.to_string() == id)
-            // A UUID can remain syntactically valid after a project was
-            // renamed, repurposed, or copied from another checkout. Never let
-            // that stale local binding outrank the current folder identity:
-            // doing so uploads one repository into another project's index.
-            .filter(|project| {
-                linked_project_name_matches_checkout(
-                    &project.name,
-                    configured_project_name,
-                    configured_checkout_root,
-                    cwd,
-                )
-            })
-            .filter(|project| {
-                linked_project_repository_is_compatible(
-                    project,
-                    checkout_repository_identity.as_ref(),
-                )
-            })
-            .cloned()
-    });
-    let folder_matches: Vec<_> = existing_projects
-        .iter()
-        .filter(|project| project.name.eq_ignore_ascii_case(folder_project_name))
-        .cloned()
-        .collect();
-    let legacy_folder_matches = folder_matches
-        .iter()
-        .filter(|project| project_repository_identity(project).is_none())
-        .cloned()
-        .collect::<Vec<_>>();
-    let folder_match = (folder_matches.len() == 1).then(|| folder_matches[0].clone());
-
-    if linked_project.is_none() && linked_project_id.is_some() {
-        warning(
-            "The project UUID saved in this directory is unavailable or does not match this checkout. Ignoring the stale binding to prevent cross-project indexing.",
-        );
-    }
+    let ProjectCandidates {
+        ws_id,
+        folder_project_name,
+        existing_projects,
+        checkout_repository_identity,
+        checkout_repository_url,
+        repository_matches,
+        linked_project,
+        legacy_folder_matches,
+        folder_match,
+    } = gather_project_candidates(client, cwd, ws).await?;
+    let folder_project_name = folder_project_name.as_str();
 
     if !prompt_user {
         // A validated checkout-local UUID wins. Otherwise a unique exact
@@ -4826,9 +4157,11 @@ pub async fn select_project_for_current_directory(
         return Ok(None);
     }
 
-    println!("\n{}{}", FOLDER, style("Project Selection").bold());
-    println!("  Current directory: {}", style(cwd.display()).dim());
-    println!("  Workspace: {}", style(&ws.name).cyan());
+    ui::say(
+        ui::Mark::Info,
+        &format!("Choose the project for {}", wizard::display_path(cwd)),
+        Some(&format!("workspace {}", ws.name)),
+    );
 
     enum ProjectChoice {
         Existing(ProjectInfo),
@@ -4836,34 +4169,25 @@ pub async fn select_project_for_current_directory(
         Skip,
     }
 
+    // Strongest evidence first, then creating a project named after the
+    // folder, then every other project. Enter therefore never links this
+    // folder to an unrelated project by accident.
     let mut options: Vec<(String, ProjectChoice)> = Vec::new();
     let mut added = HashSet::new();
 
     if let Some(project) = linked_project.as_ref() {
         added.insert(project.id.to_string());
         options.push((
-            format!(
-                "Use currently linked project: {} ({})",
-                project.name, project.id
-            ),
-            ProjectChoice::Existing(ProjectInfo {
-                id: project.id.to_string(),
-                name: project.name.clone(),
-            }),
+            format!("{} · linked to this folder", project.name),
+            ProjectChoice::Existing(ProjectInfo::from(project)),
         ));
     }
 
     for project in &repository_matches {
         if added.insert(project.id.to_string()) {
             options.push((
-                format!(
-                    "Use project matching this Git repository: {} ({})",
-                    project.name, project.id
-                ),
-                ProjectChoice::Existing(ProjectInfo {
-                    id: project.id.to_string(),
-                    name: project.name.clone(),
-                }),
+                format!("{} · matches this Git repository", project.name),
+                ProjectChoice::Existing(ProjectInfo::from(project)),
             ));
         }
     }
@@ -4871,39 +4195,33 @@ pub async fn select_project_for_current_directory(
     if let Some(project) = folder_match.as_ref() {
         if added.insert(project.id.to_string()) {
             options.push((
-                format!(
-                    "Use project matching this folder name: {} ({})",
-                    project.name, project.id
-                ),
-                ProjectChoice::Existing(ProjectInfo {
-                    id: project.id.to_string(),
-                    name: project.name.clone(),
-                }),
-            ));
-        }
-    }
-
-    for project in &existing_projects {
-        if added.insert(project.id.to_string()) {
-            options.push((
-                format!("Use existing project: {} ({})", project.name, project.id),
-                ProjectChoice::Existing(ProjectInfo {
-                    id: project.id.to_string(),
-                    name: project.name.clone(),
-                }),
+                format!("{} · same name as this folder", project.name),
+                ProjectChoice::Existing(ProjectInfo::from(project)),
             ));
         }
     }
 
     if allow_create {
         options.push((
-            format!("Create new project: {}", folder_project_name),
+            format!("Create a new project named {}", folder_project_name),
             ProjectChoice::CreateNew,
         ));
     }
 
+    for project in &existing_projects {
+        if added.insert(project.id.to_string()) {
+            options.push((
+                project.name.clone(),
+                ProjectChoice::Existing(ProjectInfo::from(project)),
+            ));
+        }
+    }
+
     if allow_skip {
-        options.push(("Skip project selection".to_string(), ProjectChoice::Skip));
+        options.push((
+            "None · don't link a project".to_string(),
+            ProjectChoice::Skip,
+        ));
     }
 
     if options.is_empty() {
@@ -4911,7 +4229,7 @@ pub async fn select_project_for_current_directory(
     }
 
     let option_refs: Vec<&str> = options.iter().map(|(label, _)| label.as_str()).collect();
-    let choice = prompts::select("Select a project for this directory:", &option_refs)?;
+    let choice = prompts::select("Which project?", &option_refs)?;
 
     match &options[choice].1 {
         ProjectChoice::Existing(project) => Ok(Some(project.clone())),
@@ -5061,11 +4379,11 @@ fn spawn_warmup(client: &ContextStreamClient, workspace_id: Option<&String>) {
     });
 }
 
-/// Spawn the background index task with the status-file and desktop
-/// notification plumbing shared by interactive setup and `setup --yes`.
-/// Warms the context API once indexing completes.
+/// Start the first index in a detached worker process so it keeps running
+/// after setup exits. The worker (`index --background-worker`) owns the
+/// status file, the desktop notification, and the context warm-up.
 fn spawn_background_index(
-    client: ContextStreamClient,
+    _client: ContextStreamClient,
     path: std::path::PathBuf,
     workspace_id: Option<String>,
     project_id: Option<uuid::Uuid>,
@@ -5074,105 +4392,91 @@ fn spawn_background_index(
     if safe_edit::is_dry_run() {
         return;
     }
-    let project_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("project")
-        .to_string();
-
-    let status_file = dirs::home_dir()
-        .map(|h| h.join(".contextstream").join("index-status.txt"))
-        .unwrap_or_else(|| std::env::temp_dir().join("contextstream-index-status.txt"));
-
-    let _ = safe_edit::write_owned_file_if_changed(
-        &status_file,
-        &format!(
-            "Status: Index update in progress\nProject: {}\nStarted: {}\n",
-            project_name,
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    match spawn_detached_index_worker(
+        &path,
+        workspace_id.as_deref(),
+        project_id,
+        include_media,
+        false,
+    ) {
+        Ok(()) => ui::say(
+            ui::Mark::Step,
+            "Indexing in the background",
+            Some("search fills in as it builds · you'll get a notification"),
         ),
-    );
+        Err(error) => ui::say(
+            ui::Mark::Warn,
+            "Couldn't start background indexing",
+            Some(&format!(
+                "{error} · run `contextstream-mcp index --path {}` instead",
+                wizard::display_path(&path)
+            )),
+        ),
+    }
+}
 
-    println!(
-        "  {}Index update is running in the background",
-        info_label()
-    );
-    println!("    Desktop notification: enabled when supported");
-    println!("    Status file: {}", style(status_file.display()).dim());
+/// Arguments for the detached index worker.
+pub fn index_worker_args(path: &Path, include_media: bool, force: bool) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        if force { "ingest" } else { "index" }.into(),
+        "--path".into(),
+        path.as_os_str().to_owned(),
+        "--background-worker".into(),
+    ];
+    if include_media {
+        args.push("--include-media".into());
+    }
+    if force {
+        args.push("--force".into());
+    }
+    args
+}
 
-    tokio::spawn(async move {
-        let result = index_project_background(
-            &client,
-            &path,
-            workspace_id.as_ref(),
-            project_id,
-            include_media,
-            false,
-        )
-        .await;
+/// Spawn this binary as a detached index worker: no stdio, its own process
+/// group (so Ctrl+C and terminal hangup in the parent do not reach it), and
+/// the workspace/project hints the caller resolved.
+pub fn spawn_detached_index_worker(
+    path: &Path,
+    workspace_id: Option<&str>,
+    project_id: Option<uuid::Uuid>,
+    include_media: bool,
+    force: bool,
+) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    // A binary replaced while running reports "<path> (deleted)" on Linux.
+    let exe = exe
+        .to_str()
+        .and_then(|raw| raw.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+        .filter(|live| live.exists())
+        .unwrap_or(exe);
 
-        let (status_msg, notification_title, notification_body) = match result {
-            Ok(outcome)
-                if outcome.committed && outcome.scan_complete && outcome.files_deferred == 0 =>
-            {
-                // Warm up the context API so the first real call is fast
-                warmup_context(&client, workspace_id.as_ref()).await;
-                (
-                    format!(
-                        "Status: Complete\nProject: {}\nFiles indexed: {}\nCompleted: {}\n",
-                        project_name,
-                        outcome.files_indexed,
-                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-                    ),
-                    "ContextStream Index Update Complete".to_string(),
-                    format!("{}: {} files indexed", project_name, outcome.files_indexed),
-                )
-            }
-            Ok(outcome) if outcome.pending_jobs > 0 => (
-                format!(
-                    "Status: Index update in progress\nProject: {}\nFiles indexed so far: {}\nPending jobs: {}\nAccepted: {}\n",
-                    project_name,
-                    outcome.files_indexed,
-                    outcome.pending_jobs,
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-                ),
-                "ContextStream Index Update Continues in Background".to_string(),
-                format!(
-                    "{}: accepted; {} server job(s) still indexing",
-                    project_name, outcome.pending_jobs
-                ),
-            ),
-            Ok(outcome) => (
-                format!(
-                    "Status: Incomplete\nProject: {}\nFiles indexed so far: {}\nFiles deferred: {}\nScan complete: {}\nFinished: {}\n",
-                    project_name,
-                    outcome.files_indexed,
-                    outcome.files_deferred,
-                    outcome.scan_complete,
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-                ),
-                "ContextStream Index Update Incomplete".to_string(),
-                format!(
-                    "{}: coverage is incomplete ({} deferred file(s)); review the status file",
-                    project_name, outcome.files_deferred
-                ),
-            ),
-            Err(e) => (
-                format!(
-                    "Status: Failed\nProject: {}\nError: {}\nCompleted: {}\n",
-                    project_name,
-                    e,
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-                ),
-                "ContextStream Index Update Failed".to_string(),
-                format!("{}: {}", project_name, e),
-            ),
-        };
-
-        let _ = safe_edit::write_owned_file_if_changed(&status_file, &status_msg);
-        send_desktop_notification(&notification_title, &notification_body);
-        print!("\x07");
-    });
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(index_worker_args(path, include_media, force))
+        .current_dir(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(workspace_id) = workspace_id {
+        command.env("CONTEXTSTREAM_WORKSPACE_ID", workspace_id);
+    }
+    if let Some(project_id) = project_id {
+        command.env("CONTEXTSTREAM_PROJECT_ID", project_id.to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    command.spawn().map(|_| ())
 }
 
 pub async fn report_setup_telemetry(
@@ -5239,8 +4543,6 @@ pub async fn index_project(
     include_media: bool,
     force: bool,
 ) -> Result<()> {
-    use indicatif::{ProgressBar, ProgressStyle};
-
     let project_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -5258,12 +4560,7 @@ pub async fn index_project(
     // operation. No bar, no per-file counter, no elapsed time, no
     // multi-line layout — the cursor character cycles in place at the
     // start of the line, the text never changes during the active run.
-    let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap();
-    let progress_pb = ProgressBar::new_spinner();
-    progress_pb.set_style(spinner_style.clone());
-    progress_pb
-        .set_message("Catching the stream! Project mapping and setup — takes a minute or two");
-    progress_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    let progress_pb = ui::ui().spinner("Indexing this project · a minute or two");
     // Task #15: track when we started waiting on the server so the UX can
     // pivot to "indexing continues in background" if no visible server
     // progress arrives within the SLO's degrade window. `waiting_since`
@@ -5347,14 +4644,25 @@ pub async fn index_project(
                 .map(|n| n > 0)
                 .unwrap_or(false);
             if degraded_shown || still_indexing {
-                println!("✓ Project linked — indexing continues in the background");
+                ui::say(
+                    ui::Mark::Ok,
+                    "Project linked",
+                    Some("indexing continues in the background"),
+                );
             } else {
-                println!("✓ Project ready");
+                ui::say(ui::Mark::Ok, "Project indexed", None);
             }
         }
         Err(error) => {
             progress_pb.finish_and_clear();
-            eprintln!("✗ Setup failed: {}", sanitize_index_error(&error));
+            eprintln!(
+                "{}",
+                ui::ui().line(
+                    ui::Mark::Fail,
+                    "Indexing failed",
+                    Some(&sanitize_index_error(&error))
+                )
+            );
             return Err(error.into());
         }
     }
@@ -5619,7 +4927,7 @@ mod tests {
     use super::{
         ambiguous_workspace_message, canonical_checkout_root, classify_project_workspace,
         data_collection_disclosure, editor_needs_managed_helper, format_index_completion_message,
-        format_setup_step_progress, linked_project_name_matches_checkout, local_mcp_allowed,
+        linked_project_name_matches_checkout, local_mcp_allowed,
         local_mcp_override_allowed_from_env_value, no_target_editors_message,
         parse_setup_ingest_job_progress, parse_setup_transport_preference,
         project_workspace_is_verified, read_setup_transport_marker,
@@ -6452,23 +5760,46 @@ mod tests {
     }
 
     #[test]
-    fn setup_step_progress_marks_completed_current_and_pending_steps() {
-        assert_eq!(format_setup_step_progress(3, 5), "● ● ◆ ○ ○");
-        assert_eq!(format_setup_step_progress(0, 3), "◆ ○ ○");
-        assert_eq!(format_setup_step_progress(9, 3), "● ● ◆");
-    }
-
-    #[test]
-    fn setup_index_choices_default_to_background_and_include_back_to_review() {
+    fn setup_index_choices_default_to_background() {
         let choices = setup_index_choices();
 
-        assert_eq!(choices.len(), 4);
+        assert_eq!(choices.len(), 3);
         // Background is the default (first) choice so setup finishes
         // immediately; blocking foreground indexing is explicit opt-in.
         assert!(choices[0].contains("background"));
         assert!(choices[0].contains("recommended"));
-        assert!(choices[1].contains("Update index now"));
-        assert!(choices[3].contains("Back to review"));
+        assert!(choices[1].starts_with("Now"));
+        assert!(choices[2].starts_with("Skip"));
+    }
+
+    #[test]
+    fn index_worker_args_select_the_detached_worker_mode() {
+        let args = super::index_worker_args(Path::new("/work/app"), false, false);
+        let args: Vec<_> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["index", "--path", "/work/app", "--background-worker"]
+        );
+
+        let args = super::index_worker_args(Path::new("/work/app"), true, true);
+        let args: Vec<_> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "ingest",
+                "--path",
+                "/work/app",
+                "--background-worker",
+                "--include-media",
+                "--force"
+            ]
+        );
     }
 
     #[test]
@@ -6737,6 +6068,15 @@ pub struct WorkspaceInfo {
 pub struct ProjectInfo {
     pub id: String,
     pub name: String,
+}
+
+impl From<&mcp_types::api::Project> for ProjectInfo {
+    fn from(project: &mcp_types::api::Project) -> Self {
+        Self {
+            id: project.id.to_string(),
+            name: project.name.clone(),
+        }
+    }
 }
 
 /// Send a desktop notification (cross-platform).

@@ -435,6 +435,10 @@ enum Commands {
         /// Run indexing in the background and notify when complete
         #[arg(long)]
         background: bool,
+
+        /// Internal: run as the detached worker `--background` starts.
+        #[arg(long, hide = true)]
+        background_worker: bool,
     },
 
     /// Index a project with progress tracking (interactive)
@@ -454,6 +458,10 @@ enum Commands {
         /// Run indexing in the background and notify when complete
         #[arg(long)]
         background: bool,
+
+        /// Internal: run as the detached worker `--background` starts.
+        #[arg(long, hide = true)]
+        background_worker: bool,
     },
 
     /// Connect this exact local checkout to a dashboard project enrollment
@@ -912,10 +920,15 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             }
             // Validate hooks after setup without rewriting MCP configs. Scoped
             // to the selection setup just recorded, so declining every editor
-            // leaves every editor alone.
+            // leaves every editor alone. Setup already reported what it
+            // configured, so this prints only problems.
             if !dry_run {
-                if let Err(e) = setup::update_hooks_scoped("global", None, true).await {
-                    eprintln!("Warning: Could not validate hooks: {}", e);
+                if let Err(e) = setup::refresh_hooks_after_setup().await {
+                    setup::ui::say(
+                        setup::ui::Mark::Warn,
+                        "Couldn't validate editor hooks",
+                        Some(&e.to_string()),
+                    );
                 }
             }
             if dry_run {
@@ -1178,8 +1191,11 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             force,
             include_media,
             background,
+            background_worker,
         }) => {
-            if let Err(e) = run_index_or_ingest(path, include_media, background, force).await {
+            if let Err(e) =
+                run_index_or_ingest(path, include_media, background, force, background_worker).await
+            {
                 eprintln!("Ingest failed: {}", e);
                 std::process::exit(1);
             }
@@ -1189,8 +1205,11 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             path,
             include_media,
             background,
+            background_worker,
         }) => {
-            if let Err(e) = run_index_or_ingest(path, include_media, background, false).await {
+            if let Err(e) =
+                run_index_or_ingest(path, include_media, background, false, background_worker).await
+            {
                 eprintln!("Index failed: {}", e);
                 std::process::exit(1);
             }
@@ -1708,41 +1727,59 @@ fn post_update_editor_refresh_commands(refresh_project_rules: bool) -> Vec<PostU
 }
 
 fn update_banner(current: &str) {
-    use console::style;
-
+    let ui = setup::ui::ui();
     eprintln!();
-    eprintln!("{}", style("ContextStream MCP Update").bold().cyan());
     eprintln!(
-        "  {} {}",
-        style("Current version").dim(),
-        style(format!("v{}", current)).bold()
+        "{}{}  {}",
+        setup::ui::GUTTER,
+        ui.paint(
+            "CONTEXTSTREAM UPDATE",
+            Some(setup::ui::Tok::AccentInk),
+            true
+        ),
+        ui.faint(&format!("current v{current}"))
     );
     eprintln!();
 }
 
 fn update_step(message: impl AsRef<str>) {
-    use console::style;
-    eprintln!("{} {}", style("●").cyan(), style(message.as_ref()).bold());
+    let ui = setup::ui::ui();
+    eprintln!(
+        "{}{} {}",
+        setup::ui::GUTTER,
+        ui.mark(setup::ui::Mark::Step),
+        ui.strong(message.as_ref())
+    );
 }
 
 fn update_detail(message: impl AsRef<str>) {
-    use console::style;
-    eprintln!("  {}", style(message.as_ref()).dim());
+    eprintln!(
+        "{}  {}",
+        setup::ui::GUTTER,
+        setup::ui::ui().muted(message.as_ref())
+    );
 }
 
 fn update_ok(message: impl AsRef<str>) {
-    use console::style;
-    eprintln!("{} {}", style("✓").green(), message.as_ref());
+    eprintln!(
+        "{}",
+        setup::ui::ui().line(setup::ui::Mark::Ok, message.as_ref(), None)
+    );
 }
 
 fn update_warn(message: impl AsRef<str>) {
-    use console::style;
-    eprintln!("{} {}", style("!").yellow(), message.as_ref());
+    eprintln!(
+        "{}",
+        setup::ui::ui().line(setup::ui::Mark::Warn, message.as_ref(), None)
+    );
 }
 
 fn update_skip(message: impl AsRef<str>) {
-    use console::style;
-    eprintln!("{} {}", style("-").dim(), style(message.as_ref()).dim());
+    let ui = setup::ui::ui();
+    eprintln!(
+        "{}",
+        ui.line(setup::ui::Mark::Pending, &ui.muted(message.as_ref()), None)
+    );
 }
 
 fn should_refresh_project_rules_after_update(cwd: &std::path::Path) -> bool {
@@ -2947,6 +2984,7 @@ async fn run_index_or_ingest(
     include_media: bool,
     background: bool,
     force: bool,
+    background_worker: bool,
 ) -> Result<()> {
     use console::style;
 
@@ -2989,24 +3027,22 @@ async fn run_index_or_ingest(
         .and_then(|n| n.to_str())
         .unwrap_or("project");
 
-    eprintln!(
-        "\n{} Index '{}' with ContextStream",
-        style("⬡").cyan(),
-        style(project_name).cyan()
-    );
-    eprintln!(
-        "  {}",
-        style("Indexing scans your project files, generates embeddings, and builds").dim()
-    );
-    eprintln!(
-        "  {}",
-        style("a searchable code graph. This powers semantic search, impact analysis,").dim()
-    );
-    eprintln!(
-        "  {}",
-        style("and context packs — so your AI actually understands your codebase.").dim()
-    );
-    eprintln!();
+    if !background_worker {
+        let ui = setup::ui::ui();
+        eprintln!();
+        eprintln!(
+            "{}{} {}",
+            setup::ui::GUTTER,
+            ui.heading("Index"),
+            ui.path(project_name)
+        );
+        eprintln!(
+            "{}{}",
+            setup::ui::GUTTER,
+            ui.muted("Builds the searchable code graph your agents use for search, impact analysis, and context.")
+        );
+        eprintln!();
+    }
 
     // Ensure we have valid credentials
     let config = match load_config() {
@@ -3204,7 +3240,7 @@ async fn run_index_or_ingest(
         })?;
     }
 
-    if background {
+    if background || background_worker {
         let bg_client = client.clone();
         let bg_path = project_path.clone();
         let bg_ws_id = workspace.as_ref().map(|w| w.id.clone());
@@ -3228,16 +3264,33 @@ async fn run_index_or_ingest(
             ),
         );
 
-        eprintln!(
-            "  {}Index update is running in the background",
-            style("ℹ  ").blue()
-        );
-        eprintln!("    You'll get a desktop notification when complete");
-        eprintln!("    Status file: {}", style(status_file.display()).dim());
+        if !background_worker {
+            // The upload must outlive this process, so it runs in a detached
+            // worker rather than a task that dies when this command exits.
+            setup::spawn_detached_index_worker(
+                &project_path,
+                workspace.as_ref().map(|w| w.id.as_str()),
+                resolved_project_id,
+                include_media,
+                force,
+            )
+            .map_err(|error| anyhow::anyhow!("Could not start background indexing: {error}"))?;
+            setup::ui::say(
+                setup::ui::Mark::Step,
+                "Indexing in the background",
+                Some("you'll get a desktop notification when it finishes"),
+            );
+            eprintln!(
+                "{}{}",
+                setup::ui::GUTTER,
+                setup::ui::ui().faint(&format!("Status file: {}", status_file.display()))
+            );
+            return Ok(());
+        }
 
         let status_file_clone = status_file.clone();
         let project_name_clone = project_name_owned.clone();
-        tokio::spawn(async move {
+        async move {
             let result = setup::index_project_background(
                 &bg_client,
                 &bg_path,
@@ -3313,10 +3366,8 @@ async fn run_index_or_ingest(
             let _ = std::fs::write(&status_file_clone, status_msg);
             setup::send_desktop_notification(&notification_title, &notification_body);
             print!("\x07");
-        });
-
-        // Wait briefly so the spawned task gets started before process exits
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        .await;
     } else {
         // Foreground index with multi-phase progress bars
         match setup::index_project(

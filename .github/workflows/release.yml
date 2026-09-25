@@ -208,7 +208,9 @@ jobs:
     if: needs.prepare.outputs.publish == 'true'
     needs: [prepare, assemble]
     runs-on: ubuntu-24.04
-    environment: public-release
+    # The repository owner releases without waiting on a second reviewer; every
+    # other actor still requires public-release environment approval.
+    environment: ${{ github.actor == 'escott-' && 'public-release-owner' || 'public-release' }}
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}

@@ -55,10 +55,15 @@ class WorkflowContractTest(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, ci)
 
+    RELEASE_ENVIRONMENT_GATE = (
+        "environment: ${{ github.actor == 'escott-' "
+        "&& 'public-release-owner' || 'public-release' }}"
+    )
+
     def test_release_is_approval_gated_and_cross_channel(self) -> None:
         release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
         for required in (
-            "environment: public-release",
+            self.RELEASE_ENVIRONMENT_GATE,
             "PRIVACY_LEGAL_APPROVAL_EVIDENCE",
             "INITIAL_RELEASE_KEY_ROTATION_EVIDENCE",
             "actions/attest-build-provenance@",
@@ -99,10 +104,20 @@ class WorkflowContractTest(unittest.TestCase):
 
         self.assertNotIn("ref: ${{ needs.prepare.outputs.source_commit }}", release)
         self.assertEqual(release.count("ref: ${{ github.sha }}"), 6)
-        self.assertEqual(release.count("environment: public-release"), 1)
         self.assertNotIn("wrangler r2 object", release)
         self.assertNotIn("CLOUDFLARE_API_TOKEN", release)
         self.assertNotIn("publish-r2:", release)
+
+    def test_release_owner_environment_bypass_is_scoped_to_the_owner(self) -> None:
+        release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+        # Exactly one job carries the deployment environment, and the
+        # reviewer-less owner environment is reachable only through the
+        # actor-scoped expression: every other actor keeps the reviewed
+        # public-release gate.
+        self.assertEqual(release.count("environment:"), 1)
+        self.assertEqual(release.count(self.RELEASE_ENVIRONMENT_GATE), 1)
+        self.assertEqual(release.count("public-release-owner"), 1)
+        self.assertEqual(release.count("github.actor"), 1)
 
     def test_codeql_covers_workflows_and_source_languages(self) -> None:
         codeql = (WORKFLOWS / "codeql.yml").read_text(encoding="utf-8")

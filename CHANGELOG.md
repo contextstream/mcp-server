@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.0.8
+
+- Setup: onboarding takes one review screen. Setup reuses a working saved
+  sign-in, accepts detected editors, picks or creates the workspace, links the
+  folder's project or Git repository (or plans a new project created only on
+  Save), and indexes in the background. Setup, doctor, update, and index screens
+  use the ContextCode terminal design, with fallbacks for 256/16-color
+  terminals, `NO_COLOR`, and legacy Windows consoles (#115).
+- Indexing: background indexing started by `setup` or `index --background` now
+  runs in a detached worker and finishes after the command exits (#115).
+- Project Brief: `init` shows the project's evidence-cited brief from the
+  session init response, framed as reference data. `project` gains `brief`,
+  `brief_update`, and `brief_refresh` (#116).
+- Sync bridge: a checkout whose account has no write access (403) or whose
+  credentials are rejected (401) is no longer re-submitted every 1.5 s. It
+  warns once, keeps local changes queued, and rechecks after 10 then 30 minutes
+  or on a bridge reload. A 429 waits for its `Retry-After`, and timeouts and
+  5xx back off from 2 s to 5 minutes. The client now honours `Retry-After`
+  without `X-RateLimit-*` headers, hands long waits back to the caller instead
+  of sleeping inside a request, and a denied full scan stops after the first
+  refused batch. Search-triggered repairs hold the same way (#120).
+- Performance: stdio `initialize` answers in ~4 ms instead of ~85 ms, editor
+  hooks run in ~3 ms instead of ~12 ms, no-op hooks are no longer installed, and
+  `init` overlaps independent lookups (#114).
+- `generate-configs --help` no longer prints the value of
+  `CONTEXTSTREAM_API_KEY` (#105).
+- `setup --yes` accepts `--workspace-id` and `CONTEXTSTREAM_WORKSPACE_ID` for
+  accounts with several workspaces (#106).
+- `qa` reads the API's renamed `upstream_*` latency fields (#107).
+- `configure --api-key-stdin` saves an existing key without the browser flow
+  (#109).
+- `answer` explains Answer API scope and lane refusals instead of returning a
+  bare 403/409/422 (#110).
+- Install URLs point at `https://contextstream.io/scripts/mcp.sh`; the README
+  one-liner and `update` fail when the download fails (#104, #108, #112).
+
 ## 1.0.3
 
 - Grounding: preserve evidence provenance, distinguish ranking signals from

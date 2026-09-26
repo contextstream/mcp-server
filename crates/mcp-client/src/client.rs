@@ -2953,16 +2953,7 @@ impl ContextStreamClient {
         endpoint: &str,
         body: &serde_json::Value,
     ) -> CacheKey {
-        // Learning fields affect only asynchronous telemetry and never change
-        // the served response. Opted-in calls bypass cache reads/writes in
-        // `should_cache_search_response` so an observation is actually created;
-        // removing both fields here keeps the pure response identity canonical.
-        let mut cache_body = body.clone();
-        if let Some(object) = cache_body.as_object_mut() {
-            object.remove("code_rerank_learning_opt_in");
-            object.remove("code_rerank_learning_request_id");
-        }
-        let serialized = serde_json::to_vec(&cache_body).unwrap_or_else(|_| b"null".to_vec());
+        let serialized = serde_json::to_vec(body).unwrap_or_else(|_| b"null".to_vec());
         Self::caller_bound_cache_key(
             SEARCH_CACHE_PREFIX,
             "contextstream-client-search-cache-v2",
@@ -3024,16 +3015,6 @@ impl ContextStreamClient {
     }
 
     fn should_cache_search_response(body: &serde_json::Value) -> bool {
-        // An explicit learning call must reach the API so its off-path shadow
-        // observation is created. This rare consented path trades only its own
-        // warm-cache hit for usable supervision; ordinary searches stay cached.
-        if body
-            .get("code_rerank_learning_opt_in")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            return false;
-        }
         // Project-scoped searches are usually interactive code lookups where
         // local files may have changed after index generation. Avoid replaying
         // stale cached API rows in that path; keep caching for workspace/global
@@ -10365,64 +10346,6 @@ impl ContextStreamClient {
         self.search_with_cache("/search/crawl", body).await
     }
 
-    /// Report an idempotent outcome for a caller-owned, explicitly opted-in
-    /// code-reranker learning observation. The API resolves the request UUID
-    /// together with authenticated user/workspace/project scope and never
-    /// accepts raw database impression IDs.
-    pub async fn record_code_rerank_outcome(
-        &self,
-        params: CodeRerankOutcomeParams,
-    ) -> Result<CodeRerankOutcomeResponse> {
-        if !params.learning_opt_in {
-            return Err(Error::Validation(
-                "learning_opt_in=true is required to report a reranker outcome".to_string(),
-            ));
-        }
-        if params.learning_request_id.is_nil() || params.event_id.is_nil() {
-            return Err(Error::Validation(
-                "learning_request_id and event_id must be non-nil UUIDs".to_string(),
-            ));
-        }
-        if params.workspace_id.is_nil() || params.project_id.is_nil() {
-            return Err(Error::Validation(
-                "workspace_id and project_id must be non-nil UUIDs".to_string(),
-            ));
-        }
-        let candidate_id = params
-            .candidate_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|candidate| !candidate.is_empty());
-        if params.candidate_id.is_some()
-            && candidate_id.is_none_or(|candidate| candidate.chars().count() > 4_096)
-        {
-            return Err(Error::Validation(
-                "candidate_id must contain 1 to 4096 characters".to_string(),
-            ));
-        }
-        if params.outcome_type.requires_candidate() && candidate_id.is_none() {
-            return Err(Error::Validation(
-                "candidate_id is required for this outcome type".to_string(),
-            ));
-        }
-        if let Some(rank) = params.observed_rank {
-            if candidate_id.is_none() || !(1..=100).contains(&rank) {
-                return Err(Error::Validation(
-                    "observed_rank requires candidate_id and must be between 1 and 100".to_string(),
-                ));
-            }
-        }
-        if params
-            .confidence
-            .is_some_and(|confidence| !confidence.is_finite() || !(0.0..=1.0).contains(&confidence))
-        {
-            return Err(Error::Validation(
-                "confidence must be finite and between 0 and 1".to_string(),
-            ));
-        }
-        self.post("/search/rerank/outcomes", params).await
-    }
-
     async fn search_with_cache(
         &self,
         endpoint: &str,
@@ -15799,15 +15722,6 @@ pub struct SearchParams {
     pub offset: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_memory: Option<bool>,
-    /// Explicit caller consent for code-reranker learning telemetry. This is
-    /// side-effect-only and must not affect response/cache identity.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code_rerank_learning_opt_in: Option<bool>,
-    /// Caller-minted correlation for a consented learning observation. It is
-    /// meaningful only with `code_rerank_learning_opt_in=true` and is excluded
-    /// from response-cache identity.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code_rerank_learning_request_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hot_paths_hint: Option<HotPathsHint>,
     /// Durable session identity (MCP session id on hosted transports). Lets
@@ -15815,51 +15729,6 @@ pub struct SearchParams {
     /// request carries no project_id (audit 2026-07-17).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CodeRerankOutcomeType {
-    Opened,
-    Cited,
-    FirstCorrectEvidence,
-    EditStarted,
-    EditValidated,
-    TestsPassed,
-    WrongRoute,
-    Abandoned,
-    Reverted,
-}
-
-impl CodeRerankOutcomeType {
-    fn requires_candidate(self) -> bool {
-        !matches!(self, Self::Abandoned)
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CodeRerankOutcomeParams {
-    pub learning_request_id: Uuid,
-    pub event_id: Uuid,
-    pub workspace_id: Uuid,
-    pub project_id: Uuid,
-    pub learning_opt_in: bool,
-    pub outcome_type: CodeRerankOutcomeType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub candidate_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_rank: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latency_to_outcome_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub metadata: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CodeRerankOutcomeResponse {
-    pub accepted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -16429,18 +16298,6 @@ impl SearchParams {
         }
         if let Some(v) = self.include_memory {
             obj.insert("include_memory".into(), serde_json::Value::Bool(v));
-        }
-        if let Some(v) = self.code_rerank_learning_opt_in {
-            obj.insert(
-                "code_rerank_learning_opt_in".into(),
-                serde_json::Value::Bool(v),
-            );
-        }
-        if let Some(v) = self.code_rerank_learning_request_id {
-            obj.insert(
-                "code_rerank_learning_request_id".into(),
-                serde_json::Value::String(v.to_string()),
-            );
         }
         if let Some(v) = self.hot_paths_hint {
             obj.insert(
@@ -23049,7 +22906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_refactor_posts_cursor_and_learning_opt_in_to_api() {
+    async fn search_refactor_posts_cursor_to_api() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -23076,7 +22933,6 @@ mod tests {
 
         let workspace_id = Uuid::new_v4();
         let project_id = Uuid::new_v4();
-        let learning_request_id = Uuid::new_v4();
         let cursor = "refactor:v1:opaque-page-two";
         let mut config = Config::default();
         config.api_url = format!("http://{}", addr);
@@ -23087,8 +22943,6 @@ mod tests {
             .search_refactor(SearchParams {
                 query: "TargetSymbol".to_string(),
                 cursor: Some(cursor.to_string()),
-                code_rerank_learning_opt_in: Some(true),
-                code_rerank_learning_request_id: Some(learning_request_id),
                 workspace_id: Some(workspace_id),
                 project_id: Some(project_id),
                 ..SearchParams::default()
@@ -23109,165 +22963,10 @@ mod tests {
             serde_json::from_str(body.trim()).expect("body is valid JSON");
         assert_eq!(json["query"], "TargetSymbol");
         assert_eq!(json["cursor"], cursor);
-        assert_eq!(json["code_rerank_learning_opt_in"], true);
-        assert_eq!(
-            json["code_rerank_learning_request_id"],
-            learning_request_id.to_string()
-        );
+        assert!(json.get("code_rerank_learning_opt_in").is_none());
+        assert!(json.get("code_rerank_learning_request_id").is_none());
         assert_eq!(json["workspace_id"], workspace_id.to_string());
         assert_eq!(json["project_id"], project_id.to_string());
-    }
-
-    #[tokio::test]
-    async fn code_rerank_outcome_posts_scoped_idempotent_correlation() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind local listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept connection");
-            let mut buf = vec![0u8; 8192];
-            let n = socket.read(&mut buf).await.expect("read request");
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
-            let response_body = r#"{"success":true,"data":{"accepted":true}}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("write response");
-            request
-        });
-
-        let learning_request_id = Uuid::new_v4();
-        let event_id = Uuid::new_v4();
-        let workspace_id = Uuid::new_v4();
-        let project_id = Uuid::new_v4();
-        let mut config = Config::default();
-        config.api_url = format!("http://{}", addr);
-        config.api_key = Some("test-key".to_string());
-        let client = ContextStreamClient::new(config);
-
-        let response = client
-            .record_code_rerank_outcome(CodeRerankOutcomeParams {
-                learning_request_id,
-                event_id,
-                workspace_id,
-                project_id,
-                learning_opt_in: true,
-                outcome_type: CodeRerankOutcomeType::TestsPassed,
-                candidate_id: Some("result-7".to_string()),
-                observed_rank: Some(2),
-                confidence: Some(0.95),
-                latency_to_outcome_ms: Some(1_250),
-                metadata: serde_json::json!({"source": "agent"}),
-            })
-            .await
-            .expect("outcome request succeeds");
-        assert!(response.accepted);
-
-        let request = server.await.expect("server task");
-        let (head, body) = request
-            .split_once("\r\n\r\n")
-            .expect("request has header/body split");
-        assert!(head.starts_with("POST /api/v1/search/rerank/outcomes "));
-        let json: serde_json::Value =
-            serde_json::from_str(body.trim()).expect("body is valid JSON");
-        assert_eq!(json["learning_request_id"], learning_request_id.to_string());
-        assert_eq!(json["event_id"], event_id.to_string());
-        assert_eq!(json["workspace_id"], workspace_id.to_string());
-        assert_eq!(json["project_id"], project_id.to_string());
-        assert_eq!(json["outcome_type"], "tests_passed");
-        assert_eq!(json["candidate_id"], "result-7");
-    }
-
-    #[tokio::test]
-    async fn code_rerank_outcome_rejects_malformed_feedback_before_network_io() {
-        let client = ContextStreamClient::new(Config::default());
-        let base = CodeRerankOutcomeParams {
-            learning_request_id: Uuid::new_v4(),
-            event_id: Uuid::new_v4(),
-            workspace_id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
-            learning_opt_in: true,
-            outcome_type: CodeRerankOutcomeType::Opened,
-            candidate_id: Some("result-7".to_string()),
-            observed_rank: Some(1),
-            confidence: None,
-            latency_to_outcome_ms: None,
-            metadata: serde_json::Value::Null,
-        };
-
-        let mut missing_consent = base.clone();
-        missing_consent.learning_opt_in = false;
-        assert!(matches!(
-            client.record_code_rerank_outcome(missing_consent).await,
-            Err(Error::Validation(_))
-        ));
-
-        let mut nil_event = base.clone();
-        nil_event.event_id = Uuid::nil();
-        assert!(matches!(
-            client.record_code_rerank_outcome(nil_event).await,
-            Err(Error::Validation(_))
-        ));
-
-        let mut nil_scope = base.clone();
-        nil_scope.project_id = Uuid::nil();
-        assert!(matches!(
-            client.record_code_rerank_outcome(nil_scope).await,
-            Err(Error::Validation(_))
-        ));
-
-        for invalid_rank in [0, 101] {
-            let mut invalid = base.clone();
-            invalid.observed_rank = Some(invalid_rank);
-            assert!(matches!(
-                client.record_code_rerank_outcome(invalid).await,
-                Err(Error::Validation(_))
-            ));
-        }
-
-        let mut missing_candidate = base.clone();
-        missing_candidate.candidate_id = None;
-        missing_candidate.observed_rank = None;
-        assert!(matches!(
-            client.record_code_rerank_outcome(missing_candidate).await,
-            Err(Error::Validation(_))
-        ));
-
-        let mut rank_without_candidate = base.clone();
-        rank_without_candidate.outcome_type = CodeRerankOutcomeType::Abandoned;
-        rank_without_candidate.candidate_id = None;
-        assert!(matches!(
-            client
-                .record_code_rerank_outcome(rank_without_candidate)
-                .await,
-            Err(Error::Validation(_))
-        ));
-
-        for candidate_id in ["   ".to_string(), "x".repeat(4_097)] {
-            let mut invalid = base.clone();
-            invalid.candidate_id = Some(candidate_id);
-            assert!(matches!(
-                client.record_code_rerank_outcome(invalid).await,
-                Err(Error::Validation(_))
-            ));
-        }
-
-        for confidence in [f32::NAN, -0.1, 1.1] {
-            let mut invalid = base.clone();
-            invalid.confidence = Some(confidence);
-            assert!(matches!(
-                client.record_code_rerank_outcome(invalid).await,
-                Err(Error::Validation(_))
-            ));
-        }
     }
 
     #[tokio::test]
@@ -23387,54 +23086,20 @@ mod tests {
     }
 
     #[test]
-    fn search_learning_opt_in_is_optional_bypasses_cache_and_does_not_partition_identity() {
-        let legacy = SearchParams {
-            query: "TargetSymbol".to_string(),
-            ..SearchParams::default()
+    fn search_bodies_never_carry_retired_rerank_learning_fields() {
+        // The learned reranker is retired: no search endpoint body may carry
+        // its consent flag or correlation id, and every search stays cacheable
+        // under the ordinary project-scope rule.
+        for endpoint in ["hybrid", "semantic", "keyword", "refactor", "guided"] {
+            let body = SearchParams {
+                query: "TargetSymbol".to_string(),
+                ..SearchParams::default()
+            }
+            .with_defaults(&Config::default(), endpoint);
+            assert!(body.get("code_rerank_learning_opt_in").is_none());
+            assert!(body.get("code_rerank_learning_request_id").is_none());
+            assert!(ContextStreamClient::should_cache_search_response(&body));
         }
-        .with_defaults(&Config::default(), "hybrid");
-        let explicit_false = SearchParams {
-            query: "TargetSymbol".to_string(),
-            code_rerank_learning_opt_in: Some(false),
-            code_rerank_learning_request_id: None,
-            ..SearchParams::default()
-        }
-        .with_defaults(&Config::default(), "hybrid");
-        let learning_request_id = Uuid::new_v4();
-        let opted_in = SearchParams {
-            query: "TargetSymbol".to_string(),
-            code_rerank_learning_opt_in: Some(true),
-            code_rerank_learning_request_id: Some(learning_request_id),
-            ..SearchParams::default()
-        }
-        .with_defaults(&Config::default(), "hybrid");
-
-        assert!(legacy.get("code_rerank_learning_opt_in").is_none());
-        assert_eq!(
-            explicit_false.get("code_rerank_learning_opt_in"),
-            Some(&serde_json::json!(false))
-        );
-        assert_eq!(
-            opted_in.get("code_rerank_learning_opt_in"),
-            Some(&serde_json::json!(true))
-        );
-        assert_eq!(
-            opted_in.get("code_rerank_learning_request_id"),
-            Some(&serde_json::json!(learning_request_id))
-        );
-        assert!(!ContextStreamClient::should_cache_search_response(
-            &opted_in
-        ));
-        let caller = "csuc:v2:j:test-caller";
-        let legacy_key = ContextStreamClient::search_cache_key(caller, "/search/hybrid", &legacy);
-        assert_eq!(
-            legacy_key,
-            ContextStreamClient::search_cache_key(caller, "/search/hybrid", &explicit_false,)
-        );
-        assert_eq!(
-            legacy_key,
-            ContextStreamClient::search_cache_key(caller, "/search/hybrid", &opted_in)
-        );
     }
 
     #[test]
@@ -27657,20 +27322,12 @@ mod caller_bound_response_cache_tests {
     }
 
     #[test]
-    fn search_key_includes_endpoint_but_excludes_learning_side_effect() {
+    fn search_key_includes_endpoint() {
         let caller = "caller";
         let base = serde_json::json!({ "query": "needle", "search_type": "hybrid" });
-        let opted_in = serde_json::json!({
-            "query": "needle",
-            "search_type": "hybrid",
-            "code_rerank_learning_opt_in": true,
-        });
         let hybrid = ContextStreamClient::search_cache_key(caller, "/search/hybrid", &base);
         let keyword = ContextStreamClient::search_cache_key(caller, "/search/keyword", &base);
-        let opted_in_key =
-            ContextStreamClient::search_cache_key(caller, "/search/hybrid", &opted_in);
         assert_ne!(hybrid, keyword);
-        assert_eq!(hybrid, opted_in_key);
     }
 
     #[test]

@@ -504,7 +504,6 @@ mod guided_search_tests {
         let workspace_id = uuid::Uuid::new_v4();
         let project_id = uuid::Uuid::new_v4();
         let installation_id = uuid::Uuid::new_v4();
-        let learning_request_id = uuid::Uuid::new_v4();
         let request = GuidedSearchApiRequest {
             query: "auth middleware",
             intent: Some("fix expired sessions"),
@@ -513,8 +512,6 @@ mod guided_search_tests {
             installation_id: Some(installation_id),
             checkout_locator: Some("checkout-locator-v1:opaque"),
             grounding_handle: Some("gb:v1:opaque"),
-            code_rerank_learning_opt_in: Some(true),
-            code_rerank_learning_request_id: Some(learning_request_id),
             limit: GUIDED_SEARCH_MAX_LIMIT,
         };
         let value = serde_json::to_value(request).unwrap();
@@ -526,35 +523,23 @@ mod guided_search_tests {
         assert_eq!(value["installation_id"], installation_id.to_string());
         assert_eq!(value["checkout_locator"], "checkout-locator-v1:opaque");
         assert_eq!(value["grounding_handle"], "gb:v1:opaque");
-        assert_eq!(value["code_rerank_learning_opt_in"], true);
-        assert_eq!(
-            value["code_rerank_learning_request_id"],
-            learning_request_id.to_string()
-        );
+        assert!(value.get("code_rerank_learning_opt_in").is_none());
+        assert!(value.get("code_rerank_learning_request_id").is_none());
         assert_eq!(value["limit"], GUIDED_SEARCH_MAX_LIMIT);
         assert!(GUIDED_SEARCH_REQUEST_TIMEOUT < std::time::Duration::from_secs(30));
     }
 
-    #[test]
-    fn guided_request_omits_learning_opt_in_without_explicit_consent() {
-        let request = GuidedSearchApiRequest {
-            query: "auth middleware",
-            intent: None,
-            workspace_id: None,
-            project_id: None,
-            installation_id: None,
-            checkout_locator: None,
-            grounding_handle: None,
-            code_rerank_learning_opt_in: None,
-            code_rerank_learning_request_id: None,
-            limit: GUIDED_SEARCH_DEFAULT_LIMIT,
-        };
-        let value = serde_json::to_value(request).unwrap();
-        assert!(value.get("code_rerank_learning_opt_in").is_none());
+    /// A legacy input that still carries the retired reranker-learning consent
+    /// flag.
+    fn legacy_learning_input(query: &str) -> SearchInput {
+        let mut value = serde_json::to_value(auto_mode_tests::base_input(query)).unwrap();
+        value["code_rerank_learning_opt_in"] = Value::Bool(true);
+        value["code_rerank_learning_request_id"] = Value::String(uuid::Uuid::new_v4().to_string());
+        serde_json::from_value(value).expect("retired learning fields are accepted and ignored")
     }
 
     #[tokio::test]
-    async fn guided_cache_miss_forwards_opt_in_true_and_omits_default() {
+    async fn guided_cache_miss_never_forwards_retired_learning_fields() {
         let workspace_id = uuid::Uuid::new_v4();
         let project_id = uuid::Uuid::new_v4();
         let checkout_scope = CheckoutRoutingScope {
@@ -572,56 +557,51 @@ mod guided_search_tests {
             .set_grounding_handle(Some("gb:v1:input-handle".to_string()))
             .await;
 
-        let mut opted_in = auto_mode_tests::base_input("auth middleware");
-        opted_in.mode = Some("guided".to_string());
-        opted_in.code_rerank_learning_opt_in = Some(true);
-        let learning_request_id = uuid::Uuid::new_v4();
-        let opted_result = tool
+        let mut legacy = legacy_learning_input("auth middleware");
+        legacy.mode = Some("guided".to_string());
+        let legacy_result = tool
             .execute_guided_search(
-                &opted_in,
+                &legacy,
                 Some(workspace_id),
                 Some(project_id),
                 Some("gb:v1:input-handle".to_string()),
-                Some(learning_request_id),
                 Some(checkout_scope.clone()),
                 false,
-                "guided-forward-opt-in".to_string(),
+                "guided-legacy-learning".to_string(),
             )
             .await
-            .expect("opted-in guided request should succeed");
-        let opted_body: Value = serde_json::from_str(
+            .expect("a legacy learning call is an ordinary guided search");
+        let legacy_body: Value = serde_json::from_str(
             &requests
                 .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("record opted-in body"),
+                .expect("record legacy body"),
         )
         .unwrap();
-        assert_eq!(opted_body["code_rerank_learning_opt_in"], true);
+        assert!(legacy_body.get("code_rerank_learning_opt_in").is_none());
+        assert!(legacy_body.get("code_rerank_learning_request_id").is_none());
+        assert_eq!(legacy_body["grounding_handle"], "gb:v1:input-handle");
         assert_eq!(
-            opted_body["code_rerank_learning_request_id"],
-            learning_request_id.to_string()
-        );
-        assert_eq!(opted_body["grounding_handle"], "gb:v1:input-handle");
-        assert_eq!(
-            opted_body["installation_id"],
+            legacy_body["installation_id"],
             checkout_scope.installation_id.to_string()
         );
         assert_eq!(
-            opted_body["checkout_locator"],
+            legacy_body["checkout_locator"],
             checkout_scope.checkout_locator
         );
-        assert_eq!(
-            opted_result.structured_content.as_ref().unwrap()["code_rerank_learning_request_id"],
-            learning_request_id.to_string()
-        );
+        assert!(legacy_result
+            .structured_content
+            .as_ref()
+            .unwrap()
+            .get("code_rerank_learning_request_id")
+            .is_none());
 
-        let mut default_input = opted_in.clone();
-        default_input.code_rerank_learning_opt_in = None;
+        let mut default_input = auto_mode_tests::base_input("auth middleware");
+        default_input.mode = Some("guided".to_string());
         tool.execute_guided_search(
             &default_input,
             Some(workspace_id),
             Some(project_id),
             Some("gb:v1:input-handle".to_string()),
-            None,
             None,
             false,
             "guided-forward-default".to_string(),
@@ -646,10 +626,9 @@ mod guided_search_tests {
     }
 
     #[tokio::test]
-    async fn guided_timeout_fallback_uses_a_distinct_served_learning_receipt() {
+    async fn guided_timeout_fallback_forwards_no_retired_learning_fields() {
         let workspace_id = uuid::Uuid::new_v4();
         let project_id = uuid::Uuid::new_v4();
-        let guided_learning_request_id = uuid::Uuid::new_v4();
         let hybrid_response = SearchResponse {
             results: vec![SearchResult {
                 id: "hybrid-served".to_string(),
@@ -677,9 +656,8 @@ mod guided_search_tests {
             },
         ]);
         let (tool, _session) = guided_tool_with_base_url(base_url);
-        let mut input = auto_mode_tests::base_input("auth middleware");
+        let mut input = legacy_learning_input("auth middleware");
         input.mode = Some("guided".to_string());
-        input.code_rerank_learning_opt_in = Some(true);
 
         let result = tool
             .execute_guided_search_with_timeout(
@@ -687,7 +665,6 @@ mod guided_search_tests {
                 Some(workspace_id),
                 Some(project_id),
                 None,
-                Some(guided_learning_request_id),
                 None,
                 false,
                 "guided-timeout-fallback".to_string(),
@@ -721,19 +698,16 @@ mod guided_search_tests {
         assert!(hybrid_line.contains("/search/hybrid"));
         let guided_body: Value = serde_json::from_str(&guided_body).unwrap();
         let hybrid_body: Value = serde_json::from_str(&hybrid_body).unwrap();
-        let fallback_learning_request_id = hybrid_body["code_rerank_learning_request_id"]
-            .as_str()
-            .and_then(|value| uuid::Uuid::parse_str(value).ok())
-            .expect("hybrid fallback has a learning request id");
-        assert_eq!(
-            guided_body["code_rerank_learning_request_id"],
-            guided_learning_request_id.to_string()
-        );
-        assert_ne!(fallback_learning_request_id, guided_learning_request_id);
-        assert_eq!(
-            result.structured_content.as_ref().unwrap()["code_rerank_learning_request_id"],
-            fallback_learning_request_id.to_string()
-        );
+        for body in [&guided_body, &hybrid_body] {
+            assert!(body.get("code_rerank_learning_opt_in").is_none());
+            assert!(body.get("code_rerank_learning_request_id").is_none());
+        }
+        assert!(result
+            .structured_content
+            .as_ref()
+            .unwrap()
+            .get("code_rerank_learning_request_id")
+            .is_none());
 
         server.join().expect("guided timeout server should finish");
     }
@@ -765,7 +739,6 @@ mod guided_search_tests {
             Some(workspace_id),
             Some(project_id),
             Some("gb:v1:older-request-handle".to_string()),
-            None,
             None,
             false,
             "guided-stale-response".to_string(),
@@ -1340,16 +1313,12 @@ mod schema_tests {
         assert!(props.contains_key("file_types"));
         assert!(props.contains_key("include_content"));
         assert!(props.contains_key("include_memory"));
-        assert!(props.contains_key("code_rerank_learning_opt_in"));
-        assert_eq!(props["code_rerank_learning_opt_in"]["default"], false);
+        assert!(!props.contains_key("code_rerank_learning_opt_in"));
         assert!(props.contains_key("cursor"));
 
         // query should be required
         if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
             assert!(required.iter().any(|v| v.as_str() == Some("query")));
-            assert!(!required
-                .iter()
-                .any(|v| v.as_str() == Some("code_rerank_learning_opt_in")));
         }
 
         // Check mode enum values
@@ -1381,8 +1350,7 @@ mod schema_tests {
         assert!(props.contains_key("query"));
         assert!(props.contains_key("workspace_id"));
         assert!(props.contains_key("limit"));
-        assert!(props.contains_key("code_rerank_learning_opt_in"));
-        assert_eq!(props["code_rerank_learning_opt_in"]["default"], false);
+        assert!(!props.contains_key("code_rerank_learning_opt_in"));
     }
 
     #[test]
@@ -1395,8 +1363,7 @@ mod schema_tests {
 
         let props = schema["properties"].as_object().unwrap();
         assert!(props.contains_key("query"));
-        assert!(props.contains_key("code_rerank_learning_opt_in"));
-        assert_eq!(props["code_rerank_learning_opt_in"]["default"], false);
+        assert!(!props.contains_key("code_rerank_learning_opt_in"));
     }
 
     #[test]
@@ -1409,8 +1376,7 @@ mod schema_tests {
 
         let props = schema["properties"].as_object().unwrap();
         assert!(props.contains_key("query"));
-        assert!(props.contains_key("code_rerank_learning_opt_in"));
-        assert_eq!(props["code_rerank_learning_opt_in"]["default"], false);
+        assert!(!props.contains_key("code_rerank_learning_opt_in"));
     }
 }
 
@@ -1522,8 +1488,6 @@ mod tokenizer_wire_tests {
                     .unwrap(),
                 "result_generation_consistent": true
             },
-            "code_rerank_learning_request_id":
-                uuid::Uuid::parse_str("fe106dc3-6903-4d62-b0b3-c33d33f19f71").unwrap(),
             "results": [{
                 "file_path": first_path,
                 "start_line": 10,
@@ -1547,7 +1511,6 @@ mod tokenizer_wire_tests {
         assert_eq!(structured["results"][0]["file_path"], first_path);
         assert!(structured.get("scope_reliability").is_some());
         assert!(structured.get("index_trust").is_some());
-        assert!(structured.get("code_rerank_learning_request_id").is_some());
         assert!(structured
             .get(crate::wire_tokens::WIRE_REPORT_KEY)
             .is_some());
@@ -1760,15 +1723,14 @@ mod auto_mode_tests {
         local_keyword_enrich_checked, merge_api_index_hints, merge_dirty_file_hints,
         normalize_count_index_trust, normalize_paths_output, normalized_symbol_retry_query,
         parse_git_status_dirty_hints, path_query_hint, prefers_hybrid_for_code_location_query,
-        prepare_code_rerank_learning_attempt, project_map_route_hint_from_structured,
-        prune_deleted_file_results, read_git_dirty_file_hints, recommend_search_mode,
-        refactor_cursor_continuation_note, resolve_effective_folder_path,
-        resolve_exact_match_boost, resolve_include_memory, resolve_mode,
-        resolve_output_preferences, resolve_search_content_max_chars, resolve_search_context_lines,
-        resolve_search_limit, resolve_search_offset, response_generation_consistency,
-        result_has_artifact_like_path, run_search_for_mode, scoped_session_folder_path,
-        search_cache, search_response_structured_value, search_tool_result_wire_budget,
-        served_api_learning_receipt, sha256_hex_bytes, should_allow_workspace_scope_fallback,
+        project_map_route_hint_from_structured, prune_deleted_file_results,
+        read_git_dirty_file_hints, recommend_search_mode, refactor_cursor_continuation_note,
+        resolve_effective_folder_path, resolve_exact_match_boost, resolve_include_memory,
+        resolve_mode, resolve_output_preferences, resolve_search_content_max_chars,
+        resolve_search_context_lines, resolve_search_limit, resolve_search_offset,
+        response_generation_consistency, result_has_artifact_like_path, run_search_for_mode,
+        scoped_session_folder_path, search_cache, search_response_structured_value,
+        search_tool_result_wire_budget, sha256_hex_bytes, should_allow_workspace_scope_fallback,
         should_append_index_health_footer, should_apply_local_enrichment,
         should_fetch_graph_enrichment, should_fetch_project_map_route_hint,
         should_filter_artifact_paths, should_retry_keyword_with_semantic,
@@ -1823,7 +1785,6 @@ mod auto_mode_tests {
             include_content: None,
             include_memory: None,
             include_vcs: None,
-            code_rerank_learning_opt_in: None,
             output_format: None,
             context_lines: None,
             content_max_chars: None,
@@ -2239,71 +2200,6 @@ mod auto_mode_tests {
     }
 
     #[test]
-    fn test_search_cache_key_excludes_learning_side_effect_opt_in() {
-        let default_input = base_input("GuidanceTarget");
-        let mut explicit_false = default_input.clone();
-        explicit_false.code_rerank_learning_opt_in = Some(false);
-        let mut opted_in = default_input.clone();
-        opted_in.code_rerank_learning_opt_in = Some(true);
-
-        let key = |input: &SearchInput| cache_key(None, None, input, SearchMode::Keyword, None);
-        assert_eq!(key(&default_input), key(&explicit_false));
-        assert_eq!(key(&default_input), key(&opted_in));
-    }
-
-    #[test]
-    fn learning_attempt_ids_are_unique_and_require_exact_scope() {
-        let workspace_id = uuid::Uuid::new_v4();
-        let project_id = uuid::Uuid::new_v4();
-        let exact = SearchParams {
-            query: "how does auth work".to_string(),
-            workspace_id: Some(workspace_id),
-            project_id: Some(project_id),
-            code_rerank_learning_opt_in: Some(true),
-            ..Default::default()
-        };
-        let (first, first_id) = prepare_code_rerank_learning_attempt(exact.clone());
-        let (second, second_id) = prepare_code_rerank_learning_attempt(exact);
-        assert!(first_id.is_some());
-        assert!(second_id.is_some());
-        assert_ne!(first_id, second_id);
-        assert_eq!(first.code_rerank_learning_request_id, first_id);
-        assert_eq!(second.code_rerank_learning_request_id, second_id);
-
-        let broad = SearchParams {
-            query: "how does auth work".to_string(),
-            workspace_id: Some(workspace_id),
-            project_id: None,
-            code_rerank_learning_opt_in: Some(true),
-            ..Default::default()
-        };
-        let (broad, broad_id) = prepare_code_rerank_learning_attempt(broad);
-        assert!(broad_id.is_none());
-        assert!(broad.code_rerank_learning_opt_in.is_none());
-        assert!(broad.code_rerank_learning_request_id.is_none());
-    }
-
-    #[test]
-    fn local_only_results_do_not_claim_a_backend_learning_receipt() {
-        let request_id = uuid::Uuid::new_v4();
-        assert_eq!(
-            served_api_learning_receipt(&SearchResponse::default(), Some(request_id)),
-            None
-        );
-        let api_response = SearchResponse {
-            results: vec![SearchResult {
-                id: "api-result".to_string(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        assert_eq!(
-            served_api_learning_receipt(&api_response, Some(request_id)),
-            Some(request_id)
-        );
-    }
-
-    #[test]
     fn guided_cache_key_partitions_grounding_handles_by_digest_only() {
         let input = base_input(&format!("GuidanceTarget-{}", uuid::Uuid::new_v4()));
         let shapers = cache_shapers(&input, 25, 800);
@@ -2338,36 +2234,6 @@ mod auto_mode_tests {
             search_cache().get(&second).is_none(),
             "a newer input handle must never hit an older handle's cached output"
         );
-    }
-
-    #[test]
-    fn guided_cache_identity_still_ignores_learning_opt_in() {
-        let base = base_input("GuidanceTarget");
-        let mut opted_in = base.clone();
-        opted_in.code_rerank_learning_opt_in = Some(true);
-        let handle = Some("gb:v1:stable-input-handle");
-
-        let first = build_search_cache_key(
-            None,
-            None,
-            &base,
-            SearchMode::Guided,
-            handle,
-            &cache_shapers(&base, 25, 800),
-            None,
-            None,
-        );
-        let second = build_search_cache_key(
-            None,
-            None,
-            &opted_in,
-            SearchMode::Guided,
-            handle,
-            &cache_shapers(&opted_in, 25, 800),
-            None,
-            None,
-        );
-        assert_eq!(first, second);
     }
 
     #[test]
@@ -2610,7 +2476,6 @@ mod auto_mode_tests {
 
     #[test]
     fn structured_search_budget_preserves_actionable_evidence_and_continuation() {
-        let learning_request_id = uuid::Uuid::new_v4();
         let rows: Vec<serde_json::Value> = (0..100)
             .map(|index| {
                 json!({
@@ -2635,7 +2500,6 @@ mod auto_mode_tests {
             "has_more": true,
             "next_offset": 20,
             "next_cursor": "refactor:v1:opaque-page-two",
-            "code_rerank_learning_request_id": learning_request_id,
             "count_is_lower_bound": true,
             "results": rows,
             "paths": ["src/module_0.rs", "src/module_1.rs"],
@@ -2647,10 +2511,6 @@ mod auto_mode_tests {
         let bounded = budget_search_structured_value(value, SEARCH_STRUCTURED_OUTPUT_BUDGET_MIN);
         assert!(serde_json::to_vec(&bounded).unwrap().len() <= SEARCH_STRUCTURED_OUTPUT_BUDGET_MIN);
         assert_eq!(bounded["next_cursor"], "refactor:v1:opaque-page-two");
-        assert_eq!(
-            bounded["code_rerank_learning_request_id"],
-            learning_request_id.to_string()
-        );
         assert_eq!(bounded["has_more"], true);
         assert_eq!(bounded["count_is_lower_bound"], true);
         assert_eq!(bounded["index_trust"]["committed_generation"], 42);
@@ -2845,7 +2705,6 @@ mod auto_mode_tests {
     #[test]
     fn absolute_structured_envelope_keeps_cursor_and_all_scope_controls() {
         const RF2_SIGNATURE_BYTES: usize = 43;
-        let learning_request_id = uuid::Uuid::new_v4();
         let cursor = format!(
             "rf2.{}.{}",
             "A".repeat(
@@ -2856,7 +2715,6 @@ mod auto_mode_tests {
         let huge = "🦀".repeat(20_000);
         let value = json!({
             "next_cursor": cursor,
-            "code_rerank_learning_request_id": learning_request_id,
             "has_more": true,
             "paths": [huge],
             "results": [{
@@ -2906,10 +2764,7 @@ mod auto_mode_tests {
         assert!(serde_json::to_vec(&bounded).unwrap().len() <= SEARCH_STRUCTURED_OUTPUT_BUDGET_MIN);
         assert_eq!(bounded["structured_budget"]["absolute_envelope"], true);
         assert_eq!(bounded["next_cursor"], cursor);
-        assert_eq!(
-            bounded["code_rerank_learning_request_id"],
-            learning_request_id.to_string()
-        );
+        assert!(bounded.get("code_rerank_learning_request_id").is_none());
         assert_eq!(bounded["index_trust"]["committed_generation"], 42);
         assert_eq!(bounded["scope_reliability"]["usable"], true);
         assert_eq!(bounded["scope_diagnostics"]["scope_valid"], true);
@@ -3505,7 +3360,7 @@ mod auto_mode_tests {
     }
 
     #[tokio::test]
-    async fn low_confidence_semantic_replacement_returns_only_the_selected_attempt_receipt() {
+    async fn low_confidence_semantic_replacement_serves_semantic_without_learning_fields() {
         let workspace_id = uuid::Uuid::new_v4();
         let project_id = uuid::Uuid::new_v4();
         let query = "how does authentication work";
@@ -3534,11 +3389,10 @@ mod auto_mode_tests {
             query: query.to_string(),
             workspace_id: Some(workspace_id),
             project_id: Some(project_id),
-            code_rerank_learning_opt_in: Some(true),
             ..Default::default()
         };
 
-        let (response, executed_mode, note, served_learning_request_id) =
+        let (response, executed_mode, note) =
             run_search_for_mode(&client, SearchMode::Hybrid, params, query, false)
                 .await
                 .expect("semantic replacement should succeed");
@@ -3551,16 +3405,10 @@ mod auto_mode_tests {
             .expect("record semantic attempt");
         let hybrid_body: Value = serde_json::from_str(&hybrid_body).unwrap();
         let semantic_body: Value = serde_json::from_str(&semantic_body).unwrap();
-        let hybrid_request_id = hybrid_body["code_rerank_learning_request_id"]
-            .as_str()
-            .and_then(|value| uuid::Uuid::parse_str(value).ok())
-            .expect("hybrid attempt correlation");
-        let semantic_request_id = semantic_body["code_rerank_learning_request_id"]
-            .as_str()
-            .and_then(|value| uuid::Uuid::parse_str(value).ok())
-            .expect("semantic attempt correlation");
-        assert_ne!(hybrid_request_id, semantic_request_id);
-        assert_eq!(served_learning_request_id, Some(semantic_request_id));
+        for body in [&hybrid_body, &semantic_body] {
+            assert!(body.get("code_rerank_learning_opt_in").is_none());
+            assert!(body.get("code_rerank_learning_request_id").is_none());
+        }
         assert_eq!(response.results[0].id, "semantic-served");
         assert_eq!(executed_mode, SearchMode::Semantic);
         assert!(note
@@ -3593,7 +3441,7 @@ mod auto_mode_tests {
             ..Default::default()
         };
 
-        let (response, executed_mode, note, _) =
+        let (response, executed_mode, note) =
             run_search_for_mode(&client, SearchMode::Keyword, params, query, false)
                 .await
                 .expect("normalized keyword search should succeed");
@@ -3645,7 +3493,7 @@ mod auto_mode_tests {
             ..Default::default()
         };
 
-        let (response, executed_mode, note, _) =
+        let (response, executed_mode, note) =
             run_search_for_mode(&client, SearchMode::Keyword, params, query, false)
                 .await
                 .expect("exhaustive literal fallback should succeed");
@@ -3702,7 +3550,7 @@ mod auto_mode_tests {
             ..Default::default()
         };
 
-        let (response, executed_mode, note, _) =
+        let (response, executed_mode, note) =
             run_search_for_mode(&client, SearchMode::Keyword, params, query, false)
                 .await
                 .expect("bounded identifier keyword request should succeed");
@@ -3750,7 +3598,7 @@ mod auto_mode_tests {
             ..Default::default()
         };
 
-        let (response, executed_mode, note, _) =
+        let (response, executed_mode, note) =
             run_search_for_mode(&client, SearchMode::Keyword, params, query, false)
                 .await
                 .expect("bounded identifier miss should succeed");
@@ -5937,7 +5785,10 @@ mod input_struct_tests {
             "file_types": ["ts", "js"],
             "include_content": true,
             "include_memory": false,
-            "code_rerank_learning_opt_in": true
+            // Retired reranker-learning consent from older clients is
+            // accepted and ignored.
+            "code_rerank_learning_opt_in": true,
+            "code_rerank_learning_request_id": "fe106dc3-6903-4d62-b0b3-c33d33f19f71"
         }))
         .unwrap();
 
@@ -5955,8 +5806,12 @@ mod input_struct_tests {
         );
         assert_eq!(input.include_content, Some(true));
         assert_eq!(input.include_memory, Some(false));
-        assert_eq!(input.code_rerank_learning_opt_in, Some(true));
         assert!(input.cursor.is_none());
+        let reserialized = serde_json::to_value(&input).unwrap();
+        assert!(reserialized.get("code_rerank_learning_opt_in").is_none());
+        assert!(reserialized
+            .get("code_rerank_learning_request_id")
+            .is_none());
     }
 
     #[test]
@@ -5987,20 +5842,7 @@ mod input_struct_tests {
         assert!(input.file_types.is_none());
         assert!(input.include_content.is_none());
         assert!(input.include_memory.is_none());
-        assert!(!input.code_rerank_learning_opt_in.unwrap_or(false));
         assert!(input.cursor.is_none());
-    }
-
-    #[test]
-    fn test_search_input_explicit_false_keeps_learning_disabled() {
-        let input: SearchInput = serde_json::from_value(json!({
-            "query": "test",
-            "code_rerank_learning_opt_in": false
-        }))
-        .unwrap();
-
-        assert_eq!(input.code_rerank_learning_opt_in, Some(false));
-        assert!(!input.code_rerank_learning_opt_in.unwrap_or(false));
     }
 
     #[test]
@@ -6982,17 +6824,13 @@ mod search_quality_tests {
     #[test]
     fn search_cache_gating_for_folder_scope() {
         // Workspace-scoped (no folder) is always cacheable, drift irrelevant.
-        assert!(should_use_search_cache(None, false, false));
-        assert!(should_use_search_cache(None, true, false));
+        assert!(should_use_search_cache(None, false));
+        assert!(should_use_search_cache(None, true));
         // Folder-scoped: cacheable only when the tree is in sync with the index.
-        assert!(should_use_search_cache(Some("/repo"), false, false));
+        assert!(should_use_search_cache(Some("/repo"), false));
         // Folder-scoped with local edits newer than the index → bypass cache so
         // we never replay stale snippets.
-        assert!(!should_use_search_cache(Some("/repo"), true, false));
-        // Explicit learning calls must reach the API so the observation exists;
-        // opt-in remains absent from pure response-cache identity.
-        assert!(!should_use_search_cache(None, false, true));
-        assert!(!should_use_search_cache(Some("/repo"), false, true));
+        assert!(!should_use_search_cache(Some("/repo"), true));
     }
 
     #[test]

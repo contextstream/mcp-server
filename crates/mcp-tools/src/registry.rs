@@ -186,13 +186,7 @@ fn acceleration_observation_action(name: &str, input: &Value) -> Option<&'static
 fn cache_layer_for_call(name: &str, input: &Value) -> Option<&'static str> {
     match name {
         "search" | "search_semantic" | "search_hybrid" | "search_keyword" => {
-            // Learning-consented calls intentionally bypass the rendered
-            // result cache so their observation reaches the API.
-            (input
-                .get("code_rerank_learning_opt_in")
-                .and_then(Value::as_bool)
-                != Some(true))
-            .then_some("mcp_search_result_cache")
+            Some("mcp_search_result_cache")
         }
         "session_recall" => Some("mcp_recall_result_cache"),
         "memory_search" => Some("mcp_memory_result_cache"),
@@ -1167,13 +1161,15 @@ mod acceleration_observation_tests {
             acceleration_observation_action("project", &json!({"action": "index"})),
             None
         );
+        // The retired reranker-learning consent no longer bypasses the
+        // rendered result cache: a legacy call is an ordinary search.
         assert_eq!(
             acceleration_observation_request(
                 "search",
                 &json!({"code_rerank_learning_opt_in": true})
             )
             .and_then(|request| request.cache_layer),
-            None
+            Some("mcp_search_result_cache")
         );
     }
 

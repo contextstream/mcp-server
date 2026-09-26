@@ -369,7 +369,6 @@ fn hot_paths_cache_identity(hint: Option<&HotPathsHint>) -> Option<String> {
 /// response/ranking-shaping input + index freshness uniquely identifies a
 /// cacheable result within the warm window. Length framing prevents delimiter
 /// ambiguity and the final SHA-256 digest keeps queries/cursors out of logs.
-/// Side-effect-only `code_rerank_learning_opt_in` is intentionally excluded.
 fn build_search_cache_key_with_tokenizer(
     workspace_id: Option<Uuid>,
     explicit_project_id: Option<Uuid>,
@@ -634,14 +633,7 @@ async fn validated_checkout_content_workspace(
 /// the index `indexed_at` (see `build_search_cache_key`), a re-ingest also
 /// invalidates older entries. Previously folder-scoped searches bypassed the
 /// cache entirely and re-paid the network round-trip on every identical call.
-fn should_use_search_cache(
-    session_folder_path: Option<&str>,
-    folder_has_drift: bool,
-    code_rerank_learning_opt_in: bool,
-) -> bool {
-    if code_rerank_learning_opt_in {
-        return false;
-    }
+fn should_use_search_cache(session_folder_path: Option<&str>, folder_has_drift: bool) -> bool {
     match session_folder_path {
         None => true,
         Some(_) => !folder_has_drift,
@@ -654,14 +646,14 @@ fn should_use_search_cache(
 async fn hybrid_with_fast_fallback(
     client: &ContextStreamClient,
     params: SearchParams,
-) -> Result<(SearchResponse, Option<String>, Option<Uuid>)> {
+) -> Result<(SearchResponse, Option<String>)> {
     match tokio::time::timeout(
         HYBRID_FAST_FALLBACK,
         execute_api_search_attempt(client, SearchMode::Hybrid, params.clone()),
     )
     .await
     {
-        Ok(Ok(attempt)) => Ok((attempt.response, None, attempt.learning_request_id)),
+        Ok(Ok(attempt)) => Ok((attempt, None)),
         Ok(Err(err)) => {
             // Server-side error: try semantic so the caller isn't empty-handed.
             tracing::warn!(
@@ -670,11 +662,10 @@ async fn hybrid_with_fast_fallback(
             );
             let attempt = execute_api_search_attempt(client, SearchMode::Semantic, params).await?;
             Ok((
-                attempt.response,
+                attempt,
                 Some(
                     "Hybrid search returned an error; semantic results shown instead.".to_string(),
                 ),
-                attempt.learning_request_id,
             ))
         }
         Err(_) => {
@@ -684,12 +675,11 @@ async fn hybrid_with_fast_fallback(
             );
             let attempt = execute_api_search_attempt(client, SearchMode::Semantic, params).await?;
             Ok((
-                attempt.response,
+                attempt,
                 Some(format!(
                     "Hybrid search exceeded {}s; semantic results shown instead.",
                     HYBRID_FAST_FALLBACK.as_secs()
                 )),
-                attempt.learning_request_id,
             ))
         }
     }
@@ -2043,7 +2033,6 @@ fn budget_search_structured_value_impl(
         "memory_evidence_count",
         "grounding_handle",
         "grounding_base_reused",
-        "code_rerank_learning_request_id",
         "continuation_unavailable",
         "continuation_protocol_violation",
         "continuation_cursor_bytes",
@@ -2118,7 +2107,6 @@ fn budget_search_structured_value_impl(
         "continuation_protocol_violation",
         "continuation_cursor_bytes",
         "max_valid_cursor_bytes",
-        "code_rerank_learning_request_id",
         "guidance_latency_ms",
         "retrieval_latency_ms",
         "navigator_latency_ms",
@@ -2186,7 +2174,6 @@ fn budget_search_structured_value_impl(
         .get("continuation_protocol_violation")
         .and_then(Value::as_str)
         .map(|reason| Value::String(truncate_json_string(reason, 64)));
-    let learning_request_id = hard.get("code_rerank_learning_request_id").cloned();
     let essential_result = hard
         .get("results")
         .and_then(Value::as_array)
@@ -2259,7 +2246,6 @@ fn budget_search_structured_value_impl(
         "next_cursor": cursor.clone(),
         "continuation_unavailable": continuation_unavailable.clone(),
         "continuation_protocol_violation": continuation_protocol_violation.clone(),
-        "code_rerank_learning_request_id": learning_request_id.clone(),
         "index_trust": essential_index_trust.clone(),
         "scope_reliability": essential_scope_reliability.clone(),
         "scope_diagnostics": essential_scope_diagnostics.clone(),
@@ -2282,7 +2268,6 @@ fn budget_search_structured_value_impl(
         "next_cursor": cursor.clone(),
         "continuation_unavailable": continuation_unavailable.clone(),
         "continuation_protocol_violation": continuation_protocol_violation.clone(),
-        "code_rerank_learning_request_id": learning_request_id.clone(),
         "index_trust": essential_index_trust.clone(),
         "scope_reliability": essential_scope_reliability.clone(),
         "scope_diagnostics": essential_scope_diagnostics.clone(),
@@ -2307,7 +2292,6 @@ fn budget_search_structured_value_impl(
         "next_cursor": cursor,
         "continuation_unavailable": cursor_unavailable,
         "continuation_protocol_violation": wire_violation,
-        "code_rerank_learning_request_id": learning_request_id,
         "index_trust": essential_index_trust,
         "scope_reliability": essential_scope_reliability,
         "scope_diagnostics": essential_scope_diagnostics,
@@ -6567,37 +6551,11 @@ fn normalize_response(mut response: SearchResponse) -> SearchResponse {
     response
 }
 
-struct CorrelatedSearchResponse {
-    response: SearchResponse,
-    learning_request_id: Option<Uuid>,
-}
-
-/// Prepare one concrete backend search attempt.
-///
-/// A learning correlation identifies the exact candidate set returned by one
-/// API call. Fallbacks and retries must therefore never reuse the UUID from a
-/// different attempt: the backend stores the first observation for a scoped
-/// UUID, while MCP may ultimately serve a later response.
-fn prepare_code_rerank_learning_attempt(mut params: SearchParams) -> (SearchParams, Option<Uuid>) {
-    let exact_learning_scope = params.workspace_id.is_some() && params.project_id.is_some();
-    let learning_request_id = (params.code_rerank_learning_opt_in == Some(true)
-        && exact_learning_scope)
-        .then(Uuid::new_v4);
-    if params.code_rerank_learning_opt_in == Some(true) && !exact_learning_scope {
-        // Broader recovery attempts still serve their ordinary result, but
-        // they cannot truthfully create a project-bound learning observation.
-        params.code_rerank_learning_opt_in = None;
-    }
-    params.code_rerank_learning_request_id = learning_request_id;
-    (params, learning_request_id)
-}
-
 async fn execute_api_search_attempt(
     client: &ContextStreamClient,
     mode: SearchMode,
     params: SearchParams,
-) -> Result<CorrelatedSearchResponse> {
-    let (params, learning_request_id) = prepare_code_rerank_learning_attempt(params);
+) -> Result<SearchResponse> {
     let response = match mode {
         SearchMode::Hybrid => client.search_hybrid(params).await?,
         SearchMode::Semantic => client.search_semantic(params).await?,
@@ -6614,10 +6572,7 @@ async fn execute_api_search_attempt(
             )));
         }
     };
-    Ok(CorrelatedSearchResponse {
-        response: normalize_response(response),
-        learning_request_id,
-    })
+    Ok(normalize_response(response))
 }
 
 fn scope_remediation_note(response: &SearchResponse) -> Option<String> {
@@ -6694,7 +6649,7 @@ async fn try_path_aware_fallbacks(
     client: &ContextStreamClient,
     params: &SearchParams,
     original_query: &str,
-) -> Option<(SearchResponse, SearchMode, &'static str, Option<Uuid>)> {
+) -> Option<(SearchResponse, SearchMode, &'static str)> {
     let hint = path_query_hint(original_query)?;
     let mut attempts: Vec<(SearchMode, SearchParams, &'static str)> = Vec::new();
     let mut seen = HashSet::new();
@@ -6736,10 +6691,8 @@ async fn try_path_aware_fallbacks(
 
     for (mode, next_params, note) in attempts {
         if let Ok(attempt) = execute_api_search_attempt(client, mode, next_params).await {
-            if !attempt.response.results.is_empty()
-                && path_fallback_response_matches_hint(&attempt.response, &hint)
-            {
-                return Some((attempt.response, mode, note, attempt.learning_request_id));
+            if !attempt.results.is_empty() && path_fallback_response_matches_hint(&attempt, &hint) {
+                return Some((attempt, mode, note));
             }
         }
     }
@@ -8031,7 +7984,7 @@ async fn run_search_for_mode(
     params: SearchParams,
     original_query: &str,
     allow_broad_fallbacks: bool,
-) -> Result<(SearchResponse, SearchMode, Option<String>, Option<Uuid>)> {
+) -> Result<(SearchResponse, SearchMode, Option<String>)> {
     let normalized_retry_query = normalized_symbol_retry_query(original_query);
     // Surrounding quotes are caller syntax for an exact literal; they are not
     // part of the literal sent to the keyword index. Normalizing before the
@@ -8061,60 +8014,36 @@ async fn run_search_for_mode(
     // Auto-selected and explicit hybrid both use /search/hybrid (matching TypeScript).
     let semantic_prefers_hybrid = requested_mode == SearchMode::Semantic
         && prefers_hybrid_for_code_location_query(original_query);
-    let (mut result, mut executed_mode, mut mode_fallback_note, mut selected_learning_request_id) =
-        match requested_mode {
-            SearchMode::Hybrid => {
-                if strict_symbol_first_pass {
-                    if let Ok(keyword_attempt) =
-                        execute_api_search_attempt(client, SearchMode::Keyword, params.clone())
-                            .await
+    let (mut result, mut executed_mode, mut mode_fallback_note) = match requested_mode {
+        SearchMode::Hybrid => {
+            if strict_symbol_first_pass {
+                if let Ok(keyword_attempt) =
+                    execute_api_search_attempt(client, SearchMode::Keyword, params.clone()).await
+                {
+                    if response_has_hits(&keyword_attempt)
+                        && response_has_symbol_anchor_match(&keyword_attempt, &symbol_anchor_terms)
                     {
-                        if response_has_hits(&keyword_attempt.response)
-                            && response_has_symbol_anchor_match(
-                                &keyword_attempt.response,
-                                &symbol_anchor_terms,
-                            )
-                        {
-                            (
-                            keyword_attempt.response,
+                        (
+                            keyword_attempt,
                             SearchMode::Keyword,
                             Some(
                                 "Hybrid query looked symbol-heavy; used strict keyword first-pass and kept anchor-aligned matches."
                                     .to_string(),
                             ),
-                            keyword_attempt.learning_request_id,
                         )
-                        } else if let Ok(refactor_attempt) =
-                            execute_api_search_attempt(client, SearchMode::Refactor, params.clone())
-                                .await
-                        {
-                            if response_has_hits(&refactor_attempt.response) {
-                                (
-                                refactor_attempt.response,
+                    } else if let Ok(refactor_attempt) =
+                        execute_api_search_attempt(client, SearchMode::Refactor, params.clone())
+                            .await
+                    {
+                        if response_has_hits(&refactor_attempt) {
+                            (
+                                refactor_attempt,
                                 SearchMode::Refactor,
                                 Some(
                                     "Hybrid query looked symbol-heavy; keyword first-pass was weak, so refactor search was used for symbol coverage."
                                         .to_string(),
                                 ),
-                                refactor_attempt.learning_request_id,
                             )
-                            } else {
-                                let hybrid_attempt = execute_api_search_attempt(
-                                    client,
-                                    SearchMode::Hybrid,
-                                    params.clone(),
-                                )
-                                .await?;
-                                (
-                                hybrid_attempt.response,
-                                SearchMode::Hybrid,
-                                Some(
-                                    "Hybrid query looked symbol-heavy; strict keyword/refactor pass had no anchor hits, so hybrid fallback was used."
-                                        .to_string(),
-                                ),
-                                hybrid_attempt.learning_request_id,
-                            )
-                            }
                         } else {
                             let hybrid_attempt = execute_api_search_attempt(
                                 client,
@@ -8123,213 +8052,171 @@ async fn run_search_for_mode(
                             )
                             .await?;
                             (
-                            hybrid_attempt.response,
-                            SearchMode::Hybrid,
-                            Some(
-                                "Hybrid query looked symbol-heavy; strict first-pass fell back to hybrid."
-                                    .to_string(),
-                            ),
-                            hybrid_attempt.learning_request_id,
-                        )
+                                hybrid_attempt,
+                                SearchMode::Hybrid,
+                                Some(
+                                    "Hybrid query looked symbol-heavy; strict keyword/refactor pass had no anchor hits, so hybrid fallback was used."
+                                        .to_string(),
+                                ),
+                            )
                         }
                     } else {
                         let hybrid_attempt =
                             execute_api_search_attempt(client, SearchMode::Hybrid, params.clone())
                                 .await?;
                         (
-                        hybrid_attempt.response,
+                            hybrid_attempt,
+                            SearchMode::Hybrid,
+                            Some(
+                                "Hybrid query looked symbol-heavy; strict first-pass fell back to hybrid."
+                                    .to_string(),
+                            ),
+                        )
+                    }
+                } else {
+                    let hybrid_attempt =
+                        execute_api_search_attempt(client, SearchMode::Hybrid, params.clone())
+                            .await?;
+                    (
+                        hybrid_attempt,
                         SearchMode::Hybrid,
                         Some(
                             "Hybrid query looked symbol-heavy; strict keyword first-pass failed and fell back to hybrid."
                                 .to_string(),
                         ),
-                        hybrid_attempt.learning_request_id,
-                    )
-                    }
-                } else {
-                    let (resp, note, learning_request_id) =
-                        hybrid_with_fast_fallback(client, params.clone()).await?;
-                    let executed = if note.is_some() {
-                        SearchMode::Semantic
-                    } else {
-                        SearchMode::Hybrid
-                    };
-                    (
-                        normalize_response(resp),
-                        executed,
-                        note,
-                        learning_request_id,
                     )
                 }
+            } else {
+                let (resp, note) = hybrid_with_fast_fallback(client, params.clone()).await?;
+                let executed = if note.is_some() {
+                    SearchMode::Semantic
+                } else {
+                    SearchMode::Hybrid
+                };
+                (normalize_response(resp), executed, note)
             }
-            SearchMode::Semantic => {
-                if semantic_prefers_hybrid {
-                    let attempt =
-                        execute_api_search_attempt(client, SearchMode::Hybrid, params.clone())
-                            .await?;
-                    (
-                    attempt.response,
+        }
+        SearchMode::Semantic => {
+            if semantic_prefers_hybrid {
+                let attempt =
+                    execute_api_search_attempt(client, SearchMode::Hybrid, params.clone()).await?;
+                (
+                    attempt,
                     SearchMode::Hybrid,
                     Some(
                         "Semantic mode query looked like a code-location/bugfix question; used hybrid for faster and more precise code retrieval."
                             .to_string(),
                     ),
-                    attempt.learning_request_id,
                 )
-                } else {
+            } else {
+                let attempt =
+                    execute_api_search_attempt(client, SearchMode::Semantic, params.clone())
+                        .await?;
+                (attempt, SearchMode::Semantic, None)
+            }
+        }
+        SearchMode::Keyword => {
+            let mut keyword_params = params.clone();
+            if let Some(literal) = quoted_keyword_literal.as_ref() {
+                keyword_params.query = literal.clone();
+            }
+            let attempt =
+                execute_api_search_attempt(client, SearchMode::Keyword, keyword_params).await?;
+            let note = if quoted_keyword_literal.is_some() {
+                Some("Normalized surrounding quotes before exact keyword search.".to_string())
+            } else if bounded_identifier_keyword_path {
+                Some("Bounded identifier lookup; use exhaustive for complete coverage.".to_string())
+            } else {
+                None
+            };
+            (attempt, SearchMode::Keyword, note)
+        }
+        SearchMode::Pattern => {
+            let attempt =
+                execute_api_search_attempt(client, SearchMode::Pattern, params.clone()).await?;
+            (attempt, SearchMode::Pattern, None)
+        }
+        SearchMode::Exhaustive => {
+            let attempt =
+                execute_api_search_attempt(client, SearchMode::Exhaustive, params.clone()).await?;
+            (attempt, SearchMode::Exhaustive, None)
+        }
+        SearchMode::Refactor => {
+            let attempt =
+                execute_api_search_attempt(client, SearchMode::Refactor, params.clone()).await?;
+            (attempt, SearchMode::Refactor, None)
+        }
+        SearchMode::Team => {
+            match execute_api_search_attempt(client, SearchMode::Team, params.clone()).await {
+                Ok(attempt) => (attempt, SearchMode::Team, None),
+                Err(err) if should_fallback_from_team_error(&err) => {
                     let attempt =
-                        execute_api_search_attempt(client, SearchMode::Semantic, params.clone())
+                        execute_api_search_attempt(client, SearchMode::Hybrid, params.clone())
                             .await?;
                     (
-                        attempt.response,
-                        SearchMode::Semantic,
-                        None,
-                        attempt.learning_request_id,
-                    )
-                }
-            }
-            SearchMode::Keyword => {
-                let mut keyword_params = params.clone();
-                if let Some(literal) = quoted_keyword_literal.as_ref() {
-                    keyword_params.query = literal.clone();
-                }
-                let attempt =
-                    execute_api_search_attempt(client, SearchMode::Keyword, keyword_params).await?;
-                let note = if quoted_keyword_literal.is_some() {
-                    Some("Normalized surrounding quotes before exact keyword search.".to_string())
-                } else if bounded_identifier_keyword_path {
-                    Some(
-                        "Bounded identifier lookup; use exhaustive for complete coverage."
-                            .to_string(),
-                    )
-                } else {
-                    None
-                };
-                (
-                    attempt.response,
-                    SearchMode::Keyword,
-                    note,
-                    attempt.learning_request_id,
-                )
-            }
-            SearchMode::Pattern => {
-                let attempt =
-                    execute_api_search_attempt(client, SearchMode::Pattern, params.clone()).await?;
-                (
-                    attempt.response,
-                    SearchMode::Pattern,
-                    None,
-                    attempt.learning_request_id,
-                )
-            }
-            SearchMode::Exhaustive => {
-                let attempt =
-                    execute_api_search_attempt(client, SearchMode::Exhaustive, params.clone())
-                        .await?;
-                (
-                    attempt.response,
-                    SearchMode::Exhaustive,
-                    None,
-                    attempt.learning_request_id,
-                )
-            }
-            SearchMode::Refactor => {
-                let attempt =
-                    execute_api_search_attempt(client, SearchMode::Refactor, params.clone())
-                        .await?;
-                (
-                    attempt.response,
-                    SearchMode::Refactor,
-                    None,
-                    attempt.learning_request_id,
-                )
-            }
-            SearchMode::Team => {
-                match execute_api_search_attempt(client, SearchMode::Team, params.clone()).await {
-                    Ok(attempt) => (
-                        attempt.response,
-                        SearchMode::Team,
-                        None,
-                        attempt.learning_request_id,
-                    ),
-                    Err(err) if should_fallback_from_team_error(&err) => {
-                        let attempt =
-                            execute_api_search_attempt(client, SearchMode::Hybrid, params.clone())
-                                .await?;
-                        (
-                    attempt.response,
+                    attempt,
                     SearchMode::Hybrid,
                     Some(
                         "Team mode is unavailable for this workspace; fell back to hybrid search."
                             .to_string(),
                     ),
-                    attempt.learning_request_id,
                 )
-                    }
-                    Err(err) => return Err(err),
                 }
+                Err(err) => return Err(err),
             }
-            SearchMode::Crawl => {
-                let attempt =
-                    execute_api_search_attempt(client, SearchMode::Crawl, params.clone()).await?;
-                (
-                    attempt.response,
-                    SearchMode::Crawl,
-                    None,
-                    attempt.learning_request_id,
-                )
-            }
-            // Guided mode is handled by `SearchTool::execute_guided_search`
-            // before this server-routing helper. Keep a safe raw-search fallback
-            // for any future internal caller that bypasses that short-circuit.
-            SearchMode::Guided => {
-                let attempt =
-                    execute_api_search_attempt(client, SearchMode::Hybrid, params.clone()).await?;
-                (
-                    attempt.response,
-                    SearchMode::Hybrid,
-                    Some(
-                        "Guided Search was unavailable; served hybrid raw evidence instead."
-                            .to_string(),
-                    ),
-                    attempt.learning_request_id,
-                )
-            }
-            // Fuzzy + Vector modes are handled by
-            // `SearchTool::execute_atlas_{fuzzy,vector}` before this
-            // server-routing logic runs. If we ever reach here (e.g. some
-            // future caller bypasses the short-circuit), fall back to
-            // keyword search with a compatibility note.
-            SearchMode::Fuzzy => {
-                let attempt =
-                    execute_api_search_attempt(client, SearchMode::Keyword, params.clone()).await?;
-                (
-                    attempt.response,
-                    SearchMode::Keyword,
-                    Some(
-                        "fuzzy mode is only available on hosted/remote deployments; \
+        }
+        SearchMode::Crawl => {
+            let attempt =
+                execute_api_search_attempt(client, SearchMode::Crawl, params.clone()).await?;
+            (attempt, SearchMode::Crawl, None)
+        }
+        // Guided mode is handled by `SearchTool::execute_guided_search`
+        // before this server-routing helper. Keep a safe raw-search fallback
+        // for any future internal caller that bypasses that short-circuit.
+        SearchMode::Guided => {
+            let attempt =
+                execute_api_search_attempt(client, SearchMode::Hybrid, params.clone()).await?;
+            (
+                attempt,
+                SearchMode::Hybrid,
+                Some(
+                    "Guided Search was unavailable; served hybrid raw evidence instead."
+                        .to_string(),
+                ),
+            )
+        }
+        // Fuzzy + Vector modes are handled by
+        // `SearchTool::execute_atlas_{fuzzy,vector}` before this
+        // server-routing logic runs. If we ever reach here (e.g. some
+        // future caller bypasses the short-circuit), fall back to
+        // keyword search with a compatibility note.
+        SearchMode::Fuzzy => {
+            let attempt =
+                execute_api_search_attempt(client, SearchMode::Keyword, params.clone()).await?;
+            (
+                attempt,
+                SearchMode::Keyword,
+                Some(
+                    "fuzzy mode is only available on hosted/remote deployments; \
                      fell back to keyword search."
-                            .to_string(),
-                    ),
-                    attempt.learning_request_id,
-                )
-            }
-            SearchMode::Vector => {
-                let attempt =
-                    execute_api_search_attempt(client, SearchMode::Semantic, params.clone())
-                        .await?;
-                (
-                    attempt.response,
-                    SearchMode::Semantic,
-                    Some(
-                        "vector mode is only available on hosted/remote deployments; \
+                        .to_string(),
+                ),
+            )
+        }
+        SearchMode::Vector => {
+            let attempt =
+                execute_api_search_attempt(client, SearchMode::Semantic, params.clone()).await?;
+            (
+                attempt,
+                SearchMode::Semantic,
+                Some(
+                    "vector mode is only available on hosted/remote deployments; \
                      fell back to semantic search."
-                            .to_string(),
-                    ),
-                    attempt.learning_request_id,
-                )
-            }
-        };
+                        .to_string(),
+                ),
+            )
+        }
+    };
     let allow_keyword_broad_fallbacks = allow_broad_fallbacks && !strict_symbol_first_pass;
     let mut quoted_exhaustive_attempted = false;
 
@@ -8338,10 +8225,9 @@ async fn run_search_for_mode(
         if let Ok(semantic_attempt) =
             execute_api_search_attempt(client, SearchMode::Semantic, params.clone()).await
         {
-            if should_prefer_semantic_results(original_query, &result, &semantic_attempt.response) {
-                result = semantic_attempt.response;
+            if should_prefer_semantic_results(original_query, &result, &semantic_attempt) {
+                result = semantic_attempt;
                 executed_mode = SearchMode::Semantic;
-                selected_learning_request_id = semantic_attempt.learning_request_id;
                 mode_fallback_note = append_note(
                     mode_fallback_note,
                     "Hybrid results looked low-confidence for this natural-language query; retried with semantic and used semantic results.",
@@ -8362,10 +8248,9 @@ async fn run_search_for_mode(
             if let Ok(exhaustive_attempt) =
                 execute_api_search_attempt(client, SearchMode::Exhaustive, exhaustive_params).await
             {
-                if response_has_hits(&exhaustive_attempt.response) {
-                    result = exhaustive_attempt.response;
+                if response_has_hits(&exhaustive_attempt) {
+                    result = exhaustive_attempt;
                     executed_mode = SearchMode::Exhaustive;
-                    selected_learning_request_id = exhaustive_attempt.learning_request_id;
                     mode_fallback_note = append_note(
                         mode_fallback_note,
                         "Exact keyword search returned no results; retried exhaustive search for complete literal coverage.",
@@ -8386,10 +8271,9 @@ async fn run_search_for_mode(
         if let Ok(keyword_attempt) =
             execute_api_search_attempt(client, SearchMode::Keyword, params.clone()).await
         {
-            if response_has_hits(&keyword_attempt.response) {
-                result = keyword_attempt.response;
+            if response_has_hits(&keyword_attempt) {
+                result = keyword_attempt;
                 executed_mode = SearchMode::Keyword;
-                selected_learning_request_id = keyword_attempt.learning_request_id;
                 mode_fallback_note = append_note(
                     mode_fallback_note,
                     "Requested mode returned no results; retried keyword search and found matches.",
@@ -8408,10 +8292,9 @@ async fn run_search_for_mode(
             if let Ok(refactor_attempt) =
                 execute_api_search_attempt(client, SearchMode::Refactor, params.clone()).await
             {
-                if response_has_hits(&refactor_attempt.response) {
-                    result = refactor_attempt.response;
+                if response_has_hits(&refactor_attempt) {
+                    result = refactor_attempt;
                     executed_mode = SearchMode::Refactor;
-                    selected_learning_request_id = refactor_attempt.learning_request_id;
                     mode_fallback_note = append_note(
                         mode_fallback_note,
                         "Keyword search returned no results; retried refactor search for identifier matching.",
@@ -8426,10 +8309,9 @@ async fn run_search_for_mode(
                 if let Ok(exhaustive_attempt) =
                     execute_api_search_attempt(client, SearchMode::Exhaustive, params.clone()).await
                 {
-                    if response_has_hits(&exhaustive_attempt.response) {
-                        result = exhaustive_attempt.response;
+                    if response_has_hits(&exhaustive_attempt) {
+                        result = exhaustive_attempt;
                         executed_mode = SearchMode::Exhaustive;
-                        selected_learning_request_id = exhaustive_attempt.learning_request_id;
                         mode_fallback_note = append_note(
                             mode_fallback_note,
                             "Keyword search returned no results; retried exhaustive search for complete identifier coverage.",
@@ -8446,10 +8328,9 @@ async fn run_search_for_mode(
             if let Ok(semantic_attempt) =
                 execute_api_search_attempt(client, SearchMode::Semantic, params.clone()).await
             {
-                if response_has_hits(&semantic_attempt.response) {
-                    result = semantic_attempt.response;
+                if response_has_hits(&semantic_attempt) {
+                    result = semantic_attempt;
                     executed_mode = SearchMode::Semantic;
-                    selected_learning_request_id = semantic_attempt.learning_request_id;
                     mode_fallback_note = append_note(
                         mode_fallback_note,
                         "Keyword search returned no results; retried semantic search for natural-language intent.",
@@ -8462,10 +8343,9 @@ async fn run_search_for_mode(
             if let Ok(hybrid_attempt) =
                 execute_api_search_attempt(client, SearchMode::Hybrid, params.clone()).await
             {
-                if response_has_hits(&hybrid_attempt.response) {
-                    result = hybrid_attempt.response;
+                if response_has_hits(&hybrid_attempt) {
+                    result = hybrid_attempt;
                     executed_mode = SearchMode::Hybrid;
-                    selected_learning_request_id = hybrid_attempt.learning_request_id;
                     mode_fallback_note = append_note(
                         mode_fallback_note,
                         "Keyword search returned no results; retried hybrid search as a broad fallback.",
@@ -8476,12 +8356,11 @@ async fn run_search_for_mode(
     }
 
     if allow_broad_fallbacks && !response_has_hits(&result) {
-        if let Some((path_result, path_mode, note, learning_request_id)) =
+        if let Some((path_result, path_mode, note)) =
             try_path_aware_fallbacks(client, &params, original_query).await
         {
             result = path_result;
             executed_mode = path_mode;
-            selected_learning_request_id = learning_request_id;
             mode_fallback_note = append_note(mode_fallback_note, note);
         }
     }
@@ -8490,12 +8369,7 @@ async fn run_search_for_mode(
         mode_fallback_note = append_note(mode_fallback_note, &note);
     }
 
-    Ok((
-        result,
-        executed_mode,
-        mode_fallback_note,
-        selected_learning_request_id,
-    ))
+    Ok((result, executed_mode, mode_fallback_note))
 }
 
 /// Check if team mode should gracefully fall back to hybrid.
@@ -8518,15 +8392,6 @@ fn max_result_score(result: &SearchResponse) -> f64 {
 
 fn response_has_hits(result: &SearchResponse) -> bool {
     !result.results.is_empty() || result.total.unwrap_or(0) > 0
-}
-
-fn served_api_learning_receipt(
-    result: &SearchResponse,
-    learning_request_id: Option<Uuid>,
-) -> Option<Uuid> {
-    (!result.results.is_empty())
-        .then_some(learning_request_id)
-        .flatten()
 }
 
 fn search_response_structured_value(result: &SearchResponse) -> Value {
@@ -8955,10 +8820,6 @@ pub struct SearchInput {
     pub include_content: Option<bool>,
     pub include_memory: Option<bool>,
     pub include_vcs: Option<bool>,
-    /// Explicit caller consent for code-reranker learning telemetry. Defaults
-    /// to false when omitted and never changes the served response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code_rerank_learning_opt_in: Option<bool>,
     pub output_format: Option<String>,
     pub context_lines: Option<i64>,
     pub content_max_chars: Option<i64>,
@@ -9010,15 +8871,6 @@ struct GuidedSearchApiRequest<'a> {
     checkout_locator: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     grounding_handle: Option<&'a str>,
-    /// Explicit caller consent for reranker-learning telemetry. This is a
-    /// side-effect flag and deliberately does not participate in response-cache
-    /// identity because it cannot change the served result.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    code_rerank_learning_opt_in: Option<bool>,
-    /// Caller-minted correlation for authenticated, idempotent outcomes. It is
-    /// never part of response-cache identity and is present only with consent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    code_rerank_learning_request_id: Option<Uuid>,
     limit: usize,
 }
 
@@ -9577,21 +9429,6 @@ fn render_guided_search_response(
     (text, structured)
 }
 
-/// Return the caller-owned learning correlation as one compact structured
-/// scalar. Keeping this flat both minimizes tool tokens and lets the hard wire
-/// envelope preserve it when larger optional diagnostics are shed.
-fn attach_code_rerank_learning_request_id(structured: &mut Value, request_id: Option<Uuid>) {
-    let Some(request_id) = request_id else {
-        return;
-    };
-    if let Some(object) = structured.as_object_mut() {
-        object.insert(
-            "code_rerank_learning_request_id".to_string(),
-            Value::String(request_id.to_string()),
-        );
-    }
-}
-
 fn guided_response_from_search_response(
     query: &str,
     workspace_id: Option<Uuid>,
@@ -9797,7 +9634,6 @@ impl SearchTool {
         workspace_id: Option<Uuid>,
         project_id: Option<Uuid>,
         resolved_grounding_handle: Option<String>,
-        code_rerank_learning_request_id: Option<Uuid>,
         checkout_scope: Option<CheckoutRoutingScope>,
         use_search_cache: bool,
         cache_key: String,
@@ -9807,7 +9643,6 @@ impl SearchTool {
             workspace_id,
             project_id,
             resolved_grounding_handle,
-            code_rerank_learning_request_id,
             checkout_scope,
             use_search_cache,
             cache_key,
@@ -9824,7 +9659,6 @@ impl SearchTool {
         workspace_id: Option<Uuid>,
         project_id: Option<Uuid>,
         resolved_grounding_handle: Option<String>,
-        code_rerank_learning_request_id: Option<Uuid>,
         checkout_scope: Option<CheckoutRoutingScope>,
         use_search_cache: bool,
         cache_key: String,
@@ -9835,7 +9669,6 @@ impl SearchTool {
             workspace_id,
             project_id,
             resolved_grounding_handle,
-            code_rerank_learning_request_id,
             checkout_scope,
             use_search_cache,
             cache_key,
@@ -9851,7 +9684,6 @@ impl SearchTool {
         workspace_id: Option<Uuid>,
         project_id: Option<Uuid>,
         resolved_grounding_handle: Option<String>,
-        code_rerank_learning_request_id: Option<Uuid>,
         checkout_scope: Option<CheckoutRoutingScope>,
         use_search_cache: bool,
         cache_key: String,
@@ -9879,8 +9711,6 @@ impl SearchTool {
                 .as_ref()
                 .map(|scope| scope.checkout_locator.as_str()),
             grounding_handle: resolved_grounding_handle.as_deref(),
-            code_rerank_learning_opt_in: input.code_rerank_learning_opt_in,
-            code_rerank_learning_request_id,
             limit: guided_search_limit(input),
         };
         let options = RequestOptions {
@@ -9969,10 +9799,6 @@ impl SearchTool {
                         object.insert("checkout_scope_unconfirmed".to_string(), Value::Bool(true));
                     }
                 }
-                attach_code_rerank_learning_request_id(
-                    &mut structured,
-                    code_rerank_learning_request_id,
-                );
                 let (text, structured) = budget_search_tool_payload(text, structured);
                 if use_search_cache && !response.degraded {
                     put_search_cache(cache_key, (text.clone(), structured.clone()));
@@ -10040,8 +9866,6 @@ impl SearchTool {
                     exact_match_boost: input.exact_match_boost,
                     offset: input.offset,
                     include_memory: Some(false),
-                    code_rerank_learning_opt_in: input.code_rerank_learning_opt_in,
-                    code_rerank_learning_request_id,
                     hot_paths_hint: None,
                     session_id: mcp_client::get_task_mcp_session_id(),
                 };
@@ -10064,16 +9888,15 @@ impl SearchTool {
                         .await,
                     )
                 };
-                let (response, learning_request_id, fallback_outcome, fallback_message) =
+                let (response, fallback_outcome, fallback_message) =
                     match fallback_result {
                         Some(Ok(Ok(attempt))) => (
                             guided_response_from_search_response(
                                 &input.query,
                                 workspace_id,
                                 project_id,
-                                attempt.response,
+                                attempt,
                             ),
-                            attempt.learning_request_id,
                             "hybrid_evidence",
                             "Guided Search was unavailable; served hybrid raw evidence instead.",
                         ),
@@ -10084,7 +9907,6 @@ impl SearchTool {
                                 project_id,
                                 SearchResponse::default(),
                             ),
-                            code_rerank_learning_request_id,
                             "hybrid_error",
                             "Guided Search and its bounded hybrid fallback were unavailable; retry the same guided search.",
                         ),
@@ -10095,7 +9917,6 @@ impl SearchTool {
                                 project_id,
                                 SearchResponse::default(),
                             ),
-                            code_rerank_learning_request_id,
                             "hybrid_timeout",
                             "Guided Search and its bounded hybrid fallback exhausted the single MCP deadline; retry the same guided search.",
                         ),
@@ -10106,7 +9927,6 @@ impl SearchTool {
                                 project_id,
                                 SearchResponse::default(),
                             ),
-                            code_rerank_learning_request_id,
                             "deadline_exhausted",
                             "Guided Search exhausted the single MCP deadline before hybrid fallback could run; retry the same guided search.",
                         ),
@@ -10124,7 +9944,6 @@ impl SearchTool {
                         Value::String(fallback_outcome.to_string()),
                     );
                 }
-                attach_code_rerank_learning_request_id(&mut structured, learning_request_id);
                 metrics::counter!(
                     "mcp_search_calls_total",
                     "requested_mode" => "guided",
@@ -10906,29 +10725,11 @@ impl SearchTool {
             local_index_project_id,
             project_id,
         );
-        let guided_learning_request_id = if input.code_rerank_learning_opt_in == Some(true) {
-            if workspace_id.is_none() || cache_project_id.is_none() {
-                return Err(Error::Validation(
-                        "code_rerank_learning_opt_in requires an exact workspace_id and project_id scope"
-                            .to_string(),
-                    ));
-            }
-            Some(Uuid::new_v4())
-        } else {
-            None
-        };
         let caller_cache_scope = super::atlas_warm_cache::current_caller_cache_scope();
         let caller_cache_identity = caller_cache_scope.cache_identity();
-        // Learning is side-effect-only and therefore excluded from cache
-        // identity, but an explicitly opted-in call must reach the API so its
-        // observation exists. Ordinary searches retain the warm-cache path.
         let use_search_cache = caller_cache_identity.is_some()
             && !checkout_scope_unroutable
-            && should_use_search_cache(
-                session_folder_path.as_deref(),
-                folder_has_drift,
-                input.code_rerank_learning_opt_in == Some(true),
-            );
+            && should_use_search_cache(session_folder_path.as_deref(), folder_has_drift);
         // Resolve once immediately before cache identity construction. The
         // exact same opaque handle is forwarded on a miss; only its SHA-256
         // digest enters the Guided cache key. Non-Guided modes intentionally
@@ -11024,7 +10825,6 @@ impl SearchTool {
                     workspace_id,
                     cache_project_id,
                     resolved_guided_grounding_handle,
-                    guided_learning_request_id,
                     checkout_routing_scope.clone(),
                     use_search_cache,
                     cache_key,
@@ -11159,10 +10959,6 @@ impl SearchTool {
             exact_match_boost: resolved_exact_match_boost,
             offset: resolved_offset,
             include_memory,
-            code_rerank_learning_opt_in: input.code_rerank_learning_opt_in,
-            // `execute_api_search_attempt` mints a fresh UUID for every
-            // concrete backend attempt and returns it paired with the response.
-            code_rerank_learning_request_id: None,
             hot_paths_hint: hot_paths_hint.clone(),
         };
         let allow_broad_fallbacks = input.cursor.is_none()
@@ -11209,7 +11005,6 @@ impl SearchTool {
             SearchResponse,
             SearchMode,
             Option<String>,
-            Option<Uuid>,
         );
         let mut selected: Option<SelectedSearchAttempt> = None;
         let mut explicit_scope_had_no_results = false;
@@ -11226,7 +11021,7 @@ impl SearchTool {
             )
             .await
             {
-                Ok((result, executed_mode, mode_fallback_note, learning_request_id)) => {
+                Ok((result, executed_mode, mode_fallback_note)) => {
                     push_fallback_stage(
                         &mut fallback_stages,
                         format!("candidate:{}:{}", idx, executed_mode.as_str()),
@@ -11242,7 +11037,6 @@ impl SearchTool {
                                 result,
                                 executed_mode,
                                 mode_fallback_note,
-                                learning_request_id,
                             ));
                         }
                         continue;
@@ -11261,7 +11055,6 @@ impl SearchTool {
                             result,
                             executed_mode,
                             mode_fallback_note,
-                            learning_request_id,
                         ));
                         break;
                     }
@@ -11273,7 +11066,6 @@ impl SearchTool {
                             result,
                             executed_mode,
                             mode_fallback_note,
-                            learning_request_id,
                         ));
                     }
                 }
@@ -11304,12 +11096,7 @@ impl SearchTool {
             } else {
                 None
             };
-            if let Ok((
-                fallback_result,
-                fallback_mode,
-                fallback_note,
-                fallback_learning_request_id,
-            )) = run_search_for_mode(
+            if let Ok((fallback_result, fallback_mode, fallback_note)) = run_search_for_mode(
                 &self.client,
                 requested_mode,
                 workspace_params,
@@ -11343,7 +11130,6 @@ impl SearchTool {
                     fallback_result,
                     fallback_mode,
                     combined_note,
-                    fallback_learning_request_id,
                 ));
             }
         }
@@ -11354,7 +11140,6 @@ impl SearchTool {
             mut result,
             mut executed_mode,
             mut mode_fallback_note,
-            mut served_learning_request_id,
         ) =
             selected.ok_or_else(|| {
                 let base = "Project not found for current context. Call init(...) in this folder or pass a valid project_id explicitly.";
@@ -11375,12 +11160,6 @@ impl SearchTool {
         } else {
             true
         };
-        // A backend receipt can only describe a backend candidate set. If the
-        // selected API response carried no rows, later local-only enrichment
-        // must not surface a UUID that can never resolve to an observation.
-        served_learning_request_id =
-            served_api_learning_receipt(&result, served_learning_request_id);
-
         if let Some(note) = sync_drift_note {
             mode_fallback_note = append_note(mode_fallback_note, &note);
         }
@@ -12153,7 +11932,7 @@ impl SearchTool {
                 )
                 .await
                 {
-                    Ok((retry_result, retry_executed_mode, _, retry_learning_request_id)) => {
+                    Ok((retry_result, retry_executed_mode, _)) => {
                         push_fallback_stage(
                             &mut fallback_stages,
                             format!("escalation:{}", retry_executed_mode.as_str()),
@@ -12161,10 +11940,6 @@ impl SearchTool {
                         let retry_has_hits =
                             !retry_result.results.is_empty() || retry_result.total.unwrap_or(0) > 0;
                         if retry_has_hits {
-                            served_learning_request_id = served_api_learning_receipt(
-                                &retry_result,
-                                retry_learning_request_id,
-                            );
                             result = retry_result;
                             executed_mode = retry_executed_mode;
                             no_hits = false;
@@ -13136,7 +12911,6 @@ impl SearchTool {
             .increment(1);
         }
 
-        attach_code_rerank_learning_request_id(&mut structured, served_learning_request_id);
         let (text, structured) = budget_search_tool_payload(text, structured);
 
         // Store in warm cache so the next identical non-local call can
@@ -13329,15 +13103,6 @@ impl ToolHandler for SearchTool {
                 "Also search linked VCS repositories (PRs, issues, code). Auto-detected when query mentions repos/PRs/issues.",
                 false,
             )
-            .property(
-                "code_rerank_learning_opt_in",
-                serde_json::json!({
-                    "type": "boolean",
-                    "description": "Optional reranker-learning consent; output unchanged.",
-                    "default": false
-                }),
-                false,
-            )
             .string_enum(
                 "output_format",
                 "Response format",
@@ -13436,15 +13201,6 @@ impl ToolHandler for SemanticSearchTool {
             .uuid("workspace_id", "Workspace ID", false)
             .uuid("project_id", "Project ID", false)
             .integer("limit", "Maximum results", false)
-            .property(
-                "code_rerank_learning_opt_in",
-                serde_json::json!({
-                    "type": "boolean",
-                    "description": "Optional reranker-learning consent; output unchanged.",
-                    "default": false
-                }),
-                false,
-            )
             .build()
     }
 }
@@ -13512,15 +13268,6 @@ impl ToolHandler for HybridSearchTool {
             .uuid("workspace_id", "Workspace ID", false)
             .uuid("project_id", "Project ID", false)
             .integer("limit", "Maximum results", false)
-            .property(
-                "code_rerank_learning_opt_in",
-                serde_json::json!({
-                    "type": "boolean",
-                    "description": "Optional reranker-learning consent; output unchanged.",
-                    "default": false
-                }),
-                false,
-            )
             .build()
     }
 }
@@ -13588,15 +13335,6 @@ impl ToolHandler for KeywordSearchTool {
             .uuid("workspace_id", "Workspace ID", false)
             .uuid("project_id", "Project ID", false)
             .integer("limit", "Maximum results", false)
-            .property(
-                "code_rerank_learning_opt_in",
-                serde_json::json!({
-                    "type": "boolean",
-                    "description": "Optional reranker-learning consent; output unchanged.",
-                    "default": false
-                }),
-                false,
-            )
             .build()
     }
 }

@@ -2617,7 +2617,7 @@ mod tests {
         ),
         (
             "search",
-            "2a4168ef3625b67f01478562408bdacb6400c66ee6a23d8cf6ecfb2df3dba336",
+            "dd6b883da11cc15b8ca603655613a290c6e67cbfb40323f1ef2b1cc1121093f5",
         ),
         (
             // Advanced in Wave 3b: additive inputs (successor_id, rationale,
@@ -2999,6 +2999,41 @@ mod tests {
                     annotations["readOnlyHint"],
                     annotations["openWorldHint"],
                     annotations["destructiveHint"],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_tool_surface_mentions_the_retired_reranker() {
+        // The learned reranker and its learning consent are retired. No listed
+        // tool or router operation may advertise either to an agent.
+        for config in [
+            Config::default(),
+            Config {
+                consolidated_mode: false,
+                ..Config::default()
+            },
+            Config {
+                router_mode: true,
+                ..Config::default()
+            },
+        ] {
+            let registry = test_registry(config);
+            let mut surfaces = contextstream_tools_list(&registry, None);
+            surfaces.extend(registry.list_operations().into_iter().map(|operation| {
+                serde_json::json!({
+                    "name": operation.metadata.name,
+                    "input_schema": operation.input_schema,
+                })
+            }));
+            assert!(!surfaces.is_empty());
+            for surface in surfaces {
+                let serialized = serde_json::to_string(&surface).unwrap().to_lowercase();
+                assert!(
+                    !serialized.contains("rerank"),
+                    "tool surface still mentions the retired reranker: {}",
+                    surface["name"]
                 );
             }
         }

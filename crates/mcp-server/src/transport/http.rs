@@ -2614,13 +2614,7 @@ pub async fn auth_middleware(
         }
     })
     .await;
-    if let Some(home) = tenant_home {
-        if let Ok(value) = header::HeaderValue::from_str(&home) {
-            response
-                .headers_mut()
-                .insert(TENANT_HOME_REGION_HEADER, value);
-        }
-    }
+    publish_tenant_home(response.headers_mut(), tenant_home);
     if let Some(key) = transient_session_key {
         state.session.discard_transient_state(&key);
     }
@@ -2631,6 +2625,28 @@ pub async fn auth_middleware(
 /// tenant; mirrored onto the gateway's response. Must match
 /// TENANT_HOME_REGION_HEADER in the API's region module.
 const TENANT_HOME_REGION_HEADER: &str = "x-contextstream-tenant-home-region";
+
+/// Publish the tenant home captured from the API, with the scopes named on
+/// the API response that carried it. Any other copy is removed first: the
+/// gateway must learn only what an API response said, and a scope only
+/// beside the home it describes.
+fn publish_tenant_home(headers: &mut HeaderMap, captured: Option<mcp_client::CapturedTenantHome>) {
+    headers.remove(TENANT_HOME_REGION_HEADER);
+    headers.remove(mcp_client::TENANT_HOME_SCOPE_HEADER);
+    let Some(captured) = captured else {
+        return;
+    };
+    let Ok(home) = header::HeaderValue::from_str(&captured.home) else {
+        return;
+    };
+    headers.insert(TENANT_HOME_REGION_HEADER, home);
+    if let Some(scopes) = captured
+        .scopes
+        .and_then(|scopes| header::HeaderValue::from_str(&scopes).ok())
+    {
+        headers.insert(mcp_client::TENANT_HOME_SCOPE_HEADER, scopes);
+    }
+}
 
 /// What the Cloudflare router said about the caller's location. Both values
 /// are validated to their canonical shapes; anything else is dropped so no
@@ -2730,6 +2746,169 @@ mod tests {
     use http_body_util::BodyExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
+
+    const SCOPE_WORKSPACE: &str = "workspace=5dfde09db0822996";
+    const SCOPE_PROJECT: &str = "project=0123456789abcdef";
+
+    #[test]
+    fn publish_tenant_home_owns_both_headers() {
+        let scope = mcp_client::TENANT_HOME_SCOPE_HEADER;
+        let stale = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(TENANT_HOME_REGION_HEADER, "eu-ams".parse().unwrap());
+            headers.insert(scope, SCOPE_PROJECT.parse().unwrap());
+            headers
+        };
+
+        let mut headers = stale();
+        publish_tenant_home(
+            &mut headers,
+            Some(mcp_client::CapturedTenantHome {
+                home: "ovh-west".to_string(),
+                scopes: Some(SCOPE_WORKSPACE.to_string()),
+            }),
+        );
+        assert_eq!(headers[TENANT_HOME_REGION_HEADER], "ovh-west");
+        assert_eq!(headers[scope], SCOPE_WORKSPACE);
+
+        let mut headers = stale();
+        publish_tenant_home(
+            &mut headers,
+            Some(mcp_client::CapturedTenantHome {
+                home: "ovh-east".to_string(),
+                scopes: None,
+            }),
+        );
+        assert_eq!(headers[TENANT_HOME_REGION_HEADER], "ovh-east");
+        assert!(
+            headers.get(scope).is_none(),
+            "a stale scope must not ride a new home"
+        );
+
+        let mut headers = stale();
+        publish_tenant_home(&mut headers, None);
+        assert!(headers.get(TENANT_HOME_REGION_HEADER).is_none());
+        assert!(headers.get(scope).is_none());
+    }
+
+    /// An API that answers every request with an empty success, naming the
+    /// given tenant home and scopes.
+    async fn tenant_home_api(home: Option<&'static str>, scopes: Option<&'static str>) -> String {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().fallback(move || async move {
+            let mut response = axum::Json(json!({"success": true, "data": []})).into_response();
+            if let Some(home) = home {
+                response
+                    .headers_mut()
+                    .insert(TENANT_HOME_REGION_HEADER, home.parse().unwrap());
+            }
+            if let Some(scopes) = scopes {
+                response.headers_mut().insert(
+                    mcp_client::TENANT_HOME_SCOPE_HEADER,
+                    scopes.parse().unwrap(),
+                );
+            }
+            response
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tenant-home API");
+        let address = listener.local_addr().expect("tenant-home API address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve tenant-home API")
+        });
+        format!("http://{address}")
+    }
+
+    /// A stateless workspace-list tool call against `api_url`, carrying
+    /// client-supplied copies of both tenant-home headers, which must never
+    /// reach the response.
+    async fn tool_call_tenant_home_headers(api_url: String) -> HeaderMap {
+        let config = Config {
+            api_url,
+            api_key: Some("test-api-key".to_string()),
+            is_http_transport: true,
+            ..Config::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config.clone()));
+        let registry = build_registry(&config, client.clone(), session.clone());
+        let state = HttpState {
+            registry: Arc::new(registry),
+            client: client.clone(),
+            session: session.clone(),
+            jwt_secret: None,
+            require_auth: false,
+            telemetry: AgenticTelemetry::new(client, session),
+            tools_list_cache: Arc::new(RwLock::new(HashMap::new())),
+            concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            metrics_handle: None,
+        };
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": "tenant-home",
+            "method": "tools/call",
+            "params": {
+                "name": "workspace",
+                "arguments": {"action": "list"},
+                "_meta": stateless_params(MCP_PROTOCOL_2026_07_28)["_meta"].clone()
+            }
+        });
+        let mut request = stateless_streamable_request(
+            call,
+            MCP_PROTOCOL_2026_07_28,
+            "tools/call",
+            Some("workspace"),
+            None,
+        );
+        let headers = request.headers_mut();
+        headers.insert(
+            "x-contextstream-api-key",
+            "caller-request-key".parse().unwrap(),
+        );
+        headers.insert(TENANT_HOME_REGION_HEADER, "eu-ams".parse().unwrap());
+        headers.insert(
+            mcp_client::TENANT_HOME_SCOPE_HEADER,
+            SCOPE_PROJECT.parse().unwrap(),
+        );
+        let response = create_router(state)
+            .oneshot(request)
+            .await
+            .expect("tool call");
+        assert_eq!(response.status(), StatusCode::OK);
+        response.headers().clone()
+    }
+
+    #[tokio::test]
+    async fn tool_call_relays_the_home_and_scopes_from_the_api_response() {
+        let headers = tool_call_tenant_home_headers(
+            tenant_home_api(Some("ovh-west"), Some(SCOPE_WORKSPACE)).await,
+        )
+        .await;
+        assert_eq!(headers[TENANT_HOME_REGION_HEADER], "ovh-west");
+        assert_eq!(
+            headers[mcp_client::TENANT_HOME_SCOPE_HEADER],
+            SCOPE_WORKSPACE
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_relays_no_scope_beside_a_home_whose_response_named_none() {
+        let headers =
+            tool_call_tenant_home_headers(tenant_home_api(Some("ovh-east"), None).await).await;
+        assert_eq!(headers[TENANT_HOME_REGION_HEADER], "ovh-east");
+        assert!(headers.get(mcp_client::TENANT_HOME_SCOPE_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_call_relays_neither_header_when_the_api_named_no_home() {
+        let headers =
+            tool_call_tenant_home_headers(tenant_home_api(None, Some(SCOPE_WORKSPACE)).await).await;
+        assert!(headers.get(TENANT_HOME_REGION_HEADER).is_none());
+        assert!(headers.get(mcp_client::TENANT_HOME_SCOPE_HEADER).is_none());
+    }
 
     fn create_protocol_test_state() -> HttpState {
         let config = Config {

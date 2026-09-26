@@ -449,16 +449,39 @@ pub fn get_task_edge_geography() -> Option<mcp_types::EdgeGeography> {
 
 tokio::task_local! {
     /// The tenant home region the API named on the responses made inside the
-    /// current request (`x-contextstream-tenant-home-region`). The HTTP
-    /// transport publishes it on its own response so the Cloudflare MCP
-    /// gateway can remember the caller's home and lead the caller's next
-    /// calls with the origin holding the tenant's primary.
-    static TASK_TENANT_HOME: std::cell::RefCell<Option<String>>;
+    /// current request (`x-contextstream-tenant-home-region`), with the scope
+    /// tokens the same response named. The HTTP transport publishes them on
+    /// its own response so the Cloudflare MCP gateway can remember the
+    /// caller's home and lead the caller's next calls with the origin holding
+    /// the tenant's primary.
+    static TASK_TENANT_HOME: std::cell::RefCell<Option<CapturedTenantHome>>;
+}
+
+/// Response header in which the API names, as `<kind>=<16 hex>` tokens, the
+/// workspaces or projects whose own home is the published tenant home. The
+/// Cloudflare MCP gateway learns a scoped call's home only when this names
+/// that call's scope. Mirrors TENANT_HOME_SCOPE_HEADER in the API's region
+/// module.
+pub const TENANT_HOME_SCOPE_HEADER: &str = "x-contextstream-tenant-home-scope";
+
+/// The gateway ignores a longer scope header, so relaying one gains nothing.
+const MAX_TENANT_HOME_SCOPE_BYTES: usize = 1024;
+
+/// A tenant home the API named on one response, with the scopes that same
+/// response said it belongs to. The pair is captured and published together,
+/// so a scope never travels beside a home read by a different API call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedTenantHome {
+    /// Canonical region name.
+    pub home: String,
+    /// Well-formed scope tokens from the same response, comma-joined.
+    pub scopes: Option<String>,
 }
 
 /// Run a future while capturing the tenant home the API names on any response
-/// made inside it. Returns the future's output and the last home seen.
-pub async fn run_capturing_tenant_home<F, Fut>(f: F) -> (Fut::Output, Option<String>)
+/// made inside it. Returns the future's output and the last home seen, with
+/// the scopes named on the response that carried it.
+pub async fn run_capturing_tenant_home<F, Fut>(f: F) -> (Fut::Output, Option<CapturedTenantHome>)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future,
@@ -473,7 +496,9 @@ where
 }
 
 /// Record the tenant home named on an API response, when a capture scope is
-/// active. Only the canonical region vocabulary is kept.
+/// active. Only the canonical region vocabulary is kept. A response that
+/// names a home replaces the whole capture, scopes included; one that names
+/// no home changes nothing, and any scope header on it is ignored.
 pub(crate) fn observe_tenant_home_header(headers: &reqwest::header::HeaderMap) {
     let Some(home) = headers
         .get("x-contextstream-tenant-home-region")
@@ -482,9 +507,162 @@ pub(crate) fn observe_tenant_home_header(headers: &reqwest::header::HeaderMap) {
     else {
         return;
     };
+    let captured = CapturedTenantHome {
+        home: home.as_header_value().to_string(),
+        scopes: tenant_home_scopes(headers),
+    };
     let _ = TASK_TENANT_HOME.try_with(|cell| {
-        *cell.borrow_mut() = Some(home.as_header_value().to_string());
+        *cell.borrow_mut() = Some(captured);
     });
+}
+
+/// The scope tokens on a response, lowercased, when there is exactly one
+/// header of bounded size and every token is `workspace=` or `project=`
+/// followed by 16 hex digits. Anything else is dropped whole.
+fn tenant_home_scopes(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(TENANT_HOME_SCOPE_HEADER).iter();
+    let raw = values.next()?.to_str().ok()?;
+    if values.next().is_some() || raw.len() > MAX_TENANT_HOME_SCOPE_BYTES {
+        return None;
+    }
+    let tokens = raw
+        .split(',')
+        .map(|token| token.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    tokens
+        .iter()
+        .all(|token| is_tenant_home_scope_token(token))
+        .then(|| tokens.join(","))
+}
+
+fn is_tenant_home_scope_token(token: &str) -> bool {
+    let Some((kind, digest)) = token.split_once('=') else {
+        return false;
+    };
+    matches!(kind, "workspace" | "project")
+        && digest.len() == 16
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tenant_home_capture_tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    const HOME: &str = "x-contextstream-tenant-home-region";
+    const WORKSPACE: &str = "workspace=5dfde09db0822996";
+    const PROJECT: &str = "project=0123456789abcdef";
+
+    fn response_headers(home: Option<&str>, scopes: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(home) = home {
+            headers.insert(HOME, HeaderValue::from_str(home).unwrap());
+        }
+        for scope in scopes {
+            headers.append(
+                TENANT_HOME_SCOPE_HEADER,
+                HeaderValue::from_str(scope).unwrap(),
+            );
+        }
+        headers
+    }
+
+    async fn capture(responses: Vec<HeaderMap>) -> Option<CapturedTenantHome> {
+        run_capturing_tenant_home(|| async move {
+            for headers in &responses {
+                observe_tenant_home_header(headers);
+            }
+        })
+        .await
+        .1
+    }
+
+    fn captured(home: &str, scopes: Option<&str>) -> Option<CapturedTenantHome> {
+        Some(CapturedTenantHome {
+            home: home.to_string(),
+            scopes: scopes.map(str::to_string),
+        })
+    }
+
+    #[tokio::test]
+    async fn scopes_are_captured_with_the_home_from_the_same_response() {
+        let got = capture(vec![response_headers(Some("eu-ams"), &[WORKSPACE])]).await;
+        assert_eq!(got, captured("eu-ams", Some(WORKSPACE)));
+
+        // Several tokens, spaced and in upper-case hex, relay normalized.
+        let both = format!("{WORKSPACE}, project=0123456789ABCDEF");
+        let got = capture(vec![response_headers(Some("ovh-east"), &[&both])]).await;
+        assert_eq!(
+            got,
+            captured("ovh-east", Some(&format!("{WORKSPACE},{PROJECT}")))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_home_never_inherits_an_earlier_scope() {
+        let got = capture(vec![
+            response_headers(Some("ovh-east"), &[WORKSPACE]),
+            response_headers(Some("ovh-west"), &[]),
+        ])
+        .await;
+        assert_eq!(got, captured("ovh-west", None));
+    }
+
+    #[tokio::test]
+    async fn a_response_without_a_home_neither_adds_a_scope_nor_drops_the_pair() {
+        let got = capture(vec![
+            response_headers(Some("ovh-east"), &[WORKSPACE]),
+            response_headers(None, &[PROJECT]),
+        ])
+        .await;
+        assert_eq!(got, captured("ovh-east", Some(WORKSPACE)));
+
+        let got = capture(vec![
+            response_headers(Some("ovh-east"), &[]),
+            response_headers(None, &[PROJECT]),
+        ])
+        .await;
+        assert_eq!(got, captured("ovh-east", None));
+    }
+
+    #[tokio::test]
+    async fn a_scope_without_a_recognized_home_is_never_captured() {
+        assert_eq!(
+            capture(vec![response_headers(None, &[WORKSPACE])]).await,
+            None
+        );
+        assert_eq!(
+            capture(vec![response_headers(Some("mars"), &[WORKSPACE])]).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_duplicate_or_oversized_scopes_are_dropped_and_the_home_kept() {
+        let oversized = vec![WORKSPACE; 40].join(",");
+        assert!(oversized.len() > MAX_TENANT_HOME_SCOPE_BYTES);
+        for scopes in [
+            vec!["workspace=5dfde09db082299"],
+            vec!["workspace=5dfde09db0822996z"],
+            vec!["workspace=5dfde09db082299g"],
+            vec!["tenant=5dfde09db0822996"],
+            vec!["workspace:5dfde09db0822996"],
+            vec!["5dfde09db0822996"],
+            vec![""],
+            vec!["workspace=5dfde09db0822996,,project=0123456789abcdef"],
+            vec![WORKSPACE, PROJECT],
+            vec![oversized.as_str()],
+        ] {
+            let got = capture(vec![response_headers(Some("eu-ams"), &scopes)]).await;
+            assert_eq!(got, captured("eu-ams", None), "scopes {scopes:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn observing_outside_a_capture_is_a_no_op() {
+        observe_tenant_home_header(&response_headers(Some("eu-ams"), &[WORKSPACE]));
+        assert_eq!(capture(vec![]).await, None);
+    }
 }
 
 tokio::task_local! {

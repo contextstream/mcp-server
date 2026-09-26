@@ -183,7 +183,7 @@ pub use client::{
     get_task_session_key, run_capturing_tenant_home, run_with_auth_override,
     run_with_caller_cache_identity, run_with_config_override, run_with_edge_geography,
     run_with_installation_id, run_with_mcp_session_id, run_with_model_id, run_with_session_key,
-    spawn_with_task_context, TaskContextSnapshot,
+    spawn_with_task_context, CapturedTenantHome, TaskContextSnapshot, TENANT_HOME_SCOPE_HEADER,
 };
 pub use ingest_guard::{
     broad_ingest_opt_in_from_env, validate_ingest_root, IngestRootAssessment, IngestRootOptions,

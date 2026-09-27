@@ -1239,12 +1239,12 @@ pub fn catalog_json() -> serde_json::Value {
                     "supported": d.dialect != ConfigDialect::RulesOnly,
                     "format": (d.dialect != ConfigDialect::RulesOnly).then(|| d.dialect.format_name()),
                     "server_path": (d.dialect != ConfigDialect::RulesOnly)
-                        .then(|| d.dialect.server_path().join(".")),
+                        .then(|| d.dialect.server_path()),
                     "global_config": (d.dialect != ConfigDialect::RulesOnly)
                         .then(|| d.global_config.map(|spec| spec.display()))
                         .flatten(),
                     "project_config": d.project_config.map(|config| config.path.display()),
-                    "project_server_path": d.project_config.map(|config| config.server_path.join(".")),
+                    "project_server_path": d.project_config.map(|config| config.server_path),
                     "remote_entry": super::mcp_config::catalog_remote_entry(editor),
                 },
                 "rules": {
@@ -1358,6 +1358,26 @@ mod tests {
             .find(|c| c["id"] == "claude")
             .expect("claude");
         assert_eq!(claude["mcp"]["global_config"], "~/.claude.json");
+        // Key paths are arrays: `amp.mcpServers` is one literal key, while
+        // ZCode nests `servers` under `mcp`.
+        assert_eq!(
+            claude["mcp"]["server_path"],
+            serde_json::json!(["mcpServers"])
+        );
+        let amp = clients.iter().find(|c| c["id"] == "amp").expect("amp");
+        assert_eq!(
+            amp["mcp"]["server_path"],
+            serde_json::json!(["amp.mcpServers"])
+        );
+        let zcode = clients.iter().find(|c| c["id"] == "zcode").expect("zcode");
+        assert_eq!(
+            zcode["mcp"]["server_path"],
+            serde_json::json!(["mcp", "servers"])
+        );
+        assert_eq!(
+            zcode["mcp"]["project_server_path"],
+            serde_json::json!(["mcp", "servers"])
+        );
         assert_eq!(claude["mcp"]["remote_entry"]["type"], "http");
 
         let markdown = catalog_markdown();

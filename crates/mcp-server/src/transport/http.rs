@@ -1867,10 +1867,56 @@ async fn router_execute_response(
     }
 }
 
+/// Log a client's self-reported `clientInfo.name` when no harness alias
+/// matches it, so aliases for new clients come from real hosted traffic (see
+/// `HarnessId::from_client_hint`). Only a short, printable form of the name and
+/// version is logged, and neither is used for authorization.
+fn log_unrecognized_client(params: &Value) {
+    if let Some((name, version)) = unrecognized_client_identity(params) {
+        info!(
+            target: "contextstream::client_identity",
+            client_info_name = %name,
+            client_info_version = %version,
+            "unrecognized MCP client"
+        );
+    }
+}
+
+/// The loggable `(name, version)` of a client no harness alias recognizes.
+fn unrecognized_client_identity(params: &Value) -> Option<(String, String)> {
+    let client = params
+        .get("clientInfo")
+        .or_else(|| params.get("client_info"))?;
+    let name = client.get("name").and_then(Value::as_str)?;
+    if HarnessId::from_client_hint(name).is_some() {
+        return None;
+    }
+    let name = loggable_client_token(name)?;
+    let version = client
+        .get("version")
+        .and_then(Value::as_str)
+        .and_then(loggable_client_token)
+        .unwrap_or_default();
+    Some((name, version))
+}
+
+/// At most 64 characters from a small printable set, or `None` when nothing
+/// usable remains.
+fn loggable_client_token(raw: &str) -> Option<String> {
+    let token: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '/' | '+'))
+        .take(64)
+        .collect();
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
 async fn handle_initialize_method(
     state: &HttpState,
     params: &Value,
 ) -> Result<Value, JsonRpcError> {
+    log_unrecognized_client(params);
     let registry = effective_registry(state).await;
     Ok(build_legacy_initialize_result(
         &registry,
@@ -5350,5 +5396,29 @@ mod tests {
                 ToolSurfaceProfile::OpenaiAgentic,
             );
         }
+    }
+
+    #[test]
+    fn only_unrecognized_clients_are_logged_and_only_as_bounded_tokens() {
+        let identity = |name: &str, version: &str| {
+            unrecognized_client_identity(&json!({
+                "clientInfo": {"name": name, "version": version}
+            }))
+        };
+        // Known clients, including exact clientInfo names, are not logged.
+        for known in ["claude-code", "cursor-vscode", "codex-mcp-client", "Zed"] {
+            assert_eq!(identity(known, "1.0.0"), None, "{known}");
+        }
+        assert_eq!(
+            identity("kimi-code-mcp-client", "0.4.1"),
+            Some(("kimi-code-mcp-client".to_string(), "0.4.1".to_string()))
+        );
+        // Control characters and markup are dropped and length is bounded.
+        let (name, version) =
+            identity("Muse\n<script>Code</script>\u{1b}[31m", &"9".repeat(200)).unwrap();
+        assert_eq!(name, "MusescriptCode/script31m");
+        assert_eq!(version.len(), 64);
+        assert_eq!(identity("\n\t<>", "1"), None);
+        assert_eq!(unrecognized_client_identity(&json!({})), None);
     }
 }

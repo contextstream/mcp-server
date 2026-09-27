@@ -549,7 +549,7 @@ fn contextstream_meta_tool_entry(
         "title": title,
         "description": description,
         "category": "router",
-        "inputSchema": input_schema,
+        "inputSchema": mcp_tools::portable_schema::portable_input_schema(&input_schema),
         "annotations": contextstream_tool_annotations(title, &annotations),
         "_meta": {
             "contextstream": contextstream_tool_extension(name, title, &annotations)
@@ -2499,19 +2499,19 @@ mod tests {
         ),
         (
             "answer",
-            "47f91fa2cab8d8769f4940a23a714965f3abfbe9abf032237adb1b2fdec43f6a",
+            "725feee5c960970b34ab4dec4a308792db1ea29b7f652c0ef36804beaac2cc0b",
         ),
         (
             "capsule",
-            "c680655059bf1f41e916674fe9610f1e6947f7fdda1a833ac9624770eb6b015a",
+            "515471604f860d05a7cd8c2225f91ddd44ea71be8982d7242b47df3bde22f423",
         ),
         (
             "capture_plan",
-            "5476f8dce574bfa5be96e6cfb9d8a9acba4a401114aaa4f61a2e78af12d90dbc",
+            "a6180b7827aeb9adb1163a7cf9eb4f4a2a530b35e2d138f52d56d16d4fa392b9",
         ),
         (
             "context",
-            "30f657e3f262c2fde96ce544d7dc78e3446a51dce8eebe19c6f5051793ba62e9",
+            "9a5d33c91956c863976d4644f0fe59b3065905bab2fb138bb3c84bb066ef97db",
         ),
         (
             // Advanced in Wave 4b: `kind` became a validated enum
@@ -2520,41 +2520,41 @@ mod tests {
             // Coordination v2: action=reply with `message`, and `metadata`
             // (git branch/commit) on check_in as judge evidence.
             "coordination",
-            "63a765be22dd19970e1aed0999ea8befd851514cad42382deee364e808707c37",
+            "28a3c5485106a5720aa8c3774f0139a37eea775d316cbd994604bb721642a4cc",
         ),
         (
             "entity",
-            "8d09ed3df23786cc510692f6d7be167c1836a2b52873f9ce7dc232870d52f0a9",
+            "ebc7e45a08512c39d7ca4cbcc997108ea8a1ce20873ee9ff8e32d727396896f8",
         ),
         (
             "feed",
-            "41f7667c0adebc364cc56192933d2fa0384bad6d536b820fdf9955ccaeac5252",
+            "87629ecbc0ff8e4c6b9a877027e09c2671781c53af955c8ae7ecb44d10f8b80c",
         ),
         (
             "graph",
-            "8badfe1e6b204a8ece5fc2f664aaa25a05c035841faf4dce63e2c49e5e742f76",
+            "a86ddb1fff028415180c19a8a61492418ed9bd2ca22a3f0dd59e4eaeee74c4ca",
         ),
         (
             // Advanced when the `feeds` bundle joined the `bundle` enum
             // (additive; every earlier value is still accepted).
             "help",
-            "77a129e3b652ddd319ebf992d5230bda949823b50f1d075936a0197190fe09cf",
+            "4c9ff7808fc2668403516509f1c0760fd59e2b115b358f08288ba02e1591defb",
         ),
         (
             "init",
-            "857e6c70edddd7cff29738d6baeb7df1010997dbdfade8fae583bfdcb300b37f",
+            "78c147fd2ee34c808a5beae712d98750bb50ea2a00e04bdf407076464b78c5fc",
         ),
         (
             "instruct",
-            "13c56d2c81bf7f87fbe8f60dbd639ad101ff5770f2f1bbdf1bda146c0c5663c1",
+            "ad1e2260b3c50468dc64e6483d4e3e84f1333b8d964c5257216596d9e10898ca",
         ),
         (
             "integration",
-            "55981cfc657ff54f030c0a0b15411709455f18ba74e0c71fa7c30b8e7ebe9f33",
+            "2e5bb35b3f48409b136a213c0483526e39f4ddf37c4b7f9714f12f84552679bb",
         ),
         (
             "media",
-            "00334ef5436ef083b374795f098791bb29e4fdffe7bf4bf252c92c05cf7ca13d",
+            "959dc2221efaf74946a3477f316646c0ccacf22099e29c90b3f447f3f16b21c2",
         ),
         (
             // Advanced in Wave 3b: additive typed-decision inputs (sort,
@@ -2563,33 +2563,33 @@ mod tests {
             // successor_id) plus the `create_decision` / `decision_action`
             // enum values. Every earlier field and action still accepted.
             "memory",
-            "7375ce8d9fb71cdb92141dc119db3e765cca73118ec740a493487b73b55f850f",
+            "264725d6678660d75850166288d84af6a09bad9b04c482318374f5d833b55a54",
         ),
         (
             "memory_complete_todo",
-            "7f12a11995cb407642794e100fd62d71c2018c0b90691c1e680c6618b1234ac3",
+            "6f551cea8459b8cc674ac3462e5e88d2dff0050f4f00acad7400bb7059fb7c23",
         ),
         (
             "memory_create_doc",
-            "d5c7af3b559d5b6e8126c6cea7d67a274224d69aa389eb990a15590eb1d94def",
+            "2dd3282d3c74b74e7d86645454630f90ae712d533b2ed0a2b6f6827d3a169252",
         ),
         (
             "memory_create_event",
-            "41b0dd9c8591d7edcd3ccb7a4205aeb719e6c5e8d632a196e470a89e7d620cdd",
+            "743397fbdca79341bbd446d447057053643b03c597695d45c26a6c1f70740acd",
         ),
         (
             "memory_create_task",
-            "60559ff57a59db8fb9c3d0cc3a2697ef964d447c7fd3c77bec1953b616995794",
+            "4dc2bd200c782baf7806ed136467b825963371f5c273d5462665d22d2c190248",
         ),
         (
             "memory_create_todo",
-            "ecd98039e145cbc1dd0815eb506a8ad66216398e38b436c067ee556380cf18fa",
+            "b4f7e55f82c743d0d1b400800c070e055bff4ffe84bc38e979af11e6d4a190c6",
         ),
         (
             // New row in Wave 3b: `memory_decisions` was registered but
             // unreachable in consolidated mode; it now reaches the surface.
             "memory_decisions",
-            "f06803e365519667ae3a0aadc7d99b5e66203eb7c1013cc2392f5529e7e2c377",
+            "0eadd6ef4f7be8ce02d07eda664ec31c66c5127aa94492fbcd30a6cd5639a08b",
         ),
         (
             "memory_delete_doc",
@@ -2601,54 +2601,54 @@ mod tests {
         ),
         (
             "memory_update_task",
-            "75339a9a7858741f90dbe3109e10ee6aa2b82648c2594fe080e5f033c21387ae",
+            "afbb3233e8a5d08967ea18f4c6da6e9ee2d0f36e492a6faf12348c69ccbee025",
         ),
         (
             "project",
-            "17f966f889e01d708c05e7e65d63301c86ee76b4c0223966c63f6a83ed1b1bbc",
+            "dbbff3e4eae3b034ff99646d3e9e72efb6c1a3adec3c81d6a1548304c0c440ed",
         ),
         (
             "qa",
-            "1539c9c06ffa32bb2d362a5c1e034ad23bccb919dce8f160ce60758e278f4e78",
+            "adc83752631c9e86d3a99f87bbba78ba5043c49771850cd3cd2da6c3928db102",
         ),
         (
             "reminder",
-            "4786b35cf4e5fca2d5d1e38fe0602ac7f81ae552d3594bb2c03c9e44efccbfc2",
+            "360b02798e9627e8bbac06ea890a3722914b4e9826ff2097657df18ceff96f64",
         ),
         (
             "search",
-            "dd6b883da11cc15b8ca603655613a290c6e67cbfb40323f1ef2b1cc1121093f5",
+            "72b6dc57fa1afead49d7515ed2a1480a59e868a6cd90dae8d04817090c927d38",
         ),
         (
             // Advanced in Wave 3b: additive inputs (successor_id, rationale,
             // alternatives, scope, confidence, supersedes) plus the
             // `supersede_lesson` action value. Additive only.
             "session",
-            "88135dfe81003211efaba8987e9a29d80ba2666b46ce5625cad352c75beeef39",
+            "13a27ebcef31a553b67dc2998e72477332364c1221a0c54e140ec24ab8e95ead",
         ),
         (
             "session_capture",
-            "54a4a2e146e231cc03898aba8ab163a596c12bb9428616ebfb9a49ea263e8e4e",
+            "2aec6a146a2658108ff68619acbc3ad89544aaae7fc5eed939b33d071266207a",
         ),
         (
             "session_capture_lesson",
-            "f6b4ffcb8eaa3f111352fa810d819847d36bd885a21b3eec6a1f4641396e5085",
+            "e14ad74849d35160cb0ebfb04a92cf6b90598c9ae1d1bf78ec28901b109c8c66",
         ),
         (
             "session_remember",
-            "fe47bd9f48eb0c15ab0cf223f0210dddb6af84ae8ba1531e88f2b3a4d93ae4ca",
+            "c0c5eda46edfcdb58a7782525dcd97026ba20783da91ec4c123691ea1673bcaf",
         ),
         (
             "skill",
-            "bf7ec63a561c62abff91b06fa92da4f752bda856b7f1786848a80ffb9efeffcc",
+            "ce994b13cda7da6493f8a60950cb08b4a13e23e375a7be4d62e48f89ca2bce9f",
         ),
         (
             "vcs",
-            "24082880cc8144907b2ae49f4aa54e22436278d9fa813cb783f8ba753a34d371",
+            "8e689ff055ae8139bbae176b61c6c6e746d15c92067d838ebea2d508f14971e3",
         ),
         (
             "workspace",
-            "29c375c10c2a2d8e131ec3765bcb1e2fa90e3e2ef8fe28aa6518c24c147562b6",
+            "82b580b422c95161db9b0732d6a184f7f77fa511d28670c035939884bbc5ffba",
         ),
     ];
 
@@ -2820,6 +2820,176 @@ mod tests {
             }
         }
         assert_eq!(actual, expected);
+    }
+
+    /// Every surface a client can be configured into, including the hosted
+    /// gateway's `complete` toolset and the worst case with integration tools
+    /// forced visible.
+    /// OpenAI-compatible Chat Completions endpoints reject function
+    /// descriptions longer than this, and several harnesses route through
+    /// them. Longer guidance belongs on the tool's main parameter via
+    /// `mcp_tools::schema::with_full_reference`.
+    const PORTABLE_DESCRIPTION_LIMIT: usize = 1024;
+
+    fn every_tool_surface_config() -> Vec<(String, Config)> {
+        let mut configs = Vec::new();
+        for toolset in [
+            mcp_types::config::Toolset::Light,
+            mcp_types::config::Toolset::Standard,
+            mcp_types::config::Toolset::Complete,
+        ] {
+            for consolidated_mode in [true, false] {
+                for (router_mode, tool_surface_profile) in [
+                    (false, ToolSurfaceProfile::Default),
+                    (true, ToolSurfaceProfile::Default),
+                    (false, ToolSurfaceProfile::OpenaiAgentic),
+                ] {
+                    for auto_hide_integrations in [true, false] {
+                        configs.push((
+                            format!(
+                                "{toolset:?} consolidated={consolidated_mode} router={router_mode} \
+                                 profile={} auto_hide={auto_hide_integrations}",
+                                tool_surface_profile.as_str()
+                            ),
+                            Config {
+                                toolset,
+                                consolidated_mode,
+                                router_mode,
+                                tool_surface_profile,
+                                auto_hide_integrations,
+                                ..Config::default()
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        configs
+    }
+
+    /// Model providers reject a whole request when any one tool is invalid,
+    /// so every advertised tool must fit the strictest common limits:
+    /// Moonshot's schema dialect (Kimi), GLM's 128-function cap and
+    /// `^[a-zA-Z0-9_-]{1,64}$` names (checked with the `mcp__contextstream__`
+    /// prefix harnesses add), and Gemini's 63-character tool names.
+    #[test]
+    fn every_advertised_tool_is_portable_across_model_providers() {
+        const HARNESS_PREFIX: &str = "mcp__contextstream__";
+        const MAX_PREFIXED_NAME: usize = 63;
+        const MAX_TOOLS: usize = 100;
+
+        let mut failures = Vec::new();
+        for (label, config) in every_tool_surface_config() {
+            let tools = contextstream_tools_list(&test_registry(config), None);
+            if tools.len() > MAX_TOOLS {
+                failures.push(format!(
+                    "{label}: {} tools exceeds {MAX_TOOLS}",
+                    tools.len()
+                ));
+            }
+            for tool in &tools {
+                let name = tool["name"].as_str().expect("tool name");
+                let valid_charset = name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                if !valid_charset {
+                    failures.push(format!("{label}: `{name}` has a non-portable name"));
+                }
+                if HARNESS_PREFIX.len() + name.len() > MAX_PREFIXED_NAME {
+                    failures.push(format!("{label}: `{HARNESS_PREFIX}{name}` is too long"));
+                }
+                let description_chars = tool["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .chars()
+                    .count();
+                if description_chars > PORTABLE_DESCRIPTION_LIMIT {
+                    failures.push(format!(
+                        "{label}: `{name}` description has {description_chars} chars \
+                         (limit {PORTABLE_DESCRIPTION_LIMIT})"
+                    ));
+                }
+                for violation in
+                    mcp_tools::portable_schema::portable_schema_violations(&tool["inputSchema"])
+                {
+                    failures.push(format!("{label}: `{name}` {violation}"));
+                }
+            }
+        }
+        failures.dedup();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Tools whose descriptions were abridged to fit the 1024-char limit
+    /// must keep their complete original guidance on their main parameter.
+    #[test]
+    fn abridged_tools_keep_their_full_reference_on_the_main_parameter() {
+        let tools = contextstream_tools_list(
+            &test_registry(Config {
+                toolset: mcp_types::config::Toolset::Complete,
+                ..Config::default()
+            }),
+            None,
+        );
+        for (name, parameter) in [
+            ("capsule", "action"),
+            ("entity", "action"),
+            ("memory", "action"),
+            ("project", "action"),
+            ("qa", "action"),
+            ("search", "mode"),
+            ("session", "action"),
+        ] {
+            let tool = tool_by_name(&tools, name);
+            let description = tool["inputSchema"]["properties"][parameter]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                description.contains("Full tool reference:"),
+                "`{name}.{parameter}` lost its full tool reference"
+            );
+            assert!(
+                description.len() > tool["description"].as_str().unwrap_or_default().len(),
+                "`{name}` reference must be the complete text, not the summary"
+            );
+        }
+    }
+
+    /// Writes the advertised tool surfaces to `$CONTEXTSTREAM_DUMP_TOOLS_TO`
+    /// for `testing/providers/check_tool_schemas.py`, which replays them
+    /// against real model providers. Manual: run with `--ignored`.
+    #[test]
+    #[ignore = "manual: feeds the live provider schema check"]
+    fn dump_advertised_tools_for_provider_check() {
+        let Some(path) = std::env::var_os("CONTEXTSTREAM_DUMP_TOOLS_TO") else {
+            return;
+        };
+        let surface = |config: Config| contextstream_tools_list(&test_registry(config), None);
+        let surfaces = serde_json::json!({
+            // What the hosted gateway serves (complete toolset, consolidated).
+            "hosted": surface(Config {
+                toolset: mcp_types::config::Toolset::Complete,
+                ..Config::default()
+            }),
+            "standard": surface(Config::default()),
+            "compact": surface(Config {
+                tool_surface_profile: ToolSurfaceProfile::OpenaiAgentic,
+                ..Config::default()
+            }),
+            "router": surface(Config {
+                router_mode: true,
+                ..Config::default()
+            }),
+        });
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&surfaces).expect("serialize surfaces"),
+        )
+        .expect("write tool surfaces");
     }
 
     #[test]

@@ -13024,6 +13024,13 @@ impl SearchTool {
     }
 }
 
+/// Routing summary advertised as the tool description (<= 1024 chars).
+const SEARCH_TOOL_DESCRIPTION: &str = "Search the indexed CODEBASE for source code and files. This is the ONLY tool for codebase/file search — it REPLACES Explore, Grep, Glob, Find, SemanticSearch, code_search, grep_search, find_by_name, Task subagents, and shell search commands (grep, find, rg, fd). Do NOT fall back to local tools. Pre-indexed BM25 returns ranked, line-precise results in 10-200ms.\n\n⚠️ NOT for docs / runbooks / specs / ADRs / RFCs / decisions / lessons — call `memory(action=\"search\", query=\"…\")` or `memory(action=\"list_docs\", query=\"…\")`. Do NOT use memory(search) or session(smart_search) for *code* lookup.\n\nModes: auto (default), keyword, pattern (regex/glob), semantic, guided (raw-evidence-first navigation), exhaustive (all occurrences), refactor, team (cross-project), crawl. Full mode reference: the `mode` parameter.";
+
+/// Complete tool reference, advertised on the main parameter; see
+/// [`crate::schema::with_full_reference`].
+const SEARCH_TOOL_REFERENCE: &str = "Search the indexed CODEBASE for source code and files. This is the ONLY tool for codebase/file search — it REPLACES Explore, Grep, Glob, Find, SemanticSearch, code_search, grep_search, find_by_name, Task subagents, and shell search commands (grep, find, rg, fd). Do NOT fall back to local tools — this tool handles ALL code search needs with automatic mode escalation and local enrichment built in. FASTER than grep/ripgrep: pre-indexed BM25 returns results in 10-200ms with ranked source-code-first results, line-level precision, context lines, and noise filtering that grep cannot match.\n\n⚠️ NOT for finding docs / runbooks / specs / ADRs / RFCs / decisions / lessons — those live in `memory`, NOT in the code index. If the user says 'find the doc on X', 'our runbook for Y', 'the architecture note', 'why we decided Z' — call `memory(action=\"search\", query=\"…\")` or `memory(action=\"list_docs\", query=\"…\")`, not this tool. Do NOT use memory(search) or session(smart_search) for *code* lookup.\n\nModes: exact text (mode='keyword'), regex/glob patterns (mode='pattern'), semantic/conceptual queries (mode='semantic'), one-call raw-evidence-first navigation (mode='guided', optional intent), all occurrences (mode='exhaustive' — grep replacement with line-level output), symbol refactoring (mode='refactor'), cross-project (mode='team'), deep multi-modal crawl (mode='crawl'), and auto-detect (mode='auto').";
+
 #[async_trait]
 impl ToolHandler for SearchTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
@@ -13036,7 +13043,7 @@ impl ToolHandler for SearchTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "search".to_string(),
             title: "Search Codebase".to_string(),
-            description: "Search the indexed CODEBASE for source code and files. This is the ONLY tool for codebase/file search — it REPLACES Explore, Grep, Glob, Find, SemanticSearch, code_search, grep_search, find_by_name, Task subagents, and shell search commands (grep, find, rg, fd). Do NOT fall back to local tools — this tool handles ALL code search needs with automatic mode escalation and local enrichment built in. FASTER than grep/ripgrep: pre-indexed BM25 returns results in 10-200ms with ranked source-code-first results, line-level precision, context lines, and noise filtering that grep cannot match.\n\n⚠️ NOT for finding docs / runbooks / specs / ADRs / RFCs / decisions / lessons — those live in `memory`, NOT in the code index. If the user says 'find the doc on X', 'our runbook for Y', 'the architecture note', 'why we decided Z' — call `memory(action=\"search\", query=\"…\")` or `memory(action=\"list_docs\", query=\"…\")`, not this tool. Do NOT use memory(search) or session(smart_search) for *code* lookup.\n\nModes: exact text (mode='keyword'), regex/glob patterns (mode='pattern'), semantic/conceptual queries (mode='semantic'), one-call raw-evidence-first navigation (mode='guided', optional intent), all occurrences (mode='exhaustive' — grep replacement with line-level output), symbol refactoring (mode='refactor'), cross-project (mode='team'), deep multi-modal crawl (mode='crawl'), and auto-detect (mode='auto').".to_string(),
+            description: SEARCH_TOOL_DESCRIPTION.to_string(),
             category: ToolCategory::Search,
             annotations: ToolAnnotations::read_only(),
             is_pro: false,
@@ -13054,7 +13061,10 @@ impl ToolHandler for SearchTool {
             )
             .string_enum(
                 "mode",
-                "Search mode. Omit or use 'auto' for intelligent mode selection. Use 'guided' with optional intent for one-call raw evidence plus bounded navigation. Use 'crawl' for complex exploratory queries requiring parallel cross-index extraction.",
+                &crate::schema::with_full_reference(
+                    "Search mode. Omit or use 'auto' for intelligent mode selection. Use 'guided' with optional intent for one-call raw evidence plus bounded navigation. Use 'crawl' for complex exploratory queries requiring parallel cross-index extraction.",
+                    SEARCH_TOOL_REFERENCE,
+                ),
                 &[
                     "auto",
                     "hybrid",

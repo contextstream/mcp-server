@@ -62,7 +62,12 @@ const VALID_KB_KINDS: &[&str] = &["guidance", "guardrail", "faq", "runbook", "ca
 /// Tool description steers AI callers to the "stuck-helper" pattern.
 /// Reads identical-shape to capsule's `description` so the tools/list
 /// surface stays uniform across the domain family.
-const TOOL_DESCRIPTION: &str = "ContextStream agent Q&A — ask the workspace/project knowledge base when you get stuck.\n\nWhen to use:\n- You need workspace-specific knowledge you cannot derive from code: prior decisions (\"why was X chosen over Y?\"), conventions (\"what's the file naming pattern in this repo?\"), runbooks (\"how does the team handle this kind of incident?\"), guardrails (\"what's off-limits in this workspace?\").\n- You're about to make a non-trivial choice and the workspace probably has prior context that shapes it.\n- A teammate has likely answered this before and you'd rather reuse than re-derive.\n\nWhen NOT to use:\n- General programming questions you can answer yourself or via web search (\"how does Rust async work?\").\n- Things you can determine by reading the code right in front of you — read it first.\n- Trivial syntax or single-line questions.\n\nNot a reflex, not a last resort. If you're spending more than ~30 seconds stuck on something workspace-shaped, ask. If you can find the answer in 30 seconds yourself, do that.\n\nActions:\n- ask: submit a question, get a grounded answer with citations + confidence.\n- search: vector-similarity-free listing of prior Q&A — check before re-asking.\n- save_kb: store guidance/guardrail/faq/runbook/caveat for future asks to reference.\n- list_kb: browse stored knowledge.\n- get_kb / update_kb / delete_kb: manage individual KB items.\n- feedback: rate an answer (-1, 0, +1) so future retrievals weight it appropriately.\n\nAnswers come from ContextCode, ContextStream's grounded Q&A agent. Every claim cites the source (`[id=decision:abc]` / `[id=lesson:xyz]` / `[id=qa_kb_item:def]` etc.) so you can verify before acting on it.";
+/// Routing summary advertised as the tool description (<= 1024 chars).
+const TOOL_DESCRIPTION: &str = "ContextStream agent Q&A — ask the workspace/project knowledge base when you get stuck on something workspace-specific: prior decisions, conventions, runbooks, guardrails, or a choice the workspace likely has context for. Not for general programming questions, things you can read in the code in front of you, or trivial syntax.\n\nNot a reflex, not a last resort: if you'd spend more than ~30 seconds stuck on something workspace-shaped, ask; if you can find it in 30 seconds yourself, do that.\n\nActions: ask (grounded answer with citations + confidence), search (prior Q&A — check before re-asking), save_kb / list_kb / get_kb / update_kb / delete_kb (knowledge items), feedback (-1, 0, +1). Answers come from ContextCode, ContextStream's grounded Q&A agent; every claim cites its source so you can verify it. Full action reference: the `action` parameter.";
+
+/// Complete tool reference, advertised on the `action` parameter; see
+/// [`crate::schema::with_full_reference`].
+const TOOL_REFERENCE: &str = "ContextStream agent Q&A — ask the workspace/project knowledge base when you get stuck.\n\nWhen to use:\n- You need workspace-specific knowledge you cannot derive from code: prior decisions (\"why was X chosen over Y?\"), conventions (\"what's the file naming pattern in this repo?\"), runbooks (\"how does the team handle this kind of incident?\"), guardrails (\"what's off-limits in this workspace?\").\n- You're about to make a non-trivial choice and the workspace probably has prior context that shapes it.\n- A teammate has likely answered this before and you'd rather reuse than re-derive.\n\nWhen NOT to use:\n- General programming questions you can answer yourself or via web search (\"how does Rust async work?\").\n- Things you can determine by reading the code right in front of you — read it first.\n- Trivial syntax or single-line questions.\n\nNot a reflex, not a last resort. If you're spending more than ~30 seconds stuck on something workspace-shaped, ask. If you can find the answer in 30 seconds yourself, do that.\n\nActions:\n- ask: submit a question, get a grounded answer with citations + confidence.\n- search: vector-similarity-free listing of prior Q&A — check before re-asking.\n- save_kb: store guidance/guardrail/faq/runbook/caveat for future asks to reference.\n- list_kb: browse stored knowledge.\n- get_kb / update_kb / delete_kb: manage individual KB items.\n- feedback: rate an answer (-1, 0, +1) so future retrievals weight it appropriately.\n\nAnswers come from ContextCode, ContextStream's grounded Q&A agent. Every claim cites the source (`[id=decision:abc]` / `[id=lesson:xyz]` / `[id=qa_kb_item:def]` etc.) so you can verify before acting on it.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QaInput {
@@ -171,7 +176,12 @@ impl ToolHandler for QaTool {
     fn input_schema(&self) -> Value {
         SchemaBuilder::new()
             .description("Agent Q&A — ask the workspace knowledge base when stuck.")
-            .string_enum("action", "Action to perform", VALID_ACTIONS, true)
+            .string_enum(
+                "action",
+                &crate::schema::with_full_reference("Action to perform", TOOL_REFERENCE),
+                VALID_ACTIONS,
+                true,
+            )
             .string("question", "Natural-language question (action=ask)", false)
             .uuid("workspace_id", "Workspace ID", false)
             .uuid("project_id", "Project ID", false)

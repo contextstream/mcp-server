@@ -431,9 +431,13 @@ impl ToolRegistry {
     }
 
     /// Register a tool.
+    ///
+    /// The advertised input schema is rewritten into the provider-portable
+    /// subset here, once, so every surface (direct tools, router operations,
+    /// `tool_search` results) exposes the same schema to every model.
     pub fn register(&mut self, name: &str, handler: Arc<dyn ToolHandler>) {
         let metadata = handler.metadata().clone();
-        let input_schema = handler.input_schema();
+        let input_schema = crate::portable_schema::portable_input_schema(&handler.input_schema());
         let operation_metadata = metadata.clone();
         let operation_input_schema = input_schema.clone();
         let operation_handler = handler.clone();

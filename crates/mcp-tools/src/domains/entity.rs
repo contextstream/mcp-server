@@ -546,6 +546,50 @@ fn format_entity_list(kind: &str, result: &Value) -> String {
     text
 }
 
+/// Routing summary advertised as the tool description (<= 1024 chars).
+const ENTITY_TOOL_DESCRIPTION: &str = "Structured taxonomy entities — tickets, handoffs, incidents, releases, experiments, goals, key_results, sprints, reviews, risks, backlog_views. USE THIS TOOL for: 'create a handoff' / 'prepare a handoff' / 'hand this over' / 'continue with another agent' (kind=handoff, body={title, summary, scope, next_steps}; add to_user_id only when known and never invent it) · 'create a ticket' / 'file a bug' (kind=ticket) · 'log an incident' · 'track this release' · 'start an experiment' · 'create an OKR' (kind=goal/key_result) · 'plan a sprint' · 'design review' · 'log a risk'.\n\nNot this tool: memory(action=create_task) (todo), memory(action=create_doc, ...) (a runbook is a doc, not a handoff), session(action=capture, ...) (events). A generic handoff always creates entity(kind=handoff); additionally call capsule for a portable bundle or share link. HANDOFF.md or prose: local text is NOT the canonical handoff.\n\nActions: list | get | create | update | delete; per-kind fields: the `action` parameter.";
+
+/// Complete tool reference, advertised on the main parameter; see
+/// [`crate::schema::with_full_reference`].
+const ENTITY_TOOL_REFERENCE: &str = "Structured taxonomy entities — tickets, handoffs, incidents, \
+                releases, experiments, goals, key_results, sprints, reviews, risks, \
+                backlog_views. USE THIS TOOL when the user says any of: \
+                'create a handoff' / 'prepare a handoff' / 'hand this over' / \
+                'continue with another agent or session' / 'package context for handoff' \
+                (kind=handoff, action=create, body={title, summary, scope, next_steps}; \
+                add to_user_id only when known and never invent it) · \
+                'create a ticket' / 'file a bug' / 'track a feature' / 'log a chore' / \
+                'assign a ticket' / 'link a doc or plan to a ticket' \
+                (kind=ticket, body.kind=bug|feature|task|chore|epic; \
+                body.assignees=[{user_id?, email?, handle?, entity_type=human|agent, role?}]; \
+                body.linked_items=[{kind=doc|diagram|plan|task|todo|handoff|runbook|capsule, id, \
+                title_snapshot?, status_snapshot?, updated_at?}]) · \
+                'log an incident' / 'open a sev1' (kind=incident) · \
+                'track this release' / 'log a deployment' (kind=release) · \
+                'start an experiment' / 'A/B test' (kind=experiment) · \
+                'create an OKR' / 'new goal this quarter' (kind=goal, then kind=key_result for KRs) · \
+                'plan a sprint' (kind=sprint) · 'request a review' / 'design review' (kind=review) · \
+                'log a risk' / 'risk register' (kind=risk) · 'save a backlog filter' (kind=backlog_view). \
+                \n\nDISTINCT FROM (don't use entity for these):\n\
+                · memory(action=create_task) — a lightweight project-tracking todo with \
+                  priority/status. NOT a 'ticket' (which is a structured entity with kind, \
+                  status timeline, assignees, links).\n\
+                · memory(action=create_doc, doc_type=runbook|adr|rfc|postmortem|...) — \
+                  a versioned markdown document. A 'runbook' is a doc, NOT a handoff.\n\
+                · session(action=capture, event_type=...) — append-only timeline events \
+                  (decisions, lessons, notes). NOT a structured entity.\n\
+                · capsule(...) — portable context bundle for handoff to ANOTHER agent. \
+                  A generic handoff always creates entity(kind=handoff); additionally call \
+                  capsule when the user requests a portable bundle, capsule, or share link.\n\
+                · HANDOFF.md / a scratch prompt / a prose-only response — local text is NOT \
+                  the canonical handoff and must not replace entity(kind=handoff). If the user \
+                  explicitly requests a local file, create the entity first and treat the file \
+                  only as an additional artifact.\n\n\
+                Actions: list | get | create | update | delete. Body is free-form JSON \
+                forwarded to the API; see the API schema for per-kind fields. Defaults \
+                workspace_id/project_id to the active session scope when omitted."
+                ;
+
 #[async_trait]
 impl ToolHandler for EntityTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
@@ -773,44 +817,7 @@ impl ToolHandler for EntityTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "entity".to_string(),
             title: "Structured Handoffs, Tickets, and Workflow Entities".to_string(),
-            description: "Structured taxonomy entities — tickets, handoffs, incidents, \
-                releases, experiments, goals, key_results, sprints, reviews, risks, \
-                backlog_views. USE THIS TOOL when the user says any of: \
-                'create a handoff' / 'prepare a handoff' / 'hand this over' / \
-                'continue with another agent or session' / 'package context for handoff' \
-                (kind=handoff, action=create, body={title, summary, scope, next_steps}; \
-                add to_user_id only when known and never invent it) · \
-                'create a ticket' / 'file a bug' / 'track a feature' / 'log a chore' / \
-                'assign a ticket' / 'link a doc or plan to a ticket' \
-                (kind=ticket, body.kind=bug|feature|task|chore|epic; \
-                body.assignees=[{user_id?, email?, handle?, entity_type=human|agent, role?}]; \
-                body.linked_items=[{kind=doc|diagram|plan|task|todo|handoff|runbook|capsule, id, \
-                title_snapshot?, status_snapshot?, updated_at?}]) · \
-                'log an incident' / 'open a sev1' (kind=incident) · \
-                'track this release' / 'log a deployment' (kind=release) · \
-                'start an experiment' / 'A/B test' (kind=experiment) · \
-                'create an OKR' / 'new goal this quarter' (kind=goal, then kind=key_result for KRs) · \
-                'plan a sprint' (kind=sprint) · 'request a review' / 'design review' (kind=review) · \
-                'log a risk' / 'risk register' (kind=risk) · 'save a backlog filter' (kind=backlog_view). \
-                \n\nDISTINCT FROM (don't use entity for these):\n\
-                · memory(action=create_task) — a lightweight project-tracking todo with \
-                  priority/status. NOT a 'ticket' (which is a structured entity with kind, \
-                  status timeline, assignees, links).\n\
-                · memory(action=create_doc, doc_type=runbook|adr|rfc|postmortem|...) — \
-                  a versioned markdown document. A 'runbook' is a doc, NOT a handoff.\n\
-                · session(action=capture, event_type=...) — append-only timeline events \
-                  (decisions, lessons, notes). NOT a structured entity.\n\
-                · capsule(...) — portable context bundle for handoff to ANOTHER agent. \
-                  A generic handoff always creates entity(kind=handoff); additionally call \
-                  capsule when the user requests a portable bundle, capsule, or share link.\n\
-                · HANDOFF.md / a scratch prompt / a prose-only response — local text is NOT \
-                  the canonical handoff and must not replace entity(kind=handoff). If the user \
-                  explicitly requests a local file, create the entity first and treat the file \
-                  only as an additional artifact.\n\n\
-                Actions: list | get | create | update | delete. Body is free-form JSON \
-                forwarded to the API; see the API schema for per-kind fields. Defaults \
-                workspace_id/project_id to the active session scope when omitted."
-                .to_string(),
+            description: ENTITY_TOOL_DESCRIPTION.to_string(),
             category: ToolCategory::Memory,
             annotations: ToolAnnotations::destructive(),
             is_pro: false,
@@ -842,7 +849,12 @@ impl ToolHandler for EntityTool {
                 VALID_ENTITY_KINDS,
                 true,
             )
-            .string_enum("action", "Action to perform", VALID_ACTIONS, true)
+            .string_enum(
+                "action",
+                &crate::schema::with_full_reference("Action to perform", ENTITY_TOOL_REFERENCE),
+                VALID_ACTIONS,
+                true,
+            )
             .string(
                 "id",
                 "Entity ID or lookup text (title/name/objective/version) for get / update / delete",

@@ -1804,6 +1804,13 @@ impl ProjectTool {
     }
 }
 
+/// Routing summary advertised as the tool description (<= 1024 chars).
+const PROJECT_TOOL_DESCRIPTION: &str = "Project management. Actions: list, get, create, update, merge (combine duplicate projects), index (preferred hosted workflow via the managed sync bridge; requires_sync_bridge means repair the bridge while keeping hosted MCP), ingest_local (direct indexing only when this process can read the folder), index_status, index_history, overview, statistics, files, recent_changes, brief / brief_update / brief_refresh (the project brief every session starts with), team_projects. Destructive cleanup: delete (remove the project), purge (de-index everything but keep the record), forget_local (stop this machine re-indexing a folder; server data untouched), remove_paths (de-index exact paths). Full action reference: the `action` parameter.";
+
+/// Complete tool reference, advertised on the main parameter; see
+/// [`crate::schema::with_full_reference`].
+const PROJECT_TOOL_REFERENCE: &str = "Project management. Actions: list, get, create, update, merge/combine duplicate projects, index (preferred hosted workflow: requests the registered managed sync bridge for the exact checkout, or ingests directly only when this process already has disk access; requires_sync_bridge means repair bridge/hooks/Desktop while keeping hosted MCP), delete (remove the project), purge (completely de-index a project — removes file_indices, code chunks, search vectors, and stored files but keeps the project record), forget_local (stop this machine from re-indexing a folder: removes its local mapping/registry entry and drops the active session's project scope; server data untouched), remove_paths (de-index specific files by exact path — deletes their vectors, indexed rows, and stored files server-side, but keeps the project; pass paths=[...]), overview, statistics, files, index_status, index_history (audit trail of indexed files), ingest_local (optional direct indexing only when this process can read the folder; reuses a unique credential-free Git repository match across machines/worktrees, otherwise creates a project and records that identity — pass skip_project_creation=true to disable creation), team_projects (list all team projects - team plans only), recent_changes (git log/diff for recent file changes), brief (the project brief every session starts with), brief_update (store brief sections; pass expected_version from the brief header), brief_refresh (rebuild the brief from the index).";
+
 #[async_trait]
 impl ToolHandler for ProjectTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
@@ -2657,7 +2664,7 @@ impl ToolHandler for ProjectTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "project".to_string(),
             title: "Project Operations".to_string(),
-            description: "Project management. Actions: list, get, create, update, merge/combine duplicate projects, index (preferred hosted workflow: requests the registered managed sync bridge for the exact checkout, or ingests directly only when this process already has disk access; requires_sync_bridge means repair bridge/hooks/Desktop while keeping hosted MCP), delete (remove the project), purge (completely de-index a project — removes file_indices, code chunks, search vectors, and stored files but keeps the project record), forget_local (stop this machine from re-indexing a folder: removes its local mapping/registry entry and drops the active session's project scope; server data untouched), remove_paths (de-index specific files by exact path — deletes their vectors, indexed rows, and stored files server-side, but keeps the project; pass paths=[...]), overview, statistics, files, index_status, index_history (audit trail of indexed files), ingest_local (optional direct indexing only when this process can read the folder; reuses a unique credential-free Git repository match across machines/worktrees, otherwise creates a project and records that identity — pass skip_project_creation=true to disable creation), team_projects (list all team projects - team plans only), recent_changes (git log/diff for recent file changes), brief (the project brief every session starts with), brief_update (store brief sections; pass expected_version from the brief header), brief_refresh (rebuild the brief from the index).".to_string(),
+            description: PROJECT_TOOL_DESCRIPTION.to_string(),
             category: ToolCategory::Project,
             annotations: ToolAnnotations::destructive(),
             is_pro: false,
@@ -2693,7 +2700,12 @@ impl ToolHandler for ProjectTool {
 
         SchemaBuilder::new()
             .description("Project operations")
-            .string_enum("action", "Operation to perform", all_actions, true)
+            .string_enum(
+                "action",
+                &crate::schema::with_full_reference("Operation to perform", PROJECT_TOOL_REFERENCE),
+                all_actions,
+                true,
+            )
             // Common fields
             .string("name", "Project name (for create/update)", false)
             .string(

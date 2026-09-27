@@ -18,6 +18,7 @@
 pub mod atlas_flags;
 pub mod domains;
 pub mod notices;
+pub mod portable_schema;
 pub mod registry;
 pub mod schema;
 pub mod wire_tokens;

@@ -65,6 +65,16 @@ pub struct LimitParam {
     pub limit: Option<i64>,
 }
 
+/// Parameter description that carries a tool's complete reference text.
+///
+/// OpenAI-compatible endpoints reject function descriptions over 1024
+/// characters, so long tool descriptions are abridged to their routing
+/// guidance and the full original text moves here, onto the tool's main
+/// parameter, which models still read and which has no such cap.
+pub fn with_full_reference(summary: &str, reference: &str) -> String {
+    format!("{summary}\n\nFull tool reference:\n{reference}")
+}
+
 /// Schema builder for creating tool input schemas.
 pub struct SchemaBuilder {
     properties: serde_json::Map<String, Value>,
@@ -236,6 +246,15 @@ pub mod patterns {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_reference_keeps_summary_first_and_reference_verbatim() {
+        let text = with_full_reference("Operation to perform", "Every detail.");
+        assert_eq!(
+            text,
+            "Operation to perform\n\nFull tool reference:\nEvery detail."
+        );
+    }
 
     #[test]
     fn test_schema_builder() {

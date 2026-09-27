@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table};
 
+use super::clients::{ConfigDialect, RemoteShape};
 use super::editors::Editor;
 
 const DEFAULT_TOOLSET: &str = "complete";
@@ -65,7 +66,6 @@ const HEADER_INSTALLATION_ID: &str = "X-ContextStream-Installation-Id";
 const HEADER_TEACHING_VERSION: &str = "X-ContextStream-Teaching-Version";
 pub const MANAGED_CONFIG_VERSION: &str = "2";
 const RECOGNIZED_MANAGED_CONFIG_VERSIONS: &[&str] = &["1", MANAGED_CONFIG_VERSION];
-const COPILOT_TOOL_SURFACE_PROFILE: &str = "openai_agentic";
 const CODEX_MANAGED_COMMENT: &str = "# ContextStream MCP Server Configuration";
 const CODEX_MANAGED_TRUST_COMMENT: &str = "# ContextStream managed project trust v1";
 
@@ -476,7 +476,12 @@ fn json_like_server_is_contextstream_managed(server: &Value) -> bool {
 }
 
 fn editor_supports_hosted_remote(editor: &Editor) -> bool {
-    !matches!(editor, Editor::Aider)
+    has_mcp_config_surface(editor)
+}
+
+/// Rules-only editors (Aider) have no MCP config to write, migrate, or clean.
+fn has_mcp_config_surface(editor: &Editor) -> bool {
+    editor.descriptor().dialect != ConfigDialect::RulesOnly
 }
 
 fn editor_defaults_to_hosted_remote(editor: &Editor) -> bool {
@@ -869,18 +874,14 @@ fn antigravity_remote_server_json(mut server: Value) -> Value {
 /// Reshape the shared remote entry for editors whose schema differs from the
 /// generic `{type: "http", url, headers}` form.
 fn shape_remote_server_for_editor(editor: &Editor, server: Value) -> Value {
-    match editor {
-        Editor::Antigravity => antigravity_remote_server_json(server),
-        _ => server,
+    match editor.descriptor().remote_shape {
+        RemoteShape::ServerUrl => antigravity_remote_server_json(server),
+        RemoteShape::TypeHttpUrl => server,
     }
 }
 
 fn default_tool_surface_profile_for_editor(editor: &Editor) -> Option<&'static str> {
-    if matches!(editor, Editor::Copilot) {
-        Some(COPILOT_TOOL_SURFACE_PROFILE)
-    } else {
-        None
-    }
+    editor.descriptor().tool_surface_profile
 }
 
 fn apply_managed_config_metadata(
@@ -1437,9 +1438,9 @@ fn generate_config_json_with_identity(
 
     // Mirror the per-editor writers exactly: install scripts paste this entry
     // verbatim when server-side generation is unavailable.
-    let mut server_config = match (use_remote, editor) {
-        (true, Editor::OpenCode) => build_opencode_remote_server_json(None),
-        (true, Editor::KiloCode) => kilo_remote_server_json(build_remote_http_server_json(
+    let mut server_config = match (use_remote, editor.descriptor().dialect) {
+        (true, ConfigDialect::OpenCode) => build_opencode_remote_server_json(None),
+        (true, ConfigDialect::Kilo) => kilo_remote_server_json(build_remote_http_server_json(
             None,
             workspace_id,
             project_id,
@@ -1458,8 +1459,8 @@ fn generate_config_json_with_identity(
                 remote_auth_api_key,
             ),
         ),
-        (false, Editor::OpenCode) => build_opencode_server_json(None, Some(api_key), None),
-        (false, Editor::KiloCode) => {
+        (false, ConfigDialect::OpenCode) => build_opencode_server_json(None, Some(api_key), None),
+        (false, ConfigDialect::Kilo) => {
             build_kilo_server_json(None, Some(api_key), workspace_id, project_id, None, None)
         }
         (false, _) => build_contextstream_server_json(
@@ -1478,17 +1479,11 @@ fn generate_config_json_with_identity(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let config_format = match editor {
-        Editor::Codex => "toml",
-        Editor::Aider => "yaml",
-        Editor::Cline | Editor::RooCode => "vscode_settings",
-        _ if editor.uses_json_config() => "json",
-        _ => "json",
-    };
+    let dialect = editor.descriptor().dialect;
+    let config_format = dialect.format_name();
 
-    let vscode_settings_key = match editor {
-        Editor::Cline => Some("cline.mcpServers"),
-        Editor::RooCode => Some("roo-cline.mcpServers"),
+    let vscode_settings_key = match dialect {
+        ConfigDialect::VsCodeSettings { key } => Some(key),
         _ => None,
     };
 
@@ -1521,6 +1516,25 @@ fn generate_config_json_with_identity(
     }
 
     result
+}
+
+/// The hosted server entry setup writes for `editor`, without credentials or
+/// installation identity, for the public `clients` catalog. `None` for
+/// rules-only editors.
+pub(crate) fn catalog_remote_entry(editor: &Editor) -> Option<Value> {
+    if !editor_supports_hosted_remote(editor) {
+        return None;
+    }
+    let generated = generate_config_json_with_identity(
+        editor,
+        "",
+        None,
+        None,
+        "remote",
+        None,
+        &ManagedConfigIdentity::default(),
+    );
+    generated.get("server_config").cloned()
 }
 
 /// Generate configs for all specified editors as a single JSON payload.
@@ -1935,18 +1949,14 @@ fn write_mcp_config_with_transport_mode(
     transport_mode: TransportMode,
     remote_auth_api_key: Option<&str>,
 ) -> Result<()> {
-    if matches!(editor, Editor::Aider) {
+    if !has_mcp_config_surface(editor) {
         // Aider has no MCP config surface; do not create installation state for
         // a write that cannot occur.
         return Ok(());
     }
     let identity = ManagedConfigIdentity::for_write()?;
-    let result = match editor {
-        Editor::ClaudeCode
-        | Editor::Cursor
-        | Editor::Windsurf
-        | Editor::Copilot
-        | Editor::Antigravity => write_json_mcp_config(
+    let result = match editor.descriptor().dialect {
+        ConfigDialect::JsonServers { .. } => write_json_mcp_config(
             editor,
             api_key,
             workspace_id,
@@ -1957,10 +1967,10 @@ fn write_mcp_config_with_transport_mode(
             remote_auth_api_key,
             &identity,
         ),
-        Editor::Cline => write_vscode_mcp_config(
+        ConfigDialect::VsCodeSettings { key } => write_vscode_mcp_config(
             editor,
             api_key,
-            "cline.mcpServers",
+            key,
             workspace_id,
             project_id,
             transcripts_enabled,
@@ -1969,7 +1979,7 @@ fn write_mcp_config_with_transport_mode(
             remote_auth_api_key,
             &identity,
         ),
-        Editor::KiloCode => write_kilo_mcp_config(
+        ConfigDialect::Kilo => write_kilo_mcp_config(
             api_key,
             workspace_id,
             project_id,
@@ -1979,19 +1989,7 @@ fn write_mcp_config_with_transport_mode(
             remote_auth_api_key,
             &identity,
         ),
-        Editor::RooCode => write_vscode_mcp_config(
-            editor,
-            api_key,
-            "roo-cline.mcpServers",
-            workspace_id,
-            project_id,
-            transcripts_enabled,
-            hook_transcripts_enabled,
-            transport_mode,
-            remote_auth_api_key,
-            &identity,
-        ),
-        Editor::Codex => write_codex_config(
+        ConfigDialect::CodexToml => write_codex_config(
             api_key,
             workspace_id,
             project_id,
@@ -2001,8 +1999,10 @@ fn write_mcp_config_with_transport_mode(
             remote_auth_api_key,
             &identity,
         ),
-        Editor::Aider => unreachable!("Aider returned before loading config identity"),
-        Editor::OpenCode => write_opencode_mcp_config(
+        ConfigDialect::RulesOnly => {
+            unreachable!("rules-only editors returned before loading config identity")
+        }
+        ConfigDialect::OpenCode => write_opencode_mcp_config(
             editor,
             api_key,
             workspace_id,
@@ -2077,7 +2077,7 @@ fn commit_mcp_config(
 fn record_configured_evidence(editor: &Editor) {
     if safe_edit::is_dry_run()
         || !crate::readiness_evidence_writes_enabled()
-        || matches!(editor, Editor::Aider)
+        || !has_mcp_config_surface(editor)
     {
         return;
     }
@@ -2497,12 +2497,8 @@ fn write_json_mcp_config(
     let loaded = safe_edit::read_for_edit(&path, safe_edit::JsonDialect::Strict)?;
     let mut config: Value = loaded.value.clone();
 
-    // VS Code (Copilot) uses "servers" root; other editors use "mcpServers".
-    let root_key = if matches!(editor, Editor::Copilot) {
-        "servers"
-    } else {
-        "mcpServers"
-    };
+    let root_key = mcp_root_key(editor)
+        .ok_or_else(|| anyhow::anyhow!("{} has no JSON server map", editor.display_name()))?;
     require_object_if_present(
         config.get(root_key),
         &format!("{} {}", editor.display_name(), root_key),
@@ -3896,13 +3892,8 @@ fn write_project_mcp_config_with_transport_mode(
         None => return Ok(()), // Editor doesn't support project MCP config
     };
     let identity = ManagedConfigIdentity::for_write()?;
-    let root_key = if matches!(editor, Editor::Copilot) {
-        "servers"
-    } else if matches!(editor, Editor::OpenCode | Editor::KiloCode) {
-        "mcp"
-    } else {
-        "mcpServers"
-    };
+    let root_key = project_mcp_root_key(editor);
+    let dialect = editor.descriptor().dialect;
 
     // Read existing config or create new
     let loaded = safe_edit::read_for_edit(&mcp_path, safe_edit::JsonDialect::Strict)?;
@@ -3921,7 +3912,7 @@ fn write_project_mcp_config_with_transport_mode(
         "project ContextStream MCP server entry",
     )?;
 
-    let mut server = if matches!(editor, Editor::OpenCode) {
+    let mut server = if dialect == ConfigDialect::OpenCode {
         if should_use_remote_http(editor, existing_server.as_ref(), transport_mode) {
             build_opencode_remote_server_json(existing_server.as_ref())
         } else {
@@ -3930,7 +3921,7 @@ fn write_project_mcp_config_with_transport_mode(
             // placeholder would leave the spawned MCP child without credentials.
             build_opencode_server_json(existing_server.as_ref(), Some(api_key), None)
         }
-    } else if matches!(editor, Editor::KiloCode) {
+    } else if dialect == ConfigDialect::Kilo {
         if should_use_remote_http(editor, existing_server.as_ref(), transport_mode) {
             kilo_remote_server_json(build_remote_http_server_json(
                 existing_server.as_ref(),
@@ -4116,21 +4107,23 @@ fn remove_contextstream_from_codex_toml(path: &Path) -> Result<()> {
 }
 
 fn mcp_root_key(editor: &Editor) -> Option<&'static str> {
-    match editor {
-        Editor::Copilot => Some("servers"),
-        Editor::ClaudeCode | Editor::Cursor | Editor::Windsurf | Editor::Antigravity => {
-            Some("mcpServers")
-        }
-        Editor::OpenCode | Editor::KiloCode => Some("mcp"),
-        Editor::Cline => Some("cline.mcpServers"),
-        Editor::RooCode => Some("roo-cline.mcpServers"),
-        Editor::Codex | Editor::Aider => None,
-    }
+    editor.descriptor().dialect.root_key()
+}
+
+/// Server map key of the editor's project-level config (which can differ
+/// from its global dialect: Roo's project `.roo/mcp.json` is plain JSON).
+fn project_mcp_root_key(editor: &Editor) -> &'static str {
+    editor
+        .descriptor()
+        .project_config
+        .map_or("mcpServers", |config| config.root_key)
 }
 
 fn mcp_json_dialect(editor: &Editor, path: &Path) -> safe_edit::JsonDialect {
-    if matches!(editor, Editor::Cline | Editor::RooCode | Editor::KiloCode)
-        || path.extension().and_then(|extension| extension.to_str()) == Some("jsonc")
+    if matches!(
+        editor.descriptor().dialect,
+        ConfigDialect::VsCodeSettings { .. } | ConfigDialect::Kilo
+    ) || path.extension().and_then(|extension| extension.to_str()) == Some("jsonc")
     {
         safe_edit::JsonDialect::Jsonc
     } else {
@@ -4392,7 +4385,7 @@ pub fn remove_contextstream_from_mcp_config(editor: &Editor) -> Result<()> {
     // Aider has no MCP configuration surface. Its similarly located YAML file
     // belongs entirely to the user and must never be parsed as JSON or touched
     // by MCP uninstall.
-    if matches!(editor, Editor::Aider) {
+    if !has_mcp_config_surface(editor) {
         return Ok(());
     }
 
@@ -4406,7 +4399,7 @@ pub fn remove_contextstream_from_mcp_config(editor: &Editor) -> Result<()> {
 }
 
 fn remove_contextstream_from_mcp_config_at(editor: &Editor, path: &Path) -> Result<()> {
-    if matches!(editor, Editor::Aider) {
+    if !has_mcp_config_surface(editor) {
         return Ok(());
     }
     let path = path.to_path_buf();
@@ -4718,16 +4711,7 @@ fn try_restore_exact_json_path_backup(
 fn project_mcp_cleanup_paths(editor: &Editor, project_path: &Path) -> Vec<(PathBuf, &'static str)> {
     let mut paths = Vec::new();
     if let Some(primary) = editor.project_mcp_config_path(project_path) {
-        // Project MCP files use "mcpServers" by default.
-        // Copilot uses VS Code's `.vscode/mcp.json` with "servers".
-        let primary_key = if matches!(editor, Editor::Copilot) {
-            "servers"
-        } else if matches!(editor, Editor::OpenCode | Editor::KiloCode) {
-            "mcp"
-        } else {
-            "mcpServers"
-        };
-        paths.push((primary, primary_key));
+        paths.push((primary, project_mcp_root_key(editor)));
     }
 
     paths
@@ -5214,7 +5198,7 @@ mod tests {
         assert_eq!(server["type"].as_str(), Some("http"));
         assert_eq!(
             server["headers"][HEADER_TOOL_SURFACE_PROFILE].as_str(),
-            Some(COPILOT_TOOL_SURFACE_PROFILE)
+            Some(super::super::clients::COPILOT_TOOL_SURFACE_PROFILE)
         );
     }
 
@@ -5236,7 +5220,7 @@ mod tests {
         assert!(server.get("command").is_some());
         assert_eq!(
             server["env"][ENV_TOOL_SURFACE_PROFILE].as_str(),
-            Some(COPILOT_TOOL_SURFACE_PROFILE)
+            Some(super::super::clients::COPILOT_TOOL_SURFACE_PROFILE)
         );
     }
 

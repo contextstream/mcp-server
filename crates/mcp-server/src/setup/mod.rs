@@ -6,6 +6,7 @@
 //! - Workspace and project setup
 //! - AI rules generation
 
+pub mod clients;
 mod credentials;
 pub mod doctor;
 pub mod editors;

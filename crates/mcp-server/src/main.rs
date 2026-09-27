@@ -36,6 +36,7 @@ Non-interactive shortcuts (CI, scripts, refresh after login):
   contextstream-mcp update-configs --scope=global --only-configured
   contextstream-mcp migrate-remote --scope=all --only-configured
   contextstream-mcp detect-editors --format=json
+  contextstream-mcp clients --format=json|markdown
   contextstream-mcp generate-configs --transport=remote --preauth
   contextstream-mcp configure --transcripts=on|off --scope=all
   printf %s "$KEY" | contextstream-mcp configure --api-key-stdin
@@ -517,6 +518,16 @@ enum Commands {
         format: String,
     },
 
+    /// List every coding client setup can configure (non-interactive)
+    #[command(
+        long_about = "Print the catalog of coding clients setup can configure: config and rules locations, config format, the hosted server entry each client expects, hook support, install detection, and status.\n\nPaths are platform-neutral (~ for HOME). Use --format markdown for a docs table."
+    )]
+    Clients {
+        /// Output format: json (default) or markdown
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+
     /// Manage file exclusion patterns for indexing
     ///
     /// View, add, or remove patterns that control which files are excluded
@@ -736,6 +747,7 @@ Non-interactive shortcuts (CI, scripts, refresh after login):
   contextstream-mcp update-configs --scope=global --only-configured
   contextstream-mcp migrate-remote --scope=all --only-configured
   contextstream-mcp detect-editors --format=json
+  contextstream-mcp clients --format=json|markdown
   contextstream-mcp generate-configs --transport=remote --preauth
   contextstream-mcp configure --transcripts=on|off --scope=all
 "#,
@@ -1239,6 +1251,18 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                 std::process::exit(1);
             }
         }
+
+        Some(Commands::Clients { format }) => match format.trim().to_ascii_lowercase().as_str() {
+            "json" => println!(
+                "{}",
+                serde_json::to_string_pretty(&setup::clients::catalog_json()).unwrap()
+            ),
+            "markdown" | "md" => print!("{}", setup::clients::catalog_markdown()),
+            other => {
+                eprintln!("Unknown --format '{other}'. Use json or markdown.");
+                std::process::exit(2);
+            }
+        },
 
         Some(Commands::DetectEditors { format: _ }) => {
             let result = setup::editors::detect_installed_editors_json();

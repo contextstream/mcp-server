@@ -1,21 +1,15 @@
-//! Editor detection and configuration.
+//! Editor identity, detection, and configuration layout.
 //!
-//! Supports detecting and configuring:
-//! - Claude Code
-//! - Cursor
-//! - Windsurf
-//! - GitHub Copilot (VS Code)
-//! - Cline (VS Code extension)
-//! - Kilo Code (CLI / VS Code extension)
-//! - Roo Code (VS Code extension)
-//! - OpenAI Codex CLI
-//! - Aider
-//! - Antigravity
-//! - OpenCode CLI
+//! [`Editor`] is setup's view of an installable harness. Everything that is a
+//! matter of file layout (config and rules paths, config dialect, install
+//! evidence, reload guidance) is declared once per editor in
+//! [`super::clients`]; the methods here resolve those descriptors.
 
 use std::path::{Path, PathBuf};
 
 use mcp_types::{HarnessId, HarnessProfile};
+
+use super::clients::{self, ClientDescriptor, ClientStatus, ConfigDialect};
 
 /// Supported editor types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -145,22 +139,25 @@ impl Editor {
         matches!(self.enforcement_tier(), EnforcementTier::TierA)
     }
 
+    /// The declarative file-layout descriptor for this editor.
+    pub fn descriptor(&self) -> &'static ClientDescriptor {
+        clients::descriptor(*self)
+    }
+
     /// Whether this editor is discontinued upstream.
     ///
     /// Deprecated editors are never offered for a new setup (selection or
     /// detection), but existing installs stay fully maintainable: doctor,
     /// hook refresh, update, and uninstall still reach them.
     pub fn is_deprecated(&self) -> bool {
-        matches!(self, Editor::RooCode)
+        matches!(self.descriptor().status, ClientStatus::Discontinued { .. })
     }
 
     /// Where users of a deprecated editor should go instead.
     pub fn deprecation_successor(&self) -> Option<Editor> {
-        match self {
-            // Roo Code shut down on 2026-05-15 and pointed users to Cline
-            // (docs.roocode.com/sunset).
-            Editor::RooCode => Some(Editor::Cline),
-            _ => None,
+        match self.descriptor().status {
+            ClientStatus::Discontinued { successor } => Some(successor),
+            ClientStatus::Supported => None,
         }
     }
 
@@ -175,50 +172,9 @@ impl Editor {
 
     /// Get the MCP config file path for this editor.
     pub fn mcp_config_path(&self) -> Option<PathBuf> {
-        match self {
-            // User-scoped Claude Code servers live in the top-level
-            // `mcpServers` of `~/.claude.json` (code.claude.com/docs/en/mcp).
-            // `~/.claude/mcp.json` is never read; see `legacy_mcp_config_paths`.
-            Editor::ClaudeCode => claude_user_config_path(),
-            Editor::Cursor => dirs::home_dir().map(|h| h.join(".cursor").join("mcp.json")),
-            Editor::Windsurf => dirs::home_dir()
-                .map(|h| h.join(".codeium").join("windsurf").join("mcp_config.json")),
-            Editor::Copilot => {
-                // VS Code user-level mcp.json (same directory as settings.json).
-                vscode_user_mcp_json_path()
-            }
-            Editor::Cline => {
-                // Cline uses VS Code settings
-                vscode_settings_path()
-            }
-            Editor::KiloCode => {
-                // Kilo accepts kilo.jsonc, kilo.json, and config.json in
-                // ~/.config/kilo/ (docs: kilo.ai/docs/automate/mcp/using-in-cli).
-                // Reuse whichever exists so we never create a second,
-                // conflicting config file.
-                kilo_config_dir().map(kilo_global_config_file)
-            }
-            Editor::RooCode => {
-                // Roo uses VS Code settings
-                vscode_settings_path()
-            }
-            Editor::Codex => {
-                // Codex uses a TOML config
-                dirs::home_dir().map(|h| h.join(".codex").join("config.toml"))
-            }
-            Editor::Aider => {
-                // Aider uses a YAML config
-                dirs::home_dir().map(|h| h.join(".aider.conf.yml"))
-            }
-            // Antigravity 2 (IDE and `agy` CLI) shares one global config
-            // (antigravity.google/docs/mcp).
-            Editor::Antigravity => {
-                dirs::home_dir().map(|h| h.join(".gemini").join("config").join("mcp_config.json"))
-            }
-            // OpenCode reads `~/.config/opencode/opencode.json[c]`
-            // (opencode.ai/docs/config); reuse whichever variant exists.
-            Editor::OpenCode => opencode_config_dir().map(opencode_global_config_file),
-        }
+        self.descriptor()
+            .global_config
+            .and_then(|spec| spec.resolve())
     }
 
     /// Global MCP config locations earlier releases wrote that the client
@@ -226,129 +182,21 @@ impl Editor {
     /// uninstall strip a managed ContextStream entry from them, and nothing
     /// ever writes to them again.
     pub fn legacy_mcp_config_paths(&self) -> Vec<PathBuf> {
-        let mut paths: Vec<PathBuf> = match self {
-            Editor::ClaudeCode => dirs::home_dir()
-                .map(|h| vec![h.join(".claude").join("mcp.json")])
-                .unwrap_or_default(),
-            Editor::Antigravity => dirs::home_dir()
-                .map(|h| {
-                    vec![h
-                        .join(".gemini")
-                        .join("antigravity")
-                        .join("mcp_config.json")]
-                })
-                .unwrap_or_default(),
-            Editor::OpenCode => dirs::home_dir()
-                .map(|h| vec![h.join(".opencode").join("mcp.json")])
-                .unwrap_or_default(),
-            // Kilo reads `~/.config/kilo` on every OS. Earlier releases used the
-            // platform config dir, which differs on macOS and Windows.
-            Editor::KiloCode => dirs::config_dir()
-                .map(|dir| kilo_global_config_file(dir.join("kilo")))
-                .into_iter()
-                .collect(),
-            _ => Vec::new(),
-        };
         let primary = self.mcp_config_path();
-        paths.retain(|path| Some(path) != primary.as_ref());
-        paths
+        self.descriptor()
+            .legacy_global_configs
+            .iter()
+            .filter_map(|spec| spec.resolve())
+            .filter(|path| Some(path) != primary.as_ref())
+            .collect()
     }
 
     /// Get the rules file path for this editor.
-    pub fn rules_path(&self, project_path: Option<&std::path::Path>) -> Option<PathBuf> {
-        match self {
-            Editor::ClaudeCode => {
-                if let Some(project) = project_path {
-                    Some(project.join("CLAUDE.md"))
-                } else {
-                    dirs::home_dir().map(|h| h.join(".claude").join("CLAUDE.md"))
-                }
-            }
-            // Modern Cursor loads `.cursor/rules/*.mdc` in every mode (Chat,
-            // Composer, Agent). The legacy `.cursorrules` file is NOT read in
-            // Agent mode at all, so it can no longer be the primary target.
-            Editor::Cursor => project_path.map(|project| {
-                project
-                    .join(".cursor")
-                    .join("rules")
-                    .join("contextstream.mdc")
-            }),
-            Editor::Copilot => {
-                project_path.map(|project| project.join(".github").join("copilot-instructions.md"))
-            }
-            Editor::Windsurf => {
-                if let Some(project) = project_path {
-                    Some(
-                        project
-                            .join(".windsurf")
-                            .join("rules")
-                            .join("contextstream.md"),
-                    )
-                } else {
-                    dirs::home_dir().map(|h| {
-                        h.join(".codeium")
-                            .join("windsurf")
-                            .join("memories")
-                            .join("global_rules.md")
-                    })
-                }
-            }
-            Editor::Cline => {
-                if let Some(project) = project_path {
-                    Some(project.join(".clinerules"))
-                } else {
-                    dirs::home_dir().map(|h| {
-                        h.join("Documents")
-                            .join("Cline")
-                            .join("Rules")
-                            .join("contextstream.md")
-                    })
-                }
-            }
-            Editor::KiloCode => {
-                if let Some(project) = project_path {
-                    Some(project.join(".kilo").join("rules").join("contextstream.md"))
-                } else {
-                    kilo_config_dir().map(|d| d.join("rules").join("contextstream.md"))
-                }
-            }
-            Editor::RooCode => {
-                if let Some(project) = project_path {
-                    Some(project.join(".roo").join("rules").join("contextstream.md"))
-                } else {
-                    dirs::home_dir().map(|h| h.join(".roo").join("rules").join("contextstream.md"))
-                }
-            }
-            Editor::Codex => {
-                if let Some(project) = project_path {
-                    Some(project.join("AGENTS.md"))
-                } else {
-                    dirs::home_dir().map(|h| h.join(".codex").join("AGENTS.md"))
-                }
-            }
-            Editor::Aider => {
-                if let Some(project) = project_path {
-                    Some(project.join(".aider.conf.yml"))
-                } else {
-                    dirs::home_dir().map(|h| h.join(".aider.conf.yml"))
-                }
-            }
-            Editor::Antigravity => {
-                if let Some(project) = project_path {
-                    Some(project.join("GEMINI.md"))
-                } else {
-                    dirs::home_dir().map(|h| h.join(".gemini").join("GEMINI.md"))
-                }
-            }
-            Editor::OpenCode => {
-                if let Some(project) = project_path {
-                    Some(project.join("AGENTS.md"))
-                } else {
-                    // opencode.ai/docs/rules: global rules live next to the
-                    // global config.
-                    opencode_config_dir().map(|d| d.join("AGENTS.md"))
-                }
-            }
+    pub fn rules_path(&self, project_path: Option<&Path>) -> Option<PathBuf> {
+        let rules = &self.descriptor().rules;
+        match project_path {
+            Some(project) => rules.project.map(|spec| spec.resolve(project)),
+            None => rules.global.and_then(|spec| spec.resolve()),
         }
     }
 
@@ -357,63 +205,8 @@ impl Editor {
     /// These paths are read/update candidates only. The primary managed location
     /// remains `rules_path(...)`.
     pub fn legacy_rules_paths(&self, project_path: Option<&Path>) -> Vec<PathBuf> {
-        match self {
-            Editor::ClaudeCode => project_path
-                .map(|p| vec![p.join(".claude").join("CLAUDE.md")])
-                .unwrap_or_default(),
-            // `.cursor/rules/contextstream.mdc` is now the primary target
-            // (see `rules_path`). Keep the older `.md` variant as a migration
-            // read/update target. `.cursorrules` is handled as cleanup-only.
-            Editor::Cursor => project_path
-                .map(|p| vec![p.join(".cursor").join("rules").join("contextstream.md")])
-                .unwrap_or_default(),
-            Editor::Cline => {
-                if let Some(project) = project_path {
-                    vec![project.join(".clinerules").join("contextstream.md")]
-                } else {
-                    dirs::home_dir()
-                        .map(|h| vec![h.join("Cline").join("Rules").join("contextstream.md")])
-                        .unwrap_or_default()
-                }
-            }
-            Editor::KiloCode => {
-                let mut paths = Vec::new();
-                if let Some(p) = project_path {
-                    // Legacy .kilocode/ paths for migration
-                    paths.push(p.join(".kilocode").join("rules").join("contextstream.md"));
-                    paths.push(p.join(".kilocoderules"));
-                    paths.push(p.join(".roorules"));
-                    paths.push(p.join(".clinerules"));
-                } else if let Some(home) = dirs::home_dir() {
-                    // Legacy global path
-                    paths.push(
-                        home.join(".kilocode")
-                            .join("rules")
-                            .join("contextstream.md"),
-                    );
-                }
-                paths
-            }
-            Editor::RooCode => project_path
-                .map(|p| vec![p.join(".roorules"), p.join(".clinerules")])
-                .unwrap_or_default(),
-            Editor::Codex => {
-                if let Some(project) = project_path {
-                    vec![project.join("AGENTS.override.md")]
-                } else {
-                    dirs::home_dir()
-                        .map(|h| vec![h.join(".codex").join("AGENTS.override.md")])
-                        .unwrap_or_default()
-                }
-            }
-            Editor::Antigravity => project_path
-                .map(|p| vec![p.join(".agent").join("rules").join("contextstream.md")])
-                .unwrap_or_default(),
-            Editor::OpenCode => project_path
-                .map(|project| vec![project.join("AGENTS.override.md")])
-                .unwrap_or_default(),
-            Editor::Windsurf | Editor::Copilot | Editor::Aider => Vec::new(),
-        }
+        let rules = &self.descriptor().rules;
+        resolve_rules(rules.legacy_project, rules.legacy_global, project_path)
     }
 
     /// Legacy rules paths that are cleanup-only.
@@ -421,25 +214,8 @@ impl Editor {
     /// These locations are scanned/cleaned for stale ContextStream blocks, but
     /// are never write targets for new managed rules.
     pub fn legacy_cleanup_only_rules_paths(&self, project_path: Option<&Path>) -> Vec<PathBuf> {
-        match self {
-            Editor::Windsurf => project_path
-                .map(|p| vec![p.join(".windsurfrules")])
-                .unwrap_or_default(),
-            // Legacy Cursor single-file rules. Cursor Agent mode ignores it, so
-            // we strip any stale ContextStream block but never recreate it.
-            Editor::Cursor => project_path
-                .map(|p| vec![p.join(".cursorrules")])
-                .unwrap_or_default(),
-            // Earlier releases wrote global OpenCode rules under `~/.opencode`,
-            // which OpenCode never reads for AGENTS.md.
-            Editor::OpenCode if project_path.is_none() => dirs::home_dir()
-                .map(|h| {
-                    let legacy = h.join(".opencode");
-                    vec![legacy.join("AGENTS.md"), legacy.join("AGENTS.override.md")]
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        }
+        let rules = &self.descriptor().rules;
+        resolve_rules(rules.cleanup_project, rules.cleanup_global, project_path)
     }
 
     /// All managed rules paths for this editor (primary first, then alternates).
@@ -470,55 +246,33 @@ impl Editor {
     }
 
     /// Get the project-level MCP config path for this editor.
-    pub fn project_mcp_config_path(&self, project_path: &std::path::Path) -> Option<PathBuf> {
-        match self {
-            Editor::ClaudeCode => Some(project_path.join(".mcp.json")),
-            Editor::Cursor => Some(project_path.join(".cursor").join("mcp.json")),
-            Editor::Windsurf => None, // Windsurf uses global mcp_config.json
-            Editor::Copilot => Some(project_path.join(".vscode").join("mcp.json")),
-            Editor::Cline => None, // Cline MCP is via extension UI
-            Editor::KiloCode => Some(kilo_project_config_file(project_path)),
-            Editor::RooCode => Some(project_path.join(".roo").join("mcp.json")),
-            Editor::Codex => None, // Codex only supports global config
-            Editor::Aider => None, // Aider doesn't use MCP
-            Editor::OpenCode => Some(project_path.join("opencode.json")),
-            // antigravity.google/docs/mcp: workspace servers.
-            Editor::Antigravity => Some(project_path.join(".agents").join("mcp_config.json")),
-        }
+    pub fn project_mcp_config_path(&self, project_path: &Path) -> Option<PathBuf> {
+        self.descriptor()
+            .project_config
+            .map(|config| config.path.resolve(project_path))
     }
 
     /// Check if this editor supports project-level MCP config.
     pub fn supports_project_mcp_config(&self) -> bool {
-        matches!(
-            self,
-            Editor::ClaudeCode
-                | Editor::Cursor
-                | Editor::Copilot
-                | Editor::KiloCode
-                | Editor::RooCode
-                | Editor::OpenCode
-                | Editor::Antigravity
-        )
+        self.descriptor().project_config.is_some()
     }
 
     /// Check if this editor uses JSON MCP config.
     pub fn uses_json_config(&self) -> bool {
         matches!(
-            self,
-            Editor::ClaudeCode
-                | Editor::Cursor
-                | Editor::Windsurf
-                | Editor::Copilot
-                | Editor::Cline
-                | Editor::KiloCode
-                | Editor::RooCode
-                | Editor::Antigravity
+            self.descriptor().dialect,
+            ConfigDialect::JsonServers { .. }
+                | ConfigDialect::VsCodeSettings { .. }
+                | ConfigDialect::Kilo
         )
     }
 
     /// Check if this editor uses VS Code extensions settings.
     pub fn uses_vscode_settings(&self) -> bool {
-        matches!(self, Editor::Cline | Editor::RooCode)
+        matches!(
+            self.descriptor().dialect,
+            ConfigDialect::VsCodeSettings { .. }
+        )
     }
 
     /// Check if this editor supports hooks (dynamic enforcement).
@@ -539,41 +293,15 @@ impl Editor {
     /// or window is valid even when a client also supports a narrower hot
     /// reload.
     pub fn activation_reload_instruction(&self) -> &'static str {
-        match self {
-            Editor::ClaudeCode => {
-                "Exit the current Claude Code session, then start a new session in the intended checkout."
-            }
-            Editor::Cursor => {
-                "In Cursor, run “Developer: Reload Window” (or fully quit and reopen), then open the intended checkout."
-            }
-            Editor::Windsurf => {
-                "In Windsurf, reload the window (or fully quit and reopen), then open the intended checkout."
-            }
-            Editor::Copilot => {
-                "Reload the VS Code window, or start a fresh GitHub Copilot CLI session, in the intended checkout."
-            }
-            Editor::Cline => {
-                "In Cline’s VS Code window, run “Developer: Reload Window”, then open the intended checkout."
-            }
-            Editor::KiloCode => {
-                "Start a fresh Kilo Code CLI session, or reload its VS Code window, in the intended checkout."
-            }
-            Editor::RooCode => {
-                "In Roo Code’s VS Code window, run “Developer: Reload Window”, then open the intended checkout."
-            }
-            Editor::Codex => {
-                "Exit the current Codex session, then start a new Codex session in the intended checkout."
-            }
-            Editor::Aider => {
-                "Start a fresh Aider session in the intended checkout so its managed rules reload; Aider is rules-only and has no MCP handshake."
-            }
-            Editor::Antigravity => {
-                "Fully quit and reopen Antigravity, then open the intended checkout."
-            }
-            Editor::OpenCode => {
-                "Exit the current OpenCode session, then start a new session in the intended checkout."
-            }
-        }
+        self.descriptor().reload_instruction
+    }
+
+    /// Whether any install evidence for this editor is present.
+    pub fn is_installed(&self) -> bool {
+        self.descriptor()
+            .detect
+            .iter()
+            .any(|evidence| evidence.present())
     }
 
     /// Get the heading used in generated rules files.
@@ -588,6 +316,23 @@ impl Editor {
 impl std::fmt::Display for Editor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.display_name())
+    }
+}
+
+fn resolve_rules(
+    project_specs: &[clients::ProjectPathSpec],
+    global_specs: &[clients::PathSpec],
+    project_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    match project_path {
+        Some(project) => project_specs
+            .iter()
+            .map(|spec| spec.resolve(project))
+            .collect(),
+        None => global_specs
+            .iter()
+            .filter_map(|spec| spec.resolve())
+            .collect(),
     }
 }
 
@@ -650,50 +395,11 @@ pub fn detect_installed_editors() -> Vec<Editor> {
 }
 
 fn is_editor_installed(editor: Editor) -> bool {
-    match editor {
-        Editor::ClaudeCode => is_claude_code_installed(),
-        Editor::Cursor => is_cursor_installed(),
-        Editor::Windsurf => is_windsurf_installed(),
-        Editor::Copilot => is_copilot_installed(),
-        Editor::Cline => is_cline_installed(),
-        Editor::KiloCode => is_kilo_installed(),
-        Editor::RooCode => is_roo_installed(),
-        Editor::Codex => is_codex_installed(),
-        Editor::Aider => is_aider_installed(),
-        Editor::Antigravity => is_antigravity_installed(),
-        Editor::OpenCode => is_opencode_installed(),
-    }
+    editor.is_installed()
 }
 
-/// Check if Claude Code is installed.
-pub fn is_claude_code_installed() -> bool {
-    // Check for claude command
-    if which::which("claude").is_ok() {
-        return true;
-    }
-
-    // A bare ~/.claude directory is not evidence of an install — plenty of
-    // tools create it. Require state only Claude Code itself writes, so we
-    // never configure an editor the user does not actually run.
-    if let Some(home) = dirs::home_dir() {
-        let dir = home.join(".claude");
-        return dir.join("settings.json").exists()
-            || dir.join("settings.local.json").exists()
-            || dir.join(".credentials.json").exists()
-            || dir.join("projects").is_dir();
-    }
-
-    false
-}
-
-/// Check if Cursor is installed.
-pub fn is_cursor_installed() -> bool {
-    // Check for cursor command
-    if which::which("cursor").is_ok() {
-        return true;
-    }
-
-    // Check platform-specific paths
+/// Cursor install locations outside HOME and PATH.
+pub(crate) fn cursor_platform_install_present() -> bool {
     #[cfg(target_os = "macos")]
     {
         if std::path::Path::new("/Applications/Cursor.app").exists() {
@@ -717,15 +423,12 @@ pub fn is_cursor_installed() -> bool {
 
     #[cfg(target_os = "linux")]
     {
-        // Check common Linux paths
-        let paths = ["/usr/bin/cursor", "/usr/local/bin/cursor"];
-        for path in &paths {
+        for path in ["/usr/bin/cursor", "/usr/local/bin/cursor"] {
             if std::path::Path::new(path).exists() {
                 return true;
             }
         }
 
-        // Check for AppImage in home directory
         if let Some(home) = dirs::home_dir() {
             if home.join("Applications").join("cursor.AppImage").exists() {
                 return true;
@@ -733,22 +436,11 @@ pub fn is_cursor_installed() -> bool {
         }
     }
 
-    // Check for config directory
-    if let Some(home) = dirs::home_dir() {
-        if home.join(".cursor").exists() {
-            return true;
-        }
-    }
-
     false
 }
 
-/// Check if Windsurf is installed.
-pub fn is_windsurf_installed() -> bool {
-    if which::which("windsurf").is_ok() {
-        return true;
-    }
-
+/// Windsurf install locations outside HOME and PATH.
+pub(crate) fn windsurf_platform_install_present() -> bool {
     #[cfg(target_os = "macos")]
     {
         if std::path::Path::new("/Applications/Windsurf.app").exists() {
@@ -787,71 +479,11 @@ pub fn is_windsurf_installed() -> bool {
         }
     }
 
-    if let Some(home) = dirs::home_dir() {
-        if home.join(".codeium").join("windsurf").exists() {
-            return true;
-        }
-    }
-
     false
-}
-
-/// Check if GitHub Copilot (extension or CLI) is installed.
-pub fn is_copilot_installed() -> bool {
-    // Copilot CLI
-    if which::which("copilot").is_ok() {
-        return true;
-    }
-
-    // VS Code extensions
-    if is_vscode_extension_installed("github.copilot")
-        || is_vscode_extension_installed("github.copilot-chat")
-    {
-        return true;
-    }
-
-    // Copilot CLI config folder
-    if let Some(home) = dirs::home_dir() {
-        if home.join(".copilot").exists() {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Check if Cline VS Code extension is installed.
-pub fn is_cline_installed() -> bool {
-    is_vscode_extension_installed("saoudrizwan.claude-dev")
-}
-
-/// Check if Kilo Code is installed (CLI or VS Code extension).
-pub fn is_kilo_installed() -> bool {
-    // Check for kilo CLI command
-    if which::which("kilo").is_ok() {
-        return true;
-    }
-
-    // Check for Kilo CLI config directory
-    if kilo_config_dir().is_some_and(|d| d.exists()) {
-        return true;
-    }
-
-    // Legacy: VS Code extension
-    if is_vscode_extension_installed("kilocode.kilo-code") {
-        return true;
-    }
-
-    false
-}
-
-/// Check if Roo Code VS Code extension is installed.
-pub fn is_roo_installed() -> bool {
-    is_vscode_extension_installed("rooveterinaryinc.roo-cline")
 }
 
 /// Check if a VS Code extension is installed.
-fn is_vscode_extension_installed(extension_id: &str) -> bool {
+pub(crate) fn vscode_extension_installed(extension_id: &str) -> bool {
     if let Some(extensions_dir) = vscode_extensions_dir() {
         if extensions_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(&extensions_dir) {
@@ -862,55 +494,6 @@ fn is_vscode_extension_installed(extension_id: &str) -> bool {
                     }
                 }
             }
-        }
-    }
-
-    false
-}
-
-/// Check if OpenAI Codex CLI is installed.
-pub fn is_codex_installed() -> bool {
-    which::which("codex").is_ok()
-}
-
-/// Check if Aider is installed.
-pub fn is_aider_installed() -> bool {
-    which::which("aider").is_ok()
-}
-
-/// Check if Antigravity (IDE or the `agy` CLI) is installed.
-pub fn is_antigravity_installed() -> bool {
-    if which::which("antigravity").is_ok() || which::which("agy").is_ok() {
-        return true;
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        let gemini = home.join(".gemini");
-        // `~/.gemini/config/` is shared by Antigravity 2; a bare `~/.gemini`
-        // may belong to Gemini CLI alone, so it is not evidence.
-        if gemini.join("antigravity").exists()
-            || gemini.join("config").join("mcp_config.json").exists()
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Check if OpenCode CLI is installed.
-pub fn is_opencode_installed() -> bool {
-    if which::which("opencode").is_ok() {
-        return true;
-    }
-
-    if opencode_config_dir().is_some_and(|dir| dir.exists()) {
-        return true;
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        if home.join(".opencode").exists() {
-            return true;
         }
     }
 
@@ -995,18 +578,8 @@ fn vscode_extensions_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".vscode").join("extensions"))
 }
 
-/// Get VS Code settings path.
-fn vscode_settings_path() -> Option<PathBuf> {
-    vscode_user_dir().map(|d| d.join("settings.json"))
-}
-
-/// VS Code user-level mcp.json path (per VS Code profile folder).
-fn vscode_user_mcp_json_path() -> Option<PathBuf> {
-    vscode_user_dir().map(|d| d.join("mcp.json"))
-}
-
 /// VS Code User directory (platform-specific).
-fn vscode_user_dir() -> Option<PathBuf> {
+pub(crate) fn vscode_user_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         dirs::home_dir().map(|h| {
@@ -1330,7 +903,7 @@ mod tests {
     fn test_copilot_uses_vscode_user_mcp_json_path() {
         assert_eq!(
             Editor::Copilot.mcp_config_path(),
-            vscode_user_mcp_json_path()
+            vscode_user_dir().map(|dir| dir.join("mcp.json"))
         );
     }
 

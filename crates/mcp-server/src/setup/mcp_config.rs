@@ -8799,3 +8799,7 @@ CONTEXTSTREAM_API_KEY = "test-key"
         assert!(local(&Editor::ClaudeCode)["command"].is_string());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "client_contract_tests.rs"]
+mod client_contract_tests;

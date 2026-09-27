@@ -52,6 +52,26 @@
     "shared-context",
     "project-context",
     "mcp-server",
-    "ai-coding"
+    "ai-coding",
+    "kimi",
+    "kimi-code",
+    "glm",
+    "zai",
+    "zcode",
+    "qwen-code",
+    "gemini-cli",
+    "muse-code",
+    "zed",
+    "windsurf",
+    "copilot",
+    "copilot-cli",
+    "opencode",
+    "crush",
+    "amp",
+    "factory-droid",
+    "cline",
+    "kilo-code",
+    "antigravity",
+    "claude-desktop"
   ]
 }

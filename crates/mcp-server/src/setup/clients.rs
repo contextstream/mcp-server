@@ -1385,4 +1385,31 @@ mod tests {
             "kilo.jsonc"
         );
     }
+
+    /// `docs/clients.md` embeds [`catalog_markdown`] between markers so the
+    /// published table cannot drift from the registry. The client contract
+    /// bless command regenerates it:
+    /// `CONTEXTSTREAM_BLESS_CLIENT_CONTRACT=1 cargo test -p mcp-server --lib client_contract`.
+    #[test]
+    fn client_contract_docs_table_is_current() {
+        const DOC_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/clients.md");
+        const BEGIN: &str =
+            "<!-- BEGIN GENERATED: contextstream-mcp clients --format markdown -->\n";
+        const END: &str = "<!-- END GENERATED -->\n";
+
+        let doc = std::fs::read_to_string(DOC_PATH).expect("read docs/clients.md");
+        let (before, rest) = doc.split_once(BEGIN).expect("begin marker");
+        let (_, after) = rest.split_once(END).expect("end marker");
+        let current = format!("{before}{BEGIN}{}{END}{after}", catalog_markdown());
+
+        if std::env::var_os("CONTEXTSTREAM_BLESS_CLIENT_CONTRACT").is_some() {
+            std::fs::write(DOC_PATH, &current).expect("regenerate docs/clients.md");
+            return;
+        }
+        assert!(
+            doc == current,
+            "docs/clients.md is out of date; regenerate it with \
+             CONTEXTSTREAM_BLESS_CLIENT_CONTRACT=1 cargo test -p mcp-server --lib client_contract"
+        );
+    }
 }

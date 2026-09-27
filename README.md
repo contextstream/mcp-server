@@ -19,7 +19,9 @@ files, recall saved decisions, and build on past work across sessions and tools.
 
 **10,000 monthly credits. No credit card required.**
 
-Works with Claude Code, Cursor, Codex, and other supported MCP clients.
+Works with Claude Code, Cursor, Codex, GitHub Copilot, Gemini CLI, Qwen Code,
+Kimi Code, Muse Code, ZCode, Zed, and [more MCP clients](docs/clients.md), on
+Claude, GPT, Gemini, Kimi, GLM, Qwen, and other models.
 Create your account or sign in during MCP onboarding. No separate website signup needed.
 
 **macOS and Linux**
@@ -38,6 +40,7 @@ Paste the command into your terminal and follow onboarding to connect your
 project and supported editor. Restart your editor after setup.
 
 [What gets installed and indexed?](docs/data-handling.md) ·
+[Supported clients](docs/clients.md) ·
 [Setup guide](https://contextstream.io/docs/editors/setup) ·
 [Prefer to start on the web?](https://contextstream.io/signup)
 
@@ -84,9 +87,11 @@ For clients supporting Streamable HTTP and OAuth, the hosted endpoint is:
 https://mcp.contextstream.io/mcp
 ```
 
-Use the [MCP documentation](https://contextstream.io/docs/mcp) for your client's
-configuration and stdio alternatives. A hosted connection alone does not sync
-your local checkout.
+[Supported clients](docs/clients.md) lists one-line add commands for Claude
+Code, Codex, Gemini CLI, Qwen Code, Copilot CLI, and Droid, and one-click
+install for VS Code. Use the [MCP documentation](https://contextstream.io/docs/mcp)
+for other clients and stdio alternatives. A hosted connection alone does not
+sync your local checkout.
 
 ### Preview or diagnose setup
 

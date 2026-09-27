@@ -6,9 +6,10 @@
 //! - Tool schema generation
 //! - Large payload handling
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::hint::black_box;
 
 /// JSON-RPC request structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]

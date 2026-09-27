@@ -1034,7 +1034,7 @@ fn sha256_hex(parts: &[&[u8]]) -> String {
     for part in parts {
         hasher.update(part);
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn normalize_copilot_skill_line_endings(content: &str) -> Cow<'_, str> {

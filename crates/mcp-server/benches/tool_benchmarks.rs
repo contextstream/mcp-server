@@ -6,8 +6,9 @@
 //! - Search operations
 //! - Memory operations
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use serde_json::{json, Value};
+use std::hint::black_box;
 
 /// Simulate tool input parsing (common operation).
 fn parse_tool_input(input: &str) -> Value {

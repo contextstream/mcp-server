@@ -5,9 +5,10 @@
 //! - HTTP request/response handling
 //! - Message routing
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::hint::black_box;
 
 /// Benchmark stdio line parsing (newline-delimited JSON).
 fn bench_stdio_line_parsing(c: &mut Criterion) {

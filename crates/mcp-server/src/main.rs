@@ -2177,7 +2177,7 @@ async fn run_configure(
         eprintln!();
         let selection = Select::new()
             .with_prompt("What would you like to configure?")
-            .items(&options)
+            .items(options)
             .default(0)
             .interact_opt()?;
 
@@ -2330,7 +2330,7 @@ async fn run_configure_transcript_defaults() -> Result<()> {
 
     let selection = Select::new()
         .with_prompt("Default transcript behavior")
-        .items(&options)
+        .items(options)
         .default(0)
         .interact_opt()?;
 

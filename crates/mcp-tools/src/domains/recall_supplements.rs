@@ -101,7 +101,7 @@ fn checked_results(
                 .zip(actual_project)
                 .is_some_and(|(requested, actual)| requested != actual)
             || provenance["version"] != 2
-            || provenance["query_sha256"] != format!("{:x}", Sha256::digest(query.as_bytes()))
+            || provenance["query_sha256"] != hex::encode(Sha256::digest(query.as_bytes()))
             || provenance["score_kind"] != "uncalibrated"
             || provenance["calibration"] != "uncalibrated"
         {
@@ -240,7 +240,7 @@ mod tests {
                     "title":"graphics","content_preview":content,"source_scope":scope,"source_project_id":null,
                     "retrieval_provenance":{"version":2,"evidence_source":"primary_authorized_display",
                         "score_kind":"uncalibrated","calibration":"uncalibrated","source_scope":scope,
-                        "query_sha256":format!("{:x}",Sha256::digest(b"graphics")),
+                        "query_sha256":hex::encode(Sha256::digest(b"graphics")),
                         "query_term_matches":1,"query_term_count":1,"lexical_query_coverage":1.0}}}]})
     }
 

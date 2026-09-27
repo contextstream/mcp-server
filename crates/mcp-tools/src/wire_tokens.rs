@@ -399,7 +399,7 @@ pub fn stable_cohort_key(
     if !stable_identity {
         update_field(&mut hasher, "anonymous_fallback", anonymous_fallback);
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 pub fn rollout_decision(tokenizer_hint: Option<&str>, canary_key: &str) -> RolloutDecision {

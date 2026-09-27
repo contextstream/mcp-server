@@ -752,7 +752,7 @@ impl CandidateQueryEvidence {
             return None;
         }
         Some(Self {
-            query_sha256: format!("{:x}", Sha256::digest(query.as_bytes())),
+            query_sha256: hex::encode(Sha256::digest(query.as_bytes())),
             workspace_id: Uuid::parse_str(recall.get("workspace_id")?.as_str()?).ok()?,
             project_id: explicit_project(recall.get("project_id")?)?,
         })
@@ -1810,7 +1810,7 @@ fn scoped_test_payload(mut payload: Value) -> Value {
         item["metadata"]["retrieval_provenance"] = serde_json::json!({
             "version":2,"evidence_source":"primary_authorized_display",
             "score_kind":"uncalibrated","calibration":"uncalibrated",
-            "query_sha256":format!("{:x}",Sha256::digest(b"routing history")),
+            "query_sha256":hex::encode(Sha256::digest(b"routing history")),
             "query_term_matches":matches,"query_term_count":2,"lexical_query_coverage":matches as f64/2.0,
             "source_scope":{"workspace_id":"00000000-0000-0000-0000-000000000010","project_id":source_project}
         });

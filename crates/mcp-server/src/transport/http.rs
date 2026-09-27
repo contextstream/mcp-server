@@ -470,7 +470,7 @@ pub fn create_router(state: HttpState) -> Router {
         .route("/initialize", post(handle_initialize))
         .route("/tools/list", get(handle_list_tools))
         .route("/tools/call", post(handle_call_tool))
-        .route("/tools/:name", post(handle_call_tool_by_name))
+        .route("/tools/{name}", post(handle_call_tool_by_name))
         // Health check
         .route("/health", get(handle_health))
         // SSE endpoint for streaming
@@ -5268,7 +5268,7 @@ mod tests {
             // POST /api/v1/initialize - MCP initialize
             // GET  /api/v1/tools/list - List available tools
             // POST /api/v1/tools/call - Call a tool by name (in body)
-            // POST /api/v1/tools/:name - Call a tool by name (in path)
+            // POST /api/v1/tools/{name} - Call a tool by name (in path)
             // GET  /api/v1/health - Health check
             // GET  /api/v1/stream - SSE streaming endpoint
             //
@@ -5280,7 +5280,7 @@ mod tests {
                 ("POST", "/api/v1/initialize"),
                 ("GET", "/api/v1/tools/list"),
                 ("POST", "/api/v1/tools/call"),
-                ("POST", "/api/v1/tools/:name"),
+                ("POST", "/api/v1/tools/{name}"),
                 ("GET", "/api/v1/health"),
                 ("GET", "/api/v1/stream"),
                 ("GET", "/health"),

@@ -13,7 +13,10 @@
 //!   stores `NULL` / `unknown`) instead of poisoning the model leaderboard
 //!   with editor or provider names.
 //! * **Alias normalization.** Common variants (kebab/snake/dot, vendor
-//!   prefixes like `anthropic/`) collapse onto the canonical id.
+//!   prefixes like `anthropic/`) collapse onto the canonical id. A
+//!   `vendor/model` id (optionally behind a gateway, as in
+//!   `openrouter/z-ai/glm-4.6`) matches only when `vendor` is a namespace of
+//!   the model's own provider.
 //! * **Visibility flag.** Internal models (e.g. `streampilot`/`kimi`)
 //!   keep their canonical id but are tagged `Visibility::Internal` so callers
 //!   can filter them from public dashboards without rewriting them to a
@@ -21,7 +24,8 @@
 //!
 //! Canonical model ids match the public catalog used by the dashboard
 //! (Anthropic Claude families, OpenAI GPT-5 family, Google Gemini, xAI Grok,
-//! ContextStream Composer/StreamPilot, Moonshot Kimi, etc.).
+//! ContextStream Composer/StreamPilot, Moonshot Kimi, Z.ai GLM, Alibaba Qwen,
+//! DeepSeek, MiniMax, Meta Muse Spark, etc.).
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -36,6 +40,14 @@ pub enum Provider {
     Google,
     XAI,
     Moonshot,
+    /// Z.ai (Zhipu AI), maker of GLM.
+    Zai,
+    /// Alibaba Cloud, maker of Qwen.
+    Alibaba,
+    DeepSeek,
+    MiniMax,
+    /// Meta, maker of Muse Spark.
+    Meta,
     ContextStream,
     Other,
 }
@@ -52,8 +64,41 @@ impl Provider {
             Self::Google => "google",
             Self::XAI => "xai",
             Self::Moonshot => "moonshot",
+            Self::Zai => "zai",
+            Self::Alibaba => "alibaba",
+            Self::DeepSeek => "deepseek",
+            Self::MiniMax => "minimax",
+            Self::Meta => "meta",
             Self::ContextStream => "contextstream",
             Self::Other => "other",
+        }
+    }
+
+    /// Namespaces that prefix this provider's model ids on gateways, model
+    /// hubs, and harness model pickers (`z-ai/glm-4.6` on OpenRouter,
+    /// `zai-org/GLM-4.6` on Hugging Face, `zai-coding-plan/glm-4.6` in
+    /// OpenCode). Only the provider's own namespaces qualify its models.
+    fn namespaces(self) -> &'static [&'static str] {
+        match self {
+            Self::Anthropic => &["anthropic"],
+            Self::OpenAI => &["openai"],
+            Self::Google => &["google"],
+            Self::XAI => &["xai", "x-ai"],
+            Self::Moonshot => &["moonshot", "moonshotai", "moonshotai-cn"],
+            Self::Zai => &[
+                "zai",
+                "z-ai",
+                "zai-org",
+                "zhipuai",
+                "zai-coding-plan",
+                "zhipuai-coding-plan",
+            ],
+            Self::Alibaba => &["qwen", "alibaba", "alibaba-cn", "dashscope"],
+            Self::DeepSeek => &["deepseek", "deepseek-ai"],
+            Self::MiniMax => &["minimax", "minimaxai", "minimax-cn"],
+            Self::Meta => &["meta"],
+            Self::ContextStream => &["contextstream"],
+            Self::Other => &[],
         }
     }
 }
@@ -520,6 +565,48 @@ const MODELS: &[KnownModel] = &[
         version: Some("2.5"),
         visibility: Visibility::Public,
     },
+    public_model!(
+        "gemini-3-flash",
+        "Gemini 3 Flash",
+        Provider::Google,
+        "gemini-3",
+        "3"
+    ),
+    public_model!(
+        "gemini-3.1-pro",
+        "Gemini 3.1 Pro",
+        Provider::Google,
+        "gemini-3.1",
+        "3.1"
+    ),
+    public_model!(
+        "gemini-3.5-flash",
+        "Gemini 3.5 Flash",
+        Provider::Google,
+        "gemini-3.5",
+        "3.5"
+    ),
+    public_model!(
+        "gemini-3.6-flash",
+        "Gemini 3.6 Flash",
+        Provider::Google,
+        "gemini-3.6",
+        "3.6"
+    ),
+    public_model!(
+        "gemini-3.7-flash",
+        "Gemini 3.7 Flash",
+        Provider::Google,
+        "gemini-3.7",
+        "3.7"
+    ),
+    public_model!(
+        "gemini-3.8-flash",
+        "Gemini 3.8 Flash",
+        Provider::Google,
+        "gemini-3.8",
+        "3.8"
+    ),
     // ---------------- xAI Grok ----------------
     KnownModel {
         canonical_id: "grok-4",
@@ -537,7 +624,8 @@ const MODELS: &[KnownModel] = &[
         version: Some("4"),
         visibility: Visibility::Public,
     },
-    // ---------------- Moonshot Kimi (internal) ----------------
+    // ---------------- Moonshot Kimi ----------------
+    // K2.5 stays internal (ContextStream runs it); later Kimi models are public.
     KnownModel {
         canonical_id: "kimi-k2.5",
         label: "Kimi K2.5",
@@ -546,6 +634,218 @@ const MODELS: &[KnownModel] = &[
         version: Some("2.5"),
         visibility: Visibility::Internal,
     },
+    public_model!(
+        "kimi-k2.6",
+        "Kimi K2.6",
+        Provider::Moonshot,
+        "kimi-k2",
+        "2.6"
+    ),
+    public_model!(
+        "kimi-k2.7-code",
+        "Kimi K2.7 Code",
+        Provider::Moonshot,
+        "kimi-k2",
+        "2.7"
+    ),
+    public_model!("kimi-k3", "Kimi K3", Provider::Moonshot, "kimi-k3", "3"),
+    // The Kimi Code subscription endpoint serves whichever coding model
+    // Moonshot currently routes it to, so it carries no version.
+    KnownModel {
+        canonical_id: "kimi-for-coding",
+        label: "Kimi for Coding",
+        provider: Provider::Moonshot,
+        family: "kimi-for-coding",
+        version: None,
+        visibility: Visibility::Public,
+    },
+    // ---------------- Z.ai GLM ----------------
+    public_model!("glm-4.5", "GLM-4.5", Provider::Zai, "glm-4.5", "4.5"),
+    public_model!(
+        "glm-4.5-air",
+        "GLM-4.5 Air",
+        Provider::Zai,
+        "glm-4.5",
+        "4.5"
+    ),
+    public_model!("glm-4.6", "GLM-4.6", Provider::Zai, "glm-4.6", "4.6"),
+    public_model!("glm-4.7", "GLM-4.7", Provider::Zai, "glm-4.7", "4.7"),
+    public_model!("glm-5", "GLM-5", Provider::Zai, "glm-5", "5"),
+    public_model!("glm-5.1", "GLM-5.1", Provider::Zai, "glm-5.1", "5.1"),
+    public_model!("glm-5.2", "GLM-5.2", Provider::Zai, "glm-5.2", "5.2"),
+    public_model!("glm-5.3", "GLM-5.3", Provider::Zai, "glm-5.3", "5.3"),
+    public_model!(
+        "glm-5.3-flash",
+        "GLM-5.3 Flash",
+        Provider::Zai,
+        "glm-5.3",
+        "5.3"
+    ),
+    // ---------------- Alibaba Qwen ----------------
+    public_model!(
+        "qwen3-coder",
+        "Qwen3 Coder",
+        Provider::Alibaba,
+        "qwen3-coder",
+        "3"
+    ),
+    public_model!(
+        "qwen3-coder-next",
+        "Qwen3 Coder Next",
+        Provider::Alibaba,
+        "qwen3-coder",
+        "3"
+    ),
+    public_model!(
+        "qwen3-coder-plus",
+        "Qwen3 Coder Plus",
+        Provider::Alibaba,
+        "qwen3-coder-plus",
+        "3"
+    ),
+    public_model!(
+        "qwen3-coder-flash",
+        "Qwen3 Coder Flash",
+        Provider::Alibaba,
+        "qwen3-coder-flash",
+        "3"
+    ),
+    public_model!(
+        "qwen3.6-plus",
+        "Qwen3.6 Plus",
+        Provider::Alibaba,
+        "qwen3.6",
+        "3.6"
+    ),
+    public_model!(
+        "qwen3.7-plus",
+        "Qwen3.7 Plus",
+        Provider::Alibaba,
+        "qwen3.7",
+        "3.7"
+    ),
+    public_model!(
+        "qwen3.7-max",
+        "Qwen3.7 Max",
+        Provider::Alibaba,
+        "qwen3.7",
+        "3.7"
+    ),
+    public_model!(
+        "qwen3.8-flash",
+        "Qwen3.8 Flash",
+        Provider::Alibaba,
+        "qwen3.8",
+        "3.8"
+    ),
+    public_model!(
+        "qwen3.8-max",
+        "Qwen3.8 Max",
+        Provider::Alibaba,
+        "qwen3.8",
+        "3.8"
+    ),
+    // ---------------- DeepSeek ----------------
+    public_model!(
+        "deepseek-v3.1",
+        "DeepSeek V3.1",
+        Provider::DeepSeek,
+        "deepseek-v3",
+        "3.1"
+    ),
+    public_model!(
+        "deepseek-v3.2",
+        "DeepSeek V3.2",
+        Provider::DeepSeek,
+        "deepseek-v3",
+        "3.2"
+    ),
+    public_model!(
+        "deepseek-r1",
+        "DeepSeek R1",
+        Provider::DeepSeek,
+        "deepseek-r1",
+        "1"
+    ),
+    public_model!(
+        "deepseek-v4-pro",
+        "DeepSeek V4 Pro",
+        Provider::DeepSeek,
+        "deepseek-v4",
+        "4"
+    ),
+    public_model!(
+        "deepseek-v4-flash",
+        "DeepSeek V4 Flash",
+        Provider::DeepSeek,
+        "deepseek-v4",
+        "4"
+    ),
+    public_model!(
+        "deepseek-v4.1-flash",
+        "DeepSeek V4.1 Flash",
+        Provider::DeepSeek,
+        "deepseek-v4.1",
+        "4.1"
+    ),
+    // ---------------- MiniMax ----------------
+    public_model!(
+        "minimax-m2",
+        "MiniMax M2",
+        Provider::MiniMax,
+        "minimax-m2",
+        "2"
+    ),
+    public_model!(
+        "minimax-m2.1",
+        "MiniMax M2.1",
+        Provider::MiniMax,
+        "minimax-m2",
+        "2.1"
+    ),
+    public_model!(
+        "minimax-m2.5",
+        "MiniMax M2.5",
+        Provider::MiniMax,
+        "minimax-m2",
+        "2.5"
+    ),
+    public_model!(
+        "minimax-m2.7",
+        "MiniMax M2.7",
+        Provider::MiniMax,
+        "minimax-m2",
+        "2.7"
+    ),
+    public_model!(
+        "minimax-m3",
+        "MiniMax M3",
+        Provider::MiniMax,
+        "minimax-m3",
+        "3"
+    ),
+    // ---------------- Meta Muse Spark (Muse Code) ----------------
+    public_model!(
+        "muse-spark-1.1",
+        "Muse Spark 1.1",
+        Provider::Meta,
+        "muse-spark",
+        "1.1"
+    ),
+    public_model!(
+        "muse-spark-1.2",
+        "Muse Spark 1.2",
+        Provider::Meta,
+        "muse-spark",
+        "1.2"
+    ),
+    public_model!(
+        "muse-spark-1.3",
+        "Muse Spark 1.3",
+        Provider::Meta,
+        "muse-spark",
+        "1.3"
+    ),
     // ---------------- ContextStream-curated models ----------------
     KnownModel {
         canonical_id: "composer-2-fast",
@@ -825,11 +1125,37 @@ impl AliasIndex {
             ("xai/grok-4", "grok-4"),
             ("xai/grok-4-fast", "grok-4-fast"),
             ("grok4", "grok-4"),
+            ("gemini-3-flash-preview", "gemini-3-flash"),
+            ("gemini-3.1-pro-preview", "gemini-3.1-pro"),
+            ("gemini-3-5-flash", "gemini-3.5-flash"),
+            ("gemini-3-6-flash", "gemini-3.6-flash"),
+            ("gemini-3-7-flash", "gemini-3.7-flash"),
+            ("gemini-3-8-flash", "gemini-3.8-flash"),
             // Moonshot Kimi
             ("moonshotai.kimi-k2.5", "kimi-k2.5"),
             ("moonshot/kimi-k2.5", "kimi-k2.5"),
             ("kimi-k2-5", "kimi-k2.5"),
             ("kimi-k2_5", "kimi-k2.5"),
+            ("kimi-k2-6", "kimi-k2.6"),
+            ("kimi-k2-7-code", "kimi-k2.7-code"),
+            ("moonshotai.kimi-k3", "kimi-k3"),
+            ("kimi-k-3", "kimi-k3"),
+            // Z.ai GLM: official ids are dotted; Hugging Face and gateways add
+            // namespaces handled by `Provider::namespaces`.
+            ("glm-4-6", "glm-4.6"),
+            ("glm-4-7", "glm-4.7"),
+            // Alibaba Qwen: open-weight repo id and dated Max snapshots.
+            ("qwen3-coder-480b-a35b-instruct", "qwen3-coder"),
+            ("qwen3.8-max-0902", "qwen3.8-max"),
+            // DeepSeek: OpenRouter ids and dated snapshots.
+            ("deepseek-chat-v3.1", "deepseek-v3.1"),
+            ("deepseek-v3.1-terminus", "deepseek-v3.1"),
+            ("deepseek-r1-0528", "deepseek-r1"),
+            ("deepseek-v4-pro-0813", "deepseek-v4-pro"),
+            ("deepseek-v4-flash-0731", "deepseek-v4-flash"),
+            // MiniMax
+            ("minimax/m3", "minimax-m3"),
+            ("minimax-m-3", "minimax-m3"),
             // ContextStream-curated
             ("contextstream/composer-2-fast", "composer-2-fast"),
             ("contextstream/composer-2", "composer-2"),
@@ -950,7 +1276,25 @@ pub fn match_model(raw: &str) -> Option<&'static KnownModel> {
         "gpt-5.5-high" => "gpt-5.6-sol-high".to_string(),
         _ => key,
     };
-    registry().by_alias.get(&key).copied()
+    registry()
+        .by_alias
+        .get(&key)
+        .copied()
+        .or_else(|| match_vendor_qualified(&key))
+}
+
+/// Resolve a `vendor/model` id, optionally behind gateway segments
+/// (`openrouter/z-ai/glm-4.6`), by looking up `model` and accepting it only
+/// when `vendor` is a namespace of that model's own provider. Mismatched
+/// pairs (`qwen/glm-4.6`, `openrouter/glm-4.6`) stay unknown, and source
+/// attributions never match this way.
+fn match_vendor_qualified(key: &str) -> Option<&'static KnownModel> {
+    let mut segments = key.rsplitn(3, '/');
+    let model_id = segments.next()?;
+    let vendor = segments.next()?;
+    let model = registry().by_alias.get(model_id).copied()?;
+    (model.visibility != Visibility::Source && model.provider.namespaces().contains(&vendor))
+        .then_some(model)
 }
 
 /// Identify the host editor from a client/host hint. Returns `None` when the
@@ -1018,6 +1362,15 @@ pub fn context_window(raw: &str) -> Option<u32> {
         "claude-opus-4.8" | "claude-fable-5" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => {
             Some(1_000_000)
         }
+        // The windows below are each maker's served maximum (OpenRouter
+        // catalog, 2026-09), rounded down so the threshold errs early. Models
+        // under 200K are left untracked: the default already fits them.
+        "gemini-3" | "gemini-3.1" | "gemini-3.5" | "gemini-3.6" | "gemini-3.7" | "gemini-3.8"
+        | "kimi-k3" | "glm-5.2" | "glm-5.3" | "qwen3-coder-plus" | "qwen3-coder-flash"
+        | "qwen3.6" | "qwen3.7" | "qwen3.8" | "deepseek-v4" | "deepseek-v4.1" | "minimax-m3"
+        | "muse-spark" => Some(1_000_000),
+        "kimi-k2" | "qwen3-coder" => Some(256_000),
+        "glm-4.6" | "glm-4.7" | "glm-5" | "glm-5.1" | "minimax-m2" => Some(200_000),
         _ => None,
     }
 }
@@ -1308,6 +1661,175 @@ mod tests {
             ("claude-fable-5-xhigh", "claude-fable-5-thinking-xhigh"),
         ] {
             assert_eq!(canonical_id(raw), Some(expected), "{raw}");
+        }
+    }
+
+    #[test]
+    fn canonical_ids_are_unique_and_resolve_to_themselves() {
+        let mut seen = std::collections::HashSet::new();
+        for model in MODELS {
+            assert!(seen.insert(model.canonical_id), "{}", model.canonical_id);
+            assert_eq!(
+                canonical_id(model.canonical_id),
+                Some(model.canonical_id),
+                "an alias shadows canonical id {}",
+                model.canonical_id
+            );
+        }
+    }
+
+    #[test]
+    fn open_weight_and_regional_models_carry_their_maker() {
+        for (raw, canonical, provider, family) in [
+            ("GLM-4.5-Air", "glm-4.5-air", "zai", "glm-4.5"),
+            ("glm-4.7", "glm-4.7", "zai", "glm-4.7"),
+            ("glm-5.3-flash", "glm-5.3-flash", "zai", "glm-5.3"),
+            (
+                "qwen3-coder-plus",
+                "qwen3-coder-plus",
+                "alibaba",
+                "qwen3-coder-plus",
+            ),
+            ("qwen3.8-max-0902", "qwen3.8-max", "alibaba", "qwen3.8"),
+            ("DeepSeek-V3.1", "deepseek-v3.1", "deepseek", "deepseek-v3"),
+            (
+                "deepseek-v4.1-flash",
+                "deepseek-v4.1-flash",
+                "deepseek",
+                "deepseek-v4.1",
+            ),
+            ("MiniMax-M2.7", "minimax-m2.7", "minimax", "minimax-m2"),
+            ("Kimi-K2.7-Code", "kimi-k2.7-code", "moonshot", "kimi-k2"),
+            (
+                "kimi-for-coding",
+                "kimi-for-coding",
+                "moonshot",
+                "kimi-for-coding",
+            ),
+            ("muse-spark-1.3", "muse-spark-1.3", "meta", "muse-spark"),
+            (
+                "gemini-3.1-pro-preview",
+                "gemini-3.1-pro",
+                "google",
+                "gemini-3.1",
+            ),
+        ] {
+            let model = match_model(raw).unwrap_or_else(|| panic!("{raw} unrecognized"));
+            assert_eq!(model.canonical_id, canonical, "{raw}");
+            assert_eq!(model.provider.as_str(), provider, "{raw}");
+            assert_eq!(model.family, family, "{raw}");
+            assert_eq!(model.visibility, Visibility::Public, "{raw}");
+        }
+    }
+
+    #[test]
+    fn vendor_namespaces_qualify_only_their_own_models() {
+        for (raw, expected) in [
+            // OpenRouter, Hugging Face, and harness picker namespaces.
+            ("z-ai/glm-4.6", "glm-4.6"),
+            ("zai/glm-5.1", "glm-5.1"),
+            ("zai-org/GLM-4.6", "glm-4.6"),
+            ("zai-coding-plan/glm-4.7", "glm-4.7"),
+            ("openrouter/z-ai/glm-5.3", "glm-5.3"),
+            ("moonshotai/kimi-k2.7-code", "kimi-k2.7-code"),
+            ("openrouter/moonshotai/kimi-k3", "kimi-k3"),
+            ("qwen/qwen3-coder", "qwen3-coder"),
+            ("Qwen/Qwen3-Coder-480B-A35B-Instruct", "qwen3-coder"),
+            ("dashscope/qwen3-coder-plus", "qwen3-coder-plus"),
+            ("deepseek-ai/DeepSeek-V3.1", "deepseek-v3.1"),
+            ("deepseek/deepseek-v4-pro-0813", "deepseek-v4-pro"),
+            ("MiniMaxAI/MiniMax-M2", "minimax-m2"),
+            ("minimax/minimax-m2.7", "minimax-m2.7"),
+            ("meta/muse-spark-1.3", "muse-spark-1.3"),
+            ("google/gemini-3.8-flash", "gemini-3.8-flash"),
+            ("x-ai/grok-4", "grok-4"),
+            (
+                "anthropic/claude-opus-4-8-thinking-low",
+                "claude-opus-4.8-thinking-low",
+            ),
+        ] {
+            assert_eq!(canonical_id(raw), Some(expected), "{raw}");
+        }
+
+        for raw in [
+            "qwen/glm-4.6",
+            "openrouter/glm-4.6",
+            "z-ai/kimi-k3",
+            "moonshotai/gpt-5",
+            "/glm-4.6",
+            "z-ai/",
+            // Source attributions are never vendor-qualified.
+            "openai/cursor",
+            "anthropic/hook",
+        ] {
+            assert_eq!(canonical_id(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn backend_registry_spellings_resolve_to_the_same_canonical_ids() {
+        // The API canonicalizes `model_id` again with its own registry, so ids
+        // it already knows must keep the exact same canonical spelling here.
+        for (raw, expected) in [
+            ("kimi-k3", "kimi-k3"),
+            ("moonshotai/kimi-k3", "kimi-k3"),
+            ("moonshotai.kimi-k3", "kimi-k3"),
+            ("moonshot/kimi-k3", "kimi-k3"),
+            ("kimi-k-3", "kimi-k3"),
+            ("minimax-m3", "minimax-m3"),
+            ("minimax/m3", "minimax-m3"),
+            ("minimax/minimax-m3", "minimax-m3"),
+            ("minimax-m-3", "minimax-m3"),
+            ("gemini-3.5-flash", "gemini-3.5-flash"),
+            ("gemini-3-5-flash", "gemini-3.5-flash"),
+            ("google/gemini-3.6-flash", "gemini-3.6-flash"),
+            ("gemini-3-7-flash", "gemini-3.7-flash"),
+        ] {
+            assert_eq!(canonical_id(raw), Some(expected), "{raw}");
+        }
+        assert_eq!(match_model("kimi-k3").map(|m| m.family), Some("kimi-k3"));
+        assert_eq!(
+            match_model("minimax-m3").map(|m| m.family),
+            Some("minimax-m3")
+        );
+    }
+
+    #[test]
+    fn context_window_tracks_new_large_window_families() {
+        for (raw, window) in [
+            ("kimi-k3", 1_000_000),
+            ("kimi-k2.5", 256_000),
+            ("moonshotai/kimi-k2.7-code", 256_000),
+            ("glm-5.3", 1_000_000),
+            ("z-ai/glm-4.6", 200_000),
+            ("glm-5.1", 200_000),
+            ("qwen3-coder", 256_000),
+            ("qwen3-coder-plus", 1_000_000),
+            ("qwen3.8-max", 1_000_000),
+            ("deepseek-v4-pro", 1_000_000),
+            ("minimax-m2.7", 200_000),
+            ("minimax-m3", 1_000_000),
+            ("gemini-3.1-pro-preview", 1_000_000),
+            ("muse-spark-1.3", 1_000_000),
+        ] {
+            assert_eq!(context_window(raw), Some(window), "{raw}");
+        }
+        // Small or unversioned windows keep the conservative default.
+        for raw in ["glm-4.5", "deepseek-v3.1", "deepseek-r1", "kimi-for-coding"] {
+            assert_eq!(context_window(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn tokenizer_encoding_is_never_guessed_for_other_makers() {
+        for raw in [
+            "glm-4.7",
+            "qwen3-coder",
+            "kimi-k3",
+            "deepseek-v4-pro",
+            "minimax-m3",
+        ] {
+            assert_eq!(tokenizer_encoding(raw), None, "{raw}");
         }
     }
 }

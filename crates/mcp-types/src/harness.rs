@@ -209,13 +209,19 @@ impl HarnessId {
     pub fn from_alias(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "claude_code" => Some(Self::ClaudeCode),
-            "cursor" => Some(Self::Cursor),
+            // `cursor-vscode` is Cursor's MCP `clientInfo.name`.
+            "cursor" | "cursor-vscode" => Some(Self::Cursor),
             "windsurf" | "cascade" => Some(Self::Windsurf),
-            "copilot" | "github-copilot" | "github_copilot" => Some(Self::Copilot),
+            // VS Code's MCP client (Copilot agent mode) reports the product name.
+            "copilot"
+            | "github-copilot"
+            | "github_copilot"
+            | "visual studio code"
+            | "visual studio code - insiders" => Some(Self::Copilot),
             "cline" => Some(Self::Cline),
             "kilo" | "kilo-code" | "kilo_code" | "kilocode" => Some(Self::KiloCode),
             "roo" | "roo-code" | "roo_code" | "roocode" => Some(Self::RooCode),
-            "codex" | "codex-cli" | "codex_cli" => Some(Self::Codex),
+            "codex" | "codex-cli" | "codex_cli" | "codex-mcp-client" => Some(Self::Codex),
             "aider" => Some(Self::Aider),
             "antigravity" | "gemini-antigravity" => Some(Self::Antigravity),
             "opencode" | "open-code" | "open_code" => Some(Self::OpenCode),
@@ -848,6 +854,26 @@ mod tests {
             HarnessId::from_client_hint("csc 0.7"),
             Some(HarnessId::ContextCode)
         );
+        // Exact MCP `clientInfo.name` values the clients send at initialize.
+        for (client_info_name, harness) in [
+            ("cursor-vscode", HarnessId::Cursor),
+            ("codex-mcp-client", HarnessId::Codex),
+            ("Visual Studio Code", HarnessId::Copilot),
+            ("Visual Studio Code - Insiders", HarnessId::Copilot),
+            ("gemini-cli-mcp-client", HarnessId::GeminiCli),
+            ("qwen-code-mcp-client", HarnessId::QwenCode),
+            ("Zed", HarnessId::Zed),
+            ("Roo Code", HarnessId::RooCode),
+            ("Kilo Code", HarnessId::KiloCode),
+        ] {
+            assert_eq!(
+                HarnessId::from_client_hint(client_info_name),
+                Some(harness),
+                "{client_info_name}"
+            );
+        }
+        assert_eq!(HarnessId::from_client_hint("Visual Studio"), None);
+        assert_eq!(HarnessId::from_client_hint("cursor-vscode-fork"), None);
         assert_eq!(HarnessId::from_client_hint("my-cursor-proxy"), None);
         assert_eq!(HarnessId::from_client_hint("claude-code-wrapper"), None);
         assert_eq!(HarnessId::from_client_hint(""), None);

@@ -2227,12 +2227,20 @@ fn extract_auth_override(headers: &HeaderMap) -> Option<AuthOverride> {
         None
     };
 
+    // Like the traffic class, the client id travels only with credentials
+    // and only as a known harness id, never as the caller's raw string.
+    let client = has_credential
+        .then(|| header_str(headers, "x-contextstream-client"))
+        .flatten()
+        .and_then(HarnessId::from_alias);
+
     let auth = AuthOverride {
         api_key,
         jwt,
         workspace_id,
         project_id,
         traffic_class,
+        client,
     };
 
     if auth.is_empty() {
@@ -4092,6 +4100,28 @@ mod tests {
                 extract_auth_override(&headers).is_none(),
                 "an unauthenticated classification header must not create an override"
             );
+        }
+
+        #[test]
+        fn client_identity_is_authenticated_and_only_a_known_harness() {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, "Bearer hosted-key".parse().unwrap());
+            for (raw, expected) in [
+                ("claude", Some(HarnessId::ClaudeCode)),
+                ("Claude-Code", Some(HarnessId::ClaudeCode)),
+                ("kimi", Some(HarnessId::KimiCode)),
+                ("web-dashboard", None),
+                ("my-own-client", None),
+            ] {
+                headers.insert("x-contextstream-client", raw.parse().unwrap());
+                let auth = extract_auth_override(&headers).expect("authenticated override");
+                assert_eq!(auth.client, expected, "{raw}");
+            }
+
+            // Without credentials the header creates no override at all.
+            headers.remove(header::AUTHORIZATION);
+            headers.insert("x-contextstream-client", "claude".parse().unwrap());
+            assert!(extract_auth_override(&headers).is_none());
         }
 
         #[test]

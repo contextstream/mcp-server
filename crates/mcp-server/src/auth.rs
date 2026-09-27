@@ -66,6 +66,9 @@ pub fn extract_auth_from_headers(headers: &serde_json::Value) -> Option<AuthOver
             workspace_id,
             project_id,
             traffic_class,
+            // The stdio runtime reports its client through the setup-managed
+            // runtime headers instead.
+            client: None,
         })
     } else {
         None

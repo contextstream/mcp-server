@@ -1060,6 +1060,8 @@ pub struct ContextStreamClient {
     session_refresh_hook: Arc<RwLock<Option<SessionRefreshHook>>>,
 }
 
+/// Harness id of the client a hosted connection was configured for.
+const CLIENT_HEADER: &str = "X-ContextStream-Client";
 const MEMORY_SEARCH_CACHE_TTL: Duration = Duration::from_secs(10);
 // Memory search is an interactive agent-start path. The API owns the scoped
 // Postgres fallback when vector retrieval degrades, so replaying a terminal
@@ -3316,6 +3318,11 @@ impl ContextStreamClient {
         if let Some(traffic_class) = auth.and_then(|value| value.traffic_class) {
             req = req.header(TrafficClass::HEADER_NAME, traffic_class.as_header_value());
         }
+        if let Some(client) = auth.and_then(|value| value.client) {
+            if !request_options_has_header(&options, CLIENT_HEADER) {
+                req = req.header(CLIENT_HEADER, client.as_str());
+            }
+        }
         req = with_edge_geography_headers(req);
 
         // Forward the agent's model so server-side compliance events attribute
@@ -3510,6 +3517,11 @@ impl ContextStreamClient {
 
         if let Some(traffic_class) = effective_auth.and_then(|value| value.traffic_class) {
             req = req.header(TrafficClass::HEADER_NAME, traffic_class.as_header_value());
+        }
+        if let Some(client) = effective_auth.and_then(|value| value.client) {
+            if !request_options_has_header(&options, CLIENT_HEADER) {
+                req = req.header(CLIENT_HEADER, client.as_str());
+            }
         }
         req = with_edge_geography_headers(req);
 
@@ -21611,6 +21623,83 @@ mod tests {
         assert!(!ordinary.contains("customer-controlled"));
     }
 
+    #[tokio::test]
+    async fn hosted_client_identity_is_forwarded_unless_a_request_names_its_own() {
+        let (client, server) = client_with_http_sequence(vec![
+            ("200 OK", "{}".to_string()),
+            ("200 OK", "ok".to_string()),
+            ("200 OK", "{}".to_string()),
+        ])
+        .await;
+
+        run_with_auth_override(
+            AuthOverride {
+                api_key: Some("hosted-key".to_string()),
+                client: Some(mcp_types::HarnessId::ClaudeCode),
+                ..Default::default()
+            },
+            || async {
+                let _: serde_json::Value = client
+                    .request::<serde_json::Value, serde_json::Value>(
+                        "GET",
+                        "/client-json",
+                        None,
+                        Some(RequestOptions {
+                            retries: Some(0),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .expect("JSON request");
+                // A request that names its own client (readiness events do)
+                // keeps it, and the header is not sent twice.
+                client
+                    .request_text::<serde_json::Value>(
+                        "GET",
+                        "/client-text",
+                        None,
+                        Some(RequestOptions {
+                            retries: Some(0),
+                            extra_headers: Some(vec![(
+                                CLIENT_HEADER.to_string(),
+                                "codex".to_string(),
+                            )]),
+                            ..Default::default()
+                        }),
+                        Some("text/plain"),
+                    )
+                    .await
+                    .expect("text request");
+            },
+        )
+        .await;
+
+        let _: serde_json::Value = client
+            .request::<serde_json::Value, serde_json::Value>(
+                "GET",
+                "/client-none",
+                None,
+                Some(RequestOptions {
+                    retries: Some(0),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("request without an override");
+
+        let requests: Vec<String> = server
+            .await
+            .expect("client-identity server task")
+            .iter()
+            .map(|request| request.to_ascii_lowercase())
+            .collect();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains("x-contextstream-client: claude\r\n"));
+        assert_eq!(requests[1].matches("x-contextstream-client:").count(), 1);
+        assert!(requests[1].contains("x-contextstream-client: codex\r\n"));
+        assert!(!requests[2].contains("x-contextstream-client:"));
+    }
+
     fn assert_release_metadata_contract(metadata: &serde_json::Value) {
         let metadata = metadata
             .as_object()
@@ -22820,6 +22909,7 @@ mod tests {
                 workspace_id: Some(user_a_ws),
                 project_id: None,
                 traffic_class: None,
+                client: None,
             },
             || async {
                 client
@@ -22876,6 +22966,7 @@ mod tests {
                 workspace_id: Some(Uuid::new_v4()),
                 project_id: Some(Uuid::new_v4()),
                 traffic_class: None,
+                client: None,
             },
             || async {
                 client.clear_defaults(true, true).await;

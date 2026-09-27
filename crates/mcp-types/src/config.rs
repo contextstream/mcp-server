@@ -425,6 +425,12 @@ pub struct AuthOverride {
     /// constructed from the exact allowlisted ingress value; arbitrary caller
     /// strings must never be stored or forwarded.
     pub traffic_class: Option<TrafficClass>,
+    /// The client the hosted connection was configured for, from the
+    /// connection's `X-ContextStream-Client` header and only as a known
+    /// harness id. Forwarded so the API can word guidance for that client
+    /// (Claude Code's tool names, for instance). It is not a credential and
+    /// does not make an override non-empty.
+    pub client: Option<crate::HarnessId>,
 }
 
 /// Allowlisted traffic classifications that may cross the MCP/API boundary.

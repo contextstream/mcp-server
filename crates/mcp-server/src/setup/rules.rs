@@ -370,6 +370,23 @@ pub enum RulesMode {
     Full,
 }
 
+/// Editors whose project rules live in a shared root `AGENTS.md` or
+/// `GEMINI.md`. Editors sharing a file must render identical ContextStream
+/// content, or configuring two of them would keep rewriting the same block.
+fn uses_project_agents_md(editor: &Editor) -> bool {
+    project_rules_file_is(editor, "AGENTS.md")
+}
+
+fn uses_project_gemini_md(editor: &Editor) -> bool {
+    project_rules_file_is(editor, "GEMINI.md")
+}
+
+fn project_rules_file_is(editor: &Editor, file: &str) -> bool {
+    editor
+        .rules_path(Some(Path::new("")))
+        .is_some_and(|path| path == Path::new(file))
+}
+
 fn mode_for_editor(editor: &Editor) -> RulesMode {
     match editor.enforcement_tier() {
         super::editors::EnforcementTier::TierA => RulesMode::Bootstrap,
@@ -574,7 +591,7 @@ fn project_rules_content(
     if *editor == Editor::Aider {
         return aider_read_pointer_block(SHARED_PROJECT_RULES_PATH);
     }
-    if *editor == Editor::Antigravity {
+    if uses_project_gemini_md(editor) {
         rules = rules.replace(
             CONTEXTSTREAM_END,
             &format!(
@@ -1237,14 +1254,14 @@ pub fn write_project_rules(
         Ok(content_has_owned_contextstream_rules(&content))
     }
 
-    // Skip AGENTS.md (Codex/OpenCode) only when Windsurf has its own project
+    // Skip AGENTS.md only when Windsurf has its own project
     // rules already. Windsurf is the one editor that loads BOTH its
     // `.windsurf/rules/` files and AGENTS.md, so duplicate ContextStream content
     // across the two makes Windsurf ignore them entirely. The other editors
     // (Cursor reads `.cursor/rules/*.mdc`, ClaudeCode reads `CLAUDE.md`,
     // Cline/KiloCode/RooCode read their own conventions) do not also consume
     // AGENTS.md and must not block its generation.
-    if matches!(editor, Editor::Codex | Editor::OpenCode) {
+    if uses_project_agents_md(editor) {
         for windsurf_path in Editor::Windsurf.all_rules_paths(Some(project_path)) {
             if path_has_contextstream_markers(&windsurf_path)? {
                 // If we're skipping AGENTS.md to avoid Windsurf duplication,
@@ -1270,7 +1287,7 @@ pub fn write_project_rules(
         ));
     }
 
-    if *editor == Editor::Aider || *editor == Editor::Antigravity {
+    if *editor == Editor::Aider || uses_project_gemini_md(editor) {
         let _ =
             write_shared_project_rules(project_path, workspace_id, workspace_name, project_name)?;
     }
@@ -1348,10 +1365,10 @@ pub fn generate_rule_content(
         );
     }
 
-    if matches!(editor, Editor::Codex | Editor::OpenCode) {
+    if uses_project_agents_md(editor) {
         content = content.replace(
             CONTEXTSTREAM_END,
-            &format!("{}\n{}", CODEX_SUPPLEMENT, CONTEXTSTREAM_END),
+            &format!("{}\n{}", AGENTS_MD_SUPPLEMENT, CONTEXTSTREAM_END),
         );
     }
 
@@ -1362,10 +1379,10 @@ pub fn generate_rule_content(
         );
     }
 
-    if *editor == Editor::Antigravity {
+    if uses_project_gemini_md(editor) {
         content = content.replace(
             CONTEXTSTREAM_END,
-            &format!("{}\n{}", ANTIGRAVITY_SUPPLEMENT, CONTEXTSTREAM_END),
+            &format!("{}\n{}", GEMINI_MD_SUPPLEMENT, CONTEXTSTREAM_END),
         );
     }
 
@@ -1756,9 +1773,9 @@ const CURSOR_SUPPLEMENT: &str = r#"
 /// Supplement for Codex/OpenCode to override their built-in search tools.
 /// Codex uses Explore subagents and "Searched for" built-in operations that
 /// bypass ContextStream's premium search entirely.
-const CODEX_SUPPLEMENT: &str = r#"
+const AGENTS_MD_SUPPLEMENT: &str = r#"
 ---
-## Codex/OpenCode-Specific Rules
+## Rules for AGENTS.md Agents
 
 **CRITICAL: ContextStream search() REPLACES all built-in search tools.**
 **The user is paying for ContextStream's premium search — default tools must not bypass it.**
@@ -1786,7 +1803,7 @@ const CODEX_SUPPLEMENT: &str = r#"
 
 ### Planning: Use ContextStream, Not Built-in Tools
 - **Do NOT** create markdown plan files — they vanish across sessions
-- **Do NOT** use Codex plan mode output (`plan_mode_respond`) as the persistent plan record — save the plan to ContextStream instead
+- **Do NOT** use a built-in plan mode's output (e.g. Codex `plan_mode_respond`) as the persistent plan record — save the plan to ContextStream instead
 - **Do NOT** use built-in todo/plan tools (`TodoWrite`, `todo_list`, `plan_mode_respond`) for persistent plans or tasks
 - **Do NOT** save plans as `session(action="capture", event_type="plan")` or `memory(action="create_event", event_type="plan")`
 - **ALWAYS** save comprehensive plans: `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"scope, concrete work, acceptance criteria, verification"}], create_tasks=true)`
@@ -1802,15 +1819,15 @@ const COPILOT_SUPPLEMENT: &str = r#"
 - Before code discovery, use `search(mode="auto", query="...")`
 "#;
 
-const ANTIGRAVITY_SUPPLEMENT: &str = r#"
+const GEMINI_MD_SUPPLEMENT: &str = r#"
 ---
-## Antigravity-Specific Reliability Notes
+## Reliability Notes for GEMINI.md Agents (Antigravity, Gemini CLI)
 
-- Antigravity currently has no documented lifecycle hooks for ContextStream enforcement.
+- These agents have no documented lifecycle hooks for ContextStream enforcement.
 - Treat ContextStream-first behavior as mandatory policy: run `context(...)` first, then `search(mode="auto", ...)` before local discovery.
-- Keep `mcp_config.json` valid and minimal: preserve non-ContextStream servers and only update the `contextstream` block.
+- Keep the MCP config valid and minimal: preserve non-ContextStream servers and only update the `contextstream` block.
 - If ContextStream appears skipped, verify:
-  1. MCP server status is healthy in Antigravity settings
+  1. MCP server status is healthy in the agent's MCP settings (`/mcp` where available)
   2. Project is indexed and `search(mode="auto", ...)` is retried before local fallbacks
   3. Rule files contain the current ContextStream managed block
 "#;
@@ -2377,6 +2394,42 @@ fn try_restore_exact_rules_backup(path: &Path, current: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editors_sharing_a_rules_file_render_identical_content() {
+        let project = Path::new("/tmp/shared-rules-project");
+        let mut checked = 0;
+        for (i, left) in Editor::all().iter().enumerate() {
+            for right in &Editor::all()[i + 1..] {
+                if left.rules_path(Some(project)).is_some()
+                    && left.rules_path(Some(project)) == right.rules_path(Some(project))
+                {
+                    checked += 1;
+                    assert_eq!(
+                        project_rules_content(left, Some("ws"), Some("Workspace"), Some("proj")),
+                        project_rules_content(right, Some("ws"), Some("Workspace"), Some("proj")),
+                        "{} and {} share project rules but render different content",
+                        left.id(),
+                        right.id()
+                    );
+                }
+                if left.rules_path(None).is_some()
+                    && left.rules_path(None) == right.rules_path(None)
+                {
+                    checked += 1;
+                    assert_eq!(
+                        global_rules_content(left, Some("ws"), Some("Workspace")),
+                        global_rules_content(right, Some("ws"), Some("Workspace")),
+                        "{} and {} share global rules but render different content",
+                        left.id(),
+                        right.id()
+                    );
+                }
+            }
+        }
+        assert!(checked >= 1, "Codex and OpenCode share AGENTS.md");
+    }
+
     use crate::env_test_mutex;
     use tempfile::tempdir;
 
@@ -2623,7 +2676,7 @@ mod tests {
             RulesMode::Full,
         );
         assert!(rules.contains("No Hooks Available"));
-        assert!(rules.contains("Antigravity-Specific Reliability Notes"));
+        assert!(rules.contains("Reliability Notes for GEMINI.md Agents"));
     }
 
     #[test]

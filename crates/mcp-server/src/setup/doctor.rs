@@ -530,30 +530,24 @@ impl DoctorReport {
     }
 }
 
-/// Root key holding MCP server entries in this editor's JSON config.
-fn mcp_root_key(editor: &Editor) -> &'static str {
-    match editor {
-        Editor::Copilot => "servers",
-        Editor::OpenCode | Editor::KiloCode => "mcp",
-        _ => "mcpServers",
+/// Locate the contextstream server entry in a parsed editor config. Global
+/// and project files can store servers at different paths (Roo's global
+/// config is VS Code settings, its project `.roo/mcp.json` is plain JSON).
+fn contextstream_entry<'a>(editor: &Editor, config: &'a Value, surface: &str) -> Option<&'a Value> {
+    let descriptor = editor.descriptor();
+    let path: Vec<&str> = if surface == "mcp_project" {
+        descriptor
+            .project_config
+            .map_or_else(Vec::new, |project| project.server_path.to_vec())
+    } else {
+        descriptor.dialect.server_path()
+    };
+    if path.is_empty() {
+        return None;
     }
-}
-
-/// Locate the contextstream server entry in a parsed editor config.
-fn contextstream_entry<'a>(editor: &Editor, config: &'a Value) -> Option<&'a Value> {
-    if editor.uses_vscode_settings() {
-        let key = match editor {
-            Editor::Cline => "cline.mcpServers",
-            Editor::RooCode => "roo-cline.mcpServers",
-            _ => return None,
-        };
-        return config
-            .get(key)
-            .and_then(|servers| servers.get("contextstream"));
-    }
-    config
-        .get(mcp_root_key(editor))
-        .and_then(|servers| servers.get("contextstream"))
+    path.iter()
+        .try_fold(config, |node, key| node.get(*key))?
+        .get("contextstream")
 }
 
 fn json_identity_value<'a>(entry: &'a Value, env_name: &str, header_name: &str) -> Option<&'a str> {
@@ -731,11 +725,12 @@ fn validate_entry_shape(editor: &Editor, entry: &Value) -> std::result::Result<S
         };
     }
 
-    // Generic editors: a usable entry has either a remote url/serverUrl or a
-    // local command whose binary exists on disk.
+    // Generic editors: a usable entry has either a remote url (`serverUrl`,
+    // `url`, or `httpUrl` by client) or a local command whose binary exists.
     if let Some(url) = entry
         .get("serverUrl")
         .or_else(|| entry.get("url"))
+        .or_else(|| entry.get("httpUrl"))
         .and_then(Value::as_str)
     {
         if url.is_empty() {
@@ -814,7 +809,7 @@ fn check_mcp_config_file(
         }
     };
 
-    match contextstream_entry(editor, &parsed) {
+    match contextstream_entry(editor, &parsed, surface) {
         Some(entry) => match validate_entry_shape(editor, entry) {
             Ok(detail) => {
                 match validate_json_managed_identity(editor, entry, expected_installation_id) {

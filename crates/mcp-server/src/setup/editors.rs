@@ -25,6 +25,17 @@ pub enum Editor {
     Aider,
     Antigravity,
     OpenCode,
+    MuseCode,
+    KimiCode,
+    ZCode,
+    QwenCode,
+    GeminiCli,
+    Zed,
+    ClaudeDesktop,
+    CopilotCli,
+    FactoryDroid,
+    Amp,
+    Crush,
 }
 
 /// Enforcement capability tier by editor.
@@ -41,7 +52,7 @@ pub enum EnforcementTier {
 /// Editors exposed to users in setup/configure flows.
 ///
 /// To disable an editor, remove it from this list.
-const ENABLED_EDITORS: [Editor; 11] = [
+const ENABLED_EDITORS: [Editor; 22] = [
     Editor::ClaudeCode,
     Editor::Cursor,
     Editor::Windsurf,
@@ -53,6 +64,17 @@ const ENABLED_EDITORS: [Editor; 11] = [
     Editor::Aider,
     Editor::Antigravity,
     Editor::OpenCode,
+    Editor::MuseCode,
+    Editor::KimiCode,
+    Editor::ZCode,
+    Editor::QwenCode,
+    Editor::GeminiCli,
+    Editor::Zed,
+    Editor::ClaudeDesktop,
+    Editor::CopilotCli,
+    Editor::FactoryDroid,
+    Editor::Amp,
+    Editor::Crush,
 ];
 
 impl Editor {
@@ -85,6 +107,17 @@ impl Editor {
             Editor::Aider => HarnessId::Aider,
             Editor::Antigravity => HarnessId::Antigravity,
             Editor::OpenCode => HarnessId::OpenCode,
+            Editor::MuseCode => HarnessId::MuseCode,
+            Editor::KimiCode => HarnessId::KimiCode,
+            Editor::ZCode => HarnessId::ZCode,
+            Editor::QwenCode => HarnessId::QwenCode,
+            Editor::GeminiCli => HarnessId::GeminiCli,
+            Editor::Zed => HarnessId::Zed,
+            Editor::ClaudeDesktop => HarnessId::ClaudeDesktop,
+            Editor::CopilotCli => HarnessId::CopilotCli,
+            Editor::FactoryDroid => HarnessId::FactoryDroid,
+            Editor::Amp => HarnessId::Amp,
+            Editor::Crush => HarnessId::Crush,
         }
     }
 
@@ -115,6 +148,17 @@ impl Editor {
             HarnessId::Aider => Some(Editor::Aider),
             HarnessId::Antigravity => Some(Editor::Antigravity),
             HarnessId::OpenCode => Some(Editor::OpenCode),
+            HarnessId::MuseCode => Some(Editor::MuseCode),
+            HarnessId::KimiCode => Some(Editor::KimiCode),
+            HarnessId::ZCode => Some(Editor::ZCode),
+            HarnessId::QwenCode => Some(Editor::QwenCode),
+            HarnessId::GeminiCli => Some(Editor::GeminiCli),
+            HarnessId::Zed => Some(Editor::Zed),
+            HarnessId::ClaudeDesktop => Some(Editor::ClaudeDesktop),
+            HarnessId::CopilotCli => Some(Editor::CopilotCli),
+            HarnessId::FactoryDroid => Some(Editor::FactoryDroid),
+            HarnessId::Amp => Some(Editor::Amp),
+            HarnessId::Crush => Some(Editor::Crush),
             HarnessId::ChatGptGateway
             | HarnessId::OpenAiResponses
             | HarnessId::ContextStreamCli
@@ -601,27 +645,49 @@ pub(crate) fn vscode_user_dir() -> Option<PathBuf> {
     }
 }
 
-/// Get Claude Desktop config path (for reference).
-pub fn _claude_desktop_config_path() -> Option<PathBuf> {
+/// Claude Desktop's `claude_desktop_config.json` (platform config dir:
+/// `~/Library/Application Support/Claude` on macOS, `%APPDATA%\Claude` on
+/// Windows; the Linux beta's `~/.config/Claude` is undocumented).
+pub(crate) fn claude_desktop_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("Claude").join("claude_desktop_config.json"))
+}
+
+/// Claude Desktop app bundle, or its config directory.
+pub(crate) fn claude_desktop_install_present() -> bool {
     #[cfg(target_os = "macos")]
     {
-        dirs::home_dir().map(|h| {
-            h.join("Library")
-                .join("Application Support")
-                .join("Claude")
-                .join("claude_desktop_config.json")
-        })
+        if std::path::Path::new("/Applications/Claude.app").exists() {
+            return true;
+        }
     }
+    claude_desktop_config_path()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .is_some_and(|dir| dir.exists())
+}
 
+/// Zed's config directory: `%APPDATA%\Zed` on Windows, else
+/// `$XDG_CONFIG_HOME/zed` (`~/.config/zed`, macOS included).
+pub(crate) fn zed_config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        dirs::data_dir().map(|d| d.join("Claude").join("claude_desktop_config.json"))
+        dirs::config_dir().map(|dir| dir.join("Zed"))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "windows"))]
     {
-        dirs::config_dir().map(|c| c.join("Claude").join("claude_desktop_config.json"))
+        xdg_config_home().map(|dir| dir.join("zed"))
     }
+}
+
+/// Zed install locations outside PATH, or its config directory.
+pub(crate) fn zed_platform_install_present() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if std::path::Path::new("/Applications/Zed.app").exists() {
+            return true;
+        }
+    }
+    zed_config_dir().is_some_and(|dir| dir.exists())
 }
 
 #[cfg(test)]
@@ -649,18 +715,34 @@ mod tests {
     #[test]
     fn test_all_editors_list() {
         let all = Editor::all();
-        assert_eq!(all.len(), 11);
-        assert!(all.contains(&Editor::ClaudeCode));
-        assert!(all.contains(&Editor::Cursor));
-        assert!(all.contains(&Editor::Windsurf));
-        assert!(all.contains(&Editor::Copilot));
-        assert!(all.contains(&Editor::Cline));
-        assert!(all.contains(&Editor::KiloCode));
-        assert!(all.contains(&Editor::RooCode));
-        assert!(all.contains(&Editor::Codex));
-        assert!(all.contains(&Editor::Aider));
-        assert!(all.contains(&Editor::Antigravity));
-        assert!(all.contains(&Editor::OpenCode));
+        assert_eq!(all.len(), 22);
+        assert_eq!(all.len(), HarnessId::INSTALLABLE.len());
+        for editor in [
+            Editor::ClaudeCode,
+            Editor::Cursor,
+            Editor::Windsurf,
+            Editor::Copilot,
+            Editor::Cline,
+            Editor::KiloCode,
+            Editor::RooCode,
+            Editor::Codex,
+            Editor::Aider,
+            Editor::Antigravity,
+            Editor::OpenCode,
+            Editor::MuseCode,
+            Editor::KimiCode,
+            Editor::ZCode,
+            Editor::QwenCode,
+            Editor::GeminiCli,
+            Editor::Zed,
+            Editor::ClaudeDesktop,
+            Editor::CopilotCli,
+            Editor::FactoryDroid,
+            Editor::Amp,
+            Editor::Crush,
+        ] {
+            assert!(all.contains(&editor), "{}", editor.id());
+        }
     }
 
     #[test]

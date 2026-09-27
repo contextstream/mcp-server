@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table};
 
-use super::clients::{ConfigDialect, RemoteShape};
+use super::clients::{ClientDescriptor, ConfigDialect, RemoteShape};
 use super::editors::Editor;
 
 const DEFAULT_TOOLSET: &str = "complete";
@@ -471,12 +471,16 @@ fn json_like_server_is_contextstream_managed(server: &Value) -> bool {
     server
         .get("url")
         .or_else(|| server.get("serverUrl"))
+        .or_else(|| server.get("httpUrl"))
         .and_then(Value::as_str)
         .is_some_and(is_default_contextstream_remote_url)
 }
 
+/// Whether the editor's config file can point at the hosted server. Some
+/// clients only launch local stdio servers from their config (Claude
+/// Desktop) or have no MCP config at all (Aider).
 fn editor_supports_hosted_remote(editor: &Editor) -> bool {
-    has_mcp_config_surface(editor)
+    has_mcp_config_surface(editor) && editor.descriptor().remote_shape.is_some()
 }
 
 /// Rules-only editors (Aider) have no MCP config to write, migrate, or clean.
@@ -519,8 +523,17 @@ fn existing_json_like_server_is_remote(existing_server: Option<&Value>) -> bool 
         existing_server_string(existing_server, "type")
             .map(|value| value.to_ascii_lowercase()),
         Some(kind) if kind == "http" || kind == "remote"
+    ) || matches!(
+        existing_server_string(existing_server, "transport")
+            .map(|value| value.to_ascii_lowercase()),
+        Some(kind) if kind == "streamable_http" || kind == "http"
     ) || existing_server
-        .and_then(|server| server.get("url").or_else(|| server.get("serverUrl")))
+        .and_then(|server| {
+            server
+                .get("url")
+                .or_else(|| server.get("serverUrl"))
+                .or_else(|| server.get("httpUrl"))
+        })
         .is_some()
 }
 
@@ -529,9 +542,11 @@ fn existing_json_like_server_is_local(existing_server: Option<&Value>) -> bool {
         existing_server_string(existing_server, "type")
             .map(|value| value.to_ascii_lowercase()),
         Some(kind) if kind == "stdio" || kind == "local"
-    ) || existing_server
-        .and_then(|server| server.get("command"))
-        .is_some()
+    ) || existing_server_string(existing_server, "transport")
+        .is_some_and(|value| value.eq_ignore_ascii_case("stdio"))
+        || existing_server
+            .and_then(|server| server.get("command"))
+            .is_some()
 }
 
 fn should_use_remote_http(
@@ -699,6 +714,7 @@ fn build_contextstream_server_json(
         obj.remove("type");
         obj.remove("url");
         obj.remove("serverUrl");
+        obj.remove("httpUrl");
         obj.remove("headers");
     }
     server
@@ -711,6 +727,7 @@ fn resolved_remote_mcp_url(existing_server: Option<&Value>) -> String {
         .filter(|value| !value.is_empty())
         .or_else(|| existing_server_string(existing_server, "url"))
         .or_else(|| existing_server_string(existing_server, "serverUrl"))
+        .or_else(|| existing_server_string(existing_server, "httpUrl"))
         .unwrap_or_else(default_remote_mcp_url)
 }
 
@@ -874,9 +891,69 @@ fn antigravity_remote_server_json(mut server: Value) -> Value {
 /// Reshape the shared remote entry for editors whose schema differs from the
 /// generic `{type: "http", url, headers}` form.
 fn shape_remote_server_for_editor(editor: &Editor, server: Value) -> Value {
-    match editor.descriptor().remote_shape {
-        RemoteShape::ServerUrl => antigravity_remote_server_json(server),
-        RemoteShape::TypeHttpUrl => server,
+    let descriptor = editor.descriptor();
+    let mut server = match descriptor.remote_shape {
+        Some(RemoteShape::ServerUrl) => antigravity_remote_server_json(server),
+        Some(RemoteShape::HttpUrl) => rename_remote_url(server, "httpUrl"),
+        Some(RemoteShape::UrlOnly) => rename_remote_url(server, "url"),
+        Some(RemoteShape::TransportStreamableHttp) => {
+            let mut server = rename_remote_url(server, "url");
+            server["transport"] = json!("streamable_http");
+            server
+        }
+        Some(RemoteShape::TypeHttpUrl) | None => server,
+    };
+    apply_entry_fields(descriptor, &mut server);
+    server
+}
+
+/// Move the remote URL to `key` and drop every other transport marker.
+fn rename_remote_url(mut server: Value, key: &str) -> Value {
+    if let Some(obj) = server.as_object_mut() {
+        let url = ["url", "serverUrl", "httpUrl"]
+            .into_iter()
+            .find_map(|candidate| obj.get(candidate).cloned());
+        for stale in ["url", "serverUrl", "httpUrl", "type", "transport"] {
+            obj.remove(stale);
+        }
+        if let Some(url) = url {
+            obj.insert(key.to_string(), url);
+        }
+    }
+    server
+}
+
+/// Add the editor's local transport marker and default entry fields to a
+/// freshly built stdio entry.
+fn shape_local_server_for_editor(editor: &Editor, mut server: Value) -> Value {
+    let descriptor = editor.descriptor();
+    if let Some(obj) = server.as_object_mut() {
+        obj.remove("transport");
+        if let Some((key, value)) = descriptor.local_type {
+            obj.insert(key.to_string(), json!(value));
+        }
+    }
+    apply_entry_fields(descriptor, &mut server);
+    server
+}
+
+/// Fields every entry for this editor carries; a user's own value wins.
+fn apply_entry_fields(descriptor: &ClientDescriptor, server: &mut Value) {
+    if let Some(obj) = server.as_object_mut() {
+        for (key, value) in descriptor.entry_fields {
+            obj.entry(key.to_string())
+                .or_insert_with(|| value.to_json());
+        }
+    }
+}
+
+/// Document-level fields the editor requires (e.g. Muse `schema_version`).
+fn apply_root_fields(editor: &Editor, config: &mut Value) {
+    if let Some(obj) = config.as_object_mut() {
+        for (key, value) in editor.descriptor().root_fields {
+            obj.entry(key.to_string())
+                .or_insert_with(|| value.to_json());
+        }
     }
 }
 
@@ -1463,13 +1540,16 @@ fn generate_config_json_with_identity(
         (false, ConfigDialect::Kilo) => {
             build_kilo_server_json(None, Some(api_key), workspace_id, project_id, None, None)
         }
-        (false, _) => build_contextstream_server_json(
-            None,
-            Some(api_key),
-            workspace_id,
-            project_id,
-            None,
-            None,
+        (false, _) => shape_local_server_for_editor(
+            editor,
+            build_contextstream_server_json(
+                None,
+                Some(api_key),
+                workspace_id,
+                project_id,
+                None,
+                None,
+            ),
         ),
     };
     apply_managed_config_metadata(editor, &mut server_config, identity);
@@ -1807,13 +1887,16 @@ fn build_json_like_server_for_editor_with_identity(
             ),
         )
     } else {
-        build_contextstream_server_json(
-            existing_server,
-            api_key,
-            workspace_id,
-            project_id,
-            transcripts_enabled,
-            hook_transcripts_enabled,
+        shape_local_server_for_editor(
+            editor,
+            build_contextstream_server_json(
+                existing_server,
+                api_key,
+                workspace_id,
+                project_id,
+                transcripts_enabled,
+                hook_transcripts_enabled,
+            ),
         )
     };
     apply_managed_config_metadata(editor, &mut server, identity);
@@ -2039,13 +2122,13 @@ fn remove_contextstream_from_legacy_mcp_configs(editor: &Editor) {
 /// managed entry forward from a legacy location so user overrides (transcript
 /// opt-outs, search limits, pinned workspace) survive the path migration.
 /// Unmanaged or unreadable legacy entries are ignored, never trusted.
-fn legacy_managed_server_seed(editor: &Editor, root_key: &str) -> Option<Value> {
+fn legacy_managed_server_seed(editor: &Editor, server_path: &[&str]) -> Option<Value> {
     editor
         .legacy_mcp_config_paths()
         .into_iter()
         .find_map(|path| {
             let loaded = safe_edit::read_for_edit(&path, mcp_json_dialect(editor, &path)).ok()?;
-            let server = loaded.value.get(root_key)?.get("contextstream")?;
+            let server = server_map(&loaded.value, server_path)?.get("contextstream")?;
             (server.is_object() && json_like_server_is_contextstream_managed(server))
                 .then(|| server.clone())
         })
@@ -2245,7 +2328,7 @@ fn write_kilo_mcp_config(
         .get("mcp")
         .and_then(|servers| servers.get("contextstream"))
         .cloned()
-        .or_else(|| legacy_managed_server_seed(&Editor::KiloCode, "mcp"));
+        .or_else(|| legacy_managed_server_seed(&Editor::KiloCode, &["mcp"]));
     let existing_server = existing_server.as_ref();
     validate_existing_json_like_server(existing_server, "Kilo mcp.contextstream")?;
 
@@ -2448,7 +2531,7 @@ fn write_opencode_mcp_config(
         .get("mcp")
         .and_then(|servers| servers.get("contextstream"))
         .cloned()
-        .or_else(|| legacy_managed_server_seed(editor, "mcp"));
+        .or_else(|| legacy_managed_server_seed(editor, &["mcp"]));
     let existing_server = existing_server.as_ref();
     validate_existing_json_like_server(existing_server, "OpenCode mcp.contextstream")?;
     let mut server = if should_use_remote_http(editor, existing_server, transport_mode) {
@@ -2494,21 +2577,19 @@ fn write_json_mcp_config(
     })?;
 
     // Read existing config or create new
-    let loaded = safe_edit::read_for_edit(&path, safe_edit::JsonDialect::Strict)?;
+    let loaded = safe_edit::read_for_edit(&path, mcp_json_dialect(editor, &path))?;
     let mut config: Value = loaded.value.clone();
 
-    let root_key = mcp_root_key(editor)
-        .ok_or_else(|| anyhow::anyhow!("{} has no JSON server map", editor.display_name()))?;
-    require_object_if_present(
-        config.get(root_key),
-        &format!("{} {}", editor.display_name(), root_key),
-    )?;
+    let server_path = server_map_path(editor);
+    if server_path.is_empty() {
+        anyhow::bail!("{} has no JSON server map", editor.display_name());
+    }
+    require_objects_along(&config, &server_path, editor.display_name())?;
 
-    let existing_server = config
-        .get(root_key)
+    let existing_server = server_map(&config, &server_path)
         .and_then(|servers| servers.get("contextstream"))
         .cloned()
-        .or_else(|| legacy_managed_server_seed(editor, root_key));
+        .or_else(|| legacy_managed_server_seed(editor, &server_path));
     let server = build_json_like_server_for_editor_with_identity(
         editor,
         existing_server.as_ref(),
@@ -2522,13 +2603,8 @@ fn write_json_mcp_config(
         identity,
     )?;
 
-    if let Some(mcp_servers) = config.get_mut(root_key).and_then(Value::as_object_mut) {
-        mcp_servers.insert("contextstream".to_string(), server);
-    } else {
-        config[root_key] = json!({
-            "contextstream": server
-        });
-    }
+    insert_contextstream_server(&mut config, &server_path, server)?;
+    apply_root_fields(editor, &mut config);
 
     commit_mcp_config(editor, &path, &loaded, &config, &[])?;
 
@@ -3892,19 +3968,15 @@ fn write_project_mcp_config_with_transport_mode(
         None => return Ok(()), // Editor doesn't support project MCP config
     };
     let identity = ManagedConfigIdentity::for_write()?;
-    let root_key = project_mcp_root_key(editor);
+    let server_path = project_server_map_path(editor);
     let dialect = editor.descriptor().dialect;
 
     // Read existing config or create new
-    let loaded = safe_edit::read_for_edit(&mcp_path, safe_edit::JsonDialect::Strict)?;
+    let loaded = safe_edit::read_for_edit(&mcp_path, mcp_json_dialect(editor, &mcp_path))?;
     let mut config: Value = loaded.value.clone();
-    require_object_if_present(
-        config.get(root_key),
-        &format!("project MCP root {}", root_key),
-    )?;
+    require_objects_along(&config, server_path, "project MCP root")?;
 
-    let existing_server = config
-        .get(root_key)
+    let existing_server = server_map(&config, server_path)
         .and_then(|servers| servers.get("contextstream"))
         .cloned();
     validate_existing_json_like_server(
@@ -3957,13 +4029,7 @@ fn write_project_mcp_config_with_transport_mode(
     };
     apply_managed_config_metadata(editor, &mut server, &identity);
 
-    if let Some(mcp_servers) = config.get_mut(root_key).and_then(Value::as_object_mut) {
-        mcp_servers.insert("contextstream".to_string(), server);
-    } else {
-        config[root_key] = json!({
-            "contextstream": server
-        });
-    }
+    insert_contextstream_server(&mut config, server_path, server)?;
 
     safe_edit::commit(&mcp_path, &loaded, &config)?;
     record_configured_evidence(editor);
@@ -4106,23 +4172,136 @@ fn remove_contextstream_from_codex_toml(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn mcp_root_key(editor: &Editor) -> Option<&'static str> {
     editor.descriptor().dialect.root_key()
 }
 
-/// Server map key of the editor's project-level config (which can differ
+/// Path from the document root to the editor's global server map.
+fn server_map_path(editor: &Editor) -> Vec<&'static str> {
+    editor.descriptor().dialect.server_path()
+}
+
+/// Server map path of the editor's project-level config (which can differ
 /// from its global dialect: Roo's project `.roo/mcp.json` is plain JSON).
-fn project_mcp_root_key(editor: &Editor) -> &'static str {
+fn project_server_map_path(editor: &Editor) -> &'static [&'static str] {
     editor
         .descriptor()
         .project_config
-        .map_or("mcpServers", |config| config.root_key)
+        .map_or(&["mcpServers"], |config| config.server_path)
+}
+
+fn server_map<'a>(config: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter().try_fold(config, |node, key| node.get(*key))
+}
+
+fn server_map_mut<'a>(config: &'a mut Value, path: &[&str]) -> Option<&'a mut Value> {
+    path.iter().try_fold(config, |node, key| node.get_mut(*key))
+}
+
+/// Every segment of `path` that already exists must be a JSON object:
+/// ContextStream never replaces user data of another type.
+fn require_objects_along(config: &Value, path: &[&str], owner: &str) -> Result<()> {
+    let mut node = config;
+    for key in path {
+        let Some(child) = node.get(*key) else {
+            return Ok(());
+        };
+        require_object_if_present(Some(child), &format!("{owner} {key}"))?;
+        node = child;
+    }
+    Ok(())
+}
+
+/// Insert `server` as `contextstream` at `path`, creating missing objects.
+fn insert_contextstream_server(config: &mut Value, path: &[&str], server: Value) -> Result<()> {
+    insert_server_at(config, path, "contextstream", server)
+}
+
+/// Insert `server` under `server_key` at `path`, creating missing objects.
+fn insert_server_at(
+    config: &mut Value,
+    path: &[&str],
+    server_key: &str,
+    server: Value,
+) -> Result<()> {
+    let mut node = config;
+    for key in path {
+        let object = node
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("MCP config parent of `{key}` is not an object"))?;
+        node = object
+            .entry((*key).to_string())
+            .or_insert_with(|| json!({}));
+    }
+    node.as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("MCP server map is not an object"))?
+        .insert(server_key.to_string(), server);
+    Ok(())
+}
+
+/// The server map at `path` holds exactly `server_key`.
+fn server_map_holds_only(config: &Value, path: &[&str], server_key: &str) -> bool {
+    server_map(config, path)
+        .and_then(Value::as_object)
+        .is_some_and(|servers| servers.len() == 1 && servers.contains_key(server_key))
+}
+
+/// The document holds nothing but the objects along `path` down to a server
+/// map containing only `server_key`, plus any `root_companions` at the top.
+fn document_holds_only_server(
+    config: &Value,
+    path: &[&str],
+    server_key: &str,
+    root_companions: &[&str],
+) -> bool {
+    let Some(root) = config.as_object() else {
+        return false;
+    };
+    let Some((first, rest)) = path.split_first() else {
+        return false;
+    };
+    if !root
+        .keys()
+        .all(|key| key == first || root_companions.contains(&key.as_str()))
+    {
+        return false;
+    }
+    let mut node = config;
+    for (depth, key) in path.iter().enumerate() {
+        let Some(child) = node.get(*key) else {
+            return false;
+        };
+        let is_intermediate = depth < rest.len();
+        if is_intermediate && child.as_object().is_none_or(|object| object.len() != 1) {
+            return false;
+        }
+        node = child;
+    }
+    server_map_holds_only(config, path, server_key)
+}
+
+/// Remove server maps along `path` that are now empty, deepest first.
+/// Returns the top-level key when the whole branch was removed.
+fn prune_empty_server_map(config: &mut Value, path: &[&'static str]) -> Option<&'static str> {
+    for depth in (1..=path.len()).rev() {
+        let (parent_path, key) = (&path[..depth - 1], path[depth - 1]);
+        let parent = if parent_path.is_empty() {
+            Some(&mut *config)
+        } else {
+            server_map_mut(config, parent_path)
+        };
+        if !remove_empty_json_object_key(parent?, key) {
+            return None;
+        }
+    }
+    path.first().copied()
 }
 
 fn mcp_json_dialect(editor: &Editor, path: &Path) -> safe_edit::JsonDialect {
     if matches!(
-        editor.descriptor().dialect,
-        ConfigDialect::VsCodeSettings { .. } | ConfigDialect::Kilo
+        editor.profile().mcp_config_format,
+        mcp_types::McpConfigFormat::Jsonc | mcp_types::McpConfigFormat::VsCodeJson
     ) || path.extension().and_then(|extension| extension.to_str()) == Some("jsonc")
     {
         safe_edit::JsonDialect::Jsonc
@@ -4136,12 +4315,11 @@ fn try_restore_exact_json_mcp_backup(
     editor: &Editor,
     current: &safe_edit::LoadedConfig,
 ) -> Result<bool> {
-    let Some(root_key) = mcp_root_key(editor) else {
+    let server_path = server_map_path(editor);
+    if server_path.is_empty() {
         return Ok(false);
-    };
-    let Some(current_server) = current
-        .value
-        .get(root_key)
+    }
+    let Some(current_server) = server_map(&current.value, &server_path)
         .and_then(Value::as_object)
         .and_then(|servers| servers.get("contextstream"))
         .cloned()
@@ -4158,9 +4336,7 @@ fn try_restore_exact_json_mcp_backup(
     else {
         return Ok(false);
     };
-    if backup
-        .value
-        .get(root_key)
+    if server_map(&backup.value, &server_path)
         .and_then(Value::as_object)
         .and_then(|servers| servers.get("contextstream"))
         .is_some_and(json_like_server_is_contextstream_managed)
@@ -4169,14 +4345,11 @@ fn try_restore_exact_json_mcp_backup(
         return Ok(false);
     }
     let mut expected = backup.value.clone();
-    if let Some(servers) = expected.get_mut(root_key).and_then(Value::as_object_mut) {
-        servers.insert("contextstream".to_string(), current_server);
-    } else {
-        expected[root_key] = json!({ "contextstream": current_server });
-    }
+    insert_contextstream_server(&mut expected, &server_path, current_server)?;
 
     // These writers intentionally add bounded companion settings. Reproduce
     // them so exact comparison still proves there were no user edits.
+    apply_root_fields(editor, &mut expected);
     if matches!(editor, Editor::OpenCode) && expected.get("$schema").is_none() {
         expected["$schema"] = json!(OPENCODE_CONFIG_SCHEMA_URL);
     }
@@ -4212,13 +4385,6 @@ fn is_empty_json_config(config: &Value) -> bool {
     config.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
-fn json_root_contains_only_server(config: &Value, root_key: &str, server_key: &str) -> bool {
-    config
-        .get(root_key)
-        .and_then(Value::as_object)
-        .is_some_and(|servers| servers.len() == 1 && servers.contains_key(server_key))
-}
-
 fn json_mcp_config_is_wholly_managed(editor: &Editor, loaded: &safe_edit::LoadedConfig) -> bool {
     if strip_json_comments_checked(&loaded.raw)
         .map(|without_comments| without_comments != loaded.raw)
@@ -4229,15 +4395,14 @@ fn json_mcp_config_is_wholly_managed(editor: &Editor, loaded: &safe_edit::Loaded
     let Some(object) = loaded.value.as_object() else {
         return false;
     };
-    let Some(root_key) = mcp_root_key(editor) else {
-        return false;
-    };
-    if !json_root_contains_only_server(&loaded.value, root_key, "contextstream") {
+    let server_path = server_map_path(editor);
+    if server_path.is_empty() {
         return false;
     }
-    if !loaded
-        .value
-        .get(root_key)
+    if !server_map_holds_only(&loaded.value, &server_path, "contextstream") {
+        return false;
+    }
+    if !server_map(&loaded.value, &server_path)
         .and_then(Value::as_object)
         .and_then(|servers| servers.get("contextstream"))
         .is_some_and(json_like_server_is_contextstream_managed)
@@ -4268,8 +4433,29 @@ fn json_mcp_config_is_wholly_managed(editor: &Editor, loaded: &safe_edit::Loaded
                         })
                 })
         }
-        _ => object.len() == 1,
+        _ => {
+            let root_fields = editor.descriptor().root_fields;
+            let companions: Vec<&str> = root_fields.iter().map(|(key, _)| *key).collect();
+            document_holds_only_server(&loaded.value, &server_path, "contextstream", &companions)
+                && root_fields.iter().all(|(key, value)| {
+                    object
+                        .get(*key)
+                        .is_none_or(|current| current == &value.to_json())
+                })
+        }
     }
+}
+
+/// Root fields setup adds (see [`apply_root_fields`]) that still hold their
+/// generated value.
+fn generated_root_field_keys(editor: &Editor, config: &Value) -> Vec<&'static str> {
+    editor
+        .descriptor()
+        .root_fields
+        .iter()
+        .filter(|(key, value)| config.get(*key) == Some(&value.to_json()))
+        .map(|(key, _)| *key)
+        .collect()
 }
 
 fn cleanup_generated_json_companions(editor: &Editor, config: &mut Value) {
@@ -4314,7 +4500,28 @@ fn cleanup_generated_json_companions(editor: &Editor, config: &mut Value) {
             object.remove("instructions");
             object.remove("permission");
         }
-        _ => {}
+        _ => {
+            // Generic editors: once the server branch is gone, drop root
+            // fields setup generated if nothing else remains.
+            let server_path = server_map_path(editor);
+            let generated = generated_root_field_keys(editor, config);
+            let Some(object) = config.as_object_mut() else {
+                return;
+            };
+            let branch_empty = server_path.first().is_none_or(|top| {
+                object
+                    .get(*top)
+                    .is_none_or(|value| value.as_object().is_some_and(serde_json::Map::is_empty))
+            });
+            let only_generated = object.keys().all(|key| {
+                generated.contains(&key.as_str()) || server_path.first() == Some(&key.as_str())
+            });
+            if !generated.is_empty() && branch_empty && only_generated {
+                for key in generated {
+                    object.remove(key);
+                }
+            }
+        }
     }
 }
 
@@ -4324,9 +4531,16 @@ fn revert_generated_json_companions_from_backup(
     config: &mut Value,
 ) -> Vec<&'static str> {
     let mut removed = Vec::new();
+    let generated = generated_root_field_keys(editor, config);
     let Some(object) = config.as_object_mut() else {
         return removed;
     };
+    for key in generated {
+        if backup.value.get(key).is_none() {
+            object.remove(key);
+            removed.push(key);
+        }
+    }
 
     if matches!(editor, Editor::OpenCode)
         && backup.value.get("$schema").is_none()
@@ -4417,10 +4631,12 @@ fn remove_contextstream_from_mcp_config_at(editor: &Editor, path: &Path) -> Resu
     }
 
     let loaded = safe_edit::read_for_edit(&path, mcp_json_dialect(editor, &path))?;
-    let root_key = mcp_root_key(editor).expect("non-Codex MCP editor has a JSON root key");
-    let Some(current_server) = loaded
-        .value
-        .get(root_key)
+    let server_path = server_map_path(editor);
+    assert!(
+        !server_path.is_empty(),
+        "non-Codex MCP editor has a JSON server map"
+    );
+    let Some(current_server) = server_map(&loaded.value, &server_path)
         .and_then(Value::as_object)
         .and_then(|servers| servers.get("contextstream"))
     else {
@@ -4446,7 +4662,7 @@ fn remove_contextstream_from_mcp_config_at(editor: &Editor, path: &Path) -> Resu
 
     if backup
         .as_ref()
-        .and_then(|backup| backup.value.get(root_key))
+        .and_then(|backup| server_map(&backup.value, &server_path))
         .is_some_and(|root| !root.is_object())
     {
         anyhow::bail!(
@@ -4454,27 +4670,25 @@ fn remove_contextstream_from_mcp_config_at(editor: &Editor, path: &Path) -> Resu
              value that cannot be restored without overwriting newer user changes",
             path.display(),
             backup_path.display(),
-            root_key
+            server_path.join(".")
         );
     }
     let original_server = backup
         .as_ref()
-        .and_then(|backup| backup.value.get(root_key))
+        .and_then(|backup| server_map(&backup.value, &server_path))
         .and_then(Value::as_object)
         .and_then(|servers| servers.get("contextstream"))
         .filter(|server| !json_like_server_is_contextstream_managed(server))
         .cloned();
     let restored_original_server = original_server.is_some();
     let changed = if let Some(original_server) = original_server {
-        config
-            .get_mut(root_key)
+        server_map_mut(&mut config, &server_path)
             .and_then(Value::as_object_mut)
             .expect("current MCP root was already read as an object")
             .insert("contextstream".to_string(), original_server);
         true
     } else {
-        config
-            .get_mut(root_key)
+        server_map_mut(&mut config, &server_path)
             .and_then(Value::as_object_mut)
             .and_then(|servers| servers.remove("contextstream"))
             .is_some()
@@ -4485,10 +4699,15 @@ fn remove_contextstream_from_mcp_config_at(editor: &Editor, path: &Path) -> Resu
             && (backup_is_wholly_managed || (!backup_exists && current_is_wholly_managed));
         let mut removed_top_level_keys = Vec::new();
         if may_remove_generated_companions {
-            let companion_candidates: &[&str] = match editor {
-                Editor::OpenCode => &["mcp", "$schema"],
-                Editor::KiloCode => &["mcp", "instructions", "permission"],
-                _ => &[],
+            let companion_candidates: Vec<&'static str> = match editor {
+                Editor::OpenCode => vec!["mcp", "$schema"],
+                Editor::KiloCode => vec!["mcp", "instructions", "permission"],
+                _ => editor
+                    .descriptor()
+                    .root_fields
+                    .iter()
+                    .map(|(key, _)| *key)
+                    .collect(),
             };
             let present_before: Vec<&str> = companion_candidates
                 .iter()
@@ -4501,10 +4720,8 @@ fn remove_contextstream_from_mcp_config_at(editor: &Editor, path: &Path) -> Resu
                     .into_iter()
                     .filter(|key| config.get(*key).is_none()),
             );
-            if let Some(root_key) = mcp_root_key(editor) {
-                if remove_empty_json_object_key(&mut config, root_key) {
-                    removed_top_level_keys.push(root_key);
-                }
+            if let Some(top) = prune_empty_server_map(&mut config, &server_path) {
+                removed_top_level_keys.push(top);
             }
         } else if let Some(backup) = backup.as_ref() {
             removed_top_level_keys.extend(revert_generated_json_companions_from_backup(
@@ -4512,11 +4729,10 @@ fn remove_contextstream_from_mcp_config_at(editor: &Editor, path: &Path) -> Resu
                 backup,
                 &mut config,
             ));
-            if !restored_original_server
-                && backup.value.get(root_key).is_none()
-                && remove_empty_json_object_key(&mut config, root_key)
-            {
-                removed_top_level_keys.push(root_key);
+            if !restored_original_server && server_map(&backup.value, &server_path).is_none() {
+                if let Some(top) = prune_empty_server_map(&mut config, &server_path) {
+                    removed_top_level_keys.push(top);
+                }
             }
         }
         if !loaded.nonstandard_syntax
@@ -4539,7 +4755,7 @@ fn remove_contextstream_from_mcp_config_at(editor: &Editor, path: &Path) -> Resu
 
 fn remove_contextstream_from_json_path(
     path: &Path,
-    root_key: &str,
+    server_path: &[&'static str],
     server_key: &str,
 ) -> Result<bool> {
     if !path
@@ -4550,9 +4766,7 @@ fn remove_contextstream_from_json_path(
     }
 
     let loaded = safe_edit::read_for_edit(path, safe_edit::JsonDialect::Strict)?;
-    let Some(current_server) = loaded
-        .value
-        .get(root_key)
+    let Some(current_server) = server_map(&loaded.value, server_path)
         .and_then(Value::as_object)
         .and_then(|servers| servers.get(server_key))
     else {
@@ -4563,7 +4777,7 @@ fn remove_contextstream_from_json_path(
         // on a recovery file ContextStream has no reason to consume.
         return Ok(false);
     }
-    if try_restore_exact_json_path_backup(path, root_key, server_key, &loaded)? {
+    if try_restore_exact_json_path_backup(path, server_path, server_key, &loaded)? {
         return Ok(true);
     }
     let backup_path = safe_edit::backup_path(path)?;
@@ -4572,32 +4786,23 @@ fn remove_contextstream_from_json_path(
     let backup_is_wholly_managed = backup.as_ref().is_some_and(|backup| {
         strip_json_comments_checked(&backup.raw)
             .is_ok_and(|without_comments| without_comments == backup.raw)
-            && backup.value.as_object().is_some_and(|object| {
-                object.len() == 1
-                    && json_root_contains_only_server(&backup.value, root_key, server_key)
-            })
-            && backup
-                .value
-                .get(root_key)
+            && document_holds_only_server(&backup.value, server_path, server_key, &[])
+            && server_map(&backup.value, server_path)
                 .and_then(Value::as_object)
                 .and_then(|servers| servers.get(server_key))
                 .is_some_and(json_like_server_is_contextstream_managed)
     });
     let current_is_wholly_managed = strip_json_comments_checked(&loaded.raw)
         .is_ok_and(|without_comments| without_comments == loaded.raw)
-        && loaded.value.as_object().is_some_and(|object| {
-            object.len() == 1 && json_root_contains_only_server(&loaded.value, root_key, server_key)
-        })
-        && loaded
-            .value
-            .get(root_key)
+        && document_holds_only_server(&loaded.value, server_path, server_key, &[])
+        && server_map(&loaded.value, server_path)
             .and_then(Value::as_object)
             .and_then(|servers| servers.get(server_key))
             .is_some_and(json_like_server_is_contextstream_managed);
     let mut config: Value = loaded.value.clone();
     if backup
         .as_ref()
-        .and_then(|backup| backup.value.get(root_key))
+        .and_then(|backup| server_map(&backup.value, server_path))
         .is_some_and(|root| !root.is_object())
     {
         anyhow::bail!(
@@ -4605,27 +4810,25 @@ fn remove_contextstream_from_json_path(
              value that cannot be restored without overwriting newer user changes",
             path.display(),
             backup_path.display(),
-            root_key
+            server_path.join(".")
         );
     }
     let original_server = backup
         .as_ref()
-        .and_then(|backup| backup.value.get(root_key))
+        .and_then(|backup| server_map(&backup.value, server_path))
         .and_then(Value::as_object)
         .and_then(|servers| servers.get(server_key))
         .filter(|server| !json_like_server_is_contextstream_managed(server))
         .cloned();
     let restored_original_server = original_server.is_some();
     let changed = if let Some(original_server) = original_server {
-        config
-            .get_mut(root_key)
+        server_map_mut(&mut config, server_path)
             .and_then(Value::as_object_mut)
             .expect("current MCP root was already read as an object")
             .insert(server_key.to_string(), original_server);
         true
     } else {
-        config
-            .get_mut(root_key)
+        server_map_mut(&mut config, server_path)
             .and_then(Value::as_object_mut)
             .and_then(|servers| servers.remove(server_key))
             .is_some()
@@ -4637,18 +4840,19 @@ fn remove_contextstream_from_json_path(
             && (backup_is_wholly_managed || (!backup_exists && current_is_wholly_managed));
         let backup_had_root = backup
             .as_ref()
-            .is_some_and(|backup| backup.value.get(root_key).is_some());
-        let removed_root = !restored_original_server
+            .is_some_and(|backup| server_map(&backup.value, server_path).is_some());
+        let removed_root = if !restored_original_server
             && (may_delete_generated || (backup_exists && !backup_had_root))
-            && remove_empty_json_object_key(&mut config, root_key);
+        {
+            prune_empty_server_map(&mut config, server_path)
+        } else {
+            None
+        };
 
         if is_empty_json_config(&config) && may_delete_generated && !loaded.nonstandard_syntax {
             safe_edit::remove_owned_file_if_unchanged(path, &loaded.raw)?;
         } else {
-            let removed_keys = removed_root
-                .then_some(root_key)
-                .into_iter()
-                .collect::<Vec<_>>();
+            let removed_keys = removed_root.into_iter().collect::<Vec<_>>();
             safe_edit::commit_with_removals(path, &loaded, &config, &removed_keys)?;
         }
         if backup_is_wholly_managed {
@@ -4663,13 +4867,11 @@ fn remove_contextstream_from_json_path(
 
 fn try_restore_exact_json_path_backup(
     path: &Path,
-    root_key: &str,
+    server_path: &[&'static str],
     server_key: &str,
     current: &safe_edit::LoadedConfig,
 ) -> Result<bool> {
-    let Some(current_server) = current
-        .value
-        .get(root_key)
+    let Some(current_server) = server_map(&current.value, server_path)
         .and_then(Value::as_object)
         .and_then(|servers| servers.get(server_key))
         .cloned()
@@ -4685,9 +4887,7 @@ fn try_restore_exact_json_path_backup(
     else {
         return Ok(false);
     };
-    if backup
-        .value
-        .get(root_key)
+    if server_map(&backup.value, server_path)
         .and_then(Value::as_object)
         .and_then(|servers| servers.get(server_key))
         .is_some_and(json_like_server_is_contextstream_managed)
@@ -4696,11 +4896,7 @@ fn try_restore_exact_json_path_backup(
         return Ok(false);
     }
     let mut expected = backup.value.clone();
-    if let Some(servers) = expected.get_mut(root_key).and_then(Value::as_object_mut) {
-        servers.insert(server_key.to_string(), current_server);
-    } else {
-        expected[root_key] = json!({ server_key: current_server });
-    }
+    insert_server_at(&mut expected, server_path, server_key, current_server)?;
     let expected_raw = safe_edit::render(&backup, &expected)?;
     if expected_raw != current.raw {
         return Ok(false);
@@ -4708,10 +4904,13 @@ fn try_restore_exact_json_path_backup(
     safe_edit::restore_first_backup(path, current, &backup.raw)
 }
 
-fn project_mcp_cleanup_paths(editor: &Editor, project_path: &Path) -> Vec<(PathBuf, &'static str)> {
+fn project_mcp_cleanup_paths(
+    editor: &Editor,
+    project_path: &Path,
+) -> Vec<(PathBuf, &'static [&'static str])> {
     let mut paths = Vec::new();
     if let Some(primary) = editor.project_mcp_config_path(project_path) {
-        paths.push((primary, project_mcp_root_key(editor)));
+        paths.push((primary, project_server_map_path(editor)));
     }
 
     paths
@@ -8000,18 +8199,16 @@ CONTEXTSTREAM_API_KEY = "test-key"
                 )
                 .to_string(),
                 _ => {
-                    let root_key = mcp_root_key(editor).expect("JSON root key");
-                    format!(
-                        concat!(
-                            "{{\n",
-                            "  \"userSetting\": {{ \"nested\": true }},\n",
-                            "  \"{root_key}\": {{\n",
-                            "    \"user-server\": {{ \"command\": \"user-command\" }}\n",
-                            "  }}\n",
-                            "}}\n"
-                        ),
-                        root_key = root_key
-                    )
+                    // Nest the user's server map along the editor's path
+                    // (ZCode keeps servers under `mcp.servers`).
+                    let mut branch = json!({ "user-server": { "command": "user-command" } });
+                    let path = server_map_path(editor);
+                    for key in path[1..].iter().rev() {
+                        branch = json!({ *key: branch });
+                    }
+                    let mut document = json!({ "userSetting": { "nested": true } });
+                    document[path[0]] = branch;
+                    safe_edit::to_pretty(&document).expect("render seed")
                 }
             };
             std::fs::write(&path, &original).expect("seed user config");
@@ -8217,7 +8414,7 @@ CONTEXTSTREAM_API_KEY = "test-key"
         std::fs::write(&backup, "{ definitely not valid JSON").expect("seed corrupt backup");
 
         let error =
-            remove_contextstream_from_json_path(&config_path, "mcpServers", "contextstream")
+            remove_contextstream_from_json_path(&config_path, &["mcpServers"], "contextstream")
                 .expect_err("a corrupt recovery snapshot must fail closed");
 
         assert!(error.to_string().contains("not valid JSON"), "{error:#}");
@@ -8257,10 +8454,12 @@ CONTEXTSTREAM_API_KEY = "test-key"
         )
         .expect("seed wholly managed refresh backup");
 
-        assert!(
-            remove_contextstream_from_json_path(&config_path, "mcpServers", "contextstream")
-                .expect("surgical uninstall")
-        );
+        assert!(remove_contextstream_from_json_path(
+            &config_path,
+            &["mcpServers"],
+            "contextstream"
+        )
+        .expect("surgical uninstall"));
 
         assert!(config_path.exists());
         let value: Value =
@@ -8380,10 +8579,12 @@ CONTEXTSTREAM_API_KEY = "test-key"
         std::fs::write(&config_path, live).unwrap();
         std::fs::write(&backup_path, backup).unwrap();
 
-        assert!(
-            remove_contextstream_from_json_path(&config_path, "mcpServers", "contextstream")
-                .expect("surgical uninstall")
-        );
+        assert!(remove_contextstream_from_json_path(
+            &config_path,
+            &["mcpServers"],
+            "contextstream"
+        )
+        .expect("surgical uninstall"));
 
         let after: Value =
             serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -8781,6 +8982,206 @@ CONTEXTSTREAM_API_KEY = "test-key"
         assert!(local(&Editor::OpenCode)["command"].is_array());
         assert_eq!(local(&Editor::KiloCode)["type"], json!("local"));
         assert!(local(&Editor::ClaudeCode)["command"].is_string());
+    }
+
+    #[test]
+    fn muse_setup_adds_schema_version_and_keeps_user_mode() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        let path = temp
+            .path()
+            .join(".config")
+            .join("muse")
+            .join("settings.json");
+        write_mcp_config_force_remote_with_auth(
+            &Editor::MuseCode,
+            "k",
+            Some("ws"),
+            None,
+            None,
+            None,
+            Some("k"),
+        )
+        .expect("fresh muse install");
+        let value = read_json(&path);
+        assert_eq!(value["schema_version"], json!(1));
+        let server = &value["mcp_servers"]["contextstream"];
+        assert_eq!(server["transport"], json!("streamable_http"));
+        assert_eq!(server["mode"], json!("optional"));
+        assert_eq!(server["enabled"], json!(true));
+        assert!(server.get("type").is_none());
+
+        // A user who deliberately made the server required keeps that choice.
+        let mut edited = value.clone();
+        edited["mcp_servers"]["contextstream"]["mode"] = json!("required");
+        seed_json(&path, &edited);
+        write_mcp_config_force_local(&Editor::MuseCode, "k", Some("ws"), None, None, None)
+            .expect("switch to local");
+        let server = read_json(&path)["mcp_servers"]["contextstream"].clone();
+        assert_eq!(server["transport"], json!("stdio"));
+        assert_eq!(server["mode"], json!("required"));
+        assert!(server.get("url").is_none() && server.get("headers").is_none());
+
+        // Uninstalling a settings file setup created removes it entirely.
+        remove_contextstream_from_mcp_config(&Editor::MuseCode).expect("uninstall");
+        assert!(
+            !path.exists(),
+            "generated schema_version must not be left behind"
+        );
+    }
+
+    #[test]
+    fn muse_uninstall_keeps_a_user_schema_version() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        let path = temp
+            .path()
+            .join(".config")
+            .join("muse")
+            .join("settings.json");
+        let original = "{\n  \"schema_version\": 1,\n  \"theme\": \"dark\"\n}\n";
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, original).unwrap();
+
+        write_mcp_config(&Editor::MuseCode, "k", None, None).expect("install");
+        remove_contextstream_from_mcp_config(&Editor::MuseCode).expect("uninstall");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn zcode_writes_nested_servers_and_refuses_non_object_parents() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        let path = temp.path().join(".zcode").join("cli").join("config.json");
+        seed_json(
+            &path,
+            &json!({"mcp": {"timeoutMs": 5000, "servers": {"memory": {"command": "npx"}}}, "ui": {}}),
+        );
+        write_mcp_config_force_remote_with_auth(
+            &Editor::ZCode,
+            "k",
+            None,
+            None,
+            None,
+            None,
+            Some("k"),
+        )
+        .expect("install");
+        let value = read_json(&path);
+        assert_eq!(value["mcp"]["timeoutMs"], json!(5000));
+        assert_eq!(value["mcp"]["servers"]["memory"]["command"], json!("npx"));
+        let server = &value["mcp"]["servers"]["contextstream"];
+        assert_eq!(server["type"], json!("http"));
+        // ZCode drops servers with unknown keys, so only schema keys appear.
+        for key in server.as_object().unwrap().keys() {
+            assert!(
+                ["type", "url", "headers"].contains(&key.as_str()),
+                "unexpected ZCode key {key}"
+            );
+        }
+        remove_contextstream_from_mcp_config(&Editor::ZCode).expect("uninstall");
+        let value = read_json(&path);
+        assert!(value["mcp"]["servers"].get("contextstream").is_none());
+        assert_eq!(value["mcp"]["servers"]["memory"]["command"], json!("npx"));
+
+        let original = "{\n  \"mcp\": \"user sentinel\"\n}\n";
+        std::fs::write(&path, original).unwrap();
+        write_mcp_config(&Editor::ZCode, "k", None, None)
+            .expect_err("a non-object `mcp` must not be replaced");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn copilot_cli_entries_carry_required_tools_without_overriding_user_lists() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+        let _copilot_home = EnvVarGuard::set("COPILOT_HOME", temp.path().join("copilot-home"));
+
+        write_mcp_config_force_local(&Editor::CopilotCli, "k", None, None, None, None)
+            .expect("install");
+        let path = temp.path().join("copilot-home").join("mcp-config.json");
+        let mut value = read_json(&path);
+        assert_eq!(value["mcpServers"]["contextstream"]["type"], json!("local"));
+        assert_eq!(value["mcpServers"]["contextstream"]["tools"], json!(["*"]));
+
+        value["mcpServers"]["contextstream"]["tools"] = json!(["search"]);
+        seed_json(&path, &value);
+        write_mcp_config_force_remote_with_auth(
+            &Editor::CopilotCli,
+            "k",
+            None,
+            None,
+            None,
+            None,
+            Some("k"),
+        )
+        .expect("switch to hosted");
+        let server = read_json(&path)["mcpServers"]["contextstream"].clone();
+        assert_eq!(server["type"], json!("http"));
+        assert_eq!(server["tools"], json!(["search"]));
+    }
+
+    #[test]
+    fn claude_desktop_is_local_only() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        assert!(!editor_supports_remote_mcp(&Editor::ClaudeDesktop));
+        assert!(catalog_remote_entry(&Editor::ClaudeDesktop).is_none());
+        write_mcp_config_force_remote_with_auth(
+            &Editor::ClaudeDesktop,
+            "k",
+            None,
+            None,
+            None,
+            None,
+            Some("k"),
+        )
+        .expect("install");
+        let path = Editor::ClaudeDesktop.mcp_config_path().expect("path");
+        let server = read_json(&path)["mcpServers"]["contextstream"].clone();
+        assert!(server["command"].is_string(), "{server}");
+        assert!(server.get("url").is_none());
+    }
+
+    #[test]
+    fn qwen_migrates_a_url_entry_to_http_url() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        let path = temp.path().join(".qwen").join("settings.json");
+        seed_json(
+            &path,
+            &json!({"mcpServers": {"contextstream": {
+                "url": "https://mcp.contextstream.io/mcp",
+                "headers": {HEADER_MANAGED_CONFIG_VERSION: MANAGED_CONFIG_VERSION}
+            }}}),
+        );
+        write_mcp_config(&Editor::QwenCode, "k", None, None).expect("refresh");
+        let server = read_json(&path)["mcpServers"]["contextstream"].clone();
+        assert_eq!(server["httpUrl"], json!("https://mcp.contextstream.io/mcp"));
+        assert!(server.get("url").is_none(), "Qwen reads `url` as SSE");
     }
 }
 

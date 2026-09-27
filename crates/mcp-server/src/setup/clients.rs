@@ -14,10 +14,11 @@
 use std::path::{Path, PathBuf};
 
 use super::editors::{
-    claude_user_config_path, cursor_platform_install_present, kilo_config_dir,
-    kilo_global_config_file, kilo_project_config_file, opencode_config_dir,
-    opencode_global_config_file, vscode_extension_installed, vscode_user_dir,
-    windsurf_platform_install_present, xdg_config_home, Editor,
+    claude_desktop_config_path, claude_desktop_install_present, claude_user_config_path,
+    cursor_platform_install_present, kilo_config_dir, kilo_global_config_file,
+    kilo_project_config_file, opencode_config_dir, opencode_global_config_file,
+    vscode_extension_installed, vscode_user_dir, windsurf_platform_install_present,
+    xdg_config_home, zed_config_dir, zed_platform_install_present, Editor,
 };
 
 /// Tool surface VS Code Copilot is configured with by default.
@@ -112,9 +113,9 @@ fn join_all(mut root: PathBuf, parts: &[&str]) -> PathBuf {
 /// How a client stores its MCP server entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigDialect {
-    /// A top-level JSON object keyed by server name (`mcpServers`, or
-    /// `servers` for VS Code).
-    JsonServers { root_key: &'static str },
+    /// A JSON object keyed by server name, found at `path` (`["mcpServers"]`,
+    /// `["servers"]` for VS Code, `["mcp", "servers"]` for ZCode).
+    JsonServers { path: &'static [&'static str] },
     /// A key inside VS Code's JSONC `settings.json`.
     VsCodeSettings { key: &'static str },
     /// Kilo CLI `kilo.jsonc`: `mcp` map of `local`/`remote` entries.
@@ -128,13 +129,19 @@ pub enum ConfigDialect {
 }
 
 impl ConfigDialect {
-    /// Key of the server map, for dialects that have one.
+    /// Top-level key that holds (or leads to) the server map.
     pub fn root_key(&self) -> Option<&'static str> {
+        self.server_path().first().copied()
+    }
+
+    /// Path from the document root to the server map; empty when the dialect
+    /// has no JSON server map.
+    pub fn server_path(&self) -> Vec<&'static str> {
         match self {
-            ConfigDialect::JsonServers { root_key } => Some(root_key),
-            ConfigDialect::VsCodeSettings { key } => Some(key),
-            ConfigDialect::Kilo | ConfigDialect::OpenCode => Some("mcp"),
-            ConfigDialect::CodexToml | ConfigDialect::RulesOnly => None,
+            ConfigDialect::JsonServers { path } => path.to_vec(),
+            ConfigDialect::VsCodeSettings { key } => vec![key],
+            ConfigDialect::Kilo | ConfigDialect::OpenCode => vec!["mcp"],
+            ConfigDialect::CodexToml | ConfigDialect::RulesOnly => Vec::new(),
         }
     }
 
@@ -156,13 +163,40 @@ pub enum RemoteShape {
     TypeHttpUrl,
     /// `{ "serverUrl": ..., "headers": ... }` (Antigravity rejects `url`).
     ServerUrl,
+    /// `{ "httpUrl": ..., "headers": ... }` (Qwen Code reads a bare `url` as SSE).
+    HttpUrl,
+    /// `{ "url": ..., "headers": ... }` with no transport field.
+    UrlOnly,
+    /// `{ "transport": "streamable_http", "url": ..., "headers": ... }` (Muse).
+    TransportStreamableHttp,
+}
+
+/// A literal a descriptor adds to entries or documents it writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldValue {
+    Bool(bool),
+    Int(i64),
+    Str(&'static str),
+    StrList(&'static [&'static str]),
+}
+
+impl FieldValue {
+    pub fn to_json(self) -> serde_json::Value {
+        match self {
+            FieldValue::Bool(value) => serde_json::json!(value),
+            FieldValue::Int(value) => serde_json::json!(value),
+            FieldValue::Str(value) => serde_json::json!(value),
+            FieldValue::StrList(values) => serde_json::json!(values),
+        }
+    }
 }
 
 /// Project-level MCP config file.
 #[derive(Debug, Clone, Copy)]
 pub struct ProjectConfig {
     pub path: ProjectPathSpec,
-    pub root_key: &'static str,
+    /// Path to the server map inside the project file.
+    pub server_path: &'static [&'static str],
 }
 
 /// Where managed rules live.
@@ -233,7 +267,16 @@ pub struct ClientDescriptor {
     pub legacy_global_configs: &'static [PathSpec],
     pub project_config: Option<ProjectConfig>,
     pub dialect: ConfigDialect,
-    pub remote_shape: RemoteShape,
+    /// How a hosted server entry is written; `None` when the client's config
+    /// file cannot reach the hosted server (rules-only, stdio-only).
+    pub remote_shape: Option<RemoteShape>,
+    /// Transport marker a local stdio entry needs, e.g. `("type", "local")`.
+    pub local_type: Option<(&'static str, &'static str)>,
+    /// Fields every ContextStream entry carries unless the user set them.
+    pub entry_fields: &'static [(&'static str, FieldValue)],
+    /// Fields the config document itself must carry (added when missing,
+    /// removed on uninstall only when setup created them).
+    pub root_fields: &'static [(&'static str, FieldValue)],
     pub tool_surface_profile: Option<&'static str>,
     pub rules: RulesLayout,
     pub detect: &'static [Evidence],
@@ -261,12 +304,15 @@ static CLAUDE_CODE: ClientDescriptor = ClientDescriptor {
     legacy_global_configs: &[PathSpec::At(Base::Home, &[".claude", "mcp.json"])],
     project_config: Some(ProjectConfig {
         path: ProjectPathSpec::At(&[".mcp.json"]),
-        root_key: "mcpServers",
+        server_path: &["mcpServers"],
     }),
     dialect: ConfigDialect::JsonServers {
-        root_key: "mcpServers",
+        path: &["mcpServers"],
     },
-    remote_shape: RemoteShape::TypeHttpUrl,
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
     tool_surface_profile: None,
     rules: RulesLayout {
         project: Some(ProjectPathSpec::At(&["CLAUDE.md"])),
@@ -294,12 +340,15 @@ static CURSOR: ClientDescriptor = ClientDescriptor {
     legacy_global_configs: &[],
     project_config: Some(ProjectConfig {
         path: ProjectPathSpec::At(&[".cursor", "mcp.json"]),
-        root_key: "mcpServers",
+        server_path: &["mcpServers"],
     }),
     dialect: ConfigDialect::JsonServers {
-        root_key: "mcpServers",
+        path: &["mcpServers"],
     },
-    remote_shape: RemoteShape::TypeHttpUrl,
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
     tool_surface_profile: None,
     rules: RulesLayout {
         // Cursor loads `.cursor/rules/*.mdc` in every mode; the legacy
@@ -328,9 +377,12 @@ static WINDSURF: ClientDescriptor = ClientDescriptor {
     legacy_global_configs: &[],
     project_config: None,
     dialect: ConfigDialect::JsonServers {
-        root_key: "mcpServers",
+        path: &["mcpServers"],
     },
-    remote_shape: RemoteShape::TypeHttpUrl,
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
     tool_surface_profile: None,
     rules: RulesLayout {
         project: Some(ProjectPathSpec::At(&[".windsurf", "rules", "contextstream.md"])),
@@ -357,25 +409,24 @@ static COPILOT: ClientDescriptor = ClientDescriptor {
     legacy_global_configs: &[],
     project_config: Some(ProjectConfig {
         path: ProjectPathSpec::At(&[".vscode", "mcp.json"]),
-        root_key: "servers",
+        server_path: &["servers"],
     }),
-    dialect: ConfigDialect::JsonServers {
-        root_key: "servers",
-    },
-    remote_shape: RemoteShape::TypeHttpUrl,
+    dialect: ConfigDialect::JsonServers { path: &["servers"] },
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
     tool_surface_profile: Some(COPILOT_TOOL_SURFACE_PROFILE),
     rules: RulesLayout {
         project: Some(ProjectPathSpec::At(&[".github", "copilot-instructions.md"])),
         ..NO_RULES_LEGACY
     },
+    // The Copilot CLI has its own target (`copilot-cli`).
     detect: &[
-        Evidence::Binary("copilot"),
         Evidence::VsCodeExtension("github.copilot"),
         Evidence::VsCodeExtension("github.copilot-chat"),
-        Evidence::HomePath(&[".copilot"]),
     ],
-    reload_instruction:
-        "Reload the VS Code window, or start a fresh GitHub Copilot CLI session, in the intended checkout.",
+    reload_instruction: "Reload the VS Code window in the intended checkout.",
     status: ClientStatus::Supported,
 };
 
@@ -387,7 +438,10 @@ static CLINE: ClientDescriptor = ClientDescriptor {
     dialect: ConfigDialect::VsCodeSettings {
         key: "cline.mcpServers",
     },
-    remote_shape: RemoteShape::TypeHttpUrl,
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
     tool_surface_profile: None,
     rules: RulesLayout {
         project: Some(ProjectPathSpec::At(&[".clinerules"])),
@@ -435,10 +489,13 @@ static KILO_CODE: ClientDescriptor = ClientDescriptor {
             resolve: kilo_project_config_file,
             display: "kilo.jsonc",
         },
-        root_key: "mcp",
+        server_path: &["mcp"],
     }),
     dialect: ConfigDialect::Kilo,
-    remote_shape: RemoteShape::TypeHttpUrl,
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
     tool_surface_profile: None,
     rules: RulesLayout {
         project: Some(ProjectPathSpec::At(&[".kilo", "rules", "contextstream.md"])),
@@ -474,12 +531,15 @@ static ROO_CODE: ClientDescriptor = ClientDescriptor {
     legacy_global_configs: &[],
     project_config: Some(ProjectConfig {
         path: ProjectPathSpec::At(&[".roo", "mcp.json"]),
-        root_key: "mcpServers",
+        server_path: &["mcpServers"],
     }),
     dialect: ConfigDialect::VsCodeSettings {
         key: "roo-cline.mcpServers",
     },
-    remote_shape: RemoteShape::TypeHttpUrl,
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
     tool_surface_profile: None,
     rules: RulesLayout {
         project: Some(ProjectPathSpec::At(&[".roo", "rules", "contextstream.md"])),
@@ -509,7 +569,10 @@ static CODEX: ClientDescriptor = ClientDescriptor {
     legacy_global_configs: &[],
     project_config: None,
     dialect: ConfigDialect::CodexToml,
-    remote_shape: RemoteShape::TypeHttpUrl,
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
     tool_surface_profile: None,
     rules: RulesLayout {
         project: Some(ProjectPathSpec::At(&["AGENTS.md"])),
@@ -531,7 +594,10 @@ static AIDER: ClientDescriptor = ClientDescriptor {
     legacy_global_configs: &[],
     project_config: None,
     dialect: ConfigDialect::RulesOnly,
-    remote_shape: RemoteShape::TypeHttpUrl,
+    remote_shape: None,
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
     tool_surface_profile: None,
     rules: RulesLayout {
         project: Some(ProjectPathSpec::At(&[".aider.conf.yml"])),
@@ -558,12 +624,15 @@ static ANTIGRAVITY: ClientDescriptor = ClientDescriptor {
     )],
     project_config: Some(ProjectConfig {
         path: ProjectPathSpec::At(&[".agents", "mcp_config.json"]),
-        root_key: "mcpServers",
+        server_path: &["mcpServers"],
     }),
     dialect: ConfigDialect::JsonServers {
-        root_key: "mcpServers",
+        path: &["mcpServers"],
     },
-    remote_shape: RemoteShape::ServerUrl,
+    remote_shape: Some(RemoteShape::ServerUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
     tool_surface_profile: None,
     rules: RulesLayout {
         project: Some(ProjectPathSpec::At(&["GEMINI.md"])),
@@ -601,10 +670,13 @@ static OPENCODE: ClientDescriptor = ClientDescriptor {
     legacy_global_configs: &[PathSpec::At(Base::Home, &[".opencode", "mcp.json"])],
     project_config: Some(ProjectConfig {
         path: ProjectPathSpec::At(&["opencode.json"]),
-        root_key: "mcp",
+        server_path: &["mcp"],
     }),
     dialect: ConfigDialect::OpenCode,
-    remote_shape: RemoteShape::TypeHttpUrl,
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
     tool_surface_profile: None,
     rules: RulesLayout {
         project: Some(ProjectPathSpec::At(&["AGENTS.md"])),
@@ -629,6 +701,479 @@ static OPENCODE: ClientDescriptor = ClientDescriptor {
     status: ClientStatus::Supported,
 };
 
+/// A directory named by an environment variable when it is set to an
+/// absolute path, else `default` under HOME.
+fn env_dir_or_home(var: &str, default: &[&str]) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| dirs::home_dir().map(|home| join_all(home, default)))
+}
+
+fn exists(path: Option<PathBuf>) -> bool {
+    path.is_some_and(|path| path.exists())
+}
+
+fn muse_settings() -> Option<PathBuf> {
+    // The Muse SDK reads exactly `$XDG_CONFIG_HOME/muse/settings.json`.
+    xdg_config_home().map(|dir| dir.join("muse").join("settings.json"))
+}
+
+static MUSE_CODE: ClientDescriptor = ClientDescriptor {
+    editor: Editor::MuseCode,
+    // dev.meta.ai/docs/muse-code/configuration: "User settings live at
+    // ~/.config/muse/settings.json"; servers go in `mcp_servers`.
+    global_config: Some(PathSpec::Resolve {
+        resolve: muse_settings,
+        display: "~/.config/muse/settings.json",
+    }),
+    legacy_global_configs: &[],
+    project_config: None,
+    dialect: ConfigDialect::JsonServers {
+        path: &["mcp_servers"],
+    },
+    remote_shape: Some(RemoteShape::TransportStreamableHttp),
+    local_type: Some(("transport", "stdio")),
+    // A server's `mode` defaults to `required`, which aborts every Muse run
+    // when it cannot start; ContextStream must never block the agent.
+    entry_fields: &[
+        ("enabled", FieldValue::Bool(true)),
+        ("mode", FieldValue::Str("optional")),
+    ],
+    // A settings file without `"schema_version": 1` fails every command.
+    root_fields: &[("schema_version", FieldValue::Int(1))],
+    tool_surface_profile: None,
+    rules: RulesLayout {
+        project: Some(ProjectPathSpec::At(&["AGENTS.md"])),
+        ..NO_RULES_LEGACY
+    },
+    detect: &[
+        Evidence::Binary("muse"),
+        Evidence::XdgConfigPath(&["muse"]),
+    ],
+    reload_instruction:
+        "Start a new Muse session in the intended checkout; `/mcp` shows server status and `muse mcp login contextstream` signs in without an API key.",
+    status: ClientStatus::Supported,
+};
+
+fn kimi_code_home() -> Option<PathBuf> {
+    env_dir_or_home("KIMI_CODE_HOME", &[".kimi-code"])
+}
+
+fn kimi_mcp_config() -> Option<PathBuf> {
+    kimi_code_home().map(|home| home.join("mcp.json"))
+}
+
+fn kimi_rules() -> Option<PathBuf> {
+    kimi_code_home().map(|home| home.join("AGENTS.md"))
+}
+
+fn kimi_code_installed() -> bool {
+    // The legacy Python kimi-cli also installs `kimi` but reads ~/.kimi, so
+    // the Kimi Code home is the evidence, not the binary.
+    exists(kimi_code_home())
+}
+
+static KIMI_CODE: ClientDescriptor = ClientDescriptor {
+    editor: Editor::KimiCode,
+    // kimi.com/code/docs: "User level: ~/.kimi-code/mcp.json (or
+    // $KIMI_CODE_HOME/mcp.json)". Strict JSON; one invalid entry fails the file.
+    global_config: Some(PathSpec::Resolve {
+        resolve: kimi_mcp_config,
+        display: "~/.kimi-code/mcp.json",
+    }),
+    legacy_global_configs: &[],
+    project_config: Some(ProjectConfig {
+        path: ProjectPathSpec::At(&[".kimi-code", "mcp.json"]),
+        server_path: &["mcpServers"],
+    }),
+    dialect: ConfigDialect::JsonServers {
+        path: &["mcpServers"],
+    },
+    // "entries with a url field and no transport are HTTP servers".
+    remote_shape: Some(RemoteShape::UrlOnly),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
+    tool_surface_profile: None,
+    rules: RulesLayout {
+        project: Some(ProjectPathSpec::At(&["AGENTS.md"])),
+        global: Some(PathSpec::Resolve {
+            resolve: kimi_rules,
+            display: "~/.kimi-code/AGENTS.md",
+        }),
+        ..NO_RULES_LEGACY
+    },
+    detect: &[Evidence::Check(kimi_code_installed)],
+    reload_instruction:
+        "Start a new Kimi Code session in the intended checkout; servers added mid-session only join new sessions.",
+    status: ClientStatus::Supported,
+};
+
+static ZCODE: ClientDescriptor = ClientDescriptor {
+    editor: Editor::ZCode,
+    // zcode.z.ai/en/docs/mcp-services: "~/.zcode/cli/config.json → mcp.servers".
+    // Each server object is validated strictly; unknown keys drop the server.
+    global_config: Some(PathSpec::At(Base::Home, &[".zcode", "cli", "config.json"])),
+    legacy_global_configs: &[],
+    project_config: Some(ProjectConfig {
+        path: ProjectPathSpec::At(&[".zcode", "config.json"]),
+        server_path: &["mcp", "servers"],
+    }),
+    dialect: ConfigDialect::JsonServers {
+        path: &["mcp", "servers"],
+    },
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
+    tool_surface_profile: None,
+    rules: RulesLayout {
+        project: Some(ProjectPathSpec::At(&["AGENTS.md"])),
+        global: Some(PathSpec::At(Base::Home, &[".zcode", "AGENTS.md"])),
+        ..NO_RULES_LEGACY
+    },
+    detect: &[Evidence::Binary("zcode"), Evidence::HomePath(&[".zcode"])],
+    reload_instruction:
+        "Start a new ZCode session in the intended checkout; running sessions may not reload MCP servers.",
+    status: ClientStatus::Supported,
+};
+
+fn qwen_home() -> Option<PathBuf> {
+    env_dir_or_home("QWEN_HOME", &[".qwen"])
+}
+
+fn qwen_settings() -> Option<PathBuf> {
+    qwen_home().map(|home| home.join("settings.json"))
+}
+
+fn qwen_rules() -> Option<PathBuf> {
+    qwen_home().map(|home| home.join("QWEN.md"))
+}
+
+static QWEN_CODE: ClientDescriptor = ClientDescriptor {
+    editor: Editor::QwenCode,
+    global_config: Some(PathSpec::Resolve {
+        resolve: qwen_settings,
+        display: "~/.qwen/settings.json",
+    }),
+    legacy_global_configs: &[],
+    project_config: Some(ProjectConfig {
+        path: ProjectPathSpec::At(&[".qwen", "settings.json"]),
+        server_path: &["mcpServers"],
+    }),
+    dialect: ConfigDialect::JsonServers {
+        path: &["mcpServers"],
+    },
+    // Qwen Code reads a bare `url` as legacy SSE; streamable HTTP is `httpUrl`.
+    remote_shape: Some(RemoteShape::HttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
+    tool_surface_profile: None,
+    rules: RulesLayout {
+        project: Some(ProjectPathSpec::At(&["QWEN.md"])),
+        global: Some(PathSpec::Resolve {
+            resolve: qwen_rules,
+            display: "~/.qwen/QWEN.md",
+        }),
+        ..NO_RULES_LEGACY
+    },
+    detect: &[Evidence::Binary("qwen"), Evidence::HomePath(&[".qwen"])],
+    reload_instruction: "Exit Qwen Code, then restart it in the intended checkout.",
+    status: ClientStatus::Supported,
+};
+
+fn gemini_cli_dir() -> Option<PathBuf> {
+    // GEMINI_CLI_HOME is the root that contains the `.gemini` folder.
+    std::env::var_os("GEMINI_CLI_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(dirs::home_dir)
+        .map(|root| root.join(".gemini"))
+}
+
+fn gemini_settings() -> Option<PathBuf> {
+    gemini_cli_dir().map(|dir| dir.join("settings.json"))
+}
+
+fn gemini_rules() -> Option<PathBuf> {
+    gemini_cli_dir().map(|dir| dir.join("GEMINI.md"))
+}
+
+static GEMINI_CLI: ClientDescriptor = ClientDescriptor {
+    editor: Editor::GeminiCli,
+    global_config: Some(PathSpec::Resolve {
+        resolve: gemini_settings,
+        display: "~/.gemini/settings.json",
+    }),
+    legacy_global_configs: &[],
+    project_config: Some(ProjectConfig {
+        path: ProjectPathSpec::At(&[".gemini", "settings.json"]),
+        server_path: &["mcpServers"],
+    }),
+    dialect: ConfigDialect::JsonServers {
+        path: &["mcpServers"],
+    },
+    // `gemini mcp add --transport http` writes `{ "type": "http", "url" }`.
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
+    tool_surface_profile: None,
+    rules: RulesLayout {
+        project: Some(ProjectPathSpec::At(&["GEMINI.md"])),
+        global: Some(PathSpec::Resolve {
+            resolve: gemini_rules,
+            display: "~/.gemini/GEMINI.md",
+        }),
+        ..NO_RULES_LEGACY
+    },
+    // `~/.gemini` alone is shared with Antigravity; settings.json is Gemini CLI's.
+    detect: &[
+        Evidence::Binary("gemini"),
+        Evidence::HomePath(&[".gemini", "settings.json"]),
+    ],
+    reload_instruction: "Run `/mcp reload` in Gemini CLI, or restart it, in the intended checkout.",
+    status: ClientStatus::Supported,
+};
+
+fn zed_settings() -> Option<PathBuf> {
+    zed_config_dir().map(|dir| dir.join("settings.json"))
+}
+
+fn zed_rules() -> Option<PathBuf> {
+    zed_config_dir().map(|dir| dir.join("AGENTS.md"))
+}
+
+static ZED: ClientDescriptor = ClientDescriptor {
+    editor: Editor::Zed,
+    // zed.dev/docs: settings.json is JSON with `//` comments; servers live in
+    // `context_servers` as `{url, headers}` or `{command, args, env}`.
+    global_config: Some(PathSpec::Resolve {
+        resolve: zed_settings,
+        display: "~/.config/zed/settings.json",
+    }),
+    legacy_global_configs: &[],
+    project_config: Some(ProjectConfig {
+        path: ProjectPathSpec::At(&[".zed", "settings.json"]),
+        server_path: &["context_servers"],
+    }),
+    dialect: ConfigDialect::JsonServers {
+        path: &["context_servers"],
+    },
+    remote_shape: Some(RemoteShape::UrlOnly),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
+    tool_surface_profile: None,
+    rules: RulesLayout {
+        // Zed reads the first match of .rules, .cursorrules, ..., AGENTS.md.
+        project: Some(ProjectPathSpec::At(&["AGENTS.md"])),
+        global: Some(PathSpec::Resolve {
+            resolve: zed_rules,
+            display: "~/.config/zed/AGENTS.md",
+        }),
+        ..NO_RULES_LEGACY
+    },
+    detect: &[
+        Evidence::Binary("zed"),
+        Evidence::Binary("zeditor"),
+        Evidence::Binary("zedit"),
+        Evidence::Check(zed_platform_install_present),
+    ],
+    reload_instruction:
+        "Zed reloads MCP servers when settings change; reopen the intended checkout if the agent panel still shows the old servers.",
+    status: ClientStatus::Supported,
+};
+
+static CLAUDE_DESKTOP: ClientDescriptor = ClientDescriptor {
+    editor: Editor::ClaudeDesktop,
+    // claude_desktop_config.json only launches local stdio servers; the hosted
+    // server is added under Settings → Connectors instead.
+    global_config: Some(PathSpec::Resolve {
+        resolve: claude_desktop_config_path,
+        display: "<Claude config dir>/claude_desktop_config.json",
+    }),
+    legacy_global_configs: &[],
+    project_config: None,
+    dialect: ConfigDialect::JsonServers {
+        path: &["mcpServers"],
+    },
+    remote_shape: None,
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
+    tool_surface_profile: None,
+    rules: NO_RULES_LEGACY,
+    detect: &[Evidence::Check(claude_desktop_install_present)],
+    reload_instruction:
+        "Fully quit Claude Desktop and reopen it; to use the hosted server instead, add https://mcp.contextstream.io/mcp under Settings → Connectors. It has no project checkout of its own.",
+    status: ClientStatus::Supported,
+};
+
+fn copilot_home() -> Option<PathBuf> {
+    env_dir_or_home("COPILOT_HOME", &[".copilot"])
+}
+
+fn copilot_cli_config() -> Option<PathBuf> {
+    copilot_home().map(|home| home.join("mcp-config.json"))
+}
+
+fn copilot_cli_rules() -> Option<PathBuf> {
+    copilot_home().map(|home| home.join("copilot-instructions.md"))
+}
+
+fn copilot_cli_installed() -> bool {
+    exists(copilot_home())
+}
+
+static COPILOT_CLI: ClientDescriptor = ClientDescriptor {
+    editor: Editor::CopilotCli,
+    // docs.github.com Copilot CLI: `~/.copilot/mcp-config.json`. Project
+    // `.mcp.json` is shared with Claude Code, so only the user file is managed.
+    global_config: Some(PathSpec::Resolve {
+        resolve: copilot_cli_config,
+        display: "~/.copilot/mcp-config.json",
+    }),
+    legacy_global_configs: &[],
+    project_config: None,
+    dialect: ConfigDialect::JsonServers {
+        path: &["mcpServers"],
+    },
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: Some(("type", "local")),
+    // `tools` is required on every server.
+    entry_fields: &[("tools", FieldValue::StrList(&["*"]))],
+    root_fields: &[],
+    tool_surface_profile: None,
+    rules: RulesLayout {
+        project: Some(ProjectPathSpec::At(&["AGENTS.md"])),
+        global: Some(PathSpec::Resolve {
+            resolve: copilot_cli_rules,
+            display: "~/.copilot/copilot-instructions.md",
+        }),
+        ..NO_RULES_LEGACY
+    },
+    detect: &[
+        Evidence::Binary("copilot"),
+        Evidence::Check(copilot_cli_installed),
+    ],
+    reload_instruction:
+        "Run `/mcp reload` in GitHub Copilot CLI, or start a fresh session, in the intended checkout.",
+    status: ClientStatus::Supported,
+};
+
+static FACTORY_DROID: ClientDescriptor = ClientDescriptor {
+    editor: Editor::FactoryDroid,
+    // docs.factory.ai/harness/mcp: user `~/.factory/mcp.json`, project
+    // `.factory/mcp.json`; http servers need `type`, stdio defaults to stdio.
+    global_config: Some(PathSpec::At(Base::Home, &[".factory", "mcp.json"])),
+    legacy_global_configs: &[],
+    project_config: Some(ProjectConfig {
+        path: ProjectPathSpec::At(&[".factory", "mcp.json"]),
+        server_path: &["mcpServers"],
+    }),
+    dialect: ConfigDialect::JsonServers {
+        path: &["mcpServers"],
+    },
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
+    tool_surface_profile: None,
+    rules: RulesLayout {
+        project: Some(ProjectPathSpec::At(&["AGENTS.md"])),
+        global: Some(PathSpec::At(Base::Home, &[".factory", "AGENTS.md"])),
+        ..NO_RULES_LEGACY
+    },
+    detect: &[Evidence::Binary("droid"), Evidence::HomePath(&[".factory"])],
+    reload_instruction:
+        "Droid reloads mcp.json automatically; start a new Droid session in the intended checkout to pick up rules.",
+    status: ClientStatus::Supported,
+};
+
+fn amp_settings() -> Option<PathBuf> {
+    // ampcode.com/docs: `~/.config/amp/settings.json` or `settings.jsonc` on
+    // every OS; reuse the JSONC file when the user has one.
+    let dir = dirs::home_dir()?.join(".config").join("amp");
+    let jsonc = dir.join("settings.jsonc");
+    Some(if jsonc.exists() {
+        jsonc
+    } else {
+        dir.join("settings.json")
+    })
+}
+
+static AMP: ClientDescriptor = ClientDescriptor {
+    editor: Editor::Amp,
+    global_config: Some(PathSpec::Resolve {
+        resolve: amp_settings,
+        display: "~/.config/amp/settings.json",
+    }),
+    legacy_global_configs: &[],
+    // Workspace servers need `amp mcp approve`, so only user settings are managed.
+    project_config: None,
+    dialect: ConfigDialect::JsonServers {
+        path: &["amp.mcpServers"],
+    },
+    remote_shape: Some(RemoteShape::UrlOnly),
+    local_type: None,
+    entry_fields: &[],
+    root_fields: &[],
+    tool_surface_profile: None,
+    rules: RulesLayout {
+        project: Some(ProjectPathSpec::At(&["AGENTS.md"])),
+        global: Some(PathSpec::At(Base::Home, &[".config", "amp", "AGENTS.md"])),
+        ..NO_RULES_LEGACY
+    },
+    detect: &[
+        Evidence::Binary("amp"),
+        Evidence::HomePath(&[".config", "amp"]),
+    ],
+    reload_instruction:
+        "Restart Amp in the intended checkout; `amp mcp doctor` shows server status.",
+    status: ClientStatus::Supported,
+};
+
+fn crush_config() -> Option<PathBuf> {
+    // Crush still reads JSON (crushrc is preferred but JSON is supported):
+    // `$CRUSH_GLOBAL_CONFIG/crush.json`, else the XDG config home.
+    std::env::var_os("CRUSH_GLOBAL_CONFIG")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| xdg_config_home().map(|dir| dir.join("crush")))
+        .map(|dir| dir.join("crush.json"))
+}
+
+static CRUSH: ClientDescriptor = ClientDescriptor {
+    editor: Editor::Crush,
+    global_config: Some(PathSpec::Resolve {
+        resolve: crush_config,
+        display: "~/.config/crush/crush.json",
+    }),
+    legacy_global_configs: &[],
+    project_config: None,
+    dialect: ConfigDialect::JsonServers { path: &["mcp"] },
+    // Crush requires `type` on every server (stdio|sse|http).
+    remote_shape: Some(RemoteShape::TypeHttpUrl),
+    local_type: Some(("type", "stdio")),
+    entry_fields: &[],
+    root_fields: &[],
+    tool_surface_profile: None,
+    rules: RulesLayout {
+        project: Some(ProjectPathSpec::At(&["AGENTS.md"])),
+        global: Some(PathSpec::At(Base::XdgConfig, &["crush", "CRUSH.md"])),
+        ..NO_RULES_LEGACY
+    },
+    detect: &[
+        Evidence::Binary("crush"),
+        Evidence::XdgConfigPath(&["crush"]),
+    ],
+    reload_instruction: "Exit Crush, then restart it in the intended checkout.",
+    status: ClientStatus::Supported,
+};
+
 /// The descriptor for `editor`.
 pub fn descriptor(editor: Editor) -> &'static ClientDescriptor {
     match editor {
@@ -643,6 +1188,17 @@ pub fn descriptor(editor: Editor) -> &'static ClientDescriptor {
         Editor::Aider => &AIDER,
         Editor::Antigravity => &ANTIGRAVITY,
         Editor::OpenCode => &OPENCODE,
+        Editor::MuseCode => &MUSE_CODE,
+        Editor::KimiCode => &KIMI_CODE,
+        Editor::ZCode => &ZCODE,
+        Editor::QwenCode => &QWEN_CODE,
+        Editor::GeminiCli => &GEMINI_CLI,
+        Editor::Zed => &ZED,
+        Editor::ClaudeDesktop => &CLAUDE_DESKTOP,
+        Editor::CopilotCli => &COPILOT_CLI,
+        Editor::FactoryDroid => &FACTORY_DROID,
+        Editor::Amp => &AMP,
+        Editor::Crush => &CRUSH,
     }
 }
 
@@ -682,12 +1238,13 @@ pub fn catalog_json() -> serde_json::Value {
                 "mcp": {
                     "supported": d.dialect != ConfigDialect::RulesOnly,
                     "format": (d.dialect != ConfigDialect::RulesOnly).then(|| d.dialect.format_name()),
-                    "root_key": d.dialect.root_key(),
+                    "server_path": (d.dialect != ConfigDialect::RulesOnly)
+                        .then(|| d.dialect.server_path().join(".")),
                     "global_config": (d.dialect != ConfigDialect::RulesOnly)
                         .then(|| d.global_config.map(|spec| spec.display()))
                         .flatten(),
                     "project_config": d.project_config.map(|config| config.path.display()),
-                    "project_root_key": d.project_config.map(|config| config.root_key),
+                    "project_server_path": d.project_config.map(|config| config.server_path.join(".")),
                     "remote_entry": super::mcp_config::catalog_remote_entry(editor),
                 },
                 "rules": {
@@ -767,7 +1324,7 @@ mod tests {
                 editor.id()
             );
             if let Some(project) = descriptor.project_config {
-                assert!(!project.root_key.is_empty(), "{}", editor.id());
+                assert!(!project.server_path.is_empty(), "{}", editor.id());
             }
             assert!(
                 descriptor.reload_instruction.contains("checkout"),

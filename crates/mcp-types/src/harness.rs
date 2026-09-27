@@ -46,6 +46,28 @@ pub enum HarnessId {
     Antigravity,
     #[serde(rename = "opencode")]
     OpenCode,
+    #[serde(rename = "muse")]
+    MuseCode,
+    #[serde(rename = "kimi")]
+    KimiCode,
+    #[serde(rename = "zcode")]
+    ZCode,
+    #[serde(rename = "qwen")]
+    QwenCode,
+    #[serde(rename = "gemini")]
+    GeminiCli,
+    #[serde(rename = "zed")]
+    Zed,
+    #[serde(rename = "claude-desktop")]
+    ClaudeDesktop,
+    #[serde(rename = "copilot-cli")]
+    CopilotCli,
+    #[serde(rename = "droid")]
+    FactoryDroid,
+    #[serde(rename = "amp")]
+    Amp,
+    #[serde(rename = "crush")]
+    Crush,
     #[serde(rename = "chatgpt-gateway")]
     ChatGptGateway,
     #[serde(rename = "openai-responses")]
@@ -73,6 +95,17 @@ impl HarnessId {
         Self::Aider,
         Self::Antigravity,
         Self::OpenCode,
+        Self::MuseCode,
+        Self::KimiCode,
+        Self::ZCode,
+        Self::QwenCode,
+        Self::GeminiCli,
+        Self::Zed,
+        Self::ClaudeDesktop,
+        Self::CopilotCli,
+        Self::FactoryDroid,
+        Self::Amp,
+        Self::Crush,
         Self::ChatGptGateway,
         Self::OpenAiResponses,
         Self::ContextStreamCli,
@@ -92,6 +125,17 @@ impl HarnessId {
         Self::Aider,
         Self::Antigravity,
         Self::OpenCode,
+        Self::MuseCode,
+        Self::KimiCode,
+        Self::ZCode,
+        Self::QwenCode,
+        Self::GeminiCli,
+        Self::Zed,
+        Self::ClaudeDesktop,
+        Self::CopilotCli,
+        Self::FactoryDroid,
+        Self::Amp,
+        Self::Crush,
     ];
 
     /// Stable, bounded identifier used in configs, telemetry, and state.
@@ -108,6 +152,17 @@ impl HarnessId {
             Self::Aider => "aider",
             Self::Antigravity => "antigravity",
             Self::OpenCode => "opencode",
+            Self::MuseCode => "muse",
+            Self::KimiCode => "kimi",
+            Self::ZCode => "zcode",
+            Self::QwenCode => "qwen",
+            Self::GeminiCli => "gemini",
+            Self::Zed => "zed",
+            Self::ClaudeDesktop => "claude-desktop",
+            Self::CopilotCli => "copilot-cli",
+            Self::FactoryDroid => "droid",
+            Self::Amp => "amp",
+            Self::Crush => "crush",
             Self::ChatGptGateway => "chatgpt-gateway",
             Self::OpenAiResponses => "openai-responses",
             Self::ContextStreamCli => "contextstream-cli",
@@ -129,6 +184,17 @@ impl HarnessId {
             Self::Aider => "Aider",
             Self::Antigravity => "Antigravity",
             Self::OpenCode => "OpenCode CLI",
+            Self::MuseCode => "Muse Code",
+            Self::KimiCode => "Kimi Code CLI",
+            Self::ZCode => "ZCode",
+            Self::QwenCode => "Qwen Code",
+            Self::GeminiCli => "Gemini CLI",
+            Self::Zed => "Zed",
+            Self::ClaudeDesktop => "Claude Desktop",
+            Self::CopilotCli => "GitHub Copilot CLI",
+            Self::FactoryDroid => "Factory Droid",
+            Self::Amp => "Amp",
+            Self::Crush => "Crush",
             Self::ChatGptGateway => "ChatGPT Gateway",
             Self::OpenAiResponses => "OpenAI Responses",
             Self::ContextStreamCli => "ContextStream CLI",
@@ -153,6 +219,21 @@ impl HarnessId {
             "aider" => Some(Self::Aider),
             "antigravity" | "gemini-antigravity" => Some(Self::Antigravity),
             "opencode" | "open-code" | "open_code" => Some(Self::OpenCode),
+            "muse" | "muse-code" | "muse_code" => Some(Self::MuseCode),
+            "kimi" | "kimi-code" | "kimi_code" | "kimi-cli" | "kimi-code-cli" => {
+                Some(Self::KimiCode)
+            }
+            "zcode" | "z-code" | "zcode-cli" => Some(Self::ZCode),
+            "qwen" | "qwen-code" | "qwen_code" | "qwen-code-mcp-client" => Some(Self::QwenCode),
+            "gemini" | "gemini-cli" | "gemini_cli" | "gemini-cli-mcp-client" => {
+                Some(Self::GeminiCli)
+            }
+            "zed" => Some(Self::Zed),
+            "claude-desktop" | "claude_desktop" => Some(Self::ClaudeDesktop),
+            "copilot-cli" | "copilot_cli" | "github-copilot-cli" => Some(Self::CopilotCli),
+            "droid" | "factory-droid" | "factory_droid" | "factory" => Some(Self::FactoryDroid),
+            "amp" | "ampcode" | "amp-code" => Some(Self::Amp),
+            "crush" => Some(Self::Crush),
             "chatgpt"
             | "chatgpt-gateway"
             | "chatgpt_gateway"
@@ -290,6 +371,112 @@ impl HarnessId {
                 TeachingLoadEvidence::BehavioralInference,
             ),
             Self::OpenCode => HarnessProfile::installable(
+                self,
+                McpConfigFormat::Json,
+                RulesFormat::Markdown,
+                HookCapabilities::none(),
+                false,
+                false,
+                TeachingLoadEvidence::BehavioralInference,
+            ),
+            Self::MuseCode => HarnessProfile::installable(
+                self,
+                McpConfigFormat::Json,
+                RulesFormat::Markdown,
+                HookCapabilities::none(),
+                false,
+                false,
+                TeachingLoadEvidence::BehavioralInference,
+            ),
+            Self::KimiCode => HarnessProfile::installable(
+                self,
+                McpConfigFormat::Json,
+                RulesFormat::Markdown,
+                HookCapabilities::none(),
+                false,
+                false,
+                TeachingLoadEvidence::BehavioralInference,
+            ),
+            Self::ZCode => HarnessProfile::installable(
+                self,
+                McpConfigFormat::Json,
+                RulesFormat::Markdown,
+                HookCapabilities::none(),
+                false,
+                false,
+                TeachingLoadEvidence::BehavioralInference,
+            ),
+            Self::QwenCode => HarnessProfile::installable(
+                self,
+                McpConfigFormat::Json,
+                RulesFormat::Markdown,
+                HookCapabilities::none(),
+                false,
+                false,
+                TeachingLoadEvidence::BehavioralInference,
+            ),
+            Self::GeminiCli => HarnessProfile::installable(
+                self,
+                McpConfigFormat::Json,
+                RulesFormat::Markdown,
+                HookCapabilities::none(),
+                false,
+                false,
+                TeachingLoadEvidence::BehavioralInference,
+            ),
+            Self::Zed => HarnessProfile::installable(
+                self,
+                McpConfigFormat::Jsonc,
+                RulesFormat::Markdown,
+                HookCapabilities::none(),
+                false,
+                false,
+                TeachingLoadEvidence::BehavioralInference,
+            ),
+            // Claude Desktop's config file only launches local stdio servers;
+            // hosted access goes through its Connectors UI instead.
+            Self::ClaudeDesktop => HarnessProfile {
+                schema_version: HARNESS_PROFILE_SCHEMA_VERSION,
+                id: self,
+                display_name: self.display_name(),
+                installable: true,
+                mcp_support: McpTransportSupport::LocalOnly,
+                mcp_config_format: McpConfigFormat::Json,
+                rules_format: RulesFormat::None,
+                rules_auto_loaded: false,
+                hooks: HookCapabilities::none(),
+                hard_first_call_enforcement: false,
+                dynamic_guidance: false,
+                teaching_load_evidence: TeachingLoadEvidence::BehavioralInference,
+            },
+            Self::CopilotCli => HarnessProfile::installable(
+                self,
+                McpConfigFormat::Json,
+                RulesFormat::Markdown,
+                HookCapabilities::none(),
+                false,
+                false,
+                TeachingLoadEvidence::BehavioralInference,
+            ),
+            Self::FactoryDroid => HarnessProfile::installable(
+                self,
+                McpConfigFormat::Json,
+                RulesFormat::Markdown,
+                HookCapabilities::none(),
+                false,
+                false,
+                TeachingLoadEvidence::BehavioralInference,
+            ),
+            Self::Amp => HarnessProfile::installable(
+                self,
+                McpConfigFormat::Jsonc,
+                RulesFormat::Markdown,
+                HookCapabilities::none(),
+                false,
+                false,
+                TeachingLoadEvidence::BehavioralInference,
+            ),
+            Self::Crush => HarnessProfile::installable(
                 self,
                 McpConfigFormat::Json,
                 RulesFormat::Markdown,
@@ -614,7 +801,7 @@ mod tests {
 
     #[test]
     fn installable_profiles_are_exhaustive_and_bounded() {
-        assert_eq!(HarnessId::INSTALLABLE.len(), 11);
+        assert_eq!(HarnessId::INSTALLABLE.len(), 22);
         let unique: HashSet<_> = HarnessId::INSTALLABLE.iter().copied().collect();
         assert_eq!(unique.len(), HarnessId::INSTALLABLE.len());
 

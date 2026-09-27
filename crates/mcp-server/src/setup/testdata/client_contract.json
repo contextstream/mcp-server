@@ -10,7 +10,18 @@
     "codex",
     "aider",
     "antigravity",
-    "opencode"
+    "opencode",
+    "muse",
+    "kimi",
+    "zcode",
+    "qwen",
+    "gemini",
+    "zed",
+    "claude-desktop",
+    "copilot-cli",
+    "droid",
+    "amp",
+    "crush"
   ],
   "detection": {
     "<empty>": {
@@ -31,6 +42,14 @@
       ],
       "setup": [
         "aider"
+      ]
+    },
+    "bin:amp": {
+      "all": [
+        "amp"
+      ],
+      "setup": [
+        "amp"
       ]
     },
     "bin:antigravity": {
@@ -59,15 +78,39 @@
     },
     "bin:copilot": {
       "all": [
-        "copilot"
+        "copilot-cli"
       ],
       "setup": [
-        "copilot"
+        "copilot-cli"
+      ]
+    },
+    "bin:crush": {
+      "all": [
+        "crush"
+      ],
+      "setup": [
+        "crush"
       ]
     },
     "bin:cursor": {
       "all": [],
       "setup": []
+    },
+    "bin:droid": {
+      "all": [
+        "droid"
+      ],
+      "setup": [
+        "droid"
+      ]
+    },
+    "bin:gemini": {
+      "all": [
+        "gemini"
+      ],
+      "setup": [
+        "gemini"
+      ]
     },
     "bin:kilo": {
       "all": [
@@ -75,6 +118,18 @@
       ],
       "setup": [
         "kilo"
+      ]
+    },
+    "bin:kimi": {
+      "all": [],
+      "setup": []
+    },
+    "bin:muse": {
+      "all": [
+        "muse"
+      ],
+      "setup": [
+        "muse"
       ]
     },
     "bin:opencode": {
@@ -85,9 +140,49 @@
         "opencode"
       ]
     },
+    "bin:qwen": {
+      "all": [
+        "qwen"
+      ],
+      "setup": [
+        "qwen"
+      ]
+    },
     "bin:windsurf": {
       "all": [],
       "setup": []
+    },
+    "bin:zcode": {
+      "all": [
+        "zcode"
+      ],
+      "setup": [
+        "zcode"
+      ]
+    },
+    "bin:zed": {
+      "all": [
+        "zed"
+      ],
+      "setup": [
+        "zed"
+      ]
+    },
+    "bin:zedit": {
+      "all": [
+        "zed"
+      ],
+      "setup": [
+        "zed"
+      ]
+    },
+    "bin:zeditor": {
+      "all": [
+        "zed"
+      ],
+      "setup": [
+        "zed"
+      ]
     },
     "home:.claude/": {
       "all": [],
@@ -129,12 +224,44 @@
       "all": [],
       "setup": []
     },
+    "home:.config/Claude/": {
+      "all": [
+        "claude-desktop"
+      ],
+      "setup": [
+        "claude-desktop"
+      ]
+    },
+    "home:.config/amp/": {
+      "all": [
+        "amp"
+      ],
+      "setup": [
+        "amp"
+      ]
+    },
+    "home:.config/crush/": {
+      "all": [
+        "crush"
+      ],
+      "setup": [
+        "crush"
+      ]
+    },
     "home:.config/kilo/": {
       "all": [
         "kilo"
       ],
       "setup": [
         "kilo"
+      ]
+    },
+    "home:.config/muse/": {
+      "all": [
+        "muse"
+      ],
+      "setup": [
+        "muse"
       ]
     },
     "home:.config/opencode/": {
@@ -145,17 +272,33 @@
         "opencode"
       ]
     },
-    "home:.copilot/": {
+    "home:.config/zed/": {
       "all": [
-        "copilot"
+        "zed"
       ],
       "setup": [
-        "copilot"
+        "zed"
+      ]
+    },
+    "home:.copilot/": {
+      "all": [
+        "copilot-cli"
+      ],
+      "setup": [
+        "copilot-cli"
       ]
     },
     "home:.cursor/": {
       "all": [],
       "setup": []
+    },
+    "home:.factory/": {
+      "all": [
+        "droid"
+      ],
+      "setup": [
+        "droid"
+      ]
     },
     "home:.gemini/": {
       "all": [],
@@ -177,12 +320,40 @@
         "antigravity"
       ]
     },
+    "home:.gemini/settings.json": {
+      "all": [
+        "gemini"
+      ],
+      "setup": [
+        "gemini"
+      ]
+    },
+    "home:.kimi-code/": {
+      "all": [
+        "kimi"
+      ],
+      "setup": [
+        "kimi"
+      ]
+    },
+    "home:.kimi/": {
+      "all": [],
+      "setup": []
+    },
     "home:.opencode/": {
       "all": [
         "opencode"
       ],
       "setup": [
         "opencode"
+      ]
+    },
+    "home:.qwen/": {
+      "all": [
+        "qwen"
+      ],
+      "setup": [
+        "qwen"
       ]
     },
     "home:.vscode/extensions/github.copilot-1.0.0/": {
@@ -221,6 +392,14 @@
       ],
       "setup": [
         "cline"
+      ]
+    },
+    "home:.zcode/": {
+      "all": [
+        "zcode"
+      ],
+      "setup": [
+        "zcode"
       ]
     },
     "home:Applications/Windsurf.AppImage": {
@@ -353,6 +532,125 @@
         "global_local": {},
         "global_merge_existing": {},
         "global_remote": {},
+        "project_local": {},
+        "project_remote": {}
+      }
+    },
+    "amp": {
+      "flags": {
+        "deprecation_successor": null,
+        "display_name": "Amp",
+        "enforcement_tier": "TierC",
+        "has_hooks": false,
+        "has_mcp_transport": true,
+        "id": "amp",
+        "is_deprecated": false,
+        "mcp_root_key": "amp.mcpServers",
+        "reload_instruction": "Restart Amp in the intended checkout; `amp mcp doctor` shows server status.",
+        "supports_project_mcp_config": false,
+        "supports_remote": true,
+        "tool_surface_profile": null,
+        "uses_json_config": true,
+        "uses_vscode_settings": false
+      },
+      "generated": {
+        "local": {
+          "config_format": "json",
+          "config_path": "~/.config/amp/settings.json",
+          "editor": "amp",
+          "editor_name": "Amp",
+          "rules_path": "~/.config/amp/AGENTS.md",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "amp",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            }
+          },
+          "supports_project_config": false,
+          "supports_remote": true,
+          "transport": "local"
+        },
+        "remote": {
+          "config_format": "json",
+          "config_path": "~/.config/amp/settings.json",
+          "editor": "amp",
+          "editor_name": "Amp",
+          "rules_path": "~/.config/amp/AGENTS.md",
+          "server_config": {
+            "headers": {
+              "X-ContextStream-API-Key": "test-key",
+              "X-ContextStream-Auto-Hide-Integrations": "true",
+              "X-ContextStream-Client": "amp",
+              "X-ContextStream-Consolidated": "true",
+              "X-ContextStream-Context-Pack-Enabled": "true",
+              "X-ContextStream-Hook-Transcripts-Enabled": "true",
+              "X-ContextStream-Installation-Id": "00000000-0000-4000-8000-000000000062",
+              "X-ContextStream-Managed-Config-Version": "2",
+              "X-ContextStream-Output-Format": "compact",
+              "X-ContextStream-Progressive-Mode": "false",
+              "X-ContextStream-Project-Id": "proj-1",
+              "X-ContextStream-Router-Mode": "false",
+              "X-ContextStream-Search-Limit": "15",
+              "X-ContextStream-Search-Max-Chars": "2400",
+              "X-ContextStream-Teaching-Version": "harness_teaching_v4",
+              "X-ContextStream-Toolset": "complete",
+              "X-ContextStream-Transcripts-Enabled": "true",
+              "X-ContextStream-Workspace-Id": "ws-1"
+            },
+            "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
+          },
+          "supports_project_config": false,
+          "supports_remote": true,
+          "transport": "remote"
+        }
+      },
+      "paths": {
+        "cleanup_rules_global": [],
+        "cleanup_rules_project": [],
+        "legacy_mcp_config": [],
+        "legacy_rules_global": [],
+        "legacy_rules_project": [],
+        "mcp_config": "~/.config/amp/settings.json",
+        "project_mcp_config": null,
+        "rules_global": "~/.config/amp/AGENTS.md",
+        "rules_project": "<project>/AGENTS.md"
+      },
+      "writes": {
+        "global_local": {
+          "~/.config/amp/settings.json": "{\n  \"amp.mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"amp\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "global_merge_existing": {
+          "~/.config/amp/settings.json": "{\n  \"userSetting\": true,\n  \"amp.mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"amp\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    },\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n",
+          "~/.config/amp/settings.json.contextstream.bak": "{\n  \"userSetting\": true,\n  \"amp.mcpServers\": {\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n"
+        },
+        "global_remote": {
+          "~/.config/amp/settings.json": "{\n  \"amp.mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"amp\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        },
         "project_local": {},
         "project_remote": {}
       }
@@ -609,6 +907,133 @@
         "project_remote": {
           "<project>/.mcp.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"claude\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
         }
+      }
+    },
+    "claude-desktop": {
+      "flags": {
+        "deprecation_successor": null,
+        "display_name": "Claude Desktop",
+        "enforcement_tier": "TierC",
+        "has_hooks": false,
+        "has_mcp_transport": true,
+        "id": "claude-desktop",
+        "is_deprecated": false,
+        "mcp_root_key": "mcpServers",
+        "reload_instruction": "Fully quit Claude Desktop and reopen it; to use the hosted server instead, add https://mcp.contextstream.io/mcp under Settings → Connectors. It has no project checkout of its own.",
+        "supports_project_mcp_config": false,
+        "supports_remote": false,
+        "tool_surface_profile": null,
+        "uses_json_config": true,
+        "uses_vscode_settings": false
+      },
+      "generated": {
+        "local": {
+          "config_format": "json",
+          "config_path": "~/.config/Claude/claude_desktop_config.json",
+          "editor": "claude-desktop",
+          "editor_name": "Claude Desktop",
+          "rules_path": "",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "claude-desktop",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            }
+          },
+          "supports_project_config": false,
+          "supports_remote": false,
+          "transport": "local"
+        },
+        "remote": {
+          "config_format": "json",
+          "config_path": "~/.config/Claude/claude_desktop_config.json",
+          "editor": "claude-desktop",
+          "editor_name": "Claude Desktop",
+          "rules_path": "",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "claude-desktop",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            }
+          },
+          "supports_project_config": false,
+          "supports_remote": false,
+          "transport": "local"
+        }
+      },
+      "paths": {
+        "cleanup_rules_global": [],
+        "cleanup_rules_project": [],
+        "legacy_mcp_config": [],
+        "legacy_rules_global": [],
+        "legacy_rules_project": [],
+        "mcp_config": "~/.config/Claude/claude_desktop_config.json",
+        "project_mcp_config": null,
+        "rules_global": null,
+        "rules_project": null
+      },
+      "writes": {
+        "global_local": {
+          "~/.config/Claude/claude_desktop_config.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"claude-desktop\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "global_merge_existing": {
+          "~/.config/Claude/claude_desktop_config.json": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"claude-desktop\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    },\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n",
+          "~/.config/Claude/claude_desktop_config.json.contextstream.bak": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n"
+        },
+        "global_remote": {
+          "~/.config/Claude/claude_desktop_config.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"claude-desktop\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "project_local": {},
+        "project_remote": {}
       }
     },
     "cline": {
@@ -871,7 +1296,7 @@
         "id": "copilot",
         "is_deprecated": false,
         "mcp_root_key": "servers",
-        "reload_instruction": "Reload the VS Code window, or start a fresh GitHub Copilot CLI session, in the intended checkout.",
+        "reload_instruction": "Reload the VS Code window in the intended checkout.",
         "supports_project_mcp_config": true,
         "supports_remote": true,
         "tool_surface_profile": "openai_agentic",
@@ -985,6 +1410,254 @@
         "project_remote": {
           "<project>/.vscode/mcp.json": "{\n  \"servers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"copilot\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Tool-Surface-Profile\": \"openai_agentic\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
         }
+      }
+    },
+    "copilot-cli": {
+      "flags": {
+        "deprecation_successor": null,
+        "display_name": "GitHub Copilot CLI",
+        "enforcement_tier": "TierC",
+        "has_hooks": false,
+        "has_mcp_transport": true,
+        "id": "copilot-cli",
+        "is_deprecated": false,
+        "mcp_root_key": "mcpServers",
+        "reload_instruction": "Run `/mcp reload` in GitHub Copilot CLI, or start a fresh session, in the intended checkout.",
+        "supports_project_mcp_config": false,
+        "supports_remote": true,
+        "tool_surface_profile": null,
+        "uses_json_config": true,
+        "uses_vscode_settings": false
+      },
+      "generated": {
+        "local": {
+          "config_format": "json",
+          "config_path": "~/.copilot/mcp-config.json",
+          "editor": "copilot-cli",
+          "editor_name": "GitHub Copilot CLI",
+          "rules_path": "~/.copilot/copilot-instructions.md",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "copilot-cli",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            },
+            "tools": [
+              "*"
+            ],
+            "type": "local"
+          },
+          "supports_project_config": false,
+          "supports_remote": true,
+          "transport": "local"
+        },
+        "remote": {
+          "config_format": "json",
+          "config_path": "~/.copilot/mcp-config.json",
+          "editor": "copilot-cli",
+          "editor_name": "GitHub Copilot CLI",
+          "rules_path": "~/.copilot/copilot-instructions.md",
+          "server_config": {
+            "headers": {
+              "X-ContextStream-API-Key": "test-key",
+              "X-ContextStream-Auto-Hide-Integrations": "true",
+              "X-ContextStream-Client": "copilot-cli",
+              "X-ContextStream-Consolidated": "true",
+              "X-ContextStream-Context-Pack-Enabled": "true",
+              "X-ContextStream-Hook-Transcripts-Enabled": "true",
+              "X-ContextStream-Installation-Id": "00000000-0000-4000-8000-000000000062",
+              "X-ContextStream-Managed-Config-Version": "2",
+              "X-ContextStream-Output-Format": "compact",
+              "X-ContextStream-Progressive-Mode": "false",
+              "X-ContextStream-Project-Id": "proj-1",
+              "X-ContextStream-Router-Mode": "false",
+              "X-ContextStream-Search-Limit": "15",
+              "X-ContextStream-Search-Max-Chars": "2400",
+              "X-ContextStream-Teaching-Version": "harness_teaching_v4",
+              "X-ContextStream-Toolset": "complete",
+              "X-ContextStream-Transcripts-Enabled": "true",
+              "X-ContextStream-Workspace-Id": "ws-1"
+            },
+            "tools": [
+              "*"
+            ],
+            "type": "http",
+            "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
+          },
+          "supports_project_config": false,
+          "supports_remote": true,
+          "transport": "remote"
+        }
+      },
+      "paths": {
+        "cleanup_rules_global": [],
+        "cleanup_rules_project": [],
+        "legacy_mcp_config": [],
+        "legacy_rules_global": [],
+        "legacy_rules_project": [],
+        "mcp_config": "~/.copilot/mcp-config.json",
+        "project_mcp_config": null,
+        "rules_global": "~/.copilot/copilot-instructions.md",
+        "rules_project": "<project>/AGENTS.md"
+      },
+      "writes": {
+        "global_local": {
+          "~/.copilot/mcp-config.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"copilot-cli\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      },\n      \"tools\": [\n        \"*\"\n      ],\n      \"type\": \"local\"\n    }\n  }\n}\n"
+        },
+        "global_merge_existing": {
+          "~/.copilot/mcp-config.json": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"copilot-cli\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"tools\": [\n        \"*\"\n      ],\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    },\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n",
+          "~/.copilot/mcp-config.json.contextstream.bak": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n"
+        },
+        "global_remote": {
+          "~/.copilot/mcp-config.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"copilot-cli\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"tools\": [\n        \"*\"\n      ],\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        },
+        "project_local": {},
+        "project_remote": {}
+      }
+    },
+    "crush": {
+      "flags": {
+        "deprecation_successor": null,
+        "display_name": "Crush",
+        "enforcement_tier": "TierC",
+        "has_hooks": false,
+        "has_mcp_transport": true,
+        "id": "crush",
+        "is_deprecated": false,
+        "mcp_root_key": "mcp",
+        "reload_instruction": "Exit Crush, then restart it in the intended checkout.",
+        "supports_project_mcp_config": false,
+        "supports_remote": true,
+        "tool_surface_profile": null,
+        "uses_json_config": true,
+        "uses_vscode_settings": false
+      },
+      "generated": {
+        "local": {
+          "config_format": "json",
+          "config_path": "~/.config/crush/crush.json",
+          "editor": "crush",
+          "editor_name": "Crush",
+          "rules_path": "~/.config/crush/CRUSH.md",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "crush",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            },
+            "type": "stdio"
+          },
+          "supports_project_config": false,
+          "supports_remote": true,
+          "transport": "local"
+        },
+        "remote": {
+          "config_format": "json",
+          "config_path": "~/.config/crush/crush.json",
+          "editor": "crush",
+          "editor_name": "Crush",
+          "rules_path": "~/.config/crush/CRUSH.md",
+          "server_config": {
+            "headers": {
+              "X-ContextStream-API-Key": "test-key",
+              "X-ContextStream-Auto-Hide-Integrations": "true",
+              "X-ContextStream-Client": "crush",
+              "X-ContextStream-Consolidated": "true",
+              "X-ContextStream-Context-Pack-Enabled": "true",
+              "X-ContextStream-Hook-Transcripts-Enabled": "true",
+              "X-ContextStream-Installation-Id": "00000000-0000-4000-8000-000000000062",
+              "X-ContextStream-Managed-Config-Version": "2",
+              "X-ContextStream-Output-Format": "compact",
+              "X-ContextStream-Progressive-Mode": "false",
+              "X-ContextStream-Project-Id": "proj-1",
+              "X-ContextStream-Router-Mode": "false",
+              "X-ContextStream-Search-Limit": "15",
+              "X-ContextStream-Search-Max-Chars": "2400",
+              "X-ContextStream-Teaching-Version": "harness_teaching_v4",
+              "X-ContextStream-Toolset": "complete",
+              "X-ContextStream-Transcripts-Enabled": "true",
+              "X-ContextStream-Workspace-Id": "ws-1"
+            },
+            "type": "http",
+            "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
+          },
+          "supports_project_config": false,
+          "supports_remote": true,
+          "transport": "remote"
+        }
+      },
+      "paths": {
+        "cleanup_rules_global": [],
+        "cleanup_rules_project": [],
+        "legacy_mcp_config": [],
+        "legacy_rules_global": [],
+        "legacy_rules_project": [],
+        "mcp_config": "~/.config/crush/crush.json",
+        "project_mcp_config": null,
+        "rules_global": "~/.config/crush/CRUSH.md",
+        "rules_project": "<project>/AGENTS.md"
+      },
+      "writes": {
+        "global_local": {
+          "~/.config/crush/crush.json": "{\n  \"mcp\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"crush\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      },\n      \"type\": \"stdio\"\n    }\n  }\n}\n"
+        },
+        "global_merge_existing": {
+          "~/.config/crush/crush.json": "{\n  \"userSetting\": true,\n  \"mcp\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"crush\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    },\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n",
+          "~/.config/crush/crush.json.contextstream.bak": "{\n  \"userSetting\": true,\n  \"mcp\": {\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n"
+        },
+        "global_remote": {
+          "~/.config/crush/crush.json": "{\n  \"mcp\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"crush\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        },
+        "project_local": {},
+        "project_remote": {}
       }
     },
     "cursor": {
@@ -1112,6 +1785,254 @@
         },
         "project_remote": {
           "<project>/.cursor/mcp.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"cursor\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        }
+      }
+    },
+    "droid": {
+      "flags": {
+        "deprecation_successor": null,
+        "display_name": "Factory Droid",
+        "enforcement_tier": "TierC",
+        "has_hooks": false,
+        "has_mcp_transport": true,
+        "id": "droid",
+        "is_deprecated": false,
+        "mcp_root_key": "mcpServers",
+        "reload_instruction": "Droid reloads mcp.json automatically; start a new Droid session in the intended checkout to pick up rules.",
+        "supports_project_mcp_config": true,
+        "supports_remote": true,
+        "tool_surface_profile": null,
+        "uses_json_config": true,
+        "uses_vscode_settings": false
+      },
+      "generated": {
+        "local": {
+          "config_format": "json",
+          "config_path": "~/.factory/mcp.json",
+          "editor": "droid",
+          "editor_name": "Factory Droid",
+          "rules_path": "~/.factory/AGENTS.md",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "droid",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            }
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "local"
+        },
+        "remote": {
+          "config_format": "json",
+          "config_path": "~/.factory/mcp.json",
+          "editor": "droid",
+          "editor_name": "Factory Droid",
+          "rules_path": "~/.factory/AGENTS.md",
+          "server_config": {
+            "headers": {
+              "X-ContextStream-API-Key": "test-key",
+              "X-ContextStream-Auto-Hide-Integrations": "true",
+              "X-ContextStream-Client": "droid",
+              "X-ContextStream-Consolidated": "true",
+              "X-ContextStream-Context-Pack-Enabled": "true",
+              "X-ContextStream-Hook-Transcripts-Enabled": "true",
+              "X-ContextStream-Installation-Id": "00000000-0000-4000-8000-000000000062",
+              "X-ContextStream-Managed-Config-Version": "2",
+              "X-ContextStream-Output-Format": "compact",
+              "X-ContextStream-Progressive-Mode": "false",
+              "X-ContextStream-Project-Id": "proj-1",
+              "X-ContextStream-Router-Mode": "false",
+              "X-ContextStream-Search-Limit": "15",
+              "X-ContextStream-Search-Max-Chars": "2400",
+              "X-ContextStream-Teaching-Version": "harness_teaching_v4",
+              "X-ContextStream-Toolset": "complete",
+              "X-ContextStream-Transcripts-Enabled": "true",
+              "X-ContextStream-Workspace-Id": "ws-1"
+            },
+            "type": "http",
+            "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "remote"
+        }
+      },
+      "paths": {
+        "cleanup_rules_global": [],
+        "cleanup_rules_project": [],
+        "legacy_mcp_config": [],
+        "legacy_rules_global": [],
+        "legacy_rules_project": [],
+        "mcp_config": "~/.factory/mcp.json",
+        "project_mcp_config": "<project>/.factory/mcp.json",
+        "rules_global": "~/.factory/AGENTS.md",
+        "rules_project": "<project>/AGENTS.md"
+      },
+      "writes": {
+        "global_local": {
+          "~/.factory/mcp.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"droid\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "global_merge_existing": {
+          "~/.factory/mcp.json": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"droid\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    },\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n",
+          "~/.factory/mcp.json.contextstream.bak": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n"
+        },
+        "global_remote": {
+          "~/.factory/mcp.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"droid\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        },
+        "project_local": {
+          "<project>/.factory/mcp.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"droid\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "project_remote": {
+          "<project>/.factory/mcp.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"droid\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        }
+      }
+    },
+    "gemini": {
+      "flags": {
+        "deprecation_successor": null,
+        "display_name": "Gemini CLI",
+        "enforcement_tier": "TierC",
+        "has_hooks": false,
+        "has_mcp_transport": true,
+        "id": "gemini",
+        "is_deprecated": false,
+        "mcp_root_key": "mcpServers",
+        "reload_instruction": "Run `/mcp reload` in Gemini CLI, or restart it, in the intended checkout.",
+        "supports_project_mcp_config": true,
+        "supports_remote": true,
+        "tool_surface_profile": null,
+        "uses_json_config": true,
+        "uses_vscode_settings": false
+      },
+      "generated": {
+        "local": {
+          "config_format": "json",
+          "config_path": "~/.gemini/settings.json",
+          "editor": "gemini",
+          "editor_name": "Gemini CLI",
+          "rules_path": "~/.gemini/GEMINI.md",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "gemini",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            }
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "local"
+        },
+        "remote": {
+          "config_format": "json",
+          "config_path": "~/.gemini/settings.json",
+          "editor": "gemini",
+          "editor_name": "Gemini CLI",
+          "rules_path": "~/.gemini/GEMINI.md",
+          "server_config": {
+            "headers": {
+              "X-ContextStream-API-Key": "test-key",
+              "X-ContextStream-Auto-Hide-Integrations": "true",
+              "X-ContextStream-Client": "gemini",
+              "X-ContextStream-Consolidated": "true",
+              "X-ContextStream-Context-Pack-Enabled": "true",
+              "X-ContextStream-Hook-Transcripts-Enabled": "true",
+              "X-ContextStream-Installation-Id": "00000000-0000-4000-8000-000000000062",
+              "X-ContextStream-Managed-Config-Version": "2",
+              "X-ContextStream-Output-Format": "compact",
+              "X-ContextStream-Progressive-Mode": "false",
+              "X-ContextStream-Project-Id": "proj-1",
+              "X-ContextStream-Router-Mode": "false",
+              "X-ContextStream-Search-Limit": "15",
+              "X-ContextStream-Search-Max-Chars": "2400",
+              "X-ContextStream-Teaching-Version": "harness_teaching_v4",
+              "X-ContextStream-Toolset": "complete",
+              "X-ContextStream-Transcripts-Enabled": "true",
+              "X-ContextStream-Workspace-Id": "ws-1"
+            },
+            "type": "http",
+            "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "remote"
+        }
+      },
+      "paths": {
+        "cleanup_rules_global": [],
+        "cleanup_rules_project": [],
+        "legacy_mcp_config": [],
+        "legacy_rules_global": [],
+        "legacy_rules_project": [],
+        "mcp_config": "~/.gemini/settings.json",
+        "project_mcp_config": "<project>/.gemini/settings.json",
+        "rules_global": "~/.gemini/GEMINI.md",
+        "rules_project": "<project>/GEMINI.md"
+      },
+      "writes": {
+        "global_local": {
+          "~/.gemini/settings.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"gemini\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "global_merge_existing": {
+          "~/.gemini/settings.json": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"gemini\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    },\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n",
+          "~/.gemini/settings.json.contextstream.bak": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n"
+        },
+        "global_remote": {
+          "~/.gemini/settings.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"gemini\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        },
+        "project_local": {
+          "<project>/.gemini/settings.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"gemini\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "project_remote": {
+          "<project>/.gemini/settings.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"gemini\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"type\": \"http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
         }
       }
     },
@@ -1249,6 +2170,254 @@
         }
       }
     },
+    "kimi": {
+      "flags": {
+        "deprecation_successor": null,
+        "display_name": "Kimi Code CLI",
+        "enforcement_tier": "TierC",
+        "has_hooks": false,
+        "has_mcp_transport": true,
+        "id": "kimi",
+        "is_deprecated": false,
+        "mcp_root_key": "mcpServers",
+        "reload_instruction": "Start a new Kimi Code session in the intended checkout; servers added mid-session only join new sessions.",
+        "supports_project_mcp_config": true,
+        "supports_remote": true,
+        "tool_surface_profile": null,
+        "uses_json_config": true,
+        "uses_vscode_settings": false
+      },
+      "generated": {
+        "local": {
+          "config_format": "json",
+          "config_path": "~/.kimi-code/mcp.json",
+          "editor": "kimi",
+          "editor_name": "Kimi Code CLI",
+          "rules_path": "~/.kimi-code/AGENTS.md",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "kimi",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            }
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "local"
+        },
+        "remote": {
+          "config_format": "json",
+          "config_path": "~/.kimi-code/mcp.json",
+          "editor": "kimi",
+          "editor_name": "Kimi Code CLI",
+          "rules_path": "~/.kimi-code/AGENTS.md",
+          "server_config": {
+            "headers": {
+              "X-ContextStream-API-Key": "test-key",
+              "X-ContextStream-Auto-Hide-Integrations": "true",
+              "X-ContextStream-Client": "kimi",
+              "X-ContextStream-Consolidated": "true",
+              "X-ContextStream-Context-Pack-Enabled": "true",
+              "X-ContextStream-Hook-Transcripts-Enabled": "true",
+              "X-ContextStream-Installation-Id": "00000000-0000-4000-8000-000000000062",
+              "X-ContextStream-Managed-Config-Version": "2",
+              "X-ContextStream-Output-Format": "compact",
+              "X-ContextStream-Progressive-Mode": "false",
+              "X-ContextStream-Project-Id": "proj-1",
+              "X-ContextStream-Router-Mode": "false",
+              "X-ContextStream-Search-Limit": "15",
+              "X-ContextStream-Search-Max-Chars": "2400",
+              "X-ContextStream-Teaching-Version": "harness_teaching_v4",
+              "X-ContextStream-Toolset": "complete",
+              "X-ContextStream-Transcripts-Enabled": "true",
+              "X-ContextStream-Workspace-Id": "ws-1"
+            },
+            "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "remote"
+        }
+      },
+      "paths": {
+        "cleanup_rules_global": [],
+        "cleanup_rules_project": [],
+        "legacy_mcp_config": [],
+        "legacy_rules_global": [],
+        "legacy_rules_project": [],
+        "mcp_config": "~/.kimi-code/mcp.json",
+        "project_mcp_config": "<project>/.kimi-code/mcp.json",
+        "rules_global": "~/.kimi-code/AGENTS.md",
+        "rules_project": "<project>/AGENTS.md"
+      },
+      "writes": {
+        "global_local": {
+          "~/.kimi-code/mcp.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"kimi\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "global_merge_existing": {
+          "~/.kimi-code/mcp.json": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"kimi\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    },\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n",
+          "~/.kimi-code/mcp.json.contextstream.bak": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n"
+        },
+        "global_remote": {
+          "~/.kimi-code/mcp.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"kimi\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        },
+        "project_local": {
+          "<project>/.kimi-code/mcp.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"kimi\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "project_remote": {
+          "<project>/.kimi-code/mcp.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"kimi\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        }
+      }
+    },
+    "muse": {
+      "flags": {
+        "deprecation_successor": null,
+        "display_name": "Muse Code",
+        "enforcement_tier": "TierC",
+        "has_hooks": false,
+        "has_mcp_transport": true,
+        "id": "muse",
+        "is_deprecated": false,
+        "mcp_root_key": "mcp_servers",
+        "reload_instruction": "Start a new Muse session in the intended checkout; `/mcp` shows server status and `muse mcp login contextstream` signs in without an API key.",
+        "supports_project_mcp_config": false,
+        "supports_remote": true,
+        "tool_surface_profile": null,
+        "uses_json_config": true,
+        "uses_vscode_settings": false
+      },
+      "generated": {
+        "local": {
+          "config_format": "json",
+          "config_path": "~/.config/muse/settings.json",
+          "editor": "muse",
+          "editor_name": "Muse Code",
+          "rules_path": "",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "enabled": true,
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "muse",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            },
+            "mode": "optional",
+            "transport": "stdio"
+          },
+          "supports_project_config": false,
+          "supports_remote": true,
+          "transport": "local"
+        },
+        "remote": {
+          "config_format": "json",
+          "config_path": "~/.config/muse/settings.json",
+          "editor": "muse",
+          "editor_name": "Muse Code",
+          "rules_path": "",
+          "server_config": {
+            "enabled": true,
+            "headers": {
+              "X-ContextStream-API-Key": "test-key",
+              "X-ContextStream-Auto-Hide-Integrations": "true",
+              "X-ContextStream-Client": "muse",
+              "X-ContextStream-Consolidated": "true",
+              "X-ContextStream-Context-Pack-Enabled": "true",
+              "X-ContextStream-Hook-Transcripts-Enabled": "true",
+              "X-ContextStream-Installation-Id": "00000000-0000-4000-8000-000000000062",
+              "X-ContextStream-Managed-Config-Version": "2",
+              "X-ContextStream-Output-Format": "compact",
+              "X-ContextStream-Progressive-Mode": "false",
+              "X-ContextStream-Project-Id": "proj-1",
+              "X-ContextStream-Router-Mode": "false",
+              "X-ContextStream-Search-Limit": "15",
+              "X-ContextStream-Search-Max-Chars": "2400",
+              "X-ContextStream-Teaching-Version": "harness_teaching_v4",
+              "X-ContextStream-Toolset": "complete",
+              "X-ContextStream-Transcripts-Enabled": "true",
+              "X-ContextStream-Workspace-Id": "ws-1"
+            },
+            "mode": "optional",
+            "transport": "streamable_http",
+            "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
+          },
+          "supports_project_config": false,
+          "supports_remote": true,
+          "transport": "remote"
+        }
+      },
+      "paths": {
+        "cleanup_rules_global": [],
+        "cleanup_rules_project": [],
+        "legacy_mcp_config": [],
+        "legacy_rules_global": [],
+        "legacy_rules_project": [],
+        "mcp_config": "~/.config/muse/settings.json",
+        "project_mcp_config": null,
+        "rules_global": null,
+        "rules_project": "<project>/AGENTS.md"
+      },
+      "writes": {
+        "global_local": {
+          "~/.config/muse/settings.json": "{\n  \"mcp_servers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"enabled\": true,\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"muse\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      },\n      \"mode\": \"optional\",\n      \"transport\": \"stdio\"\n    }\n  },\n  \"schema_version\": 1\n}\n"
+        },
+        "global_merge_existing": {
+          "~/.config/muse/settings.json": "{\n  \"userSetting\": true,\n  \"mcp_servers\": {\n    \"contextstream\": {\n      \"enabled\": true,\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"muse\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"mode\": \"optional\",\n      \"transport\": \"streamable_http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    },\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  },\n  \"schema_version\": 1\n}\n",
+          "~/.config/muse/settings.json.contextstream.bak": "{\n  \"userSetting\": true,\n  \"mcp_servers\": {\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n"
+        },
+        "global_remote": {
+          "~/.config/muse/settings.json": "{\n  \"mcp_servers\": {\n    \"contextstream\": {\n      \"enabled\": true,\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"muse\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"mode\": \"optional\",\n      \"transport\": \"streamable_http\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  },\n  \"schema_version\": 1\n}\n"
+        },
+        "project_local": {},
+        "project_remote": {}
+      }
+    },
     "opencode": {
       "flags": {
         "deprecation_successor": null,
@@ -1357,6 +2526,129 @@
         },
         "project_remote": {
           "<project>/opencode.json": "{\n  \"mcp\": {\n    \"contextstream\": {\n      \"enabled\": true,\n      \"headers\": {\n        \"X-ContextStream-Client\": \"opencode\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\"\n      },\n      \"type\": \"remote\",\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        }
+      }
+    },
+    "qwen": {
+      "flags": {
+        "deprecation_successor": null,
+        "display_name": "Qwen Code",
+        "enforcement_tier": "TierC",
+        "has_hooks": false,
+        "has_mcp_transport": true,
+        "id": "qwen",
+        "is_deprecated": false,
+        "mcp_root_key": "mcpServers",
+        "reload_instruction": "Exit Qwen Code, then restart it in the intended checkout.",
+        "supports_project_mcp_config": true,
+        "supports_remote": true,
+        "tool_surface_profile": null,
+        "uses_json_config": true,
+        "uses_vscode_settings": false
+      },
+      "generated": {
+        "local": {
+          "config_format": "json",
+          "config_path": "~/.qwen/settings.json",
+          "editor": "qwen",
+          "editor_name": "Qwen Code",
+          "rules_path": "~/.qwen/QWEN.md",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "qwen",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            }
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "local"
+        },
+        "remote": {
+          "config_format": "json",
+          "config_path": "~/.qwen/settings.json",
+          "editor": "qwen",
+          "editor_name": "Qwen Code",
+          "rules_path": "~/.qwen/QWEN.md",
+          "server_config": {
+            "headers": {
+              "X-ContextStream-API-Key": "test-key",
+              "X-ContextStream-Auto-Hide-Integrations": "true",
+              "X-ContextStream-Client": "qwen",
+              "X-ContextStream-Consolidated": "true",
+              "X-ContextStream-Context-Pack-Enabled": "true",
+              "X-ContextStream-Hook-Transcripts-Enabled": "true",
+              "X-ContextStream-Installation-Id": "00000000-0000-4000-8000-000000000062",
+              "X-ContextStream-Managed-Config-Version": "2",
+              "X-ContextStream-Output-Format": "compact",
+              "X-ContextStream-Progressive-Mode": "false",
+              "X-ContextStream-Project-Id": "proj-1",
+              "X-ContextStream-Router-Mode": "false",
+              "X-ContextStream-Search-Limit": "15",
+              "X-ContextStream-Search-Max-Chars": "2400",
+              "X-ContextStream-Teaching-Version": "harness_teaching_v4",
+              "X-ContextStream-Toolset": "complete",
+              "X-ContextStream-Transcripts-Enabled": "true",
+              "X-ContextStream-Workspace-Id": "ws-1"
+            },
+            "httpUrl": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "remote"
+        }
+      },
+      "paths": {
+        "cleanup_rules_global": [],
+        "cleanup_rules_project": [],
+        "legacy_mcp_config": [],
+        "legacy_rules_global": [],
+        "legacy_rules_project": [],
+        "mcp_config": "~/.qwen/settings.json",
+        "project_mcp_config": "<project>/.qwen/settings.json",
+        "rules_global": "~/.qwen/QWEN.md",
+        "rules_project": "<project>/QWEN.md"
+      },
+      "writes": {
+        "global_local": {
+          "~/.qwen/settings.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"qwen\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "global_merge_existing": {
+          "~/.qwen/settings.json": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"qwen\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"httpUrl\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    },\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n",
+          "~/.qwen/settings.json.contextstream.bak": "{\n  \"userSetting\": true,\n  \"mcpServers\": {\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n"
+        },
+        "global_remote": {
+          "~/.qwen/settings.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"qwen\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"httpUrl\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        },
+        "project_local": {
+          "<project>/.qwen/settings.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"qwen\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "project_remote": {
+          "<project>/.qwen/settings.json": "{\n  \"mcpServers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"qwen\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"httpUrl\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
         }
       }
     },
@@ -1610,6 +2902,253 @@
         "project_local": {},
         "project_remote": {}
       }
+    },
+    "zcode": {
+      "flags": {
+        "deprecation_successor": null,
+        "display_name": "ZCode",
+        "enforcement_tier": "TierC",
+        "has_hooks": false,
+        "has_mcp_transport": true,
+        "id": "zcode",
+        "is_deprecated": false,
+        "mcp_root_key": "mcp",
+        "reload_instruction": "Start a new ZCode session in the intended checkout; running sessions may not reload MCP servers.",
+        "supports_project_mcp_config": true,
+        "supports_remote": true,
+        "tool_surface_profile": null,
+        "uses_json_config": true,
+        "uses_vscode_settings": false
+      },
+      "generated": {
+        "local": {
+          "config_format": "json",
+          "config_path": "~/.zcode/cli/config.json",
+          "editor": "zcode",
+          "editor_name": "ZCode",
+          "rules_path": "~/.zcode/AGENTS.md",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "zcode",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            }
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "local"
+        },
+        "remote": {
+          "config_format": "json",
+          "config_path": "~/.zcode/cli/config.json",
+          "editor": "zcode",
+          "editor_name": "ZCode",
+          "rules_path": "~/.zcode/AGENTS.md",
+          "server_config": {
+            "headers": {
+              "X-ContextStream-API-Key": "test-key",
+              "X-ContextStream-Auto-Hide-Integrations": "true",
+              "X-ContextStream-Client": "zcode",
+              "X-ContextStream-Consolidated": "true",
+              "X-ContextStream-Context-Pack-Enabled": "true",
+              "X-ContextStream-Hook-Transcripts-Enabled": "true",
+              "X-ContextStream-Installation-Id": "00000000-0000-4000-8000-000000000062",
+              "X-ContextStream-Managed-Config-Version": "2",
+              "X-ContextStream-Output-Format": "compact",
+              "X-ContextStream-Progressive-Mode": "false",
+              "X-ContextStream-Project-Id": "proj-1",
+              "X-ContextStream-Router-Mode": "false",
+              "X-ContextStream-Search-Limit": "15",
+              "X-ContextStream-Search-Max-Chars": "2400",
+              "X-ContextStream-Teaching-Version": "harness_teaching_v4",
+              "X-ContextStream-Toolset": "complete",
+              "X-ContextStream-Transcripts-Enabled": "true",
+              "X-ContextStream-Workspace-Id": "ws-1"
+            },
+            "type": "http",
+            "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "remote"
+        }
+      },
+      "paths": {
+        "cleanup_rules_global": [],
+        "cleanup_rules_project": [],
+        "legacy_mcp_config": [],
+        "legacy_rules_global": [],
+        "legacy_rules_project": [],
+        "mcp_config": "~/.zcode/cli/config.json",
+        "project_mcp_config": "<project>/.zcode/config.json",
+        "rules_global": "~/.zcode/AGENTS.md",
+        "rules_project": "<project>/AGENTS.md"
+      },
+      "writes": {
+        "global_local": {
+          "~/.zcode/cli/config.json": "{\n  \"mcp\": {\n    \"servers\": {\n      \"contextstream\": {\n        \"args\": [],\n        \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n        \"env\": {\n          \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n          \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n          \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n          \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n          \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n          \"CONTEXTSTREAM_CLIENT\": \"zcode\",\n          \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n          \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n          \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n          \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n          \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n          \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n          \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n          \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n          \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n          \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n          \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n          \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n          \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n          \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n          \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n          \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n          \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n          \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n          \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n        }\n      }\n    }\n  }\n}\n"
+        },
+        "global_merge_existing": {
+          "~/.zcode/cli/config.json": "{\n  \"userSetting\": true,\n  \"mcp\": {\n    \"servers\": {\n      \"contextstream\": {\n        \"headers\": {\n          \"X-ContextStream-API-Key\": \"test-key\",\n          \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n          \"X-ContextStream-Client\": \"zcode\",\n          \"X-ContextStream-Consolidated\": \"true\",\n          \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n          \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n          \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n          \"X-ContextStream-Managed-Config-Version\": \"2\",\n          \"X-ContextStream-Output-Format\": \"compact\",\n          \"X-ContextStream-Progressive-Mode\": \"false\",\n          \"X-ContextStream-Project-Id\": \"proj-1\",\n          \"X-ContextStream-Router-Mode\": \"false\",\n          \"X-ContextStream-Search-Limit\": \"15\",\n          \"X-ContextStream-Search-Max-Chars\": \"2400\",\n          \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n          \"X-ContextStream-Toolset\": \"complete\",\n          \"X-ContextStream-Transcripts-Enabled\": \"true\",\n          \"X-ContextStream-Workspace-Id\": \"ws-1\"\n        },\n        \"type\": \"http\",\n        \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n      }\n    },\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n",
+          "~/.zcode/cli/config.json.contextstream.bak": "{\n  \"userSetting\": true,\n  \"mcp\": {\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n"
+        },
+        "global_remote": {
+          "~/.zcode/cli/config.json": "{\n  \"mcp\": {\n    \"servers\": {\n      \"contextstream\": {\n        \"headers\": {\n          \"X-ContextStream-API-Key\": \"test-key\",\n          \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n          \"X-ContextStream-Client\": \"zcode\",\n          \"X-ContextStream-Consolidated\": \"true\",\n          \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n          \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n          \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n          \"X-ContextStream-Managed-Config-Version\": \"2\",\n          \"X-ContextStream-Output-Format\": \"compact\",\n          \"X-ContextStream-Progressive-Mode\": \"false\",\n          \"X-ContextStream-Project-Id\": \"proj-1\",\n          \"X-ContextStream-Router-Mode\": \"false\",\n          \"X-ContextStream-Search-Limit\": \"15\",\n          \"X-ContextStream-Search-Max-Chars\": \"2400\",\n          \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n          \"X-ContextStream-Toolset\": \"complete\",\n          \"X-ContextStream-Transcripts-Enabled\": \"true\",\n          \"X-ContextStream-Workspace-Id\": \"ws-1\"\n        },\n        \"type\": \"http\",\n        \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n      }\n    }\n  }\n}\n"
+        },
+        "project_local": {
+          "<project>/.zcode/config.json": "{\n  \"mcp\": {\n    \"servers\": {\n      \"contextstream\": {\n        \"args\": [],\n        \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n        \"env\": {\n          \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n          \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n          \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n          \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n          \"CONTEXTSTREAM_CLIENT\": \"zcode\",\n          \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n          \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n          \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n          \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n          \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n          \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n          \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n          \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n          \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n          \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n          \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n          \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n          \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n          \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n          \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n          \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n          \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n          \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n          \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n        }\n      }\n    }\n  }\n}\n"
+        },
+        "project_remote": {
+          "<project>/.zcode/config.json": "{\n  \"mcp\": {\n    \"servers\": {\n      \"contextstream\": {\n        \"headers\": {\n          \"X-ContextStream-API-Key\": \"test-key\",\n          \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n          \"X-ContextStream-Client\": \"zcode\",\n          \"X-ContextStream-Consolidated\": \"true\",\n          \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n          \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n          \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n          \"X-ContextStream-Managed-Config-Version\": \"2\",\n          \"X-ContextStream-Output-Format\": \"compact\",\n          \"X-ContextStream-Progressive-Mode\": \"false\",\n          \"X-ContextStream-Project-Id\": \"proj-1\",\n          \"X-ContextStream-Router-Mode\": \"false\",\n          \"X-ContextStream-Search-Limit\": \"15\",\n          \"X-ContextStream-Search-Max-Chars\": \"2400\",\n          \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n          \"X-ContextStream-Toolset\": \"complete\",\n          \"X-ContextStream-Transcripts-Enabled\": \"true\",\n          \"X-ContextStream-Workspace-Id\": \"ws-1\"\n        },\n        \"type\": \"http\",\n        \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n      }\n    }\n  }\n}\n"
+        }
+      }
+    },
+    "zed": {
+      "flags": {
+        "deprecation_successor": null,
+        "display_name": "Zed",
+        "enforcement_tier": "TierC",
+        "has_hooks": false,
+        "has_mcp_transport": true,
+        "id": "zed",
+        "is_deprecated": false,
+        "mcp_root_key": "context_servers",
+        "reload_instruction": "Zed reloads MCP servers when settings change; reopen the intended checkout if the agent panel still shows the old servers.",
+        "supports_project_mcp_config": true,
+        "supports_remote": true,
+        "tool_surface_profile": null,
+        "uses_json_config": true,
+        "uses_vscode_settings": false
+      },
+      "generated": {
+        "local": {
+          "config_format": "json",
+          "config_path": "~/.config/zed/settings.json",
+          "editor": "zed",
+          "editor_name": "Zed",
+          "rules_path": "~/.config/zed/AGENTS.md",
+          "server_config": {
+            "args": [],
+            "command": "~/.contextstream/bin/contextstream-mcp",
+            "env": {
+              "CONTEXTSTREAM_ACCOUNT_MODE": "auto",
+              "CONTEXTSTREAM_ALLOW_HEADER_AUTH": "false",
+              "CONTEXTSTREAM_API_KEY": "test-key",
+              "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+              "CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS": "true",
+              "CONTEXTSTREAM_CLIENT": "zed",
+              "CONTEXTSTREAM_CONSOLIDATED": "true",
+              "CONTEXTSTREAM_CONTEXT_PACK": "true",
+              "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT": "true",
+              "CONTEXTSTREAM_INSTALLATION_ID": "00000000-0000-4000-8000-000000000062",
+              "CONTEXTSTREAM_LOG_LEVEL": "quiet",
+              "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+              "CONTEXTSTREAM_OUTPUT_FORMAT": "compact",
+              "CONTEXTSTREAM_PROGRESSIVE_MODE": "false",
+              "CONTEXTSTREAM_PROJECT_ID": "proj-1",
+              "CONTEXTSTREAM_ROUTER_MODE": "false",
+              "CONTEXTSTREAM_SEARCH_LIMIT": "15",
+              "CONTEXTSTREAM_SEARCH_MAX_CHARS": "2400",
+              "CONTEXTSTREAM_SHOW_TIMING": "false",
+              "CONTEXTSTREAM_TEACHING_VERSION": "harness_teaching_v4",
+              "CONTEXTSTREAM_TOOLSET": "complete",
+              "CONTEXTSTREAM_TRANSCRIPTS_ENABLED": "true",
+              "CONTEXTSTREAM_USER_AGENT": "contextstream-mcp-rust/1.0.8",
+              "CONTEXTSTREAM_WORKSPACE_ID": "ws-1"
+            }
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "local"
+        },
+        "remote": {
+          "config_format": "json",
+          "config_path": "~/.config/zed/settings.json",
+          "editor": "zed",
+          "editor_name": "Zed",
+          "rules_path": "~/.config/zed/AGENTS.md",
+          "server_config": {
+            "headers": {
+              "X-ContextStream-API-Key": "test-key",
+              "X-ContextStream-Auto-Hide-Integrations": "true",
+              "X-ContextStream-Client": "zed",
+              "X-ContextStream-Consolidated": "true",
+              "X-ContextStream-Context-Pack-Enabled": "true",
+              "X-ContextStream-Hook-Transcripts-Enabled": "true",
+              "X-ContextStream-Installation-Id": "00000000-0000-4000-8000-000000000062",
+              "X-ContextStream-Managed-Config-Version": "2",
+              "X-ContextStream-Output-Format": "compact",
+              "X-ContextStream-Progressive-Mode": "false",
+              "X-ContextStream-Project-Id": "proj-1",
+              "X-ContextStream-Router-Mode": "false",
+              "X-ContextStream-Search-Limit": "15",
+              "X-ContextStream-Search-Max-Chars": "2400",
+              "X-ContextStream-Teaching-Version": "harness_teaching_v4",
+              "X-ContextStream-Toolset": "complete",
+              "X-ContextStream-Transcripts-Enabled": "true",
+              "X-ContextStream-Workspace-Id": "ws-1"
+            },
+            "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast"
+          },
+          "supports_project_config": true,
+          "supports_remote": true,
+          "transport": "remote"
+        }
+      },
+      "paths": {
+        "cleanup_rules_global": [],
+        "cleanup_rules_project": [],
+        "legacy_mcp_config": [],
+        "legacy_rules_global": [],
+        "legacy_rules_project": [],
+        "mcp_config": "~/.config/zed/settings.json",
+        "project_mcp_config": "<project>/.zed/settings.json",
+        "rules_global": "~/.config/zed/AGENTS.md",
+        "rules_project": "<project>/AGENTS.md"
+      },
+      "writes": {
+        "global_local": {
+          "~/.config/zed/settings.json": "{\n  \"context_servers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_KEY\": \"test-key\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"zed\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "global_merge_existing": {
+          "~/.config/zed/settings.json": "{\n  \"userSetting\": true,\n  \"context_servers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"zed\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    },\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n",
+          "~/.config/zed/settings.json.contextstream.bak": "{\n  \"userSetting\": true,\n  \"context_servers\": {\n    \"user-server\": {\n      \"command\": \"user-command\"\n    }\n  }\n}\n"
+        },
+        "global_remote": {
+          "~/.config/zed/settings.json": "{\n  \"context_servers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"zed\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        },
+        "project_local": {
+          "<project>/.zed/settings.json": "{\n  \"context_servers\": {\n    \"contextstream\": {\n      \"args\": [],\n      \"command\": \"~/.contextstream/bin/contextstream-mcp\",\n      \"env\": {\n        \"CONTEXTSTREAM_ACCOUNT_MODE\": \"auto\",\n        \"CONTEXTSTREAM_ALLOW_HEADER_AUTH\": \"false\",\n        \"CONTEXTSTREAM_API_URL\": \"https://api.contextstream.io\",\n        \"CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS\": \"true\",\n        \"CONTEXTSTREAM_CLIENT\": \"zed\",\n        \"CONTEXTSTREAM_CONSOLIDATED\": \"true\",\n        \"CONTEXTSTREAM_CONTEXT_PACK\": \"true\",\n        \"CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_INCLUDE_STRUCTURED_CONTENT\": \"true\",\n        \"CONTEXTSTREAM_INSTALLATION_ID\": \"00000000-0000-4000-8000-000000000062\",\n        \"CONTEXTSTREAM_LOG_LEVEL\": \"quiet\",\n        \"CONTEXTSTREAM_MANAGED_CONFIG_VERSION\": \"2\",\n        \"CONTEXTSTREAM_OUTPUT_FORMAT\": \"compact\",\n        \"CONTEXTSTREAM_PROGRESSIVE_MODE\": \"false\",\n        \"CONTEXTSTREAM_PROJECT_ID\": \"proj-1\",\n        \"CONTEXTSTREAM_ROUTER_MODE\": \"false\",\n        \"CONTEXTSTREAM_SEARCH_LIMIT\": \"15\",\n        \"CONTEXTSTREAM_SEARCH_MAX_CHARS\": \"2400\",\n        \"CONTEXTSTREAM_SHOW_TIMING\": \"false\",\n        \"CONTEXTSTREAM_TEACHING_VERSION\": \"harness_teaching_v4\",\n        \"CONTEXTSTREAM_TOOLSET\": \"complete\",\n        \"CONTEXTSTREAM_TRANSCRIPTS_ENABLED\": \"true\",\n        \"CONTEXTSTREAM_USER_AGENT\": \"contextstream-mcp-rust/1.0.8\",\n        \"CONTEXTSTREAM_WORKSPACE_ID\": \"ws-1\"\n      }\n    }\n  }\n}\n"
+        },
+        "project_remote": {
+          "<project>/.zed/settings.json": "{\n  \"context_servers\": {\n    \"contextstream\": {\n      \"headers\": {\n        \"X-ContextStream-API-Key\": \"test-key\",\n        \"X-ContextStream-Auto-Hide-Integrations\": \"true\",\n        \"X-ContextStream-Client\": \"zed\",\n        \"X-ContextStream-Consolidated\": \"true\",\n        \"X-ContextStream-Context-Pack-Enabled\": \"true\",\n        \"X-ContextStream-Hook-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Installation-Id\": \"00000000-0000-4000-8000-000000000062\",\n        \"X-ContextStream-Managed-Config-Version\": \"2\",\n        \"X-ContextStream-Output-Format\": \"compact\",\n        \"X-ContextStream-Progressive-Mode\": \"false\",\n        \"X-ContextStream-Project-Id\": \"proj-1\",\n        \"X-ContextStream-Router-Mode\": \"false\",\n        \"X-ContextStream-Search-Limit\": \"15\",\n        \"X-ContextStream-Search-Max-Chars\": \"2400\",\n        \"X-ContextStream-Teaching-Version\": \"harness_teaching_v4\",\n        \"X-ContextStream-Toolset\": \"complete\",\n        \"X-ContextStream-Transcripts-Enabled\": \"true\",\n        \"X-ContextStream-Workspace-Id\": \"ws-1\"\n      },\n      \"url\": \"https://mcp.contextstream.io/mcp?default_context_mode=fast\"\n    }\n  }\n}\n"
+        }
+      }
     }
   },
   "schema": 1,
@@ -1623,6 +3162,17 @@
     "codex",
     "aider",
     "antigravity",
-    "opencode"
+    "opencode",
+    "muse",
+    "kimi",
+    "zcode",
+    "qwen",
+    "gemini",
+    "zed",
+    "claude-desktop",
+    "copilot-cli",
+    "droid",
+    "amp",
+    "crush"
   ]
 }

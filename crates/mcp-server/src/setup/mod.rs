@@ -1510,12 +1510,28 @@ async fn update_configs_scoped_with_interactivity(
             };
             match write_result {
                 Ok(()) => {
+                    // Some clients' config files cannot reach the hosted
+                    // server (Claude Desktop launches local servers only).
+                    let local_only =
+                        !use_local_transport && !mcp_config::editor_supports_remote_mcp(editor);
                     eprintln!(
                         "{} {} MCP config updated for {}",
                         CHECK,
-                        transport_label,
+                        if local_only {
+                            "Local binary"
+                        } else {
+                            transport_label
+                        },
                         editor.display_name()
                     );
+                    if local_only {
+                        eprintln!(
+                            "{} {} only launches local servers from its config file. {}",
+                            info_label(),
+                            editor.display_name(),
+                            editor.activation_reload_instruction()
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -2016,8 +2032,8 @@ pub async fn update_rules_scoped(
             }
         }
 
-        // Update project rules
-        if scope == "project" || scope == "all" {
+        // Update project rules (some clients, e.g. Claude Desktop, have none)
+        if (scope == "project" || scope == "all") && editor.rules_path(Some(&cwd)).is_some() {
             match rules::write_project_rules(
                 editor,
                 &cwd,
@@ -3620,7 +3636,9 @@ pub async fn configure_editor_with_workspace(
 
     // Generate project-level rules only after the caller authorized cwd as a
     // project. Global setup must not create AGENTS.md/CLAUDE.md in HOME.
-    if let Some(project_path) = project_path {
+    // Clients without project rules (Claude Desktop) are skipped.
+    if let Some(project_path) = project_path.filter(|path| editor.rules_path(Some(path)).is_some())
+    {
         match rules::write_project_rules(
             editor,
             project_path,

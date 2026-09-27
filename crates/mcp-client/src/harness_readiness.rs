@@ -23,7 +23,9 @@ use uuid::Uuid;
 pub const HARNESS_READINESS_LEDGER_SCHEMA_VERSION: u16 = 1;
 pub const HARNESS_READINESS_FILE_NAME: &str = "harness-readiness.json";
 const MAX_LEDGER_BYTES: u64 = 1024 * 1024;
-const MAX_HARNESSES: usize = 20;
+/// One ledger slot per canonical harness, so adding a harness can never make
+/// a machine's readiness state unwritable.
+const MAX_HARNESSES: usize = HarnessId::ALL.len();
 const MAX_EVIDENCE: usize = 512;
 const MAX_EVIDENCE_PER_HARNESS: usize = 48;
 const MAX_VERSION_BYTES: usize = 64;

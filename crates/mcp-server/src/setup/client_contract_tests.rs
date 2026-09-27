@@ -290,6 +290,17 @@ fn detection_matrix() -> Value {
         "antigravity",
         "agy",
         "opencode",
+        "muse",
+        "kimi",
+        "zcode",
+        "qwen",
+        "gemini",
+        "zed",
+        "zeditor",
+        "zedit",
+        "droid",
+        "amp",
+        "crush",
     ];
     const HOME_PATHS: &[&str] = &[
         ".claude/",
@@ -314,6 +325,17 @@ fn detection_matrix() -> Value {
         ".vscode/extensions/saoudrizwan.claude-dev-1.0.0/",
         ".vscode/extensions/rooveterinaryinc.roo-cline-1.0.0/",
         ".vscode/extensions/kilocode.kilo-code-1.0.0/",
+        ".config/muse/",
+        ".kimi-code/",
+        ".kimi/",
+        ".zcode/",
+        ".qwen/",
+        ".gemini/settings.json",
+        ".config/zed/",
+        ".config/Claude/",
+        ".factory/",
+        ".config/amp/",
+        ".config/crush/",
     ];
     let detect = |setup: &dyn Fn(&Sandbox)| {
         let sandbox = Sandbox::new();

@@ -433,10 +433,30 @@ fn host_probing_editors_are_detected_by_their_own_evidence() {
     }
 }
 
+/// The generated configs carry the binary's version in their User-Agent.
+/// It is replaced so a release bump alone never changes the contract.
+fn without_release_version(value: Value) -> Value {
+    let versioned = format!("contextstream-mcp-rust/{}", env!("CARGO_PKG_VERSION"));
+    match value {
+        Value::String(text) => {
+            Value::String(text.replace(&versioned, "contextstream-mcp-rust/<version>"))
+        }
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(without_release_version).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, item)| (key, without_release_version(item)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 #[test]
 fn client_contract_matches_blessed_snapshot() {
     let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
-    let actual = current_contract();
+    let actual = without_release_version(current_contract());
     let rendered = serde_json::to_string_pretty(&actual).expect("render contract") + "\n";
 
     if std::env::var_os(BLESS_ENV).is_some() {

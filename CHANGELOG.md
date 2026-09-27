@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.0.9
+
+- Setup: configures Muse Code, Kimi Code CLI, ZCode, Qwen Code, Gemini CLI,
+  Zed, Claude Desktop, GitHub Copilot CLI, Factory Droid, Amp, and Crush, 22
+  clients in all. Each gets its MCP config, instruction file, doctor checks,
+  and detection; Claude Desktop gets the local binary because its config file
+  only launches local servers (#129).
+- Setup: global configs land where each client reads them. Claude Code's user
+  scope moves to `~/.claude.json` (it never read `~/.claude/mcp.json`),
+  OpenCode to `~/.config/opencode/opencode.json`, and Antigravity to
+  `~/.gemini/config/mcp_config.json`. GitHub Copilot CLI is its own client.
+  Roo Code, which has shut down, is repaired and removed but no longer offered
+  (#127).
+- `contextstream-mcp clients --format json|markdown` prints every supported
+  client with its config paths, key path, and entry shape (#128, #133).
+  `docs/clients.md` lists them with one-line add commands and a VS Code
+  one-click install (#131).
+- Tools: every advertised tool schema uses only keywords all major model
+  providers accept, and long tool descriptions are summarized to at most 1024
+  characters with the full text kept on the main parameter. Kimi, GLM, Qwen,
+  Gemini, and OpenAI-compatible endpoints no longer reject ContextStream's tools
+  (#126).
+- Models: session analytics recognize GLM, Qwen, DeepSeek, MiniMax, newer Kimi,
+  Gemini 3, and Muse Spark, including vendor-prefixed ids such as
+  `openrouter/z-ai/glm-4.6`, and size context-pressure warnings to their
+  windows. Cursor, Codex, and VS Code are recognized by the names they report
+  at initialize (#130).
+- Hosted: the connection's client is forwarded to the API, so guidance names
+  tools the way that client does, and unrecognized client names are logged for
+  future support (#132, #134).
+- Hosted: the tenant-home scope header is relayed beside the home region it
+  describes (#125).
+- Search: the retired reranker-learning consent is no longer offered or
+  forwarded (#124).
+
 ## 1.0.8
 
 - Setup: onboarding takes one review screen. Setup reuses a working saved

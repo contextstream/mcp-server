@@ -515,7 +515,7 @@ fn existing_json_like_server_is_remote(existing_server: Option<&Value>) -> bool 
             .map(|value| value.to_ascii_lowercase()),
         Some(kind) if kind == "http" || kind == "remote"
     ) || existing_server
-        .and_then(|server| server.get("url"))
+        .and_then(|server| server.get("url").or_else(|| server.get("serverUrl")))
         .is_some()
 }
 
@@ -693,6 +693,7 @@ fn build_contextstream_server_json(
     if let Some(obj) = server.as_object_mut() {
         obj.remove("type");
         obj.remove("url");
+        obj.remove("serverUrl");
         obj.remove("headers");
     }
     server
@@ -704,6 +705,7 @@ fn resolved_remote_mcp_url(existing_server: Option<&Value>) -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .or_else(|| existing_server_string(existing_server, "url"))
+        .or_else(|| existing_server_string(existing_server, "serverUrl"))
         .unwrap_or_else(default_remote_mcp_url)
 }
 
@@ -849,6 +851,28 @@ fn build_remote_http_server_json(
     }
 
     server
+}
+
+/// Antigravity reads remote servers only from `serverUrl`: "Legacy fields like
+/// `url` or `httpUrl` are not supported" (antigravity.google/docs/mcp).
+fn antigravity_remote_server_json(mut server: Value) -> Value {
+    if let Some(obj) = server.as_object_mut() {
+        if let Some(url) = obj.remove("url") {
+            obj.insert("serverUrl".to_string(), url);
+        }
+        obj.remove("type");
+        obj.remove("httpUrl");
+    }
+    server
+}
+
+/// Reshape the shared remote entry for editors whose schema differs from the
+/// generic `{type: "http", url, headers}` form.
+fn shape_remote_server_for_editor(editor: &Editor, server: Value) -> Value {
+    match editor {
+        Editor::Antigravity => antigravity_remote_server_json(server),
+        _ => server,
+    }
 }
 
 fn default_tool_surface_profile_for_editor(editor: &Editor) -> Option<&'static str> {
@@ -1411,17 +1435,41 @@ fn generate_config_json_with_identity(
     );
     let use_remote = supports_remote && (!requested_local || !super::local_mcp_allowed());
 
-    let mut server_config = if use_remote {
-        build_remote_http_server_json(
+    // Mirror the per-editor writers exactly: install scripts paste this entry
+    // verbatim when server-side generation is unavailable.
+    let mut server_config = match (use_remote, editor) {
+        (true, Editor::OpenCode) => build_opencode_remote_server_json(None),
+        (true, Editor::KiloCode) => kilo_remote_server_json(build_remote_http_server_json(
             None,
             workspace_id,
             project_id,
             None,
             None,
             remote_auth_api_key,
-        )
-    } else {
-        build_contextstream_server_json(None, Some(api_key), workspace_id, project_id, None, None)
+        )),
+        (true, _) => shape_remote_server_for_editor(
+            editor,
+            build_remote_http_server_json(
+                None,
+                workspace_id,
+                project_id,
+                None,
+                None,
+                remote_auth_api_key,
+            ),
+        ),
+        (false, Editor::OpenCode) => build_opencode_server_json(None, Some(api_key), None),
+        (false, Editor::KiloCode) => {
+            build_kilo_server_json(None, Some(api_key), workspace_id, project_id, None, None)
+        }
+        (false, _) => build_contextstream_server_json(
+            None,
+            Some(api_key),
+            workspace_id,
+            project_id,
+            None,
+            None,
+        ),
     };
     apply_managed_config_metadata(editor, &mut server_config, identity);
 
@@ -1733,13 +1781,16 @@ fn build_json_like_server_for_editor_with_identity(
 ) -> Result<Value> {
     validate_existing_json_like_server(existing_server, "ContextStream MCP server entry")?;
     let mut server = if should_use_remote_http(editor, existing_server, transport_mode) {
-        build_remote_http_server_json(
-            existing_server,
-            workspace_id,
-            project_id,
-            transcripts_enabled,
-            hook_transcripts_enabled,
-            remote_auth_api_key,
+        shape_remote_server_for_editor(
+            editor,
+            build_remote_http_server_json(
+                existing_server,
+                workspace_id,
+                project_id,
+                transcripts_enabled,
+                hook_transcripts_enabled,
+                remote_auth_api_key,
+            ),
         )
     } else {
         build_contextstream_server_json(
@@ -1963,8 +2014,64 @@ fn write_mcp_config_with_transport_mode(
         ),
     };
     result?;
+    remove_contextstream_from_legacy_mcp_configs(editor);
     record_configured_evidence(editor);
     Ok(())
+}
+
+/// Strip a managed ContextStream entry from global config locations earlier
+/// releases wrote but the editor never reads. Best effort: a malformed or
+/// foreign legacy file must not fail a setup that already succeeded.
+fn remove_contextstream_from_legacy_mcp_configs(editor: &Editor) {
+    for path in editor.legacy_mcp_config_paths() {
+        if let Err(error) = remove_contextstream_from_mcp_config_at(editor, &path) {
+            tracing::warn!(
+                editor = editor.id(),
+                path = %path.display(),
+                error = %error,
+                "Could not clean up a legacy ContextStream MCP entry"
+            );
+        }
+    }
+}
+
+/// When the editor's real config has no ContextStream entry yet, carry the
+/// managed entry forward from a legacy location so user overrides (transcript
+/// opt-outs, search limits, pinned workspace) survive the path migration.
+/// Unmanaged or unreadable legacy entries are ignored, never trusted.
+fn legacy_managed_server_seed(editor: &Editor, root_key: &str) -> Option<Value> {
+    editor
+        .legacy_mcp_config_paths()
+        .into_iter()
+        .find_map(|path| {
+            let loaded = safe_edit::read_for_edit(&path, mcp_json_dialect(editor, &path)).ok()?;
+            let server = loaded.value.get(root_key)?.get("contextstream")?;
+            (server.is_object() && json_like_server_is_contextstream_managed(server))
+                .then(|| server.clone())
+        })
+}
+
+/// `~/.claude.json` is Claude Code's own state file: it is rewritten
+/// constantly, so a first-install copy can never be restored exactly and would
+/// only leave a stale duplicate of account state behind. Edit it without a
+/// recovery sidecar, keeping owner-only permissions.
+fn is_claude_user_state_file(editor: &Editor, path: &Path) -> bool {
+    matches!(editor, Editor::ClaudeCode)
+        && super::editors::claude_user_config_path().as_deref() == Some(path)
+}
+
+fn commit_mcp_config(
+    editor: &Editor,
+    path: &Path,
+    loaded: &safe_edit::LoadedConfig,
+    config: &Value,
+    removed_top_level_keys: &[&str],
+) -> Result<bool> {
+    if is_claude_user_state_file(editor, path) {
+        safe_edit::commit_private(path, loaded, config, removed_top_level_keys)
+    } else {
+        safe_edit::commit_with_removals(path, loaded, config, removed_top_level_keys)
+    }
 }
 
 fn record_configured_evidence(editor: &Editor) {
@@ -2136,7 +2243,10 @@ fn write_kilo_mcp_config(
 
     let existing_server = config
         .get("mcp")
-        .and_then(|servers| servers.get("contextstream"));
+        .and_then(|servers| servers.get("contextstream"))
+        .cloned()
+        .or_else(|| legacy_managed_server_seed(&Editor::KiloCode, "mcp"));
+    let existing_server = existing_server.as_ref();
     validate_existing_json_like_server(existing_server, "Kilo mcp.contextstream")?;
 
     let mut server = if should_use_remote_http(&Editor::KiloCode, existing_server, transport_mode) {
@@ -2336,7 +2446,10 @@ fn write_opencode_mcp_config(
 
     let existing_server = config
         .get("mcp")
-        .and_then(|servers| servers.get("contextstream"));
+        .and_then(|servers| servers.get("contextstream"))
+        .cloned()
+        .or_else(|| legacy_managed_server_seed(editor, "mcp"));
+    let existing_server = existing_server.as_ref();
     validate_existing_json_like_server(existing_server, "OpenCode mcp.contextstream")?;
     let mut server = if should_use_remote_http(editor, existing_server, transport_mode) {
         build_opencode_remote_server_json(existing_server)
@@ -2397,10 +2510,12 @@ fn write_json_mcp_config(
 
     let existing_server = config
         .get(root_key)
-        .and_then(|servers| servers.get("contextstream"));
+        .and_then(|servers| servers.get("contextstream"))
+        .cloned()
+        .or_else(|| legacy_managed_server_seed(editor, root_key));
     let server = build_json_like_server_for_editor_with_identity(
         editor,
-        existing_server,
+        existing_server.as_ref(),
         Some(api_key),
         workspace_id,
         project_id,
@@ -2419,7 +2534,7 @@ fn write_json_mcp_config(
         });
     }
 
-    safe_edit::commit(&path, &loaded, &config)?;
+    commit_mcp_config(editor, &path, &loaded, &config, &[])?;
 
     Ok(())
 }
@@ -4281,9 +4396,20 @@ pub fn remove_contextstream_from_mcp_config(editor: &Editor) -> Result<()> {
         return Ok(());
     }
 
-    let Some(path) = editor.mcp_config_path() else {
+    if let Some(path) = editor.mcp_config_path() {
+        remove_contextstream_from_mcp_config_at(editor, &path)?;
+    }
+    for path in editor.legacy_mcp_config_paths() {
+        remove_contextstream_from_mcp_config_at(editor, &path)?;
+    }
+    Ok(())
+}
+
+fn remove_contextstream_from_mcp_config_at(editor: &Editor, path: &Path) -> Result<()> {
+    if matches!(editor, Editor::Aider) {
         return Ok(());
-    };
+    }
+    let path = path.to_path_buf();
     if !path
         .try_exists()
         .with_context(|| format!("Could not inspect config {}", path.display()))?
@@ -4406,7 +4532,7 @@ pub fn remove_contextstream_from_mcp_config(editor: &Editor) -> Result<()> {
         {
             safe_edit::remove_owned_file_if_unchanged(&path, &loaded.raw)?;
         } else {
-            safe_edit::commit_with_removals(&path, &loaded, &config, &removed_top_level_keys)?;
+            commit_mcp_config(editor, &path, &loaded, &config, &removed_top_level_keys)?;
         }
         if backup_is_wholly_managed {
             if let Some(backup) = backup {
@@ -5701,12 +5827,12 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
         std::env::set_var("HOME", temp.path());
         let _xdg_guard = XdgConfigGuard::isolate_under(temp.path());
 
-        let claude_dir = temp.path().join(".claude");
-        std::fs::create_dir_all(&claude_dir).expect("create claude dir");
-        let config_path = claude_dir.join("mcp.json");
+        let config_path = temp.path().join(".claude.json");
         std::fs::write(
             &config_path,
             serde_json::to_string_pretty(&json!({
+                "numStartups": 42,
+                "primaryApiKey": "sk-claude-owned",
                 "mcpServers": {
                     "contextstream": {
                         "command": "/usr/local/bin/contextstream-mcp",
@@ -5745,6 +5871,12 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
         );
         assert_eq!(server["env"][ENV_SEARCH_LIMIT].as_str(), Some("21"));
         assert_eq!(server["env"][ENV_SEARCH_MAX_CHARS].as_str(), Some("4100"));
+        assert_eq!(value["numStartups"], json!(42));
+        assert_eq!(value["primaryApiKey"], json!("sk-claude-owned"));
+        assert!(
+            !safe_edit::backup_path(&config_path).unwrap().exists(),
+            "~/.claude.json may hold account secrets and must never get a recovery copy"
+        );
 
         if let Some(value) = previous_home {
             std::env::set_var("HOME", value);
@@ -5766,7 +5898,7 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
         write_mcp_config(&Editor::ClaudeCode, "test-key", Some("ws-id"), None)
             .expect("write claude config");
 
-        let config_path = temp.path().join(".claude").join("mcp.json");
+        let config_path = temp.path().join(".claude.json");
         let content = std::fs::read_to_string(&config_path).expect("read claude config");
         let value: serde_json::Value = serde_json::from_str(&content).expect("parse json");
         let server = &value["mcpServers"]["contextstream"];
@@ -5820,7 +5952,7 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
         )
         .expect("write claude config");
 
-        let config_path = temp.path().join(".claude").join("mcp.json");
+        let config_path = temp.path().join(".claude.json");
         let content = std::fs::read_to_string(&config_path).expect("read claude config");
         let value: serde_json::Value = serde_json::from_str(&content).expect("parse json");
         let server = &value["mcpServers"]["contextstream"];
@@ -6405,7 +6537,7 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
         )
         .expect("write claude config");
 
-        let config_path = temp.path().join(".claude").join("mcp.json");
+        let config_path = temp.path().join(".claude.json");
         let content = std::fs::read_to_string(&config_path).expect("read claude config");
         assert!(content.contains(r#""command":"#));
         assert!(content.contains(r#""env":"#));
@@ -6575,9 +6707,9 @@ url = "{}"
         std::env::set_var("HOME", temp.path());
         let _xdg_guard = XdgConfigGuard::isolate_under(temp.path());
 
-        let opencode_dir = temp.path().join(".opencode");
+        let opencode_dir = temp.path().join(".config").join("opencode");
         std::fs::create_dir_all(&opencode_dir).expect("create opencode dir");
-        let config_path = opencode_dir.join("mcp.json");
+        let config_path = opencode_dir.join("opencode.json");
         std::fs::write(
             &config_path,
             serde_json::to_string_pretty(&json!({
@@ -6731,9 +6863,10 @@ CONTEXTSTREAM_SEARCH_MAX_CHARS = "4100"
 
         let claude_dir = temp.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).expect("create claude dir");
-        let config_path = claude_dir.join("mcp.json");
+        let legacy_path = claude_dir.join("mcp.json");
+        let config_path = temp.path().join(".claude.json");
         std::fs::write(
-            &config_path,
+            &legacy_path,
             r#"{
   "mcpServers": {
     "contextstream": {
@@ -6764,6 +6897,10 @@ CONTEXTSTREAM_SEARCH_MAX_CHARS = "4100"
         assert!(content.contains(r#""X-ContextStream-API-Key": "test-key""#));
         assert!(content.contains(r#""X-ContextStream-Workspace-Id": "ws-id""#));
         assert!(content.contains(r#""X-ContextStream-Project-Id": "project-id""#));
+        assert!(
+            !legacy_path.exists(),
+            "the wholly managed legacy ~/.claude/mcp.json is removed after migration"
+        );
 
         if let Some(value) = previous_api_url {
             std::env::set_var("CONTEXTSTREAM_API_URL", value);
@@ -7147,14 +7284,16 @@ CONTEXTSTREAM_API_KEY = "test-key"
         let ag_path = temp
             .path()
             .join(".gemini")
-            .join("antigravity")
+            .join("config")
             .join("mcp_config.json");
         let content = std::fs::read_to_string(ag_path).expect("read antigravity config");
         let value: serde_json::Value = serde_json::from_str(&content).expect("parse json");
-        assert_eq!(
-            value["mcpServers"]["contextstream"]["type"].as_str(),
-            Some("http")
-        );
+        let server = &value["mcpServers"]["contextstream"];
+        // Antigravity rejects `url`/`httpUrl`; remote servers use `serverUrl`.
+        assert_eq!(server["serverUrl"], json!(default_remote_mcp_url()));
+        assert!(server.get("url").is_none());
+        assert!(server.get("type").is_none());
+        assert_eq!(server["headers"][HEADER_API_KEY].as_str(), Some("test-key"));
         assert_eq!(
             value["mcpServers"]["contextstream"]["headers"][HEADER_WORKSPACE_ID].as_str(),
             Some("ws-id")
@@ -7418,8 +7557,7 @@ CONTEXTSTREAM_API_KEY = "test-key"
         let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
         let _identity_persistence = ManagedIdentityPersistenceGuard::enabled();
 
-        let config_path = temp.path().join(".claude").join("mcp.json");
-        std::fs::create_dir_all(config_path.parent().unwrap()).expect("create config parent");
+        let config_path = temp.path().join(".claude.json");
         std::fs::write(
             &config_path,
             concat!(
@@ -7862,6 +8000,21 @@ CONTEXTSTREAM_API_KEY = "test-key"
                         root_key = root_key
                     )
                 }
+                // Claude Code writes ~/.claude.json itself with
+                // JSON.stringify(_, null, 2). It gets no recovery sidecar (it
+                // may hold account secrets), so exact restoration relies on the
+                // surgical splice reproducing that canonical layout.
+                Editor::ClaudeCode => concat!(
+                    "{\n",
+                    "  \"numStartups\": 3,\n",
+                    "  \"mcpServers\": {\n",
+                    "    \"user-server\": {\n",
+                    "      \"command\": \"user-command\"\n",
+                    "    }\n",
+                    "  }\n",
+                    "}\n"
+                )
+                .to_string(),
                 _ => {
                     let root_key = mcp_root_key(editor).expect("JSON root key");
                     format!(
@@ -7908,6 +8061,12 @@ CONTEXTSTREAM_API_KEY = "test-key"
                     editor.id()
                 );
             }
+            if matches!(editor, Editor::ClaudeCode) {
+                assert!(
+                    !safe_edit::backup_path(&path).unwrap().exists(),
+                    "~/.claude.json must never get a recovery copy"
+                );
+            }
 
             remove_contextstream_from_mcp_config(editor)
                 .unwrap_or_else(|error| panic!("{} uninstall failed: {error:#}", editor.id()));
@@ -7936,9 +8095,9 @@ CONTEXTSTREAM_API_KEY = "test-key"
         let _xdg_guard = XdgConfigGuard::isolate_under(temp.path());
         std::env::set_var("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
 
-        let config_path = temp.path().join(".claude").join("mcp.json");
+        let config_path = temp.path().join(".cursor").join("mcp.json");
         write_mcp_config_force_local(
-            &Editor::ClaudeCode,
+            &Editor::Cursor,
             "test-key",
             Some("first-workspace"),
             None,
@@ -7947,7 +8106,7 @@ CONTEXTSTREAM_API_KEY = "test-key"
         )
         .expect("first generated write");
         write_mcp_config_force_local(
-            &Editor::ClaudeCode,
+            &Editor::Cursor,
             "test-key",
             Some("second-workspace"),
             None,
@@ -7960,8 +8119,7 @@ CONTEXTSTREAM_API_KEY = "test-key"
             "refresh should have a classified intermediate backup"
         );
 
-        remove_contextstream_from_mcp_config(&Editor::ClaudeCode)
-            .expect("uninstall generated config");
+        remove_contextstream_from_mcp_config(&Editor::Cursor).expect("uninstall generated config");
 
         assert!(!config_path.exists());
         assert!(!safe_edit::backup_path(&config_path).unwrap().exists());
@@ -8136,7 +8294,7 @@ CONTEXTSTREAM_API_KEY = "test-key"
         std::env::set_var("HOME", temp.path());
         let _xdg_guard = XdgConfigGuard::isolate_under(temp.path());
 
-        let config_path = temp.path().join(".claude").join("mcp.json");
+        let config_path = temp.path().join(".claude.json");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let original = concat!(
             "{\n",
@@ -8370,5 +8528,274 @@ CONTEXTSTREAM_API_KEY = "test-key"
             backup_path.exists(),
             "a non-exact recovery snapshot must remain available"
         );
+    }
+
+    fn seed_json(path: &Path, value: &Value) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(path, safe_edit::to_pretty(value).expect("render")).expect("seed json");
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(path).expect("read json"))
+            .expect("parse json")
+    }
+
+    #[test]
+    fn claude_global_setup_migrates_legacy_entry_into_claude_json() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        let legacy = temp.path().join(".claude").join("mcp.json");
+        seed_json(
+            &legacy,
+            &json!({"mcpServers": {"contextstream": {
+                "command": "/usr/local/bin/contextstream-mcp",
+                "args": [],
+                "env": {
+                    ENV_MANAGED_CONFIG_VERSION: MANAGED_CONFIG_VERSION,
+                    ENV_TRANSCRIPTS_ENABLED: "false",
+                    ENV_SEARCH_LIMIT: "21"
+                }
+            }}}),
+        );
+        let claude_json = temp.path().join(".claude.json");
+        seed_json(
+            &claude_json,
+            &json!({"numStartups": 7, "mcpServers": {"user-server": {"command": "keep"}}}),
+        );
+
+        write_mcp_config_force_local(
+            &Editor::ClaudeCode,
+            "test-key",
+            Some("ws"),
+            None,
+            None,
+            None,
+        )
+        .expect("write claude config");
+
+        let value = read_json(&claude_json);
+        let server = &value["mcpServers"]["contextstream"];
+        assert_eq!(server["env"][ENV_TRANSCRIPTS_ENABLED], json!("false"));
+        assert_eq!(server["env"][ENV_SEARCH_LIMIT], json!("21"));
+        assert_eq!(value["mcpServers"]["user-server"]["command"], json!("keep"));
+        assert_eq!(value["numStartups"], json!(7));
+        assert!(!legacy.exists(), "wholly managed legacy file is removed");
+        assert!(!safe_edit::backup_path(&claude_json).unwrap().exists());
+    }
+
+    #[test]
+    fn legacy_cleanup_leaves_unowned_entries_untouched() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        let legacy = temp.path().join(".claude").join("mcp.json");
+        let original = "{\n  \"mcpServers\": {\n    \"contextstream\": { \"command\": \"/opt/user/cs\" }\n  }\n}\n";
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, original).unwrap();
+
+        write_mcp_config_force_remote_with_auth(
+            &Editor::ClaudeCode,
+            "test-key",
+            Some("ws"),
+            None,
+            None,
+            None,
+            Some("test-key"),
+        )
+        .expect("write claude config");
+
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), original);
+        let server =
+            read_json(&temp.path().join(".claude.json"))["mcpServers"]["contextstream"].clone();
+        assert_eq!(server["type"], json!("http"));
+        assert!(
+            server.get("command").is_none(),
+            "an unowned legacy entry is never used as a seed"
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_managed_entries_from_primary_and_legacy_paths() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        write_mcp_config_force_local(&Editor::ClaudeCode, "test-key", None, None, None, None)
+            .expect("write claude config");
+        // A stale entry reappears at the legacy path (e.g. an older binary ran).
+        let legacy = temp.path().join(".claude").join("mcp.json");
+        let claude_json = temp.path().join(".claude.json");
+        let managed = read_json(&claude_json)["mcpServers"]["contextstream"].clone();
+        seed_json(&legacy, &json!({"mcpServers": {"contextstream": managed}}));
+
+        remove_contextstream_from_mcp_config(&Editor::ClaudeCode).expect("uninstall");
+
+        assert!(
+            !claude_json.exists(),
+            "a ~/.claude.json we created alone is removed"
+        );
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn antigravity_setup_migrates_legacy_http_entry_to_server_url() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        let legacy = temp
+            .path()
+            .join(".gemini")
+            .join("antigravity")
+            .join("mcp_config.json");
+        seed_json(
+            &legacy,
+            &json!({"mcpServers": {"contextstream": {
+                "type": "http",
+                "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast",
+                "headers": {
+                    HEADER_MANAGED_CONFIG_VERSION: MANAGED_CONFIG_VERSION,
+                    HEADER_TRANSCRIPTS_ENABLED: "false"
+                }
+            }}}),
+        );
+
+        write_mcp_config(&Editor::Antigravity, "test-key", Some("ws"), None)
+            .expect("write antigravity config");
+
+        let path = temp
+            .path()
+            .join(".gemini")
+            .join("config")
+            .join("mcp_config.json");
+        let server = read_json(&path)["mcpServers"]["contextstream"].clone();
+        assert_eq!(server["serverUrl"], json!(default_remote_mcp_url()));
+        assert!(server.get("url").is_none());
+        assert!(server.get("type").is_none());
+        assert_eq!(
+            server["headers"][HEADER_TRANSCRIPTS_ENABLED],
+            json!("false")
+        );
+        assert!(!legacy.exists());
+
+        // Antigravity's workspace config uses the same shape.
+        let project = tempfile::tempdir().expect("project");
+        write_project_mcp_config_force_remote_with_auth(
+            &Editor::Antigravity,
+            project.path(),
+            "test-key",
+            Some("ws"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("write antigravity workspace config");
+        let workspace = read_json(&project.path().join(".agents").join("mcp_config.json"));
+        assert!(workspace["mcpServers"]["contextstream"]["serverUrl"].is_string());
+        assert!(workspace["mcpServers"]["contextstream"]
+            .get("url")
+            .is_none());
+    }
+
+    #[test]
+    fn opencode_setup_migrates_legacy_entry_to_xdg_config() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        let legacy = temp.path().join(".opencode").join("mcp.json");
+        seed_json(
+            &legacy,
+            &json!({
+                "$schema": OPENCODE_CONFIG_SCHEMA_URL,
+                "mcp": {"contextstream": {
+                    "type": "local",
+                    "command": ["/usr/local/bin/contextstream-mcp"],
+                    "environment": {
+                        ENV_MANAGED_CONFIG_VERSION: MANAGED_CONFIG_VERSION,
+                        ENV_SEARCH_LIMIT: "21"
+                    },
+                    "enabled": true
+                }}
+            }),
+        );
+
+        write_mcp_config(&Editor::OpenCode, "test-key", None, None).expect("write opencode config");
+
+        let path = temp
+            .path()
+            .join(".config")
+            .join("opencode")
+            .join("opencode.json");
+        let value = read_json(&path);
+        assert_eq!(value["mcp"]["contextstream"]["type"], json!("local"));
+        assert_eq!(
+            value["mcp"]["contextstream"]["environment"][ENV_SEARCH_LIMIT],
+            json!("21")
+        );
+        assert!(
+            !legacy.exists(),
+            "legacy file with only generated content is removed"
+        );
+    }
+
+    #[test]
+    fn generated_configs_match_each_editor_writer_shape() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+        let identity = ManagedConfigIdentity::default();
+
+        let remote = |editor: &Editor| {
+            generate_config_json_with_identity(
+                editor,
+                "key",
+                Some("ws"),
+                None,
+                "remote",
+                None,
+                &identity,
+            )["server_config"]
+                .clone()
+        };
+        assert_eq!(remote(&Editor::OpenCode)["type"], json!("remote"));
+        assert_eq!(remote(&Editor::KiloCode)["type"], json!("remote"));
+        assert!(remote(&Editor::Antigravity).get("serverUrl").is_some());
+        assert!(remote(&Editor::Antigravity).get("url").is_none());
+        assert_eq!(remote(&Editor::ClaudeCode)["type"], json!("http"));
+
+        let _local = EnvVarGuard::set("CONTEXTSTREAM_ALLOW_LOCAL_MCP", "1");
+        let local = |editor: &Editor| {
+            generate_config_json_with_identity(
+                editor,
+                "key",
+                Some("ws"),
+                None,
+                "local",
+                None,
+                &identity,
+            )["server_config"]
+                .clone()
+        };
+        assert_eq!(local(&Editor::OpenCode)["type"], json!("local"));
+        assert!(local(&Editor::OpenCode)["command"].is_array());
+        assert_eq!(local(&Editor::KiloCode)["type"], json!("local"));
+        assert!(local(&Editor::ClaudeCode)["command"].is_string());
     }
 }

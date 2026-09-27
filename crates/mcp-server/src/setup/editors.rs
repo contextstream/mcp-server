@@ -145,10 +145,41 @@ impl Editor {
         matches!(self.enforcement_tier(), EnforcementTier::TierA)
     }
 
+    /// Whether this editor is discontinued upstream.
+    ///
+    /// Deprecated editors are never offered for a new setup (selection or
+    /// detection), but existing installs stay fully maintainable: doctor,
+    /// hook refresh, update, and uninstall still reach them.
+    pub fn is_deprecated(&self) -> bool {
+        matches!(self, Editor::RooCode)
+    }
+
+    /// Where users of a deprecated editor should go instead.
+    pub fn deprecation_successor(&self) -> Option<Editor> {
+        match self {
+            // Roo Code shut down on 2026-05-15 and pointed users to Cline
+            // (docs.roocode.com/sunset).
+            Editor::RooCode => Some(Editor::Cline),
+            _ => None,
+        }
+    }
+
+    /// Editors a new setup may offer or auto-select.
+    pub fn selectable() -> Vec<Editor> {
+        Editor::all()
+            .iter()
+            .copied()
+            .filter(|editor| !editor.is_deprecated())
+            .collect()
+    }
+
     /// Get the MCP config file path for this editor.
     pub fn mcp_config_path(&self) -> Option<PathBuf> {
         match self {
-            Editor::ClaudeCode => dirs::home_dir().map(|h| h.join(".claude").join("mcp.json")),
+            // User-scoped Claude Code servers live in the top-level
+            // `mcpServers` of `~/.claude.json` (code.claude.com/docs/en/mcp).
+            // `~/.claude/mcp.json` is never read; see `legacy_mcp_config_paths`.
+            Editor::ClaudeCode => claude_user_config_path(),
             Editor::Cursor => dirs::home_dir().map(|h| h.join(".cursor").join("mcp.json")),
             Editor::Windsurf => dirs::home_dir()
                 .map(|h| h.join(".codeium").join("windsurf").join("mcp_config.json")),
@@ -179,16 +210,48 @@ impl Editor {
                 // Aider uses a YAML config
                 dirs::home_dir().map(|h| h.join(".aider.conf.yml"))
             }
-            Editor::Antigravity => dirs::home_dir().map(|h| {
-                h.join(".gemini")
-                    .join("antigravity")
-                    .join("mcp_config.json")
-            }),
-            Editor::OpenCode => {
-                // OpenCode uses a JSON config
-                dirs::home_dir().map(|h| h.join(".opencode").join("mcp.json"))
+            // Antigravity 2 (IDE and `agy` CLI) shares one global config
+            // (antigravity.google/docs/mcp).
+            Editor::Antigravity => {
+                dirs::home_dir().map(|h| h.join(".gemini").join("config").join("mcp_config.json"))
             }
+            // OpenCode reads `~/.config/opencode/opencode.json[c]`
+            // (opencode.ai/docs/config); reuse whichever variant exists.
+            Editor::OpenCode => opencode_config_dir().map(opencode_global_config_file),
         }
+    }
+
+    /// Global MCP config locations earlier releases wrote that the client
+    /// never reads (or no longer reads). They are cleanup-only: setup and
+    /// uninstall strip a managed ContextStream entry from them, and nothing
+    /// ever writes to them again.
+    pub fn legacy_mcp_config_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = match self {
+            Editor::ClaudeCode => dirs::home_dir()
+                .map(|h| vec![h.join(".claude").join("mcp.json")])
+                .unwrap_or_default(),
+            Editor::Antigravity => dirs::home_dir()
+                .map(|h| {
+                    vec![h
+                        .join(".gemini")
+                        .join("antigravity")
+                        .join("mcp_config.json")]
+                })
+                .unwrap_or_default(),
+            Editor::OpenCode => dirs::home_dir()
+                .map(|h| vec![h.join(".opencode").join("mcp.json")])
+                .unwrap_or_default(),
+            // Kilo reads `~/.config/kilo` on every OS. Earlier releases used the
+            // platform config dir, which differs on macOS and Windows.
+            Editor::KiloCode => dirs::config_dir()
+                .map(|dir| kilo_global_config_file(dir.join("kilo")))
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        };
+        let primary = self.mcp_config_path();
+        paths.retain(|path| Some(path) != primary.as_ref());
+        paths
     }
 
     /// Get the rules file path for this editor.
@@ -281,7 +344,9 @@ impl Editor {
                 if let Some(project) = project_path {
                     Some(project.join("AGENTS.md"))
                 } else {
-                    dirs::home_dir().map(|h| h.join(".opencode").join("AGENTS.md"))
+                    // opencode.ai/docs/rules: global rules live next to the
+                    // global config.
+                    opencode_config_dir().map(|d| d.join("AGENTS.md"))
                 }
             }
         }
@@ -344,15 +409,9 @@ impl Editor {
             Editor::Antigravity => project_path
                 .map(|p| vec![p.join(".agent").join("rules").join("contextstream.md")])
                 .unwrap_or_default(),
-            Editor::OpenCode => {
-                if let Some(project) = project_path {
-                    vec![project.join("AGENTS.override.md")]
-                } else {
-                    dirs::home_dir()
-                        .map(|h| vec![h.join(".opencode").join("AGENTS.override.md")])
-                        .unwrap_or_default()
-                }
-            }
+            Editor::OpenCode => project_path
+                .map(|project| vec![project.join("AGENTS.override.md")])
+                .unwrap_or_default(),
             Editor::Windsurf | Editor::Copilot | Editor::Aider => Vec::new(),
         }
     }
@@ -370,6 +429,14 @@ impl Editor {
             // we strip any stale ContextStream block but never recreate it.
             Editor::Cursor => project_path
                 .map(|p| vec![p.join(".cursorrules")])
+                .unwrap_or_default(),
+            // Earlier releases wrote global OpenCode rules under `~/.opencode`,
+            // which OpenCode never reads for AGENTS.md.
+            Editor::OpenCode if project_path.is_none() => dirs::home_dir()
+                .map(|h| {
+                    let legacy = h.join(".opencode");
+                    vec![legacy.join("AGENTS.md"), legacy.join("AGENTS.override.md")]
+                })
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
@@ -415,7 +482,8 @@ impl Editor {
             Editor::Codex => None, // Codex only supports global config
             Editor::Aider => None, // Aider doesn't use MCP
             Editor::OpenCode => Some(project_path.join("opencode.json")),
-            Editor::Antigravity => None,
+            // antigravity.google/docs/mcp: workspace servers.
+            Editor::Antigravity => Some(project_path.join(".agents").join("mcp_config.json")),
         }
     }
 
@@ -429,6 +497,7 @@ impl Editor {
                 | Editor::KiloCode
                 | Editor::RooCode
                 | Editor::OpenCode
+                | Editor::Antigravity
         )
     }
 
@@ -562,7 +631,16 @@ pub fn detect_installed_editors_json() -> serde_json::Value {
     })
 }
 
-/// Detect all installed editors.
+/// Installed editors a new setup may auto-select (discontinued ones excluded).
+pub fn detect_installed_editors_for_setup() -> Vec<Editor> {
+    detect_installed_editors()
+        .into_iter()
+        .filter(|editor| !editor.is_deprecated())
+        .collect()
+}
+
+/// Detect all installed editors, including discontinued ones so cleanup,
+/// doctor, and hook refresh can still reach existing installs.
 pub fn detect_installed_editors() -> Vec<Editor> {
     Editor::all()
         .iter()
@@ -800,14 +878,19 @@ pub fn is_aider_installed() -> bool {
     which::which("aider").is_ok()
 }
 
-/// Check if Antigravity is installed.
+/// Check if Antigravity (IDE or the `agy` CLI) is installed.
 pub fn is_antigravity_installed() -> bool {
-    if which::which("antigravity").is_ok() {
+    if which::which("antigravity").is_ok() || which::which("agy").is_ok() {
         return true;
     }
 
     if let Some(home) = dirs::home_dir() {
-        if home.join(".gemini").join("antigravity").exists() {
+        let gemini = home.join(".gemini");
+        // `~/.gemini/config/` is shared by Antigravity 2; a bare `~/.gemini`
+        // may belong to Gemini CLI alone, so it is not evidence.
+        if gemini.join("antigravity").exists()
+            || gemini.join("config").join("mcp_config.json").exists()
+        {
             return true;
         }
     }
@@ -821,6 +904,10 @@ pub fn is_opencode_installed() -> bool {
         return true;
     }
 
+    if opencode_config_dir().is_some_and(|dir| dir.exists()) {
+        return true;
+    }
+
     if let Some(home) = dirs::home_dir() {
         if home.join(".opencode").exists() {
             return true;
@@ -830,9 +917,41 @@ pub fn is_opencode_installed() -> bool {
     false
 }
 
+/// `$XDG_CONFIG_HOME`, else `~/.config`, on every OS.
+///
+/// Node CLIs built on xdg-basedir (OpenCode, Kilo) use this layout even on
+/// macOS and Windows, where the platform config dir (`dirs::config_dir`)
+/// points somewhere else.
+pub fn xdg_config_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+}
+
+/// Claude Code's user-scope state file, which holds user-scoped MCP servers.
+pub fn claude_user_config_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude.json"))
+}
+
+/// OpenCode global config directory (`~/.config/opencode/`).
+pub fn opencode_config_dir() -> Option<PathBuf> {
+    xdg_config_home().map(|c| c.join("opencode"))
+}
+
+/// Pick the OpenCode global config file, reusing `opencode.jsonc` when the
+/// user already has one so setup never creates a competing file.
+pub fn opencode_global_config_file(dir: PathBuf) -> PathBuf {
+    let jsonc = dir.join("opencode.jsonc");
+    if jsonc.exists() {
+        return jsonc;
+    }
+    dir.join("opencode.json")
+}
+
 /// Get Kilo CLI config directory (~/.config/kilo/).
 pub fn kilo_config_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|c| c.join("kilo"))
+    xdg_config_home().map(|c| c.join("kilo"))
 }
 
 /// Pick the Kilo global config file inside ~/.config/kilo/.
@@ -1105,24 +1224,106 @@ mod tests {
 
     #[test]
     fn test_antigravity_uses_gemini_global_mcp_config_path() {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = dirs::home_dir().expect("home dir");
         assert_eq!(
             Editor::Antigravity.mcp_config_path(),
-            Some(
-                home.join(".gemini")
-                    .join("antigravity")
-                    .join("mcp_config.json")
-            )
+            Some(home.join(".gemini").join("config").join("mcp_config.json"))
+        );
+        assert_eq!(
+            Editor::Antigravity.legacy_mcp_config_paths(),
+            vec![home
+                .join(".gemini")
+                .join("antigravity")
+                .join("mcp_config.json")]
         );
     }
 
     #[test]
-    fn test_antigravity_does_not_support_project_mcp_config() {
-        assert!(!Editor::Antigravity.supports_project_mcp_config());
+    fn test_antigravity_supports_workspace_mcp_config() {
+        assert!(Editor::Antigravity.supports_project_mcp_config());
         assert_eq!(
             Editor::Antigravity.project_mcp_config_path(Path::new("/tmp/project")),
-            None
+            Some(Path::new("/tmp/project/.agents/mcp_config.json").to_path_buf())
         );
+    }
+
+    #[test]
+    fn claude_code_user_scope_lives_in_claude_json() {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(
+            Editor::ClaudeCode.mcp_config_path(),
+            Some(home.join(".claude.json"))
+        );
+        assert_eq!(
+            Editor::ClaudeCode.legacy_mcp_config_paths(),
+            vec![home.join(".claude").join("mcp.json")]
+        );
+    }
+
+    #[test]
+    fn legacy_mcp_config_paths_never_include_the_primary_path() {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for editor in Editor::all() {
+            let primary = editor.mcp_config_path();
+            for legacy in editor.legacy_mcp_config_paths() {
+                assert_ne!(Some(&legacy), primary.as_ref(), "{}", editor.id());
+            }
+        }
+    }
+
+    #[test]
+    fn opencode_uses_xdg_config_home_and_reuses_jsonc() {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", temp.path());
+
+        let dir = temp.path().join("opencode");
+        assert_eq!(
+            Editor::OpenCode.mcp_config_path(),
+            Some(dir.join("opencode.json"))
+        );
+        assert_eq!(
+            Editor::OpenCode.rules_path(None),
+            Some(dir.join("AGENTS.md"))
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+        assert_eq!(
+            Editor::OpenCode.mcp_config_path(),
+            Some(dir.join("opencode.jsonc"))
+        );
+        let home = dirs::home_dir().expect("home dir");
+        assert!(Editor::OpenCode
+            .legacy_cleanup_only_rules_paths(None)
+            .contains(&home.join(".opencode").join("AGENTS.md")));
+
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    fn roo_code_is_deprecated_in_favor_of_cline() {
+        assert!(Editor::RooCode.is_deprecated());
+        assert_eq!(Editor::RooCode.deprecation_successor(), Some(Editor::Cline));
+        assert!(!Editor::selectable().contains(&Editor::RooCode));
+        // Existing installs stay reachable for doctor/uninstall.
+        assert!(Editor::all().contains(&Editor::RooCode));
+        for editor in Editor::selectable() {
+            assert!(!editor.is_deprecated());
+        }
     }
 
     #[test]

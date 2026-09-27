@@ -193,7 +193,7 @@ pub(super) async fn run(
         "Connect your editors",
         "Each one gets the ContextStream MCP server, rules, and hooks.",
     );
-    let detected = editors::detect_installed_editors();
+    let detected = editors::detect_installed_editors_for_setup();
     let editors = initial_editors(only, &detected)?;
     let transport = super::prompt_setup_transport_preference(&editors)?;
 
@@ -407,6 +407,7 @@ fn initial_editors(
                 super::selected_editors_summary(requested)
             )),
         );
+        super::warn_deprecated_editors(requested);
         return Ok(requested.to_vec());
     }
     if detected.is_empty() {

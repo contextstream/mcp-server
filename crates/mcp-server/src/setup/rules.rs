@@ -1179,6 +1179,15 @@ pub fn write_editor_rules(
         let _ = write_contextstream_block_to_path(legacy, &rules, false)?;
     }
 
+    // Strip stale blocks from global locations the editor never reads (e.g.
+    // `~/.opencode/AGENTS.md`) once the authoritative file is written.
+    for cleanup_path in editor.legacy_cleanup_only_rules_paths(None) {
+        if !cleanup_path.exists() {
+            continue;
+        }
+        let _ = remove_contextstream_from_path(&cleanup_path)?;
+    }
+
     // Keep a canonical global long-form rules file for Aider pointer-based loading.
     if *editor == Editor::Aider {
         if let Some(home) = dirs::home_dir() {

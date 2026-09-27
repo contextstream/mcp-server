@@ -721,7 +721,7 @@ Notes:
       - Ensure CONTEXTSTREAM_HOOK_ENABLED is not set to false
   - Antigravity troubleshooting:
       - Antigravity currently uses rules-only guidance (no lifecycle hooks)
-      - Verify ~/.gemini/antigravity/mcp_config.json contains contextstream
+      - Verify ~/.gemini/config/mcp_config.json contains contextstream (serverUrl)
       - Follow strict init() -> context() -> search(mode="auto") workflow
 
 Team workflows:

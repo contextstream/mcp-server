@@ -602,6 +602,23 @@ pub fn read_setup_transport_marker_result() -> Result<Option<SetupTransportPrefe
         })
 }
 
+/// Tell the operator an explicitly requested editor is discontinued upstream.
+/// The request is still honored so existing installs remain maintainable.
+pub(crate) fn warn_deprecated_editors(requested: &[editors::Editor]) {
+    for editor in requested.iter().filter(|editor| editor.is_deprecated()) {
+        let hint = editor
+            .deprecation_successor()
+            .map(|successor| {
+                format!(
+                    "discontinued upstream; consider {}",
+                    successor.display_name()
+                )
+            })
+            .unwrap_or_else(|| "discontinued upstream".to_string());
+        ui::say(ui::Mark::Warn, editor.display_name(), Some(&hint));
+    }
+}
+
 /// Resolve which editors a non-interactive hook refresh may touch.
 ///
 /// Hooks are written into shared, hand-maintained config files, so a refresh
@@ -2417,8 +2434,11 @@ async fn run_setup_noninteractive(
     // An explicit --editors list wins; otherwise fall back to detection, which
     // is the documented behaviour of `setup --yes`.
     let editors_to_configure = match only {
-        Some(list) => list.to_vec(),
-        None => editors::detect_installed_editors(),
+        Some(list) => {
+            warn_deprecated_editors(list);
+            list.to_vec()
+        }
+        None => editors::detect_installed_editors_for_setup(),
     };
     let cwd = std::env::current_dir()?;
     let project_path = resolve_setup_project_path(&cwd, explicit_project_path, account_only)?;

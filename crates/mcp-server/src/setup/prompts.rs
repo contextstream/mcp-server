@@ -105,7 +105,7 @@ pub fn select_editors_with_defaults(
     detected: &[Editor],
     current: &[Editor],
 ) -> Result<Vec<Editor>> {
-    let (all_editors, options, _) = build_editor_selection_model(detected);
+    let (all_editors, options, _) = build_editor_selection_model(detected, current);
     let defaults: Vec<bool> = all_editors
         .iter()
         .map(|editor| current.contains(editor))
@@ -125,14 +125,25 @@ pub fn select_editors_with_defaults(
     Ok(indices.into_iter().map(|i| all_editors[i]).collect())
 }
 
-fn build_editor_selection_model(detected: &[Editor]) -> (Vec<Editor>, Vec<String>, Vec<bool>) {
-    let all_editors = Editor::all().to_vec();
+/// Selectable editors, plus any discontinued editor the user already chose so
+/// re-running setup never silently drops an existing install.
+fn build_editor_selection_model(
+    detected: &[Editor],
+    current: &[Editor],
+) -> (Vec<Editor>, Vec<String>, Vec<bool>) {
+    let all_editors: Vec<Editor> = Editor::all()
+        .iter()
+        .copied()
+        .filter(|editor| !editor.is_deprecated() || current.contains(editor))
+        .collect();
     let mut options = Vec::with_capacity(all_editors.len());
     let mut defaults = Vec::with_capacity(all_editors.len());
 
     for editor in &all_editors {
-        let is_detected = detected.contains(editor);
-        if is_detected {
+        let is_detected = detected.contains(editor) && !editor.is_deprecated();
+        if editor.is_deprecated() {
+            options.push(format!("{} · discontinued", editor.display_name()));
+        } else if is_detected {
             options.push(format!("{} · detected", editor.display_name()));
         } else {
             options.push(editor.display_name().to_string());
@@ -214,9 +225,9 @@ mod tests {
     #[test]
     fn test_build_editor_selection_model_defaults() {
         let detected = [Editor::ClaudeCode, Editor::Codex];
-        let (all_editors, options, defaults) = build_editor_selection_model(&detected);
+        let (all_editors, options, defaults) = build_editor_selection_model(&detected, &[]);
 
-        assert_eq!(all_editors.len(), Editor::all().len());
+        assert_eq!(all_editors, Editor::selectable());
         assert_eq!(options.len(), all_editors.len());
         assert_eq!(defaults.len(), all_editors.len());
 
@@ -239,5 +250,25 @@ mod tests {
 
         assert!(options[claude_idx].ends_with(" · detected"));
         assert_eq!(options[cursor_idx], Editor::Cursor.display_name());
+    }
+
+    #[test]
+    fn discontinued_editors_are_offered_only_when_already_chosen() {
+        let detected = [Editor::RooCode, Editor::Cline];
+        let (fresh, _, _) = build_editor_selection_model(&detected, &[]);
+        assert!(!fresh.contains(&Editor::RooCode));
+        assert!(fresh.contains(&Editor::Cline));
+
+        let (existing, options, defaults) =
+            build_editor_selection_model(&detected, &[Editor::RooCode]);
+        let roo_idx = existing
+            .iter()
+            .position(|editor| *editor == Editor::RooCode)
+            .expect("an existing Roo selection stays visible");
+        assert!(options[roo_idx].ends_with(" · discontinued"));
+        assert!(
+            !defaults[roo_idx],
+            "detection never pre-selects a discontinued editor"
+        );
     }
 }

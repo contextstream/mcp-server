@@ -27,7 +27,7 @@ Create your account or sign in during MCP onboarding. No separate website signup
 **macOS and Linux**
 
 ```sh
-bash -o pipefail -c 'curl -fsSL https://contextstream.io/scripts/mcp.sh | bash'
+curl -fsSL https://contextstream.io/scripts/mcp.sh | bash
 ```
 
 **Windows PowerShell**
@@ -102,10 +102,15 @@ contextstream-mcp doctor --scope=all --only-configured
 
 ### Scripted and CI setup
 
-`pipefail` makes the install command fail when the download fails, instead of
-reporting success after installing nothing. `setup --yes` reads the key from
-`CONTEXTSTREAM_API_KEY` or saved credentials, and needs `--workspace-id` when
-the account has more than one workspace:
+For automation, wrap the install in `pipefail` so it fails when the download
+fails, instead of reporting success after installing nothing:
+
+```bash
+bash -o pipefail -c 'curl -fsSL https://contextstream.io/scripts/mcp.sh | bash'
+```
+
+`setup --yes` reads the key from `CONTEXTSTREAM_API_KEY` or saved credentials,
+and needs `--workspace-id` when the account has more than one workspace:
 
 ```bash
 export CONTEXTSTREAM_API_KEY=...   # or: printf %s "$KEY" | contextstream-mcp configure --api-key-stdin

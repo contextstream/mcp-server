@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.10
+
+- Dependencies: Rust dependencies updated, including axum 0.8, schemars 1.2,
+  notify 8, jsonwebtoken 11, tower-http 0.7, dirs 7, dialoguer 0.12, and
+  toml_edit 0.25 (#90). The MCP wire contract is unchanged from 1.0.9: the
+  same 35 tools with identical names, descriptions, and input schemas, and the
+  same HTTP routes.
+- The npm "Homepage" link and the README web link now open the MCP landing
+  page, and the README shows the hosted endpoint as
+  `https://mcp.contextstream.io/mcp?default_context_mode=fast` (#136).
+
 ## 1.0.9
 
 - Setup: configures Muse Code, Kimi Code CLI, ZCode, Qwen Code, Gemini CLI,
@@ -34,6 +45,9 @@
   describes (#125).
 - Search: the retired reranker-learning consent is no longer offered or
   forwarded (#124).
+- Search reports an index's age from the committed-index time when result
+  rows carry no ingest time, so an index built on another machine is no longer
+  labelled "recent" while days old (#123).
 
 ## 1.0.8
 

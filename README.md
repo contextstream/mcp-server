@@ -42,7 +42,7 @@ project and supported editor. Restart your editor after setup.
 [What gets installed and indexed?](docs/data-handling.md) ·
 [Supported clients](docs/clients.md) ·
 [Setup guide](https://contextstream.io/docs/editors/setup) ·
-[Prefer to start on the web?](https://contextstream.io/signup)
+[Prefer to start on the web?](https://contextstream.io/lp/mcp-marketplace?utm_source=github&utm_medium=directory&utm_campaign=mcp_organic_2026q3&utm_content=card_cta)
 
 ## Make the next session useful
 
@@ -84,7 +84,7 @@ its SHA-256 checksum. Pin an exact package version for production automation.
 For clients supporting Streamable HTTP and OAuth, the hosted endpoint is:
 
 ```text
-https://mcp.contextstream.io/mcp
+https://mcp.contextstream.io/mcp?default_context_mode=fast
 ```
 
 [Supported clients](docs/clients.md) lists one-line add commands for Claude

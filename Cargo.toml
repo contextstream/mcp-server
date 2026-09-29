@@ -78,7 +78,7 @@ phf = { version = "0.14", features = ["macros"] }
 regex-lite = "0.1"
 sha2 = "0.11"
 hex = "0.4"
-tiktoken-rs = "=0.12.0"
+tiktoken-rs = "=0.12.1"
 
 # Environment and config
 dotenvy = "0.15"

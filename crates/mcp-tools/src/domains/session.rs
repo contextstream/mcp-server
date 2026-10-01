@@ -2236,6 +2236,20 @@ fn restore_context_was_successful(result: &Value) -> bool {
         .unwrap_or(false)
 }
 
+async fn fresh_account_learning_status(client: &ContextStreamClient) -> Value {
+    let learning = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.account_learning_status(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
+    match learning.and_then(|v| v.get("enabled").and_then(Value::as_bool)) {
+        Some(enabled) => serde_json::json!({"enabled": enabled, "status_only": true}),
+        None => serde_json::json!({"status": "unavailable", "status_only": true}),
+    }
+}
+
 #[async_trait]
 impl ToolHandler for InitTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
@@ -2295,7 +2309,8 @@ impl ToolHandler for InitTool {
         );
 
         // Fast-path: if session is already initialized and force is not set,
-        // return cached session state without making an API call (~0ms vs ~400ms).
+        // return cached session scope without repeating its API lookups. The
+        // account-learning choice is still read afresh with a bounded timeout.
         //
         // Exception: when the caller passes `folder_path`, ALWAYS re-resolve.
         // The cached state may be from a stale prior binding (e.g., a pre-fix
@@ -2347,6 +2362,7 @@ impl ToolHandler for InitTool {
                     "folder_path": state.folder_path,
                     "session_id": state.session_id,
                     "cached": true,
+                    "account_learning": fresh_account_learning_status(&self.client).await,
                 });
                 return Ok(ToolResult::with_structured(text, structured));
             }
@@ -2910,18 +2926,7 @@ impl ToolHandler for InitTool {
 
         // Read afresh on init only. This fact cannot grant consent and never
         // inherits cached account state from a previous initialization.
-        let learning = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.client.account_learning_status(),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok);
-        result["account_learning"] =
-            match learning.and_then(|v| v.get("enabled").and_then(Value::as_bool)) {
-                Some(enabled) => serde_json::json!({"enabled": enabled, "status_only": true}),
-                None => serde_json::json!({"status": "unavailable", "status_only": true}),
-            };
+        result["account_learning"] = fresh_account_learning_status(&self.client).await;
 
         // Auto-index: trigger background ingest when index is missing, aging, stale,
         // or the local worktree has changes newer than the last local ingest.
@@ -17412,5 +17417,61 @@ mod proactive_vcs_scope_tests {
     fn missing_workspace_never_allows_vcs_fallback() {
         assert!(!proactive_vcs_scope_allowed(None, None));
         assert!(!proactive_vcs_scope_allowed(None, Some(Uuid::new_v4())));
+    }
+}
+
+#[cfg(test)]
+mod account_learning_status_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn cached_init_observes_consent_withdrawal_without_changing_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for enabled in [true, false] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0, "connection closed before request headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(request.len() <= 8192);
+                }
+                assert!(String::from_utf8_lossy(&request)
+                    .starts_with("GET /api/v1/users/me/learning-consent "));
+                let body = serde_json::json!({"data":{"enabled":enabled}}).to_string();
+                stream
+                    .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = Config {
+            api_url: format!("http://{address}"),
+            api_key: Some("cbiq_test-only".into()),
+            ..Config::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        let workspace = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        session
+            .initialize(Some(workspace), Some(project), None, None)
+            .await;
+        let tool = InitTool::new(client, session);
+        for enabled in [true, false] {
+            let result = tool
+                .execute(serde_json::json!({"workspace_id":workspace,"project_id":project}))
+                .await
+                .unwrap();
+            let data = result.structured_content.unwrap();
+            assert_eq!(data["cached"], true);
+            assert_eq!(data["account_learning"]["enabled"], enabled);
+            assert_eq!(data["account_learning"]["status_only"], true);
+        }
+        server.await.unwrap();
     }
 }

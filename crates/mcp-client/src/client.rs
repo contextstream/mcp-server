@@ -23404,8 +23404,8 @@ mod tests {
 
     #[test]
     fn search_bodies_never_carry_retired_rerank_learning_fields() {
-        // The learned relevance ranking is retired: no search endpoint body may carry
-        // its consent flag or correlation id, and every search stays cacheable
+        // Legacy search-learning request fields remain retired: no endpoint may
+        // carry their consent flag or correlation id. Search stays cacheable
         // under the ordinary project-scope rule.
         for endpoint in ["hybrid", "semantic", "keyword", "refactor", "guided"] {
             let body = SearchParams {

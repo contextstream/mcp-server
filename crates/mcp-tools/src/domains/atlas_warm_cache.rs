@@ -854,7 +854,7 @@ fn hash_query_for_scope(query: Option<&str>) -> String {
     }
 }
 
-/// Variable-length Neo4j graph queries (impact / call_path /
+/// Variable-length relationship storage graph queries (impact / call_path /
 /// circular_dependencies / unused_code) cache PER TARGET — each
 /// query about a different code element is a different question. A
 /// per-workspace snapshot would conflate them. Key shape:

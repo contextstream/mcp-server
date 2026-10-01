@@ -17,6 +17,14 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class PublicBoundaryTest(unittest.TestCase):
+    def test_private_search_names_are_rejected_in_public_comments_and_copy(self) -> None:
+        for name in ("Voyage", "neo4j", "QDRANT"):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "public.rs").write_text(f'// Service uses {name}\n', encoding="utf-8")
+                with self.assertRaisesRegex(boundary.BoundaryError, "private search/storage"):
+                    boundary.verify_paths_and_source(root)
+
     def test_repository_satisfies_public_boundary(self) -> None:
         self.assertEqual(boundary.verify(REPOSITORY_ROOT), "1.0.10")
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Optional account learning starts off. Interactive setup offers a separate review,
+  while plain `setup --yes` preserves the account’s choice. `setup` and `configure`
+  accept `--account-learning on|off`: on opens the dashboard for human consent; off
+  withdraws directly. Doctor and init report status without opting anyone in.
+
+
 ## 1.0.10
 
 - Dependencies: Rust dependencies updated, including axum 0.8, schemars 1.2,
@@ -43,7 +51,7 @@
   future support (#132, #134).
 - Hosted: the tenant-home scope header is relayed beside the home region it
   describes (#125).
-- Search: the retired reranker-learning consent is no longer offered or
+- Search: the retired search-learning consent is no longer offered or
   forwarded (#124).
 - Search reports an index's age from the committed-index time when result
   rows carry no ingest time, so an index built on another machine is no longer

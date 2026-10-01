@@ -2908,6 +2908,21 @@ impl ToolHandler for InitTool {
             ),
         );
 
+        // Read afresh on init only. This fact cannot grant consent and never
+        // inherits cached account state from a previous initialization.
+        let learning = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.client.account_learning_status(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        result["account_learning"] =
+            match learning.and_then(|v| v.get("enabled").and_then(Value::as_bool)) {
+                Some(enabled) => serde_json::json!({"enabled": enabled, "status_only": true}),
+                None => serde_json::json!({"status": "unavailable", "status_only": true}),
+            };
+
         // Auto-index: trigger background ingest when index is missing, aging, stale,
         // or the local worktree has changes newer than the last local ingest.
         // On first init: auto-index if missing or aging (>4h).

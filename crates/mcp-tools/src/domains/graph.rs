@@ -278,7 +278,7 @@ pub struct GraphDependenciesTool {
     session: Arc<SessionManager>,
     /// Legacy no-op layer retained for read-through compatibility via
     /// `AtlasWarmCacheKind::DependencyResult`
-    /// (2-min TTL). Highest-volume Neo4j-touching graph endpoint, with
+    /// (2-min TTL). Highest-volume relationship storage-touching graph endpoint, with
     /// the agentic-burst access pattern: agents revisit the same
     /// (target_type, target_id, depth, transitive) tuple multiple
     /// times in a single tool-use loop.
@@ -373,7 +373,7 @@ impl ToolHandler for GraphDependenciesTool {
             include_transitive: input.include_transitive,
         };
 
-        // Highest-volume Neo4j endpoint (~17.5K calls/day vs the rest
+        // Highest-volume relationship storage endpoint (~17.5K calls/day vs the rest
         // combined). Cache the (workspace, project, target_type,
         // target, depth, transitive) tuple in the regional warm cache
         // (DependencyResult kind, 2-min TTL — covers the agentic-burst
@@ -655,7 +655,7 @@ impl ToolHandler for GraphImpactTool {
 
         // A8b: try the regional warm cache for this exact (workspace,
         // project, target_id) tuple. graph_impact is variable-length
-        // Neo4j; cache hit serves <30ms vs primary's variable spike.
+        // relationship storage; cache hit serves <30ms vs primary's variable spike.
         // Lookup hard-capped at 50ms; cache miss = primary unchanged.
         let cache_target = input.target_id.clone();
         let cached_impact = if let Some(ws) = scope.workspace_id {
@@ -2365,7 +2365,7 @@ impl ToolHandler for GraphTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "graph".to_string(),
             title: "Code Graph Analysis".to_string(),
-            description: "Code graph structural analysis and Code Health dashboard retrieval. NOT for searching code by content/keywords (use the 'search' tool for that). Actions: dependencies (module deps), impact (change impact), call_path (function call path), related (related graph nodes), path (path between nodes), decisions (decisions linked to a graph node), ingest (build graph), outbox_status and outbox_canary (Neo4j graph outbox operations), circular_dependencies, unused_code, complexity_metrics, quality_trends, quality_history, quality_freshness, quality_snapshot, contradictions, usages (reverse deps — find all files that use/render a component, type, or function). Use the quality_* actions when the user asks for dashboard Code Health data, scan history, trends, freshness, or recommendations.".to_string(),
+            description: "Code graph structural analysis and Code Health dashboard retrieval. NOT for searching code by content/keywords (use the 'search' tool for that). Actions: dependencies (module deps), impact (change impact), call_path (function call path), related (related graph nodes), path (path between nodes), decisions (decisions linked to a graph node), ingest (build graph), outbox_status and outbox_canary (relationship storage graph outbox operations), circular_dependencies, unused_code, complexity_metrics, quality_trends, quality_history, quality_freshness, quality_snapshot, contradictions, usages (reverse deps — find all files that use/render a component, type, or function). Use the quality_* actions when the user asks for dashboard Code Health data, scan history, trends, freshness, or recommendations.".to_string(),
             category: ToolCategory::Graph,
             // The unified surface includes ingest, outbox canary, and
             // quality_snapshot actions. Dedicated query-only graph tools remain
@@ -2513,7 +2513,7 @@ pub fn register_graph_tools(
 ) {
     // Snapshot the atlas layer so every cache-aware tool can route
     // through the regional warm cache:
-    //   - GraphTool / GraphImpactTool — variable-length Neo4j via
+    //   - GraphTool / GraphImpactTool — variable-length relationship storage via
     //     SubgraphSnapshot (15-min TTL)
     //   - GraphDependenciesTool — highest-volume endpoint via
     //     DependencyResult (2-min TTL, agentic-burst pattern)

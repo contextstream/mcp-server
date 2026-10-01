@@ -3176,7 +3176,7 @@ mod tests {
 
     #[test]
     fn no_tool_surface_mentions_the_retired_reranker() {
-        // The learned reranker and its learning consent are retired. No listed
+        // The learned relevance ranking and its learning consent are retired. No listed
         // tool or router operation may advertise either to an agent.
         for config in [
             Config::default(),
@@ -3202,7 +3202,7 @@ mod tests {
                 let serialized = serde_json::to_string(&surface).unwrap().to_lowercase();
                 assert!(
                     !serialized.contains("rerank"),
-                    "tool surface still mentions the retired reranker: {}",
+                    "tool surface still mentions the retired relevance ranking: {}",
                     surface["name"]
                 );
             }

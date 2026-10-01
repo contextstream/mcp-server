@@ -3,7 +3,7 @@
 //! This crate is compiled only behind `mcp-server`'s
 //! `remote-acceleration` feature. It must never depend on `mongodb` or
 //! `bson`; providers call ContextStream server APIs backed by
-//! Postgres, Redis, R2, Qdrant, Neo4j, and Cloudflare.
+//! Postgres, Redis, R2, search storage, relationship storage, and Cloudflare.
 
 pub mod analytics;
 pub mod archive;

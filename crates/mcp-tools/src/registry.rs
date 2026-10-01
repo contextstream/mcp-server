@@ -1165,7 +1165,7 @@ mod acceleration_observation_tests {
             acceleration_observation_action("project", &json!({"action": "index"})),
             None
         );
-        // The retired reranker-learning consent no longer bypasses the
+        // The retired relevance ranking-learning consent no longer bypasses the
         // rendered result cache: a legacy call is an ordinary search.
         assert_eq!(
             acceleration_observation_request(

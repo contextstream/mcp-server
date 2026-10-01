@@ -7,6 +7,7 @@ setup wizard prints the same material before it writes configuration.
 
 | Flow | Default | Data sent | Control |
 |---|---:|---|---|
+| Account learning | off for new accounts | Context-use and feedback signals in the hosted account, only after separate consent | Account → Privacy; `configure --account-learning off` withdraws. An explicit `--account-learning on` opens browser consent. Plain `setup --yes` preserves the current choice |
 | MCP transcript exchange saving | on | User/assistant exchanges supplied to `context` when transcript saving applies | `CONTEXTSTREAM_TRANSCRIPTS_ENABLED=false` or `contextstream-mcp configure --transcripts off` |
 | Hook transcript saving | on | Supported editor lifecycle exchange payloads | `CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED=false` or `contextstream-mcp configure --hook-transcripts off` |
 | Project indexing | setup-dependent | Files matched after ignore rules, plus index metadata | Skip indexing; add `.contextstream/ignore`; use `project(action="purge")` to de-index server-side content |
@@ -44,3 +45,17 @@ in the user cache. Cache files are not transcript or project content.
 
 Hosted-service retention, account deletion, and subprocessors are governed by
 the current ContextStream privacy documentation and account controls.
+
+## Optional account learning
+
+Your signed-in dashboard shows the current server consent text, with a checkbox
+that starts unchecked. The CLI cannot grant consent and the MCP tools expose no
+consent mutation. `setup` and `configure` accept `--account-learning on|off`: on
+opens Account → Privacy for you to read and confirm; off withdraws using your
+saved credentials. Dry-run changes neither the account nor browser state.
+
+Collection stops immediately on withdrawal. Learned history and generated
+learning items are queued for deletion in live systems within 30 days. Ordinary
+content you saved remains. Learned data is never sold or used to train AI models.
+Learning events and signals have a 180-day retention window; consent audit records
+document your choice. A reconnect does not opt you in or reset your choice.

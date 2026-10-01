@@ -322,7 +322,7 @@ pub enum AtlasStreamEventKind {
     /// An MCP tool call completed. Used for live "what just happened"
     /// signals and per-workspace tool-usage aggregation.
     ToolCall,
-    /// The authoritative Neo4j graph changed. Atlas Stream Processing
+    /// The authoritative relationship storage graph changed. Atlas Stream Processing
     /// consumers use this as a cache invalidation/materialization signal
     /// for regional graph serving collections, not as the graph write log.
     GraphChanged,
@@ -534,7 +534,7 @@ pub enum AtlasVectorError {
 // - `context()` coding-task: 1428ms p50, 1514ms p95 → context_warm_bundles
 // - `memory(list_events)`: 125ms p50, 134ms p95 → memory_events_hot
 // - `graph_impact`/`graph_call_path`/`graph_circular_dependencies`/
-//   `graph_unused_code`: variable-length Neo4j → subgraph_snapshots
+//   `graph_unused_code`: variable-length relationship storage → subgraph_snapshots
 //   (already populated by A5's `refresh-subgraph-snapshot` trigger)
 
 /// Which warm-cache collection a lookup targets.
@@ -548,7 +548,7 @@ pub enum AtlasWarmCacheKind {
     /// for `memory(list_events)`. Refreshed by
     /// `pipeline-memory-events-hot`.
     MemoryEventsHot,
-    /// Per-workspace subgraph snapshot for variable-length Neo4j
+    /// Per-workspace subgraph snapshot for variable-length relationship storage
     /// queries (impact/call_path/circular_dependencies/unused_code).
     /// Already refreshed by A5's `refresh-subgraph-snapshot` trigger.
     SubgraphSnapshot,
@@ -687,10 +687,10 @@ impl AtlasWarmCacheKind {
         }
     }
 
-    /// True for cache rows derived from the Neo4j project graph.
+    /// True for cache rows derived from the relationship storage project graph.
     ///
     /// These caches must also consult `graph_dirty_scopes` on read:
-    /// their own TTL may still be valid, but a newer Neo4j graph
+    /// their own TTL may still be valid, but a newer relationship storage graph
     /// build makes the cached payload stale immediately.
     pub fn is_graph_derived(&self) -> bool {
         matches!(
@@ -1235,8 +1235,8 @@ pub trait AtlasTriggersProvider: Send + Sync {
 // batch operations on **Atlas-resident** data (transcripts / decisions
 // / lessons / docs mirrored via CDC, plus Online Archive). We
 // **deliberately do not** route work that is already handled by the
-// ContextStream server's Voyage Large 4 + Qdrant pipeline (semantic
-// search, rerank) or its Neo4j graph (PageRank, impact analysis) —
+// ContextStream server's search processing + search storage pipeline (semantic
+// search, rerank) or its relationship storage graph (PageRank, impact analysis) —
 // duplicating those would create the same drift A3 / A5 narrowed away
 // from. Scope: Atlas-only data, Atlas-only work.
 //
@@ -1447,7 +1447,7 @@ pub enum AtlasFunctionsError {
 /// The provider's job is narrow: insert into `jobs` (the trigger does
 /// the actual work), then read `jobs` + `job_results` for status +
 /// pagination. It deliberately does NOT route work the ContextStream
-/// server's existing Voyage / Qdrant / Neo4j stack already handles.
+/// server's existing search provider / search storage / relationship storage stack already handles.
 #[async_trait::async_trait]
 pub trait AtlasFunctionsProvider: Send + Sync {
     /// Submit a new job. Returns immediately once the doc is

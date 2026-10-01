@@ -6,6 +6,7 @@
 //! - Workspace and project setup
 //! - AI rules generation
 
+pub mod account_learning;
 pub mod clients;
 mod credentials;
 pub mod doctor;
@@ -2397,10 +2398,34 @@ pub async fn run_setup_wizard_with_options(
     account_only: bool,
     workspace_id: Option<&str>,
 ) -> Result<()> {
+    run_setup_with_learning_choice(
+        non_interactive,
+        only,
+        project_path,
+        account_only,
+        workspace_id,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Explicit learning choices are handled once by the caller after setup saves.
+/// A cancelled wizard returns false so the caller performs no follow-up action.
+pub async fn run_setup_with_learning_choice(
+    non_interactive: bool,
+    only: Option<&[editors::Editor]>,
+    project_path: Option<&Path>,
+    account_only: bool,
+    workspace_id: Option<&str>,
+    learning_choice: Option<bool>,
+) -> Result<bool> {
     if non_interactive {
-        run_setup_noninteractive(only, project_path, account_only, workspace_id).await
+        run_setup_noninteractive(only, project_path, account_only, workspace_id)
+            .await
+            .map(|_| true)
     } else {
-        wizard::run(only, project_path, account_only).await
+        wizard::run(only, project_path, account_only, learning_choice).await
     }
 }
 
@@ -2781,7 +2806,7 @@ fn disclosure_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn data_collection_points(non_interactive: bool) -> [String; 5] {
+fn data_collection_points(non_interactive: bool) -> [String; 6] {
     let transcripts = disclosure_env_bool("CONTEXTSTREAM_TRANSCRIPTS_ENABLED", true);
     let hook_transcripts = disclosure_env_bool("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED", true);
     let git_capture = crate::config::git_capture_default_enabled();
@@ -2792,6 +2817,7 @@ fn data_collection_points(non_interactive: bool) -> [String; 5] {
     };
 
     [
+        "Account learning is optional and starts off. Only you can consent in Account → Privacy. Plain setup --yes preserves your choice. Use --account-learning on to open consent, or configure --account-learning off to withdraw.".to_string(),
         format!("Transcript exchange saving default: {transcripts}. Change with `contextstream-mcp configure --transcripts on|off`."),
         format!("Hook transcript saving default: {hook_transcripts}. Change with `contextstream-mcp configure --hook-transcripts on|off`."),
         format!("Project indexing {index_behavior}; matched source files are sent to your ContextStream workspace. Exclude files with `.contextstream/ignore`; de-index with `project(action=\"purge\")`."),

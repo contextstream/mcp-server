@@ -144,3 +144,12 @@ Use the pinned Rust toolchain. For contribution checks and commit sign-off, read
 [Pricing](https://contextstream.io/pricing) ·
 [Integrations](https://contextstream.io/integrations) ·
 [Benchmarks](https://contextstream.io/benchmarks)
+
+### Optional account learning
+
+Account learning starts off for new accounts. Plain `contextstream-mcp setup --yes`
+preserves your current choice. To review consent, run
+`contextstream-mcp configure --account-learning on` and confirm on the signed-in
+privacy page. To withdraw, run `contextstream-mcp configure --account-learning off`.
+Agents cannot consent for you. Doctor and init show status only. See
+[data handling and controls](docs/data-handling.md).

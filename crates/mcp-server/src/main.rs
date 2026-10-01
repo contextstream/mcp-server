@@ -111,6 +111,10 @@ enum Commands {
         #[arg(long, short = 'y', alias = "non-interactive")]
         yes: bool,
 
+        /// Optional learning: on opens human consent; off withdraws. Omitted preserves your choice.
+        #[arg(long, value_enum)]
+        account_learning: Option<ToggleValue>,
+
         /// One-time setup token from the web "build your context engine"
         /// flow — runs the branded non-interactive installer for the
         /// editors/workspace chosen in the questionnaire
@@ -380,6 +384,10 @@ enum Commands {
         /// Print configurable options and exit
         #[arg(long)]
         list_options: bool,
+
+        /// Optional learning: on opens human consent; off withdraws.
+        #[arg(long, value_enum, conflicts_with_all = ["list_options", "api_key_stdin"])]
+        account_learning: Option<ToggleValue>,
 
         /// Verify an API key read from stdin and save it to the credentials
         /// file. Prompts without echo on a terminal. Reading stdin keeps the
@@ -883,6 +891,7 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
         }
         Some(Commands::Setup {
             yes,
+            account_learning,
             profile,
             profile_file,
             editors,
@@ -916,19 +925,28 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                     account_only,
                 )
                 .await
+                .map(|_| true)
             } else {
-                setup::run_setup_wizard_with_options(
+                setup::run_setup_with_learning_choice(
                     yes,
                     explicit.as_deref(),
                     project_path.as_deref(),
                     account_only,
                     workspace_id.as_deref(),
+                    account_learning.map(|choice| choice.as_bool()),
                 )
                 .await
             };
-            if let Err(e) = result {
-                eprintln!("Setup failed: {}", e);
-                std::process::exit(1);
+            match result {
+                Ok(false) => return Ok(()),
+                Err(e) => {
+                    eprintln!("Setup failed: {}", e);
+                    std::process::exit(1);
+                }
+                Ok(true) => {}
+            }
+            if let Some(choice) = account_learning {
+                setup::account_learning::configure(choice.as_bool()).await?;
             }
             // Validate hooks after setup without rewriting MCP configs. Scoped
             // to the selection setup just recorded, so declining every editor
@@ -1129,6 +1147,7 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
 
         Some(Commands::Configure {
             list_options,
+            account_learning,
             api_key_stdin,
             transcripts,
             hook_transcripts,
@@ -1145,6 +1164,12 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                     std::process::exit(1);
                 }
             };
+            if let Some(choice) = account_learning {
+                setup::account_learning::configure(choice.as_bool()).await?;
+                if transcripts.is_none() && hook_transcripts.is_none() {
+                    return Ok(());
+                }
+            }
             if api_key_stdin {
                 if explicit.is_some() || only_configured || dry_run {
                     eprintln!(
@@ -2246,6 +2271,7 @@ fn print_configure_options() {
     eprintln!("  - hooks: reinstall hook scripts");
     eprintln!("  - rules: regenerate AI rule files");
     eprintln!("  - mcp-configs: regenerate MCP config files");
+    eprintln!("  - account-learning: review consent or withdraw (--account-learning on|off)");
     eprintln!("  - transcripts: default transcript policy for new chats (--transcripts on|off)");
     eprintln!();
     eprintln!("Save an existing API key without the browser flow:");
@@ -3835,6 +3861,41 @@ mod tests {
             "--account-only",
         ]);
         assert!(conflict.is_err());
+    }
+
+    #[test]
+    fn account_learning_requires_an_explicit_choice_and_yes_preserves_it() {
+        let cli = Cli::try_parse_from(["contextstream-mcp", "setup", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Setup {
+                account_learning: None,
+                ..
+            })
+        ));
+        for command in ["setup", "configure"] {
+            assert!(Cli::try_parse_from([
+                "contextstream-mcp",
+                command,
+                "--account-learning",
+                "on"
+            ])
+            .is_ok());
+            assert!(Cli::try_parse_from([
+                "contextstream-mcp",
+                command,
+                "--account-learning",
+                "off"
+            ])
+            .is_ok());
+            assert!(Cli::try_parse_from([
+                "contextstream-mcp",
+                command,
+                "--account-learning",
+                "true"
+            ])
+            .is_err());
+        }
     }
 
     #[test]

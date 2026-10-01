@@ -3722,6 +3722,23 @@ impl ContextStreamClient {
         self.get("/auth/me").await
     }
 
+    /// Read account learning without changing consent or caching its state.
+    pub async fn account_learning_status(&self) -> Result<serde_json::Value> {
+        self.get("/users/me/learning-consent").await
+    }
+
+    /// Withdrawal is safe for API-key clients. Granting consent is deliberately
+    /// absent from this client and from the MCP tool surface.
+    pub async fn withdraw_account_learning(&self) -> Result<serde_json::Value> {
+        self.put(
+            "/users/me/learning-consent",
+            serde_json::json!({
+                "enabled": false, "surface": "cli_configure"
+            }),
+        )
+        .await
+    }
+
     /// Start device login flow.
     pub async fn start_device_login(&self) -> Result<serde_json::Value> {
         self.post("/auth/device/start", serde_json::json!({})).await
@@ -4774,7 +4791,7 @@ impl ContextStreamClient {
     }
 
     /// Fully purge a project's index: deletes file_indices (cascading to
-    /// code_chunks), index_states/history, the Qdrant collection + vectors, and
+    /// code_chunks), index_states/history, the search storage collection + vectors, and
     /// S3-stored file objects. The project record itself is preserved. Use this
     /// to completely de-index accidentally-ingested content.
     pub async fn purge_project_index(&self, id: Uuid) -> Result<serde_json::Value> {
@@ -12859,7 +12876,7 @@ impl ContextStreamClient {
         self.post(&format!("/graph/ingest/{}", proj_id), body).await
     }
 
-    /// Get Neo4j graph outbox status.
+    /// Get relationship storage graph outbox status.
     pub async fn graph_outbox_status(
         &self,
         _workspace_id: Option<Uuid>,
@@ -12874,7 +12891,7 @@ impl ContextStreamClient {
         self.get(&format!("/graph/outbox/{}/status", proj_id)).await
     }
 
-    /// Enqueue a Neo4j graph outbox canary rebuild.
+    /// Enqueue a relationship storage graph outbox canary rebuild.
     pub async fn graph_outbox_canary(
         &self,
         _workspace_id: Option<Uuid>,
@@ -20300,6 +20317,37 @@ mod tests {
         (ContextStreamClient::new(config), server)
     }
 
+    #[tokio::test]
+    async fn account_learning_status_is_fresh_and_withdrawal_never_grants() {
+        let (client, server) = client_with_http_sequence(vec![
+            ("200 OK", r#"{"data":{"enabled":true}}"#.into()),
+            ("200 OK", r#"{"data":{"enabled":false}}"#.into()),
+            ("200 OK", r#"{"data":{"enabled":false}}"#.into()),
+        ])
+        .await;
+        assert_eq!(
+            client.account_learning_status().await.unwrap()["enabled"],
+            true
+        );
+        assert_eq!(
+            client.account_learning_status().await.unwrap()["enabled"],
+            false
+        );
+        assert_eq!(
+            client.withdraw_account_learning().await.unwrap()["enabled"],
+            false
+        );
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("GET /api/v1/users/me/learning-consent "));
+        assert!(requests[1].starts_with("GET /api/v1/users/me/learning-consent "));
+        assert!(requests[2].starts_with("PUT /api/v1/users/me/learning-consent "));
+        let body: serde_json::Value =
+            serde_json::from_str(requests[2].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["enabled"], false);
+        assert_eq!(body["surface"], "cli_configure");
+        assert!(body.get("consent_version").is_none());
+    }
+
     /// Serve raw HTTP responses in order and report how many requests
     /// arrived within `window`, so tests can prove a call was not retried.
     async fn client_with_raw_responses(
@@ -23356,7 +23404,7 @@ mod tests {
 
     #[test]
     fn search_bodies_never_carry_retired_rerank_learning_fields() {
-        // The learned reranker is retired: no search endpoint body may carry
+        // The learned relevance ranking is retired: no search endpoint body may carry
         // its consent flag or correlation id, and every search stays cacheable
         // under the ordinary project-scope rule.
         for endpoint in ["hybrid", "semantic", "keyword", "refactor", "guided"] {

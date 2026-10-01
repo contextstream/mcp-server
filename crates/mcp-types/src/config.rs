@@ -464,7 +464,7 @@ impl TrafficClass {
     }
 }
 
-/// The region nearest to the caller, as the Cloudflare edge computed it from the
+/// The region nearest to the caller, as the network edge computed it from the
 /// request's geography (`X-ContextStream-Suggested-Home-Region`). The hosted
 /// gateway forwards it on every API call so the API records the client's
 /// nearest region per request and homes a NEW tenant there. Only the canonical

@@ -45,6 +45,8 @@ SOURCE_SUFFIXES = {
     ".yml",
 }
 FORBIDDEN_SOURCE_PATTERNS = {
+    "private search/storage implementation": re.compile(r"\b(?:Voyage|Neo4j|Qdrant)\b", re.IGNORECASE),
+    "private edge implementation": re.compile(r"Cloudflare\s+edge", re.IGNORECASE),
     "excluded Atlas crate": re.compile(r"mcp[-_]atlas[-_]products"),
     "excluded Atlas feature": re.compile(r"atlas-products"),
     "private operator connection": re.compile(r"MONGODB_ATLAS_URI"),
@@ -198,7 +200,11 @@ def verify_paths_and_source(root: Path) -> None:
         except (OSError, UnicodeError) as error:
             raise BoundaryError(f"Could not inspect {relative}: {error}") from error
         for label, pattern in FORBIDDEN_SOURCE_PATTERNS.items():
-            if pattern.search(contents):
+            inspected = contents
+            if label == "private search/storage implementation":
+                # Negative disclosure assertions test API descriptions rather than publish copy.
+                inspected = re.sub(r'(?m)^\s*assert!\(!low\.contains\("(?:voyage|qdrant)"\).*\n?', "", contents)
+            if pattern.search(inspected):
                 violations.append(f"{relative}: {label}")
         unknown_uuids = sorted(
             {

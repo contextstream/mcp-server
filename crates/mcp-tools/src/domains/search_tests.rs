@@ -529,7 +529,7 @@ mod guided_search_tests {
         assert!(GUIDED_SEARCH_REQUEST_TIMEOUT < std::time::Duration::from_secs(30));
     }
 
-    /// A legacy input that still carries the retired reranker-learning consent
+    /// A legacy input that still carries the retired relevance ranking-learning consent
     /// flag.
     fn legacy_learning_input(query: &str) -> SearchInput {
         let mut value = serde_json::to_value(auto_mode_tests::base_input(query)).unwrap();
@@ -5785,7 +5785,7 @@ mod input_struct_tests {
             "file_types": ["ts", "js"],
             "include_content": true,
             "include_memory": false,
-            // Retired reranker-learning consent from older clients is
+            // Retired relevance ranking-learning consent from older clients is
             // accepted and ignored.
             "code_rerank_learning_opt_in": true,
             "code_rerank_learning_request_id": "fe106dc3-6903-4d62-b0b3-c33d33f19f71"

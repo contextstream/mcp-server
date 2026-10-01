@@ -68,7 +68,7 @@ terminal-colorsaurus = "1.0.3"
 [features]
 # Adds the MongoDB-free acceleration-layer foundation for the remote
 # HTTP gateway. Providers are wired incrementally through server APIs,
-# Redis, R2, Qdrant, Neo4j, and Cloudflare; this feature must not pull
+# Redis, R2, search storage, relationship storage, and Cloudflare; this feature must not pull
 # `mongodb` or `bson` into the dependency tree.
 remote-acceleration = ["dep:mcp-acceleration-products"]
 

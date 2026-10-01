@@ -137,6 +137,7 @@ struct Choices {
     workspace: Option<WorkspaceInfo>,
     project: ProjectPlan,
     index: IndexPlan,
+    learning_choice: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +146,7 @@ enum ReviewAction {
     Editors,
     Project,
     Indexing,
+    AccountLearning,
     Account,
     Exit,
 }
@@ -161,6 +163,10 @@ fn review_actions(index: IndexPlan) -> Vec<(ReviewAction, &'static str)> {
     ) {
         actions.push((ReviewAction::Indexing, "Change when indexing runs"));
     }
+    actions.push((
+        ReviewAction::AccountLearning,
+        "Change consent-page reminder",
+    ));
     actions.push((ReviewAction::Account, "Sign in with a different account"));
     actions.push((ReviewAction::Exit, "Exit without saving"));
     actions
@@ -171,7 +177,8 @@ pub(super) async fn run(
     only: Option<&[editors::Editor]>,
     explicit_project_path: Option<&Path>,
     account_only: bool,
-) -> Result<()> {
+    explicit_learning_choice: Option<bool>,
+) -> Result<bool> {
     super::print_welcome_banner();
     super::print_data_collection_disclosure(false);
 
@@ -228,6 +235,11 @@ pub(super) async fn run(
         workspace,
         project,
         index,
+        learning_choice: match explicit_learning_choice {
+            Some(choice) => Some(choice),
+            None => super::confirm("Open optional account-learning consent after setup?", false)?
+                .then_some(true),
+        },
     };
 
     loop {
@@ -237,7 +249,12 @@ pub(super) async fn run(
             "Nothing is saved until you choose Save. Change anything first.",
         );
         print_review(&choices);
-        let actions = review_actions(choices.index);
+        let actions: Vec<_> = review_actions(choices.index)
+            .into_iter()
+            .filter(|(action, _)| {
+                explicit_learning_choice.is_none() || *action != ReviewAction::AccountLearning
+            })
+            .collect();
         let labels: Vec<&str> = actions.iter().map(|(_, label)| *label).collect();
         let choice = prompts::select("Ready to set up ContextStream?", &labels)?;
         match actions[choice].0 {
@@ -265,6 +282,11 @@ pub(super) async fn run(
                     choices.index = IndexPlan::from_choice(super::prompt_setup_index_choice(path)?);
                 }
             }
+            ReviewAction::AccountLearning => {
+                choices.learning_choice =
+                    super::confirm("Open optional account-learning consent after setup?", false)?
+                        .then_some(true);
+            }
             ReviewAction::Account => {
                 let (api_key, email) = sign_in(None).await?;
                 choices.client = client_for(&api_key);
@@ -286,13 +308,19 @@ pub(super) async fn run(
             ReviewAction::Exit => {
                 ui::say(Mark::Pending, "Setup cancelled", Some("nothing was saved"));
                 println!();
-                return Ok(());
+                return Ok(false);
             }
         }
     }
 
     print_step(5, "Finishing setup", "");
-    finish(choices).await
+    let review_learning =
+        choices.learning_choice == Some(true) && explicit_learning_choice.is_none();
+    finish(choices).await?;
+    if review_learning {
+        super::account_learning::configure(true).await?;
+    }
+    Ok(true)
 }
 
 fn client_for(api_key: &str) -> ContextStreamClient {
@@ -646,6 +674,14 @@ fn print_review(choices: &Choices) {
         rows.push(ui.row("Folder", &ui.path(&display_path(path))));
     }
     rows.push(ui.row("Indexing", choices.index.summary()));
+    rows.push(ui.row(
+        "Account learning",
+        match choices.learning_choice {
+            Some(true) => "Review consent in browser",
+            Some(false) => "Withdraw consent after saving",
+            None => "No change (default)",
+        },
+    ));
     if matches!(choices.transport, SetupTransportPreference::LocalBinary) {
         rows.push(ui.row("Connection", &ui.warning("Local binary · recovery mode")));
     }
@@ -666,6 +702,7 @@ async fn finish(choices: Choices) -> Result<()> {
         workspace,
         project,
         index,
+        learning_choice: _,
     } = choices;
 
     super::persist_setup_editor_selection(&editors)?;
@@ -1058,6 +1095,7 @@ mod tests {
                 repository_url: None,
             },
             index: IndexPlan::Background,
+            learning_choice: None,
         };
         print_review(&choices);
 

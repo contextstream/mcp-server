@@ -791,8 +791,8 @@ mod registration_tests {
         //
         // No-required-params actions:
         // - ingest: Build/rebuild graph
-        // - outbox_status: Inspect Neo4j graph outbox
-        // - outbox_canary: Enqueue Neo4j graph outbox canary
+        // - outbox_status: Inspect relationship storage graph outbox
+        // - outbox_canary: Enqueue relationship storage graph outbox canary
         // - circular_dependencies: Find circular deps
         // - unused_code: Find unused code
         // - complexity_metrics: Retrieve dashboard complexity data

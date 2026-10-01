@@ -2101,7 +2101,7 @@ fn sync_bridge_check(
     }
 }
 
-fn doctor_client_config() -> Result<Config> {
+pub(super) fn doctor_client_config() -> Result<Config> {
     let saved = super::read_saved_credentials()?;
     let nonempty_env = |name: &str| {
         std::env::var(name)
@@ -2584,6 +2584,19 @@ pub async fn run_doctor(options: DoctorOptions, json: bool, support: bool) -> Re
         return Ok(report.has_failures());
     }
 
+    let learning = match doctor_client_config() {
+        Ok(config) => tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            ContextStreamClient::new(config).account_learning_status(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|v| super::account_learning::status_label(&v))
+        .unwrap_or("Unavailable"),
+        Err(_) => "Unavailable",
+    };
+    println!("Account learning: {learning} (status only; Account → Privacy controls consent)");
     let ui = super::ui::ui();
     let target_names = if report.targeting.editors.is_empty() {
         "none".to_string()

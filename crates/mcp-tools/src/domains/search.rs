@@ -8831,7 +8831,7 @@ pub struct SearchInput {
     /// Pre-computed query embedding for `mode="vector"` calls. The
     /// remote binary does not yet run an embedder locally; callers
     /// supply the vector. Length must match the Atlas Vector index
-    /// (`1024` for Voyage `voyage-3`).
+    /// (match the dimension configured for the project search index).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_vector: Option<Vec<f32>>,
 }
@@ -10006,16 +10006,16 @@ impl SearchTool {
     ///
     /// `mode = "vector"` here is a **gap-coverage** route, not the
     /// primary semantic path. Atlas Vector Search is appropriate for:
-    /// - archived data (the compatibility provider's Online Archive — Qdrant doesn't
+    /// - archived data (the compatibility provider's Online Archive — search storage doesn't
     ///   carry cold transcripts), and
-    /// - MongoDB-resident docs the server's Qdrant pipeline doesn't
+    /// - MongoDB-resident docs the server's search storage pipeline doesn't
     ///   index, and
     /// - vector queries that need MongoDB-side `$match` joins with
-    ///   non-Qdrant metadata.
+    ///   non-search storage metadata.
     ///
     /// For primary semantic search over code or `memory_events` (the
     /// vast majority of callers), **route to `mode = "semantic"`** —
-    /// that hits ContextStream's existing Voyage Large 4 + Qdrant
+    /// that hits ContextStream's existing search processing + search storage
     /// pipeline which is faster and higher recall than rebuilding the
     /// same retrieval atop Atlas. The handler below tells the caller
     /// this when the layer isn't available; we keep the callable
@@ -10147,7 +10147,7 @@ impl SearchTool {
 
         let header = if count == 0 {
             format!(
-                "[VECTOR] 0 hits for `{}` with filter {} ({}ms; index may be empty pending warm-tier embeddings)",
+                "[VECTOR] 0 hits for `{}` with filter {} ({}ms; index may be empty pending warm-tier search representations)",
                 residual_query.trim(),
                 summarize_filter(&scope),
                 elapsed_ms

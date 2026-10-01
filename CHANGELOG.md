@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Optional account learning starts off. Interactive setup offers a separate review,
+- Optional deep project learning starts off. Interactive setup offers a separate review,
   while plain `setup --yes` preserves the account’s choice. `setup` and `configure`
   accept `--account-learning on|off`: on opens the dashboard for human consent; off
   withdraws directly. Doctor and init report status without opting anyone in.

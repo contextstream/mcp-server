@@ -2817,7 +2817,7 @@ fn data_collection_points(non_interactive: bool) -> [String; 6] {
     };
 
     [
-        "Account learning is optional and starts off. Only you can consent in Account → Privacy. Plain setup --yes preserves your choice. Use --account-learning on to open consent, or configure --account-learning off to withdraw.".to_string(),
+        "Deep project learning is optional and starts off. Only you can consent in Account → Privacy. Plain setup --yes preserves your choice. Use --account-learning on to open consent, or configure --account-learning off to withdraw.".to_string(),
         format!("Transcript exchange saving default: {transcripts}. Change with `contextstream-mcp configure --transcripts on|off`."),
         format!("Hook transcript saving default: {hook_transcripts}. Change with `contextstream-mcp configure --hook-transcripts on|off`."),
         format!("Project indexing {index_behavior}; matched source files are sent to your ContextStream workspace. Exclude files with `.contextstream/ignore`; de-index with `project(action=\"purge\")`."),

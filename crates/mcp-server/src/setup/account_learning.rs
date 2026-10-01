@@ -16,7 +16,7 @@ pub fn status_label(value: &serde_json::Value) -> &'static str {
 pub async fn configure(enabled: bool) -> Result<()> {
     if super::safe_edit::is_dry_run() {
         println!(
-            "Account learning: would {}",
+            "Deep project learning: would {}",
             if enabled {
                 "open the consent page"
             } else {
@@ -26,7 +26,7 @@ pub async fn configure(enabled: bool) -> Result<()> {
         return Ok(());
     }
     if enabled {
-        println!("Account learning needs your separate consent in a signed-in browser.");
+        println!("Deep project learning needs your separate consent in a signed-in browser.");
         println!("Read the current terms and tick the unchecked box at {PRIVACY_URL}");
         println!("Your choice has not changed. Agents and API keys cannot consent for you.");
         let _ = open::that(PRIVACY_URL);
@@ -38,7 +38,9 @@ pub async fn configure(enabled: bool) -> Result<()> {
         status_label(&value) == "Off",
         "Withdrawal was not confirmed; retry or use Account → Privacy."
     );
-    println!("Account learning is off. Collection has stopped; learned-data deletion is queued.");
+    println!(
+        "Deep project learning is off. Collection has stopped; learned-data deletion is queued."
+    );
     Ok(())
 }
 

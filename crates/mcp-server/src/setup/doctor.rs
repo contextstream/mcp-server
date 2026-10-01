@@ -2596,7 +2596,7 @@ pub async fn run_doctor(options: DoctorOptions, json: bool, support: bool) -> Re
         .unwrap_or("Unavailable"),
         Err(_) => "Unavailable",
     };
-    println!("Account learning: {learning} (status only; Account → Privacy controls consent)");
+    println!("Deep project learning: {learning} (status only; Account → Privacy controls consent)");
     let ui = super::ui::ui();
     let target_names = if report.targeting.editors.is_empty() {
         "none".to_string()

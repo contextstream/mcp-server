@@ -111,7 +111,7 @@ enum Commands {
         #[arg(long, short = 'y', alias = "non-interactive")]
         yes: bool,
 
-        /// Optional learning: on opens human consent; off withdraws. Omitted preserves your choice.
+        /// Optional deep project learning: on opens human consent; off withdraws. Omitted preserves your choice.
         #[arg(long, value_enum)]
         account_learning: Option<ToggleValue>,
 
@@ -385,7 +385,7 @@ enum Commands {
         #[arg(long)]
         list_options: bool,
 
-        /// Optional learning: on opens human consent; off withdraws.
+        /// Optional deep project learning: on opens human consent; off withdraws.
         #[arg(long, value_enum, conflicts_with_all = ["list_options", "api_key_stdin"])]
         account_learning: Option<ToggleValue>,
 
@@ -2271,7 +2271,7 @@ fn print_configure_options() {
     eprintln!("  - hooks: reinstall hook scripts");
     eprintln!("  - rules: regenerate AI rule files");
     eprintln!("  - mcp-configs: regenerate MCP config files");
-    eprintln!("  - account-learning: review consent or withdraw (--account-learning on|off)");
+    eprintln!("  - deep project learning: review consent or withdraw (--account-learning on|off)");
     eprintln!("  - transcripts: default transcript policy for new chats (--transcripts on|off)");
     eprintln!();
     eprintln!("Save an existing API key without the browser flow:");

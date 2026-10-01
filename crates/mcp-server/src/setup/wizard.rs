@@ -237,8 +237,11 @@ pub(super) async fn run(
         index,
         learning_choice: match explicit_learning_choice {
             Some(choice) => Some(choice),
-            None => super::confirm("Open optional account-learning consent after setup?", false)?
-                .then_some(true),
+            None => super::confirm(
+                "Open optional deep project learning consent after setup?",
+                false,
+            )?
+            .then_some(true),
         },
     };
 
@@ -283,9 +286,11 @@ pub(super) async fn run(
                 }
             }
             ReviewAction::AccountLearning => {
-                choices.learning_choice =
-                    super::confirm("Open optional account-learning consent after setup?", false)?
-                        .then_some(true);
+                choices.learning_choice = super::confirm(
+                    "Open optional deep project learning consent after setup?",
+                    false,
+                )?
+                .then_some(true);
             }
             ReviewAction::Account => {
                 let (api_key, email) = sign_in(None).await?;
@@ -675,7 +680,7 @@ fn print_review(choices: &Choices) {
     }
     rows.push(ui.row("Indexing", choices.index.summary()));
     rows.push(ui.row(
-        "Account learning",
+        "Deep project learning",
         match choices.learning_choice {
             Some(true) => "Review consent in browser",
             Some(false) => "Withdraw consent after saving",

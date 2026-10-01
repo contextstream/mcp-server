@@ -7,7 +7,7 @@ setup wizard prints the same material before it writes configuration.
 
 | Flow | Default | Data sent | Control |
 |---|---:|---|---|
-| Account learning | off for new accounts | Context-use and feedback signals in the hosted account, only after separate consent | Account → Privacy; `configure --account-learning off` withdraws. An explicit `--account-learning on` opens browser consent. Plain `setup --yes` preserves the current choice |
+| Deep project learning | off for new accounts | Context-use and feedback signals in the hosted account, only after separate consent | Account → Privacy; `configure --account-learning off` withdraws. An explicit `--account-learning on` opens browser consent. Plain `setup --yes` preserves the current choice |
 | MCP transcript exchange saving | on | User/assistant exchanges supplied to `context` when transcript saving applies | `CONTEXTSTREAM_TRANSCRIPTS_ENABLED=false` or `contextstream-mcp configure --transcripts off` |
 | Hook transcript saving | on | Supported editor lifecycle exchange payloads | `CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED=false` or `contextstream-mcp configure --hook-transcripts off` |
 | Project indexing | setup-dependent | Files matched after ignore rules, plus index metadata | Skip indexing; add `.contextstream/ignore`; use `project(action="purge")` to de-index server-side content |
@@ -46,7 +46,7 @@ in the user cache. Cache files are not transcript or project content.
 Hosted-service retention, account deletion, and subprocessors are governed by
 the current ContextStream privacy documentation and account controls.
 
-## Optional account learning
+## Optional deep project learning
 
 Your signed-in dashboard shows the current server consent text, with a checkbox
 that starts unchecked. The CLI cannot grant consent and the MCP tools expose no

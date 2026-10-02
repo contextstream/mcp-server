@@ -28,6 +28,7 @@ pub async fn handle() -> Result<()> {
         .unwrap_or("");
     let trigger = input
         .get("trigger")
+        .or_else(|| input.get("source"))
         .and_then(|v| v.as_str())
         .unwrap_or("startup");
 
@@ -43,10 +44,10 @@ pub async fn handle() -> Result<()> {
         })
         .unwrap_or_default();
 
-    // Require `init(...)` before other MCP operations at the beginning of this
-    // session. PreToolUse clears this once init is called.
+    // Keep the gate specific to the host session. Replayed startup/resume
+    // events and parallel sessions in this checkout must not reset it.
     prompt_state::cleanup_stale(360);
-    prompt_state::mark_init_required(&cwd);
+    prompt_state::mark_session_init_required(&cwd, &input);
 
     // Load config from env + .mcp.json + .contextstream/config.json
     let config = load_config(&cwd);

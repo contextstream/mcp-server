@@ -6,8 +6,193 @@
 //! State file: `~/.contextstream/prompt-state.json`
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// Initialization belongs to the editor's host session, rather than its cwd.
+/// Keep this state separate from the legacy prompt file: older hook binaries
+/// and concurrent sessions may still update that file using folder-only keys.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SessionInitStateFile {
+    sessions: HashMap<String, SessionInitStateEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionInitStateEntry {
+    require_init: bool,
+    updated_at: String,
+}
+
+const SESSION_INIT_RETENTION_DAYS: i64 = 7;
+const MAX_SESSION_INIT_ENTRIES: usize = 8192;
+
+fn session_init_state_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".contextstream").join("session-init-state.json"))
+}
+
+/// Tool arguments contain an independently chosen ContextStream session id;
+/// only the top-level editor session identity can isolate the hook gate.
+fn session_init_key(input: &Value) -> Option<String> {
+    let host_session_id = ["session_id", "sessionId"].iter().find_map(|key| {
+        input
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })?;
+    Some(hex::encode(Sha256::digest(host_session_id.as_bytes())))
+}
+
+fn prune_session_init_state(state: &mut SessionInitStateFile) {
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(SESSION_INIT_RETENTION_DAYS);
+    state.sessions.retain(|_, entry| {
+        parse_rfc3339_utc(&entry.updated_at).is_some_and(|updated_at| updated_at >= cutoff)
+    });
+    if state.sessions.len() > MAX_SESSION_INIT_ENTRIES {
+        let mut oldest: Vec<_> = state
+            .sessions
+            .iter()
+            .map(|(key, entry)| (entry.updated_at.clone(), key.clone()))
+            .collect();
+        oldest.sort_unstable();
+        let remove_count = oldest.len() - MAX_SESSION_INIT_ENTRIES;
+        for (_, key) in oldest.into_iter().take(remove_count) {
+            state.sessions.remove(&key);
+        }
+    }
+}
+
+fn write_session_init_state(path: &Path, state: &SessionInitStateFile) -> std::io::Result<()> {
+    let json = serde_json::to_vec(state).map_err(std::io::Error::other)?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session-init-state.json");
+    let temporary_path = path.with_file_name(format!("{filename}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut temporary = options.open(&temporary_path)?;
+        temporary.write_all(&json)?;
+        temporary.sync_all()?;
+        // The temporary file shares the destination directory, so replacement
+        // is atomic and readers never observe a partially written JSON file.
+        std::fs::rename(&temporary_path, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn with_session_init_state<T>(
+    path: &Path,
+    update: impl FnOnce(&mut SessionInitStateFile) -> T,
+) -> std::io::Result<T> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Lock a stable sibling, not the state inode that atomic replacement
+    // changes. File drop releases the advisory lock on every return path.
+    let lock_path = path.with_extension("lock");
+    let lock: File = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let mut state = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            SessionInitStateFile::default()
+        }
+        Err(error) => return Err(error),
+    };
+    prune_session_init_state(&mut state);
+    let result = update(&mut state);
+    prune_session_init_state(&mut state);
+    write_session_init_state(path, &state)?;
+    Ok(result)
+}
+
+fn mark_session_init_required_at(path: &Path, key: &str) -> std::io::Result<()> {
+    with_session_init_state(path, |state| {
+        let now = chrono::Utc::now().to_rfc3339();
+        // Repeated startup/resume/compact events must not re-arm a session
+        // that has already completed its initialization call.
+        let entry = state
+            .sessions
+            .entry(key.to_owned())
+            .or_insert(SessionInitStateEntry {
+                require_init: true,
+                updated_at: now.clone(),
+            });
+        entry.updated_at = now;
+    })
+}
+
+fn clear_session_init_required_at(path: &Path, key: &str) -> std::io::Result<()> {
+    with_session_init_state(path, |state| {
+        // Also record success when an editor omitted SessionStart. A later
+        // replayed SessionStart then recognizes this session as initialized.
+        state.sessions.insert(
+            key.to_owned(),
+            SessionInitStateEntry {
+                require_init: false,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+    })
+}
+
+fn is_session_init_required_at(path: &Path, key: &str) -> std::io::Result<bool> {
+    with_session_init_state(path, |state| {
+        state.sessions.get_mut(key).is_some_and(|entry| {
+            entry.updated_at = chrono::Utc::now().to_rfc3339();
+            entry.require_init
+        })
+    })
+}
+
+pub fn mark_session_init_required(cwd: &str, input: &Value) {
+    let Some(key) = session_init_key(input) else {
+        mark_init_required(cwd);
+        return;
+    };
+    if let Some(path) = session_init_state_path() {
+        let _ = mark_session_init_required_at(&path, &key);
+    }
+}
+
+pub fn clear_session_init_required(cwd: &str, input: &Value) {
+    let Some(key) = session_init_key(input) else {
+        clear_init_required(cwd);
+        return;
+    };
+    if let Some(path) = session_init_state_path() {
+        let _ = clear_session_init_required_at(&path, &key);
+    }
+}
+
+pub fn is_session_init_required(cwd: &str, input: &Value) -> bool {
+    let Some(key) = session_init_key(input) else {
+        return is_init_required(cwd);
+    };
+    // Identified sessions never inherit another session's legacy cwd gate.
+    session_init_state_path()
+        .and_then(|path| is_session_init_required_at(&path, &key).ok())
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PromptStateFile {
@@ -344,6 +529,156 @@ pub fn cleanup_stale(max_age_minutes: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_init_isolated_for_parallel_sessions_in_same_directory() {
+        let directory = tempfile::tempdir().expect("create isolated hook state");
+        let path = directory.path().join("session-init-state.json");
+        let a = session_init_key(&serde_json::json!({
+            "session_id": "host-a", "cwd": "/same/project"
+        }))
+        .expect("host A identity");
+        let b = session_init_key(&serde_json::json!({
+            "session_id": "host-b", "cwd": "/same/project"
+        }))
+        .expect("host B identity");
+
+        mark_session_init_required_at(&path, &a).expect("start A");
+        assert!(is_session_init_required_at(&path, &a).expect("read fresh A"));
+        clear_session_init_required_at(&path, &a).expect("initialize A");
+        mark_session_init_required_at(&path, &b).expect("start B");
+        assert!(!is_session_init_required_at(&path, &a).expect("A stays initialized"));
+        assert!(is_session_init_required_at(&path, &b).expect("B still requires init"));
+    }
+
+    #[test]
+    fn session_init_replayed_start_preserves_initialization_across_directories() {
+        let directory = tempfile::tempdir().expect("create isolated hook state");
+        let path = directory.path().join("session-init-state.json");
+        let original = session_init_key(&serde_json::json!({
+            "session_id": "same-host", "cwd": "/original/project"
+        }))
+        .expect("original identity");
+        let resumed = session_init_key(&serde_json::json!({
+            "session_id": "same-host", "cwd": "/other/project", "source": "resume"
+        }))
+        .expect("resumed identity");
+        assert_eq!(original, resumed);
+        mark_session_init_required_at(&path, &original).expect("first start");
+        clear_session_init_required_at(&path, &original).expect("initialize");
+        mark_session_init_required_at(&path, &resumed).expect("replayed start");
+        assert!(!is_session_init_required_at(&path, &resumed).expect("read resumed session"));
+    }
+
+    #[test]
+    fn session_init_success_before_start_is_preserved_and_unknown_session_is_open() {
+        let directory = tempfile::tempdir().expect("create isolated hook state");
+        let path = directory.path().join("session-init-state.json");
+        let key = session_init_key(&serde_json::json!({ "session_id": "quick-start" }))
+            .expect("host identity");
+        assert!(!is_session_init_required_at(&path, &key).expect("unknown session"));
+        clear_session_init_required_at(&path, &key).expect("context success without start");
+        mark_session_init_required_at(&path, &key).expect("late session start");
+        assert!(!is_session_init_required_at(&path, &key).expect("success remains recorded"));
+    }
+
+    #[test]
+    fn session_init_identity_uses_trimmed_host_aliases_and_ignores_tool_arguments() {
+        let snake = serde_json::json!({ "session_id": " host-session " });
+        let camel = serde_json::json!({ "sessionId": "host-session" });
+        assert_eq!(session_init_key(&snake), session_init_key(&camel));
+        assert_eq!(
+            session_init_key(&snake),
+            session_init_key(&serde_json::json!({
+                "session_id": "  ", "sessionId": "host-session"
+            }))
+        );
+        let key = session_init_key(&snake).expect("hashed host identity");
+        assert_eq!(key.len(), 64);
+        assert!(!key.contains("host-session"));
+        assert!(session_init_key(&serde_json::json!({
+            "session_id": " ", "sessionId": "",
+            "tool_input": { "session_id": "tool-session" }
+        }))
+        .is_none());
+        assert_eq!(
+            session_init_key(&snake),
+            session_init_key(&serde_json::json!({
+                "session_id": "host-session",
+                "tool_input": { "session_id": "different-contextstream-session" }
+            }))
+        );
+    }
+
+    #[test]
+    fn session_init_concurrent_writers_preserve_every_session() {
+        let directory = tempfile::tempdir().expect("create isolated hook state");
+        let path = directory.path().join("session-init-state.json");
+        let workers: Vec<_> = (0..24)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let key = session_init_key(&serde_json::json!({
+                        "session_id": format!("host-{index}")
+                    }))
+                    .expect("worker identity");
+                    mark_session_init_required_at(&path, &key).expect("start worker");
+                    assert!(is_session_init_required_at(&path, &key).expect("fresh worker"));
+                    clear_session_init_required_at(&path, &key).expect("initialize worker");
+                    mark_session_init_required_at(&path, &key).expect("replay worker start");
+                    key
+                })
+            })
+            .collect();
+        let keys: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker finished"))
+            .collect();
+        let state: SessionInitStateFile =
+            serde_json::from_slice(&std::fs::read(&path).expect("read complete state"))
+                .expect("atomic state remains valid JSON");
+        assert_eq!(state.sessions.len(), keys.len());
+        for key in keys {
+            assert!(!state.sessions[&key].require_init);
+        }
+        assert!(path.with_extension("lock").exists());
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("read isolated state directory")
+                .count(),
+            2,
+            "atomic replacement should leave only state and the stable lock"
+        );
+    }
+
+    #[test]
+    fn session_init_retention_discards_only_expired_sessions() {
+        let directory = tempfile::tempdir().expect("create isolated hook state");
+        let path = directory.path().join("session-init-state.json");
+        let mut state = SessionInitStateFile::default();
+        state.sessions.insert(
+            "expired".to_string(),
+            SessionInitStateEntry {
+                require_init: true,
+                updated_at: (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339(),
+            },
+        );
+        state.sessions.insert(
+            "recent".to_string(),
+            SessionInitStateEntry {
+                require_init: false,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+        write_session_init_state(&path, &state).expect("write retention fixture");
+        mark_session_init_required_at(&path, "fresh").expect("start fresh session");
+        let saved: SessionInitStateFile =
+            serde_json::from_slice(&std::fs::read(path).expect("read pruned state"))
+                .expect("valid pruned state");
+        assert!(!saved.sessions.contains_key("expired"));
+        assert!(!saved.sessions["recent"].require_init);
+        assert!(saved.sessions["fresh"].require_init);
+    }
 
     #[test]
     fn prompt_state_roundtrip_shape_is_stable() {

@@ -1107,8 +1107,10 @@ const CLAUDE_HOOK_SPECS: &[ClaudeHookSpec] = &[
     },
     ClaudeHookSpec {
         event: ClaudeHookEvent::PostToolUse,
+        // Observe successful quick-start context and session ground calls as
+        // well as init so hosted transports can persist local session state.
         matcher: Some(
-            "Edit|Write|NotebookEdit|mcp__contextstream__init|mcp__contextstream__project",
+            "Edit|Write|NotebookEdit|mcp__contextstream__init|mcp__contextstream__context|mcp__contextstream__session|mcp__contextstream__project",
         ),
         hook_name: "post-tool-use",
         timeout: 10,
@@ -2476,6 +2478,43 @@ mod tests {
     }
 
     #[test]
+    fn post_tool_use_observes_init_context_and_session_ground() {
+        let hooks = generate_contextstream_hooks(None);
+        let observer = hooks
+            .post_tool_use
+            .iter()
+            .find(|entry| {
+                entry
+                    .hooks
+                    .iter()
+                    .any(|command| command.command.contains(" hook post-tool-use "))
+            })
+            .expect("managed post-tool-use observer");
+        // The host matcher is a disjunction of literal tool names. Check the
+        // generated config, rather than only the source spec, so quick-start
+        // and fallback grounding both reach the success observer after setup.
+        let matcher = observer.matcher.as_deref().expect("tool matcher");
+        for tool in [
+            "mcp__contextstream__init",
+            "mcp__contextstream__context",
+            "mcp__contextstream__session",
+            "mcp__contextstream__project",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+        ] {
+            assert!(
+                matcher.split('|').any(|alternative| alternative == tool),
+                "post-tool-use does not observe {tool}"
+            );
+        }
+        assert!(!matcher
+            .split('|')
+            .any(|alternative| { matches!(alternative, "Bash" | "mcp__other__context") }));
+        assert_eq!(observer.hooks[0].timeout, Some(10));
+    }
+
+    #[test]
     fn test_claude_enforcement_critical_events_are_present() {
         for event in CLAUDE_ENFORCEMENT_CRITICAL_EVENTS {
             assert!(
@@ -2706,6 +2745,50 @@ mod tests {
         let commands = event_commands(&hooks, "PreToolUse");
         assert!(commands.len() >= 2);
         assert!(commands.iter().any(|c| c == "echo user hook"));
+    }
+
+    #[test]
+    fn refreshing_post_tool_use_replaces_old_matcher_and_preserves_user_hooks() {
+        let user_hook = json!({
+            "matcher": "MyTool",
+            "future_host_field": {"keep": true},
+            "hooks": [{"type": "command", "command": "echo user post hook"}]
+        });
+        let hooks = merged_hooks_object(json!({
+            "PostToolUse": [
+                {
+                    "matcher": "Edit|Write|NotebookEdit|mcp__contextstream__init|mcp__contextstream__project",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!(
+                            "contextstream-mcp hook post-tool-use {MANAGED_HOOK_ARGUMENT}"
+                        )
+                    }]
+                },
+                user_hook.clone()
+            ]
+        }));
+
+        let entries = hooks["PostToolUse"].as_array().expect("post-tool entries");
+        assert!(entries.contains(&user_hook));
+        let observers: Vec<&Value> = entries
+            .iter()
+            .filter(|entry| {
+                entry["hooks"].as_array().is_some_and(|commands| {
+                    commands.iter().any(|command| {
+                        command["command"].as_str().is_some_and(|command| {
+                            command.contains(" hook post-tool-use ")
+                                && is_owned_contextstream_hook_command(command)
+                        })
+                    })
+                })
+            })
+            .collect();
+        assert_eq!(observers.len(), 1, "old managed observer must be replaced");
+        let matcher = observers[0]["matcher"].as_str().expect("new matcher");
+        for tool in ["mcp__contextstream__context", "mcp__contextstream__session"] {
+            assert!(matcher.split('|').any(|alternative| alternative == tool));
+        }
     }
 
     #[test]

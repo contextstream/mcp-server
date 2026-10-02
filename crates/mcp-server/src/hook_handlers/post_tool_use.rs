@@ -190,6 +190,10 @@ fn tool_call_succeeded(tool_response: &Value) -> bool {
     has_response_evidence && !is_error && tool_response.get("error").is_none()
 }
 
+fn completes_session_init(normalized_tool_name: &str, tool_response: &Value) -> bool {
+    matches!(normalized_tool_name, "init" | "context") && tool_call_succeeded(tool_response)
+}
+
 fn contextstream_post_tool_nudge(
     normalized_tool_name: &str,
     action: &str,
@@ -791,14 +795,6 @@ fn parse_project_binding_from_config(
 
 /// Handle the PostToolUse hook.
 pub async fn handle() -> Result<()> {
-    if std::env::var("CONTEXTSTREAM_POSTWRITE_ENABLED")
-        .map(|v| v == "false")
-        .unwrap_or(false)
-    {
-        write_stdout_json(&HookOutput::empty())?;
-        return Ok(());
-    }
-
     let input = read_stdin_json()?;
     let tool_name = extract_tool_name(&input);
     let tool_input = extract_tool_input(&input);
@@ -806,6 +802,31 @@ pub async fn handle() -> Result<()> {
     let mcp_server_name = extract_mcp_server_name(&input);
     let normalized_tool_name = normalize_contextstream_tool_name(&tool_name);
     let cwd = extract_cwd(&input);
+
+    if is_contextstream_server_call(&mcp_server_name, &tool_name) {
+        // Record successful initialization before optional indexing/routing
+        // work, whose early returns must not lose this session's receipt.
+        if completes_session_init(&normalized_tool_name, &tool_response) {
+            super::prompt_state::clear_session_init_required(&cwd, &input);
+        }
+        if tool_call_succeeded(&tool_response)
+            && (normalized_tool_name == "context"
+                || (normalized_tool_name == "session"
+                    && contextstream_action(&tool_input) == "ground"))
+        {
+            super::prompt_state::clear_context_required(&cwd);
+        }
+    }
+
+    // Disabling file indexing must not disable initialization receipts while
+    // the corresponding PreToolUse gate remains enabled.
+    if std::env::var("CONTEXTSTREAM_POSTWRITE_ENABLED")
+        .map(|v| v == "false")
+        .unwrap_or(false)
+    {
+        write_stdout_json(&HookOutput::empty())?;
+        return Ok(());
+    }
 
     if is_contextstream_server_call(&mcp_server_name, &tool_name) {
         let action = contextstream_action(&tool_input);
@@ -1273,6 +1294,27 @@ mod tests {
             normalize_contextstream_tool_name("mcp__contextstream__project"),
             "project"
         );
+    }
+
+    #[test]
+    fn session_init_requires_a_successful_init_or_context_result() {
+        let success =
+            serde_json::json!({"content": [{"type": "text", "text": "ready"}], "isError": false});
+        for tool in ["init", "context"] {
+            assert!(completes_session_init(tool, &success));
+            assert!(!completes_session_init(tool, &serde_json::json!({})));
+            assert!(!completes_session_init(
+                tool,
+                &serde_json::json!({"isError": true, "content": ["failed"]})
+            ));
+            assert!(!completes_session_init(
+                tool,
+                &serde_json::json!({"error": "failed"})
+            ));
+        }
+        for tool in ["search", "project", "session", "entity"] {
+            assert!(!completes_session_init(tool, &success));
+        }
     }
 
     #[test]

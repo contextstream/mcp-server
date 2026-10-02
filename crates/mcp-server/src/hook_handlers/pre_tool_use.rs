@@ -1879,9 +1879,10 @@ pub async fn handle() -> Result<()> {
     // Prompt requirement: enforce context(...) before other MCP calls.
     if supports_hard_first_call_enforcement(&editor) {
         prompt_state::cleanup_stale(180);
-        if prompt_state::is_init_required(&cwd) {
+        if prompt_state::is_session_init_required(&cwd, &input) {
             if clears_init_gate(is_contextstream_call, &normalized_contextstream_tool) {
-                prompt_state::clear_init_required(&cwd);
+                // Allow the initializing call, but record completion only in
+                // PostToolUse after its result confirms success.
                 emit_compliance(ComplianceEvent {
                     rule_key: compliance::RULE_INIT_REQUIRED,
                     rule_class: RuleClass::Procedural,
@@ -1890,7 +1891,7 @@ pub async fn handle() -> Result<()> {
                     severity: 1,
                     metadata: Some(serde_json::json!({
                         "tool": tool,
-                        "reason": "init_gate_satisfied_by_init_or_context"
+                        "reason": "initializing_call_allowed_pending_success"
                     })),
                     ..Default::default()
                 });

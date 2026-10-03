@@ -4438,6 +4438,73 @@ fn truncate_context_wire_text(value: &str, max_chars: usize) -> String {
     output
 }
 
+/// Smallest truncated head worth keeping instead of dropping a block outright:
+/// below this the block is a sliver that reads as noise.
+const CONTEXT_WIRE_MIN_PARTIAL_BLOCK_TOKENS: usize = 200;
+
+/// The longest truncated head of `blocks[index]` that, with the other blocks,
+/// still fits `target_tokens`. `None` when dropping the block would not fit
+/// anyway, when what would fit is only a sliver, or when the block carries
+/// `<system-reminder>` boundaries (those are only ever kept or dropped whole).
+fn truncate_context_wire_block_to_fit(
+    blocks: &[ContextWireTextBlock],
+    index: usize,
+    structured: Option<&Value>,
+    target_tokens: usize,
+) -> Option<String> {
+    let block = &blocks[index];
+    if block.text.contains("<system-reminder>") || block.text.contains("</system-reminder>") {
+        return None;
+    }
+
+    let mut candidate_blocks = blocks.to_vec();
+    candidate_blocks[index].text = String::new();
+    let base_tokens = estimated_context_tool_wire_tokens_with_optional(
+        &render_context_wire_text_blocks(&candidate_blocks),
+        structured,
+    );
+    if base_tokens.saturating_add(CONTEXT_WIRE_MIN_PARTIAL_BLOCK_TOKENS) > target_tokens {
+        return None;
+    }
+
+    let ends_with_newline = block.text.ends_with('\n');
+    let render_head = |chars: usize| {
+        let mut head = truncate_context_wire_text(&block.text, chars);
+        // Keep the next block's tag on its own line.
+        if ends_with_newline && !head.ends_with('\n') {
+            head.push('\n');
+        }
+        head
+    };
+    let fits = |head: String, candidate_blocks: &mut Vec<ContextWireTextBlock>| {
+        candidate_blocks[index].text = head;
+        estimated_context_tool_wire_tokens_with_optional(
+            &render_context_wire_text_blocks(candidate_blocks),
+            structured,
+        ) <= target_tokens
+    };
+
+    let mut low = 0usize;
+    let mut high = block.text.chars().count();
+    let mut best: Option<(usize, String)> = None;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        if fits(render_head(mid), &mut candidate_blocks) {
+            best = Some((mid, render_head(mid)));
+            low = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    // `estimated_context_tool_wire_tokens` is bytes / 4, so a head is worth
+    // keeping once it is roughly the minimum token count in characters.
+    best.filter(|(chars, _)| *chars >= CONTEXT_WIRE_MIN_PARTIAL_BLOCK_TOKENS * 2)
+        .map(|(_, head)| head)
+}
+
 fn reduce_context_wire_text(
     text: &str,
     structured: Option<&Value>,
@@ -4445,10 +4512,14 @@ fn reduce_context_wire_text(
 ) -> (String, usize, bool) {
     let mut blocks = context_wire_text_blocks(text);
     let mut dropped_blocks = 0usize;
+    let mut truncated_block = false;
 
     // Drop complete low/normal/high blocks in priority order. Within a tier,
     // remove the largest block first; ties remove the later block so retained
-    // output stays stable and front-loaded.
+    // output stays stable and front-loaded. When the largest block is the only
+    // thing standing between the response and its budget, keep a truncated head
+    // of it instead: removing a 9k-token context pack whole used to leave a 4k
+    // budget less than a third used.
     for priority in 0u8..=2 {
         while estimated_context_tool_wire_tokens_with_optional(
             &render_context_wire_text_blocks(&blocks),
@@ -4469,6 +4540,13 @@ fn reduce_context_wire_text(
             let Some(remove_at) = remove_at else {
                 break;
             };
+            if let Some(head) =
+                truncate_context_wire_block_to_fit(&blocks, remove_at, structured, target_tokens)
+            {
+                blocks[remove_at].text = head;
+                truncated_block = true;
+                break;
+            }
             blocks.remove(remove_at);
             dropped_blocks += 1;
         }
@@ -4476,7 +4554,7 @@ fn reduce_context_wire_text(
 
     let rendered = render_context_wire_text_blocks(&blocks);
     if estimated_context_tool_wire_tokens_with_optional(&rendered, structured) <= target_tokens {
-        return (rendered, dropped_blocks, false);
+        return (rendered, dropped_blocks, truncated_block);
     }
 
     // A response can carry more than one critical semantic unit, most often a
@@ -4558,14 +4636,28 @@ const CONTEXT_STRUCTURED_DROP_ORDER: &[&str] = &[
     "recent_decisions",
     "memory_nodes",
     "flash_suggestions",
+    // `items`, `summary` and `context` repeat what the text already carries
+    // (the `[CTX]` block and friends) and are by far the largest structured
+    // fields, so they are expendable before anything an agent acts on.
     "items",
+    "summary",
+    "context",
+];
+
+/// Small structured fields an agent acts on: skills, lessons, instructions,
+/// coordination notices and grounding evidence. They are kept while the text can
+/// still be shrunk to make room, and only dropped (in this order) when even the
+/// critical text plus these fields cannot fit the budget.
+const CONTEXT_STRUCTURED_PROTECTED_ORDER: &[&str] = &[
     "matched_skills_typed",
     "matched_skills",
     "lessons",
     "remember_items",
     "instructions",
-    "summary",
-    "context",
+    // Listed explicitly: unknown fields fall into the lexical pass, where
+    // `coordination_inbox` sorts early and would be removed before anything
+    // else.
+    "coordination_inbox",
     // This is the structured form of the tool's primary job. Preserve it
     // after duplicated context/summary fields and every diagnostic surface.
     "grounding_hits",
@@ -4575,6 +4667,71 @@ fn record_context_wire_field(fields: &mut Vec<String>, field: &str) {
     if !fields.iter().any(|existing| existing == field) {
         fields.push(field.to_string());
     }
+}
+
+/// Remove `order`'s structured fields one at a time until the whole wire fits.
+fn drop_context_wire_fields_while_over(
+    order: &[&str],
+    text: &str,
+    structured: &mut Value,
+    target_tokens: usize,
+    dropped_fields: &mut Vec<String>,
+) {
+    for field in order {
+        if estimated_context_tool_wire_tokens(text, structured) <= target_tokens {
+            break;
+        }
+        if structured
+            .as_object_mut()
+            .and_then(|object| object.remove(*field))
+            .is_some()
+        {
+            record_context_wire_field(dropped_fields, field);
+        }
+    }
+}
+
+/// Whether the structured fields still present fit the budget beside the text's
+/// high-priority and critical blocks (instructions, skills, grounding, notices),
+/// i.e. whether shrinking only the *low-priority* text can bring the whole wire
+/// within budget.
+///
+/// The text repeats most of what the structured fields carry, so when it is the
+/// oversized part, dropping small structured fields cannot fix the budget; it
+/// only loses them (and the ids a follow-up call needs) before the text is ever
+/// touched. The check deliberately counts the high-priority text blocks as
+/// untouchable too: a client may show the model only the text, so under a budget
+/// too tight to keep both copies this keeps the old behaviour (structured fields
+/// go first) rather than trading the text's instructions for their duplicates.
+fn context_wire_fits_by_shrinking_text(
+    text: &str,
+    structured: &Value,
+    target_tokens: usize,
+) -> bool {
+    let kept_text: String = context_wire_text_blocks(text)
+        .iter()
+        .filter(|block| block.priority >= 2)
+        .map(|block| block.text.as_str())
+        .collect();
+    estimated_context_tool_wire_tokens(&kept_text, structured) <= target_tokens
+}
+
+/// Notice, then shrink the text to the budget. Returns the dropped block count
+/// and whether any block was truncated.
+fn compact_context_wire_text(
+    text: &mut String,
+    structured: &Value,
+    target_tokens: usize,
+    estimated_tokens_before: usize,
+) -> (usize, bool) {
+    if estimated_tokens_before > target_tokens && !text.contains("[WIRE_BUDGET]") {
+        text.push_str(
+            "\n[WIRE_BUDGET] Whole-wire context compacted to the requested token envelope.",
+        );
+    }
+    let reduced = reduce_context_wire_text(text, Some(structured), target_tokens);
+    *text = reduced.0;
+    (reduced.1, reduced.2)
 }
 
 fn budget_context_wire_payload(
@@ -4615,18 +4772,37 @@ fn budget_context_wire_payload(
         );
     }
 
-    for field in CONTEXT_STRUCTURED_DROP_ORDER {
-        if estimated_context_tool_wire_tokens(&text, &structured) <= target_tokens {
-            break;
-        }
-        if structured
-            .as_object_mut()
-            .and_then(|object| object.remove(*field))
-            .is_some()
-        {
-            record_context_wire_field(&mut dropped_fields, field);
-        }
+    drop_context_wire_fields_while_over(
+        CONTEXT_STRUCTURED_DROP_ORDER,
+        &text,
+        &mut structured,
+        target_tokens,
+        &mut dropped_fields,
+    );
+
+    // What is left is small, actionable and identifying. If shrinking the text
+    // can fit the budget beside it, do that first instead of stripping every
+    // structured field to chase a budget the text is what's blowing.
+    if estimated_context_tool_wire_tokens(&text, &structured) > target_tokens
+        && context_wire_fits_by_shrinking_text(&text, &structured, target_tokens)
+    {
+        let (dropped, truncated) = compact_context_wire_text(
+            &mut text,
+            &structured,
+            target_tokens,
+            estimated_tokens_before,
+        );
+        dropped_text_blocks += dropped;
+        truncated_text |= truncated;
     }
+
+    drop_context_wire_fields_while_over(
+        CONTEXT_STRUCTURED_PROTECTED_ORDER,
+        &text,
+        &mut structured,
+        target_tokens,
+        &mut dropped_fields,
+    );
 
     // Unknown/forward-compatible fields are still subject to the same wire
     // budget. Remove them in lexical order, retaining only the report until
@@ -4658,15 +4834,14 @@ fn budget_context_wire_payload(
     }
 
     if estimated_context_tool_wire_tokens(&text, &structured) > target_tokens {
-        if estimated_tokens_before > target_tokens {
-            text.push_str(
-                "\n[WIRE_BUDGET] Whole-wire context compacted to the requested token envelope.",
-            );
-        }
-        let reduced = reduce_context_wire_text(&text, Some(&structured), target_tokens);
-        text = reduced.0;
-        dropped_text_blocks += reduced.1;
-        truncated_text |= reduced.2;
+        let (dropped, truncated) = compact_context_wire_text(
+            &mut text,
+            &structured,
+            target_tokens,
+            estimated_tokens_before,
+        );
+        dropped_text_blocks += dropped;
+        truncated_text |= truncated;
     }
 
     if let Some(report) = structured

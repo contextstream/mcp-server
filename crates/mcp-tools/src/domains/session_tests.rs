@@ -250,6 +250,33 @@ mod init_index_status_tests {
         assert!(!init_index_status_reports_ready(&status, true));
         assert!(init_index_status_reports_ready(&status, false));
     }
+
+    #[test]
+    fn init_does_not_report_an_empty_project_as_ready() {
+        // What the hosted status returns for a project that was never indexed:
+        // a "ready"/"completed" label, zero files, and no `indexed` field.
+        let status = json!({
+            "project_index_state": "ready",
+            "status": "completed",
+            "status_detail": "no_files_indexed",
+            "indexed_files": 0,
+            "indexed_file_count": 0,
+            "total_files": 0,
+            "committed_generation": 0
+        });
+
+        assert!(!init_index_status_reports_ready(&status, true));
+        assert!(!init_index_status_reports_ready(&status, false));
+
+        // The same project once files are committed is ready.
+        let indexed = json!({
+            "project_index_state": "ready",
+            "status": "completed",
+            "indexed_files": 41,
+            "indexed_file_count": 41
+        });
+        assert!(init_index_status_reports_ready(&indexed, true));
+    }
 }
 
 #[test]
@@ -839,6 +866,125 @@ M:request metrics 403 handling details
             first.1["wire_budget"]["hard_floor_exceeded"].as_bool(),
             Some(false)
         );
+    }
+
+    /// A production-sized `context` response: the text carries every block, and
+    /// the structured copy repeats the large context pack beside a few small,
+    /// actionable fields (about 15k+ tokens before budgeting).
+    fn production_sized_context_wire_payload() -> (String, serde_json::Value) {
+        let pack = "repository context and implementation detail\n".repeat(800);
+        let instructions = "run search for code discovery ".repeat(60);
+        let evidence = "prior session evidence ".repeat(100);
+        let text = format!(
+            "[SEARCH] {}\n[ACCOUNT_CONTEXT] {}\n[TEAM_CONTEXT] {}\n[CTX]\n{}[/CTX]\n[MATCHED_SKILLS] {}\n[INSTRUCTIONS] {}\n[COORDINATION] 2 pending handoffs: review the index fix, confirm the worktree binding.\n[GROUNDING] {}",
+            "search reminder ".repeat(200),
+            "account detail ".repeat(200),
+            "team detail ".repeat(200),
+            pack,
+            "skill guidance ".repeat(60),
+            instructions,
+            evidence,
+        );
+        let structured = json!({
+            "context": pack,
+            "instructions": instructions,
+            "matched_skills": [{"name": "index-repair", "description": "skill guidance ".repeat(20)}],
+            "coordination_inbox": {
+                "pending": 2,
+                "items": [{"title": "review the index fix"}, {"title": "confirm the worktree binding"}]
+            },
+            "grounding_hits": [{"content": evidence}],
+            "why_this_context": {"trace": "diagnostic detail ".repeat(100)},
+        });
+        (text, structured)
+    }
+
+    #[test]
+    fn oversized_context_pack_does_not_cost_the_small_actionable_fields() {
+        let requested = 4_000usize;
+        let (text, structured) = production_sized_context_wire_payload();
+        let before = estimated_context_tool_wire_tokens(&text, &structured);
+        assert!(
+            before > 4 * requested,
+            "fixture must be far over budget: {before}"
+        );
+
+        let (text, structured) = budget_context_wire_payload(text, structured, requested);
+        let report = &structured["wire_budget"];
+
+        assert!(
+            estimated_context_tool_wire_tokens(&text, &structured)
+                <= requested + CONTEXT_WIRE_ENVELOPE_TOKENS
+        );
+        // The structured context pack only duplicates the `[CTX]` text block, so
+        // it is what goes. The few hundred tokens of guidance, the coordination
+        // inbox and the grounding evidence must not be sacrificed for it.
+        assert!(structured.get("context").is_none(), "report={report:?}");
+        for field in [
+            "instructions",
+            "matched_skills",
+            "coordination_inbox",
+            "grounding_hits",
+        ] {
+            assert!(
+                structured.get(field).is_some(),
+                "{field} was dropped to make room for the duplicate context pack; report={report:?}"
+            );
+        }
+        for tag in [
+            "[INSTRUCTIONS]",
+            "[COORDINATION]",
+            "[MATCHED_SKILLS]",
+            "[GROUNDING]",
+        ] {
+            assert!(text.contains(tag), "{tag} missing from {text:.200}");
+        }
+    }
+
+    #[test]
+    fn budget_is_filled_by_truncating_a_block_rather_than_dropping_it_whole() {
+        let requested = 4_000usize;
+        let (text, structured) = production_sized_context_wire_payload();
+        let (text, structured) = budget_context_wire_payload(text, structured, requested);
+        let target = requested + CONTEXT_WIRE_ENVELOPE_TOKENS;
+        let estimated = estimated_context_tool_wire_tokens(&text, &structured);
+
+        assert!(estimated <= target);
+        // Dropping the 9k-token `[CTX]` block whole used to leave about 1.3k of a
+        // 4.1k budget. A truncated head of it is more useful than nothing.
+        assert!(
+            estimated * 100 >= target * 70,
+            "budget left unused: {estimated} of {target} tokens"
+        );
+        assert!(text.contains("[CTX]"), "context pack lost entirely");
+        assert!(text.contains("repository context and implementation detail"));
+        assert_eq!(structured["wire_budget"]["truncated_text"], true);
+    }
+
+    #[test]
+    fn budget_too_tight_for_both_copies_keeps_the_text_instructions() {
+        // A client may show the model only the text. When the budget cannot hold
+        // a block's text and its structured duplicate, the text must win.
+        let requested = 1_500usize;
+        let (text, structured) = production_sized_context_wire_payload();
+        let (text, structured) = budget_context_wire_payload(text, structured, requested);
+
+        assert!(
+            estimated_context_tool_wire_tokens(&text, &structured)
+                <= requested + CONTEXT_WIRE_ENVELOPE_TOKENS
+        );
+        for tag in [
+            "[INSTRUCTIONS]",
+            "[COORDINATION]",
+            "[MATCHED_SKILLS]",
+            "[GROUNDING]",
+        ] {
+            assert!(
+                text.contains(tag),
+                "{tag} lost from the text while its structured copy was kept: {:?}",
+                structured["wire_budget"]
+            );
+        }
     }
 
     #[test]

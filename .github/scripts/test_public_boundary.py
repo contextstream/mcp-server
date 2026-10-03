@@ -26,7 +26,7 @@ class PublicBoundaryTest(unittest.TestCase):
                     boundary.verify_paths_and_source(root)
 
     def test_repository_satisfies_public_boundary(self) -> None:
-        self.assertEqual(boundary.verify(REPOSITORY_ROOT), "1.0.11")
+        self.assertEqual(boundary.verify(REPOSITORY_ROOT), "1.0.12")
 
     def test_forbidden_private_source_is_detected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="public-boundary-") as temporary:

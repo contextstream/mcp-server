@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.12
+
+- Security: rustls 0.23.45 and rustls-webpki 0.103.15 replace 0.23.40 and
+  0.103.13, which RUSTSEC-2026-0285 flags. rustls accepted TLS 1.3 handshake
+  messages sent at the wrong encryption level. The advisory is medium severity
+  (5.3) and does not let a network attacker alter or complete a handshake.
+- Hooks: initialization is tracked per host session, so starting or resuming a
+  second session in the same checkout no longer blocks an initialized session
+  with "First call required". A successful `init` or `context` result completes
+  initialization, and the managed post-tool matcher now includes `context` and
+  `session` (#144).
+- An empty project no longer reports `canonical_index_ready`: a reported file
+  count of 0 now outranks a "ready" label, so agents are not sent to an empty
+  search (#145).
+- Shell code search (`rg`, `grep -r`, `find -name`) in a checkout with no
+  recorded index gets a non-blocking nudge to run `project(action="index")`, at
+  most once every 10 minutes per checkout (#145).
+- `context()` keeps `instructions`, `matched_skills`, `coordination_inbox`, and
+  `grounding_hits` under the wire budget, trimming the large duplicate fields
+  first (#145).
+- Global rules are written without a workspace identity, so setup runs in
+  different directories no longer leave different workspaces in the one global
+  file (#145).
+- `testing/adoption` measures ContextStream search against shell search from
+  local agent transcripts (#145).
+- Dependencies: hyper-util 0.1.21, tiktoken-rs 0.12.1, ignore 0.4.33,
+  tokio-test 0.4.6, and console 0.16.6 (#139). CI action pins updated (#140).
+
 ## 1.0.11
 
 - Optional deep project learning starts off. Interactive setup offers a separate review,

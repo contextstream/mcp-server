@@ -65,6 +65,10 @@ const QUESTION_WORDS: &[&str] = &[
 const DEFAULT_INDEX_WAIT_SECONDS: u64 = 20;
 const MIN_INDEX_WAIT_SECONDS: u64 = 15;
 const MAX_INDEX_WAIT_SECONDS: u64 = 20;
+/// How long the "no index recorded for this checkout" shell-search nudge stays
+/// quiet after it fires. Long enough that a session full of `rg` calls hears
+/// it once, short enough to resurface if the agent keeps ignoring it.
+const SHELL_SEARCH_NUDGE_COOLDOWN_SECONDS: u64 = 600;
 
 /// Check if a glob pattern is a broad discovery pattern.
 /// Allows targeted patterns like "src/models/*.rs", "web/src/**/*sidebar*",
@@ -1172,6 +1176,27 @@ fn is_local_discovery_tool_during_index_wait(tool_lower: &str, tool_input: &Valu
         }
         _ => false,
     }
+}
+
+/// Nudge for shell code search (`rg`, `grep -r`, `find -name`, `fd`) in a
+/// checkout that has no recorded index.
+///
+/// Telling the agent to "use search" here would send it to an empty index; one
+/// empty result and most agents stop searching for the session. So the nudge is
+/// honest: search has nothing yet, build the index once, then prefer search.
+/// Returns `None` for commands that are not code discovery (log filtering,
+/// process lists, a single targeted file), so those never get nudged.
+fn unindexed_shell_search_nudge(editor: &EditorFormat, command: &str) -> Option<String> {
+    let (tool_name, query_hint) = detect_bash_code_search(command)?;
+    let (mode, _) = recommend_search_mode(&query_hint);
+    let search = search_call(editor, mode, &query_hint);
+    let project = contextstream_tool_name(editor, "project");
+    Some(format!(
+        "ContextStream has no index recorded for this checkout, so search may come back empty until one exists. \
+         Build it once with {project}(action=\"index\") (it runs in the background and search fills in as files commit), \
+         then use {search} instead of shell `{tool_name}` for code discovery. \
+         Shell search is fine in the meantime."
+    ))
 }
 
 fn is_contextstream_read_only_operation(tool_name: &str, tool_input: &Value) -> bool {
@@ -2428,6 +2453,20 @@ pub async fn handle() -> Result<()> {
             return Ok(());
         }
 
+        // Shell code search is the same discovery the indexed path redirects,
+        // but it used to fall through to the silent Allow below, so a checkout
+        // missing from the local registry never got a nudge at all.
+        if tool_lower == "bash" {
+            let command = first_str(&tool_input, &["command"]).unwrap_or("").trim();
+            if let Some(msg) = unindexed_shell_search_nudge(&editor, command) {
+                if prompt_state::claim_shell_search_nudge(&cwd, SHELL_SEARCH_NUDGE_COOLDOWN_SECONDS)
+                {
+                    emit(HookDecision::AllowWithContext(msg))?;
+                    return Ok(());
+                }
+            }
+        }
+
         // Non-discovery tools should continue while refresh runs in background.
         emit(HookDecision::Allow)?;
         return Ok(());
@@ -3609,6 +3648,41 @@ mod tests {
             "task",
             &serde_json::json!({ "subagent_type": "explore" })
         ));
+    }
+
+    #[test]
+    fn unindexed_checkout_nudges_shell_code_search_toward_indexing() {
+        for command in [
+            "rg -n 'canonical_index_ready' crates",
+            "grep -rn \"PreToolUse\" .",
+            "cd crates && rg -n foo",
+            "find . -name '*.rs'",
+        ] {
+            let nudge = unindexed_shell_search_nudge(&EditorFormat::Claude, command)
+                .unwrap_or_else(|| panic!("expected a nudge for: {command}"));
+            assert!(nudge.contains("mcp__contextstream__project(action=\"index\")"));
+            assert!(nudge.contains("mcp__contextstream__search"));
+            // Must not claim an index exists.
+            assert!(nudge.contains("no index recorded"));
+        }
+    }
+
+    #[test]
+    fn unindexed_checkout_does_not_nudge_non_discovery_shell_commands() {
+        for command in [
+            "ps aux | grep node",
+            "grep ERROR /var/log/app.log",
+            "grep -n foo src/main.rs",
+            "git status",
+            "cargo test",
+            "find . -newer Cargo.lock",
+            "",
+        ] {
+            assert!(
+                unindexed_shell_search_nudge(&EditorFormat::Claude, command).is_none(),
+                "unexpected nudge for: {command}"
+            );
+        }
     }
 
     #[test]

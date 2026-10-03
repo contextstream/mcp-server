@@ -27,6 +27,10 @@ struct PromptStateEntry {
     index_wait_started_at: Option<String>,
     #[serde(default)]
     index_wait_until: Option<String>,
+    /// When the "no index recorded for this checkout" shell-search nudge last
+    /// fired, so it repeats at most once per cooldown instead of on every `rg`.
+    #[serde(default)]
+    shell_search_nudged_at: Option<String>,
     updated_at: String,
 }
 
@@ -97,6 +101,7 @@ pub fn mark_context_required(cwd: &str) {
             last_state_change_at: None,
             index_wait_started_at: None,
             index_wait_until: None,
+            shell_search_nudged_at: None,
             updated_at: now.clone(),
         });
     entry.require_context = true;
@@ -135,6 +140,7 @@ pub fn mark_init_required(cwd: &str) {
             last_state_change_at: None,
             index_wait_started_at: None,
             index_wait_until: None,
+            shell_search_nudged_at: None,
             updated_at: now.clone(),
         });
     entry.require_init = true;
@@ -189,6 +195,7 @@ pub fn mark_state_changed(cwd: &str) {
             last_state_change_at: None,
             index_wait_started_at: None,
             index_wait_until: None,
+            shell_search_nudged_at: None,
             updated_at: now.clone(),
         });
     entry.last_state_change_at = Some(now.clone());
@@ -272,6 +279,7 @@ pub fn start_index_wait_window(cwd: &str, wait_seconds: u64) {
             last_state_change_at: None,
             index_wait_started_at: None,
             index_wait_until: None,
+            shell_search_nudged_at: None,
             updated_at: now_iso.clone(),
         });
 
@@ -322,6 +330,55 @@ pub fn index_wait_remaining_seconds(cwd: &str) -> Option<u64> {
     (remaining > 0).then_some(remaining as u64)
 }
 
+/// Whether a nudge last shown at `last` may be shown again at `now`.
+fn nudge_cooldown_elapsed(
+    last: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    cooldown_seconds: u64,
+) -> bool {
+    match last.and_then(parse_rfc3339_utc) {
+        Some(last) => now.signed_duration_since(last).num_seconds() >= cooldown_seconds as i64,
+        None => true,
+    }
+}
+
+/// Claim the right to show the shell-search "no index recorded" nudge for
+/// `cwd`. Returns `true` at most once per `cooldown_seconds`; the caller emits
+/// the nudge only when it does.
+pub fn claim_shell_search_nudge(cwd: &str, cooldown_seconds: u64) -> bool {
+    if cwd.trim().is_empty() {
+        return false;
+    }
+    let mut state = read_state();
+    let now = chrono::Utc::now();
+    let now_iso = now.to_rfc3339();
+    let entry = state
+        .workspaces
+        .entry(cwd.to_string())
+        .or_insert(PromptStateEntry {
+            require_context: false,
+            require_init: false,
+            last_context_at: None,
+            last_state_change_at: None,
+            index_wait_started_at: None,
+            index_wait_until: None,
+            shell_search_nudged_at: None,
+            updated_at: now_iso.clone(),
+        });
+
+    if !nudge_cooldown_elapsed(
+        entry.shell_search_nudged_at.as_deref(),
+        now,
+        cooldown_seconds,
+    ) {
+        return false;
+    }
+    entry.shell_search_nudged_at = Some(now_iso.clone());
+    entry.updated_at = now_iso;
+    write_state(&state);
+    true
+}
+
 pub fn cleanup_stale(max_age_minutes: u64) {
     let mut state = read_state();
     let now = chrono::Utc::now();
@@ -357,6 +414,7 @@ mod tests {
                 last_state_change_at: None,
                 index_wait_started_at: None,
                 index_wait_until: None,
+                shell_search_nudged_at: None,
                 updated_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -373,6 +431,37 @@ mod tests {
             .index_wait_started_at
             .is_none());
         assert!(parsed.workspaces["/tmp/project"].index_wait_until.is_none());
+    }
+
+    #[test]
+    fn shell_search_nudge_cooldown_only_repeats_after_it_elapses() {
+        let now = chrono::Utc::now();
+        // Never nudged, or an unreadable timestamp: allowed.
+        assert!(nudge_cooldown_elapsed(None, now, 600));
+        assert!(nudge_cooldown_elapsed(Some("not a timestamp"), now, 600));
+        // Nudged a minute ago with a ten minute cooldown: suppressed.
+        let recent = (now - chrono::Duration::seconds(60)).to_rfc3339();
+        assert!(!nudge_cooldown_elapsed(Some(&recent), now, 600));
+        // Nudged eleven minutes ago: allowed again.
+        let old = (now - chrono::Duration::seconds(660)).to_rfc3339();
+        assert!(nudge_cooldown_elapsed(Some(&old), now, 600));
+    }
+
+    #[test]
+    fn legacy_prompt_state_defaults_shell_search_nudge_to_never() {
+        let legacy = serde_json::json!({
+            "workspaces": {
+                "/tmp/project": {
+                    "require_context": false,
+                    "updated_at": chrono::Utc::now().to_rfc3339()
+                }
+            }
+        });
+        let parsed: PromptStateFile =
+            serde_json::from_value(legacy).expect("parse legacy prompt state");
+        assert!(parsed.workspaces["/tmp/project"]
+            .shell_search_nudged_at
+            .is_none());
     }
 
     #[test]

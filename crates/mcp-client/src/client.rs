@@ -5160,14 +5160,24 @@ impl ContextStreamClient {
             return true;
         }
 
-        let committed_files = body
-            .get("indexed_files")
-            .and_then(serde_json::Value::as_i64)
-            .or_else(|| {
-                body.get("indexed_file_count")
-                    .and_then(serde_json::Value::as_i64)
-            })
-            .unwrap_or(0);
+        // The hosted status labels a project with no index row as
+        // `project_index_state: "ready"` / `status: "completed"`. A reported
+        // file count of zero is therefore authoritative: nothing is searchable,
+        // whatever the state label or a stale generation number says. State and
+        // generation only stand in for the count when the response omits it.
+        let reported_files = [
+            body.get("indexed_files")
+                .and_then(serde_json::Value::as_i64),
+            body.get("indexed_file_count")
+                .and_then(serde_json::Value::as_i64),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        let committed_files = reported_files.unwrap_or(0);
+        if reported_files.is_some() && committed_files <= 0 {
+            return false;
+        }
         let ready_state = body
             .get("project_index_state")
             .or_else(|| body.get("status"))
@@ -21104,6 +21114,41 @@ mod tests {
             !ContextStreamClient::project_index_status_reports_canonical_ready(
                 &serde_json::json!({"status": "success"})
             )
+        );
+    }
+
+    #[test]
+    fn empty_project_labelled_ready_is_not_canonically_ready() {
+        // Shape the hosted status returns for a project that was never
+        // indexed: a "ready"/"completed" label with zero files and no `indexed`.
+        for status in [
+            serde_json::json!({
+                "project_index_state": "ready",
+                "status": "completed",
+                "status_detail": "no_files_indexed",
+                "indexed_files": 0,
+                "indexed_file_count": 0,
+                "total_files": 0,
+                "committed_generation": 0
+            }),
+            serde_json::json!({
+                "project_index_state": "ready",
+                "indexed_file_count": 0,
+                "committed_generation": 12
+            }),
+            serde_json::json!({"indexed_files": 0, "status": "completed"}),
+        ] {
+            assert!(
+                !ContextStreamClient::project_index_status_reports_canonical_ready(&status),
+                "empty project must not report canonical readiness: {status}"
+            );
+        }
+        // A positive count still wins over a missing label.
+        assert!(
+            ContextStreamClient::project_index_status_reports_canonical_ready(&serde_json::json!({
+                "indexed_files": 0,
+                "indexed_file_count": 7
+            }))
         );
     }
 

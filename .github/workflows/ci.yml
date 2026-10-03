@@ -40,6 +40,8 @@ jobs:
         run: python3 .github/scripts/test_dco_check.py
       - name: Test grounding qualification evidence gates
         run: python3 -m unittest discover -s testing/grounding -p test_qualify.py
+      - name: Test search adoption metric
+        run: python3 -m unittest discover -s testing/adoption -p test_search_adoption.py
       - name: Test npm launcher
         run: npm test
       - name: Inspect npm package payload

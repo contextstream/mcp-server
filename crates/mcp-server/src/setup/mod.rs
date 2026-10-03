@@ -1983,7 +1983,12 @@ pub async fn update_rules_scoped(
     //   3. Resolved from the API (so the rule header shows a real UUID + name
     //      instead of the null UUID when neither 1 nor 2 is available)
     //   4. Inferred from existing rule-file headers (offline fallback)
-    let (ws_id, ws_name): (Option<String>, Option<String>) = if workspace_id.is_some() {
+    // Only project rules carry a workspace identity (global rules are
+    // workspace-neutral), so a global-only refresh needs none and skips the API
+    // lookup entirely.
+    let (ws_id, ws_name): (Option<String>, Option<String>) = if !include_project {
+        (None, None)
+    } else if workspace_id.is_some() {
         (
             workspace_id.map(String::from),
             workspace_name.map(String::from),
@@ -2022,7 +2027,7 @@ pub async fn update_rules_scoped(
 
         // Update global rules
         if scope == "global" || scope == "all" {
-            match rules::write_editor_rules(editor, ws_id_ref, ws_name_ref) {
+            match rules::write_editor_rules(editor) {
                 Ok(()) => updated.push("global rules"),
                 Err(e) => {
                     if !e.to_string().contains("Could not determine rules path") {
@@ -3641,7 +3646,7 @@ pub async fn configure_editor_with_workspace(
     }
 
     // Generate AI rules (global)
-    match rules::write_editor_rules(editor, workspace_id, workspace_name) {
+    match rules::write_editor_rules(editor) {
         Ok(()) => {
             rules_targets.push("global");
         }

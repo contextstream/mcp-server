@@ -1175,11 +1175,13 @@ fn apply_mcp_prefix(content: &str) -> String {
 }
 
 /// Write editor rules file (global).
-pub fn write_editor_rules(
-    editor: &Editor,
-    workspace_id: Option<&str>,
-    workspace_name: Option<&str>,
-) -> Result<()> {
+///
+/// Global rules apply to every project the editor opens, so they never carry a
+/// workspace identity: the rules tell the agent to use the ids `init(...)` and
+/// `context(...)` return. Stamping the workspace of whichever directory setup or
+/// repair happened to run in made the one global file name a different workspace
+/// each time (and disagree with the project rules loaded beside it).
+pub fn write_editor_rules(editor: &Editor) -> Result<()> {
     let paths = editor.all_rules_paths(None);
     if paths.is_empty() {
         return Err(anyhow::anyhow!(
@@ -1188,7 +1190,7 @@ pub fn write_editor_rules(
         ));
     }
 
-    let rules = global_rules_content(editor, workspace_id, workspace_name);
+    let rules = global_rules_content(editor, None, None);
 
     let primary = &paths[0];
     write_contextstream_block_to_path(primary, &rules, true)?;
@@ -1209,7 +1211,7 @@ pub fn write_editor_rules(
     if *editor == Editor::Aider {
         if let Some(home) = dirs::home_dir() {
             let shared = home.join(".contextstream").join("rules.md");
-            let shared_content = shared_rules_content(workspace_id, workspace_name, None);
+            let shared_content = shared_rules_content(None, None, None);
             write_contextstream_block_to_path(&shared, &shared_content, true)?;
         }
     }
@@ -4270,6 +4272,52 @@ mod tests {
         } else {
             std::env::remove_var("HOME");
         }
+    }
+
+    #[test]
+    fn rewriting_global_rules_drops_a_stale_workspace_stamp_and_keeps_user_content() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+
+        // A global block stamped with some other directory's workspace, the way
+        // repeated setup/repair runs left it, with the user's own text around it.
+        let global_rules = temp.path().join(".codex").join("AGENTS.md");
+        std::fs::create_dir_all(global_rules.parent().expect("parent")).expect("mkdirs");
+        std::fs::write(
+            &global_rules,
+            format!(
+                "my own notes above\n\n{}\n{} 0123456789abcdef -->\n# Workspace: Stale Example Workspace\n# Workspace ID: 11111111-2222-4333-8444-555555555555\n# ContextStream Rules\nMANDATORY STARTUP:\n{}\n\nmy own notes below\n",
+                CONTEXTSTREAM_START, RULES_HASH_MARKER_PREFIX, CONTEXTSTREAM_END
+            ),
+        )
+        .expect("seed stale global rules");
+
+        let result = write_editor_rules(&Editor::Codex);
+        let rewritten = std::fs::read_to_string(&global_rules).unwrap_or_default();
+
+        if let Some(value) = previous_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        result.expect("global rules rewrite");
+        assert!(
+            !rewritten.contains("Stale Example Workspace")
+                && !rewritten.contains("11111111-2222-4333-8444-555555555555"),
+            "stale workspace identity survived a global rewrite:\n{rewritten}"
+        );
+        assert!(rewritten.contains(&format!("# Workspace: {DEFAULT_WORKSPACE_NAME}")));
+        assert!(rewritten.contains(&format!("# Workspace ID: {DEFAULT_WORKSPACE_ID}")));
+        assert!(rewritten.starts_with("my own notes above\n"), "{rewritten}");
+        assert!(rewritten.contains("my own notes below"), "{rewritten}");
+        assert_eq!(
+            rewritten.matches(CONTEXTSTREAM_START).count(),
+            1,
+            "exactly one managed block expected:\n{rewritten}"
+        );
     }
 
     #[test]

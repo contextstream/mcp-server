@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.0.13
+
+- Session: `session(action="resume_list")` lists the caller's recent sessions,
+  newest first, and `session(action="resume")` loads one session's card (the
+  newest session that did real work when no `resume_id` is given), so a fresh
+  session can pick up recent work without a handoff. Both call the ContextStream
+  API and show its rendered text. The `session` tool's input schema gains these
+  two actions and a `resume_id` parameter; tool names and descriptions are
+  unchanged.
+- Hooks: Codex and Claude prompt hooks receive the canonical context output
+  schema. Cursor is now recognized by its own event names, instead of by the
+  absence of `tool_name`, which also matched Codex and Claude prompt events.
+- Hooks: global ignore rules are matched against the checkout being indexed, so a
+  prompt hook draining another checkout no longer panics.
+- `context()` shrinks `grounding_hits`, `instructions`, `coordination_inbox`,
+  `matched_skills`, and `lessons` to fit the wire budget before dropping them.
+  Ids, handles, paths, urls, and kind, type, and status strings are never
+  truncated. The budget report gains `shrunk_structured_field_count`.
+
 ## 1.0.12
 
 - Security: rustls 0.23.45 and rustls-webpki 0.103.15 replace 0.23.40 and

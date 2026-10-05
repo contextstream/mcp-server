@@ -1001,15 +1001,24 @@ impl ToolHandler for VcsTool {
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty())
                     .ok_or_else(|| Error::Validation("target_id is required".to_string()))?;
+                // The tool documents `source_*` as the VCS object and `target_*`
+                // as the ContextStream object. The API names the same two sides
+                // `vcs_object_*` and `cs_object_*`, requires all four, and takes
+                // both ids as UUIDs. Sending the tool's own names made the API
+                // refuse every call ("missing field `vcs_object_type`").
+                let source_uuid = Uuid::parse_str(&source_id)
+                    .map_err(|_| Error::Validation("source_id must be a UUID".to_string()))?;
+                let target_uuid = Uuid::parse_str(&target_id)
+                    .map_err(|_| Error::Validation("target_id must be a UUID".to_string()))?;
                 let path = format!("{}/links", workspace_base);
                 self.client
                     .post(
                         &path,
                         serde_json::json!({
-                            "source_type": source_type,
-                            "source_id": source_id,
-                            "target_type": target_type,
-                            "target_id": target_id
+                            "vcs_object_type": source_type,
+                            "vcs_object_id": source_uuid,
+                            "cs_object_type": target_type,
+                            "cs_object_id": target_uuid
                         }),
                     )
                     .await?
@@ -1169,3 +1178,7 @@ pub fn register_vcs_tools(
 ) {
     registry.register("vcs", Arc::new(VcsTool::new(client)));
 }
+
+#[cfg(test)]
+#[path = "vcs_tests.rs"]
+mod tests;

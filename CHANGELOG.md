@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.15
+
+- Session: `resume` and `resume_list` now leave out the session `init` just
+  opened. The 1.0.14 exclusion did not take effect when the caller passed no
+  `session_id`: the server kept a random local id, while the API stores snapshots
+  under the id it returns from `init`, which was never read. `init` now records
+  the API's id, and `resume` and `resume_list` exclude, in order, the explicit
+  `session_id`, the API's id, the id the server was initialized with, then the
+  transport's MCP session id.
+
 ## 1.0.14
 
 - macOS: the launchd-managed sync bridge no longer stays down or respawns

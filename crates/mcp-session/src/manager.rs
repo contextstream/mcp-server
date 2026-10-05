@@ -129,6 +129,11 @@ pub struct SessionState {
     /// Session ID
     pub session_id: Option<String>,
 
+    /// The session id the API assigned at init. It differs from `session_id`
+    /// when the caller sent none: the server then keeps a random local id,
+    /// while snapshots and transcripts are stored under the API's.
+    pub api_session_id: Option<String>,
+
     /// Workspace ID for this session
     pub workspace_id: Option<Uuid>,
 
@@ -202,6 +207,7 @@ impl Default for SessionState {
     fn default() -> Self {
         Self {
             session_id: None,
+            api_session_id: None,
             workspace_id: None,
             project_id: None,
             folder_path: None,
@@ -582,6 +588,7 @@ impl SessionManager {
         state.initialized = true;
         state.started_at = Utc::now();
         state.session_id = Some(session_id);
+        state.api_session_id = None;
         state.transcript_capture_enabled = None;
         state.default_search_mode = default_search_mode;
 
@@ -677,6 +684,17 @@ impl SessionManager {
         });
         let handle = self.state_for_current();
         handle.write().await.grounding_handle = normalized;
+    }
+
+    /// Record the session id the API returned from init. Empty values, and ones
+    /// over the 255 bytes the API accepts, are discarded.
+    pub async fn set_api_session_id(&self, session_id: Option<String>) {
+        let normalized = session_id.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty() && trimmed.len() <= 255).then(|| trimmed.to_string())
+        });
+        let handle = self.state_for_current();
+        handle.write().await.api_session_id = normalized;
     }
 
     /// Increment conversation turn count.
@@ -1015,6 +1033,61 @@ mod tests {
             .await;
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn the_api_session_id_is_trimmed_bounded_and_forgotten_by_a_new_init() {
+        let session = test_session_manager();
+        session
+            .initialize_with_session_id(None, None, None, None, Some("local".to_string()))
+            .await;
+        assert_eq!(
+            session.state().await.api_session_id,
+            None,
+            "nothing is recorded until init returns one"
+        );
+
+        session
+            .set_api_session_id(Some("  api-id  ".to_string()))
+            .await;
+        let state = session.state().await;
+        assert_eq!(state.api_session_id.as_deref(), Some("api-id"));
+        assert_eq!(
+            state.session_id.as_deref(),
+            Some("local"),
+            "the API's id is kept beside the local one, not instead of it"
+        );
+
+        session.set_api_session_id(Some("   ".to_string())).await;
+        assert_eq!(session.state().await.api_session_id, None);
+        session.set_api_session_id(Some("x".repeat(256))).await;
+        assert_eq!(
+            session.state().await.api_session_id,
+            None,
+            "the API rejects ids over 255 bytes"
+        );
+        session.set_api_session_id(Some("x".repeat(255))).await;
+        assert_eq!(
+            session
+                .state()
+                .await
+                .api_session_id
+                .as_deref()
+                .map(str::len),
+            Some(255)
+        );
+        session.set_api_session_id(None).await;
+        assert_eq!(session.state().await.api_session_id, None);
+
+        session.set_api_session_id(Some("api-id".to_string())).await;
+        session
+            .initialize_with_session_id(None, None, None, None, Some("local-2".to_string()))
+            .await;
+        assert_eq!(
+            session.state().await.api_session_id,
+            None,
+            "a new init forgets the previous session's id"
+        );
     }
 
     #[tokio::test]

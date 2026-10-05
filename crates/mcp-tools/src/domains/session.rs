@@ -2190,16 +2190,28 @@ fn context_pressure_notice(
     }
 }
 
+/// The session id the API assigned at init, from the top level of its response.
+/// When the caller sends no id the API picks one, and snapshots and transcripts
+/// are stored under it, not under the random id the server keeps locally.
+fn api_session_id_from(result: &Value) -> Option<String> {
+    result
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// The session the caller is in, which is never a candidate to resume: the
-/// explicit `session_id`, else the id this server was initialized with, else the
-/// transport's MCP session id (the order `context` uses). Without this a fresh
-/// session, which already has its own snapshot, would be offered itself.
+/// explicit `session_id`, else the id the API assigned at init (what snapshots
+/// are stored under), else the id this server was initialized with, else the
+/// transport's MCP session id. Without this a fresh session, which already has
+/// its own snapshot, would be offered itself.
 fn caller_session_id(
     explicit: Option<&str>,
+    api_assigned: Option<&str>,
     initialized: Option<&str>,
     transport: Option<&str>,
 ) -> Option<String> {
-    [explicit, initialized, transport]
+    [explicit, api_assigned, initialized, transport]
         .into_iter()
         .flatten()
         .map(str::trim)
@@ -2795,6 +2807,11 @@ impl ToolHandler for InitTool {
             .await;
         self.session
             .set_grounding_handle(extract_grounding_handle(&result))
+            .await;
+        // The API's own id for this session: not the server's when the caller
+        // sent none, and the one resume must keep out of its results.
+        self.session
+            .set_api_session_id(api_session_id_from(&result))
             .await;
 
         // Update client defaults so all subsequent client methods have workspace/project IDs
@@ -17076,10 +17093,11 @@ impl ToolHandler for SessionTool {
                     )
                 })?;
                 // The caller's own session is not a candidate to resume.
-                let own_session_id = self.session.state().await.session_id;
+                let state = self.session.state().await;
                 let exclude_session_id = caller_session_id(
                     input.session_id.as_deref(),
-                    own_session_id.as_deref(),
+                    state.api_session_id.as_deref(),
+                    state.session_id.as_deref(),
                     mcp_client::get_task_mcp_session_id().as_deref(),
                 );
                 let result = self
@@ -17122,10 +17140,11 @@ impl ToolHandler for SessionTool {
                     .to_string();
                 // Never offer the caller's own session back, whether or not
                 // the caller passed its id.
-                let own_session_id = self.session.state().await.session_id;
+                let state = self.session.state().await;
                 let exclude_session_id = caller_session_id(
                     input.session_id.as_deref(),
-                    own_session_id.as_deref(),
+                    state.api_session_id.as_deref(),
+                    state.session_id.as_deref(),
                     mcp_client::get_task_mcp_session_id().as_deref(),
                 );
                 let result = self

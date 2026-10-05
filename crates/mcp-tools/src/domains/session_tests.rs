@@ -6340,36 +6340,68 @@ mod init_prefetch_tests {
 // ============================================================================
 
 #[test]
-fn the_callers_own_session_is_the_explicit_one_then_the_initialized_one_then_the_transport_one() {
+fn the_callers_own_session_id_follows_a_fixed_order() {
     assert_eq!(
-        caller_session_id(Some("explicit"), Some("own"), Some("transport")).as_deref(),
+        caller_session_id(
+            Some("explicit"),
+            Some("api"),
+            Some("own"),
+            Some("transport")
+        )
+        .as_deref(),
         Some("explicit")
     );
     assert_eq!(
-        caller_session_id(Some("  "), Some(" own "), Some("transport")).as_deref(),
-        Some("own"),
+        caller_session_id(None, Some("api"), Some("own"), Some("transport")).as_deref(),
+        Some("api"),
+        "the API's id beats the server's local one: snapshots are stored under it"
+    );
+    assert_eq!(
+        caller_session_id(None, None, Some("own"), Some("transport")).as_deref(),
+        Some("own")
+    );
+    assert_eq!(
+        caller_session_id(None, None, None, Some("transport")).as_deref(),
+        Some("transport")
+    );
+    assert_eq!(
+        caller_session_id(Some("  "), Some(" api "), None, None).as_deref(),
+        Some("api"),
         "a blank id is not an id, and ids are trimmed"
     );
     assert_eq!(
-        caller_session_id(None, Some(""), Some("transport")).as_deref(),
-        Some("transport")
+        caller_session_id(None, Some(""), Some("own"), None).as_deref(),
+        Some("own")
     );
+    assert_eq!(caller_session_id(None, None, None, None), None);
     assert_eq!(
-        caller_session_id(None, None, Some("transport")).as_deref(),
-        Some("transport")
+        caller_session_id(Some(""), Some(" "), Some("\t"), Some("")),
+        None
     );
-    assert_eq!(caller_session_id(None, None, None), None);
-    assert_eq!(caller_session_id(Some(""), Some(" "), Some("\t")), None);
 }
 
-/// The JSON body the API receives from one resume call. Any other request the
-/// call makes while resolving scope is answered 404.
-async fn resume_request_body(
-    action: &str,
-    explicit: Option<&str>,
-    initialized: Option<&str>,
-    transport: Option<&str>,
-) -> Value {
+#[test]
+fn the_api_session_id_is_read_from_the_top_of_the_init_response() {
+    assert_eq!(
+        api_session_id_from(&json!({"session_id": "abc", "other": 1})).as_deref(),
+        Some("abc")
+    );
+    assert_eq!(api_session_id_from(&json!({"workspace_id": "w"})), None);
+    assert_eq!(api_session_id_from(&json!({"session_id": null})), None);
+    assert_eq!(api_session_id_from(&json!({"session_id": 7})), None);
+    assert_eq!(
+        api_session_id_from(&json!({"data": {"session_id": "nested"}})),
+        None,
+        "only the top level of the response counts"
+    );
+}
+
+/// A mock API on a local port. `session/init` answers `init_response` (404 when
+/// there is none); the first resume request is answered and its JSON body
+/// returned by the task; anything else is a 404.
+async fn spawn_resume_mock(
+    init_response: Option<Value>,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<Value>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6398,10 +6430,11 @@ async fn resume_request_body(
                     }
                 };
                 let is_resume = head.starts_with("POST /api/v1/session/resume/");
-                let (status, payload) = if is_resume {
-                    ("200 OK", json!({"text": "ok"}).to_string())
-                } else {
-                    ("404 Not Found", json!({"error": "not found"}).to_string())
+                let is_init = head.starts_with("POST /api/v1/session/init");
+                let (status, payload) = match (&init_response, is_init, is_resume) {
+                    (Some(response), true, _) => ("200 OK", response.to_string()),
+                    (_, _, true) => ("200 OK", json!({"text": "ok"}).to_string()),
+                    _ => ("404 Not Found", json!({"error": "not found"}).to_string()),
                 };
                 socket
                     .write_all(
@@ -6421,7 +6454,18 @@ async fn resume_request_body(
         .await
         .expect("bounded resume request")
     });
+    (address, server)
+}
 
+/// The JSON body the API receives from one resume call.
+async fn resume_request_body(
+    action: &str,
+    explicit: Option<&str>,
+    api_assigned: Option<&str>,
+    initialized: Option<&str>,
+    transport: Option<&str>,
+) -> Value {
+    let (address, server) = spawn_resume_mock(None).await;
     let mut config = TestFixtures::test_config();
     config.api_url = format!("http://{address}");
     let client = ContextStreamClient::new(config.clone());
@@ -6431,6 +6475,9 @@ async fn resume_request_body(
         session
             .initialize_with_session_id(Some(workspace_id), None, None, None, Some(id.to_string()))
             .await;
+    }
+    if let Some(id) = api_assigned {
+        session.set_api_session_id(Some(id.to_string())).await;
     }
     let tool = SessionTool::new(client, session, mcp_types::atlas_layer::noop_layer());
     let mut input = json!({"action": action, "workspace_id": workspace_id});
@@ -6449,26 +6496,82 @@ async fn resume_request_body(
 #[tokio::test]
 async fn resume_actions_never_offer_the_callers_own_session() {
     for action in ["resume_list", "resume"] {
-        let body =
-            resume_request_body(action, Some("explicit"), Some("own"), Some("transport")).await;
+        let body = resume_request_body(
+            action,
+            Some("explicit"),
+            Some("api"),
+            Some("own"),
+            Some("transport"),
+        )
+        .await;
         assert_eq!(
             body["exclude_session_id"], "explicit",
             "{action}: an explicit id wins"
         );
-        let body = resume_request_body(action, None, Some("own"), Some("transport")).await;
+        let body =
+            resume_request_body(action, None, Some("api"), Some("own"), Some("transport")).await;
+        assert_eq!(
+            body["exclude_session_id"], "api",
+            "{action}: else the id the API assigned at init"
+        );
+        let body = resume_request_body(action, None, None, Some("own"), Some("transport")).await;
         assert_eq!(
             body["exclude_session_id"], "own",
             "{action}: else the id this server was initialized with"
         );
-        let body = resume_request_body(action, None, None, Some("transport")).await;
+        let body = resume_request_body(action, None, None, None, Some("transport")).await;
         assert_eq!(
             body["exclude_session_id"], "transport",
             "{action}: else the transport's session id"
         );
-        let body = resume_request_body(action, None, None, None).await;
+        let body = resume_request_body(action, None, None, None, None).await;
         assert!(
             body.get("exclude_session_id").is_none_or(Value::is_null),
             "{action}: with no session known nothing is excluded: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resume_after_a_real_init_never_offers_the_session_the_api_just_opened() {
+    // Agents usually call init without a session id. The server then keeps a
+    // random local id while the API assigns its own and returns it, and the
+    // API's is the one snapshots are stored under.
+    for action in ["resume_list", "resume"] {
+        let workspace_id = Uuid::new_v4();
+        let (address, server) = spawn_resume_mock(Some(json!({
+            "workspace_id": workspace_id,
+            "session_id": "api-assigned-session",
+        })))
+        .await;
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{address}");
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+
+        InitTool::new(client.clone(), session.clone())
+            .execute(json!({"auto_update": false}))
+            .await
+            .expect("init");
+        let state = session.state().await;
+        assert_eq!(
+            state.api_session_id.as_deref(),
+            Some("api-assigned-session")
+        );
+        assert_ne!(
+            state.session_id.as_deref(),
+            Some("api-assigned-session"),
+            "the premise: the server's own id is a random local one"
+        );
+
+        SessionTool::new(client, session, mcp_types::atlas_layer::noop_layer())
+            .execute(json!({"action": action, "workspace_id": workspace_id}))
+            .await
+            .expect("resume call");
+        let body = server.await.expect("resume server");
+        assert_eq!(
+            body["exclude_session_id"], "api-assigned-session",
+            "{action}: the session init just opened is not a candidate to resume"
         );
     }
 }

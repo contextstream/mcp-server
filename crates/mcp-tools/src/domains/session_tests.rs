@@ -6457,6 +6457,17 @@ async fn spawn_resume_mock(
     (address, server)
 }
 
+fn result_text(result: &mcp_types::tool::ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .find_map(|item| match item {
+            mcp_types::tool::ContentItem::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// The JSON body the API receives from one resume call.
 async fn resume_request_body(
     action: &str,
@@ -6465,6 +6476,20 @@ async fn resume_request_body(
     initialized: Option<&str>,
     transport: Option<&str>,
 ) -> Value {
+    resume_call(action, explicit, api_assigned, initialized, transport)
+        .await
+        .0
+}
+
+/// The JSON body the API receives from one resume call, and the text the
+/// caller gets back.
+async fn resume_call(
+    action: &str,
+    explicit: Option<&str>,
+    api_assigned: Option<&str>,
+    initialized: Option<&str>,
+    transport: Option<&str>,
+) -> (Value, String) {
     let (address, server) = spawn_resume_mock(None).await;
     let mut config = TestFixtures::test_config();
     config.api_url = format!("http://{address}");
@@ -6489,8 +6514,9 @@ async fn resume_request_body(
         Some(id) => mcp_client::run_with_mcp_session_id(id.to_string(), || call).await,
         None => call.await,
     };
-    result.expect("resume call");
-    server.await.expect("resume server")
+    let result = result.expect("resume call");
+    let text = result_text(&result);
+    (server.await.expect("resume server"), text)
 }
 
 #[tokio::test]
@@ -6573,5 +6599,106 @@ async fn resume_after_a_real_init_never_offers_the_session_the_api_just_opened()
             body["exclude_session_id"], "api-assigned-session",
             "{action}: the session init just opened is not a candidate to resume"
         );
+    }
+}
+
+#[tokio::test]
+async fn resume_says_so_when_it_could_not_leave_the_callers_own_session_out() {
+    for action in ["resume_list", "resume"] {
+        let (_, text) = resume_call(action, None, None, None, None).await;
+        assert!(
+            text.contains("not left out")
+                && text.contains(&format!("session(action=\"{action}\", session_id=")),
+            "{action}: no id known, so the caller is told how to pass one: {text}"
+        );
+        for (explicit, api_assigned, initialized, transport) in [
+            (Some("mine"), None, None, None),
+            (None, Some("api"), None, None),
+            (None, None, Some("own"), None),
+            (None, None, None, Some("transport")),
+        ] {
+            let (_, text) =
+                resume_call(action, explicit, api_assigned, initialized, transport).await;
+            assert!(
+                !text.contains("not left out"),
+                "{action}: an id was known, so there is nothing to say: {text}"
+            );
+        }
+    }
+}
+
+/// The hosted gateway gives every request its own state bucket and discards it
+/// afterwards, so what init stored is gone when resume runs. One manager, a
+/// different bucket per request, exactly as the gateway does it.
+#[tokio::test]
+async fn on_a_stateless_gateway_the_agent_carries_the_session_id_from_init_to_resume() {
+    use mcp_client::run_with_session_key;
+    use mcp_types::SessionKey;
+
+    for pass_the_id in [false, true] {
+        let workspace_id = Uuid::new_v4();
+        let (address, server) = spawn_resume_mock(Some(json!({
+            "workspace_id": workspace_id,
+            "session_id": "api-assigned-session",
+        })))
+        .await;
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{address}");
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+
+        let init_key = SessionKey::for_anonymous_http("stateless-request:init");
+        let init = run_with_session_key(init_key.clone(), || async {
+            InitTool::new(client.clone(), session.clone())
+                .execute(json!({"auto_update": false}))
+                .await
+        })
+        .await
+        .expect("init");
+        session.discard_transient_state(&init_key);
+        let init_text = result_text(&init);
+        let told = init_text
+            .split("session_id=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("init names the session id to pass to resume");
+        assert_eq!(told, "api-assigned-session");
+
+        let resume_key = SessionKey::for_anonymous_http("stateless-request:resume");
+        let mut input = json!({"action": "resume", "workspace_id": workspace_id});
+        if pass_the_id {
+            input["session_id"] = json!(told);
+        }
+        let resume = run_with_session_key(resume_key.clone(), || async {
+            assert!(
+                session.state().await.api_session_id.is_none(),
+                "the premise: nothing init stored survives into the next request"
+            );
+            SessionTool::new(
+                client.clone(),
+                session.clone(),
+                mcp_types::atlas_layer::noop_layer(),
+            )
+            .execute(input)
+            .await
+        })
+        .await
+        .expect("resume call");
+        session.discard_transient_state(&resume_key);
+        let body = server.await.expect("resume server");
+
+        if pass_the_id {
+            assert_eq!(body["exclude_session_id"], "api-assigned-session");
+            assert!(!result_text(&resume).contains("not left out"));
+        } else {
+            assert!(
+                body.get("exclude_session_id").is_none_or(Value::is_null),
+                "nothing carries the id across requests: {body}"
+            );
+            assert!(
+                result_text(&resume).contains("not left out"),
+                "without the id the caller is told how to pass it"
+            );
+        }
     }
 }

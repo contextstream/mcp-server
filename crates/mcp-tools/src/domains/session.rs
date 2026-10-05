@@ -2219,6 +2219,17 @@ fn caller_session_id(
         .map(str::to_string)
 }
 
+/// Appended to a resume response when no id was available to leave the
+/// caller's own session out. The hosted gateway keeps no state between
+/// calls, so only the caller can say which session is its own, and the
+/// session init just opened is the newest one with a snapshot.
+fn own_session_note(action: &str) -> String {
+    format!(
+        "Your own session is not left out because no session_id was passed. \
+         Pass the session_id init returned: session(action=\"{action}\", session_id=\"<that id>\")."
+    )
+}
+
 /// The model-visible text of a resume response. The API renders it within a
 /// token budget; when it sends none, say so instead of returning nothing.
 fn resume_text(result: &Value, empty: &str) -> String {
@@ -3057,6 +3068,13 @@ impl ToolHandler for InitTool {
             text.push_str(
                 "\nNo usable workspace_id was returned. Run init(folder_path=\"...\") after checking workspace access, or pass workspace_id explicitly.",
             );
+        }
+        // The id is the caller's to carry: resume cannot find it on a
+        // transport that keeps no state between calls.
+        if let Some(api_session_id) = api_session_id_from(&result) {
+            text.push_str(&format!(
+                "\nSession id: {api_session_id}. To resume the previous session, call session(action=\"resume\", session_id=\"{api_session_id}\")."
+            ));
         }
         // Zero-touch auto-provisioning: surface the server's one-liner as a
         // positive fact ("project created — no setup needed"), never as a
@@ -17100,6 +17118,7 @@ impl ToolHandler for SessionTool {
                     state.session_id.as_deref(),
                     mcp_client::get_task_mcp_session_id().as_deref(),
                 );
+                let own_session_unknown = exclude_session_id.is_none();
                 let result = self
                     .client
                     .session_resume_list(mcp_client::SessionResumeListParams {
@@ -17111,6 +17130,9 @@ impl ToolHandler for SessionTool {
                     })
                     .await?;
                 let mut text = resume_text(&result, "No recent sessions found.");
+                if own_session_unknown {
+                    text.push_str(&format!("\n\n{}", own_session_note("resume_list")));
+                }
                 if let Some(note) = scope.note {
                     text.push_str(&format!("\n\n{note}"));
                 }
@@ -17147,6 +17169,7 @@ impl ToolHandler for SessionTool {
                     state.session_id.as_deref(),
                     mcp_client::get_task_mcp_session_id().as_deref(),
                 );
+                let own_session_unknown = exclude_session_id.is_none();
                 let result = self
                     .client
                     .session_resume_get(mcp_client::SessionResumeGetParams {
@@ -17159,6 +17182,9 @@ impl ToolHandler for SessionTool {
                     })
                     .await?;
                 let mut text = resume_text(&result, "Nothing to resume for this scope.");
+                if own_session_unknown {
+                    text.push_str(&format!("\n\n{}", own_session_note("resume")));
+                }
                 if let Some(note) = scope.note {
                     text.push_str(&format!("\n\n{note}"));
                 }
@@ -17369,7 +17395,7 @@ impl ToolHandler for SessionTool {
             .string("session_id", "Session ID for transcript/snapshot restore", false)
             .string(
                 "resume_id",
-                "For resume: a session id or an unambiguous prefix of one (6+ characters) from resume_list, or \"latest\" (the default) for the newest session that did real work. session_id (your current session) is left out of resume_list and latest.",
+                "For resume: a session id or an unambiguous prefix of one (6+ characters) from resume_list, or \"latest\" (the default) for the newest session that did real work. Pass session_id (the one init returned) so your current session is left out of resume_list and latest; without it your own session can come back.",
                 false,
             )
             .string(

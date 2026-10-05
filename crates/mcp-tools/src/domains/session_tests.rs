@@ -6334,3 +6334,141 @@ mod init_prefetch_tests {
         ));
     }
 }
+
+// ============================================================================
+// resume: the caller's own session is never offered back
+// ============================================================================
+
+#[test]
+fn the_callers_own_session_is_the_explicit_one_then_the_initialized_one_then_the_transport_one() {
+    assert_eq!(
+        caller_session_id(Some("explicit"), Some("own"), Some("transport")).as_deref(),
+        Some("explicit")
+    );
+    assert_eq!(
+        caller_session_id(Some("  "), Some(" own "), Some("transport")).as_deref(),
+        Some("own"),
+        "a blank id is not an id, and ids are trimmed"
+    );
+    assert_eq!(
+        caller_session_id(None, Some(""), Some("transport")).as_deref(),
+        Some("transport")
+    );
+    assert_eq!(
+        caller_session_id(None, None, Some("transport")).as_deref(),
+        Some("transport")
+    );
+    assert_eq!(caller_session_id(None, None, None), None);
+    assert_eq!(caller_session_id(Some(""), Some(" "), Some("\t")), None);
+}
+
+/// The JSON body the API receives from one resume call. Any other request the
+/// call makes while resolving scope is answered 404.
+async fn resume_request_body(
+    action: &str,
+    explicit: Option<&str>,
+    initialized: Option<&str>,
+    transport: Option<&str>,
+) -> Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (head, body) = loop {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0, "request ended before its body");
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_string();
+                        let length: usize = head
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse().unwrap())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break (head, request[end + 4..end + 4 + length].to_vec());
+                        }
+                    }
+                };
+                let is_resume = head.starts_with("POST /api/v1/session/resume/");
+                let (status, payload) = if is_resume {
+                    ("200 OK", json!({"text": "ok"}).to_string())
+                } else {
+                    ("404 Not Found", json!({"error": "not found"}).to_string())
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                if is_resume {
+                    return serde_json::from_slice::<Value>(&body).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("bounded resume request")
+    });
+
+    let mut config = TestFixtures::test_config();
+    config.api_url = format!("http://{address}");
+    let client = ContextStreamClient::new(config.clone());
+    let session = Arc::new(SessionManager::new(client.clone(), config));
+    let workspace_id = Uuid::new_v4();
+    if let Some(id) = initialized {
+        session
+            .initialize_with_session_id(Some(workspace_id), None, None, None, Some(id.to_string()))
+            .await;
+    }
+    let tool = SessionTool::new(client, session, mcp_types::atlas_layer::noop_layer());
+    let mut input = json!({"action": action, "workspace_id": workspace_id});
+    if let Some(id) = explicit {
+        input["session_id"] = json!(id);
+    }
+    let call = tool.execute(input);
+    let result = match transport {
+        Some(id) => mcp_client::run_with_mcp_session_id(id.to_string(), || call).await,
+        None => call.await,
+    };
+    result.expect("resume call");
+    server.await.expect("resume server")
+}
+
+#[tokio::test]
+async fn resume_actions_never_offer_the_callers_own_session() {
+    for action in ["resume_list", "resume"] {
+        let body =
+            resume_request_body(action, Some("explicit"), Some("own"), Some("transport")).await;
+        assert_eq!(
+            body["exclude_session_id"], "explicit",
+            "{action}: an explicit id wins"
+        );
+        let body = resume_request_body(action, None, Some("own"), Some("transport")).await;
+        assert_eq!(
+            body["exclude_session_id"], "own",
+            "{action}: else the id this server was initialized with"
+        );
+        let body = resume_request_body(action, None, None, Some("transport")).await;
+        assert_eq!(
+            body["exclude_session_id"], "transport",
+            "{action}: else the transport's session id"
+        );
+        let body = resume_request_body(action, None, None, None).await;
+        assert!(
+            body.get("exclude_session_id").is_none_or(Value::is_null),
+            "{action}: with no session known nothing is excluded: {body}"
+        );
+    }
+}

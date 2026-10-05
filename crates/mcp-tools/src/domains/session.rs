@@ -2190,6 +2190,23 @@ fn context_pressure_notice(
     }
 }
 
+/// The session the caller is in, which is never a candidate to resume: the
+/// explicit `session_id`, else the id this server was initialized with, else the
+/// transport's MCP session id (the order `context` uses). Without this a fresh
+/// session, which already has its own snapshot, would be offered itself.
+fn caller_session_id(
+    explicit: Option<&str>,
+    initialized: Option<&str>,
+    transport: Option<&str>,
+) -> Option<String> {
+    [explicit, initialized, transport]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// The model-visible text of a resume response. The API renders it within a
 /// token budget; when it sends none, say so instead of returning nothing.
 fn resume_text(result: &Value, empty: &str) -> String {
@@ -17058,6 +17075,13 @@ impl ToolHandler for SessionTool {
                             .to_string(),
                     )
                 })?;
+                // The caller's own session is not a candidate to resume.
+                let own_session_id = self.session.state().await.session_id;
+                let exclude_session_id = caller_session_id(
+                    input.session_id.as_deref(),
+                    own_session_id.as_deref(),
+                    mcp_client::get_task_mcp_session_id().as_deref(),
+                );
                 let result = self
                     .client
                     .session_resume_list(mcp_client::SessionResumeListParams {
@@ -17065,8 +17089,7 @@ impl ToolHandler for SessionTool {
                         project_id: scope.project_id,
                         scope: input.scope,
                         limit: input.limit,
-                        // The caller's own session is not a candidate to resume.
-                        exclude_session_id: input.session_id,
+                        exclude_session_id,
                     })
                     .await?;
                 let mut text = resume_text(&result, "No recent sessions found.");
@@ -17097,6 +17120,14 @@ impl ToolHandler for SessionTool {
                     .filter(|id| !id.is_empty())
                     .unwrap_or("latest")
                     .to_string();
+                // Never offer the caller's own session back, whether or not
+                // the caller passed its id.
+                let own_session_id = self.session.state().await.session_id;
+                let exclude_session_id = caller_session_id(
+                    input.session_id.as_deref(),
+                    own_session_id.as_deref(),
+                    mcp_client::get_task_mcp_session_id().as_deref(),
+                );
                 let result = self
                     .client
                     .session_resume_get(mcp_client::SessionResumeGetParams {
@@ -17104,7 +17135,7 @@ impl ToolHandler for SessionTool {
                         project_id: scope.project_id,
                         scope: input.scope,
                         id,
-                        exclude_session_id: input.session_id,
+                        exclude_session_id,
                         include_card: None,
                     })
                     .await?;

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.14
+
+- macOS: the launchd-managed sync bridge no longer stays down or respawns
+  thousands of times after `contextstream-mcp update`. Updates re-sign the staged
+  binary with a stable identifier (`io.contextstream.mcp`), so launchd's cached
+  launch constraints still match. A version change reloads the job (bootout, then
+  bootstrap, retrying bootstrap briefly) instead of `launchctl kickstart -k`. A
+  watcher running under the managed launchd label now waits for the singleton
+  lock and takes over when it is free, instead of exiting at once and being
+  respawned every ten seconds.
+- Session: `resume` and `resume_list` leave out the caller's own session by
+  default, so a fresh session's `resume` returns the previous session and not
+  itself. The excluded id is the explicit `session_id`, then the id the server
+  was initialized with, then the transport's MCP session id.
+
 ## 1.0.13
 
 - Session: `session(action="resume_list")` lists the caller's recent sessions,

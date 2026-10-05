@@ -14,6 +14,12 @@
   default, so a fresh session's `resume` returns the previous session and not
   itself. The excluded id is the explicit `session_id`, then the id the server
   was initialized with, then the transport's MCP session id.
+- `vcs`: `create_link` works. It sent `source_*` and `target_*` as the request
+  field names, where the API requires `vcs_object_type`, `vcs_object_id`,
+  `cs_object_type`, and `cs_object_id`, so the API refused every call with
+  "missing field `vcs_object_type`". The parameters are unchanged (`source_*` is
+  the VCS object, `target_*` the ContextStream object). Both ids must be UUIDs and
+  are checked before the request is sent.
 
 ## 1.0.13
 

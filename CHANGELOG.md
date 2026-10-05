@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.16
+
+- Session: `resume` and `resume_list` can now leave out your own session on the
+  hosted gateway for clients that connect with the stateless 2026-07-28 protocol,
+  such as Claude Code 2.1.289. On that protocol the gateway keeps no state
+  between calls, so the session id that `init` stored (the 1.0.15 approach) did
+  not exist when `resume` ran, and `resume` returned the session `init` had just
+  opened. The caller now carries the id: `init` prints "Session id: <id>" and the
+  `resume` call to make, and `resume` and `resume_list` add a one-line note naming
+  that call when no id was available. The stored-id fallbacks stay for stdio and
+  for initialize-era HTTP, where state persists. The `resume_id` parameter text
+  now says to pass the session id `init` returned.
+
 ## 1.0.15
 
 - Session: `resume` and `resume_list` now leave out the session `init` just

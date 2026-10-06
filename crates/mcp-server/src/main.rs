@@ -540,6 +540,18 @@ enum Commands {
         /// List what would be imported without sending anything
         #[arg(long)]
         dry_run: bool,
+
+        /// Only import this Claude project directory (e.g. -Users-me-repo)
+        #[arg(long, value_name = "NAME", allow_hyphen_values = true)]
+        project_dir: Option<String>,
+
+        /// Workspace to import into instead of the folder's link
+        #[arg(long, value_name = "UUID")]
+        workspace_id: Option<uuid::Uuid>,
+
+        /// Project to import into
+        #[arg(long, value_name = "UUID")]
+        project_id: Option<uuid::Uuid>,
     },
 
     /// List every coding client setup can configure (non-interactive)
@@ -1295,8 +1307,20 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             }
         }
 
-        Some(Commands::ImportLocalMemory { dry_run }) => {
-            let (_, _, failed) = setup::local_memory_import::run(dry_run).await?;
+        Some(Commands::ImportLocalMemory {
+            dry_run,
+            project_dir,
+            workspace_id,
+            project_id,
+        }) => {
+            let (_, _, failed) =
+                setup::local_memory_import::run(setup::local_memory_import::ImportOptions {
+                    dry_run,
+                    project_dir,
+                    workspace_id,
+                    project_id,
+                })
+                .await?;
             if failed > 0 {
                 std::process::exit(1);
             }

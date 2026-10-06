@@ -1896,6 +1896,15 @@ fn auto_memory_redirect_message(
     )
 }
 
+/// Note for a repository doc written before the session resolved its scope.
+fn repo_doc_pending_mirror_note(editor: &EditorFormat, doc_type: &str) -> String {
+    format!(
+        "ContextStream will mirror this {doc_type} file to a doc (doc_type=\"{doc_type}\") as soon as this session runs {}(...) or {}(...), which it has not yet; do not call create_doc for it. Keep editing the repository file.",
+        init_tool_name(editor),
+        context_tool_name(editor)
+    )
+}
+
 /// Note for a repository doc that PostToolUse mirrors to ContextStream.
 fn repo_doc_mirror_note(doc_type: &str) -> String {
     format!(
@@ -2929,7 +2938,8 @@ pub async fn handle() -> Result<()> {
                     } else {
                         Path::new(&cwd).join(raw_file_path)
                     };
-                    if super::durable_capture::doc_mirror_available(&absolute).await {
+                    let host_session = first_non_empty_str(&input, &["session_id", "sessionId"]);
+                    if super::durable_capture::doc_mirror_available(&absolute, host_session).await {
                         emit_compliance(ComplianceEvent {
                             rule_key: compliance::RULE_DOC_PERSISTENCE,
                             rule_class: RuleClass::Soft,
@@ -2944,6 +2954,11 @@ pub async fn handle() -> Result<()> {
                             ..Default::default()
                         });
                         context_note.get_or_insert_with(|| repo_doc_mirror_note(doc_type));
+                    } else if compliance_config.is_configured() && host_session.is_some() {
+                        // PostToolUse queues it and mirrors it as soon as
+                        // init/context resolves this session's scope.
+                        context_note
+                            .get_or_insert_with(|| repo_doc_pending_mirror_note(&editor, doc_type));
                     } else {
                         unhandled_path.get_or_insert(raw_file_path);
                     }

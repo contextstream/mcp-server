@@ -162,12 +162,32 @@ fn claude_config_dir() -> Option<PathBuf> {
     crate::hook_handlers::durable_paths::claude_config_dir()
 }
 
+/// Which files to import and where, beyond the folder links `init` records.
+#[derive(Debug, Clone, Default)]
+pub struct ImportOptions {
+    pub dry_run: bool,
+    /// Only this Claude project directory (e.g. `-Users-me-repo`).
+    pub project_dir: Option<String>,
+    /// Scope to use instead of the folder's link (for unlinked or stale links).
+    pub workspace_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+}
+
 /// Import every not-yet-imported auto memory file. With `dry_run`, only list
 /// what would be imported. Returns `(imported, skipped, failed)`.
-pub async fn run(dry_run: bool) -> Result<(usize, usize, usize)> {
+pub async fn run(options: ImportOptions) -> Result<(usize, usize, usize)> {
+    let dry_run = options.dry_run;
     let config_dir =
         claude_config_dir().ok_or_else(|| anyhow::anyhow!("Could not find the Claude config"))?;
-    let memories = discover(&config_dir);
+    let memories: Vec<LocalMemory> = discover(&config_dir)
+        .into_iter()
+        .filter(|memory| {
+            options
+                .project_dir
+                .as_deref()
+                .is_none_or(|dir| memory.project_dir == dir)
+        })
+        .collect();
     if memories.is_empty() {
         println!(
             "No Claude auto memory files found under {}",
@@ -194,13 +214,26 @@ pub async fn run(dry_run: bool) -> Result<(usize, usize, usize)> {
             skipped += 1;
             continue;
         }
-        let (workspace_id, project_id) = scope_for_project_dir(&mappings, &memory.project_dir);
+        let (linked_workspace, linked_project) =
+            scope_for_project_dir(&mappings, &memory.project_dir);
+        let (workspace_id, project_id) = match options.workspace_id {
+            Some(workspace) => (Some(workspace), options.project_id),
+            None => (linked_workspace, options.project_id.or(linked_project)),
+        };
         let label = format!(
             "{} '{}' ({})",
             memory.node_type(),
             memory.name,
             memory.project_dir
         );
+        let Some(workspace_id) = workspace_id else {
+            eprintln!(
+                "skipped {label}: its folder is not linked to a ContextStream workspace. Link it with `contextstream-mcp setup --project-path <folder>`, or rerun with --project-dir={} --workspace-id <id>.",
+                memory.project_dir
+            );
+            failed += 1;
+            continue;
+        };
         if dry_run {
             println!("would import {label}");
             imported += 1;
@@ -209,7 +242,7 @@ pub async fn run(dry_run: bool) -> Result<(usize, usize, usize)> {
         let client = mcp_client::ContextStreamClient::new(mcp_types::Config {
             api_url: config.api_url.clone(),
             api_key: Some(config.api_key.clone()),
-            default_workspace_id: workspace_id,
+            default_workspace_id: Some(workspace_id),
             default_project_id: project_id,
             ..Default::default()
         });
@@ -230,7 +263,7 @@ pub async fn run(dry_run: bool) -> Result<(usize, usize, usize)> {
                 content: Some(crate::hook_handlers::common::scrub_credential_tokens(
                     &content,
                 )),
-                workspace_id,
+                workspace_id: Some(workspace_id),
                 project_id,
                 metadata: Some(serde_json::json!({
                     "source": "claude_auto_memory",
@@ -251,7 +284,15 @@ pub async fn run(dry_run: bool) -> Result<(usize, usize, usize)> {
                 imported += 1;
             }
             Err(error) => {
-                eprintln!("could not import {label}: {error}");
+                let hint = if error.to_string().contains("403") {
+                    format!(
+                        " The folder's link points at workspace {workspace_id}, which this account cannot write to; rerun with --project-dir={} --workspace-id <id> [--project-id <id>].",
+                        memory.project_dir
+                    )
+                } else {
+                    String::new()
+                };
+                eprintln!("could not import {label}: {error}.{hint}");
                 failed += 1;
             }
         }

@@ -186,6 +186,51 @@ fn tool_call_succeeded(tool_response: &Value) -> bool {
     has_response_evidence && !is_error && tool_response.get("error").is_none()
 }
 
+/// The host editor's session id (top-level `session_id`/`sessionId`).
+fn host_session_id(input: &Value) -> Option<String> {
+    ["session_id", "sessionId"].iter().find_map(|key| {
+        input
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// The workspace/project an `init` or `context` result resolved. MCP results
+/// reach hooks as structured content, a JSON string, or text content blocks.
+fn resolved_scope_from_response(tool_response: &Value) -> Option<(Uuid, Option<Uuid>)> {
+    let payload = tool_response_payload(tool_response);
+    let parsed: Value;
+    let object = if payload.is_object() {
+        payload
+    } else {
+        let text = payload.as_str().map(str::to_string).or_else(|| {
+            payload.as_array().and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find_map(|block| block.get("text").and_then(Value::as_str))
+                    .map(str::to_string)
+            })
+        })?;
+        parsed = serde_json::from_str(&text).ok()?;
+        &parsed
+    };
+    let pick = |key: &str| {
+        object
+            .get(key)
+            .or_else(|| {
+                object
+                    .get("resolved_scope")
+                    .and_then(|scope| scope.get(key))
+            })
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok())
+    };
+    Some((pick("workspace_id")?, pick("project_id")))
+}
+
 fn completes_session_init(normalized_tool_name: &str, tool_response: &Value) -> bool {
     matches!(normalized_tool_name, "init" | "context") && tool_call_succeeded(tool_response)
 }
@@ -804,6 +849,23 @@ pub async fn handle() -> Result<()> {
         // work, whose early returns must not lose this session's receipt.
         if completes_session_init(&normalized_tool_name, &tool_response) {
             super::prompt_state::clear_session_init_required(&cwd, &input);
+            // Remember the scope the server resolved for this session, so
+            // plans and docs saved later land where the agent's own calls go.
+            if let (Some(host_session), Some((workspace_id, project_id))) = (
+                host_session_id(&input),
+                resolved_scope_from_response(&tool_response),
+            ) {
+                super::durable_capture::record_session_scope(
+                    &host_session,
+                    &cwd,
+                    workspace_id,
+                    project_id,
+                );
+                // Docs written before this init/context were promised a mirror.
+                if hook_feature_enabled("CONTEXTSTREAM_DOC_MIRROR_ENABLED") {
+                    let _ = super::durable_capture::mirror_pending_docs(&host_session).await;
+                }
+            }
         }
         if tool_call_succeeded(&tool_response)
             && (normalized_tool_name == "context"
@@ -951,8 +1013,11 @@ pub async fn handle() -> Result<()> {
         }
         reached_drain
     };
-    let (mirror_notes, reached_drain) =
-        tokio::join!(mirror_repo_docs(&absolute_paths), index_files);
+    let host_session = host_session_id(&input);
+    let (mirror_notes, reached_drain) = tokio::join!(
+        mirror_repo_docs(&absolute_paths, host_session.as_deref()),
+        index_files
+    );
 
     // PostToolUse-tail drain: flush any edits recorded this turn that the
     // single-file push didn't commit (e.g. a MultiEdit fan-out, or a push that
@@ -979,7 +1044,7 @@ fn hook_feature_enabled(variable: &str) -> bool {
 
 /// Mirror written repository runbooks/ADRs/RFCs/notes to ContextStream docs
 /// and return one agent-facing note per mirrored file.
-async fn mirror_repo_docs(absolute_paths: &[String]) -> Vec<String> {
+async fn mirror_repo_docs(absolute_paths: &[String], host_session: Option<&str>) -> Vec<String> {
     if !hook_feature_enabled("CONTEXTSTREAM_DOC_MIRROR_ENABLED") {
         return Vec::new();
     }
@@ -990,8 +1055,22 @@ async fn mirror_repo_docs(absolute_paths: &[String]) -> Vec<String> {
         else {
             continue;
         };
-        if let Some(mirror) =
-            super::durable_capture::mirror_repo_doc(Path::new(absolute_path), doc_type).await
+        if !super::durable_capture::doc_mirror_available(Path::new(absolute_path), host_session)
+            .await
+        {
+            // The agent wrote the doc before init/context resolved this
+            // session's scope; mirror it as soon as one does.
+            if let Some(host_session) = host_session {
+                super::durable_capture::queue_pending_doc(host_session, Path::new(absolute_path));
+            }
+            continue;
+        }
+        if let Some(mirror) = super::durable_capture::mirror_repo_doc(
+            Path::new(absolute_path),
+            doc_type,
+            host_session,
+        )
+        .await
         {
             notes.push(mirror.message());
         }
@@ -1051,15 +1130,19 @@ async fn capture_exit_plan_mode(
         write_stdout_json(&HookOutput::empty())?;
         return Ok(());
     };
-    let message =
-        match super::durable_capture::capture_approved_plan(cwd, &markdown, plan_path.as_deref())
-            .await
-        {
-            Some(capture) => capture.message(),
-            // PreToolUse told the agent the plan would be saved for it; say
-            // plainly that it was not, so the plan is not lost.
-            None => PLAN_CAPTURE_FAILED.to_string(),
-        };
+    let message = match super::durable_capture::capture_approved_plan(
+        cwd,
+        &markdown,
+        plan_path.as_deref(),
+        host_session_id(input).as_deref(),
+    )
+    .await
+    {
+        Some(capture) => capture.message(),
+        // PreToolUse told the agent the plan would be saved for it; say
+        // plainly that it was not, so the plan is not lost.
+        None => PLAN_CAPTURE_FAILED.to_string(),
+    };
     super::write_context_for_input(input, message)?;
     Ok(())
 }
@@ -1691,6 +1774,39 @@ mod tests {
                 .get("workspace_id")
                 .and_then(Value::as_str),
             Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    #[test]
+    fn resolved_scope_is_read_from_every_result_shape() {
+        let ws = "dc5fcbaf-dca4-4cd9-b395-c9393294704f";
+        let pid = "2a4e8193-d93d-4dbb-990a-374f3ea54fc7";
+        let expected = Some((
+            Uuid::parse_str(ws).unwrap(),
+            Some(Uuid::parse_str(pid).unwrap()),
+        ));
+        let init_text = serde_json::json!({"workspace_id": ws, "project_id": pid}).to_string();
+        assert_eq!(
+            resolved_scope_from_response(&Value::String(init_text.clone())),
+            expected
+        );
+        assert_eq!(
+            resolved_scope_from_response(&serde_json::json!([{"type": "text", "text": init_text}])),
+            expected
+        );
+        assert_eq!(
+            resolved_scope_from_response(&serde_json::json!({
+                "structuredContent": {"resolved_scope": {"workspace_id": ws, "project_id": pid}}
+            })),
+            expected
+        );
+        assert_eq!(
+            resolved_scope_from_response(&Value::String("not json".into())),
+            None
+        );
+        assert_eq!(
+            resolved_scope_from_response(&serde_json::json!({"project_id": pid})),
+            None
         );
     }
 

@@ -238,7 +238,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn write_state_atomically(path: &Path, state: &MirrorState) -> std::io::Result<()> {
+fn write_state_atomically<S: Serialize>(path: &Path, state: &S) -> std::io::Result<()> {
     let json = serde_json::to_vec(state).map_err(std::io::Error::other)?;
     let file_name = path
         .file_name()
@@ -264,9 +264,12 @@ fn write_state_atomically(path: &Path, state: &MirrorState) -> std::io::Result<(
     result
 }
 
-/// Read-modify-write a mirror state file under an advisory lock on a stable
+/// Read-modify-write a JSON state file under an advisory lock on a stable
 /// sibling, so parallel hooks never lose each other's entries.
-fn with_mirror_state<T>(path: &Path, update: impl FnOnce(&mut MirrorState) -> T) -> Option<T> {
+fn with_locked_json<S, T>(path: &Path, update: impl FnOnce(&mut S) -> T) -> Option<T>
+where
+    S: Default + Serialize + serde::de::DeserializeOwned,
+{
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
@@ -278,11 +281,24 @@ fn with_mirror_state<T>(path: &Path, update: impl FnOnce(&mut MirrorState) -> T)
         .open(path.with_extension("lock"))
         .ok()?;
     fs2::FileExt::lock_exclusive(&lock).ok()?;
-    let mut state: MirrorState = std::fs::read(path)
+    let mut state: S = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
     let result = update(&mut state);
+    write_state_atomically(path, &state).ok()?;
+    Some(result)
+}
+
+fn with_mirror_state<T>(path: &Path, update: impl FnOnce(&mut MirrorState) -> T) -> Option<T> {
+    with_locked_json(path, |state: &mut MirrorState| {
+        let result = update(state);
+        prune_mirror_state(state);
+        result
+    })
+}
+
+fn prune_mirror_state(state: &mut MirrorState) {
     if state.entries.len() > MAX_STATE_ENTRIES {
         let mut oldest: Vec<(String, String)> = state
             .entries
@@ -295,8 +311,6 @@ fn with_mirror_state<T>(path: &Path, update: impl FnOnce(&mut MirrorState) -> T)
             state.entries.remove(&key);
         }
     }
-    write_state_atomically(path, &state).ok()?;
-    Some(result)
 }
 
 fn read_entry(path: &Path, key: &str) -> Option<MirrorEntry> {
@@ -348,25 +362,210 @@ impl CaptureScope {
     }
 }
 
-/// Credentials from the usual hook sources and the workspace/project bound to
-/// `folder` (its checkout config or the global folder mappings init writes).
-/// `None` without credentials or a workspace: content from a folder that is
-/// not linked to ContextStream is never sent to a default workspace.
-async fn resolve_scope(folder: &str) -> Option<CaptureScope> {
+/// The scope the server resolved for a host session's working folder, as
+/// observed by PostToolUse on a successful `init` or `context` call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionScope {
+    cwd: String,
+    workspace_id: Uuid,
+    project_id: Option<Uuid>,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SessionScopes {
+    #[serde(default)]
+    sessions: BTreeMap<String, SessionScope>,
+}
+
+const SESSION_SCOPE_MAX_AGE_HOURS: i64 = 24;
+const MAX_SESSION_SCOPES: usize = 512;
+
+fn session_scopes_path() -> Option<PathBuf> {
+    state_dir().map(|dir| dir.join("session-scopes.json"))
+}
+
+/// Record the workspace/project the server resolved for this host session.
+/// Plans and docs saved later in the session use it when the checkout has no
+/// verified local link (the same scope the agent's own calls would use).
+pub(crate) fn record_session_scope(
+    host_session_id: &str,
+    cwd: &str,
+    workspace_id: Uuid,
+    project_id: Option<Uuid>,
+) {
+    let Some(path) = session_scopes_path() else {
+        return;
+    };
+    record_session_scope_at(&path, host_session_id, cwd, workspace_id, project_id);
+}
+
+fn record_session_scope_at(
+    path: &Path,
+    host_session_id: &str,
+    cwd: &str,
+    workspace_id: Uuid,
+    project_id: Option<Uuid>,
+) {
+    let key = sha256_hex(host_session_id.as_bytes());
+    let scope = SessionScope {
+        cwd: cwd.trim_end_matches('/').to_string(),
+        workspace_id,
+        project_id,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = with_locked_json(path, |state: &mut SessionScopes| {
+        state.sessions.insert(key, scope);
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(SESSION_SCOPE_MAX_AGE_HOURS);
+        state.sessions.retain(|_, entry| {
+            chrono::DateTime::parse_from_rfc3339(&entry.updated_at)
+                .is_ok_and(|updated| updated >= cutoff)
+        });
+        while state.sessions.len() > MAX_SESSION_SCOPES {
+            let Some(oldest) = state
+                .sessions
+                .iter()
+                .min_by(|a, b| a.1.updated_at.cmp(&b.1.updated_at))
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            state.sessions.remove(&oldest);
+        }
+    });
+}
+
+/// Whether one folder contains the other (or they are the same folder).
+fn folders_related(a: &str, b: &str) -> bool {
+    let a = a.trim_end_matches('/');
+    let b = b.trim_end_matches('/');
+    !a.is_empty()
+        && !b.is_empty()
+        && (a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/")))
+}
+
+fn session_scope_at(
+    path: &Path,
+    host_session_id: &str,
+    folder: &str,
+) -> Option<(Uuid, Option<Uuid>)> {
+    let bytes = std::fs::read(path).ok()?;
+    let state: SessionScopes = serde_json::from_slice(&bytes).ok()?;
+    let entry = state
+        .sessions
+        .get(&sha256_hex(host_session_id.as_bytes()))?;
+    let fresh = chrono::DateTime::parse_from_rfc3339(&entry.updated_at).is_ok_and(|updated| {
+        chrono::Utc::now().signed_duration_since(updated)
+            <= chrono::Duration::hours(SESSION_SCOPE_MAX_AGE_HOURS)
+    });
+    (fresh && folders_related(&entry.cwd, folder)).then_some((entry.workspace_id, entry.project_id))
+}
+
+/// Repository docs written before the session had a resolved scope (the
+/// agent wrote them before calling init/context). Mirrored once it does.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PendingDocs {
+    #[serde(default)]
+    sessions: BTreeMap<String, Vec<PendingDoc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingDoc {
+    path: String,
+    queued_at: String,
+}
+
+const MAX_PENDING_DOCS_PER_SESSION: usize = 50;
+
+fn pending_docs_path() -> Option<PathBuf> {
+    state_dir().map(|dir| dir.join("pending-doc-mirrors.json"))
+}
+
+fn queue_pending_doc_at(path: &Path, host_session_id: &str, doc_path: &Path) {
+    let key = sha256_hex(host_session_id.as_bytes());
+    let doc = doc_path.to_string_lossy().to_string();
+    let _ = with_locked_json(path, |state: &mut PendingDocs| {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(SESSION_SCOPE_MAX_AGE_HOURS);
+        for docs in state.sessions.values_mut() {
+            docs.retain(|pending| {
+                chrono::DateTime::parse_from_rfc3339(&pending.queued_at)
+                    .is_ok_and(|queued| queued >= cutoff)
+            });
+        }
+        state.sessions.retain(|_, docs| !docs.is_empty());
+        let docs = state.sessions.entry(key).or_default();
+        if !docs.iter().any(|pending| pending.path == doc)
+            && docs.len() < MAX_PENDING_DOCS_PER_SESSION
+        {
+            docs.push(PendingDoc {
+                path: doc,
+                queued_at: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+    });
+}
+
+fn take_pending_docs_at(path: &Path, host_session_id: &str) -> Vec<PathBuf> {
+    let key = sha256_hex(host_session_id.as_bytes());
+    if !path.exists() {
+        return Vec::new();
+    }
+    with_locked_json(path, |state: &mut PendingDocs| {
+        state
+            .sessions
+            .remove(&key)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|pending| PathBuf::from(pending.path))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Remember a repository doc written before this session had a scope.
+pub(crate) fn queue_pending_doc(host_session_id: &str, doc_path: &Path) {
+    if let Some(path) = pending_docs_path() {
+        queue_pending_doc_at(&path, host_session_id, doc_path);
+    }
+}
+
+/// Mirror the docs this session wrote before it had a scope. Called after a
+/// successful init/context recorded one. Returns one note per mirrored doc.
+pub(crate) async fn mirror_pending_docs(host_session_id: &str) -> Vec<String> {
+    let Some(path) = pending_docs_path() else {
+        return Vec::new();
+    };
+    let mut notes = Vec::new();
+    for doc in take_pending_docs_at(&path, host_session_id) {
+        let Some(doc_type) = super::durable_paths::repo_doc_type(&doc.to_string_lossy()) else {
+            continue;
+        };
+        if let Some(mirror) = mirror_repo_doc(&doc, doc_type, Some(host_session_id)).await {
+            notes.push(mirror.message());
+        }
+    }
+    notes
+}
+
+/// Credentials from the usual hook sources and the workspace/project for
+/// `folder`: its verified checkout link or folder mapping first, then the
+/// scope the server resolved for this host session's folder. `None` without
+/// credentials or a workspace: content is never sent to a default workspace.
+async fn resolve_scope(folder: &str, host_session_id: Option<&str>) -> Option<CaptureScope> {
     let config = load_config(folder);
     if !config.is_configured() {
         return None;
     }
     let mapping = mcp_session::auto_init::resolve_workspace(folder).await;
     let parse = |value: &Option<String>| value.as_deref().and_then(|id| Uuid::parse_str(id).ok());
-    let workspace_id = mapping
+    let local = mapping
         .as_ref()
-        .map(|mapping| mapping.workspace_id)
-        .or_else(|| parse(&config.workspace_id))?;
-    let project_id = mapping
-        .as_ref()
-        .and_then(|mapping| mapping.project_id)
-        .or_else(|| parse(&config.project_id));
+        .map(|mapping| (mapping.workspace_id, mapping.project_id))
+        .or_else(|| parse(&config.workspace_id).map(|ws| (ws, parse(&config.project_id))));
+    let (workspace_id, project_id) = local.or_else(|| {
+        let path = session_scopes_path()?;
+        session_scope_at(&path, host_session_id?, folder)
+    })?;
     Some(CaptureScope {
         config,
         workspace_id: Some(workspace_id),
@@ -375,12 +574,15 @@ async fn resolve_scope(folder: &str) -> Option<CaptureScope> {
 }
 
 /// Whether a repository doc at `path` can be mirrored: credentials exist and
-/// its checkout is linked to a ContextStream workspace. Reads local files only.
-pub(crate) async fn doc_mirror_available(path: &Path) -> bool {
+/// its checkout is linked to a ContextStream workspace (locally, or through
+/// this session's resolved scope). Reads local files only.
+pub(crate) async fn doc_mirror_available(path: &Path, host_session_id: Option<&str>) -> bool {
     let Some(root) = repository_root(path).or_else(|| path.parent().map(Path::to_path_buf)) else {
         return false;
     };
-    resolve_scope(&root.to_string_lossy()).await.is_some()
+    resolve_scope(&root.to_string_lossy(), host_session_id)
+        .await
+        .is_some()
 }
 
 fn response_id(value: &Value) -> Option<Uuid> {
@@ -511,6 +713,7 @@ async fn capture_plan_inner(
     cwd: &str,
     plan_markdown: &str,
     plan_file_path: Option<&str>,
+    host_session_id: Option<&str>,
 ) -> Option<PlanCapture> {
     let parsed = parse_plan_markdown(plan_markdown);
     let sha = sha256_hex(plan_markdown.as_bytes());
@@ -528,7 +731,7 @@ async fn capture_plan_inner(
         }
     }
 
-    let scope = resolve_scope(cwd).await?;
+    let scope = resolve_scope(cwd, host_session_id).await?;
     let client = scope.client();
     let steps = plan_steps(&parsed);
 
@@ -619,13 +822,14 @@ pub async fn capture_approved_plan(
     cwd: &str,
     plan_markdown: &str,
     plan_file_path: Option<&str>,
+    host_session_id: Option<&str>,
 ) -> Option<PlanCapture> {
     if plan_markdown.trim().is_empty() {
         return None;
     }
     tokio::time::timeout(
         CAPTURE_DEADLINE,
-        capture_plan_inner(cwd, plan_markdown, plan_file_path),
+        capture_plan_inner(cwd, plan_markdown, plan_file_path, host_session_id),
     )
     .await
     .ok()
@@ -706,7 +910,11 @@ impl DocMirror {
     }
 }
 
-async fn mirror_doc_inner(absolute_path: &Path, doc_type: &'static str) -> Option<DocMirror> {
+async fn mirror_doc_inner(
+    absolute_path: &Path,
+    doc_type: &'static str,
+    host_session_id: Option<&str>,
+) -> Option<DocMirror> {
     let metadata = std::fs::metadata(absolute_path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_MIRRORED_DOC_BYTES {
         return None;
@@ -738,7 +946,7 @@ async fn mirror_doc_inner(absolute_path: &Path, doc_type: &'static str) -> Optio
         return None;
     }
 
-    let scope = resolve_scope(&root.to_string_lossy()).await?;
+    let scope = resolve_scope(&root.to_string_lossy(), host_session_id).await?;
     let client = scope.client();
     let update = |doc_id: Uuid| {
         let client = client.clone();
@@ -828,11 +1036,18 @@ async fn mirror_doc_inner(absolute_path: &Path, doc_type: &'static str) -> Optio
 
 /// Mirror a repository doc to ContextStream after it was written. Returns
 /// `None` when nothing was sent (unchanged, too large, no credentials, error).
-pub async fn mirror_repo_doc(absolute_path: &Path, doc_type: &'static str) -> Option<DocMirror> {
-    tokio::time::timeout(CAPTURE_DEADLINE, mirror_doc_inner(absolute_path, doc_type))
-        .await
-        .ok()
-        .flatten()
+pub async fn mirror_repo_doc(
+    absolute_path: &Path,
+    doc_type: &'static str,
+    host_session_id: Option<&str>,
+) -> Option<DocMirror> {
+    tokio::time::timeout(
+        CAPTURE_DEADLINE,
+        mirror_doc_inner(absolute_path, doc_type, host_session_id),
+    )
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]
@@ -905,6 +1120,50 @@ mod tests {
             names.iter().all(|name| !name.ends_with(".tmp")),
             "{names:?}"
         );
+    }
+
+    #[test]
+    fn session_scopes_apply_only_to_related_fresh_folders() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session-scopes.json");
+        let workspace = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        record_session_scope_at(&path, "host-1", "/repo/app/", workspace, Some(project));
+        assert_eq!(
+            session_scope_at(&path, "host-1", "/repo/app"),
+            Some((workspace, Some(project)))
+        );
+        assert_eq!(
+            session_scope_at(&path, "host-1", "/repo/app/docs"),
+            Some((workspace, Some(project)))
+        );
+        assert_eq!(
+            session_scope_at(&path, "host-1", "/repo"),
+            Some((workspace, Some(project)))
+        );
+        assert_eq!(session_scope_at(&path, "host-1", "/repo/application"), None);
+        assert_eq!(session_scope_at(&path, "host-1", "/other"), None);
+        assert_eq!(session_scope_at(&path, "host-2", "/repo/app"), None);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("host-1"),
+            "host session ids are stored hashed"
+        );
+    }
+
+    #[test]
+    fn pending_docs_are_queued_once_per_session_and_taken_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("pending-doc-mirrors.json");
+        queue_pending_doc_at(&path, "host-1", Path::new("/repo/docs/runbooks/a.md"));
+        queue_pending_doc_at(&path, "host-1", Path::new("/repo/docs/runbooks/a.md"));
+        queue_pending_doc_at(&path, "host-2", Path::new("/repo/notes/b.md"));
+        assert_eq!(
+            take_pending_docs_at(&path, "host-1"),
+            vec![PathBuf::from("/repo/docs/runbooks/a.md")]
+        );
+        assert!(take_pending_docs_at(&path, "host-1").is_empty());
+        assert_eq!(take_pending_docs_at(&path, "host-2").len(), 1);
     }
 
     #[test]

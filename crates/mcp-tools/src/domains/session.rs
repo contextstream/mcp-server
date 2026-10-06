@@ -2230,6 +2230,29 @@ fn own_session_note(action: &str) -> String {
     )
 }
 
+/// What init tells the caller about its own session: the id, and the exact call
+/// that resumes the previous session.
+fn resume_hint(session_id: &str) -> String {
+    format!(
+        "Session id: {session_id}. To resume the previous session, call session(action=\"resume\", session_id=\"{session_id}\")."
+    )
+}
+
+/// Writes `text` into the structured result too. Some clients show only the
+/// structured content, so anything added to the text alone never reaches the
+/// agent.
+fn set_structured_text(result: &mut Value, text: &str) {
+    let in_data = result.get("data").is_some_and(Value::is_object);
+    let target = if in_data {
+        &mut result["data"]
+    } else {
+        &mut *result
+    };
+    if let Some(object) = target.as_object_mut() {
+        object.insert("text".to_string(), Value::String(text.to_string()));
+    }
+}
+
 /// The model-visible text of a resume response. The API renders it within a
 /// token budget; when it sends none, say so instead of returning nothing.
 fn resume_text(result: &Value, empty: &str) -> String {
@@ -3072,9 +3095,10 @@ impl ToolHandler for InitTool {
         // The id is the caller's to carry: resume cannot find it on a
         // transport that keeps no state between calls.
         if let Some(api_session_id) = api_session_id_from(&result) {
-            text.push_str(&format!(
-                "\nSession id: {api_session_id}. To resume the previous session, call session(action=\"resume\", session_id=\"{api_session_id}\")."
-            ));
+            let hint = resume_hint(&api_session_id);
+            text.push_str(&format!("\n{hint}"));
+            // Some clients show only the structured content: it carries the hint too.
+            result["resume_hint"] = Value::String(hint);
         }
         // Zero-touch auto-provisioning: surface the server's one-liner as a
         // positive fact ("project created — no setup needed"), never as a
@@ -17119,7 +17143,7 @@ impl ToolHandler for SessionTool {
                     mcp_client::get_task_mcp_session_id().as_deref(),
                 );
                 let own_session_unknown = exclude_session_id.is_none();
-                let result = self
+                let mut result = self
                     .client
                     .session_resume_list(mcp_client::SessionResumeListParams {
                         workspace_id: Some(workspace_id),
@@ -17136,6 +17160,7 @@ impl ToolHandler for SessionTool {
                 if let Some(note) = scope.note {
                     text.push_str(&format!("\n\n{note}"));
                 }
+                set_structured_text(&mut result, &text);
                 Ok(ToolResult::with_structured(text, result))
             }
             "resume" => {
@@ -17170,7 +17195,7 @@ impl ToolHandler for SessionTool {
                     mcp_client::get_task_mcp_session_id().as_deref(),
                 );
                 let own_session_unknown = exclude_session_id.is_none();
-                let result = self
+                let mut result = self
                     .client
                     .session_resume_get(mcp_client::SessionResumeGetParams {
                         workspace_id: Some(workspace_id),
@@ -17188,6 +17213,7 @@ impl ToolHandler for SessionTool {
                 if let Some(note) = scope.note {
                     text.push_str(&format!("\n\n{note}"));
                 }
+                set_structured_text(&mut result, &text);
                 Ok(ToolResult::with_structured(text, result))
             }
             "capture_plan" => {

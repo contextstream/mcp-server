@@ -26,6 +26,7 @@ pub mod pre_compact;
 pub mod pre_tool_use;
 pub(crate) mod prompt_state;
 pub(crate) mod protected;
+mod resume_intent;
 mod save_intent;
 pub mod session_end;
 pub mod session_start;

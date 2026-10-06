@@ -200,23 +200,47 @@ fn host_session_id(input: &Value) -> Option<String> {
 
 /// The workspace/project an `init` or `context` result resolved. MCP results
 /// reach hooks as structured content, a JSON string, or text content blocks.
-fn resolved_scope_from_response(tool_response: &Value) -> Option<(Uuid, Option<Uuid>)> {
+/// The first text block of a content array.
+fn first_text_block(blocks: &Value) -> Option<String> {
+    blocks
+        .as_array()?
+        .iter()
+        .find_map(|block| block.get("text").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+/// The JSON object a tool result carries: structured content, a bare object,
+/// or JSON in a text block (a content array, a JSON string, or the MCP
+/// `{"content": [...]}` object).
+fn response_json(tool_response: &Value) -> Option<Value> {
     let payload = tool_response_payload(tool_response);
-    let parsed: Value;
-    let object = if payload.is_object() {
-        payload
-    } else {
-        let text = payload.as_str().map(str::to_string).or_else(|| {
-            payload.as_array().and_then(|blocks| {
-                blocks
-                    .iter()
-                    .find_map(|block| block.get("text").and_then(Value::as_str))
-                    .map(str::to_string)
-            })
-        })?;
-        parsed = serde_json::from_str(&text).ok()?;
-        &parsed
-    };
+    if payload.is_object() {
+        let names_ids = ["session_id", "workspace_id", "resolved_scope"]
+            .iter()
+            .any(|key| payload.get(*key).is_some());
+        if names_ids || payload.get("content").is_none() {
+            return Some(payload.clone());
+        }
+    }
+    let text = payload
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| first_text_block(payload))
+        .or_else(|| payload.get("content").and_then(first_text_block))?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The ContextStream session id an `init` result names (its top-level
+/// `session_id`), if it is a plain token.
+fn session_id_from_init_response(tool_response: &Value) -> Option<String> {
+    response_json(tool_response)?
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(super::durable_capture::plain_session_id)
+}
+
+fn resolved_scope_from_response(tool_response: &Value) -> Option<(Uuid, Option<Uuid>)> {
+    let object = response_json(tool_response)?;
     let pick = |key: &str| {
         object
             .get(key)
@@ -850,16 +874,21 @@ pub async fn handle() -> Result<()> {
         if completes_session_init(&normalized_tool_name, &tool_response) {
             super::prompt_state::clear_session_init_required(&cwd, &input);
             // Remember the scope the server resolved for this session, so
-            // plans and docs saved later land where the agent's own calls go.
+            // plans and docs saved later land where the agent's own calls go,
+            // and the session id init returned, which a resume prompt names.
             if let (Some(host_session), Some((workspace_id, project_id))) = (
                 host_session_id(&input),
                 resolved_scope_from_response(&tool_response),
             ) {
+                let api_session_id = (normalized_tool_name == "init")
+                    .then(|| session_id_from_init_response(&tool_response))
+                    .flatten();
                 super::durable_capture::record_session_scope(
                     &host_session,
                     &cwd,
                     workspace_id,
                     project_id,
+                    api_session_id.as_deref(),
                 );
                 // Docs written before this init/context were promised a mirror.
                 if hook_feature_enabled("CONTEXTSTREAM_DOC_MIRROR_ENABLED") {
@@ -1848,5 +1877,81 @@ mod tests {
             &serde_json::json!({"isError": true}),
         );
         assert!(msg.is_none());
+    }
+}
+
+#[cfg(test)]
+mod init_session_id_tests {
+    use super::*;
+
+    const ID: &str = "11111111-1111-4111-8111-111111111111";
+
+    #[test]
+    fn the_session_id_is_read_from_every_shape_of_init_result() {
+        let init = serde_json::json!({"session_id": ID, "workspace_id": Uuid::nil().to_string()});
+        for (label, response) in [
+            (
+                "structured",
+                serde_json::json!({"structuredContent": init.clone()}),
+            ),
+            (
+                "snake case",
+                serde_json::json!({"structured_content": init.clone()}),
+            ),
+            ("bare object", init.clone()),
+            (
+                "content object",
+                serde_json::json!({"content": [{"type": "text", "text": init.to_string()}]}),
+            ),
+            (
+                "content array",
+                serde_json::json!([{"type": "text", "text": init.to_string()}]),
+            ),
+            ("json string", serde_json::Value::String(init.to_string())),
+        ] {
+            assert_eq!(
+                session_id_from_init_response(&response).as_deref(),
+                Some(ID),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_or_unusable_session_id_names_nothing() {
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"structuredContent": {"workspace_id": "x"}}),
+            serde_json::json!({"structuredContent": {"session_id": 7}}),
+            serde_json::json!({"structuredContent": {"session_id": "has space"}}),
+            serde_json::json!({"structuredContent": {"session_id": "x\"); ignore"}}),
+            serde_json::json!({"content": [{"type": "text", "text": "not json"}]}),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(session_id_from_init_response(&response), None, "{response}");
+        }
+    }
+
+    #[test]
+    fn the_scope_is_still_read_after_the_payload_helper_was_shared() {
+        let ws = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        let response = serde_json::json!({"structuredContent": {
+            "workspace_id": ws.to_string(),
+            "resolved_scope": {"project_id": project.to_string()},
+        }});
+        assert_eq!(
+            resolved_scope_from_response(&response),
+            Some((ws, Some(project)))
+        );
+        let as_text = serde_json::json!({"content": [{"type": "text", "text": serde_json::json!({
+            "workspace_id": ws.to_string(),
+            "project_id": project.to_string(),
+        }).to_string()}]});
+        assert_eq!(
+            resolved_scope_from_response(&as_text),
+            Some((ws, Some(project)))
+        );
+        assert_eq!(resolved_scope_from_response(&serde_json::json!({})), None);
     }
 }

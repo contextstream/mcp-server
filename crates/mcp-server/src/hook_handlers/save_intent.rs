@@ -322,12 +322,17 @@ pub fn detects_save_intent(prompt: &str) -> bool {
     has_file_hint || has_keyword
 }
 
-/// Return save guidance for this hook payload when save intent is detected.
+/// Return handoff, resume or save guidance for this hook payload when the
+/// prompt asks for one of them.
 pub fn guidance_for_input(input: &Value) -> Option<String> {
     let prompt = extract_user_prompt(input)?;
     match detect_handoff_intent(&prompt) {
         HandoffIntent::Canonical | HandoffIntent::ExplicitLocalFile => {
             Some(HANDOFF_INTENT_GUIDANCE.to_string())
+        }
+        // Resume wins over the save keywords: "remember where we left off".
+        HandoffIntent::None if super::resume_intent::detect_resume_intent(&prompt).is_some() => {
+            super::resume_intent::guidance_for_input(input)
         }
         HandoffIntent::None if detects_save_intent(&prompt) => {
             Some(SAVE_INTENT_GUIDANCE.to_string())

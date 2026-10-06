@@ -28,7 +28,8 @@ MEDIA ASSETS: photos/images, videos, audio, and documents/PDFs live behind media
 STRUCTURED ENTITIES: tickets/handoffs/incidents/releases/experiments/goals/key_results/sprints/reviews/risks/backlog_views all live behind one tool — entity(kind="<kind>", action="list|get|create|update|delete", body={...}, query={...}). Every request to prepare/create a handoff, hand work over, or continue in another agent/session must create entity(kind="handoff", action="create", body={"title":"...","summary":"...","scope":"...","next_steps":[...]}). Add to_user_id only when known. HANDOFF.md, scratch prompts, generic docs/events, and prose are not substitutes; add capsule only when a portable bundle/share link is requested. Other examples: entity(kind="ticket", action="create", body={"title": "Fix replication lag", "kind": "bug", "priority": "high"}); entity(kind="goal", action="list", query={"period": "2026-Q2"}); entity(kind="risk", action="list", query={"status": "open", "impact": "severe"}). Markdown-shaped artefacts (runbook, adr, rfc, postmortem, retro, release_notes, playbook, prd, user_story, persona, interview, design_spec, critique, glossary, oncall_schedule, slo, q_and_a, changelog, style_guide) are docs — use memory(action="create_doc", doc_type="<type>", title="...", content="..."). Distilled summary nodes for goal/risk/term — use memory(action="create_node", node_type="goal|risk|term", ...). Recurring signals — use memory(action="create_event", event_type="standup|status_update|question|approval|feedback|discovery|achievement", ...).
 CODE HEALTH / DEPENDENCY RECOMMENDATIONS: when the user asks about code quality, dependency risk, circular dependencies, unused code, complexity, dashboard scans, or recommendations from prior dashboard analysis, call graph before guessing from source alone. Use graph(action="quality_freshness"), graph(action="quality_trends"), graph(action="quality_history"), graph(action="circular_dependencies"), graph(action="unused_code"), graph(action="complexity_metrics"), or graph(action="dependencies") with the current project_id. Use returned recommendations to propose small plans/tickets before edits; use graph(action="quality_snapshot") after scans/fixes when a saved baseline is useful.
 KNOWLEDGE FIRST (not just code): when the user asks "how/why/what pattern/did we decide X?", the answer usually lives in docs/decisions/lessons/preferences/plans/tasks/skills — NOT in source. Pick by type: decisions → memory(action="decisions", workspace_id="<current_workspace_id>", project_id="<current_project_id>") when ids are available, docs → memory(action="list_docs"|"get_doc"), lessons → session(action="get_lessons"), preferences/constraints → memory(action="list_nodes", node_type="preference"|"constraint"), tasks/todos → memory(action="list_tasks"|"list_todos"), plans → session(action="list_plans"|"get_plan"), skills → skill(action="list"|"run"), unsure → memory(action="search") (hybrid memory + docs). Search code only after checking the right knowledge surface.
-PAST SESSIONS: when the user references prior work ("last time", "yesterday", "pick up where we left off"), read any `[GROUNDING]` from your last `context()` first. Fresh, relevant, sufficient grounding completes the retrieval step; do not immediately duplicate it with session(action="recall"). Use recall only when grounding is absent, thin, stale, off-topic, or the user explicitly requests broader or session-specific history. For a bundled pack without waiting on context: session(action="ground", user_message="..."). If recall is thin, fall through to memory(action="search_transcripts", query="...") for full-text or memory(action="list_events", event_type="session_snapshot") for turning-point bookmarks. Save a session_snapshot at the end so the next session can pick up."#;
+PAST SESSIONS: when the user references prior work ("last time", "yesterday"), read any `[GROUNDING]` from your last `context()` first. Fresh, relevant, sufficient grounding completes the retrieval step; do not immediately duplicate it with session(action="recall"). Use recall only when grounding is absent, thin, stale, off-topic, or the user explicitly requests broader or session-specific history. For a bundled pack without waiting on context: session(action="ground", user_message="..."). If recall is thin, fall through to memory(action="search_transcripts", query="...") for full-text or memory(action="list_events", event_type="session_snapshot") for turning-point bookmarks. Save a session_snapshot at the end so the next session can pick up.
+RESUME: when the user asks to resume or pick up earlier work ("resume recent work", "pick up where we left off"), call session(action="resume", session_id="<the session_id init returned>") for the most recent earlier session, or session(action="resume_list", session_id="<the session_id init returned>") to choose. Always pass session_id (init's resume_hint names it) so your own session is left out."#;
 
 /// Build the full fallback reminder with decoded attribution.
 fn fallback_reminder() -> String {
@@ -846,5 +847,24 @@ mod tests {
         assert!(supports_hard_first_call_enforcement(
             EditorFormat::ClineLike
         ));
+    }
+}
+
+#[cfg(test)]
+mod resume_text_tests {
+    use super::*;
+
+    #[test]
+    fn the_static_reminder_sends_resume_requests_to_resume_not_recall() {
+        assert!(
+            FALLBACK_REMINDER_BASE.contains("session(action=\"resume\", session_id="),
+            "the reminder names the resume call"
+        );
+        assert!(FALLBACK_REMINDER_BASE.contains("so your own session is left out"));
+        assert!(
+            !FALLBACK_REMINDER_BASE
+                .contains("(\"last time\", \"yesterday\", \"pick up where we left off\")"),
+            "pick up where we left off is no longer a recall trigger"
+        );
     }
 }

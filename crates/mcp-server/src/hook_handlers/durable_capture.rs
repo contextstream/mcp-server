@@ -369,6 +369,11 @@ struct SessionScope {
     cwd: String,
     workspace_id: Uuid,
     project_id: Option<Uuid>,
+    /// The ContextStream session id `init` returned for this host session
+    /// (not the host's own id). The hosted server keeps no state between
+    /// calls, so a prompt hook names it when the user asks to resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_session_id: Option<String>,
     updated_at: String,
 }
 
@@ -388,16 +393,60 @@ fn session_scopes_path() -> Option<PathBuf> {
 /// Record the workspace/project the server resolved for this host session.
 /// Plans and docs saved later in the session use it when the checkout has no
 /// verified local link (the same scope the agent's own calls would use).
+///
+/// `api_session_id` is the id an `init` result named: `None` (a `context`
+/// result) keeps the one already recorded, and a new `init` replaces it.
 pub(crate) fn record_session_scope(
     host_session_id: &str,
     cwd: &str,
     workspace_id: Uuid,
     project_id: Option<Uuid>,
+    api_session_id: Option<&str>,
 ) {
     let Some(path) = session_scopes_path() else {
         return;
     };
-    record_session_scope_at(&path, host_session_id, cwd, workspace_id, project_id);
+    record_session_scope_at(
+        &path,
+        host_session_id,
+        cwd,
+        workspace_id,
+        project_id,
+        api_session_id,
+    );
+}
+
+/// A session id is stored and quoted into prompt text only if it is a plain
+/// token: letters, digits and `-_.:`, at most 128 characters.
+pub(crate) fn plain_session_id(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    (!raw.is_empty()
+        && raw.len() <= 128
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')))
+    .then(|| raw.to_string())
+}
+
+/// The ContextStream session id `init` returned for this host session, if a
+/// hook saw it within the last day.
+pub(crate) fn session_api_session_id(host_session_id: &str) -> Option<String> {
+    session_api_session_id_at(&session_scopes_path()?, host_session_id)
+}
+
+fn session_api_session_id_at(path: &Path, host_session_id: &str) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let state: SessionScopes = serde_json::from_slice(&bytes).ok()?;
+    let entry = state
+        .sessions
+        .get(&sha256_hex(host_session_id.as_bytes()))?;
+    let fresh = chrono::DateTime::parse_from_rfc3339(&entry.updated_at).is_ok_and(|updated| {
+        chrono::Utc::now().signed_duration_since(updated)
+            <= chrono::Duration::hours(SESSION_SCOPE_MAX_AGE_HOURS)
+    });
+    fresh
+        .then(|| entry.api_session_id.as_deref().and_then(plain_session_id))
+        .flatten()
 }
 
 fn record_session_scope_at(
@@ -406,15 +455,23 @@ fn record_session_scope_at(
     cwd: &str,
     workspace_id: Uuid,
     project_id: Option<Uuid>,
+    api_session_id: Option<&str>,
 ) {
     let key = sha256_hex(host_session_id.as_bytes());
-    let scope = SessionScope {
+    let mut scope = SessionScope {
         cwd: cwd.trim_end_matches('/').to_string(),
         workspace_id,
         project_id,
+        api_session_id: api_session_id.and_then(plain_session_id),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
     let _ = with_locked_json(path, |state: &mut SessionScopes| {
+        if scope.api_session_id.is_none() {
+            scope.api_session_id = state
+                .sessions
+                .get(&key)
+                .and_then(|previous| previous.api_session_id.clone());
+        }
         state.sessions.insert(key, scope);
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(SESSION_SCOPE_MAX_AGE_HOURS);
         state.sessions.retain(|_, entry| {
@@ -1128,7 +1185,14 @@ mod tests {
         let path = temp.path().join("session-scopes.json");
         let workspace = Uuid::new_v4();
         let project = Uuid::new_v4();
-        record_session_scope_at(&path, "host-1", "/repo/app/", workspace, Some(project));
+        record_session_scope_at(
+            &path,
+            "host-1",
+            "/repo/app/",
+            workspace,
+            Some(project),
+            None,
+        );
         assert_eq!(
             session_scope_at(&path, "host-1", "/repo/app"),
             Some((workspace, Some(project)))
@@ -1198,5 +1262,129 @@ mod tests {
                 Some(id.clone())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod api_session_id_tests {
+    use super::*;
+
+    fn record(path: &Path, host: &str, api: Option<&str>) {
+        record_session_scope_at(
+            path,
+            host,
+            "/repo/app",
+            Uuid::from_u128(1),
+            Some(Uuid::from_u128(2)),
+            api,
+        );
+    }
+
+    #[test]
+    fn the_id_init_returned_is_kept_per_host_session_and_hashed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session-scopes.json");
+        record(&path, "host-1", Some("api-session-1"));
+        record(&path, "host-2", Some("api-session-2"));
+        assert_eq!(
+            session_api_session_id_at(&path, "host-1").as_deref(),
+            Some("api-session-1")
+        );
+        assert_eq!(
+            session_api_session_id_at(&path, "host-2").as_deref(),
+            Some("api-session-2")
+        );
+        assert_eq!(session_api_session_id_at(&path, "host-3"), None);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("host-1"), "host session ids stay hashed");
+    }
+
+    #[test]
+    fn a_context_result_keeps_the_id_and_a_new_init_replaces_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session-scopes.json");
+        record(&path, "host-1", Some("first"));
+        record(&path, "host-1", None);
+        assert_eq!(
+            session_api_session_id_at(&path, "host-1").as_deref(),
+            Some("first")
+        );
+        record(&path, "host-1", Some("second"));
+        assert_eq!(
+            session_api_session_id_at(&path, "host-1").as_deref(),
+            Some("second")
+        );
+        // The scope stays readable beside it.
+        assert_eq!(
+            session_scope_at(&path, "host-1", "/repo/app"),
+            Some((Uuid::from_u128(1), Some(Uuid::from_u128(2))))
+        );
+    }
+
+    #[test]
+    fn an_id_that_is_not_a_plain_token_is_never_stored() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session-scopes.json");
+        let too_long = "a".repeat(129);
+        for hostile in ["a b", "x\"y", "line\nbreak", "", too_long.as_str()] {
+            record(&path, "host-1", Some(hostile));
+            assert_eq!(
+                session_api_session_id_at(&path, "host-1"),
+                None,
+                "{hostile:?}"
+            );
+        }
+        assert_eq!(
+            plain_session_id(" abc-123_x.y:z "),
+            Some("abc-123_x.y:z".into())
+        );
+        assert_eq!(
+            plain_session_id(&"a".repeat(128)).map(|id| id.len()),
+            Some(128)
+        );
+    }
+
+    #[test]
+    fn an_entry_older_than_a_day_names_no_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session-scopes.json");
+        record(&path, "host-1", Some("api-session-1"));
+        let stale = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        let mut state: SessionScopes =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for entry in state.sessions.values_mut() {
+            entry.updated_at = stale.clone();
+        }
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(session_api_session_id_at(&path, "host-1"), None);
+    }
+
+    #[test]
+    fn a_file_written_before_the_field_existed_still_reads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session-scopes.json");
+        let key = sha256_hex(b"host-1");
+        let mut sessions = serde_json::Map::new();
+        sessions.insert(
+            key,
+            serde_json::json!({
+                "cwd": "/repo/app",
+                "workspace_id": Uuid::from_u128(1),
+                "project_id": null,
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            }),
+        );
+        let old = serde_json::json!({ "sessions": sessions });
+        std::fs::write(&path, old.to_string()).unwrap();
+        assert_eq!(
+            session_scope_at(&path, "host-1", "/repo/app"),
+            Some((Uuid::from_u128(1), None))
+        );
+        assert_eq!(session_api_session_id_at(&path, "host-1"), None);
+        record(&path, "host-1", Some("api-session-1"));
+        assert_eq!(
+            session_api_session_id_at(&path, "host-1").as_deref(),
+            Some("api-session-1")
+        );
     }
 }

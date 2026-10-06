@@ -6772,3 +6772,62 @@ fn the_structured_text_is_written_where_the_resume_text_is_read() {
     set_structured_text(&mut other, "b");
     assert_eq!(other, json!(["x"]));
 }
+
+#[test]
+fn the_session_tool_tells_agents_how_to_resume_and_to_pass_their_own_session_id() {
+    let tool = SessionTool::new(
+        create_mock_client(),
+        create_mock_session(),
+        mcp_types::atlas_layer::noop_layer(),
+    );
+
+    // The short description every client lists.
+    let description = tool.metadata().description.clone();
+    assert!(description.contains("action='resume'"), "{description}");
+    assert!(description.contains("'resume_list'"), "{description}");
+    assert!(
+        description.contains("session_id = id init returned"),
+        "{description}"
+    );
+    assert!(description.chars().count() <= 1024, "the portable limit");
+
+    let schema = tool.input_schema();
+    let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+    for action in ["resume", "resume_list"] {
+        assert!(
+            actions.iter().any(|candidate| candidate == action),
+            "{action}"
+        );
+    }
+
+    // The full action reference says what each one does.
+    let reference = schema["properties"]["action"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(reference.contains("resume_list (recent sessions, newest first"));
+    assert!(reference.contains("resume (one session's saved state and newest messages"));
+    assert!(reference.contains("always with session_id set to the id init returned"));
+
+    // And the parameter that carries the id says so.
+    let session_id = schema["properties"]["session_id"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(session_id.contains("resume"), "{session_id}");
+    assert!(session_id.contains("init returned"), "{session_id}");
+    assert!(session_id.contains("resume_hint"), "{session_id}");
+}
+
+#[tokio::test]
+async fn a_mistyped_session_action_is_told_about_the_resume_actions() {
+    let tool = SessionTool::new(
+        create_mock_client(),
+        create_mock_session(),
+        mcp_types::atlas_layer::noop_layer(),
+    );
+    let error = tool
+        .execute(json!({"action": "resumee"}))
+        .await
+        .expect_err("not an action")
+        .to_string();
+    assert!(error.contains("'resume_list', 'resume'"), "{error}");
+}

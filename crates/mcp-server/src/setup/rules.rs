@@ -122,7 +122,8 @@ Every workspace-scoped call below must include `workspace_id="<current_workspace
 - "list events" → `memory(action="list_events")`
 - "show snapshots" / "list snapshots" → `memory(action="list_events", event_type="session_snapshot")`
 - "save snapshot" → `session(action="capture", event_type="session_snapshot", title="...", content="...")`
-- "what did we do last session" / "past sessions" / "previous work" / "pick up where we left off" → `session(action="recall", query="...")` (ranked context) OR `memory(action="list_transcripts", limit=10)` (chronological list)
+- "resume" / "resume recent work" / "pick up where we left off" / "continue my last session" → `session(action="resume", session_id="<the session_id init returned>")` (most recent earlier session) or `session(action="resume_list", session_id="<the session_id init returned>")` to choose; always pass `session_id` (init's `resume_hint` names it) so your own session is left out of the result
+- "what did we do last session" / "past sessions" / "previous work" → `session(action="recall", query="...")` (ranked context) OR `memory(action="list_transcripts", limit=10)` (chronological list)
 - "search past sessions" / "find in past transcripts" / "when did we discuss X" → `memory(action="search_transcripts", query="...")` — full-text search over saved conversation transcripts
 - "show transcript" / "read session <id>" → `memory(action="get_transcript", transcript_id="...")`
 - "list media" / "show assets" / "show photos/videos/audio/docs" → `media(action="list", content_types=["image"])` (use `image|video|audio|document`; omit `content_types` for all assets)
@@ -271,6 +272,7 @@ When you need information, do not default to code search or trial-and-error. Con
 - **Risks (active risk register)** → `entity(kind="risk", action="list")` — distinct from distilled `node_type='risk'` summary nodes
 - **Runbooks / ADRs / RFCs / postmortems / retros / release-notes / playbooks / PRDs / personas / glossary / SLOs / etc.** → `memory(action="list_docs", doc_type="runbook|adr|rfc|postmortem|retro|release_notes|playbook|prd|user_story|persona|interview|design_spec|critique|glossary|oncall_schedule|slo|q_and_a|changelog|style_guide")`
 - **"What did we do before?" (continuation work)** → read fresh `[GROUNDING]` from `context()` first; use `session(action="recall", query="...")` only when that grounding is insufficient — see the Past Sessions ladder below
+- **"Resume" / "pick up where we left off"** → `session(action="resume", session_id="<the session_id init returned>")` for the most recent earlier session, or `session(action="resume_list", session_id="<the session_id init returned>")` to choose; pass `session_id` so your own session is left out
 - **Unsure which surface** → `memory(action="search", query="...")` — hybrid across memory nodes + docs; falls back to `session(action="recall", query="...")` for transcript/snapshot coverage
 
 Default assumption: if the user asks "how do we do X?", "why did we choose Y?", "what's the pattern for Z?", or "did we already decide about Q?" — the answer is likely in a doc, decision, lesson, plan, or skill, NOT in the code. Check the right knowledge surface BEFORE reading source files, re-deriving the answer, or asking the user a clarifying question.
@@ -4344,5 +4346,49 @@ mod tests {
         assert!(!cleaned.contains(CONTEXTSTREAM_START));
         assert!(!cleaned.contains(CONTEXTSTREAM_END));
         assert!(cleaned.contains("extra content"));
+    }
+}
+
+#[cfg(test)]
+mod resume_rules_tests {
+    use super::*;
+
+    #[test]
+    fn every_full_rules_file_tells_the_agent_how_to_resume() {
+        let mut checked = 0;
+        for editor in Editor::all().iter() {
+            for content in [
+                global_rules_content(editor, Some("ws"), Some("Workspace")),
+                project_rules_content(editor, Some("ws"), Some("Workspace"), Some("proj")),
+            ] {
+                // Pointer files and short bootstrap rules do not carry this list.
+                if !content.contains("\"list lessons\"") {
+                    continue;
+                }
+                checked += 1;
+                let id = editor.id();
+                assert!(
+                    content.contains(
+                        "session(action=\"resume\", session_id=\"<the session_id init returned>\")"
+                    ),
+                    "{id}: no resume mapping"
+                );
+                assert!(
+                    content.contains("session(action=\"resume_list\", session_id="),
+                    "{id}: no resume_list mapping"
+                );
+                assert!(content.contains("resume_hint"), "{id}");
+                // "Pick up where we left off" is a resume request, not a recall one.
+                let recall_line = content
+                    .lines()
+                    .find(|line| line.contains("(ranked context) OR"))
+                    .expect("the recall mapping");
+                assert!(
+                    !recall_line.contains("pick up where we left off"),
+                    "{id}: {recall_line}"
+                );
+            }
+        }
+        assert!(checked >= 5, "only {checked} full rules files were checked");
     }
 }

@@ -13,13 +13,13 @@
 #   scripts/ovh-cargo.sh clippy --workspace --all-targets -- -D warnings
 #   scripts/ovh-cargo.sh fmt --check
 #
-# Env: OVH_HOST (default ovh-dev),
+# Env: OVH_HOST (default ovh-desktop),
 #      OVH_REMOTE_DIR (default ~/dev/maker/mcp-server-wt-parity),
 #      OVH_TARGET_DIR (default ~/dev/maker/mcp-server-wt-parity/target),
 #      OVH_EXTRA_ENV (extra `KEY=value` pairs exported before cargo).
 set -euo pipefail
 
-HOST=${OVH_HOST:-ovh-dev}
+HOST=${OVH_HOST:-ovh-desktop}
 REMOTE_DIR=${OVH_REMOTE_DIR:-'$HOME/dev/maker/mcp-server-wt-parity'}
 TARGET_DIR=${OVH_TARGET_DIR:-'$HOME/dev/maker/mcp-server-wt-parity/target'}
 EXTRA_ENV=${OVH_EXTRA_ENV:-}
@@ -62,9 +62,9 @@ if [ ! -d \"\$MAIN_DIR/.git\" ]; then git clone -q git@github.com:contextstream/
 git -C \"\$MAIN_DIR\" fetch -q origin
 if [ ! -e \"\$REMOTE_DIR/.git\" ]; then git -C \"\$MAIN_DIR\" worktree add -q --detach \"\$REMOTE_DIR\" $BASE; fi
 cd \"\$REMOTE_DIR\"
-git checkout -q --detach $BASE
 git reset -q --hard
 git clean -qfd -e target
+git checkout -q --detach $BASE
 git apply --binary --whitespace=nowarn --allow-empty -
 echo \"== applied: \$(git status --short | wc -l | tr -d ' ') paths differ from base\" >&2
 git status --short | sed 's/^/==   /' >&2

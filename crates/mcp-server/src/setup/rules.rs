@@ -162,7 +162,7 @@ Every workspace-scoped call below must include `workspace_id="<current_workspace
 - "list risks" / "open risks" / "severe risks" → `entity(kind="risk", action="list", query={"status": "open", "impact": "severe"})`
 - "create backlog view" / "save backlog filter" → `entity(kind="backlog_view", action="create", body={"name": "Now/Next/Later", "bucket": "now", "filters": {...}})`
 - "save runbook" / "create runbook" → `memory(action="create_doc", doc_type="runbook", title="...", content="...")` (plus 20 other doc types: adr, rfc, postmortem, retro, release_notes, playbook, prd, user_story, persona, interview, design_spec, critique, glossary, oncall_schedule, slo, q_and_a, changelog, style_guide)
-- "save goal node" / "distill OKR" → `memory(action="create_node", node_type="goal"|"risk"|"term", summary="...", details="...")`
+- "save goal node" / "distill OKR" → `memory(action="create_node", node_type="goal"|"risk"|"term", title="...", content="...")`
 - "log standup" / "log status" / "log feedback" / "log achievement" → `memory(action="create_event", event_type="standup"|"status_update"|"feedback"|"achievement"|"discovery"|"question"|"approval", title="...", content="...")`
 
 Use `context(user_message="...", mode="fast")` for quick turns.

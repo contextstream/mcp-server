@@ -16,12 +16,18 @@ use super::{write_stdout_json, HookOutput};
 
 /// Search protocol base (tool guidance only — no sensitive text).
 const SEARCH_PROTOCOL_BASE: &str = r#"[CONTEXTSTREAM SEARCH]
-When searching code, prefer ContextStream search tools if the project is indexed:
-- mcp__contextstream__search(mode="auto", query="...") for smart search
-- mcp__contextstream__search(mode="semantic", query="...") for concept search
-- mcp__contextstream__search(mode="keyword", query="...") for exact matches
-- mcp__contextstream__search(mode="pattern", query="...") for regex
-- mcp__contextstream__graph(action="related", query="...") for dependency analysis
+When searching code, use ContextStream search if the project is indexed. Every local search has a mode:
+- Unsure / broad: mcp__contextstream__search(mode="auto", query="...")
+- How or where something works: mode="semantic"
+- Exact text: mode="keyword"
+- Grep regex: mode="pattern" (output_format="paths" lists files, "count" counts)
+- Every occurrence of a literal, like grep: mode="exhaustive"
+- Every usage of a symbol, e.g. before a rename: mode="refactor"
+- File names, like Glob or find: mode="pattern", query="**/*.rs", output_format="paths"
+- A whole exploration task in one call: mode="guided", query="...", intent="<the task>"
+- Deep multi-source research: mode="crawl"; across projects: mode="team"
+- Grep -C N: context_lines=N; only some file types: file_types=["rs"]
+- Callers, dependencies, impact: mcp__contextstream__graph(action="usages"|"dependencies"|"impact", target_type="function|type|module", target_id="...")
 Fall back to Glob/Grep/Read only if ContextStream search is unavailable or returns no results."#;
 
 /// Fallback base when API is unreachable.

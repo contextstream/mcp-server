@@ -145,16 +145,12 @@ fn extract_mcp_server_name(input: &Value) -> String {
 }
 
 fn is_contextstream_server_call(server_name: &str, tool_name: &str) -> bool {
-    server_name.eq_ignore_ascii_case("contextstream")
-        || tool_name.starts_with("mcp__contextstream__")
+    server_name.to_ascii_lowercase().contains("contextstream")
+        || super::durable_paths::is_contextstream_mcp_tool_name(tool_name)
 }
 
 fn normalize_contextstream_tool_name(tool_name: &str) -> String {
-    tool_name
-        .strip_prefix("mcp__contextstream__")
-        .unwrap_or(tool_name)
-        .trim()
-        .to_ascii_lowercase()
+    super::durable_paths::normalize_contextstream_tool_name(tool_name.trim())
 }
 
 fn contextstream_action(tool_input: &Value) -> String {
@@ -818,6 +814,12 @@ pub async fn handle() -> Result<()> {
         }
     }
 
+    // An approved plan-mode plan is saved to ContextStream. This is not a file
+    // index push, so the post-write switch below does not apply to it.
+    if tool_name == "ExitPlanMode" {
+        return capture_exit_plan_mode(&input, &cwd, &tool_input, &tool_response).await;
+    }
+
     // Disabling file indexing must not disable initialization receipts while
     // the corresponding PreToolUse gate remains enabled.
     if std::env::var("CONTEXTSTREAM_POSTWRITE_ENABLED")
@@ -906,33 +908,168 @@ pub async fn handle() -> Result<()> {
         }
     }
 
-    // Only process write/edit-like tools.
-    if !matches!(
-        tool_name.as_str(),
-        "Edit" | "MultiEdit" | "Write" | "NotebookEdit"
-    ) {
+    // Only process write/edit-like tools (Codex edits arrive as `apply_patch`).
+    let is_codex_patch = tool_name.eq_ignore_ascii_case("apply_patch");
+    if !is_codex_patch
+        && !matches!(
+            tool_name.as_str(),
+            "Edit" | "MultiEdit" | "Write" | "NotebookEdit"
+        )
+    {
         write_stdout_json(&HookOutput::empty())?;
         return Ok(());
     }
 
-    // Extract file path (multi-editor support)
-    let file_path = match extract_file_path(&input) {
-        Some(fp) => fp,
-        None => {
-            write_stdout_json(&HookOutput::empty())?;
-            return Ok(());
-        }
-    };
-
-    // Resolve to absolute path
-    let absolute_path = if Path::new(&file_path).is_absolute() {
-        file_path.clone()
+    // Extract file paths (multi-editor support; a patch can touch several).
+    let file_paths = if is_codex_patch {
+        super::durable_paths::write_target_paths("apply_patch", &tool_input)
     } else {
-        Path::new(&cwd)
-            .join(&file_path)
-            .to_string_lossy()
-            .to_string()
+        extract_file_path(&input).into_iter().collect()
     };
+    if file_paths.is_empty() {
+        write_stdout_json(&HookOutput::empty())?;
+        return Ok(());
+    }
+    let absolute_paths: Vec<String> = file_paths
+        .iter()
+        .map(|file_path| {
+            if Path::new(file_path).is_absolute() {
+                file_path.clone()
+            } else {
+                Path::new(&cwd)
+                    .join(file_path)
+                    .to_string_lossy()
+                    .to_string()
+            }
+        })
+        .collect();
+
+    let index_files = async {
+        let mut reached_drain = false;
+        for absolute_path in &absolute_paths {
+            reached_drain |= index_written_file(&cwd, absolute_path).await;
+        }
+        reached_drain
+    };
+    let (mirror_notes, reached_drain) =
+        tokio::join!(mirror_repo_docs(&absolute_paths), index_files);
+
+    // PostToolUse-tail drain: flush any edits recorded this turn that the
+    // single-file push didn't commit (e.g. a MultiEdit fan-out, or a push that
+    // returned 202). Cooldown-gated, so it's a cheap no-op on most calls and
+    // never blocks the hook beyond the deadline.
+    if reached_drain {
+        super::dirty_drain::drain_best_effort(std::time::Duration::from_millis(1200)).await;
+    }
+
+    if mirror_notes.is_empty() {
+        write_stdout_json(&HookOutput::empty())?;
+    } else {
+        super::write_context_for_input(&input, mirror_notes.join("\n"))?;
+    }
+    Ok(())
+}
+
+/// Whether a hook feature is enabled by an opt-out environment variable.
+fn hook_feature_enabled(variable: &str) -> bool {
+    !std::env::var(variable)
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0"))
+        .unwrap_or(false)
+}
+
+/// Mirror written repository runbooks/ADRs/RFCs/notes to ContextStream docs
+/// and return one agent-facing note per mirrored file.
+async fn mirror_repo_docs(absolute_paths: &[String]) -> Vec<String> {
+    if !hook_feature_enabled("CONTEXTSTREAM_DOC_MIRROR_ENABLED") {
+        return Vec::new();
+    }
+    let mut notes = Vec::new();
+    for absolute_path in absolute_paths {
+        let Some(super::durable_paths::DurableWrite::RepoDoc { doc_type }) =
+            super::durable_paths::classify(absolute_path, None)
+        else {
+            continue;
+        };
+        if let Some(mirror) =
+            super::durable_capture::mirror_repo_doc(Path::new(absolute_path), doc_type).await
+        {
+            notes.push(mirror.message());
+        }
+    }
+    notes
+}
+
+/// The approved plan's markdown from a PostToolUse(ExitPlanMode) payload:
+/// `tool_input.plan`, the response's `plan`, or the plan file itself.
+fn approved_plan_markdown(
+    tool_input: &Value,
+    tool_response: &Value,
+) -> Option<(String, Option<String>)> {
+    let plan_path = ["planFilePath", "plan_file_path"]
+        .iter()
+        .find_map(|key| tool_input.get(*key).and_then(Value::as_str))
+        .or_else(|| {
+            ["filePath", "planFilePath"]
+                .iter()
+                .find_map(|key| tool_response.get(*key).and_then(Value::as_str))
+        })
+        .map(str::to_string);
+    let inline = tool_input
+        .get("plan")
+        .or_else(|| tool_response.get("plan"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|plan| !plan.trim().is_empty());
+    let markdown = inline.or_else(|| {
+        plan_path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .filter(|plan| !plan.trim().is_empty())
+    })?;
+    Some((markdown, plan_path))
+}
+
+/// Agent instruction when the approved plan could not be saved automatically.
+const PLAN_CAPTURE_FAILED: &str = "ContextStream could not save the approved plan automatically (no credentials, the folder is not linked to a workspace, or the API did not answer). Save it now with mcp__contextstream__session(action=\"capture_plan\", title=\"...\", description=\"...\", steps=[...], create_tasks=true).";
+
+/// Save the plan the user approved in Claude Code plan mode to ContextStream.
+async fn capture_exit_plan_mode(
+    input: &Value,
+    cwd: &str,
+    tool_input: &Value,
+    tool_response: &Value,
+) -> Result<()> {
+    let from_subagent = tool_response
+        .get("isAgent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if from_subagent || !hook_feature_enabled("CONTEXTSTREAM_PLAN_CAPTURE_ENABLED") {
+        write_stdout_json(&HookOutput::empty())?;
+        return Ok(());
+    }
+    let Some((markdown, plan_path)) = approved_plan_markdown(tool_input, tool_response) else {
+        write_stdout_json(&HookOutput::empty())?;
+        return Ok(());
+    };
+    let message =
+        match super::durable_capture::capture_approved_plan(cwd, &markdown, plan_path.as_deref())
+            .await
+        {
+            Some(capture) => capture.message(),
+            // PreToolUse told the agent the plan would be saved for it; say
+            // plainly that it was not, so the plan is not lost.
+            None => PLAN_CAPTURE_FAILED.to_string(),
+        };
+    super::write_context_for_input(input, message)?;
+    Ok(())
+}
+
+/// Push one written file to the project index (the checkout-scoped,
+/// ownership-verified targeted ingest). Every failure is silent. Returns
+/// whether the push ran to the end, where the turn's dirty-file drain follows.
+async fn index_written_file(cwd: &str, absolute_path: &str) -> bool {
+    let cwd = cwd.to_string();
+    let absolute_path = absolute_path.to_string();
 
     // Resolve the checkout before recording. Keying by raw cwd fragments one
     // checkout into unreconcilable subdirectory roots.
@@ -949,8 +1086,7 @@ pub async fn handle() -> Result<()> {
     let submitted_versions = record_dirty_file(&ledger_root, &absolute_path);
 
     if !should_index(&absolute_path) {
-        write_stdout_json(&HookOutput::empty())?;
-        return Ok(());
+        return false;
     }
 
     if let Some(config) = project_config {
@@ -962,8 +1098,7 @@ pub async fn handle() -> Result<()> {
         // root here.
         if let Some(tracked_root) = config.project_root.clone() {
             if submitted_versions.is_empty() {
-                write_stdout_json(&HookOutput::empty())?;
-                return Ok(());
+                return false;
             }
             if mcp_client::validate_ingest_root(
                 Path::new(&tracked_root),
@@ -971,8 +1106,7 @@ pub async fn handle() -> Result<()> {
             )
             .is_err()
             {
-                write_stdout_json(&HookOutput::empty())?;
-                return Ok(());
+                return false;
             }
             let checkout_guard = match ContextStreamClient::checkout_guard_for_scope(
                 &tracked_root,
@@ -981,8 +1115,7 @@ pub async fn handle() -> Result<()> {
             ) {
                 Ok(guard) => guard,
                 Err(_) => {
-                    write_stdout_json(&HookOutput::empty())?;
-                    return Ok(());
+                    return false;
                 }
             };
             if super::dirty_drain::has_pending_submission_for_scope(
@@ -990,8 +1123,7 @@ pub async fn handle() -> Result<()> {
                 config.project_id,
                 config.workspace_id,
             ) {
-                write_stdout_json(&HookOutput::empty())?;
-                return Ok(());
+                return false;
             }
             let Some(reservation) = super::dirty_drain::reserve_pending_submission(
                 &ledger_root,
@@ -1004,8 +1136,7 @@ pub async fn handle() -> Result<()> {
                 checkout_guard.as_deref(),
                 true,
             ) else {
-                write_stdout_json(&HookOutput::empty())?;
-                return Ok(());
+                return false;
             };
 
             let (files, deleted_paths) = match ContextStreamClient::targeted_text_file_decision(
@@ -1017,8 +1148,7 @@ pub async fn handle() -> Result<()> {
                 TargetedFileDecision::Reject => {
                     let _ =
                         super::dirty_drain::cancel_pending_submission(&ledger_root, &reservation);
-                    write_stdout_json(&HookOutput::empty())?;
-                    return Ok(());
+                    return false;
                 }
             };
 
@@ -1032,8 +1162,7 @@ pub async fn handle() -> Result<()> {
                     && fresh.project_root.as_deref() == Some(tracked_root.as_str())
             }) else {
                 let _ = super::dirty_drain::cancel_pending_submission(&ledger_root, &reservation);
-                write_stdout_json(&HookOutput::empty())?;
-                return Ok(());
+                return false;
             };
             let client = build_hook_client(&fresh_config);
 
@@ -1087,15 +1216,7 @@ pub async fn handle() -> Result<()> {
             }
         }
     }
-
-    // PostToolUse-tail drain: flush any edits recorded this turn that the
-    // single-file push above didn't commit (e.g. a MultiEdit fan-out, or a
-    // push that returned 202). Cooldown-gated, so it's a cheap no-op on most
-    // calls and never blocks the hook beyond the deadline.
-    super::dirty_drain::drain_best_effort(std::time::Duration::from_millis(1200)).await;
-
-    write_stdout_json(&HookOutput::empty())?;
-    Ok(())
+    true
 }
 
 // ============================================================================

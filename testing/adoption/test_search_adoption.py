@@ -121,6 +121,25 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(stats["contextstream_search"], 1)
         self.assertEqual(stats["shell_search"], 2)
 
+    def test_codex_code_mode_exec_calls_count(self):
+        codex = self.root / "codex"
+        write_jsonl(
+            codex / "2026" / "rollout-2.jsonl",
+            [
+                {"type": "response_item", "payload": {
+                    "type": "custom_tool_call", "name": "exec",
+                    "input": "const hits = await tools.mcp__contextstream__search({query: 'x'});\n"
+                             "await tools.mcp__contextstream__context({user_message: 'y'});\n"
+                             "await tools.mcp__github__search({q: 'z'});"}},
+            ],
+        )
+
+        stats = measure("codex", codex, since=0)
+
+        self.assertEqual(stats["contextstream_search"], 1)
+        self.assertEqual(stats["contextstream_other"], 1)
+        self.assertEqual(stats["sessions_with_contextstream_search"], 1)
+
     def test_window_excludes_old_transcripts_and_missing_dirs_are_empty(self):
         claude = self.root / "claude"
         old = claude / "old.jsonl"

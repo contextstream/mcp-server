@@ -13,6 +13,7 @@ pub mod doctor;
 pub mod editors;
 pub mod git_hooks;
 mod hooks;
+pub mod local_memory_import;
 mod mcp_config;
 mod pending_connection;
 pub mod profile;
@@ -2417,6 +2418,49 @@ pub async fn run_setup_wizard_with_options(
 
 /// Explicit learning choices are handled once by the caller after setup saves.
 /// A cancelled wizard returns false so the caller performs no follow-up action.
+/// Set by `setup --keep-claude-auto-memory`.
+static KEEP_CLAUDE_AUTO_MEMORY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Keep Claude Code auto memory on during this setup run instead of the
+/// default of turning it off.
+pub fn set_keep_claude_auto_memory(keep: bool) {
+    KEEP_CLAUDE_AUTO_MEMORY.store(keep, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether setup leaves Claude Code auto memory alone: the
+/// `--keep-claude-auto-memory` flag or `CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY`.
+pub(crate) fn keep_claude_auto_memory() -> bool {
+    KEEP_CLAUDE_AUTO_MEMORY.load(std::sync::atomic::Ordering::SeqCst)
+        || std::env::var("CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY")
+            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+            .unwrap_or(false)
+}
+
+/// Setup default: when Claude Code is configured, turn its auto memory off.
+/// While it is on, Claude Code's system prompt saves "remember" requests and
+/// preferences to local files that ContextStream, other machines and Codex
+/// never see. Respects `--keep-claude-auto-memory` and dry-run, and never
+/// prompts.
+pub(crate) fn apply_claude_auto_memory_default(editors: &[editors::Editor]) {
+    if keep_claude_auto_memory() || !editors.contains(&editors::Editor::ClaudeCode) {
+        return;
+    }
+    match hooks::disable_claude_auto_memory() {
+        Ok(true) => ui::say(
+            ui::Mark::Ok,
+            "Claude auto memory off",
+            Some("memories and preferences go to ContextStream"),
+        ),
+        Ok(false) => {}
+        Err(error) => ui::say(
+            ui::Mark::Warn,
+            "Claude auto memory is still on",
+            Some(&error.to_string()),
+        ),
+    }
+}
+
 pub async fn run_setup_with_learning_choice(
     non_interactive: bool,
     only: Option<&[editors::Editor]>,
@@ -2585,6 +2629,7 @@ async fn run_setup_noninteractive(
         )
         .await?;
     }
+    apply_claude_auto_memory_default(&editors_to_configure);
     let binding_established = if let Some(project_path) = configured_project_path {
         if let Some(ref workspace) = workspace {
             establish_validated_setup_binding(

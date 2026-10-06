@@ -24,69 +24,84 @@ mcp__contextstream__entity(
 - If the user explicitly requested a capsule, a real capsule must be created; never replace it with only an entity or prose.
 [END GUIDANCE]"#;
 
-/// Guidance injected when the prompt indicates intent to persist work.
+/// Guidance injected when the prompt indicates intent to persist knowledge.
+/// One line per kind, so the agent can route without a second lookup.
 pub const SAVE_INTENT_GUIDANCE: &str = r#"[CONTEXTSTREAM DOCUMENT STORAGE]
-The user wants to save/store content. Use ContextStream instead of local files:
-
-**For decisions/notes/operations:**
-```
-mcp__contextstream__session(
-  action="capture",
-  event_type="decision|insight|operation|uncategorized",
-  title="...",
-  content="...",
-  importance="high|medium|low"
-)
-```
-
-**For documents/specs:**
-```
-mcp__contextstream__memory(
-  action="create_doc",
-  title="...",
-  content="...",
-  doc_type="implementation|design|spec|guide"
-)
-```
-
-**For plans:**
-```
-mcp__contextstream__session(
-  action="capture_plan",
-  title="...",
-  steps=[...]
-)
-```
-
-**Why ContextStream?**
-- Persists across sessions (local files don't)
-- Searchable and retrievable
-- Shows up in context automatically
-- Can be shared with team
-- For longer writes/indexing, give the user an explicit in-progress update and a completion update.
-
-Only save to local files if user explicitly requests a specific file path.
+Save durable knowledge to ContextStream, not to local files (no Claude auto-memory files, MEMORY.md, HANDOFF.md, or notes/*.md):
+- Preference, "remember", "always/never" -> mcp__contextstream__session(action="remember", content="<the rule and why>")
+- Lesson from a mistake or correction -> mcp__contextstream__session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...")
+- Decision -> mcp__contextstream__session(action="capture", event_type="decision", title="...", content="...")
+- Doc, runbook, spec, ADR -> mcp__contextstream__memory(action="create_doc", doc_type="runbook|spec|adr|general", title="...", content="...")
+- Plan -> mcp__contextstream__session(action="capture_plan", title="...", steps=[...])
+- Todo -> mcp__contextstream__memory(action="create_todo", title="...", content="...")
+- Ticket or bug -> mcp__contextstream__entity(kind="ticket", action="create", body={"title":"...","kind":"bug|feature|task"})
+- Handoff -> mcp__contextstream__entity(kind="handoff", action="create", body={"title":"...","summary":"...","scope":"...","next_steps":[...]})
+Write a local file only when the user names its path. Repository runbooks, ADRs and notes are mirrored to ContextStream docs automatically.
 [END GUIDANCE]"#;
 
+/// Phrases that signal the user wants something kept for later. Bare words
+/// that also describe ordinary coding work ("file", "path", "document",
+/// "spec", "record") are deliberately absent: they fired on most prompts.
 const SAVE_KEYWORDS: &[&str] = &[
-    "save",
-    "store",
-    "record",
-    "capture",
-    "document",
+    "save this",
+    "save that",
+    "save it",
+    "save these",
+    "save our",
+    "save my",
+    "store this",
+    "store that",
+    "store it",
+    "capture this",
+    "capture that",
+    "capture the decision",
+    "capture a lesson",
     "write down",
+    "write this down",
     "note down",
+    "make a note",
+    "take a note",
     "remember",
+    "don't forget",
+    "do not forget",
     "for later reference",
     "for future reference",
-    "decision",
-    "design doc",
-    "spec",
-    "implementation doc",
+    "from now on",
+    "going forward",
+    "lesson learned",
+    "lessons learned",
+    "record a decision",
+    "record the decision",
+    "record this decision",
+    "we decided",
+    "log a decision",
+    "save a runbook",
+    "write a runbook",
+    "create a runbook",
+    "update the runbook",
+    "write a design doc",
+    "write up a design doc",
+    "create a ticket",
+    "file a bug",
+    "file a ticket",
+    "add a todo",
+    "add to my todos",
+    "add a to-do",
 ];
 
+/// Wording that asks for a local note-like file.
 const LOCAL_FILE_HINTS: &[&str] = &[
-    ".md", ".txt", ".json", "docs/", "notes/", "readme", "file", "path", "./", "../", "~/",
+    "notes.md",
+    "todo.md",
+    "decisions.md",
+    "lessons.md",
+    "memory.md",
+    "runbook.md",
+    "notes/",
+    "into a markdown file",
+    "in a markdown file",
+    "to a markdown file",
+    "local markdown",
 ];
 
 const HANDOFF_TRIGGERS: &[&str] = &[
@@ -327,21 +342,48 @@ mod tests {
 
     #[test]
     fn detects_direct_save_intent() {
-        assert!(detects_save_intent(
-            "Please save this decision for future reference."
-        ));
+        for prompt in [
+            "Please save this decision for future reference.",
+            "Remember that the API tests need a local Redis.",
+            "From now on, always use pnpm instead of npm.",
+            "Lesson learned: check the filesystem before deleting.",
+            "Add a todo to rotate the staging keys.",
+            "Write down the release steps as a runbook.",
+            "Put these notes into a markdown file.",
+        ] {
+            assert!(detects_save_intent(prompt), "{prompt}");
+        }
     }
 
     #[test]
-    fn detects_local_file_save_intent() {
-        assert!(detects_save_intent(
-            "Write this to docs/architecture.md and keep a summary."
-        ));
+    fn ignores_ordinary_coding_prompts() {
+        for prompt in [
+            "Explain how this module works.",
+            "Read the config file at ./config/app.json and fix the path handling.",
+            "Write this to docs/architecture.md and keep a summary.",
+            "Document the public API in the README.",
+            "Update the spec test for the parser.",
+            "Record the request latency in the metrics module.",
+            "Fix the save button on the settings page.",
+        ] {
+            assert!(!detects_save_intent(prompt), "{prompt}");
+        }
     }
 
     #[test]
-    fn ignores_non_save_prompt() {
-        assert!(!detects_save_intent("Explain how this module works."));
+    fn save_guidance_routes_every_durable_kind() {
+        for call in [
+            "action=\"remember\"",
+            "action=\"capture_lesson\"",
+            "event_type=\"decision\"",
+            "action=\"create_doc\"",
+            "action=\"capture_plan\"",
+            "action=\"create_todo\"",
+            "kind=\"ticket\"",
+            "kind=\"handoff\"",
+        ] {
+            assert!(SAVE_INTENT_GUIDANCE.contains(call), "{call}");
+        }
     }
 
     #[test]

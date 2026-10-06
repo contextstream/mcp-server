@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use super::compliance::{self, CheckResult, CheckType, ComplianceEvent, RuleClass};
+use super::durable_paths::DurableWrite;
 use super::prompt_state;
 use super::{read_stdin_json, write_stdout_json, HookOutput};
 
@@ -281,6 +282,8 @@ enum SearchMode {
     Exhaustive,
     Refactor,
     Team,
+    /// One call: raw evidence plus bounded navigation for a task (`intent`).
+    Guided,
 }
 
 impl SearchMode {
@@ -293,6 +296,7 @@ impl SearchMode {
             Self::Exhaustive => "exhaustive",
             Self::Refactor => "refactor",
             Self::Team => "team",
+            Self::Guided => "guided",
         }
     }
 }
@@ -928,15 +932,14 @@ fn extract_mcp_server_name(input: &Value) -> String {
 }
 
 fn normalize_contextstream_tool_name(tool_name: &str) -> String {
-    tool_name
-        .strip_prefix("mcp__contextstream__")
-        .unwrap_or(tool_name)
-        .to_ascii_lowercase()
+    super::durable_paths::normalize_contextstream_tool_name(tool_name)
 }
 
+/// ContextStream can be registered under more than one server name (the local
+/// `contextstream` server, the claude.ai `ContextStream` connector, plugins).
 fn is_contextstream_server_call(server_name: &str, tool_name: &str) -> bool {
-    server_name.eq_ignore_ascii_case("contextstream")
-        || tool_name.starts_with("mcp__contextstream__")
+    server_name.to_ascii_lowercase().contains("contextstream")
+        || super::durable_paths::is_contextstream_mcp_tool_name(tool_name)
 }
 
 fn is_windsurf_pre_mcp_tool_use(input: &Value) -> bool {
@@ -1306,6 +1309,474 @@ fn search_call(editor: &EditorFormat, mode: SearchMode, query: &str) -> String {
     format!("{}({})", search_tool_name(editor), args.join(", "))
 }
 
+/// A ContextStream search call that does the same job as a local search
+/// (Grep/Glob tools, `grep`/`rg`/`ag`/`find`/`fd`, an Explore subagent),
+/// carrying over what the local call asked for: regex vs literal, file
+/// lists vs counts vs matching lines, context lines and file types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchSuggestion {
+    mode: SearchMode,
+    query: String,
+    output_format: Option<&'static str>,
+    context_lines: Option<u64>,
+    file_types: Vec<String>,
+    intent: Option<String>,
+}
+
+impl SearchSuggestion {
+    fn new(mode: SearchMode, query: &str) -> Self {
+        Self {
+            mode,
+            query: query.trim().to_string(),
+            output_format: None,
+            context_lines: None,
+            file_types: Vec::new(),
+            intent: None,
+        }
+    }
+
+    fn call(&self, editor: &EditorFormat) -> String {
+        let mode_name = if self.query.is_empty() && self.mode == SearchMode::Hybrid {
+            "auto"
+        } else {
+            self.mode.as_str()
+        };
+        let mut args = vec![format!("mode=\"{mode_name}\"")];
+        if self.query.is_empty() {
+            args.push("query=\"...\"".to_string());
+        } else {
+            args.push(format!(
+                "query=\"{}\"",
+                escape_for_double_quotes(&self.query)
+            ));
+        }
+        if let Some(output_format) = self.output_format {
+            args.push(format!("output_format=\"{output_format}\""));
+        }
+        if let Some(lines) = self.context_lines {
+            args.push(format!("context_lines={lines}"));
+        }
+        if !self.file_types.is_empty() {
+            let types: Vec<String> = self
+                .file_types
+                .iter()
+                .map(|file_type| format!("\"{}\"", escape_for_double_quotes(file_type)))
+                .collect();
+            args.push(format!("file_types=[{}]", types.join(", ")));
+        }
+        if let Some(intent) = &self.intent {
+            args.push(format!("intent=\"{}\"", escape_for_double_quotes(intent)));
+        }
+        format!("{}({})", search_tool_name(editor), args.join(", "))
+    }
+}
+
+/// Mode for a grep-like search: regex syntax goes to `pattern`, a code
+/// identifier to `refactor` (symbol usages), and any other literal to
+/// `exhaustive`, the every-occurrence grep replacement.
+fn grep_like_mode(pattern: &str, fixed_string: bool) -> SearchMode {
+    if !fixed_string && has_regex_characters(pattern) {
+        SearchMode::Pattern
+    } else if is_identifier_query(pattern) {
+        SearchMode::Refactor
+    } else {
+        SearchMode::Exhaustive
+    }
+}
+
+/// One sentence on why the suggested call matches the local search.
+fn suggestion_reason(suggestion: &SearchSuggestion) -> String {
+    let mode = match suggestion.mode {
+        SearchMode::Pattern => "mode=\"pattern\" runs the regex/glob against the index",
+        SearchMode::Exhaustive => "mode=\"exhaustive\" returns every occurrence, like grep",
+        SearchMode::Refactor => "mode=\"refactor\" finds every usage of the symbol",
+        SearchMode::Keyword => "mode=\"keyword\" matches the exact text",
+        SearchMode::Semantic => "mode=\"semantic\" matches by meaning",
+        SearchMode::Guided => "mode=\"guided\" returns evidence plus where to look",
+        SearchMode::Team => "mode=\"team\" searches across projects",
+        SearchMode::Hybrid => "mode=\"auto\" picks the best mode",
+    };
+    let output = match suggestion.output_format {
+        Some("paths") => "; output_format=\"paths\" lists files",
+        Some("count") => "; output_format=\"count\" returns counts",
+        _ => "",
+    };
+    format!("{mode}{output}.")
+}
+
+/// File extensions named by a glob (`*.rs`, `**/*.{ts,tsx}`).
+fn file_types_from_glob(glob: &str) -> Vec<String> {
+    let mut types = Vec::new();
+    let mut rest = glob;
+    while let Some(index) = rest.find("*.") {
+        rest = &rest[index + 2..];
+        let extensions: String = if let Some(group) = rest.strip_prefix('{') {
+            group.split('}').next().unwrap_or("").to_string()
+        } else {
+            rest.chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect()
+        };
+        for extension in extensions.split(',') {
+            let extension = extension.trim().to_ascii_lowercase();
+            if !extension.is_empty()
+                && extension.chars().all(|c| c.is_ascii_alphanumeric())
+                && !types.contains(&extension)
+            {
+                types.push(extension);
+            }
+        }
+    }
+    types
+}
+
+/// File extension for a ripgrep `--type` name.
+fn file_type_for_rg_type(name: &str) -> Option<&'static str> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "rust" | "rs" => "rs",
+        "ts" | "typescript" => "ts",
+        "tsx" => "tsx",
+        "js" | "javascript" => "js",
+        "py" | "python" => "py",
+        "go" => "go",
+        "java" => "java",
+        "kotlin" | "kt" => "kt",
+        "swift" => "swift",
+        "ruby" | "rb" => "rb",
+        "cpp" | "c++" => "cpp",
+        "c" => "c",
+        "cs" | "csharp" => "cs",
+        "php" => "php",
+        "md" | "markdown" => "md",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "sh" | "bash" => "sh",
+        "sql" => "sql",
+        "html" => "html",
+        "css" => "css",
+        _ => return None,
+    })
+}
+
+fn push_file_types(types: &mut Vec<String>, new: impl IntoIterator<Item = String>) {
+    for file_type in new {
+        if !types.contains(&file_type) {
+            types.push(file_type);
+        }
+    }
+}
+
+/// Claude Code's Grep tool as a ContextStream search. Grep lists matching
+/// files by default (`output_mode: files_with_matches`).
+fn grep_tool_suggestion(tool_input: &Value) -> SearchSuggestion {
+    let pattern = first_str(tool_input, &["pattern", "query", "regex"])
+        .unwrap_or("")
+        .trim();
+    let mut suggestion = SearchSuggestion::new(grep_like_mode(pattern, false), pattern);
+    suggestion.output_format = match first_str(tool_input, &["output_mode"]).unwrap_or("") {
+        "count" => Some("count"),
+        "content" => None,
+        _ => Some("paths"),
+    };
+    suggestion.context_lines = ["-C", "context", "-A", "-B"]
+        .iter()
+        .filter_map(|key| tool_input.get(*key).and_then(Value::as_u64))
+        .max();
+    if let Some(glob) = first_str(tool_input, &["glob"]) {
+        push_file_types(&mut suggestion.file_types, file_types_from_glob(glob));
+    }
+    if let Some(file_type) = first_str(tool_input, &["type"]).and_then(file_type_for_rg_type) {
+        push_file_types(&mut suggestion.file_types, [file_type.to_string()]);
+    }
+    suggestion
+}
+
+/// Claude Code's Glob tool as a ContextStream file search.
+fn glob_tool_suggestion(pattern: &str) -> SearchSuggestion {
+    if pattern.is_empty() || is_generic_discovery_glob(pattern) {
+        return SearchSuggestion::new(SearchMode::Hybrid, "");
+    }
+    let mut suggestion = SearchSuggestion::new(SearchMode::Pattern, pattern);
+    suggestion.output_format = Some("paths");
+    suggestion.file_types = file_types_from_glob(pattern);
+    suggestion
+}
+
+/// An Explore subagent as one guided ContextStream search: raw evidence plus
+/// bounded navigation for the task it was going to explore.
+fn explore_suggestion(tool_input: &Value) -> SearchSuggestion {
+    let description = first_str(tool_input, &["description"]).unwrap_or("").trim();
+    let prompt = first_str(tool_input, &["prompt"]).unwrap_or("").trim();
+    let query: String = if description.is_empty() {
+        prompt.chars().take(120).collect()
+    } else {
+        description.to_string()
+    };
+    let mut suggestion = SearchSuggestion::new(SearchMode::Guided, &query);
+    if !prompt.is_empty() {
+        suggestion.intent = Some(
+            prompt
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(300)
+                .collect(),
+        );
+    }
+    suggestion
+}
+
+/// Split a shell command into words, honoring single and double quotes.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut in_word = false;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            None => {
+                current.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    words
+}
+
+/// Strip leading `cd <dir> &&` / `cd <dir>;` segments.
+fn strip_cd_prefix(command: &str) -> &str {
+    let mut head = command.trim();
+    loop {
+        let lowered = head.trim_start();
+        if let Some(rest) = lowered
+            .strip_prefix("cd ")
+            .and_then(|s| s.split_once("&&").or_else(|| s.split_once(';')))
+        {
+            head = rest.1.trim_start();
+            continue;
+        }
+        return head;
+    }
+}
+
+/// Flags of grep/rg/ag that take a value (the value is not the pattern).
+fn grep_flag_takes_value(tool: &str, flag: &str) -> bool {
+    let common = matches!(
+        flag,
+        "-e" | "-f"
+            | "-m"
+            | "-A"
+            | "-B"
+            | "-C"
+            | "--regexp"
+            | "--file"
+            | "--max-count"
+            | "--after-context"
+            | "--before-context"
+            | "--context"
+    );
+    common
+        || match tool {
+            "rg" => matches!(
+                flag,
+                "-g" | "-t"
+                    | "-T"
+                    | "-j"
+                    | "-E"
+                    | "-M"
+                    | "-r"
+                    | "--glob"
+                    | "--iglob"
+                    | "--type"
+                    | "--type-not"
+                    | "--threads"
+                    | "--encoding"
+                    | "--max-columns"
+                    | "--replace"
+                    | "--max-depth"
+                    | "--max-filesize"
+            ),
+            "ag" => matches!(flag, "-G" | "--file-search-regex" | "--depth"),
+            _ => matches!(
+                flag,
+                "--include" | "--exclude" | "--exclude-dir" | "-d" | "-D"
+            ),
+        }
+}
+
+/// A shell code search (`grep`/`rg`/`ag`/`find`/`fd`) as a ContextStream
+/// search, carrying over its pattern and flags.
+fn shell_search_suggestion(tool: &str, command: &str) -> SearchSuggestion {
+    let words = shell_words(strip_cd_prefix(command));
+    let args = words.get(1..).unwrap_or(&[]);
+    match tool {
+        "find" => {
+            let name = args
+                .windows(2)
+                .find(|pair| {
+                    matches!(
+                        pair[0].as_str(),
+                        "-name" | "-iname" | "-path" | "-ipath" | "-regex" | "-iregex"
+                    )
+                })
+                .map(|pair| pair[1].clone())
+                .unwrap_or_default();
+            let mut suggestion = SearchSuggestion::new(SearchMode::Pattern, &name);
+            suggestion.output_format = Some("paths");
+            suggestion.file_types = file_types_from_glob(&name);
+            suggestion
+        }
+        "fd" => {
+            let mut pattern = String::new();
+            let mut file_types = Vec::new();
+            let mut iter = args.iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "-e" | "--extension" => {
+                        if let Some(extension) = iter.next() {
+                            push_file_types(
+                                &mut file_types,
+                                [extension.trim_start_matches('.').to_ascii_lowercase()],
+                            );
+                        }
+                    }
+                    "-t" | "--type" | "-d" | "--max-depth" | "-E" | "--exclude" | "-j" => {
+                        iter.next();
+                    }
+                    flag if flag.starts_with('-') => {}
+                    value if pattern.is_empty() => pattern = value.to_string(),
+                    _ => {}
+                }
+            }
+            let mut suggestion = SearchSuggestion::new(SearchMode::Pattern, &pattern);
+            suggestion.output_format = Some("paths");
+            push_file_types(&mut file_types, file_types_from_glob(&pattern));
+            suggestion.file_types = file_types;
+            suggestion
+        }
+        _ => {
+            let mut pattern: Option<String> = None;
+            let mut fixed_string = tool == "fgrep";
+            let mut files_only = false;
+            let mut count = false;
+            let mut context_lines: Option<u64> = None;
+            let mut file_types = Vec::new();
+            let mut iter = args.iter();
+            while let Some(arg) = iter.next() {
+                let (flag, inline_value) = match arg.split_once('=') {
+                    Some((flag, value)) if arg.starts_with("--") => (flag, Some(value.to_string())),
+                    _ => (arg.as_str(), None),
+                };
+                if !flag.starts_with('-') || flag == "-" {
+                    if pattern.is_none() {
+                        pattern = Some(arg.clone());
+                    }
+                    continue;
+                }
+                let value = || -> Option<String> { inline_value.clone() };
+                // Attached short values: -C3, -A2, -tpy, -g*.rs.
+                let attached = |prefix: &str| -> Option<String> {
+                    (!flag.starts_with("--")
+                        && flag.len() > prefix.len()
+                        && flag.starts_with(prefix))
+                    .then(|| flag[prefix.len()..].to_string())
+                };
+                if let Some(lines) = attached("-C")
+                    .or_else(|| attached("-A"))
+                    .or_else(|| attached("-B"))
+                {
+                    if let Ok(lines) = lines.parse::<u64>() {
+                        context_lines = Some(context_lines.unwrap_or(0).max(lines));
+                        continue;
+                    }
+                }
+                if tool == "rg" {
+                    if let Some(name) = attached("-t") {
+                        push_file_types(
+                            &mut file_types,
+                            file_type_for_rg_type(&name).map(str::to_string),
+                        );
+                        continue;
+                    }
+                    if let Some(glob) = attached("-g") {
+                        push_file_types(&mut file_types, file_types_from_glob(&glob));
+                        continue;
+                    }
+                }
+                let takes_value = grep_flag_takes_value(tool, flag);
+                let flag_value = if takes_value {
+                    value().or_else(|| iter.next().cloned())
+                } else {
+                    None
+                };
+                match flag {
+                    "-e" | "--regexp" => pattern = flag_value,
+                    "-A" | "-B" | "-C" | "--after-context" | "--before-context" | "--context" => {
+                        if let Some(lines) = flag_value.and_then(|v| v.parse::<u64>().ok()) {
+                            context_lines = Some(context_lines.unwrap_or(0).max(lines));
+                        }
+                    }
+                    "-t" | "--type" => push_file_types(
+                        &mut file_types,
+                        flag_value
+                            .as_deref()
+                            .and_then(file_type_for_rg_type)
+                            .map(str::to_string),
+                    ),
+                    "-g" | "--glob" | "--iglob" | "--include" | "-G" => push_file_types(
+                        &mut file_types,
+                        file_types_from_glob(flag_value.as_deref().unwrap_or("")),
+                    ),
+                    "-F" | "--fixed-strings" | "-Q" | "--literal" => fixed_string = true,
+                    "-l" | "-L" | "--files-with-matches" | "--files-without-match" => {
+                        files_only = true
+                    }
+                    "-c" | "--count" | "--count-matches" => count = true,
+                    _ if !flag.starts_with("--") && !takes_value => {
+                        // Combined short flags such as -rnF or -rl.
+                        let letters = &flag[1..];
+                        fixed_string |=
+                            letters.contains('F') || (tool == "ag" && letters.contains('Q'));
+                        files_only |= letters.contains('l') || letters.contains('L');
+                        count |= letters.contains('c');
+                    }
+                    _ => {}
+                }
+            }
+            let pattern = pattern.unwrap_or_default();
+            let mut suggestion =
+                SearchSuggestion::new(grep_like_mode(&pattern, fixed_string), &pattern);
+            suggestion.output_format = if count {
+                Some("count")
+            } else if files_only {
+                Some("paths")
+            } else {
+                None
+            };
+            suggestion.context_lines = context_lines;
+            suggestion.file_types = file_types;
+            suggestion
+        }
+    }
+}
+
 /// Build a session plan capture call snippet.
 fn plan_capture_call(editor: &EditorFormat) -> String {
     format!(
@@ -1371,6 +1842,65 @@ fn handoff_file_write_decision(
             "A local HANDOFF.md-style file is not a canonical ContextStream handoff. If this file is intended to hand work to another agent/session, create {entity_call} and use {capsule_call} only for a requested portable bundle/share link. Keep the local file only when the user explicitly requested it."
         ))),
     }
+}
+
+/// Plan mode guidance when PostToolUse(ExitPlanMode) saves approved plans.
+const PLAN_AUTO_CAPTURE_NOTE: &str = "When the user approves the plan, ContextStream saves it automatically as a plan with one linked task per numbered step and returns its id, so do not call capture_plan for it. Give the plan file an H1 title, a Context section, and numbered steps whose text says what to change and how to verify it.";
+
+/// The text a write stores for `path`, when the tool input carries it whole.
+fn written_content_for(tool_lower: &str, tool_input: &Value, path: &str) -> Option<String> {
+    if tool_lower == "apply_patch" {
+        return super::durable_paths::patch_body(tool_input)
+            .and_then(|patch| super::durable_paths::patch_added_content(patch, path));
+    }
+    super::durable_paths::written_content(tool_input).map(str::to_string)
+}
+
+/// Escape hatch for people who keep Claude auto memory on deliberately.
+fn local_memory_writes_allowed() -> bool {
+    std::env::var("CONTEXTSTREAM_ALLOW_LOCAL_MEMORY")
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+        .unwrap_or(false)
+}
+
+/// Deny reason for a Claude auto memory write, routed by the memory's type.
+fn auto_memory_redirect_message(
+    editor: &EditorFormat,
+    memory_type: Option<&str>,
+    is_index: bool,
+) -> String {
+    let session = session_tool_name(editor);
+    let memory = contextstream_tool_name(editor, "memory");
+    let remember = format!("{session}(action=\"remember\", content=\"<the preference and why>\")");
+    let lesson = format!(
+        "{session}(action=\"capture_lesson\", title=\"...\", trigger=\"...\", impact=\"...\", prevention=\"...\")"
+    );
+    let fact = format!(
+        "{memory}(action=\"create_node\", node_type=\"fact\", title=\"...\", content=\"...\")"
+    );
+    let lead = if is_index {
+        "MEMORY.md is not needed: ContextStream indexes what you save and surfaces it in later sessions."
+            .to_string()
+    } else {
+        match memory_type {
+            Some("feedback" | "user" | "preference") => {
+                format!("Save this preference with {remember}.")
+            }
+            Some("lesson") => format!("Save this lesson with {lesson}."),
+            Some("project" | "reference" | "fact") => format!("Save this as a fact with {fact}."),
+            _ => "Save it to ContextStream instead.".to_string(),
+        }
+    };
+    format!(
+        "Blocked: this workspace keeps memory in ContextStream, not in Claude auto-memory files, which stay on this machine and are invisible to other sessions, other machines and Codex. {lead} Routing: a preference or \"remember this\" -> {remember}; a lesson from a mistake or correction -> {lesson}; a project fact or reference -> {fact}. Do not retry the local write."
+    )
+}
+
+/// Note for a repository doc that PostToolUse mirrors to ContextStream.
+fn repo_doc_mirror_note(doc_type: &str) -> String {
+    format!(
+        "ContextStream mirrors this {doc_type} file to a doc (doc_type=\"{doc_type}\") automatically after the write, so do not also call create_doc for it. Keep editing the repository file."
+    )
 }
 
 fn contextstream_surface_nudge(
@@ -2172,15 +2702,23 @@ pub async fn handle() -> Result<()> {
         || tool_lower == "plan_mode_start"
     {
         let search = search_call(&editor, SearchMode::Hybrid, "");
-        let msg = format!(
-            "Plan mode does NOT bypass ContextStream search-first. Start with {} before broad file reads \
-             and avoid Explore/file-by-file scans. After finalizing your plan, save it to ContextStream \
-             (not a local markdown file): {}. \
-             Then create tasks with {}.",
-            search,
-            plan_capture_call(&editor),
-            plan_task_create_call(&editor)
-        );
+        let msg = if tool == "EnterPlanMode" && super::durable_paths::plan_auto_capture_installed()
+        {
+            format!(
+                "Plan mode does NOT bypass ContextStream search-first. Start with {search} before broad file reads \
+                 and avoid Explore/file-by-file scans. {PLAN_AUTO_CAPTURE_NOTE}"
+            )
+        } else {
+            format!(
+                "Plan mode does NOT bypass ContextStream search-first. Start with {} before broad file reads \
+                 and avoid Explore/file-by-file scans. After finalizing your plan, save it to ContextStream \
+                 (not a local markdown file): {}. \
+                 Then create tasks with {}.",
+                search,
+                plan_capture_call(&editor),
+                plan_task_create_call(&editor)
+            )
+        };
         emit_compliance(ComplianceEvent {
             rule_key: compliance::RULE_PLAN_PERSISTENCE,
             rule_class: RuleClass::Soft,
@@ -2211,11 +2749,15 @@ pub async fn handle() -> Result<()> {
     }
 
     if tool_lower == "exitplanmode" {
-        let msg = format!(
-            "Before exiting plan mode, make sure the plan is saved to ContextStream: {}. \
-             Plans in ContextStream persist across sessions and are searchable.",
-            plan_capture_call(&editor)
-        );
+        let msg = if super::durable_paths::plan_auto_capture_installed() {
+            PLAN_AUTO_CAPTURE_NOTE.to_string()
+        } else {
+            format!(
+                "Before exiting plan mode, make sure the plan is saved to ContextStream: {}. \
+                 Plans in ContextStream persist across sessions and are searchable.",
+                plan_capture_call(&editor)
+            )
+        };
         emit(HookDecision::AllowWithContext(msg))?;
         return Ok(());
     }
@@ -2300,103 +2842,180 @@ pub async fn handle() -> Result<()> {
         return Ok(());
     }
 
-    // Intercept plan file writes and doc file writes
-    if matches!(
-        tool_lower.as_str(),
-        "write_to_file" | "create_file" | "write" | "edit" | "multiedit" | "notebookedit"
-    ) {
-        let raw_file_path = first_str(
-            &tool_input,
-            &["file_path", "path", "target_file", "TargetFile"],
-        )
-        .unwrap_or("");
+    // Intercept writes that would keep durable knowledge in local files: Claude
+    // auto memory, handoff files, plans and docs. Codex `apply_patch` can touch
+    // several files, so every target path is checked.
+    if super::durable_paths::is_write_tool(&tool_lower) {
+        let target_paths = super::durable_paths::write_target_paths(&tool_lower, &tool_input);
+        let mut context_note: Option<String> = None;
+        let mut unhandled_path: Option<&str> = None;
 
-        if let Some(decision) = handoff_file_write_decision(&editor, &input, raw_file_path) {
-            match &decision {
-                HookDecision::BlockWithMessage(_) => emit_compliance(ComplianceEvent {
-                    rule_key: compliance::RULE_HANDOFF_PERSISTENCE,
-                    rule_class: RuleClass::Hard,
-                    check_type: CheckType::Deterministic,
-                    result: CheckResult::Fail,
-                    severity: 4,
-                    metadata: Some(serde_json::json!({
-                        "tool": tool,
-                        "artifact": "handoff_file",
-                        "reason": "local_handoff_substitute_blocked",
-                    })),
-                    ..Default::default()
-                }),
-                HookDecision::Allow | HookDecision::AllowWithContext(_) => {
-                    emit_compliance(ComplianceEvent {
-                        rule_key: compliance::RULE_HANDOFF_PERSISTENCE,
-                        rule_class: RuleClass::Soft,
-                        check_type: CheckType::Deterministic,
-                        result: CheckResult::Pass,
-                        severity: 2,
-                        metadata: Some(serde_json::json!({
-                            "tool": tool,
-                            "artifact": "handoff_file",
-                            "reason": "local_handoff_file_nudged",
-                        })),
-                        ..Default::default()
-                    })
+        for raw_file_path in &target_paths {
+            let raw_file_path = raw_file_path.as_str();
+            if let Some(decision) = handoff_file_write_decision(&editor, &input, raw_file_path) {
+                match decision {
+                    HookDecision::BlockWithMessage(_) => {
+                        emit_compliance(ComplianceEvent {
+                            rule_key: compliance::RULE_HANDOFF_PERSISTENCE,
+                            rule_class: RuleClass::Hard,
+                            check_type: CheckType::Deterministic,
+                            result: CheckResult::Fail,
+                            severity: 4,
+                            metadata: Some(serde_json::json!({
+                                "tool": tool,
+                                "artifact": "handoff_file",
+                                "reason": "local_handoff_substitute_blocked",
+                            })),
+                            ..Default::default()
+                        });
+                        emit(decision)?;
+                        return Ok(());
+                    }
+                    HookDecision::Allow | HookDecision::AllowWithContext(_) => {
+                        emit_compliance(ComplianceEvent {
+                            rule_key: compliance::RULE_HANDOFF_PERSISTENCE,
+                            rule_class: RuleClass::Soft,
+                            check_type: CheckType::Deterministic,
+                            result: CheckResult::Pass,
+                            severity: 2,
+                            metadata: Some(serde_json::json!({
+                                "tool": tool,
+                                "artifact": "handoff_file",
+                                "reason": "local_handoff_file_nudged",
+                            })),
+                            ..Default::default()
+                        });
+                        if let HookDecision::AllowWithContext(msg) = decision {
+                            context_note.get_or_insert(msg);
+                        }
+                        continue;
+                    }
                 }
             }
-            emit(decision)?;
-            return Ok(());
+
+            let content = written_content_for(&tool_lower, &tool_input, raw_file_path);
+            match super::durable_paths::classify(raw_file_path, content.as_deref()) {
+                Some(DurableWrite::ClaudeAutoMemory {
+                    memory_type,
+                    is_index,
+                }) => {
+                    if local_memory_writes_allowed() {
+                        continue;
+                    }
+                    emit_compliance(ComplianceEvent {
+                        rule_key: compliance::RULE_DOC_PERSISTENCE,
+                        rule_class: RuleClass::Hard,
+                        check_type: CheckType::Deterministic,
+                        result: CheckResult::Fail,
+                        severity: 4,
+                        metadata: Some(serde_json::json!({
+                            "tool": tool,
+                            "kind": "claude_auto_memory",
+                            "reason": "local_memory_write_blocked",
+                        })),
+                        ..Default::default()
+                    });
+                    emit(HookDecision::BlockWithMessage(
+                        auto_memory_redirect_message(&editor, memory_type.as_deref(), is_index),
+                    ))?;
+                    return Ok(());
+                }
+                // Plan mode must write this file; the approved plan is saved
+                // to ContextStream by PostToolUse(ExitPlanMode).
+                Some(DurableWrite::ClaudeHarnessPlan) => continue,
+                Some(DurableWrite::RepoDoc { doc_type }) => {
+                    let absolute = if Path::new(raw_file_path).is_absolute() {
+                        Path::new(raw_file_path).to_path_buf()
+                    } else {
+                        Path::new(&cwd).join(raw_file_path)
+                    };
+                    if super::durable_capture::doc_mirror_available(&absolute).await {
+                        emit_compliance(ComplianceEvent {
+                            rule_key: compliance::RULE_DOC_PERSISTENCE,
+                            rule_class: RuleClass::Soft,
+                            check_type: CheckType::Deterministic,
+                            result: CheckResult::Pass,
+                            severity: 1,
+                            metadata: Some(serde_json::json!({
+                                "tool": tool,
+                                "kind": doc_type,
+                                "reason": "repo_doc_mirrored",
+                            })),
+                            ..Default::default()
+                        });
+                        context_note.get_or_insert_with(|| repo_doc_mirror_note(doc_type));
+                    } else {
+                        unhandled_path.get_or_insert(raw_file_path);
+                    }
+                }
+                None => {
+                    unhandled_path.get_or_insert(raw_file_path);
+                }
+            }
         }
 
-        let file_path = raw_file_path.to_lowercase();
+        if let Some(note) = context_note {
+            emit(HookDecision::AllowWithContext(note))?;
+            return Ok(());
+        }
+        if unhandled_path.is_none() && !target_paths.is_empty() {
+            emit(HookDecision::Allow)?;
+            return Ok(());
+        }
+        // With no recognizable target the generic checks below still run.
+        if let Some(raw_file_path) = unhandled_path {
+            let file_path = raw_file_path.to_lowercase();
 
-        // Plan file writes (e.g. .windsurf/plans/, plan*.md)
-        if file_path.contains(".windsurf/plans")
-            || file_path.contains(".cursor/plans")
-            || (file_path.ends_with(".md") && file_path.contains("plan"))
-        {
-            let msg = format!(
-                "Instead of writing a plan to a local file, save it to ContextStream where it \
+            // Plan file writes (e.g. .windsurf/plans/, plan*.md)
+            if file_path.contains(".windsurf/plans")
+                || file_path.contains(".cursor/plans")
+                || (file_path.ends_with(".md") && file_path.contains("plan"))
+            {
+                let msg = format!(
+                    "Instead of writing a plan to a local file, save it to ContextStream where it \
                  persists across sessions: {}. \
                  Then create tasks with {}.",
-                plan_capture_call(&editor),
-                plan_task_create_call(&editor)
-            );
-            emit(HookDecision::AllowWithContext(msg))?;
-            return Ok(());
-        }
+                    plan_capture_call(&editor),
+                    plan_task_create_call(&editor)
+                );
+                emit(HookDecision::AllowWithContext(msg))?;
+                return Ok(());
+            }
 
-        // Doc/spec/notes file writes
-        if file_path.contains("docs/")
-            || file_path.contains("notes/")
-            || file_path.contains("specs/")
-            || file_path.ends_with(".spec.md")
-            || (file_path.ends_with(".md")
-                && (file_path.contains("implementation")
-                    || file_path.contains("design")
-                    || file_path.contains("architecture")
-                    || file_path.contains("spec")))
-        {
-            let memory_tool = session_tool_name(&editor).replace("session", "memory");
-            let msg = format!(
+            // Doc/spec/notes file writes
+            if file_path.contains("docs/")
+                || file_path.contains("notes/")
+                || file_path.contains("specs/")
+                || file_path.ends_with(".spec.md")
+                || (file_path.ends_with(".md")
+                    && (file_path.contains("implementation")
+                        || file_path.contains("design")
+                        || file_path.contains("architecture")
+                        || file_path.contains("spec")))
+            {
+                let memory_tool = session_tool_name(&editor).replace("session", "memory");
+                let msg = format!(
                 "Consider saving this document to ContextStream where it persists across sessions \
                  and is searchable: {}(action=\"create_doc\", title=\"...\", content=\"...\", \
                  doc_type=\"spec|general\"). Only write to a local file if the user explicitly \
                  requested a specific file path.",
                 memory_tool
             );
-            emit_compliance(ComplianceEvent {
-                rule_key: compliance::RULE_DOC_PERSISTENCE,
-                rule_class: RuleClass::Soft,
-                check_type: CheckType::Deterministic,
-                result: CheckResult::Pass,
-                severity: 2,
-                metadata: Some(serde_json::json!({
-                    "tool": tool,
-                    "file_path": file_path,
-                })),
-                ..Default::default()
-            });
-            emit(HookDecision::AllowWithContext(msg))?;
-            return Ok(());
+                emit_compliance(ComplianceEvent {
+                    rule_key: compliance::RULE_DOC_PERSISTENCE,
+                    rule_class: RuleClass::Soft,
+                    check_type: CheckType::Deterministic,
+                    result: CheckResult::Pass,
+                    severity: 2,
+                    metadata: Some(serde_json::json!({
+                        "tool": tool,
+                        "file_path": file_path,
+                    })),
+                    ..Default::default()
+                });
+                emit(HookDecision::AllowWithContext(msg))?;
+                return Ok(());
+            }
         }
     }
 
@@ -2492,35 +3111,13 @@ pub async fn handle() -> Result<()> {
                 .trim();
 
             // Inside Explore: block ALL glob patterns, redirect to search
-            if in_explore {
-                let query = if is_generic_discovery_glob(pattern) || pattern.is_empty() {
-                    ""
-                } else {
-                    pattern
-                };
-                let (mode, _) = recommend_search_mode(query);
-                let call = search_call(&editor, mode, query);
+            if in_explore || is_discovery_glob(pattern) {
+                let call = glob_tool_suggestion(pattern).call(&editor);
                 search_first_redirect_decision(
                     status,
                     format!(
-                        "This project index is usable. Use {} instead of Glob for faster, richer code results.",
-                        call
-                    ),
-                    stale_index_local_fallback_message(&editor, &call, &tool),
-                )
-            } else if is_discovery_glob(pattern) {
-                let query = if is_generic_discovery_glob(pattern) {
-                    ""
-                } else {
-                    pattern
-                };
-                let (mode, reason) = recommend_search_mode(query);
-                let call = search_call(&editor, mode, query);
-                search_first_redirect_decision(
-                    status,
-                    format!(
-                        "Project index is usable. Use {} instead of broad glob \"{}\". {}",
-                        call, pattern, reason
+                        "Project index is usable. Use {} instead of Glob \"{}\": mode=\"pattern\" takes the same glob and lists matching files from the index.",
+                        call, pattern
                     ),
                     stale_index_local_fallback_message(&editor, &call, &tool),
                 )
@@ -2551,13 +3148,14 @@ pub async fn handle() -> Result<()> {
             if !path.is_empty() && !is_discovery_path(path) {
                 HookDecision::Allow
             } else if !pattern.is_empty() {
-                let (mode, reason) = recommend_search_mode(pattern);
-                let call = search_call(&editor, mode, pattern);
+                let suggestion = grep_tool_suggestion(&tool_input);
+                let call = suggestion.call(&editor);
                 search_first_redirect_decision(
                     status,
                     format!(
                         "Project index is usable. Use {} instead of broad Grep on the repo. {}",
-                        call, reason
+                        call,
+                        suggestion_reason(&suggestion)
                     ),
                     stale_index_local_fallback_message(&editor, &call, &tool),
                 )
@@ -2580,13 +3178,20 @@ pub async fn handle() -> Result<()> {
             //   `-path`, `-regex`) passes (e.g. `find -newer`).
             let command = first_str(&tool_input, &["command"]).unwrap_or("").trim();
             if let Some((tool_name, query_hint)) = detect_bash_code_search(command) {
-                let (mode, _) = recommend_search_mode(&query_hint);
-                let call = search_call(&editor, mode, &query_hint);
+                let mut suggestion = shell_search_suggestion(tool_name, command);
+                if suggestion.query.is_empty() && !query_hint.is_empty() {
+                    let (mode, _) = recommend_search_mode(&query_hint);
+                    suggestion.mode = mode;
+                    suggestion.query = query_hint.clone();
+                }
+                let call = suggestion.call(&editor);
                 search_first_redirect_decision(
                     status,
                     format!(
-                        "Use {} instead of shell `{}` for code discovery — the project index already has the answer, ranked. Local shell search is still available for non-code uses (process lists, log filtering, etc.).",
-                        call, tool_name
+                        "Use {} instead of shell `{}` for code discovery — the project index already has the answer, ranked. {} Local shell search is still available for non-code uses (process lists, log filtering, etc.).",
+                        call,
+                        tool_name,
+                        suggestion_reason(&suggestion)
                     ),
                     stale_index_local_fallback_message(&editor, &call, &tool),
                 )
@@ -2670,9 +3275,9 @@ pub async fn handle() -> Result<()> {
                     // Allow Explore agents — SubagentStart hook will inject
                     // ContextStream search context into the subagent.
                     // Blocking prevents SubagentStart from ever firing.
-                    let call = search_call(&editor, SearchMode::Hybrid, "");
+                    let call = explore_suggestion(&tool_input).call(&editor);
                     HookDecision::AllowWithContext(format!(
-                        "Prefer {} instead of launching Explore for broad code discovery. \
+                        "Prefer {} instead of launching Explore for broad code discovery: guided search returns ranked evidence and where to look in one call. \
                          If Explore is still used, keep it narrow and avoid file-by-file scans; \
                          the SubagentStart hook will enforce search-first guidance.",
                         call
@@ -4030,5 +4635,169 @@ mod tests {
         let allow_ctx = cursor_pre_tool_output(&HookDecision::AllowWithContext("fyi".into()));
         assert_eq!(allow_ctx["permission"], "allow");
         assert!(allow_ctx.get("agent_message").is_none());
+    }
+    #[test]
+    fn grep_tool_translates_mode_output_context_and_file_types() {
+        let regex = grep_tool_suggestion(&serde_json::json!({
+            "pattern": "fn\\s+handle", "glob": "*.rs", "output_mode": "content", "-C": 3
+        }));
+        assert_eq!(regex.mode, SearchMode::Pattern);
+        assert_eq!(regex.output_format, None);
+        assert_eq!(regex.context_lines, Some(3));
+        assert_eq!(regex.file_types, vec!["rs".to_string()]);
+        let call = regex.call(&EditorFormat::Claude);
+        assert!(
+            call.starts_with("mcp__contextstream__search(mode=\"pattern\""),
+            "{call}"
+        );
+        assert!(
+            call.contains("context_lines=3") && call.contains("file_types=[\"rs\"]"),
+            "{call}"
+        );
+
+        // Grep lists matching files by default.
+        let literal = grep_tool_suggestion(&serde_json::json!({"pattern": "TODO later"}));
+        assert_eq!(literal.mode, SearchMode::Exhaustive);
+        assert_eq!(literal.output_format, Some("paths"));
+
+        let symbol = grep_tool_suggestion(&serde_json::json!({
+            "pattern": "handle_oauth", "output_mode": "count", "type": "rust"
+        }));
+        assert_eq!(symbol.mode, SearchMode::Refactor);
+        assert_eq!(symbol.output_format, Some("count"));
+        assert_eq!(symbol.file_types, vec!["rs".to_string()]);
+    }
+
+    #[test]
+    fn shell_searches_translate_their_flags() {
+        // (tool, command, mode, query, output_format, context_lines, file_types)
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            SearchMode,
+            &'a str,
+            Option<&'a str>,
+            Option<u64>,
+            &'a [&'a str],
+        );
+        let cases: &[Case] = &[
+            (
+                "rg",
+                "rg -n foo .",
+                SearchMode::Exhaustive,
+                "foo",
+                None,
+                None,
+                &[],
+            ),
+            (
+                "rg",
+                "rg -l 'fn\\s+main' -t rust crates/",
+                SearchMode::Pattern,
+                "fn\\s+main",
+                Some("paths"),
+                None,
+                &["rs"],
+            ),
+            (
+                "grep",
+                "grep -rnF 'x.*y' src/",
+                SearchMode::Exhaustive,
+                "x.*y",
+                None,
+                None,
+                &[],
+            ),
+            (
+                "grep",
+                "grep -rc TODO --include='*.ts' .",
+                SearchMode::Refactor,
+                "TODO",
+                Some("count"),
+                None,
+                &["ts"],
+            ),
+            (
+                "rg",
+                "rg -C3 -g '*.{ts,tsx}' useAuth",
+                SearchMode::Refactor,
+                "useAuth",
+                None,
+                Some(3),
+                &["ts", "tsx"],
+            ),
+            (
+                "rg",
+                "cd crates && rg --type=rust -e 'impl\\s+Tool' --context=2",
+                SearchMode::Pattern,
+                "impl\\s+Tool",
+                None,
+                Some(2),
+                &["rs"],
+            ),
+            (
+                "find",
+                "find . -name '*.rs' -type f",
+                SearchMode::Pattern,
+                "*.rs",
+                Some("paths"),
+                None,
+                &["rs"],
+            ),
+            (
+                "fd",
+                "fd -e py config",
+                SearchMode::Pattern,
+                "config",
+                Some("paths"),
+                None,
+                &["py"],
+            ),
+        ];
+        for (tool, command, mode, query, output, context, types) in cases {
+            let suggestion = shell_search_suggestion(tool, command);
+            assert_eq!(suggestion.mode, *mode, "{command}");
+            assert_eq!(suggestion.query, *query, "{command}");
+            assert_eq!(suggestion.output_format, *output, "{command}");
+            assert_eq!(suggestion.context_lines, *context, "{command}");
+            let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+            assert_eq!(suggestion.file_types, types, "{command}");
+        }
+    }
+
+    #[test]
+    fn glob_and_explore_translate_to_file_and_guided_search() {
+        let glob = glob_tool_suggestion("crates/**/*.rs");
+        assert_eq!(glob.mode, SearchMode::Pattern);
+        assert_eq!(glob.output_format, Some("paths"));
+        assert_eq!(glob.file_types, vec!["rs".to_string()]);
+        assert!(glob_tool_suggestion("**/*")
+            .call(&EditorFormat::Claude)
+            .contains("mode=\"auto\""));
+
+        let explore = explore_suggestion(&serde_json::json!({
+            "subagent_type": "Explore",
+            "description": "Find hook installers",
+            "prompt": "Find where Claude hooks are installed\nand how matchers are built."
+        }));
+        assert_eq!(explore.mode, SearchMode::Guided);
+        assert_eq!(explore.query, "Find hook installers");
+        assert_eq!(
+            explore.intent.as_deref(),
+            Some("Find where Claude hooks are installed and how matchers are built.")
+        );
+        assert!(explore
+            .call(&EditorFormat::Claude)
+            .contains("mode=\"guided\""));
+    }
+
+    #[test]
+    fn shell_words_honor_quotes() {
+        assert_eq!(
+            shell_words("rg -g '*.rs' \"a b\" c"),
+            vec!["rg", "-g", "*.rs", "a b", "c"]
+        );
+        assert_eq!(file_types_from_glob("**/*.{ts,tsx}"), vec!["ts", "tsx"]);
+        assert!(file_types_from_glob("src/**").is_empty());
     }
 }

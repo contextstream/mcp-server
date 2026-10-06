@@ -729,6 +729,91 @@ fn install_claude_code_hooks(api_key: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Claude Code's `autoMemoryEnabled` user setting. Auto memory is on unless
+/// the setting is `false`; while it is on, Claude Code's own system prompt
+/// tells the model to save "remember" requests and preferences as local
+/// `~/.claude/projects/<project>/memory/*.md` files that ContextStream never
+/// sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeAutoMemory {
+    /// `autoMemoryEnabled: false`.
+    Off,
+    /// `autoMemoryEnabled: true`.
+    On,
+    /// Not set, which Claude Code treats as on.
+    DefaultOn,
+}
+
+impl ClaudeAutoMemory {
+    pub fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+fn claude_auto_memory_in(settings: &Value) -> ClaudeAutoMemory {
+    match settings.get("autoMemoryEnabled").and_then(Value::as_bool) {
+        Some(false) => ClaudeAutoMemory::Off,
+        Some(true) => ClaudeAutoMemory::On,
+        None => ClaudeAutoMemory::DefaultOn,
+    }
+}
+
+/// Read the user-level auto memory setting. `None` when the settings file
+/// exists but cannot be parsed.
+pub fn claude_auto_memory_setting() -> Option<ClaudeAutoMemory> {
+    let path = claude_code_settings_path()?;
+    let loaded = safe_edit::read_for_edit(&path, safe_edit::JsonDialect::Strict).ok()?;
+    Some(claude_auto_memory_in(&loaded.value))
+}
+
+/// Set `autoMemoryEnabled: false` in the user's Claude settings, rewriting
+/// only that key. Returns `true` when the file changed.
+pub fn disable_claude_auto_memory() -> Result<bool> {
+    let settings_path = claude_code_settings_path()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine Claude Code settings path"))?;
+    let loaded = safe_edit::read_for_edit(&settings_path, safe_edit::JsonDialect::Strict)?;
+    warn_on_nonstandard_syntax(&loaded, &settings_path);
+    if claude_auto_memory_in(&loaded.value) == ClaudeAutoMemory::Off {
+        return Ok(false);
+    }
+    let mut updated = loaded.value.clone();
+    updated["autoMemoryEnabled"] = Value::Bool(false);
+    safe_edit::commit(&settings_path, &loaded, &updated)
+}
+
+/// Local auto memory files under `<claude config>/projects/*/memory/`, not
+/// counting the `MEMORY.md` indexes: `(files, projects)`.
+pub fn count_claude_auto_memory_files() -> (usize, usize) {
+    let Some(projects) =
+        claude_code_settings_path().and_then(|path| path.parent().map(|dir| dir.join("projects")))
+    else {
+        return (0, 0);
+    };
+    let Ok(entries) = std::fs::read_dir(projects) else {
+        return (0, 0);
+    };
+    let mut files = 0;
+    let mut with_memory = 0;
+    for entry in entries.flatten() {
+        let Ok(memory) = std::fs::read_dir(entry.path().join("memory")) else {
+            continue;
+        };
+        let count = memory
+            .flatten()
+            .filter(|file| {
+                let name = file.file_name();
+                let name = name.to_string_lossy();
+                name.ends_with(".md") && !name.eq_ignore_ascii_case("MEMORY.md")
+            })
+            .count();
+        if count > 0 {
+            files += count;
+            with_memory += 1;
+        }
+    }
+    (files, with_memory)
+}
+
 /// Note a settings file whose syntax the host tool may not accept.
 fn warn_on_nonstandard_syntax(loaded: &safe_edit::LoadedConfig, path: &Path) {
     if loaded.nonstandard_syntax {
@@ -1121,8 +1206,9 @@ const CLAUDE_HOOK_SPECS: &[ClaudeHookSpec] = &[
         event: ClaudeHookEvent::PostToolUse,
         // Observe successful quick-start context and session ground calls as
         // well as init so hosted transports can persist local session state.
+        // ExitPlanMode saves the approved plan-mode plan to ContextStream.
         matcher: Some(
-            "Edit|Write|NotebookEdit|mcp__contextstream__init|mcp__contextstream__context|mcp__contextstream__session|mcp__contextstream__project",
+            "Edit|Write|NotebookEdit|ExitPlanMode|mcp__contextstream__init|mcp__contextstream__context|mcp__contextstream__session|mcp__contextstream__project",
         ),
         hook_name: "post-tool-use",
         timeout: 10,
@@ -1148,16 +1234,13 @@ const CLAUDE_HOOK_SPECS: &[ClaudeHookSpec] = &[
         hook_name: "instructions-loaded",
         timeout: 10,
     },
+    // `user-prompt-submit` also carries the save/handoff routing guidance, so
+    // the separate `on-save-intent` entry is no longer installed (it injected
+    // the same guidance a second time). `update-hooks` strips old entries.
     ClaudeHookSpec {
         event: ClaudeHookEvent::UserPromptSubmit,
         matcher: None,
         hook_name: "user-prompt-submit",
-        timeout: 5,
-    },
-    ClaudeHookSpec {
-        event: ClaudeHookEvent::UserPromptSubmit,
-        matcher: None,
-        hook_name: "on-save-intent",
         timeout: 5,
     },
     ClaudeHookSpec {
@@ -3247,7 +3330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_user_prompt_submit_includes_save_intent_hook() {
+    fn test_user_prompt_submit_installs_one_prompt_hook() {
         let hooks = generate_contextstream_hooks(None);
         let commands: Vec<&str> = hooks
             .user_prompt_submit
@@ -3255,10 +3338,31 @@ mod tests {
             .flat_map(|entry| entry.hooks.iter().map(|hook| hook.command.as_str()))
             .collect();
 
-        assert!(commands
+        // `user-prompt-submit` carries the save routing; a second
+        // `on-save-intent` entry injected the same guidance twice.
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(commands[0].contains("user-prompt-submit"));
+    }
+
+    #[test]
+    fn test_post_tool_use_observes_exit_plan_mode_and_file_writes() {
+        let hooks = generate_contextstream_hooks(None);
+        let matchers: Vec<&str> = hooks
+            .post_tool_use
             .iter()
-            .any(|cmd| cmd.contains("user-prompt-submit")));
-        assert!(commands.iter().any(|cmd| cmd.contains("on-save-intent")));
+            .filter(|entry| {
+                entry
+                    .hooks
+                    .iter()
+                    .any(|hook| hook.command.contains("hook post-tool-use"))
+            })
+            .filter_map(|entry| entry.matcher.as_deref())
+            .collect();
+        assert_eq!(matchers.len(), 1, "{matchers:?}");
+        let tools: Vec<&str> = matchers[0].split('|').collect();
+        for tool in ["Edit", "Write", "ExitPlanMode", "mcp__contextstream__init"] {
+            assert!(tools.contains(&tool), "{tool} missing from {}", matchers[0]);
+        }
     }
 
     #[test]
@@ -3711,6 +3815,52 @@ mod tests {
 
         assert!(error.to_string().contains("not valid JSON"), "{error:#}");
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), live_raw);
+    }
+
+    #[test]
+    fn claude_auto_memory_is_read_disabled_surgically_and_counted() {
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+
+        let claude = temp.path().join(".claude");
+        std::fs::create_dir_all(claude.join("projects/-a/memory")).unwrap();
+        std::fs::create_dir_all(claude.join("projects/-b/memory")).unwrap();
+        std::fs::create_dir_all(claude.join("projects/-c")).unwrap();
+        for file in [
+            "-a/memory/MEMORY.md",
+            "-a/memory/one.md",
+            "-a/memory/two.md",
+            "-b/memory/three.md",
+        ] {
+            std::fs::write(claude.join("projects").join(file), "x").unwrap();
+        }
+        assert_eq!(count_claude_auto_memory_files(), (3, 2));
+
+        // Missing settings: Claude Code's default is on.
+        assert_eq!(
+            claude_auto_memory_setting(),
+            Some(ClaudeAutoMemory::DefaultOn)
+        );
+
+        let settings = claude.join("settings.json");
+        let original = "{\n  \"model\": \"opus\",\n  \"autoMemoryEnabled\": true\n}\n";
+        std::fs::write(&settings, original).unwrap();
+        assert_eq!(claude_auto_memory_setting(), Some(ClaudeAutoMemory::On));
+        assert!(disable_claude_auto_memory().expect("disable"));
+        let written = std::fs::read_to_string(&settings).unwrap();
+        assert!(written.contains("\"model\": \"opus\""), "{written}");
+        assert_eq!(claude_auto_memory_setting(), Some(ClaudeAutoMemory::Off));
+        assert!(!disable_claude_auto_memory().expect("idempotent"));
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 
     #[test]

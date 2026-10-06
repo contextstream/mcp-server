@@ -20,6 +20,7 @@ floor and rerun if a Codex update changes the transcript format.
 """
 import argparse
 import json
+import re
 import sys
 import time
 from collections import Counter
@@ -169,6 +170,10 @@ def claude_calls(path):
                     yield "shell_search", tool
 
 
+# Codex code mode calls tools from inside an `exec` cell: tools.mcp__<server>__<tool>(...).
+EXEC_TOOL_CALL = re.compile(r"tools\.mcp__([A-Za-z0-9_]*?)__([A-Za-z0-9_]+)\s*\(")
+
+
 def codex_calls(path):
     """Yield (kind, detail) for each tool call in a Codex rollout."""
     for record in records(path):
@@ -180,6 +185,11 @@ def codex_calls(path):
         tool = _contextstream_tool(name)
         if tool:
             yield "contextstream", tool
+            continue
+        if name == "exec" and isinstance(arguments, str):
+            for server, exec_tool in EXEC_TOOL_CALL.findall(arguments):
+                if "contextstream" in server.lower():
+                    yield "contextstream", exec_tool.lower()
             continue
         command = _command_text(arguments)
         search = shell_code_search(command)

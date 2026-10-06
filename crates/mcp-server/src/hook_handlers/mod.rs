@@ -7,6 +7,8 @@ pub mod client_model_extractor;
 pub mod common;
 pub mod compliance;
 pub mod dirty_drain;
+pub(crate) mod durable_capture;
+pub(crate) mod durable_paths;
 pub mod git_bash_observed;
 pub mod git_common;
 pub mod git_post_checkout;

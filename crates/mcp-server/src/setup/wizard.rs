@@ -138,6 +138,9 @@ struct Choices {
     project: ProjectPlan,
     index: IndexPlan,
     learning_choice: Option<bool>,
+    /// `Some(true)` turns Claude Code auto memory off after saving; `None`
+    /// when Claude Code is not being set up or auto memory is already off.
+    claude_auto_memory_off: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,11 +150,15 @@ enum ReviewAction {
     Project,
     Indexing,
     AccountLearning,
+    ClaudeAutoMemory,
     Account,
     Exit,
 }
 
-fn review_actions(index: IndexPlan) -> Vec<(ReviewAction, &'static str)> {
+fn review_actions(
+    index: IndexPlan,
+    claude_auto_memory_off: Option<bool>,
+) -> Vec<(ReviewAction, &'static str)> {
     let mut actions = vec![
         (ReviewAction::Save, "Save and finish"),
         (ReviewAction::Editors, "Change editors"),
@@ -167,6 +174,14 @@ fn review_actions(index: IndexPlan) -> Vec<(ReviewAction, &'static str)> {
         ReviewAction::AccountLearning,
         "Change consent-page reminder",
     ));
+    match claude_auto_memory_off {
+        Some(true) => actions.push((ReviewAction::ClaudeAutoMemory, "Keep Claude auto memory on")),
+        Some(false) => actions.push((
+            ReviewAction::ClaudeAutoMemory,
+            "Turn Claude auto memory off",
+        )),
+        None => {}
+    }
     actions.push((ReviewAction::Account, "Sign in with a different account"));
     actions.push((ReviewAction::Exit, "Exit without saving"));
     actions
@@ -243,7 +258,9 @@ pub(super) async fn run(
             )?
             .then_some(true),
         },
+        claude_auto_memory_off: None,
     };
+    choices.claude_auto_memory_off = claude_auto_memory_default(&choices.editors);
 
     loop {
         print_step(
@@ -252,7 +269,7 @@ pub(super) async fn run(
             "Nothing is saved until you choose Save. Change anything first.",
         );
         print_review(&choices);
-        let actions: Vec<_> = review_actions(choices.index)
+        let actions: Vec<_> = review_actions(choices.index, choices.claude_auto_memory_off)
             .into_iter()
             .filter(|(action, _)| {
                 explicit_learning_choice.is_none() || *action != ReviewAction::AccountLearning
@@ -266,6 +283,7 @@ pub(super) async fn run(
                 choices.editors =
                     prompts::select_editors_with_defaults(&detected, &choices.editors)?;
                 choices.transport = super::prompt_setup_transport_preference(&choices.editors)?;
+                choices.claude_auto_memory_off = claude_auto_memory_default(&choices.editors);
             }
             ReviewAction::Project => {
                 choices.workspace =
@@ -291,6 +309,9 @@ pub(super) async fn run(
                     false,
                 )?
                 .then_some(true);
+            }
+            ReviewAction::ClaudeAutoMemory => {
+                choices.claude_auto_memory_off = choices.claude_auto_memory_off.map(|off| !off);
             }
             ReviewAction::Account => {
                 let (api_key, email) = sign_in(None).await?;
@@ -649,6 +670,20 @@ async fn pick_project(
     })
 }
 
+/// Default for the Claude auto memory choice: off whenever Claude Code is
+/// being set up and auto memory is on (its system prompt otherwise saves
+/// memories and preferences to local files), unless setup was told to keep
+/// it. `None` when the choice does not apply. Review can change it.
+fn claude_auto_memory_default(editors: &[editors::Editor]) -> Option<bool> {
+    if !editors.contains(&editors::Editor::ClaudeCode) {
+        return None;
+    }
+    if !super::hooks::claude_auto_memory_setting().is_some_and(|setting| setting.is_on()) {
+        return None;
+    }
+    Some(!super::keep_claude_auto_memory())
+}
+
 fn print_review(choices: &Choices) {
     let ui = ui();
     let mut account = choices.email.clone();
@@ -687,6 +722,16 @@ fn print_review(choices: &Choices) {
             None => "No change (default)",
         },
     ));
+    if let Some(off) = choices.claude_auto_memory_off {
+        rows.push(ui.row(
+            "Claude auto memory",
+            if off {
+                "Off (default) · memories and preferences go to ContextStream"
+            } else {
+                "Keep on · Claude saves memories to local files"
+            },
+        ));
+    }
     if matches!(choices.transport, SetupTransportPreference::LocalBinary) {
         rows.push(ui.row("Connection", &ui.warning("Local binary · recovery mode")));
     }
@@ -708,6 +753,7 @@ async fn finish(choices: Choices) -> Result<()> {
         project,
         index,
         learning_choice: _,
+        claude_auto_memory_off,
     } = choices;
 
     super::persist_setup_editor_selection(&editors)?;
@@ -745,6 +791,21 @@ async fn finish(choices: Choices) -> Result<()> {
                 tracing::warn!("{error:#}");
                 failed_editors.push(editor.display_name());
             }
+        }
+    }
+
+    if claude_auto_memory_off == Some(true) {
+        match super::hooks::disable_claude_auto_memory() {
+            Ok(_) => ui::say(
+                Mark::Ok,
+                "Claude auto memory off",
+                Some("memories and preferences go to ContextStream"),
+            ),
+            Err(error) => ui::say(
+                Mark::Warn,
+                "Claude auto memory is still on",
+                Some(&error.to_string()),
+            ),
         }
     }
 
@@ -1012,8 +1073,22 @@ mod tests {
     }
 
     #[test]
+    fn review_offers_the_claude_auto_memory_toggle_only_when_it_applies() {
+        let label = |off| {
+            review_actions(IndexPlan::Background, off)
+                .into_iter()
+                .find(|(action, _)| *action == ReviewAction::ClaudeAutoMemory)
+                .map(|(_, label)| label)
+        };
+        assert_eq!(label(Some(true)), Some("Keep Claude auto memory on"));
+        assert_eq!(label(Some(false)), Some("Turn Claude auto memory off"));
+        assert_eq!(label(None), None);
+        assert!(claude_auto_memory_default(&[editors::Editor::Cursor]).is_none());
+    }
+
+    #[test]
     fn review_offers_indexing_changes_only_when_there_is_something_to_index() {
-        let with_index: Vec<_> = review_actions(IndexPlan::Background)
+        let with_index: Vec<_> = review_actions(IndexPlan::Background, None)
             .into_iter()
             .map(|(action, _)| action)
             .collect();
@@ -1021,7 +1096,7 @@ mod tests {
         assert!(with_index.contains(&ReviewAction::Indexing));
         assert_eq!(with_index.last(), Some(&ReviewAction::Exit));
 
-        let empty: Vec<_> = review_actions(IndexPlan::NothingYet)
+        let empty: Vec<_> = review_actions(IndexPlan::NothingYet, None)
             .into_iter()
             .map(|(action, _)| action)
             .collect();
@@ -1101,6 +1176,7 @@ mod tests {
             },
             index: IndexPlan::Background,
             learning_choice: None,
+            claude_auto_memory_off: None,
         };
         print_review(&choices);
 
@@ -1110,7 +1186,10 @@ mod tests {
             .format_select_prompt(&mut prompt, "Ready to set up ContextStream?")
             .unwrap();
         println!("{prompt}");
-        for (index, (_, label)) in review_actions(IndexPlan::Background).iter().enumerate() {
+        for (index, (_, label)) in review_actions(IndexPlan::Background, None)
+            .iter()
+            .enumerate()
+        {
             let mut item = String::new();
             theme
                 .format_select_prompt_item(&mut item, label, index == 0)

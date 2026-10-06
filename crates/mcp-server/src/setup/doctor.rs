@@ -1175,9 +1175,45 @@ fn check_editor_surfaces(
         }
 
         checks.push(check_hooks(editor));
+        if matches!(editor, Editor::ClaudeCode) {
+            checks.push(check_claude_auto_memory());
+        }
     }
 
     checks
+}
+
+/// Claude Code auto memory competes with ContextStream: while it is on, the
+/// host's system prompt routes "remember" and preferences to local files.
+fn check_claude_auto_memory() -> SurfaceCheck {
+    const SURFACE: &str = "claude_auto_memory";
+    const FIX: &str = "contextstream-mcp doctor --repair --scope global --editors claude";
+    let (files, projects) = super::hooks::count_claude_auto_memory_files();
+    let local_files = if files == 0 {
+        String::new()
+    } else {
+        format!(
+            " {files} local memory file(s) in {projects} project(s) may not be in ContextStream; copy them with `contextstream-mcp import-local-memory`."
+        )
+    };
+    match super::hooks::claude_auto_memory_setting() {
+        Some(super::hooks::ClaudeAutoMemory::Off) => SurfaceCheck::pass(
+            SURFACE,
+            format!(
+                "auto memory is off; memories and preferences are saved to ContextStream.{local_files}"
+            ),
+            None,
+        ),
+        Some(_) => SurfaceCheck::warning(
+            SURFACE,
+            format!(
+                "Claude Code auto memory is on: its system prompt saves \"remember\" requests and preferences to ~/.claude/projects/*/memory instead of ContextStream.{local_files}"
+            ),
+            None,
+            Some(FIX),
+        ),
+        None => SurfaceCheck::skipped(SURFACE, "Claude settings could not be read"),
+    }
 }
 
 /// Compatibility wrapper used by the compact post-setup summary.
@@ -2282,6 +2318,14 @@ async fn run_repairs(options: &DoctorOptions, targets: &[Editor]) -> DoctorRepai
         operations.push("hooks");
         if let Err(error) = super::update_hooks_scoped("global", Some(targets), true).await {
             failures.push(format!("hooks: {error}"));
+        }
+        // An explicit global repair for Claude Code also turns off its auto
+        // memory, which otherwise routes memories away from ContextStream.
+        if targets.contains(&Editor::ClaudeCode) {
+            operations.push("claude_auto_memory");
+            if let Err(error) = super::hooks::disable_claude_auto_memory() {
+                failures.push(format!("claude_auto_memory: {error}"));
+            }
         }
     }
     let changes = if options.dry_run {

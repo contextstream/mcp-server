@@ -239,6 +239,7 @@ pub async fn run_setup_with_profile(
         .await
         .with_context(|| format!("configuring {}", editor.display_name()))?;
     }
+    super::apply_claude_auto_memory_default(&editors_to_configure);
     if !editors_to_configure.is_empty() {
         // Heal deleted local-binary paths so a re-run leaves a working machine.
         mcp_config::repair_deleted_binary_path_configs(&editors_to_configure, None)

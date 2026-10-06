@@ -62,6 +62,14 @@ fn write_editor_output(editor: EditorFormat, guidance: Option<String>) -> Result
     Ok(())
 }
 
+/// Whether `user-prompt-submit` emits its per-prompt context (and with it the
+/// save guidance). Mirrors the switch in `user_prompt_submit::handle`.
+fn prompt_reminder_enabled() -> bool {
+    !std::env::var("CONTEXTSTREAM_REMINDER_ENABLED")
+        .map(|value| value == "false")
+        .unwrap_or(false)
+}
+
 /// Handle the on-save-intent hook.
 pub async fn handle() -> Result<()> {
     // Check env var BEFORE reading stdin to avoid blocking in tests or when disabled.
@@ -76,6 +84,13 @@ pub async fn handle() -> Result<()> {
     let input: Value =
         serde_json::from_reader(std::io::stdin().lock()).unwrap_or_else(|_| serde_json::json!({}));
     let editor = detect_editor(&input);
+
+    // Claude Code and Codex run `user-prompt-submit` for the same event, and it
+    // already appends this guidance. Older installs register both hooks, which
+    // injected the guidance twice; stay silent unless reminders are disabled.
+    if matches!(editor, EditorFormat::Claude) && prompt_reminder_enabled() {
+        return Ok(());
+    }
 
     // Only produce output when save intent detected — matches TypeScript behavior.
     // Writing nothing when no intent avoids unnecessary hook noise for Claude.

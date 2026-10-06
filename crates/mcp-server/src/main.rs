@@ -147,6 +147,12 @@ enum Commands {
         #[arg(long, value_name = "UUID", requires = "yes")]
         workspace_id: Option<String>,
 
+        /// Leave Claude Code auto memory on. By default setup turns it off so
+        /// memories and preferences are saved to ContextStream instead of
+        /// local ~/.claude/projects/*/memory files.
+        #[arg(long)]
+        keep_claude_auto_memory: bool,
+
         /// Show every file that would change, without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -526,6 +532,16 @@ enum Commands {
         format: String,
     },
 
+    /// Import Claude Code auto memory files into ContextStream (one time)
+    #[command(
+        long_about = "Copy each Claude Code auto memory file (~/.claude/projects/*/memory/*.md) into a ContextStream memory node: feedback and user memories become preferences, lessons become lessons, project and reference memories become facts. Each file's project is matched to the workspace/project its folder is linked to. Files already imported are skipped, and the local files are left in place.\n\nTurn auto memory off with `contextstream-mcp doctor --repair --scope global --editors claude` so new memories go to ContextStream."
+    )]
+    ImportLocalMemory {
+        /// List what would be imported without sending anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// List every coding client setup can configure (non-interactive)
     #[command(
         long_about = "Print the catalog of coding clients setup can configure: config and rules locations, config format, the hosted server entry each client expects, hook support, install detection, and status.\n\nPaths are platform-neutral (~ for HOME). Use --format markdown for a docs table."
@@ -899,8 +915,10 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             account_only,
             workspace_id,
             dry_run,
+            keep_claude_auto_memory,
         }) => {
             setup::safe_edit::set_dry_run(dry_run);
+            setup::set_keep_claude_auto_memory(keep_claude_auto_memory);
             if dry_run && profile.is_some() {
                 eprintln!(
                     "Setup failed: --dry-run cannot redeem a one-time --profile token because \
@@ -1273,6 +1291,13 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             if let Err(e) = run_update(check, force, remote).await {
                 eprintln!("Update failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        Some(Commands::ImportLocalMemory { dry_run }) => {
+            let (_, _, failed) = setup::local_memory_import::run(dry_run).await?;
+            if failed > 0 {
                 std::process::exit(1);
             }
         }

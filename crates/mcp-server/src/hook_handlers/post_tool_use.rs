@@ -1779,8 +1779,8 @@ mod tests {
 
     #[test]
     fn resolved_scope_is_read_from_every_result_shape() {
-        let ws = "dc5fcbaf-dca4-4cd9-b395-c9393294704f";
-        let pid = "2a4e8193-d93d-4dbb-990a-374f3ea54fc7";
+        let ws = "11111111-1111-4111-8111-111111111111";
+        let pid = "01234567-89ab-4cde-8fab-0123456789ab";
         let expected = Some((
             Uuid::parse_str(ws).unwrap(),
             Some(Uuid::parse_str(pid).unwrap()),

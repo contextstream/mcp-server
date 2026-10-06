@@ -6481,6 +6481,14 @@ async fn resume_request_body(
         .0
 }
 
+/// What a client that shows only the structured result (Claude Code) sees.
+fn result_structured(result: &mcp_types::tool::ToolResult) -> Value {
+    result
+        .structured_content
+        .clone()
+        .expect("the result carries structured content")
+}
+
 /// The JSON body the API receives from one resume call, and the text the
 /// caller gets back.
 async fn resume_call(
@@ -6490,6 +6498,20 @@ async fn resume_call(
     initialized: Option<&str>,
     transport: Option<&str>,
 ) -> (Value, String) {
+    let (body, result) =
+        resume_call_result(action, explicit, api_assigned, initialized, transport).await;
+    (body, result_text(&result))
+}
+
+/// The JSON body the API receives from one resume call, and the whole result
+/// the caller gets back, text and structured content.
+async fn resume_call_result(
+    action: &str,
+    explicit: Option<&str>,
+    api_assigned: Option<&str>,
+    initialized: Option<&str>,
+    transport: Option<&str>,
+) -> (Value, mcp_types::tool::ToolResult) {
     let (address, server) = spawn_resume_mock(None).await;
     let mut config = TestFixtures::test_config();
     config.api_url = format!("http://{address}");
@@ -6515,8 +6537,7 @@ async fn resume_call(
         None => call.await,
     };
     let result = result.expect("resume call");
-    let text = result_text(&result);
-    (server.await.expect("resume server"), text)
+    (server.await.expect("resume server"), result)
 }
 
 #[tokio::test]
@@ -6605,11 +6626,25 @@ async fn resume_after_a_real_init_never_offers_the_session_the_api_just_opened()
 #[tokio::test]
 async fn resume_says_so_when_it_could_not_leave_the_callers_own_session_out() {
     for action in ["resume_list", "resume"] {
-        let (_, text) = resume_call(action, None, None, None, None).await;
+        let (_, result) = resume_call_result(action, None, None, None, None).await;
+        let text = result_text(&result);
         assert!(
             text.contains("not left out")
                 && text.contains(&format!("session(action=\"{action}\", session_id=")),
             "{action}: no id known, so the caller is told how to pass one: {text}"
+        );
+        // A client that shows only the structured result must be told as well.
+        let structured = result_structured(&result);
+        assert_eq!(
+            structured["text"], text,
+            "{action}: the structured text is the text"
+        );
+        assert!(
+            structured["own_session_note"].as_str().is_some_and(|note| {
+                note.contains("not left out")
+                    && note.contains(&format!("session(action=\"{action}\", session_id="))
+            }),
+            "{action}: the structured result names the call to make: {structured}"
         );
         for (explicit, api_assigned, initialized, transport) in [
             (Some("mine"), None, None, None),
@@ -6617,11 +6652,18 @@ async fn resume_says_so_when_it_could_not_leave_the_callers_own_session_out() {
             (None, None, Some("own"), None),
             (None, None, None, Some("transport")),
         ] {
-            let (_, text) =
-                resume_call(action, explicit, api_assigned, initialized, transport).await;
+            let (_, result) =
+                resume_call_result(action, explicit, api_assigned, initialized, transport).await;
+            let text = result_text(&result);
             assert!(
                 !text.contains("not left out"),
                 "{action}: an id was known, so there is nothing to say: {text}"
+            );
+            let structured = result_structured(&result);
+            assert!(
+                structured.get("own_session_note").is_none()
+                    && !structured.to_string().contains("not left out"),
+                "{action}: nor in the structured result: {structured}"
             );
         }
     }
@@ -6656,13 +6698,24 @@ async fn on_a_stateless_gateway_the_agent_carries_the_session_id_from_init_to_re
         .await
         .expect("init");
         session.discard_transient_state(&init_key);
-        let init_text = result_text(&init);
-        let told = init_text
+        // Claude Code shows the structured result and never the text, so the
+        // hint has to be in the structured result, and the text says the same.
+        let init_structured = result_structured(&init);
+        let hint = init_structured["resume_hint"]
+            .as_str()
+            .expect("init's structured result carries the resume hint");
+        assert!(
+            result_text(&init).contains(hint),
+            "the text says what the structured result says"
+        );
+        let told = hint
             .split("session_id=\"")
             .nth(1)
             .and_then(|rest| rest.split('"').next())
-            .expect("init names the session id to pass to resume");
+            .expect("the hint names the session id to pass to resume")
+            .to_string();
         assert_eq!(told, "api-assigned-session");
+        assert_eq!(init_structured["session_id"], "api-assigned-session");
 
         let resume_key = SessionKey::for_anonymous_http("stateless-request:resume");
         let mut input = json!({"action": "resume", "workspace_id": workspace_id});
@@ -6687,9 +6740,16 @@ async fn on_a_stateless_gateway_the_agent_carries_the_session_id_from_init_to_re
         session.discard_transient_state(&resume_key);
         let body = server.await.expect("resume server");
 
+        let structured = result_structured(&resume);
+        let structured_text = structured["text"]
+            .as_str()
+            .expect("the structured result carries the resume text")
+            .to_string();
         if pass_the_id {
             assert_eq!(body["exclude_session_id"], "api-assigned-session");
             assert!(!result_text(&resume).contains("not left out"));
+            assert!(structured.get("own_session_note").is_none());
+            assert!(!structured_text.contains("not left out"));
         } else {
             assert!(
                 body.get("exclude_session_id").is_none_or(Value::is_null),
@@ -6699,6 +6759,72 @@ async fn on_a_stateless_gateway_the_agent_carries_the_session_id_from_init_to_re
                 result_text(&resume).contains("not left out"),
                 "without the id the caller is told how to pass it"
             );
+            assert!(
+                structured["own_session_note"]
+                    .as_str()
+                    .is_some_and(|note| note.contains("not left out")),
+                "a client that shows only the structured result is told too: {structured}"
+            );
+            assert_eq!(
+                structured_text,
+                result_text(&resume),
+                "the structured text is the text the caller would have read"
+            );
         }
     }
+}
+
+#[tokio::test]
+async fn init_without_an_api_session_id_offers_no_resume_hint() {
+    let workspace_id = Uuid::new_v4();
+    let (address, server) = spawn_resume_mock(Some(json!({"workspace_id": workspace_id}))).await;
+    let mut config = TestFixtures::test_config();
+    config.api_url = format!("http://{address}");
+    let client = ContextStreamClient::new(config.clone());
+    let session = Arc::new(SessionManager::new(client.clone(), config));
+
+    let init = InitTool::new(client.clone(), session.clone())
+        .execute(json!({"auto_update": false}))
+        .await
+        .expect("init");
+    assert!(result_structured(&init).get("resume_hint").is_none());
+    assert!(!result_text(&init).contains("Session id:"));
+
+    // The mock stops after one resume request.
+    SessionTool::new(client, session, mcp_types::atlas_layer::noop_layer())
+        .execute(json!({"action": "resume", "workspace_id": workspace_id}))
+        .await
+        .expect("resume call");
+    server.await.expect("resume server");
+}
+
+#[test]
+fn the_final_resume_text_goes_where_the_api_text_lives() {
+    // The API's own text sits in `data.text`: that field gets the final text.
+    let shaped = resume_structured(
+        json!({"data": {"text": "from the API", "sessions": 2}}),
+        "from the API\n\nnote",
+        Some("note"),
+    );
+    assert_eq!(shaped["data"]["text"], "from the API\n\nnote");
+    assert_eq!(shaped["data"]["sessions"], 2);
+    assert_eq!(shaped["own_session_note"], "note");
+    assert!(shaped.get("text").is_none());
+
+    // A flat response carries it at the top, with no note field when none applies.
+    let shaped = resume_structured(json!({"text": "from the API"}), "final", None);
+    assert_eq!(shaped["text"], "final");
+    assert!(shaped.get("own_session_note").is_none());
+
+    // No text at all, such as an API that found nothing to resume.
+    let shaped = resume_structured(json!({"data": {}}), "Nothing to resume.", None);
+    assert_eq!(shaped["data"]["text"], "Nothing to resume.");
+
+    // Responses that are not objects keep their data.
+    let shaped = resume_structured(json!(["a"]), "final", None);
+    assert_eq!(shaped["items"], json!(["a"]));
+    assert_eq!(shaped["text"], "final");
+    let shaped = resume_structured(json!({"data": "opaque"}), "final", None);
+    assert_eq!(shaped["data"], "opaque");
+    assert_eq!(shaped["text"], "final");
 }

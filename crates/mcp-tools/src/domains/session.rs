@@ -21,8 +21,8 @@ use mcp_types::{
     atlas_layer::AtlasLayer,
     config::{OutputFormat, ToolSurfaceProfile},
     tool::{
-        structured_content_enabled, ContentItem, ToolAnnotations, ToolCategory, ToolMetadata,
-        ToolResult,
+        as_structured_object, structured_content_enabled, ContentItem, ToolAnnotations,
+        ToolCategory, ToolMetadata, ToolResult,
     },
     Config, Error, Result,
 };
@@ -2230,6 +2230,34 @@ fn own_session_note(action: &str) -> String {
     )
 }
 
+/// What init tells the caller about carrying its session id to `resume`. One
+/// string feeds both the text and the structured `resume_hint` of init's
+/// result: a client that shows the structured result (Claude Code) never
+/// reads the text.
+fn session_resume_hint(api_session_id: &str) -> String {
+    format!(
+        "Session id: {api_session_id}. To resume the previous session, call session(action=\"resume\", session_id=\"{api_session_id}\")."
+    )
+}
+
+/// Puts the final `text` of a resume response where a client that reads only
+/// the structured result finds it: the `text` field of the API's `data`
+/// object, or the top-level `text` when the API sends no `data`, the same
+/// field `resume_text` reads. The own-session note also gets a field of its
+/// own, so nothing said to the caller exists only in the text.
+fn resume_structured(result: Value, text: &str, own_session_note: Option<&str>) -> Value {
+    let mut result = as_structured_object(result).unwrap_or_else(|| serde_json::json!({}));
+    if result.get("data").is_some_and(Value::is_object) {
+        result["data"]["text"] = serde_json::json!(text);
+    } else {
+        result["text"] = serde_json::json!(text);
+    }
+    if let Some(note) = own_session_note {
+        result["own_session_note"] = serde_json::json!(note);
+    }
+    result
+}
+
 /// The model-visible text of a resume response. The API renders it within a
 /// token budget; when it sends none, say so instead of returning nothing.
 fn resume_text(result: &Value, empty: &str) -> String {
@@ -3070,11 +3098,11 @@ impl ToolHandler for InitTool {
             );
         }
         // The id is the caller's to carry: resume cannot find it on a
-        // transport that keeps no state between calls.
-        if let Some(api_session_id) = api_session_id_from(&result) {
-            text.push_str(&format!(
-                "\nSession id: {api_session_id}. To resume the previous session, call session(action=\"resume\", session_id=\"{api_session_id}\")."
-            ));
+        // transport that keeps no state between calls. The same hint goes
+        // into the structured result below, which is all some clients read.
+        let resume_hint = api_session_id_from(&result).map(|id| session_resume_hint(&id));
+        if let Some(hint) = resume_hint.as_deref() {
+            text.push_str(&format!("\n{hint}"));
         }
         // Zero-touch auto-provisioning: surface the server's one-liner as a
         // positive fact ("project created — no setup needed"), never as a
@@ -3425,6 +3453,9 @@ impl ToolHandler for InitTool {
             }
         }
 
+        if let (Some(hint), Some(fields)) = (resume_hint, result.as_object_mut()) {
+            fields.insert("resume_hint".to_string(), serde_json::json!(hint));
+        }
         Ok(ToolResult::with_structured(text, result))
     }
 
@@ -17130,13 +17161,15 @@ impl ToolHandler for SessionTool {
                     })
                     .await?;
                 let mut text = resume_text(&result, "No recent sessions found.");
-                if own_session_unknown {
-                    text.push_str(&format!("\n\n{}", own_session_note("resume_list")));
+                let own_note = own_session_unknown.then(|| own_session_note("resume_list"));
+                if let Some(note) = own_note.as_deref() {
+                    text.push_str(&format!("\n\n{note}"));
                 }
                 if let Some(note) = scope.note {
                     text.push_str(&format!("\n\n{note}"));
                 }
-                Ok(ToolResult::with_structured(text, result))
+                let structured = resume_structured(result, &text, own_note.as_deref());
+                Ok(ToolResult::with_structured(text, structured))
             }
             "resume" => {
                 let scope = resolve_read_scope(
@@ -17182,13 +17215,15 @@ impl ToolHandler for SessionTool {
                     })
                     .await?;
                 let mut text = resume_text(&result, "Nothing to resume for this scope.");
-                if own_session_unknown {
-                    text.push_str(&format!("\n\n{}", own_session_note("resume")));
+                let own_note = own_session_unknown.then(|| own_session_note("resume"));
+                if let Some(note) = own_note.as_deref() {
+                    text.push_str(&format!("\n\n{note}"));
                 }
                 if let Some(note) = scope.note {
                     text.push_str(&format!("\n\n{note}"));
                 }
-                Ok(ToolResult::with_structured(text, result))
+                let structured = resume_structured(result, &text, own_note.as_deref());
+                Ok(ToolResult::with_structured(text, structured))
             }
             "capture_plan" => {
                 let title = input

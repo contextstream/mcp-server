@@ -17097,6 +17097,10 @@ pub struct CaptureVcsLocalEventParams {
     pub deletions: Option<i64>,
     pub files_changed: Option<i64>,
     pub pushed_refs: Option<Vec<String>>,
+    /// The commits a push carries (pre-push hook): full shas of
+    /// `remote..local`, newest first. Capped and cleaned at the client
+    /// boundary; only shas are sent, never messages.
+    pub pushed_commits: Option<Vec<String>>,
     /// RFC3339 author/commit time when available.
     pub committed_at: Option<String>,
     pub session_id: Option<String>,
@@ -17108,6 +17112,7 @@ const VCS_REF_MAX_CHARS: usize = 160;
 const VCS_SESSION_MAX_CHARS: usize = 160;
 const VCS_AGENT_MAX_CHARS: usize = 64;
 const VCS_PUSHED_REFS_MAX: usize = 32;
+const VCS_PUSHED_COMMITS_MAX: usize = 50;
 
 fn vcs_local_event_body(
     params: CaptureVcsLocalEventParams,
@@ -17139,6 +17144,16 @@ fn vcs_local_event_body(
             .collect::<Vec<_>>();
         (!refs.is_empty()).then_some(refs)
     });
+    let pushed_commits = params.pushed_commits.and_then(|shas| {
+        let mut seen = std::collections::HashSet::new();
+        let shas = shas
+            .into_iter()
+            .filter_map(sanitize_sha)
+            .filter(|sha| seen.insert(sha.clone()))
+            .take(VCS_PUSHED_COMMITS_MAX)
+            .collect::<Vec<_>>();
+        (!shas.is_empty()).then_some(shas)
+    });
     let committed_at = params.committed_at.and_then(|value| {
         chrono::DateTime::parse_from_rfc3339(value.trim())
             .ok()
@@ -17163,6 +17178,7 @@ fn vcs_local_event_body(
         "deletions": params.deletions.filter(|value| *value >= 0),
         "files_changed": params.files_changed.filter(|value| *value >= 0),
         "pushed_refs": pushed_refs,
+        "pushed_commits": pushed_commits,
         "committed_at": committed_at,
         "session_id": session_id,
         "agent": agent,
@@ -27980,5 +27996,71 @@ mod caller_bound_response_cache_tests {
             ContextStreamClient::parse_checkout_id(&first_id),
             Some(first_id)
         );
+    }
+}
+
+#[cfg(test)]
+mod pushed_commits_body_tests {
+    use super::*;
+
+    fn push_body(commits: Option<Vec<String>>) -> serde_json::Value {
+        vcs_local_event_body(
+            CaptureVcsLocalEventParams {
+                event_type: "push.local".to_string(),
+                sha: Some("c".repeat(40)),
+                pushed_commits: commits,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("a valid push event")
+    }
+
+    #[test]
+    fn a_push_names_its_commits_cleaned_deduplicated_and_bounded() {
+        let mut input = vec![
+            "ABCDEF1".to_string(),
+            "abcdef1".to_string(),
+            "not hex".to_string(),
+            "--force".to_string(),
+            "abc12".to_string(),
+            format!("abcdef1; DROP TABLE {}", "x".repeat(10)),
+            "1".repeat(65),
+            " 0123456789abcdef ".to_string(),
+        ];
+        input.extend((0..80).map(|n| format!("{n:040x}")));
+
+        let body = push_body(Some(input));
+        let sent: Vec<&str> = body["pushed_commits"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|sha| sha.as_str().unwrap())
+            .collect();
+        assert_eq!(sent.len(), VCS_PUSHED_COMMITS_MAX);
+        assert_eq!(&sent[..2], ["abcdef1", "0123456789abcdef"]);
+        for sha in &sent {
+            assert!(
+                (7..=64).contains(&sha.len())
+                    && sha
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "{sha}"
+            );
+        }
+        // The tip still travels as `sha`, and nothing else is sent about the commits.
+        assert_eq!(body["sha"], "c".repeat(40));
+    }
+
+    #[test]
+    fn without_a_usable_range_the_field_is_left_out() {
+        for commits in [
+            None,
+            Some(Vec::new()),
+            Some(vec!["not a sha".to_string(), "--force".to_string()]),
+        ] {
+            let body = push_body(commits);
+            assert!(body.get("pushed_commits").is_none(), "{body}");
+        }
     }
 }

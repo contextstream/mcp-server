@@ -532,6 +532,36 @@ enum Commands {
         format: String,
     },
 
+    /// Check or repair which ContextStream project a folder is linked to
+    #[command(
+        long_about = "Show which ContextStream project a checkout is linked to, check it against every project your account can open, and repair it.\n\nThe check ranks projects by the Git repository the checkout tracks, other linked checkouts of the same repository on this machine (worktrees and clones), repository/project/folder names, and indexing activity. Benchmark, fixture and test workspaces and generated, dated or temporary projects rank low. --fix applies a confident best match; --project-id links an exact project. The sync bridge runs the same check in the background and repairs only links backed by the repository itself, never into an isolated workspace, and never for a pinned folder (--pin). Every change is recorded with the previous link in ~/.contextstream/link-audit.json."
+    )]
+    Link {
+        /// Folder to check (defaults to the current directory)
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+
+        /// Check every folder this machine has linked or indexed
+        #[arg(long, conflicts_with = "path")]
+        all: bool,
+
+        /// Re-link to the confident best match
+        #[arg(long)]
+        fix: bool,
+
+        /// Link to this exact project
+        #[arg(long, value_name = "UUID", conflicts_with = "all")]
+        project_id: Option<uuid::Uuid>,
+
+        /// Keep the background audit from changing this folder's link
+        #[arg(long)]
+        pin: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Import Claude Code auto memory files into ContextStream (one time)
     #[command(
         long_about = "Copy each Claude Code auto memory file (~/.claude/projects/*/memory/*.md) into a ContextStream memory node: feedback and user memories become preferences, lessons become lessons, project and reference memories become facts. Each file's project is matched to the workspace/project its folder is linked to. Files already imported are skipped, and the local files are left in place.\n\nTurn auto memory off with `contextstream-mcp doctor --repair --scope global --editors claude` so new memories go to ContextStream."
@@ -1303,6 +1333,28 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             if let Err(e) = run_update(check, force, remote).await {
                 eprintln!("Update failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        Some(Commands::Link {
+            path,
+            all,
+            fix,
+            project_id,
+            pin,
+            json,
+        }) => {
+            let all_correct = mcp_server::link::run(mcp_server::link::LinkCommand {
+                path,
+                all,
+                fix,
+                project_id,
+                pin,
+                json,
+            })
+            .await?;
+            if !all_correct {
                 std::process::exit(1);
             }
         }

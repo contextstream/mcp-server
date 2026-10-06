@@ -934,8 +934,35 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, CheckoutIdentityError> {
 
 #[derive(Debug)]
 struct GitLayout {
+    repository_root: PathBuf,
     git_dir: PathBuf,
     common_dir: PathBuf,
+}
+
+/// Where a Git checkout sits in its repository: the working-tree root that
+/// owns `.git`, and for a linked worktree (`git worktree add`) the main
+/// checkout whose repository it shares.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckoutRepositoryLayout {
+    pub repository_root: PathBuf,
+    pub main_checkout: Option<PathBuf>,
+}
+
+/// Resolve the repository layout for `path` (any folder inside a checkout)
+/// without running Git. `None` outside a Git checkout.
+pub fn checkout_repository_layout(path: impl AsRef<Path>) -> Option<CheckoutRepositoryLayout> {
+    let layout = resolve_git_layout(path.as_ref()).ok()?;
+    let main_checkout = (layout.git_dir != layout.common_dir)
+        .then(|| {
+            (layout.common_dir.file_name()? == ".git")
+                .then(|| layout.common_dir.parent().map(Path::to_path_buf))
+                .flatten()
+        })
+        .flatten();
+    Some(CheckoutRepositoryLayout {
+        repository_root: layout.repository_root,
+        main_checkout,
+    })
 }
 
 fn resolve_git_layout(checkout_root: &Path) -> Result<GitLayout, CheckoutIdentityError> {
@@ -1019,6 +1046,7 @@ fn resolve_git_layout(checkout_root: &Path) -> Result<GitLayout, CheckoutIdentit
         }
     };
     Ok(GitLayout {
+        repository_root,
         git_dir,
         common_dir,
     })

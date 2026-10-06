@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 mcp-types = { workspace = true }
 mcp-client = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

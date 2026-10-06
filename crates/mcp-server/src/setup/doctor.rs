@@ -283,6 +283,9 @@ pub struct DoctorReport {
     pub editors: Vec<EditorReport>,
     pub installation: SurfaceCheck,
     pub credentials: SurfaceCheck,
+    /// Whether the project folder is linked to the right ContextStream project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_link: Option<SurfaceCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repair: Option<DoctorRepairReport>,
     pub pass: usize,
@@ -2314,6 +2317,33 @@ async fn run_repairs(options: &DoctorOptions, targets: &[Editor]) -> DoctorRepai
     if let Err(error) = super::update_rules_scoped(scope, None, None, Some(targets), true).await {
         failures.push(format!("rules: {error}"));
     }
+    if options.scope.include_project() && !options.dry_run {
+        if let (Some(project_path), Ok(config)) = (
+            options.project_path.as_deref(),
+            crate::config::load_config(),
+        ) {
+            operations.push("project_link");
+            let client = ContextStreamClient::new(config);
+            match mcp_session::project_link::load_candidates(&client).await {
+                Ok(candidates) => {
+                    let outcomes = crate::link::audit_folders(
+                        &candidates,
+                        &[project_path.to_path_buf()],
+                        crate::link::RepairMode::Confident,
+                        None,
+                        "doctor_repair",
+                    )
+                    .await;
+                    for outcome in outcomes {
+                        if let Some(error) = outcome.error {
+                            failures.push(format!("project_link: {error}"));
+                        }
+                    }
+                }
+                Err(error) => failures.push(format!("project_link: {error}")),
+            }
+        }
+    }
     if options.scope.include_global() {
         operations.push("hooks");
         if let Err(error) = super::update_hooks_scoped("global", Some(targets), true).await {
@@ -2471,6 +2501,16 @@ async fn build_report_for_targets(
             }
         })
         .collect();
+    let project_link = match (
+        options.scope.include_project(),
+        options.project_path.as_deref(),
+        credential_probe.client.as_ref(),
+    ) {
+        (true, Some(project_path), Some(client)) => {
+            Some(check_project_link(client, project_path).await)
+        }
+        _ => None,
+    };
     let credentials = credential_probe.check;
 
     let mut pass = 0;
@@ -2482,6 +2522,7 @@ async fn build_report_for_targets(
         .flat_map(|report| report.checks.iter())
         .chain(std::iter::once(&installation))
         .chain(std::iter::once(&credentials))
+        .chain(project_link.iter())
     {
         match check.status {
             CheckStatus::Pass => pass += 1,
@@ -2502,11 +2543,61 @@ async fn build_report_for_targets(
         editors: editor_reports,
         installation,
         credentials,
+        project_link,
         repair,
         pass,
         warn,
         fail,
         skipped,
+    }
+}
+
+/// Which ContextStream project the folder should be linked to, from the
+/// same resolver as `contextstream-mcp link`.
+async fn check_project_link(client: &ContextStreamClient, project_path: &Path) -> SurfaceCheck {
+    const SURFACE: &str = "project_link";
+    const FIX: &str = "contextstream-mcp link --fix";
+    let candidates = match mcp_session::project_link::load_candidates(client).await {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            return SurfaceCheck::skipped(SURFACE, format!("projects could not be listed: {error}"))
+        }
+    };
+    let outcome = crate::link::audit_folders(
+        &candidates,
+        &[project_path.to_path_buf()],
+        crate::link::RepairMode::Check,
+        None,
+        "doctor",
+    )
+    .await;
+    let Some(outcome) = outcome.first() else {
+        return SurfaceCheck::skipped(SURFACE, "no folder to check");
+    };
+    let assessment = &outcome.assessment;
+    let best = assessment
+        .recommended()
+        .map(|best| {
+            format!(
+                " Best match: {} in {}.",
+                best.project_name, best.workspace_name
+            )
+        })
+        .unwrap_or_default();
+    let path = Some(assessment.root.as_path());
+    use mcp_session::project_link::LinkStatus;
+    match &assessment.status {
+        LinkStatus::Correct => SurfaceCheck::pass(SURFACE, "linked to the right project", path),
+        LinkStatus::Unverified => SurfaceCheck::warning(
+            SURFACE,
+            format!("linked without a verified repository fingerprint, so automatic sync skips it.{best}"),
+            path,
+            Some(FIX),
+        ),
+        LinkStatus::Unlinked => SurfaceCheck::warning(SURFACE, format!("not linked.{best}"), path, Some(FIX)),
+        LinkStatus::Broken { reason } | LinkStatus::Wrong { reason } => {
+            SurfaceCheck::failure(SURFACE, format!("{reason}.{best}"), path, Some(FIX))
+        }
     }
 }
 
@@ -2671,6 +2762,9 @@ pub async fn run_doctor(options: DoctorOptions, json: bool, support: bool) -> Re
     println!();
     print_check(&report.installation, "");
     print_check(&report.credentials, "");
+    if let Some(project_link) = &report.project_link {
+        print_check(project_link, "");
+    }
     println!();
     for editor_report in &report.editors {
         println!(
@@ -3210,6 +3304,7 @@ mod tests {
                 readiness,
             }],
             installation: SurfaceCheck::pass("installation", "ok", None),
+            project_link: None,
             credentials: SurfaceCheck::skipped("credentials", "not checked"),
             repair: None,
             pass: 2,
@@ -3270,6 +3365,7 @@ mod tests {
             ),
         };
         let report = DoctorReport {
+            project_link: None,
             schema_version: DOCTOR_REPORT_SCHEMA_VERSION,
             targeting: DoctorTargeting {
                 scope: DoctorScope::All,
@@ -3489,6 +3585,7 @@ mod tests {
                 },
             }],
             installation: SurfaceCheck::pass("installation", "ok", None),
+            project_link: None,
             credentials: SurfaceCheck::pass("credentials", "ok", None),
             repair: None,
             pass: 2,

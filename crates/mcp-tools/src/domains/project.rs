@@ -974,6 +974,30 @@ pub struct ProjectInput {
 }
 
 /// Unified project tool handler.
+/// The project a readable local folder already belongs to, when the link
+/// resolver finds a confident, non-isolated winner (limited to `workspace_id`
+/// when the session has one). Errors listing projects mean "no answer".
+async fn existing_project_for_folder(
+    client: &ContextStreamClient,
+    path: &str,
+    workspace_id: Option<Uuid>,
+) -> Option<mcp_session::project_link::ScoredProject> {
+    use mcp_session::project_link::{assess, gather_checkout_facts, load_candidates, Verdict};
+    let mut candidates = load_candidates(client).await.ok()?;
+    if let Some(workspace_id) = workspace_id {
+        candidates.retain(|candidate| candidate.workspace.id == workspace_id);
+    }
+    let mappings = dirs::home_dir()
+        .and_then(|home| std::fs::read_to_string(home.join(".contextstream/mappings.json")).ok())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let facts = gather_checkout_facts(std::path::Path::new(path), &mappings);
+    match assess(&facts, &candidates, chrono::Utc::now()).verdict {
+        Verdict::Confident { best } if !best.isolated_workspace => Some(best),
+        _ => None,
+    }
+}
+
 pub struct ProjectTool {
     client: ContextStreamClient,
     session: Arc<SessionManager>,
@@ -1292,6 +1316,24 @@ impl ProjectTool {
                         "Refusing to {action} local folder '{path}': same-name legacy project(s) {ids} have no trustworthy repository identity. Select the canonical project explicitly once so it can be bound and backfilled; no duplicate was created and no local ingest was started."
                     )));
                 }
+            }
+        }
+
+        if resolved_project.is_none() && std::path::Path::new(&path).is_dir() {
+            // A worktree, clone or renamed folder of a repository that already
+            // has a project must reuse it, never fork a new project named after
+            // the folder. Rank the projects this account can open and take a
+            // confident winner outside isolated benchmark/test workspaces.
+            if let Some(best) =
+                existing_project_for_folder(&self.client, &path, resolved_workspace_id).await
+            {
+                resolved_workspace_id = Some(best.workspace_id);
+                workspace_display_name = Some(best.workspace_name.clone());
+                resolved_project_name = Some(best.project_name.clone());
+                resolved_project = Some(ResolvedIngestProject {
+                    project_id: best.project_id,
+                    source: "project_link_resolver",
+                });
             }
         }
 

@@ -61,6 +61,10 @@ const JOB_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 /// How often the watcher re-reads the registries to pick up newly mapped
 /// projects (and drop folders that disappeared).
 const REENUMERATE_INTERVAL: Duration = Duration::from_secs(120);
+/// How often the bridge re-checks which project each linked folder belongs to
+/// (see `crate::link`). The first check runs shortly after start.
+const LINK_AUDIT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const LINK_AUDIT_FIRST_DELAY: Duration = Duration::from_secs(120);
 
 /// How often the singleton lock's heartbeat timestamp is refreshed.
 const LOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -169,6 +173,14 @@ pub struct WatchTarget {
 
 /// Whether the watcher is enabled. On by default; opt out with
 /// `CONTEXTSTREAM_WATCH=0` (also accepts false/off/no).
+/// The background project-link audit, on unless
+/// `CONTEXTSTREAM_LINK_AUDIT=0|false`.
+fn link_audit_enabled() -> bool {
+    !std::env::var("CONTEXTSTREAM_LINK_AUDIT")
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false"))
+        .unwrap_or(false)
+}
+
 pub fn watch_enabled() -> bool {
     !matches!(
         std::env::var("CONTEXTSTREAM_WATCH")
@@ -1957,6 +1969,12 @@ pub async fn run_watch() -> Result<()> {
     job_reconcile_tick.reset();
     let mut reenumerate_tick = tokio::time::interval(REENUMERATE_INTERVAL);
     reenumerate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut link_audit_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + LINK_AUDIT_FIRST_DELAY,
+        LINK_AUDIT_INTERVAL,
+    );
+    link_audit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let link_audit_running = Arc::new(AtomicBool::new(false));
     let mut lock_tick = tokio::time::interval(LOCK_REFRESH_INTERVAL);
     lock_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut bridge_heartbeat_tick = tokio::time::interval(BRIDGE_CONTROL_HEARTBEAT_INTERVAL);
@@ -2082,6 +2100,25 @@ pub async fn run_watch() -> Result<()> {
             }
             _ = lock_tick.tick() => {
                 lock.write_heartbeat(targets.len());
+            }
+            _ = link_audit_tick.tick() => {
+                if link_audit_enabled()
+                    && link_audit_running
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    let client = client.clone();
+                    let running = link_audit_running.clone();
+                    tokio::spawn(async move {
+                        // A repaired link changes which folders the bridge
+                        // may sync; the next re-enumeration picks it up.
+                        let relinked = crate::link::background_audit(&client).await;
+                        if relinked > 0 {
+                            let _ = request_sync_bridge_reload();
+                        }
+                        running.store(false, Ordering::Release);
+                    });
+                }
             }
             _ = bridge_heartbeat_tick.tick() => {
                 if bridge_control_supported.load(Ordering::Acquire)

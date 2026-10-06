@@ -24,6 +24,7 @@ pub mod connect;
 pub mod hook_handlers;
 pub mod hooks;
 pub mod limited_mode;
+pub mod link;
 pub mod server;
 // Relocated to `mcp-session` so the `context()` tool (in `mcp-tools`) can read
 // the per-session model too. Re-exported here so existing

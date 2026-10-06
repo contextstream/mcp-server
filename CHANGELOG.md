@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.0.17
+
+- Claude Code auto memory: setup now turns Claude's auto memory off when it
+  configures Claude Code, and the hooks deny writes to Claude's auto memory files
+  (`~/.claude/projects/*/memory`) with a message naming the ContextStream call to
+  use instead (`session(action="remember")`, `capture_lesson`, or a `fact` node).
+  To keep auto memory on, answer so in the setup wizard's review step, run
+  `setup --keep-claude-auto-memory`, or set `CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY=1`;
+  `CONTEXTSTREAM_ALLOW_LOCAL_MEMORY=true` lifts the write denial. `doctor` reports
+  the setting and `doctor --repair --scope global` turns auto memory off.
+  `import-local-memory` copies existing memory files into ContextStream once
+  (a63d160).
+- Hooks: an approved Claude Code plan is saved as a ContextStream plan with one
+  linked task per numbered step. A plan with the same title is adopted, and
+  approving again updates it. Repository runbooks, ADRs, RFCs, postmortems and
+  notes are mirrored to ContextStream docs keyed by repository and path, for
+  checkouts linked to a workspace (scrubbed, 256 KB cap). Codex `apply_patch`
+  writes get the same handling. Hooks recognize every ContextStream server name,
+  including the claude.ai connector. Save guidance is injected once per prompt and
+  only when the prompt asks to save something, and it routes each kind
+  (preference, lesson, decision, doc, plan, todo, ticket, handoff). The
+  `on-save-intent` hook is no longer installed (a63d160).
+- Hooks: plan capture and doc mirroring use the workspace and project that a
+  successful `init` or `context` resolved for the host session (kept for 24
+  hours), so they also work in checkouts that only have a legacy folder link. A
+  repository doc written before the session has a scope is queued and mirrored
+  once `init` or `context` succeeds. `import-local-memory` skips folders with no
+  workspace link, explains a 403 on a stale link, and takes `--project-dir`,
+  `--workspace-id` and `--project-id` to import one Claude project into an
+  explicit scope (fb1bac8).
+- Search-first nudges give the exact ContextStream call for each local search:
+  regex to `mode=pattern`, literals to `exhaustive`, identifiers to `refactor`,
+  file-name searches to `pattern` with `output_format="paths"`, `-C/-A/-B` to
+  `context_lines`, glob and type filters to `file_types`, and Explore to
+  `mode=guided` with the task as `intent`. The same table now reaches Explore and
+  Plan subagents. The rules recipe for goal, risk and term nodes passes `title`
+  and `content`, which `memory(action="create_node")` requires (a63d160, ffab454).
+- Project links: `contextstream-mcp link [--path|--all] [--fix] [--project-id]
+  [--pin] [--json]` shows which project a checkout is linked to, ranks the
+  candidates with the reasons, and re-links with a verified repository
+  fingerprint. A checkout is ranked by the Git repository it tracks, other
+  checkouts of the same repository on the machine, names, and where it was
+  indexed before; benchmark, isolated, generated, worktree-named, dated or
+  temporary projects are penalized, and a close call is reported as ambiguous.
+  The sync bridge runs the same audit two minutes after it starts and every six
+  hours, repairs only links backed by the repository or a sibling checkout, never
+  into an isolated workspace and never for a pinned or temporary folder, and
+  records every change with the previous link in `~/.contextstream/link-audit.json`
+  (`CONTEXTSTREAM_LINK_AUDIT=0` turns the audit off). `doctor --scope project`
+  reports a `project_link` check and `doctor --repair` applies a confident fix.
+  `project(action="ingest_local")` reuses the folder's existing project instead of
+  creating a new one named after the folder, and worktrees no longer start new
+  projects (452bd2a).
+- Session: the session id and the `resume` call that 1.0.16 added to `init`, and
+  the own-session note on `resume` and `resume_list`, were only in the text of
+  those results, which Claude Code does not show. They are now in the structured
+  result too: `init` adds `resume_hint` next to `session_id`, and `resume` and
+  `resume_list` write the finished text, with the note and the scope note, into
+  the structured text. The text itself is unchanged (3241462).
+- `testing/adoption` adds `persistence_adoption.py`, which measures the share of
+  an agent's durable saves that went to local files, and `search_adoption.py` now
+  reads Codex code-mode `exec` calls. `scripts/ovh-cargo.sh` defaults to
+  ovh-desktop (a63d160, ffab454).
+
 ## 1.0.16
 
 - Session: `resume` and `resume_list` can now leave out your own session on the

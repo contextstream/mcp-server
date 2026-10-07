@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.0.18
+
+- Resume: agents are now told how to resume, with their own session id. A
+  resume that is given the id `init` returned skips the caller's own session, but
+  nothing told an agent to pass it. The `session` tool's description now says to
+  use `resume` or `resume_list` with the id `init` returned, its action reference
+  documents both actions, `session_id` says it is that id for `resume` and
+  `resume_list`, and the unknown-action error lists them. The rules every editor's
+  file carries map "resume", "resume recent work", "pick up where we left off"
+  and "continue my last session" to `session(action="resume" | "resume_list",
+  session_id=<id init returned>)`, no longer to `recall`; the rules reach a machine
+  with `contextstream-mcp update`. The tool text reaches users when the hosted
+  gateway runs this version (29a1bbd).
+- Hooks: in Claude Code and Codex, a prompt that asks to resume earlier work
+  gets the exact call, the latest session or `resume_list` when the user wants to
+  choose. Only specific phrases count, prompts over 600 characters are ignored,
+  and "update my resume", "resume.pdf" and "resume the download" do nothing.
+  PostToolUse records the session id an `init` result names, per host session
+  (the host id is hashed, kept for 24 hours), so the hook still names the right id
+  after a long conversation or a compaction. Cursor and Windsurf get the guidance
+  from the tool text and the rules only (29a1bbd).
+- Git events: the pre-push hook also sends the commits a push carries, as
+  `pushed_commits` (newest first, at most 50, shas only), so every commit in a
+  pushed range shows as pushed and not only its tip. It claims nothing when git
+  cannot name the range, and the hosted API ignores the field if it does not know
+  it (63cfbf1).
+- Git events are tagged with the session id `init` returned, for Claude Code,
+  Codex and Cursor. They were tagged with the host's own session id, which no
+  transcript or resume card uses, so a push shortly after a commit was dropped from
+  its card. With no `init` on record nothing is tagged, and the host id is never
+  sent. After a commit the hook sends a copy of the event that names the session
+  and agent, and the backend keeps one row. Cursor's `afterShellExecution` also
+  runs `git-bash-observed` (refresh Cursor's hooks to get it), and Codex events say
+  `codex` or `cursor` instead of always `claude_code`. Codex gets this only where it
+  already runs the ContextStream Bash hook, because setup installs no Codex hooks
+  (8f637f6).
+
 ## 1.0.17
 
 - Claude Code auto memory: setup now turns Claude's auto memory off when it

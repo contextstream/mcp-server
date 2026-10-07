@@ -877,7 +877,9 @@ pub async fn handle() -> Result<()> {
             // plans and docs saved later land where the agent's own calls go,
             // and the session id init returned, which a resume prompt names.
             if let (Some(host_session), Some((workspace_id, project_id))) = (
-                host_session_id(&input),
+                // Cursor names its conversation `conversation_id`; recording under
+                // it lets a git hook there find the id `init` returned.
+                super::common::host_session_key(&input),
                 resolved_scope_from_response(&tool_response),
             ) {
                 let api_session_id = (normalized_tool_name == "init")

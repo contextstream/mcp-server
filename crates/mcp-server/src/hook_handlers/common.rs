@@ -50,6 +50,34 @@ impl ApiConfig {
     }
 }
 
+/// The host's own id for the conversation: Claude Code and Codex send
+/// `session_id` (or `sessionId`), Cursor `conversation_id`. This is not the id
+/// `init` returns, which is what a transcript and a resume card use.
+pub fn host_session_key(input: &Value) -> Option<String> {
+    ["session_id", "sessionId", "conversation_id"]
+        .iter()
+        .find_map(|key| {
+            input
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// The label a git event carries for the harness that ran the hook: `cursor`,
+/// `codex` (its tool events carry a `turn_id`) or `claude_code`.
+pub fn agent_label(input: &Value) -> &'static str {
+    if super::input_is_cursor(input) {
+        "cursor"
+    } else if input.get("turn_id").is_some() {
+        "codex"
+    } else {
+        "claude_code"
+    }
+}
+
 /// Extract working directory from a hook payload.
 pub fn extract_cwd(input: &Value) -> String {
     input

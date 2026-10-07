@@ -1388,6 +1388,15 @@ const CURSOR_HOOK_SPECS: &[JsonHookSpec] = &[
         matcher: Some("*"),
         show_output: None,
     },
+    // Observe finished shell commands to tag a local git commit with the agent
+    // session (the Cursor counterpart of Claude Code's Bash `PostToolUse` entry).
+    JsonHookSpec {
+        event: "afterShellExecution",
+        hook_name: "git-bash-observed",
+        timeout: 5,
+        matcher: Some("*"),
+        show_output: None,
+    },
     JsonHookSpec {
         event: "beforeReadFile",
         hook_name: "pre-tool-use",
@@ -4135,5 +4144,25 @@ mod customized_settings_tests {
             .contains("audit.sh"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cursor_and_claude_observe_shell_commands_to_tag_git_commits_with_the_session() {
+        // Cursor: finished shell commands reach the git observer, beside the
+        // failure hook that already listens to the same event.
+        for hook_name in ["git-bash-observed", "post-tool-use-failure"] {
+            assert!(
+                CURSOR_HOOK_SPECS
+                    .iter()
+                    .any(|spec| spec.event == "afterShellExecution" && spec.hook_name == hook_name),
+                "Cursor afterShellExecution must run {hook_name}"
+            );
+        }
+        // Claude Code: the Bash PostToolUse entry.
+        assert!(CLAUDE_HOOK_SPECS.iter().any(|spec| {
+            spec.event == ClaudeHookEvent::PostToolUse
+                && spec.matcher == Some("Bash")
+                && spec.hook_name == "git-bash-observed"
+        }));
     }
 }

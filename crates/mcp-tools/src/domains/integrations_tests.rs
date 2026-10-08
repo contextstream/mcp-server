@@ -636,7 +636,11 @@ mod constants_tests {
         assert!(VALID_PROVIDERS.contains(&"jira"));
         assert!(VALID_PROVIDERS.contains(&"figma"));
         assert!(VALID_PROVIDERS.contains(&"all"));
-        assert_eq!(VALID_PROVIDERS.len(), 7);
+        // Connected apps served by the integration runtime.
+        for provider in ["microsoft", "google_workspace", "dropbox", "box"] {
+            assert!(VALID_PROVIDERS.contains(&provider), "{provider}");
+        }
+        assert_eq!(VALID_PROVIDERS.len(), 11);
     }
 
     #[test]
@@ -767,5 +771,123 @@ mod registration_tests {
             + notion_actions.len()
             + team_actions.len();
         assert_eq!(total, 20);
+    }
+}
+
+// ============================================================================
+// Connected App Tests
+// ============================================================================
+
+mod app_action_tests {
+    use super::IntegrationTool;
+    use super::{create_mock_client, create_test_session, json, ToolHandler};
+
+    fn tool() -> IntegrationTool {
+        let client = create_mock_client();
+        IntegrationTool::new(client.clone(), create_test_session(&client))
+    }
+
+    async fn error_for(input: serde_json::Value) -> String {
+        tool().execute(input).await.unwrap_err().to_string()
+    }
+
+    #[test]
+    fn the_schema_offers_connected_apps() {
+        let schema = tool().input_schema();
+        let props = schema["properties"].as_object().unwrap();
+        let providers: Vec<&str> = props["provider"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for provider in ["microsoft", "google_workspace", "dropbox", "box"] {
+            assert!(providers.contains(&provider), "{provider}");
+        }
+        let actions: Vec<&str> = props["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for action in ["apps", "find", "read", "capabilities", "edit"] {
+            assert!(actions.contains(&action), "{action}");
+        }
+        for field in [
+            "reference_id",
+            "connection_id",
+            "resource_id",
+            "resource_type",
+            "mime_type",
+            "container",
+            "operation",
+            "arguments",
+            "base_revisions",
+            "idempotency_key",
+        ] {
+            assert!(props.contains_key(field), "{field}");
+        }
+        assert!(tool().metadata().description.contains("Microsoft 365"));
+    }
+
+    #[tokio::test]
+    async fn find_needs_a_query() {
+        let error = error_for(json!({"provider": "all", "action": "find"})).await;
+        assert!(error.contains("query is required for find"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn read_needs_an_item() {
+        let error = error_for(json!({"provider": "all", "action": "read"})).await;
+        assert!(error.contains("connection_id or reference_id"), "{error}");
+
+        let error = error_for(json!({
+            "provider": "microsoft",
+            "action": "read",
+            "connection_id": "550e8400-e29b-41d4-a716-446655440000"
+        }))
+        .await;
+        assert!(error.contains("resource_id or operation"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn edit_needs_an_operation_its_arguments_and_a_session() {
+        let connection = "550e8400-e29b-41d4-a716-446655440000";
+        let error = error_for(json!({"provider": "microsoft", "action": "edit"})).await;
+        assert!(
+            error.contains("connection_id is required for edit"),
+            "{error}"
+        );
+
+        let error = error_for(json!({
+            "provider": "microsoft", "action": "edit", "connection_id": connection
+        }))
+        .await;
+        assert!(error.contains("operation is required for edit"), "{error}");
+
+        let error = error_for(json!({
+            "provider": "microsoft", "action": "edit", "connection_id": connection,
+            "operation": "excel.range.update", "arguments": "not an object"
+        }))
+        .await;
+        assert!(error.contains("arguments must be an object"), "{error}");
+
+        // An uninitialized session has nowhere to record the change.
+        let error = error_for(json!({
+            "provider": "microsoft", "action": "edit", "connection_id": connection,
+            "operation": "excel.range.update", "arguments": {"range": "B2"}
+        }))
+        .await;
+        assert!(error.contains("needs a session"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn app_actions_reach_the_runtime() {
+        // The mock API is unreachable: getting that far means validation passed.
+        let error =
+            error_for(json!({"provider": "all", "action": "find", "query": "budget"})).await;
+        assert!(!error.contains("Validation"), "{error}");
+        let error = error_for(json!({"provider": "all", "action": "apps"})).await;
+        assert!(!error.contains("Validation"), "{error}");
     }
 }

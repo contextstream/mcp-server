@@ -2551,8 +2551,11 @@ mod tests {
             "ad1e2260b3c50468dc64e6483d4e3e84f1333b8d964c5257216596d9e10898ca",
         ),
         (
+            // Additive: connected-app actions (apps, find, read,
+            // capabilities, edit), their fields, and the runtime providers
+            // (microsoft, google_workspace, dropbox, box).
             "integration",
-            "2e5bb35b3f48409b136a213c0483526e39f4ddf37c4b7f9714f12f84552679bb",
+            "42d3df4988616bb872a2c1865d63cc154f3423d27bd2cbeb00cd926938b68658",
         ),
         (
             "media",

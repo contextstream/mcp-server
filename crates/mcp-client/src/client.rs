@@ -13303,6 +13303,25 @@ impl ContextStreamClient {
     // Integrations
     // =========================================================================
 
+    /// One read through the integration runtime: connected apps, a live
+    /// search across them, an attached reference, or an item's content.
+    /// `body` carries the runtime's own fields, `workspace_id` included.
+    pub async fn integration_runtime_read(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.post("/integration-runtime/read", body).await
+    }
+
+    /// One integration runtime mutation (prepare or execute an edit), sent
+    /// exactly once: a replayed execute could repeat a provider write.
+    pub async fn integration_runtime_action(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.post_once("/integration-runtime/action", body).await
+    }
+
     /// Check integration status.
     pub async fn integration_status(
         &self,

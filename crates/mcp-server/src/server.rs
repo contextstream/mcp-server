@@ -2943,6 +2943,7 @@ mod tests {
         for (name, parameter) in [
             ("capsule", "action"),
             ("entity", "action"),
+            ("integration", "action"),
             ("memory", "action"),
             ("project", "action"),
             ("qa", "action"),

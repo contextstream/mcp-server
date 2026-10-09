@@ -172,6 +172,13 @@ impl IntegrationTool {
     }
 }
 
+/// Routing summary advertised as the tool description (<= 1024 chars).
+const INTEGRATION_TOOL_DESCRIPTION: &str = "Integration operations for Slack, GitHub, Notion, Linear, Jira and Figma, and for the apps a person connected: Microsoft 365, Google Workspace, Dropbox, Box, Slack, Notion, Linear and Figma. Provider: slack, github, notion, linear, jira, figma, microsoft, google_workspace, dropbox, box, all.\n\nConnected apps: apps (what is connected and whether agents may edit), find (search items by name across apps), read (an attached item by reference_id, or an item find returned), capabilities (an app's operations and their arguments), edit (change an item; applies when the person allows agent edits; on a conflict read again and retry).\n\nOther actions: status, search, stats, activity, contributors, knowledge, summary, connected, channels, discussions, repos, issues, files, Notion pages and databases (create_page, get_page, update_page, search_pages, query_database, create_database, list_databases), team_activity, team_search. Full action reference, with each action's fields and filters: the `action` parameter.";
+
+/// Complete tool reference, advertised on the main parameter; see
+/// [`crate::schema::with_full_reference`].
+const INTEGRATION_TOOL_REFERENCE: &str = "Integration operations for Slack, GitHub, Notion, Linear, Jira, and Figma, plus connected apps (Microsoft 365 Word/Excel/OneDrive, Google Workspace Docs/Sheets/Drive, Dropbox, Box, Slack, Notion, Linear, Figma). Provider: slack, github, notion, linear, jira, figma, microsoft, google_workspace, dropbox, box, all. Connected apps: apps (what is connected and whether agents may edit), find (live search by name; query), read (reference_id from an attached item, or connection_id + resource_id with the resource_type/mime_type/container find returned, or connection_id + operation + arguments), capabilities (operations and their arguments; connection_id), edit (connection_id + operation + arguments; applies when the person allows agent edits and returns a receipt; on a conflict read again and retry). Actions: status, search, stats, activity, contributors, knowledge, summary, connected (list connected integrations), channels (slack), discussions (slack), repos (github), issues (github/linear/jira), files (figma), create_page (notion), create_database (notion), list_databases (notion), search_pages (notion), get_page (notion), query_database (notion), update_page (notion), team_activity (team-only), team_search (team-only cross-provider search). Linear filters: team_id, status, priority, assignee. Jira filters: project_key, status, priority, issue_type, assignee. Figma filters: figma_project_id.";
+
 #[async_trait]
 impl ToolHandler for IntegrationTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
@@ -741,7 +748,7 @@ impl ToolHandler for IntegrationTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "integration".to_string(),
             title: "Integration Operations".to_string(),
-            description: "Integration operations for Slack, GitHub, Notion, Linear, Jira, and Figma, plus connected apps (Microsoft 365 Word/Excel/OneDrive, Google Workspace Docs/Sheets/Drive, Dropbox, Box, Slack, Notion, Linear, Figma). Provider: slack, github, notion, linear, jira, figma, microsoft, google_workspace, dropbox, box, all. Connected apps: apps (what is connected and whether agents may edit), find (live search by name; query), read (reference_id from an attached item, or connection_id + resource_id with the resource_type/mime_type/container find returned, or connection_id + operation + arguments), capabilities (operations and their arguments; connection_id), edit (connection_id + operation + arguments; applies when the person allows agent edits and returns a receipt; on a conflict read again and retry). Actions: status, search, stats, activity, contributors, knowledge, summary, connected (list connected integrations), channels (slack), discussions (slack), repos (github), issues (github/linear/jira), files (figma), create_page (notion), create_database (notion), list_databases (notion), search_pages (notion), get_page (notion), query_database (notion), update_page (notion), team_activity (team-only), team_search (team-only cross-provider search). Linear filters: team_id, status, priority, assignee. Jira filters: project_key, status, priority, issue_type, assignee. Figma filters: figma_project_id.".to_string(),
+            description: INTEGRATION_TOOL_DESCRIPTION.to_string(),
             category: ToolCategory::Integrations,
             annotations: ToolAnnotations::destructive(),
             is_pro: false,
@@ -753,7 +760,15 @@ impl ToolHandler for IntegrationTool {
         SchemaBuilder::new()
             .description("Integration operations")
             .string_enum("provider", "Integration provider", VALID_PROVIDERS, true)
-            .string_enum("action", "Action to perform", VALID_ACTIONS, true)
+            .string_enum(
+                "action",
+                &crate::schema::with_full_reference(
+                    "Action to perform",
+                    INTEGRATION_TOOL_REFERENCE,
+                ),
+                VALID_ACTIONS,
+                true,
+            )
             // Common fields
             .uuid("workspace_id", "Workspace ID", false)
             .uuid("project_id", "Project ID", false)

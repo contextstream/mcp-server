@@ -12,6 +12,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+use super::common::truncate_with_ellipsis;
 use super::{write_stdout_json, HookOutput};
 
 /// Search protocol base (tool guidance only — no sensitive text).
@@ -394,11 +395,7 @@ async fn fetch_plan_context(config: &ApiConfig) -> Option<String> {
                     text.push_str(&format!("- **{}**{}\n", title, conflict));
                 } else {
                     // Truncate long decision content for context efficiency
-                    let truncated = if content.len() > 200 {
-                        format!("{}...", &content[..200])
-                    } else {
-                        content.to_string()
-                    };
+                    let truncated = decision_content_preview(content);
                     text.push_str(&format!("- **{}**: {}{}\n", title, truncated, conflict));
                 }
             }
@@ -411,6 +408,11 @@ async fn fetch_plan_context(config: &ApiConfig) -> Option<String> {
     }
 
     Some(sections.join("\n"))
+}
+
+/// Decision content shortened to 200 bytes for the plan-agent context.
+fn decision_content_preview(content: &str) -> String {
+    truncate_with_ellipsis(content, 200)
 }
 
 // ============================================================================
@@ -526,6 +528,36 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An emoji (4 bytes), a CJK character (3) and an accented letter (2).
+    const MULTI_BYTE_CHARS: [&str; 3] = ["\u{1F600}", "\u{4E16}", "\u{E9}"];
+
+    #[test]
+    fn decision_preview_does_not_split_a_multi_byte_character() {
+        for ch in MULTI_BYTE_CHARS {
+            // Put the cut after 1..len-1 bytes of the character.
+            for inside in 1..ch.len() {
+                let head = "a".repeat(200 - inside);
+                let content = format!("{head}{ch}tail");
+                assert_eq!(
+                    decision_content_preview(&content),
+                    format!("{head}..."),
+                    "{ch:?} cut {inside} byte(s) in"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decision_preview_output_for_ascii_is_unchanged() {
+        let exact = "a".repeat(200);
+        assert_eq!(decision_content_preview(&exact), exact);
+        assert_eq!(
+            decision_content_preview(&"a".repeat(201)),
+            format!("{}...", "a".repeat(200))
+        );
+        assert_eq!(decision_content_preview("short"), "short");
+    }
 
     #[test]
     fn test_search_protocol_contains_key_tools() {

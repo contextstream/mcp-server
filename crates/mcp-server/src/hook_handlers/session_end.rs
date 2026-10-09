@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
 
+use super::common::prefix_within_bytes;
 use super::{read_stdin_json, write_stdout_json, HookOutput};
 
 /// Handle the Stop/SessionEnd hook.
@@ -374,10 +375,10 @@ fn parse_transcript_stats(transcript_path: &str) -> TranscriptStats {
                     .get("content")
                     .map(|c| {
                         if let Some(s) = c.as_str() {
-                            s[..s.len().min(2000)].to_string()
+                            prefix_within_bytes(s, 2000).to_string()
                         } else {
                             let s = c.to_string();
-                            s[..s.len().min(2000)].to_string()
+                            prefix_within_bytes(&s, 2000).to_string()
                         }
                     })
                     .unwrap_or_default();
@@ -545,4 +546,65 @@ async fn save_summary_event(
         .await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An emoji (4 bytes), a CJK character (3) and an accented letter (2).
+    const MULTI_BYTE_CHARS: [&str; 3] = ["\u{1F600}", "\u{4E16}", "\u{E9}"];
+
+    /// The preview kept for the one `tool_result` entry in a transcript.
+    fn tool_result_preview(content: Value) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let entry = serde_json::json!({
+            "type": "tool_result",
+            "name": "Read",
+            "content": content,
+            "timestamp": "2026-01-01T00:00:02Z",
+        });
+        std::fs::write(&path, format!("{entry}\n")).unwrap();
+
+        let stats = parse_transcript_stats(path.to_str().unwrap());
+        assert_eq!(stats.messages.len(), 1);
+        stats.messages[0]["content"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn tool_result_text_is_cut_on_a_character_boundary() {
+        for ch in MULTI_BYTE_CHARS {
+            for inside in 1..ch.len() {
+                let head = "a".repeat(2000 - inside);
+                let preview = tool_result_preview(Value::String(format!("{head}{ch}tail")));
+                assert_eq!(preview, head, "{ch:?} cut {inside} byte(s) in");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_result_json_is_cut_on_a_character_boundary() {
+        // Non-string content is stored as its JSON text: `{"text":"..."}`.
+        let wrapper = r#"{"text":""#;
+        for ch in MULTI_BYTE_CHARS {
+            for inside in 1..ch.len() {
+                let head = "a".repeat(2000 - wrapper.len() - inside);
+                let content = serde_json::json!({ "text": format!("{head}{ch}tail") });
+                let preview = tool_result_preview(content);
+                assert_eq!(
+                    preview,
+                    format!("{wrapper}{head}"),
+                    "{ch:?} cut {inside} byte(s) in"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tool_result_output_for_ascii_is_unchanged() {
+        let long = "a".repeat(2500);
+        assert_eq!(tool_result_preview(Value::String(long)), "a".repeat(2000));
+        assert_eq!(tool_result_preview(Value::String("short".into())), "short");
+    }
 }

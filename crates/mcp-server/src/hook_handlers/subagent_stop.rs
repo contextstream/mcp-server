@@ -7,7 +7,9 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
 
-use super::common::{create_plan, create_task, extract_cwd, load_config, post_memory_event};
+use super::common::{
+    create_plan, create_task, extract_cwd, load_config, post_memory_event, truncate_with_ellipsis,
+};
 use super::{read_stdin_json, write_stdout_json, HookOutput};
 
 const MAX_PLAN_DESCRIPTION_LEN: usize = 12_000;
@@ -381,10 +383,7 @@ fn normalize_task_line(line: &str) -> String {
 }
 
 fn truncate(value: &str, max_len: usize) -> String {
-    if value.len() <= max_len {
-        return value.to_string();
-    }
-    format!("{}...", &value[..max_len])
+    truncate_with_ellipsis(value, max_len)
 }
 
 #[cfg(test)]
@@ -433,5 +432,61 @@ mod tests {
         assert!(merged.iter().any(|task| task == "Set up hooks"));
         assert!(merged.iter().any(|task| task == "Add tests"));
         assert!(merged.iter().any(|task| task == "Update docs"));
+    }
+
+    /// An emoji (4 bytes), a CJK character (3) and an accented letter (2).
+    const MULTI_BYTE_CHARS: [&str; 3] = ["\u{1F600}", "\u{4E16}", "\u{E9}"];
+
+    #[test]
+    fn truncate_does_not_split_a_multi_byte_character() {
+        for ch in MULTI_BYTE_CHARS {
+            // Put the cut after 1..len-1 bytes of the character.
+            for inside in 1..ch.len() {
+                let head = "a".repeat(10 - inside);
+                let value = format!("{head}{ch}tail");
+                assert_eq!(
+                    truncate(&value, 10),
+                    format!("{head}..."),
+                    "{ch:?} cut {inside} byte(s) in"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_keeps_a_character_that_ends_exactly_at_the_limit() {
+        for ch in MULTI_BYTE_CHARS {
+            let head = "a".repeat(10 - ch.len());
+            let value = format!("{head}{ch}tail");
+            assert_eq!(truncate(&value, 10), format!("{head}{ch}..."));
+        }
+    }
+
+    #[test]
+    fn truncate_output_for_ascii_is_unchanged() {
+        assert_eq!(truncate("abcdef", 3), "abc...");
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("abc", 10), "abc");
+        assert_eq!(truncate("", 0), "");
+        assert_eq!(truncate("abc", 0), "...");
+    }
+
+    #[test]
+    fn plan_title_and_task_lines_survive_a_multi_byte_character_at_the_cut() {
+        for ch in MULTI_BYTE_CHARS {
+            let heading = format!("# {}{ch}tail", "a".repeat(119));
+            assert_eq!(
+                derive_plan_title(&heading, "agent"),
+                format!("{}...", "a".repeat(119)),
+                "{ch:?} in a heading"
+            );
+
+            let task = format!("- {}{ch}tail", "a".repeat(219));
+            assert_eq!(
+                normalize_task_line(&task),
+                format!("{}...", "a".repeat(219)),
+                "{ch:?} in a task line"
+            );
+        }
     }
 }

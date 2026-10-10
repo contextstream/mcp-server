@@ -59,10 +59,20 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::domains::account_mode::apply_is_personal_to_body;
+use crate::domains::lookup::{self, Lookup, LookupAction, LookupContext, RecordKind};
 use crate::registry::ToolHandler;
 use crate::schema::SchemaBuilder;
 
 const VALID_ACTIONS: &[&str] = &["list", "get", "create", "update", "delete"];
+
+/// Where each kind keeps its human-readable label, first non-empty wins:
+/// `objective` for goals, `version` for releases, `name` for sprints and
+/// experiments. An entity is referenced by this label and never by its body.
+const ENTITY_TITLE_FIELDS: &[&str] = &["title", "objective", "version", "name", "summary"];
+
+/// Said next to the candidates when an update that sets a status is refused.
+const STATUS_CHANGE_HINT: &str =
+    "An update that sets a status needs an id or the exact title, like a delete.";
 
 /// Input for the unified entity tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,15 +243,21 @@ impl EntityTool {
         }
     }
 
+    /// Resolve an entity reference (an id or a title) for
+    /// `entity(action=action_name)`, by the rule every reference follows (see
+    /// `lookup`).
     async fn resolve_entity_id_for_action(
         &self,
         kind: &str,
         lookup: &str,
         workspace_id: &Option<String>,
         project_id: &Option<String>,
-    ) -> Result<(Uuid, Option<String>)> {
+        action: LookupAction,
+        action_name: &str,
+        hint: Option<&str>,
+    ) -> Result<Lookup> {
         if let Ok(id) = Uuid::parse_str(lookup.trim()) {
-            return Ok((id, None));
+            return Ok(Lookup::Found(lookup::Found::by_id(id)));
         }
 
         let mut params = Vec::new();
@@ -255,34 +271,28 @@ impl EntityTool {
         params.push(("query".to_string(), lookup.trim().to_string()));
 
         let list = self.client.entity_list(kind, params).await?;
-        let items = extract_items_array(&list).cloned().unwrap_or_default();
-        let ranked = rank_entity_matches(&items, lookup);
-        let best = ranked.first().ok_or_else(|| {
-            Error::Validation(format!(
-                "No {} found matching \"{}\". Use entity(kind=\"{}\", action=\"list\", query={{\"query\": \"{}\"}}) to inspect candidates.",
-                plural_kind(kind),
-                lookup,
-                kind,
-                lookup
-            ))
-        })?;
-
-        let second_score = ranked.get(1).map(|m| m.score).unwrap_or_default();
-        if !best.exact && second_score > 0 && best.score <= second_score + 200 {
-            return Err(Error::Validation(format_entity_match_disambiguation(
-                kind, lookup, &ranked,
-            )));
-        }
-
-        let note = if best.exact {
-            None
-        } else {
-            Some(format!(
-                "Resolved \"{}\" to {} **{}** (id: {}).",
-                lookup, kind, best.title, best.id
-            ))
-        };
-        Ok((best.id, note))
+        let items = extract_items_array(&list)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let singular = kind.replace('_', " ");
+        let plural = plural_kind(kind);
+        let retry = format!("entity(kind=\"{kind}\", action=\"{action_name}\", id=\"<id>\")");
+        lookup::resolve_reference(
+            &LookupContext {
+                kind: RecordKind::new(&singular, &plural),
+                action,
+                retry: &retry,
+                hint,
+            },
+            lookup,
+            &lookup::candidates_from_items(items, ENTITY_TITLE_FIELDS),
+            || {
+                format!(
+                    "No {} found matching \"{}\". Use entity(kind=\"{}\", action=\"list\", query={{\"query\": \"{}\"}}) to inspect candidates.",
+                    plural, lookup, kind, lookup
+                )
+            },
+        )
     }
 }
 
@@ -309,7 +319,7 @@ fn extract_items_array(result: &Value) -> Option<&Vec<Value>> {
 /// `version` for releases, `name` for sprints/experiments) so we have to try
 /// several before giving up.
 fn entity_display_title(item: &Value) -> String {
-    for field in ["title", "objective", "version", "name", "summary"] {
+    for field in ENTITY_TITLE_FIELDS {
         if let Some(raw) = item.get(field).and_then(|v| v.as_str()) {
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
@@ -353,112 +363,6 @@ fn extract_entity_object<'a>(kind: &str, result: &'a Value) -> &'a Value {
         }
     }
     result
-}
-
-fn normalize_entity_lookup(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[derive(Debug, Clone)]
-struct RankedEntityMatch {
-    id: Uuid,
-    title: String,
-    score: i64,
-    exact: bool,
-}
-
-fn rank_entity_matches(items: &[Value], lookup: &str) -> Vec<RankedEntityMatch> {
-    let raw = lookup.trim();
-    let normalized = normalize_entity_lookup(raw);
-    if raw.is_empty() {
-        return Vec::new();
-    }
-
-    let mut ranked = Vec::new();
-    for item in items {
-        let id = item
-            .get("id")
-            .and_then(|v| v.as_str())
-            .and_then(|value| Uuid::parse_str(value).ok());
-        let Some(id) = id else { continue };
-
-        let title = entity_display_title(item);
-        let title_norm = normalize_entity_lookup(&title);
-        let mut score = 0i64;
-        let mut exact = false;
-
-        if id.to_string().eq_ignore_ascii_case(raw) {
-            score = 10_000;
-            exact = true;
-        } else if !normalized.is_empty() && title_norm == normalized {
-            score = 9_000;
-            exact = true;
-        } else if !normalized.is_empty() && title_norm.contains(&normalized) {
-            score = 7_200;
-        } else if !normalized.is_empty()
-            && normalized.contains(&title_norm)
-            && title_norm.len() >= 8
-        {
-            score = 6_500;
-        } else if !normalized.is_empty() {
-            let terms: Vec<&str> = normalized.split_whitespace().collect();
-            let matched = terms
-                .iter()
-                .filter(|term| title_norm.contains(**term))
-                .count();
-            if matched > 0 {
-                score = 2_500 + (matched as i64 * 140);
-                if matched == terms.len() && !terms.is_empty() {
-                    score += 600;
-                }
-            }
-        }
-
-        if score > 0 {
-            ranked.push(RankedEntityMatch {
-                id,
-                title,
-                score,
-                exact,
-            });
-        }
-    }
-
-    ranked.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
-    ranked
-}
-
-fn format_entity_match_disambiguation(
-    kind: &str,
-    lookup: &str,
-    matches: &[RankedEntityMatch],
-) -> String {
-    let mut text = format!(
-        "Multiple {} match \"{}\". Please retry with an explicit ID:\n\n",
-        plural_kind(kind),
-        lookup
-    );
-    for (idx, item) in matches.iter().take(5).enumerate() {
-        text.push_str(&format!(
-            "{}. **{}** (id: {})\n",
-            idx + 1,
-            item.title,
-            item.id
-        ));
-    }
-    text
 }
 
 /// One-line summary of a single entity for use in the LLM-visible text
@@ -660,9 +564,22 @@ impl ToolHandler for EntityTool {
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| Error::Validation("id is required".to_string()))?
                     .to_string();
-                let (id, resolution_note) = self
-                    .resolve_entity_id_for_action(&kind, &lookup, &ws, &proj)
-                    .await?;
+                let found = match self
+                    .resolve_entity_id_for_action(
+                        &kind,
+                        &lookup,
+                        &ws,
+                        &proj,
+                        LookupAction::READ,
+                        "get",
+                        None,
+                    )
+                    .await?
+                {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let workspace_id = ws.as_ref().and_then(|s| uuid::Uuid::parse_str(s).ok());
                 let project_id = proj.as_ref().and_then(|p| uuid::Uuid::parse_str(p).ok());
                 let result = if let (Some(cache_kind), Some(workspace_id)) =
@@ -693,15 +610,12 @@ impl ToolHandler for EntityTool {
                     self.client.entity_get(&kind, id).await?
                 };
                 let summary = format_entity_summary(&kind, &result);
-                let mut text = if summary.is_empty() {
+                let text = if summary.is_empty() {
                     format!("Fetched {} {}.", kind, id)
                 } else {
                     format!("Fetched {}: {}", kind, summary)
                 };
-                if let Some(note) = resolution_note {
-                    text = format!("{}\n{}", note, text);
-                }
-                Ok(ToolResult::with_structured(text, result))
+                Ok(found.tool_result(text, result))
             }
 
             "create" => {
@@ -748,9 +662,27 @@ impl ToolHandler for EntityTool {
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| Error::Validation("id is required".to_string()))?
                     .to_string();
-                let (id, resolution_note) = self
-                    .resolve_entity_id_for_action(&kind, &lookup, &ws, &proj)
-                    .await?;
+                // A status change moves the entity through its lifecycle, and
+                // each kind's statuses are defined by the API, not here. So
+                // every update that sets a status is resolved as strictly as a
+                // delete.
+                let status = input
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.get("status"))
+                    .and_then(Value::as_str);
+                let (action, _) = lookup::update_action(status, &[]);
+                let hint = action.destructive.then_some(STATUS_CHANGE_HINT);
+                let found = match self
+                    .resolve_entity_id_for_action(
+                        &kind, &lookup, &ws, &proj, action, "update", hint,
+                    )
+                    .await?
+                {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let mut body = input.body.unwrap_or_else(|| serde_json::json!({}));
                 if !body.is_object() {
                     return Err(Error::Validation(
@@ -771,15 +703,12 @@ impl ToolHandler for EntityTool {
                     enrich_ticket_result_from_request(&body, &mut result);
                 }
                 let summary = format_entity_summary(&kind, &result);
-                let mut text = if summary.is_empty() {
+                let text = if summary.is_empty() {
                     format!("Updated {} {}.", kind, id)
                 } else {
                     format!("Updated {}: {}", kind, summary)
                 };
-                if let Some(note) = resolution_note {
-                    text = format!("{}\n{}", note, text);
-                }
-                Ok(ToolResult::with_structured(text, result))
+                Ok(found.tool_result(text, result))
             }
 
             "delete" => {
@@ -793,15 +722,25 @@ impl ToolHandler for EntityTool {
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| Error::Validation("id is required".to_string()))?
                     .to_string();
-                let (id, resolution_note) = self
-                    .resolve_entity_id_for_action(&kind, &lookup, &ws, &proj)
-                    .await?;
+                let found = match self
+                    .resolve_entity_id_for_action(
+                        &kind,
+                        &lookup,
+                        &ws,
+                        &proj,
+                        LookupAction::DELETE,
+                        "delete",
+                        None,
+                    )
+                    .await?
+                {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.entity_delete(&kind, id).await?;
-                let mut text = format!("Deleted {} {}.", kind, id);
-                if let Some(note) = resolution_note {
-                    text = format!("{}\n{}", note, text);
-                }
-                Ok(ToolResult::with_structured(text, result))
+                let text = format!("Deleted {} {}.", kind, id);
+                Ok(found.tool_result(text, result))
             }
 
             _ => Err(Error::Validation(format!(
@@ -857,7 +796,7 @@ impl ToolHandler for EntityTool {
             )
             .string(
                 "id",
-                "Entity ID or lookup text (title/name/objective/version) for get / update / delete",
+                "Entity ID or lookup text (title/name/objective/version) for get / update / delete. delete and an update that sets status need an ID or the exact title.",
                 false,
             )
             .uuid(

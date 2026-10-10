@@ -20,6 +20,9 @@ use std::time::Duration;
 use tracing;
 use uuid::Uuid;
 
+use crate::domains::lookup::{
+    self, Lookup, LookupAction, LookupCandidate, LookupContext, RecordKind,
+};
 use crate::domains::result_cache::{rendered_entry_fits, ResultCache};
 use crate::domains::scope::{
     attach_scope_recovery_metadata, recover_write_scope_after_project_error, resolve_read_scope,
@@ -296,8 +299,6 @@ const VALID_NODE_TYPES: &[&str] = &[
     "term",
 ];
 
-const DOC_AUTO_OPEN_SCORE: i64 = 700;
-const DOC_AUTO_OPEN_SECONDARY_MAX: i64 = 500;
 const DOC_LOCAL_SWEEP_SCORE: i64 = 650;
 
 async fn resolve_target_project_input(
@@ -856,99 +857,65 @@ fn normalize_lookup_text(input: &str) -> String {
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-#[derive(Debug, Clone)]
-struct LookupMatch {
-    id: Uuid,
-    title: String,
-    score: i64,
-    exact: bool,
+/// How one kind of memory record is referenced: its noun, the argument that
+/// carries the reference, and the fields that hold its title (the first
+/// non-empty one wins). A record is never matched on its body or its type.
+struct MemoryRecord {
+    kind: RecordKind<'static>,
+    id_param: &'static str,
+    title_fields: &'static [&'static str],
 }
 
-fn extract_first_string<'a>(item: &'a Value, fields: &[&str]) -> Option<&'a str> {
-    fields.iter().find_map(|field| {
-        item.get(field)
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    })
-}
+const NODE: MemoryRecord = MemoryRecord {
+    kind: RecordKind::new("node", "nodes"),
+    id_param: "node_id",
+    title_fields: &["title", "summary", "name"],
+};
+const EVENT: MemoryRecord = MemoryRecord {
+    kind: RecordKind::new("event", "events"),
+    id_param: "event_id",
+    title_fields: &["title", "summary"],
+};
+const TASK: MemoryRecord = MemoryRecord {
+    kind: RecordKind::new("task", "tasks"),
+    id_param: "task_id",
+    title_fields: &["title"],
+};
+const TODO: MemoryRecord = MemoryRecord {
+    kind: RecordKind::new("todo", "todos"),
+    id_param: "todo_id",
+    title_fields: &["title"],
+};
+const DIAGRAM: MemoryRecord = MemoryRecord {
+    kind: RecordKind::new("diagram", "diagrams"),
+    id_param: "diagram_id",
+    title_fields: &["title"],
+};
+const DOC: MemoryRecord = MemoryRecord {
+    kind: RecordKind::new("doc", "docs"),
+    id_param: "doc_id",
+    title_fields: &["title"],
+};
 
-fn extract_item_uuid(item: &Value) -> Option<Uuid> {
-    item.get("id")
-        .and_then(|v| v.as_str())
-        .and_then(|raw| Uuid::parse_str(raw).ok())
-}
+const DECISIONS: RecordKind<'static> = RecordKind::new("decision", "decisions");
+const DECISION_TITLE_FIELDS: &[&str] = &["title", "summary", "name"];
 
-fn score_lookup_match(
-    item: &Value,
-    lookup_raw: &str,
-    lookup_norm: &str,
-    fields: &[&str],
-) -> Option<LookupMatch> {
-    let id = extract_item_uuid(item)?;
-    let title = extract_first_string(item, fields).unwrap_or("(untitled)");
-    let title_norm = normalize_lookup_text(title);
-    let mut score = 0i64;
-    let mut exact = false;
+/// Statuses that leave a task or a todo open. An update that sets any other
+/// status retires the record.
+const OPEN_TASK_STATUSES: &[&str] = &["pending", "in_progress", "blocked"];
+const OPEN_TODO_STATUSES: &[&str] = &["pending"];
 
-    if id.to_string().eq_ignore_ascii_case(lookup_raw) {
-        score = 10_000;
-        exact = true;
-    } else if !lookup_norm.is_empty() && title_norm == lookup_norm {
-        score = 9_000;
-        exact = true;
-    } else if !lookup_norm.is_empty() && title_norm.contains(lookup_norm) {
-        score = 7_200;
-    } else if !lookup_norm.is_empty() && lookup_norm.contains(&title_norm) && title_norm.len() >= 8
-    {
-        score = 6_600;
-    } else if !lookup_norm.is_empty() {
-        let terms: Vec<&str> = lookup_norm.split_whitespace().collect();
-        let matched = terms
-            .iter()
-            .filter(|term| title_norm.contains(**term))
-            .count();
-        if matched == 0 {
-            return None;
-        }
-        score = 2_500 + (matched as i64 * 150);
-        if matched == terms.len() && !terms.is_empty() {
-            score += 600;
-        }
-    }
+/// Said next to the candidates of a refused `delete_node` or `delete_event`.
+const DELETE_ALL_HINT: &str =
+    "delete_all=true deletes every record whose title is exactly the one you pass.";
 
-    if score <= 0 {
-        return None;
-    }
+/// Most docs considered when a doc is looked up by title for a write.
+const DOC_LOOKUP_LIMIT: i64 = 100;
 
-    Some(LookupMatch {
-        id,
-        title: title.to_string(),
-        score,
-        exact,
-    })
-}
-
-fn rank_lookup_matches(
-    items: &[Value],
-    lookup: &str,
-    fields: &[&str],
-    limit: usize,
-) -> Vec<LookupMatch> {
-    let lookup_raw = lookup.trim();
-    let lookup_norm = normalize_lookup_text(lookup_raw);
-    if lookup_raw.is_empty() {
-        return Vec::new();
-    }
-
-    let mut matches: Vec<LookupMatch> = items
-        .iter()
-        .filter_map(|item| score_lookup_match(item, lookup_raw, &lookup_norm, fields))
-        .collect();
-
-    matches.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
-    matches.truncate(limit);
-    matches
+fn listed_items(collection: &Value) -> &[Value] {
+    extract_collection_array(collection)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
 }
 
 /// Exact (id or exact-title) matches for a `delete_all` bulk delete. Restricting
@@ -958,110 +925,62 @@ fn collect_bulk_delete_matches(
     collection: &Value,
     lookup: &str,
     fields: &[&str],
-) -> Vec<LookupMatch> {
-    let items = extract_collection_array(collection)
-        .cloned()
-        .unwrap_or_default();
-    rank_lookup_matches(&items, lookup, fields, 100)
-        .into_iter()
-        .filter(|m| m.exact)
-        .collect()
-}
-
-enum LookupResolution<'a> {
-    None,
-    Single(&'a LookupMatch),
-    Ambiguous,
-}
-
-/// One clear winner (exact id/title, or a score gap above the ambiguity
-/// window) resolves; several close matches are ambiguous.
-fn classify_lookup_resolution(ranked: &[LookupMatch]) -> LookupResolution<'_> {
-    let Some(best) = ranked.first() else {
-        return LookupResolution::None;
-    };
-    let second_score = ranked.get(1).map(|item| item.score).unwrap_or_default();
-    if !best.exact && second_score > 0 && best.score <= second_score + 200 {
-        LookupResolution::Ambiguous
-    } else {
-        LookupResolution::Single(best)
-    }
-}
-
-/// `[CANDIDATES]` result for an ambiguous `supersede_node` lookup. Nothing
-/// is superseded; the agent retries with one of the listed ids.
-fn supersede_candidates_result(lookup: &str, matches: &[LookupMatch]) -> ToolResult {
-    let mut text = format!(
-        "[CANDIDATES] Multiple nodes match \"{lookup}\"; nothing was superseded. Retry supersede_node with node_id set to one of:\n"
-    );
-    let candidates: Vec<Value> = matches
-        .iter()
-        .take(5)
-        .enumerate()
-        .map(|(index, item)| {
-            text.push_str(&format!(
-                "{}. **{}** (id: {})\n",
-                index + 1,
-                item.title,
-                item.id
-            ));
-            serde_json::json!({"id": item.id, "title": item.title, "score": item.score})
-        })
-        .collect();
-    ToolResult::with_structured(
-        text.trim_end().to_string(),
-        serde_json::json!({"resolved": false, "lookup": lookup, "candidates": candidates}),
+) -> Vec<LookupCandidate> {
+    lookup::exact_matches(
+        lookup,
+        &lookup::candidates_from_items(listed_items(collection), fields),
     )
 }
 
-fn format_lookup_ambiguity(entity_name: &str, lookup: &str, matches: &[LookupMatch]) -> String {
-    let mut text = format!(
-        "Multiple {} match \"{}\". Retry with an explicit id from the list below, \
-         or pass delete_all=true to remove ALL exact-title matches in one call:\n\n",
-        entity_name, lookup
-    );
-    for (idx, item) in matches.iter().take(5).enumerate() {
-        text.push_str(&format!(
-            "{}. **{}** (id: {})\n",
-            idx + 1,
-            item.title,
-            item.id
-        ));
-    }
-    text
+/// Resolve a memory record reference (an id or a title) against a listing from
+/// the API, for `memory(action=action_name)`.
+fn resolve_from_collection_lookup(
+    record: &MemoryRecord,
+    action: LookupAction,
+    action_name: &str,
+    hint: Option<&str>,
+    lookup: &str,
+    collection: &Value,
+) -> Result<Lookup> {
+    resolve_memory_reference(
+        record,
+        action,
+        action_name,
+        hint,
+        lookup,
+        &lookup::candidates_from_items(listed_items(collection), record.title_fields),
+    )
 }
 
-fn resolve_uuid_from_matches(
-    entity_name: &str,
+fn resolve_memory_reference(
+    record: &MemoryRecord,
+    action: LookupAction,
+    action_name: &str,
+    hint: Option<&str>,
     lookup: &str,
-    matches: &[LookupMatch],
-) -> Result<(Uuid, Option<String>)> {
-    let best = matches.first().ok_or_else(|| {
-        Error::Validation(format!(
-            "No {} found matching \"{}\". Use list_{} to inspect available IDs.",
-            entity_name, lookup, entity_name
-        ))
-    })?;
-
-    let second_score = matches.get(1).map(|m| m.score).unwrap_or_default();
-    if !best.exact && second_score > 0 && best.score <= second_score + 200 {
-        return Err(Error::Validation(format_lookup_ambiguity(
-            entity_name,
-            lookup,
-            matches,
-        )));
-    }
-
-    let note = if best.exact {
-        None
-    } else {
-        Some(format!(
-            "Resolved \"{}\" to {} (id: {}).",
-            lookup, best.title, best.id
-        ))
-    };
-
-    Ok((best.id, note))
+    candidates: &[LookupCandidate],
+) -> Result<Lookup> {
+    let retry = format!(
+        "memory(action=\"{action_name}\", {}=\"<id>\")",
+        record.id_param
+    );
+    let plural = record.kind.plural;
+    lookup::resolve_reference(
+        &LookupContext {
+            kind: record.kind,
+            action,
+            retry: &retry,
+            hint,
+        },
+        lookup,
+        candidates,
+        || {
+            format!(
+                "No {plural} found matching \"{}\". Use memory(action=\"list_{plural}\") to inspect available IDs.",
+                lookup.trim()
+            )
+        },
+    )
 }
 
 fn is_doc_query_stopword(term: &str) -> bool {
@@ -1330,12 +1249,6 @@ fn doc_match_source(doc: &Value) -> &str {
         .unwrap_or("unknown")
 }
 
-fn doc_exact_match(doc: &Value) -> bool {
-    doc.get("exact_match")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
 fn rank_docs_for_query(docs: Vec<Value>, query: &str, limit: usize) -> Vec<Value> {
     let prepared = PreparedDocQuery::new(query);
     let mut scored: Vec<(i64, usize, Value)> = docs
@@ -1468,47 +1381,8 @@ fn format_doc_matches(query: &str, docs: &[Value]) -> String {
     text
 }
 
-fn find_exact_doc_match<'a>(docs: &'a [Value], query: &str) -> Option<&'a Value> {
-    let normalized_query = normalize_lookup_text(query.trim());
-    if normalized_query.is_empty() {
-        return None;
-    }
-
-    docs.iter().find(|doc| {
-        if doc_exact_match(doc) {
-            return true;
-        }
-        let id = doc.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
-        if !id.is_empty() && id.eq_ignore_ascii_case(query.trim()) {
-            return true;
-        }
-        let title = doc
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        !title.is_empty() && normalize_lookup_text(title) == normalized_query
-    })
-}
-
-fn select_resolved_doc_match<'a>(docs: &'a [Value], query: &str) -> Option<&'a Value> {
-    if let Some(exact) = find_exact_doc_match(docs, query) {
-        return Some(exact);
-    }
-
-    let best = docs.first()?;
-    let second_score = docs.get(1).map(doc_match_score).unwrap_or_default();
-    if doc_match_score(best) >= DOC_AUTO_OPEN_SCORE && second_score < DOC_AUTO_OPEN_SECONDARY_MAX {
-        Some(best)
-    } else {
-        None
-    }
-}
-
-fn resolve_uuid_lookup_input(raw: &str) -> Option<Uuid> {
-    Uuid::parse_str(raw.trim()).ok()
-}
-
+/// Resolve a doc reference (an id or a title) for a write, for
+/// `memory(action=action_name)`.
 async fn resolve_doc_uuid_for_action(
     client: &ContextStreamClient,
     workspace_id: Option<Uuid>,
@@ -1516,12 +1390,15 @@ async fn resolve_doc_uuid_for_action(
     lookup: &str,
     doc_type: Option<&str>,
     is_personal: Option<bool>,
-    limit: Option<i64>,
-) -> Result<(Uuid, Option<String>)> {
-    if let Some(uuid) = resolve_uuid_lookup_input(lookup) {
-        return Ok((uuid, None));
+    action: LookupAction,
+    action_name: &str,
+) -> Result<Lookup> {
+    if let Ok(id) = Uuid::parse_str(lookup.trim()) {
+        return Ok(Lookup::Found(lookup::Found::by_id(id)));
     }
 
+    // Search as widely as the API allows, whatever `limit` the caller passed:
+    // a second doc with the same title must not fall off the page.
     let matches = search_docs_by_title(
         client,
         workspace_id,
@@ -1529,57 +1406,17 @@ async fn resolve_doc_uuid_for_action(
         doc_type,
         is_personal,
         lookup,
-        limit,
+        Some(DOC_LOOKUP_LIMIT),
     )
     .await?;
-
-    if matches.is_empty() {
-        return Err(Error::Validation(format!(
-            "No docs found matching \"{}\". Use memory(action=\"list_docs\", query=\"{}\") to inspect candidates.",
-            lookup, lookup
-        )));
-    }
-
-    if let Some(resolved) = select_resolved_doc_match(&matches, lookup) {
-        if let Some(id_str) = resolved.get("id").and_then(|v| v.as_str()) {
-            if let Ok(uuid) = Uuid::parse_str(id_str) {
-                let note = if id_str.eq_ignore_ascii_case(lookup.trim()) {
-                    None
-                } else {
-                    Some(format!(
-                        "Resolved \"{}\" to doc **{}** (id: {}).",
-                        lookup,
-                        resolved
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Untitled"),
-                        id_str
-                    ))
-                };
-                return Ok((uuid, note));
-            }
-        }
-    }
-
-    let ranked = rank_lookup_matches(&matches, lookup, &["title"], 5);
-    resolve_uuid_from_matches("docs", lookup, &ranked)
-}
-
-fn resolve_from_collection_lookup(
-    entity_name: &str,
-    lookup: &str,
-    collection: &Value,
-    title_fields: &[&str],
-) -> Result<(Uuid, Option<String>)> {
-    if let Some(uuid) = resolve_uuid_lookup_input(lookup) {
-        return Ok((uuid, None));
-    }
-
-    let items = extract_collection_array(collection)
-        .cloned()
-        .unwrap_or_default();
-    let ranked = rank_lookup_matches(&items, lookup, title_fields, 8);
-    resolve_uuid_from_matches(entity_name, lookup, &ranked)
+    resolve_memory_reference(
+        &DOC,
+        action,
+        action_name,
+        None,
+        lookup,
+        &lookup::candidates_from_items(&matches, DOC.title_fields),
+    )
 }
 
 fn extract_memory_search_results(value: &Value) -> Vec<Value> {
@@ -1948,41 +1785,41 @@ impl ToolHandler for MemorySearchTool {
         );
 
         let mut doc_detail_degraded = false;
-        let resolved_doc = match select_resolved_doc_match(&docs, &query) {
-            Some(doc) => {
-                let doc_id = doc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                if let Ok(doc_uuid) = Uuid::parse_str(doc_id) {
-                    let now = tokio::time::Instant::now();
-                    let detail_deadline =
-                        std::cmp::min(tool_deadline, now + MEMORY_SEARCH_DOC_DETAIL_TIMEOUT);
-                    let detail = if detail_deadline <= now {
-                        Err(Error::Timeout(1))
-                    } else {
-                        match tokio::time::timeout_at(
-                            detail_deadline,
-                            self.client.get_doc(doc_uuid),
-                        )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => Err(Error::Timeout(
-                                MEMORY_SEARCH_DOC_DETAIL_TIMEOUT.as_secs().max(1),
-                            )),
-                        }
-                    };
-                    match detail {
-                        Ok(doc) => Some(doc),
-                        Err(error) => {
-                            doc_detail_degraded = true;
-                            tracing::warn!(error = %error, "document detail lookup unavailable; preserving ranked matches");
-                            None
-                        }
-                    }
+        // A search whose query names one doc (the rule in `lookup`) also
+        // shows that doc.
+        let named_doc = lookup::resolve(
+            &query,
+            &lookup::candidates_from_items(&docs, DOC.title_fields),
+            DOC.kind,
+            false,
+        );
+        let resolved_doc = match named_doc {
+            lookup::Outcome::Found { id: doc_uuid, .. } => {
+                let now = tokio::time::Instant::now();
+                let detail_deadline =
+                    std::cmp::min(tool_deadline, now + MEMORY_SEARCH_DOC_DETAIL_TIMEOUT);
+                let detail = if detail_deadline <= now {
+                    Err(Error::Timeout(1))
                 } else {
-                    None
+                    match tokio::time::timeout_at(detail_deadline, self.client.get_doc(doc_uuid))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::Timeout(
+                            MEMORY_SEARCH_DOC_DETAIL_TIMEOUT.as_secs().max(1),
+                        )),
+                    }
+                };
+                match detail {
+                    Ok(doc) => Some(doc),
+                    Err(error) => {
+                        doc_detail_degraded = true;
+                        tracing::warn!(error = %error, "document detail lookup unavailable; preserving ranked matches");
+                        None
+                    }
                 }
             }
-            None => None,
+            _ => None,
         };
 
         let text = if let Some(doc) = resolved_doc.as_ref() {
@@ -2504,34 +2341,34 @@ fn compose_decision_content(
     text
 }
 
-fn format_decision_candidates(lookup: &str, matches: &[LookupMatch]) -> String {
-    let mut text = format!(
-        "Multiple decisions match \"{}\". Retry with an explicit decision id:\n\n",
-        lookup
-    );
-    for (index, item) in matches.iter().take(5).enumerate() {
-        text.push_str(&format!(
-            "{}. **{}** (id: {})\n",
-            index + 1,
-            item.title,
-            item.id
-        ));
+/// How exact a decision reference must be for a lifecycle action. Supersede,
+/// choose_successor and invalidate retire the decision (the API marks it
+/// superseded); dispute and verify stamp a review status on it. An action this
+/// server does not know is treated as retiring.
+fn decision_lookup_action(action: &str) -> LookupAction {
+    match action {
+        "verify" => LookupAction::edit("verified"),
+        "dispute" => LookupAction::edit("disputed"),
+        "invalidate" => LookupAction::retire("invalidated"),
+        "supersede" | "choose_successor" => LookupAction::SUPERSEDE,
+        _ => LookupAction::retire("changed"),
     }
-    text
 }
 
-/// Resolve a decision id from a UUID or lookup text against the typed
-/// decisions listing (all statuses). A single high-confidence match wins;
-/// several close matches return the candidate list as a validation error.
+/// Resolve a decision reference (an id or a title) against the typed
+/// decisions listing (all statuses). `retry` is the call to repeat with an id.
 pub(crate) async fn resolve_decision_id(
     client: &ContextStreamClient,
     workspace_id: Option<Uuid>,
     project_id: Option<Uuid>,
     lookup: &str,
-) -> Result<(Uuid, Option<String>)> {
+    action: LookupAction,
+    retry: &str,
+    hint: Option<&str>,
+) -> Result<Lookup> {
     let lookup = lookup.trim();
     if let Ok(id) = Uuid::parse_str(lookup) {
-        return Ok((id, None));
+        return Ok(Lookup::Found(lookup::Found::by_id(id)));
     }
     if lookup.is_empty() {
         return Err(Error::Validation("decision_id is required".to_string()));
@@ -2549,27 +2386,23 @@ pub(crate) async fn resolve_decision_id(
     let items = envelope
         .get("items")
         .and_then(Value::as_array)
-        .cloned()
+        .map(Vec::as_slice)
         .unwrap_or_default();
-    let ranked = rank_lookup_matches(&items, lookup, &["title", "summary", "name"], 8);
-    let best = ranked.first().ok_or_else(|| {
-        Error::Validation(format!(
-            "No decisions match \"{lookup}\". Use memory(action=\"decisions\", query=\"{lookup}\", status=\"all\") to inspect candidates."
-        ))
-    })?;
-    let second_score = ranked.get(1).map(|item| item.score).unwrap_or_default();
-    if !best.exact && second_score > 0 && best.score <= second_score + 200 {
-        return Err(Error::Validation(format_decision_candidates(
-            lookup, &ranked,
-        )));
-    }
-    let note = (!best.exact).then(|| {
-        format!(
-            "Resolved decision \"{}\" to **{}** (id: {}).",
-            lookup, best.title, best.id
-        )
-    });
-    Ok((best.id, note))
+    lookup::resolve_reference(
+        &LookupContext {
+            kind: DECISIONS,
+            action,
+            retry,
+            hint,
+        },
+        lookup,
+        &lookup::candidates_from_items(items, DECISION_TITLE_FIELDS),
+        || {
+            format!(
+                "No decisions match \"{lookup}\". Use memory(action=\"decisions\", query=\"{lookup}\", status=\"all\") to inspect candidates."
+            )
+        },
+    )
 }
 
 /// Create a typed decision (`POST /memory/decisions`). When the server
@@ -2619,11 +2452,20 @@ pub async fn execute_create_decision(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        Some(lookup) => Some(
-            resolve_decision_id(client, scope.workspace_id, scope.project_id, lookup)
-                .await?
-                .0,
-        ),
+        Some(lookup) => match resolve_decision_id(
+            client,
+            scope.workspace_id,
+            scope.project_id,
+            lookup,
+            LookupAction::SUPERSEDE,
+            "memory(action=\"create_decision\", supersedes=\"<id>\")",
+            Some("The new decision was not recorded."),
+        )
+        .await?
+        {
+            Lookup::Found(found) => Some(found.id),
+            Lookup::Candidates(candidates) => return Ok(candidates),
+        },
         None => None,
     };
     let decision_scope = input
@@ -2776,24 +2618,46 @@ pub async fn execute_decision_action(
         input.project_id.as_deref(),
     )
     .await?;
-    let (decision_id, resolution_note) = resolve_decision_id(
+    let lookup_action = decision_lookup_action(&action);
+    let target = match resolve_decision_id(
         client,
         scope.workspace_id,
         scope.project_id,
         &input.decision_id,
+        lookup_action,
+        &format!(
+            "memory(action=\"decision_action\", decision_action=\"{action}\", decision_id=\"<id>\")"
+        ),
+        None,
     )
-    .await?;
+    .await?
+    {
+        Lookup::Found(found) => found,
+        Lookup::Candidates(candidates) => return Ok(candidates),
+    };
+    let decision_id = target.id;
     let successor = match input
         .successor_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        Some(lookup) => Some(
-            resolve_decision_id(client, scope.workspace_id, scope.project_id, lookup)
-                .await?
-                .0,
-        ),
+        Some(lookup) => match resolve_decision_id(
+            client,
+            scope.workspace_id,
+            scope.project_id,
+            lookup,
+            lookup_action,
+            &format!(
+                "memory(action=\"decision_action\", decision_action=\"{action}\", decision_id=\"{decision_id}\", successor_id=\"<id>\")"
+            ),
+            None,
+        )
+        .await?
+        {
+            Lookup::Found(found) => Some(found.id),
+            Lookup::Candidates(candidates) => return Ok(candidates),
+        },
         None => None,
     };
     if matches!(action.as_str(), "supersede" | "choose_successor")
@@ -2810,8 +2674,8 @@ pub async fn execute_decision_action(
     }
 
     let mut text = String::new();
-    if let Some(note) = resolution_note {
-        text.push_str(&note);
+    if let Some(note) = target.note.as_deref() {
+        text.push_str(note);
         text.push('\n');
     }
     let params = mcp_client::DecisionActionParams {
@@ -2821,7 +2685,7 @@ pub async fn execute_decision_action(
         title: input.title.clone(),
     };
     match client.decision_action(decision_id, params).await {
-        Ok(result) => {
+        Ok(mut result) => {
             let applied = result
                 .get("applied")
                 .and_then(Value::as_bool)
@@ -2841,6 +2705,7 @@ pub async fn execute_decision_action(
                 text.push_str(&format!("   successor={successor}\n"));
             }
             text.push_str(&render_degraded_lines(&result));
+            target.annotate(&mut result);
             let mut output = ToolResult::with_structured(text.trim_end().to_string(), result);
             if let Some(note) = scope.note {
                 output = output.with_prefix(format!("{note}\n"));
@@ -3448,7 +3313,7 @@ const MEMORY_TOOL_DESCRIPTION: &str = "Persistent memory storage — docs, runbo
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const MEMORY_TOOL_REFERENCE: &str = "Persistent memory storage — docs, runbooks, specs, ADRs, RFCs, decisions, lessons, preferences, tasks, todos, knowledge nodes, transcripts. NOT for codebase/file search.\n\n⚠️ FINDING A DOC, RUNBOOK, SPEC, OR ARCHITECTURE NOTE? USE THIS TOOL — NOT `find`, `ls`, `grep`, or filesystem searches. ContextStream docs/runbooks/specs/decisions/lessons live ONLY in this tool's storage (Postgres + indexes), NEVER on disk under ~/.claude, /tmp, or the project tree. If the user mentions 'the doc on X', 'our runbook for Y', 'the design spec', 'the ADR/RFC', 'a postmortem', 'the architecture note', 'why we decided Z' — go through:\n  · memory(action=\"search\", query=\"…\") — hybrid across docs + nodes (try this first when unsure)\n  · memory(action=\"list_docs\", query=\"…\") then memory(action=\"get_doc\", doc_id=\"<id-or-title>\")\n  · memory(action=\"decisions\", query=\"…\") for past architectural decisions\n  · session(action=\"recall\", query=\"…\") if it might be in past-session transcripts\nFalling back to filesystem tools to find a ContextStream doc is wrong — the doc is not on disk.\n\nCodebase / source / files? Use the `search` tool, not memory.\n\nPlans? Use session(action=\"capture_plan\") instead of memory(action=\"create_event\", event_type=\"plan\"). Plan tasks should be created with plan_id, plan_step_id, priority/status, and detailed descriptions.\n\nDISTINCT FROM (don't use memory for these):\n· entity(kind=ticket|handoff|incident|release|experiment|goal|key_result|sprint|review|risk|backlog_view) — structured taxonomy entities with their own status timelines and per-kind fields. When the user says 'create a ticket', 'file a bug', 'create a handoff', 'log an incident', 'track this release' — that's `entity`, not memory(create_task).\n· session(action=capture_lesson|capture|recall|capture_plan) — lessons / decisions / snapshots / plans tied to the current session.\n· capsule(...) — portable context bundles for cross-agent handoffs.\n\nThis tool's `create_task` is a lightweight project-tracking todo with priority/status — NOT a 'ticket'. This tool's `create_task` should include plan_id and plan_step_id when the task belongs to a plan. This tool's `create_doc(doc_type=runbook)` is a versioned markdown doc — NOT a 'handoff'.\n\nNode actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node (node_id accepts an id or lookup text; ambiguous text returns a [CANDIDATES] list). Query actions: search (searches memory nodes and relevant docs together, not code), decisions (typed envelope: query, category, sort=recency|relevance, status=active|superseded|disputed|verified|all, since, offset, limit), timeline, summary. Decision actions: create_decision (title, content, rationale, alternatives, scope, confidence, supersedes, category, tags), decision_action (decision_id or lookup text + decision_action=supersede|dispute|verify|invalidate|choose_successor, successor_id, reason). Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch. Task actions: create_task, get_task, update_task, delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram (diagram_type values: flowchart, sequence, class, er, gantt, mindmap, pie, other — use sequence for API/request flows and er for data models). Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap (doc_type values: roadmap, spec, runbook, adr, rfc, postmortem, retro, release_notes, playbook, prd, user_story, persona, interview, design_spec, critique, glossary, oncall_schedule, slo, q_and_a, changelog, style_guide, general — `get_doc` accepts ID or natural-language title query). Transcript actions: list_transcripts, get_transcript, search_transcripts, search_archive, delete_transcript. `search_archive` queries the cold storage tier for transcripts past the hot-retention window (remote/hosted deployments only). Team actions: team_tasks, team_todos, team_diagrams, team_docs.";
+const MEMORY_TOOL_REFERENCE: &str = "Persistent memory storage — docs, runbooks, specs, ADRs, RFCs, decisions, lessons, preferences, tasks, todos, knowledge nodes, transcripts. NOT for codebase/file search.\n\n⚠️ FINDING A DOC, RUNBOOK, SPEC, OR ARCHITECTURE NOTE? USE THIS TOOL — NOT `find`, `ls`, `grep`, or filesystem searches. ContextStream docs/runbooks/specs/decisions/lessons live ONLY in this tool's storage (Postgres + indexes), NEVER on disk under ~/.claude, /tmp, or the project tree. If the user mentions 'the doc on X', 'our runbook for Y', 'the design spec', 'the ADR/RFC', 'a postmortem', 'the architecture note', 'why we decided Z' — go through:\n  · memory(action=\"search\", query=\"…\") — hybrid across docs + nodes (try this first when unsure)\n  · memory(action=\"list_docs\", query=\"…\") then memory(action=\"get_doc\", doc_id=\"<id-or-title>\")\n  · memory(action=\"decisions\", query=\"…\") for past architectural decisions\n  · session(action=\"recall\", query=\"…\") if it might be in past-session transcripts\nFalling back to filesystem tools to find a ContextStream doc is wrong — the doc is not on disk.\n\nCodebase / source / files? Use the `search` tool, not memory.\n\nPlans? Use session(action=\"capture_plan\") instead of memory(action=\"create_event\", event_type=\"plan\"). Plan tasks should be created with plan_id, plan_step_id, priority/status, and detailed descriptions.\n\nDISTINCT FROM (don't use memory for these):\n· entity(kind=ticket|handoff|incident|release|experiment|goal|key_result|sprint|review|risk|backlog_view) — structured taxonomy entities with their own status timelines and per-kind fields. When the user says 'create a ticket', 'file a bug', 'create a handoff', 'log an incident', 'track this release' — that's `entity`, not memory(create_task).\n· session(action=capture_lesson|capture|recall|capture_plan) — lessons / decisions / snapshots / plans tied to the current session.\n· capsule(...) — portable context bundles for cross-agent handoffs.\n\nThis tool's `create_task` is a lightweight project-tracking todo with priority/status — NOT a 'ticket'. This tool's `create_task` should include plan_id and plan_step_id when the task belongs to a plan. This tool's `create_doc(doc_type=runbook)` is a versioned markdown doc — NOT a 'handoff'.\n\nNode actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node (a *_id argument takes an id or a title: get/update take a title that names one record; delete, supersede and complete need an id or the exact title; anything else returns a [CANDIDATES] list and changes nothing). Query actions: search (searches memory nodes and relevant docs together, not code), decisions (typed envelope: query, category, sort=recency|relevance, status=active|superseded|disputed|verified|all, since, offset, limit), timeline, summary. Decision actions: create_decision (title, content, rationale, alternatives, scope, confidence, supersedes, category, tags), decision_action (decision_id or lookup text + decision_action=supersede|dispute|verify|invalidate|choose_successor, successor_id, reason). Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch. Task actions: create_task, get_task, update_task, delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram (diagram_type values: flowchart, sequence, class, er, gantt, mindmap, pie, other — use sequence for API/request flows and er for data models). Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap (doc_type values: roadmap, spec, runbook, adr, rfc, postmortem, retro, release_notes, playbook, prd, user_story, persona, interview, design_spec, critique, glossary, oncall_schedule, slo, q_and_a, changelog, style_guide, general — `get_doc` accepts ID or natural-language title query). Transcript actions: list_transcripts, get_transcript, search_transcripts, search_archive, delete_transcript. `search_archive` queries the cold storage tier for transcripts past the hot-retention window (remote/hosted deployments only). Team actions: team_tasks, team_todos, team_diagrams, team_docs.";
 
 #[async_trait]
 impl ToolHandler for MemoryTool {
@@ -3591,12 +3456,18 @@ impl ToolHandler for MemoryTool {
                     .client
                     .list_memory_nodes(workspace_id, project_id, input.node_type.clone(), Some(100))
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "nodes",
+                let found = match resolve_from_collection_lookup(
+                    &NODE,
+                    LookupAction::READ,
+                    "get_node",
+                    None,
                     &node_lookup,
                     &node_listing,
-                    &["title", "summary", "name"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.get_memory_node(id).await?;
                 let node_type = result
                     .get("node_type")
@@ -3612,12 +3483,8 @@ impl ToolHandler for MemoryTool {
                     .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n\n", note));
-                }
-                text.push_str(&format!("[{}] {}\nID: {}", node_type, title, node_id_str));
-                Ok(ToolResult::with_structured(text, result))
+                let text = format!("[{}] {}\nID: {}", node_type, title, node_id_str);
+                Ok(found.tool_result(text, result))
             }
             "update_node" => {
                 let node_id = input
@@ -3628,12 +3495,18 @@ impl ToolHandler for MemoryTool {
                     .client
                     .list_memory_nodes(workspace_id, project_id, input.node_type.clone(), Some(100))
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "nodes",
+                let found = match resolve_from_collection_lookup(
+                    &NODE,
+                    LookupAction::UPDATE,
+                    "update_node",
+                    None,
                     &node_lookup,
                     &node_listing,
-                    &["title", "summary", "name"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 // Accept `new_content` as the node body too: agents reach for
                 // it by analogy with update_doc/supersede_node, and the API
                 // used to silently drop everything (no-op "success") when the
@@ -3667,12 +3540,8 @@ impl ToolHandler for MemoryTool {
                         }),
                     );
                 }
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str(&format!("Node updated: {}.\nProgress: completed.", id));
-                Ok(ToolResult::with_structured(text, result))
+                let text = format!("Node updated: {}.\nProgress: completed.", id);
+                Ok(found.tool_result(text, result))
             }
             "delete_node" => {
                 let node_id = input
@@ -3687,7 +3556,7 @@ impl ToolHandler for MemoryTool {
                     let matches = collect_bulk_delete_matches(
                         &node_listing,
                         &node_lookup,
-                        &["title", "summary", "name"],
+                        NODE.title_fields,
                     );
                     if matches.is_empty() {
                         return Err(Error::Validation(format!(
@@ -3702,13 +3571,13 @@ impl ToolHandler for MemoryTool {
                         match self.client.delete_memory_node(m.id).await {
                             Ok(_) => {
                                 deleted += 1;
-                                lines.push_str(&format!("- deleted \"{}\" ({})\n", m.title, m.id));
+                                lines.push_str(&format!("- deleted \"{}\" ({})\n", m.title(), m.id));
                             }
                             Err(e) => {
                                 errors += 1;
                                 lines.push_str(&format!(
                                     "- FAILED \"{}\" ({}): {}\n",
-                                    m.title, m.id, e
+                                    m.title(), m.id, e
                                 ));
                             }
                         }
@@ -3726,19 +3595,21 @@ impl ToolHandler for MemoryTool {
                         }),
                     ));
                 }
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "nodes",
+                let found = match resolve_from_collection_lookup(
+                    &NODE,
+                    LookupAction::DELETE,
+                    "delete_node",
+                    Some(DELETE_ALL_HINT),
                     &node_lookup,
                     &node_listing,
-                    &["title", "summary", "name"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.delete_memory_node(id).await?;
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str("Node deleted successfully.");
-                Ok(ToolResult::with_structured(text, result))
+                let text = "Node deleted successfully.";
+                Ok(found.tool_result(text, result))
             }
             "list_nodes" => {
                 // P0 #5 — PreferencesHot warm cache, scoped to
@@ -3832,8 +3703,8 @@ impl ToolHandler for MemoryTool {
                     .new_content
                     .ok_or_else(|| Error::Validation("new_content is required".to_string()))?;
                 let node_lookup = node_id.trim().to_string();
-                let (id, resolution_note) = match Uuid::parse_str(&node_lookup) {
-                    Ok(id) => (id, None),
+                let id = match Uuid::parse_str(&node_lookup) {
+                    Ok(id) => id,
                     Err(_) => {
                         let listing = self
                             .client
@@ -3844,33 +3715,16 @@ impl ToolHandler for MemoryTool {
                                 Some(100),
                             )
                             .await?;
-                        let items = extract_collection_array(&listing)
-                            .cloned()
-                            .unwrap_or_default();
-                        let ranked = rank_lookup_matches(
-                            &items,
+                        match resolve_from_collection_lookup(
+                            &NODE,
+                            LookupAction::SUPERSEDE,
+                            "supersede_node",
+                            None,
                             &node_lookup,
-                            &["title", "summary", "name"],
-                            8,
-                        );
-                        match classify_lookup_resolution(&ranked) {
-                            LookupResolution::None => {
-                                return Err(Error::Validation(format!(
-                                    "No nodes match \"{node_lookup}\". Use memory(action=\"list_nodes\") or memory(action=\"search\", query=\"{node_lookup}\") to find the node id."
-                                )));
-                            }
-                            LookupResolution::Single(best) => {
-                                let note = (!best.exact).then(|| {
-                                    format!(
-                                        "Resolved node \"{}\" to **{}** (id: {}).",
-                                        node_lookup, best.title, best.id
-                                    )
-                                });
-                                (best.id, note)
-                            }
-                            LookupResolution::Ambiguous => {
-                                return Ok(supersede_candidates_result(&node_lookup, &ranked));
-                            }
+                            &listing,
+                        )? {
+                            Lookup::Found(found) => found.id,
+                            Lookup::Candidates(candidates) => return Ok(candidates),
                         }
                     }
                 };
@@ -3879,16 +3733,11 @@ impl ToolHandler for MemoryTool {
                     reason: input.reason,
                 };
                 let result = self.client.supersede_memory_node(id, params).await?;
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&note);
-                    text.push('\n');
-                }
                 let new_id = result
                     .get("new_node_id")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                text.push_str(&format!("Node superseded: {id} → {new_id}."));
+                let text = format!("Node superseded: {id} → {new_id}.");
                 Ok(ToolResult::with_structured(text, result))
             }
             "create_decision" => {
@@ -4053,21 +3902,23 @@ impl ToolHandler for MemoryTool {
                         Some(100),
                     )
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "events",
+                let found = match resolve_from_collection_lookup(
+                    &EVENT,
+                    LookupAction::READ,
+                    "get_event",
+                    None,
                     &event_lookup,
                     &events_listing,
-                    &["title", "summary", "event_type", "content"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 match self.client.get_memory_event(id).await {
                     Ok(result) => {
                         consume_grounding_memory_tool(&self.session).await;
-                        let mut text = String::new();
-                        if let Some(note) = resolution_note {
-                            text.push_str(&format!("{}\n\n", note));
-                        }
-                        text.push_str(&format_event_detail(&result));
-                        Ok(ToolResult::with_structured(text, result))
+                        let text = format_event_detail(&result);
+                        Ok(found.tool_result(text, result))
                     }
                     Err(err) if is_not_found_error(&err) => {
                         consume_grounding_memory_tool(&self.session).await;
@@ -4108,12 +3959,18 @@ impl ToolHandler for MemoryTool {
                         Some(100),
                     )
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "events",
+                let found = match resolve_from_collection_lookup(
+                    &EVENT,
+                    LookupAction::UPDATE,
+                    "update_event",
+                    None,
                     &event_lookup,
                     &events_listing,
-                    &["title", "summary", "event_type", "content"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let params = UpdateMemoryEventParams {
                     title: input.title,
                     content: input.content,
@@ -4136,12 +3993,8 @@ impl ToolHandler for MemoryTool {
                         }),
                     );
                 }
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str(&format!("Event updated: {}.\nProgress: completed.", id));
-                Ok(ToolResult::with_structured(text, result))
+                let text = format!("Event updated: {}.\nProgress: completed.", id);
+                Ok(found.tool_result(text, result))
             }
             "delete_event" => {
                 let event_id = input
@@ -4165,7 +4018,7 @@ impl ToolHandler for MemoryTool {
                     let matches = collect_bulk_delete_matches(
                         &events_listing,
                         &event_lookup,
-                        &["title", "summary", "event_type", "content"],
+                        EVENT.title_fields,
                     );
                     if matches.is_empty() {
                         return Err(Error::Validation(format!(
@@ -4180,13 +4033,13 @@ impl ToolHandler for MemoryTool {
                         match self.client.delete_memory_event(m.id).await {
                             Ok(_) => {
                                 deleted += 1;
-                                lines.push_str(&format!("- deleted \"{}\" ({})\n", m.title, m.id));
+                                lines.push_str(&format!("- deleted \"{}\" ({})\n", m.title(), m.id));
                             }
                             Err(e) => {
                                 errors += 1;
                                 lines.push_str(&format!(
                                     "- FAILED \"{}\" ({}): {}\n",
-                                    m.title, m.id, e
+                                    m.title(), m.id, e
                                 ));
                             }
                         }
@@ -4204,19 +4057,21 @@ impl ToolHandler for MemoryTool {
                         }),
                     ));
                 }
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "events",
+                let found = match resolve_from_collection_lookup(
+                    &EVENT,
+                    LookupAction::DELETE,
+                    "delete_event",
+                    Some(DELETE_ALL_HINT),
                     &event_lookup,
                     &events_listing,
-                    &["title", "summary", "event_type", "content"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.delete_memory_event(id).await?;
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str("Event deleted successfully.");
-                Ok(ToolResult::with_structured(text, result))
+                let text = "Event deleted successfully.";
+                Ok(found.tool_result(text, result))
             }
             "distill_event" => {
                 let event_id = input
@@ -4491,20 +4346,22 @@ impl ToolHandler for MemoryTool {
                         Some(100),
                     )
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "tasks",
+                let found = match resolve_from_collection_lookup(
+                    &TASK,
+                    LookupAction::READ,
+                    "get_task",
+                    None,
                     &task_lookup,
                     &task_listing,
-                    &["title", "description", "content"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.get_task(id).await?;
                 consume_grounding_memory_tool(&self.session).await;
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n\n", note));
-                }
-                text.push_str(&format_task_detail(&result));
-                Ok(ToolResult::with_structured(text, result))
+                let text = format_task_detail(&result);
+                Ok(found.tool_result(text, result))
             }
             "update_task" => {
                 let task_id = input
@@ -4523,12 +4380,20 @@ impl ToolHandler for MemoryTool {
                         Some(100),
                     )
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "tasks",
+                let (action, hint) =
+                    lookup::update_action(input.task_status.as_deref(), OPEN_TASK_STATUSES);
+                let found = match resolve_from_collection_lookup(
+                    &TASK,
+                    action,
+                    "update_task",
+                    hint,
                     &task_lookup,
                     &task_listing,
-                    &["title", "description", "content"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let params = UpdateTaskParams {
                     title: input.title,
                     description: input.description,
@@ -4566,15 +4431,11 @@ impl ToolHandler for MemoryTool {
                                 }),
                             );
                         }
-                        let mut text = String::new();
-                        if let Some(note) = resolution_note {
-                            text.push_str(&format!("{}\n", note));
-                        }
-                        text.push_str(&format!(
+                        let text = format!(
                             "Task already has status '{}'; no changes were needed.\nProgress: completed.",
                             target_status
-                        ));
-                        return Ok(ToolResult::with_structured(text, current));
+                        );
+                        return Ok(found.tool_result(text, current));
                     }
                 }
                 let mut result = self.client.update_task(id, params).await?;
@@ -4594,12 +4455,8 @@ impl ToolHandler for MemoryTool {
                         }),
                     );
                 }
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str(&format!("Task updated: {}.\nProgress: completed.", id));
-                Ok(ToolResult::with_structured(text, result))
+                let text = format!("Task updated: {}.\nProgress: completed.", id);
+                Ok(found.tool_result(text, result))
             }
             "delete_task" => {
                 let task_id = input
@@ -4618,19 +4475,21 @@ impl ToolHandler for MemoryTool {
                         Some(100),
                     )
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "tasks",
+                let found = match resolve_from_collection_lookup(
+                    &TASK,
+                    LookupAction::DELETE,
+                    "delete_task",
+                    None,
                     &task_lookup,
                     &task_listing,
-                    &["title", "description", "content"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.delete_task(id).await?;
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str("Task deleted successfully.");
-                Ok(ToolResult::with_structured(text, result))
+                let text = "Task deleted successfully.";
+                Ok(found.tool_result(text, result))
             }
             "list_tasks" => {
                 require_explicit_task_workspace(raw_workspace_id.as_deref())?;
@@ -4797,20 +4656,22 @@ impl ToolHandler for MemoryTool {
                         page: None,
                     })
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "todos",
+                let found = match resolve_from_collection_lookup(
+                    &TODO,
+                    LookupAction::READ,
+                    "get_todo",
+                    None,
                     &todo_lookup,
                     &todo_listing,
-                    &["title", "content", "description"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.get_todo(id).await?;
                 consume_grounding_memory_tool(&self.session).await;
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n\n", note));
-                }
-                text.push_str(&format_todo_detail(&result));
-                Ok(ToolResult::with_structured(text, result))
+                let text = format_todo_detail(&result);
+                Ok(found.tool_result(text, result))
             }
             "update_todo" => {
                 let todo_id = input
@@ -4822,8 +4683,11 @@ impl ToolHandler for MemoryTool {
                     .list_todos(ListTodosParams {
                         workspace_id,
                         project_id,
-                        status: input.todo_status.clone(),
-                        priority: input.todo_priority.clone(),
+                        // `todo_status` and `todo_priority` are the new
+                        // values here, not filters: the todo being changed
+                        // does not have them yet.
+                        status: None,
+                        priority: None,
                         is_personal: input.is_personal,
                         scope: input.scope.clone(),
                         query: Some(todo_lookup.clone()),
@@ -4839,12 +4703,20 @@ impl ToolHandler for MemoryTool {
                         page: None,
                     })
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "todos",
+                let (action, hint) =
+                    lookup::update_action(input.todo_status.as_deref(), OPEN_TODO_STATUSES);
+                let found = match resolve_from_collection_lookup(
+                    &TODO,
+                    action,
+                    "update_todo",
+                    hint,
                     &todo_lookup,
                     &todo_listing,
-                    &["title", "content", "description"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let params = UpdateTodoParams {
                     title: input.title,
                     content: input.content,
@@ -4870,12 +4742,8 @@ impl ToolHandler for MemoryTool {
                         }),
                     );
                 }
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str(&format!("Todo updated: {}.\nProgress: completed.", id));
-                Ok(ToolResult::with_structured(text, result))
+                let text = format!("Todo updated: {}.\nProgress: completed.", id);
+                Ok(found.tool_result(text, result))
             }
             "delete_todo" => {
                 let todo_id = input
@@ -4904,19 +4772,21 @@ impl ToolHandler for MemoryTool {
                         page: None,
                     })
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "todos",
+                let found = match resolve_from_collection_lookup(
+                    &TODO,
+                    LookupAction::DELETE,
+                    "delete_todo",
+                    None,
                     &todo_lookup,
                     &todo_listing,
-                    &["title", "content", "description"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.delete_todo(id).await?;
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str("Todo deleted successfully.");
-                Ok(ToolResult::with_structured(text, result))
+                let text = "Todo deleted successfully.";
+                Ok(found.tool_result(text, result))
             }
             "complete_todo" => {
                 let todo_id = input
@@ -4945,19 +4815,21 @@ impl ToolHandler for MemoryTool {
                         page: None,
                     })
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "todos",
+                let found = match resolve_from_collection_lookup(
+                    &TODO,
+                    LookupAction::COMPLETE,
+                    "complete_todo",
+                    None,
                     &todo_lookup,
                     &todo_listing,
-                    &["title", "content", "description"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.complete_todo(id).await?;
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str("Todo completed successfully.");
-                Ok(ToolResult::with_structured(text, result))
+                let text = "Todo completed successfully.";
+                Ok(found.tool_result(text, result))
             }
             "list_todos" => {
                 // P1 #6 — MemoryTodosHot warm cache. 30 s TTL.
@@ -5111,19 +4983,21 @@ impl ToolHandler for MemoryTool {
                         input.diagram_type.clone(),
                     )
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "diagrams",
+                let found = match resolve_from_collection_lookup(
+                    &DIAGRAM,
+                    LookupAction::READ,
+                    "get_diagram",
+                    None,
                     &diagram_lookup,
                     &diagrams_listing,
-                    &["title", "content", "description"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.get_diagram(id).await?;
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n\n", note));
-                }
-                text.push_str("Diagram retrieved.");
-                Ok(ToolResult::with_structured(text, result))
+                let text = "Diagram retrieved.";
+                Ok(found.tool_result(text, result))
             }
             "update_diagram" => {
                 let diagram_id = input
@@ -5140,12 +5014,18 @@ impl ToolHandler for MemoryTool {
                         input.diagram_type.clone(),
                     )
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "diagrams",
+                let found = match resolve_from_collection_lookup(
+                    &DIAGRAM,
+                    LookupAction::UPDATE,
+                    "update_diagram",
+                    None,
                     &diagram_lookup,
                     &diagrams_listing,
-                    &["title", "content", "description"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let params = UpdateDiagramParams {
                     title: input.title,
                     content: input.content,
@@ -5169,12 +5049,8 @@ impl ToolHandler for MemoryTool {
                         }),
                     );
                 }
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str(&format!("Diagram updated: {}.\nProgress: completed.", id));
-                Ok(ToolResult::with_structured(text, result))
+                let text = format!("Diagram updated: {}.\nProgress: completed.", id);
+                Ok(found.tool_result(text, result))
             }
             "delete_diagram" => {
                 let diagram_id = input
@@ -5191,19 +5067,21 @@ impl ToolHandler for MemoryTool {
                         input.diagram_type.clone(),
                     )
                     .await?;
-                let (id, resolution_note) = resolve_from_collection_lookup(
-                    "diagrams",
+                let found = match resolve_from_collection_lookup(
+                    &DIAGRAM,
+                    LookupAction::DELETE,
+                    "delete_diagram",
+                    None,
                     &diagram_lookup,
                     &diagrams_listing,
-                    &["title", "content", "description"],
-                )?;
+                )? {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.delete_diagram(id).await?;
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str("Diagram deleted successfully.");
-                Ok(ToolResult::with_structured(text, result))
+                let text = "Diagram deleted successfully.";
+                Ok(found.tool_result(text, result))
             }
             "list_diagrams" => {
                 let result = self
@@ -5350,20 +5228,27 @@ impl ToolHandler for MemoryTool {
                     )));
                 }
 
-                if let Some(doc) = select_resolved_doc_match(&matches, query) {
-                    if let Some(id_str) = doc.get("id").and_then(|v| v.as_str()) {
-                        if let Ok(doc_uuid) = Uuid::parse_str(id_str) {
-                            let result = self.client.get_doc(doc_uuid).await?;
-                            let text = format!(
-                                "Resolved doc query \"{}\" to doc ID {}.\n\n{}",
-                                query,
-                                id_str,
-                                format_doc_detail(&result)
-                            );
-                            consume_grounding_memory_tool(&self.session).await;
-                            return Ok(ToolResult::with_structured(text, result));
-                        }
-                    }
+                // The rule every reference follows (see `lookup`): one doc
+                // whose title holds every word of the query is opened, and
+                // anything less gets the match list below.
+                let named = lookup::resolve(
+                    query,
+                    &lookup::candidates_from_items(&matches, DOC.title_fields),
+                    DOC.kind,
+                    false,
+                )
+                .found(DOC.kind, query);
+                if let Some(found) = named {
+                    let mut result = self.client.get_doc(found.id).await?;
+                    let text = format!(
+                        "Resolved doc query \"{}\" to doc ID {}.\n\n{}",
+                        query,
+                        found.id,
+                        format_doc_detail(&result)
+                    );
+                    found.annotate(&mut result);
+                    consume_grounding_memory_tool(&self.session).await;
+                    return Ok(ToolResult::with_structured(text, result));
                 }
 
                 let text = format_doc_matches(query, &matches);
@@ -5378,16 +5263,23 @@ impl ToolHandler for MemoryTool {
                 let doc_id = input
                     .doc_id
                     .ok_or_else(|| Error::Validation("doc_id is required".to_string()))?;
-                let (id, resolution_note) = resolve_doc_uuid_for_action(
+                let found = match resolve_doc_uuid_for_action(
                     &self.client,
                     workspace_id,
                     project_id,
                     doc_id.trim(),
-                    input.doc_type.as_deref(),
+                    // `doc_type` is the new type here, not a filter.
+                    None,
                     input.is_personal,
-                    input.limit,
+                    LookupAction::UPDATE,
+                    "update_doc",
                 )
-                .await?;
+                .await?
+                {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let params = UpdateDocParams {
                     title: input.title,
                     content: input.content,
@@ -5410,34 +5302,32 @@ impl ToolHandler for MemoryTool {
                         }),
                     );
                 }
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str(&format!("Doc updated: {}.\nProgress: completed.", id));
-                Ok(ToolResult::with_structured(text, result))
+                let text = format!("Doc updated: {}.\nProgress: completed.", id);
+                Ok(found.tool_result(text, result))
             }
             "delete_doc" => {
                 let doc_id = input
                     .doc_id
                     .ok_or_else(|| Error::Validation("doc_id is required".to_string()))?;
-                let (id, resolution_note) = resolve_doc_uuid_for_action(
+                let found = match resolve_doc_uuid_for_action(
                     &self.client,
                     workspace_id,
                     project_id,
                     doc_id.trim(),
                     input.doc_type.as_deref(),
                     input.is_personal,
-                    input.limit,
+                    LookupAction::DELETE,
+                    "delete_doc",
                 )
-                .await?;
+                .await?
+                {
+                    Lookup::Found(found) => found,
+                    Lookup::Candidates(candidates) => return Ok(candidates),
+                };
+                let id = found.id;
                 let result = self.client.delete_doc(id).await?;
-                let mut text = String::new();
-                if let Some(note) = resolution_note {
-                    text.push_str(&format!("{}\n", note));
-                }
-                text.push_str("Doc deleted successfully.");
-                Ok(ToolResult::with_structured(text, result))
+                let text = "Doc deleted successfully.";
+                Ok(found.tool_result(text, result))
             }
             "list_docs" => {
                 if let Some(query) = input.query.as_deref() {
@@ -6349,7 +6239,7 @@ impl ToolHandler for MemoryTool {
             )
             .string(
                 "event_id",
-                "Event ID or lookup text (title/content) for event operations",
+                "Event ID or lookup text (title) for event operations",
                 false,
             )
             .array(
@@ -6361,7 +6251,7 @@ impl ToolHandler for MemoryTool {
             // Task fields
             .string(
                 "task_id",
-                "Task ID or lookup text (title/description) for task operations",
+                "Task ID or lookup text (title) for task operations",
                 false,
             )
             .string(
@@ -6399,7 +6289,7 @@ impl ToolHandler for MemoryTool {
             // Todo fields
             .string(
                 "todo_id",
-                "Todo ID or lookup text (title/content) for todo operations",
+                "Todo ID or lookup text (title) for todo operations",
                 false,
             )
             .string_enum(
@@ -6422,7 +6312,7 @@ impl ToolHandler for MemoryTool {
             // Diagram fields
             .string(
                 "diagram_id",
-                "Diagram ID or lookup text (title/content) for diagram operations",
+                "Diagram ID or lookup text (title) for diagram operations",
                 false,
             )
             .string_enum(

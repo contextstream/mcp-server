@@ -16,6 +16,7 @@ use std::{env, path::Path, sync::Arc};
 use uuid::Uuid;
 
 // Re-use the string-or-vec deserializer from the session module.
+use super::lookup::{self, Lookup, LookupAction, LookupCandidate, LookupContext, RecordKind};
 use super::session::deserialize_string_or_vec;
 
 use crate::registry::ToolHandler;
@@ -361,6 +362,87 @@ impl SkillTool {
         Ok(ranked[0].id)
     }
 
+    /// Resolve the skill a destructive action names: `skill_id`, or a `name`
+    /// that is exactly one skill's name or title (the rule in `lookup`). The
+    /// looser matching `resolve_skill_id_for_action` does to find a skill to
+    /// read or run is not enough to delete or archive one.
+    async fn resolve_skill_exactly(
+        &self,
+        input: &SkillInput,
+        action: LookupAction,
+        action_name: &str,
+        hint: Option<&str>,
+    ) -> Result<Lookup> {
+        if let Some(id) = Self::parse_uuid(&input.skill_id, "skill_id")? {
+            return Ok(Lookup::Found(lookup::Found::by_id(id)));
+        }
+
+        let name = input
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                Error::Validation(format!(
+                    "Either skill_id or name is required for '{}'",
+                    action_name
+                ))
+            })?;
+
+        let workspace_id = self.resolve_workspace_id(&input.workspace_id).await;
+        let project_id = self.resolve_target_project_id(input).await?;
+        let listed = self
+            .client
+            .list_skills(
+                workspace_id,
+                project_id,
+                None,
+                None,
+                None,
+                Some(name.to_string()),
+                None,
+                Some(25),
+            )
+            .await?;
+        let mut candidates = skill_lookup_candidates(&listed);
+        if project_id.is_some() && input.target_project.is_none() {
+            // The project's skills are not the only ones the name can mean: a
+            // second skill of that name at account level makes it ambiguous.
+            let account = self
+                .client
+                .list_skills(
+                    workspace_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(name.to_string()),
+                    None,
+                    Some(25),
+                )
+                .await?;
+            candidates.extend(skill_lookup_candidates(&account));
+        }
+
+        let retry = format!("skill(action=\"{action_name}\", skill_id=\"<id>\")");
+        lookup::resolve_reference(
+            &LookupContext {
+                kind: RecordKind::new("skill", "skills"),
+                action,
+                retry: &retry,
+                hint,
+            },
+            name,
+            &candidates,
+            || {
+                format!(
+                    "Skill '{}' not found. Provide a different name or skill_id.",
+                    name
+                )
+            },
+        )
+    }
+
     fn command_exists(name: &str) -> bool {
         let Some(path_var) = env::var_os("PATH") else {
             return false;
@@ -684,7 +766,20 @@ impl SkillTool {
     }
 
     async fn handle_update(&self, input: &SkillInput) -> Result<ToolResult> {
-        let skill_id = self.resolve_skill_id_for_action(input, "update").await?;
+        // Archiving a skill through update retires it as surely as supersede
+        // does, so that update needs the same exact reference.
+        let (action, hint) = lookup::update_action(input.status.as_deref(), OPEN_SKILL_STATUSES);
+        let skill_id = if action.destructive {
+            match self
+                .resolve_skill_exactly(input, action, "update", hint)
+                .await?
+            {
+                Lookup::Found(found) => found.id,
+                Lookup::Candidates(candidates) => return Ok(candidates),
+            }
+        } else {
+            self.resolve_skill_id_for_action(input, "update").await?
+        };
 
         let result = self
             .client
@@ -720,7 +815,13 @@ impl SkillTool {
     /// matches/context and skill search. Records the replacement in the
     /// version-history change summary — no schema change required.
     async fn handle_supersede(&self, input: &SkillInput) -> Result<ToolResult> {
-        let skill_id = self.resolve_skill_id_for_action(input, "supersede").await?;
+        let skill_id = match self
+            .resolve_skill_exactly(input, LookupAction::retire("archived"), "supersede", None)
+            .await?
+        {
+            Lookup::Found(found) => found.id,
+            Lookup::Candidates(candidates) => return Ok(candidates),
+        };
 
         let change_summary = input
             .superseded_by
@@ -780,7 +881,13 @@ impl SkillTool {
     }
 
     async fn handle_delete(&self, input: &SkillInput) -> Result<ToolResult> {
-        let skill_id = self.resolve_skill_id_for_action(input, "delete").await?;
+        let skill_id = match self
+            .resolve_skill_exactly(input, LookupAction::DELETE, "delete", None)
+            .await?
+        {
+            Lookup::Found(found) => found.id,
+            Lookup::Candidates(candidates) => return Ok(candidates),
+        };
 
         self.client.delete_skill(skill_id).await?;
 
@@ -1128,6 +1235,35 @@ fn skill_candidates_from_items(value: &Value) -> Vec<RankedSkillCandidate> {
                 status,
                 score: 10,
             })
+        })
+        .collect()
+}
+
+/// Statuses that leave a skill in use. An update that sets any other status
+/// retires the skill.
+const OPEN_SKILL_STATUSES: &[&str] = &["active", "draft"];
+
+/// The skills a reference may name: each answers to its title and to its
+/// name, and is shown with its name, scope and status.
+fn skill_lookup_candidates(result: &Value) -> Vec<LookupCandidate> {
+    // `skill_candidates_from_items` writes "?" for a missing name or title.
+    // A placeholder is not something a skill answers to.
+    fn known(value: &str) -> &str {
+        if value == "?" {
+            ""
+        } else {
+            value
+        }
+    }
+    skill_candidates_from_items(result)
+        .into_iter()
+        .map(|skill| {
+            LookupCandidate::new(skill.id, known(&skill.title))
+                .also_known_as(known(&skill.name))
+                .with_detail(format!(
+                    "({}) [{}|{}]",
+                    skill.name, skill.scope, skill.status
+                ))
         })
         .collect()
 }

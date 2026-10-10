@@ -872,13 +872,27 @@ mod app_action_tests {
         .await;
         assert!(error.contains("arguments must be an object"), "{error}");
 
-        // An uninitialized session has nowhere to record the change.
+        // An uninitialized session has nowhere to record the change, and the
+        // refusal says how to give it one (a stateless client cannot run init
+        // first and have it remembered).
         let error = error_for(json!({
             "provider": "microsoft", "action": "edit", "connection_id": connection,
             "operation": "excel.range.update", "arguments": {"range": "B2"}
         }))
         .await;
-        assert!(error.contains("needs a session"), "{error}");
+        assert!(error.contains("session_id"), "{error}");
+        assert!(error.contains("init"), "{error}");
+
+        // The id init returned, passed as session_id, is all a client with no
+        // stored state needs: validation passes and the call reaches the
+        // runtime (unreachable here, so the error is not a validation one).
+        let error = error_for(json!({
+            "provider": "microsoft", "action": "edit", "connection_id": connection,
+            "operation": "excel.range.update", "arguments": {"range": "B2"},
+            "session_id": "api-assigned-session", "workspace_id": "550e8400-e29b-41d4-a716-446655440001"
+        }))
+        .await;
+        assert!(!error.contains("Validation"), "{error}");
     }
 
     #[tokio::test]

@@ -2552,10 +2552,11 @@ mod tests {
         ),
         (
             // Additive: connected-app actions (apps, find, read,
-            // capabilities, edit), their fields, and the runtime providers
-            // (microsoft, google_workspace, dropbox, box).
+            // capabilities, edit), their fields (session_id is the id init
+            // returned, for clients that keep no state), and the runtime
+            // providers (microsoft, google_workspace, dropbox, box).
             "integration",
-            "42d3df4988616bb872a2c1865d63cc154f3423d27bd2cbeb00cd926938b68658",
+            "d6d7fce258e02def04847766a5c4b0ecac466883a2a4c6ffcbf4dddf978d0ed7",
         ),
         (
             "media",

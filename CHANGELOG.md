@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.0.19
+
+- Connected apps: the `integration` tool now reaches the apps a person connects
+  in ContextStream (Microsoft 365, Google Workspace, Dropbox, Box, and Slack,
+  Notion, Linear and Figma), so an agent can find an item, read it as it is now
+  and change it (#160). Five new actions: `apps` (what is connected, and how far
+  an agent may go in each: read only, read and propose edits, or read and edit),
+  `find` (one live search by name across every connected app; each hit carries
+  the ids `read` takes), `read` (an item attached with `@` by `reference_id`, an
+  item `find` returned by `connection_id` and `resource_id`, or a named
+  `operation` with its `arguments`; the result carries the item's revision),
+  `capabilities` (the operations an agent can run on one connection, with their
+  arguments, and whether edits apply directly) and `edit` (prepares and applies
+  a change in one call; the result says whether it was applied and confirmed, is
+  waiting for approval, or was refused, and on a revision conflict the agent is
+  told to read again and retry). `provider` gains `microsoft`, `google_workspace`,
+  `dropbox` and `box`. The actions call the hosted API's integration runtime;
+  against an older API they return its error and nothing else changes. Every
+  action still needs `provider` (use `all` when no one app is meant), and
+  `workspace_id` when the client keeps no state.
+- Connected apps, `edit` on a client that keeps no state: an edit is recorded
+  under a session, and the hosted gateway on the stateless 2026-07-28 contract
+  (Claude Code) has none stored between calls, so `edit` could only refuse and
+  `init` could not help. `integration` now accepts `session_id`, the id `init`
+  returned (its `resume_hint` names it). Without one the id the API assigned at
+  `init` is used, then the server's local id, and the refusal says to pass
+  `session_id` (#163). `apps`, `find`, `read` and `capabilities` need no session.
+- The `integration` tool's description is a routing summary under 1,024
+  characters, and the full action reference moved to the `action` parameter, as
+  for `capsule`, `entity` and `memory` (#160). The schema change is additive. The
+  tool text reaches hosted clients when the hosted gateway runs this version.
+- Hooks: text is cut on a character boundary. The SessionEnd, PreCompact,
+  SubagentStop and SubagentStart handlers cut text at a byte count (a tool
+  result at 2000 bytes, a subagent summary at 4000, a Plan subagent's title at
+  120 and description at 12000, a decision preview at 200) and panicked when an
+  emoji, a CJK character or an accented letter straddled the cut, which lost the
+  capture. ASCII output is unchanged; other text is cut at the start of the
+  straddling character (#161). Two similar byte slices outside the hooks, an
+  HTTP error detail in `setup/profile.rs` and API key masking in `setup/mod.rs`,
+  are not changed here. The fix takes effect on a machine that runs this version
+  of the binary.
+- Dependencies: `uuid` 1.26.1 to 1.27.0 and `libc` 0.2.189 to 0.2.190, in
+  `Cargo.lock` only; `Cargo.toml` is unchanged (#155). The `attest-build-provenance`
+  pin in the legacy release workflow moved to 4.2.2 (#156); releases are not
+  built by that workflow.
+
 ## 1.0.18
 
 - Resume: agents are now told how to resume, with their own session id. A

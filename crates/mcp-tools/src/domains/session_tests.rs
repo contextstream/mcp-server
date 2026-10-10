@@ -3737,9 +3737,9 @@ mod validation_tests {
 
     use super::{
         build_plan_candidate_listing, degenerate_title_reason, format_plan_text,
-        format_team_surfacing, plan_id, plan_lookup_terms, plan_title,
-        select_latest_actionable_plan, select_latest_from_plan_sets, select_named_plan_from_sets,
-        validate_capture_plan_input,
+        format_team_surfacing, plan_id, plan_title, select_latest_actionable_plan,
+        select_latest_from_plan_sets, select_named_plan_from_sets, validate_capture_plan_input,
+        NamedPlan,
     };
     use super::{
         create_mock_client, create_mock_index_keeper, create_mock_index_keeper_from,
@@ -3750,6 +3750,7 @@ mod validation_tests {
         SessionCompressTool, SessionDecisionTraceTool, SessionDeltaTool, SessionRememberTool,
         SessionSmartSearchTool, SessionTool, TestFixtures, UpdatePlanTool,
     };
+    use crate::domains::lookup::{MatchGrade, Unresolved};
 
     fn mock_status_text(code: u16) -> &'static str {
         match code {
@@ -4270,20 +4271,45 @@ mod validation_tests {
             }
         ]);
 
-        let selected = select_named_plan_from_sets(
+        let NamedPlan::Found { plan, grade } = select_named_plan_from_sets(
             &[&scoped_plans, &workspace_plans],
             "fix daily recap on dashboard",
-        )
-        .expect("named plan should resolve");
+        ) else {
+            panic!("the exact title should resolve");
+        };
 
-        assert_eq!(
-            plan_id(&selected),
-            Some("22222222-2222-4222-8222-222222222222")
-        );
+        assert_eq!(plan_id(&plan), Some("22222222-2222-4222-8222-222222222222"));
+        assert_eq!(grade, Some(MatchGrade::ExactTitle));
     }
 
     #[test]
-    fn test_select_named_plan_from_sets_falls_back_to_content_match() {
+    fn test_select_named_plan_from_sets_resolves_the_one_title_with_every_word() {
+        let plans = json!([
+            {
+                "id": "11111111-1111-4111-8111-111111111111",
+                "title": "Fix Daily Recap On Dashboard",
+                "status": "active"
+            },
+            {
+                "id": "22222222-2222-4222-8222-222222222222",
+                "title": "Dashboard theming",
+                "status": "active"
+            }
+        ]);
+
+        let NamedPlan::Found { plan, grade } =
+            select_named_plan_from_sets(&[&plans], "daily recap dashboard")
+        else {
+            panic!("one title holds every word of the reference");
+        };
+
+        assert_eq!(plan_id(&plan), Some("11111111-1111-4111-8111-111111111111"));
+        assert_eq!(grade, Some(MatchGrade::AllWords));
+    }
+
+    #[test]
+    fn test_select_named_plan_from_sets_does_not_search_plan_content() {
+        // Before, a phrase found only in a plan's content resolved that plan.
         let plans = json!([
             {
                 "id": "11111111-1111-4111-8111-111111111111",
@@ -4294,17 +4320,16 @@ mod validation_tests {
             }
         ]);
 
-        let selected = select_named_plan_from_sets(&[&plans], "daily recap card")
-            .expect("content match should resolve");
-
-        assert_eq!(
-            plan_id(&selected),
-            Some("11111111-1111-4111-8111-111111111111")
-        );
+        assert!(matches!(
+            select_named_plan_from_sets(&[&plans], "daily recap card"),
+            NamedPlan::None
+        ));
     }
 
     #[test]
-    fn test_select_named_plan_from_sets_uses_term_overlap_for_natural_prompt() {
+    fn test_select_named_plan_from_sets_does_not_pick_on_partial_overlap() {
+        // Before, any plan sharing a word or two with the prompt was picked,
+        // however many of the prompt's words its title lacked.
         let plans = json!([
             {
                 "id": "11111111-1111-4111-8111-111111111111",
@@ -4315,16 +4340,64 @@ mod validation_tests {
             }
         ]);
 
-        let selected = select_named_plan_from_sets(
-            &[&plans],
-            "Check mcp tool to see if it can retrieve data about code quality and dependencies that were run in the dashboard",
-        )
-        .expect("term-overlap natural prompt should resolve");
+        assert!(matches!(
+            select_named_plan_from_sets(
+                &[&plans],
+                "Check mcp tool to see if it can retrieve data about code quality and dependencies that were run in the dashboard",
+            ),
+            NamedPlan::None
+        ));
+        assert!(matches!(
+            select_named_plan_from_sets(&[&plans], "quality dashboard"),
+            NamedPlan::None
+        ));
+    }
 
-        assert_eq!(
-            plan_id(&selected),
-            Some("11111111-1111-4111-8111-111111111111")
-        );
+    #[test]
+    fn test_select_named_plan_from_sets_returns_a_tie_as_a_tie() {
+        // Before, the newest non-terminal plan won a tie.
+        let twins = json!([
+            {
+                "id": "11111111-1111-4111-8111-111111111111",
+                "title": "Release cutover",
+                "status": "completed",
+                "updated_at": "2026-05-13T12:00:00Z"
+            },
+            {
+                "id": "22222222-2222-4222-8222-222222222222",
+                "title": "release cutover",
+                "status": "active",
+                "updated_at": "2026-05-14T12:00:00Z"
+            }
+        ]);
+        let NamedPlan::Tied(reason, tied) =
+            select_named_plan_from_sets(&[&twins], "Release cutover")
+        else {
+            panic!("two plans with one title must not resolve");
+        };
+        assert_eq!(reason, Unresolved::DuplicateTitle);
+        assert_eq!(tied.len(), 2);
+
+        let close = json!([
+            {"id": "11111111-1111-4111-8111-111111111111", "title": "Release cutover for web"},
+            {"id": "22222222-2222-4222-8222-222222222222", "title": "Release cutover for mobile"}
+        ]);
+        let NamedPlan::Tied(reason, tied) =
+            select_named_plan_from_sets(&[&close], "release cutover")
+        else {
+            panic!("two titles that hold every word must not resolve");
+        };
+        assert_eq!(reason, Unresolved::Ambiguous);
+        assert_eq!(tied.len(), 2);
+
+        // The same plan in the project and the workspace listing is one plan.
+        let listed_twice = json!([
+            {"id": "11111111-1111-4111-8111-111111111111", "title": "Release cutover"}
+        ]);
+        assert!(matches!(
+            select_named_plan_from_sets(&[&listed_twice, &listed_twice], "release cutover"),
+            NamedPlan::Found { .. }
+        ));
     }
 
     #[test]
@@ -4506,19 +4579,6 @@ mod validation_tests {
         );
         assert_eq!(structured["plan_resolution"]["mode"], json!("no_plans"));
         assert_eq!(structured["plan_resolution"]["candidate_count"], json!(0));
-    }
-
-    #[test]
-    fn test_plan_lookup_terms_keep_plural_variant_keywords() {
-        let terms = plan_lookup_terms(
-            "Check mcp tool to see code quality and dependencies in the dashboard",
-        );
-
-        assert!(terms.contains(&"quality".to_string()));
-        assert!(terms.contains(&"dependencies".to_string()));
-        assert!(terms.contains(&"dependency".to_string()));
-        assert!(terms.contains(&"dashboard".to_string()));
-        assert!(!terms.contains(&"mcp".to_string()));
     }
 
     #[test]
@@ -4744,16 +4804,20 @@ mod validation_tests {
             .expect("update_lesson should succeed");
 
         let text = extract_text(&result);
-        assert!(text.contains("Resolved lesson"));
+        assert!(text.contains(
+            "Resolved \"shell quoting failure\" to lesson **Recurring shell quoting failure**"
+        ));
         assert!(text.contains("Lesson updated"));
         assert!(text.contains("[PARTIAL] /lessons endpoint unavailable (404)"));
+        if let Some(structured) = result.structured_content.as_ref() {
+            assert_eq!(structured["lookup_resolution"]["resolved_id"], lesson_id);
+            assert_eq!(structured["lookup_resolution"]["match"], "all_words");
+        }
         server_thread.join().expect("mock server should complete");
     }
 
-    #[tokio::test]
-    async fn test_session_tool_delete_lesson_resolves_lookup_and_deletes_event() {
-        let lesson_id = "22222222-2222-4222-8222-222222222222";
-        let (base_url, server_thread) = spawn_ordered_http_server(vec![
+    fn lesson_event_search(lesson_id: &str) -> Vec<(String, String, u16, String)> {
+        vec![
             (
                 "GET".to_string(),
                 "/api/v1/lessons?".to_string(),
@@ -4776,17 +4840,16 @@ mod validation_tests {
                 })
                 .to_string(),
             ),
-            (
-                "DELETE".to_string(),
-                format!("/api/v1/memory/events/{}", lesson_id),
-                200,
-                serde_json::json!({
-                    "deleted": true,
-                    "id": lesson_id
-                })
-                .to_string(),
-            ),
-        ]);
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_session_tool_delete_lesson_refuses_a_title_that_is_not_exact() {
+        // Before, this reference deleted the lesson: its title contains it.
+        let lesson_id = "22222222-2222-4222-8222-222222222222";
+        // The mock answers the two lookups and nothing else, so a DELETE
+        // would fail the call instead of returning candidates.
+        let (base_url, server_thread) = spawn_ordered_http_server(lesson_event_search(lesson_id));
         let (client, session) = create_client_and_session_with_base_url(base_url);
         let tool = SessionTool::new(client, session, mcp_types::atlas_layer::noop_layer());
 
@@ -4796,17 +4859,53 @@ mod validation_tests {
                 "lesson_id": "dashboard recap card sorting"
             }))
             .await
+            .expect("an inexact title is answered with candidates");
+
+        assert!(result.is_error);
+        let text = extract_text(&result);
+        assert!(text.starts_with(
+            "[CANDIDATES] \"dashboard recap card sorting\" is not the id or the exact title of any lesson; nothing was deleted."
+        ));
+        assert!(text.contains(lesson_id));
+        assert!(text.contains("Retry: session(action=\"delete_lesson\", lesson_id=\"<id>\")"));
+        server_thread.join().expect("mock server should complete");
+    }
+
+    #[tokio::test]
+    async fn test_session_tool_delete_lesson_deletes_the_lesson_with_the_exact_title() {
+        let lesson_id = "22222222-2222-4222-8222-222222222222";
+        let mut expectations = lesson_event_search(lesson_id);
+        expectations.push((
+            "DELETE".to_string(),
+            format!("/api/v1/memory/events/{}", lesson_id),
+            200,
+            serde_json::json!({
+                "deleted": true,
+                "id": lesson_id
+            })
+            .to_string(),
+        ));
+        let (base_url, server_thread) = spawn_ordered_http_server(expectations);
+        let (client, session) = create_client_and_session_with_base_url(base_url);
+        let tool = SessionTool::new(client, session, mcp_types::atlas_layer::noop_layer());
+
+        let result = tool
+            .execute(json!({
+                "action": "delete_lesson",
+                "lesson_id": "fix dashboard recap card SORTING"
+            }))
+            .await
             .expect("delete_lesson should succeed");
 
+        assert!(!result.is_error);
         let text = extract_text(&result);
-        assert!(text.contains("Resolved lesson"));
         assert!(text.contains("Lesson deleted"));
         assert!(text.contains("[PARTIAL] /lessons endpoint unavailable (404)"));
         server_thread.join().expect("mock server should complete");
     }
 
     #[tokio::test]
-    async fn test_session_tool_update_lesson_returns_ambiguity_error_for_lookup() {
+    async fn test_session_tool_update_lesson_returns_candidates_for_an_ambiguous_lookup() {
         let lesson_a = "33333333-3333-4333-8333-333333333333";
         let lesson_b = "44444444-4444-4444-8444-444444444444";
         let (base_url, server_thread) = spawn_ordered_http_server(vec![(
@@ -4840,13 +4939,16 @@ mod validation_tests {
                 "lesson_id": "dashboard recap card",
                 "title": "Updated title"
             }))
-            .await;
+            .await
+            .expect("an ambiguous title is answered with candidates");
 
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("Multiple lessons match"));
-        assert!(err.contains(lesson_a));
-        assert!(err.contains(lesson_b));
+        assert!(result.is_error);
+        let text = extract_text(&result);
+        assert!(text.starts_with(
+            "[CANDIDATES] 2 lessons match \"dashboard recap card\" equally well; nothing was updated."
+        ));
+        assert!(text.contains(lesson_a));
+        assert!(text.contains(lesson_b));
         server_thread.join().expect("mock server should complete");
     }
 

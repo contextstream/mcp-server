@@ -71,6 +71,9 @@ use crate::domains::account_mode::{
     parse_account_mode_override, refresh_account_execution_state,
 };
 use crate::domains::grounding::looks_like_historical_status_claim;
+use crate::domains::lookup::{
+    self, Lookup, LookupAction, LookupCandidate, LookupContext, RecordKind,
+};
 use crate::domains::scope::{
     attach_scope_recovery_metadata, is_scope_access_error, recover_write_scope_after_project_error,
     resolve_read_scope, resolve_write_scope, ResolvedReadScope,
@@ -6261,7 +6264,7 @@ fn lesson_title_from_value(value: &str) -> String {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(|line| line.trim_start_matches('#').trim().to_string())
-        .unwrap_or_else(|| "Untitled lesson".to_string())
+        .unwrap_or_else(|| UNTITLED_LESSON.to_string())
 }
 
 fn lesson_guidance_from_value(value: &str) -> String {
@@ -11714,31 +11717,41 @@ pub(crate) const LESSONS_LIST_PARTIAL: &str =
 
 /// Where a lesson id was resolved and whether the typed endpoint exists.
 struct LessonTarget {
-    id: Uuid,
-    note: Option<String>,
+    found: lookup::Found,
     /// `false` once `GET /lessons` answered 404 for this server.
     lessons_api_available: bool,
 }
 
-/// Resolve a lesson from a UUID or lookup text: typed `/lessons` listing
-/// first, events-based search when the server answers 404.
+/// A lesson reference: the lesson to act on, or the candidate list to answer
+/// the call with.
+enum LessonLookup {
+    Target(LessonTarget),
+    Candidates(ToolResult),
+}
+
+const LESSONS: RecordKind<'static> = RecordKind::new("lesson", "lessons");
+
+/// Resolve a lesson from a UUID or a title: typed `/lessons` listing first,
+/// events-based search when the server answers 404. `retry` is the call to
+/// repeat with an id.
 async fn resolve_lesson_target(
     client: &ContextStreamClient,
     workspace_id: Option<Uuid>,
     project_id: Option<Uuid>,
     lookup: &str,
     limit: Option<i64>,
-) -> Result<LessonTarget> {
+    action: LookupAction,
+    retry: &str,
+) -> Result<LessonLookup> {
     let lookup = lookup.trim();
     if let Ok(id) = Uuid::parse_str(lookup) {
-        return Ok(LessonTarget {
-            id,
-            note: None,
+        return Ok(LessonLookup::Target(LessonTarget {
+            found: lookup::Found::by_id(id),
             lessons_api_available: true,
-        });
+        }));
     }
     let search_limit = limit.unwrap_or(50).clamp(10, 100);
-    match client
+    let (lessons, lessons_api_available) = match client
         .list_lessons(mcp_client::ListLessonsParams {
             workspace_id,
             project_id,
@@ -11749,27 +11762,36 @@ async fn resolve_lesson_target(
         })
         .await
     {
-        Ok(envelope) => {
-            let items = extract_result_items(&envelope);
-            let ranked = rank_lesson_matches(&items, lookup);
-            let (id, note) = pick_lesson_match(lookup, &ranked)?;
-            Ok(LessonTarget {
-                id,
-                note,
-                lessons_api_available: true,
-            })
-        }
-        Err(err) if is_not_found_error(&err) => {
-            let (id, note) =
-                resolve_lesson_event_id(client, workspace_id, project_id, lookup, limit).await?;
-            Ok(LessonTarget {
-                id,
-                note,
-                lessons_api_available: false,
-            })
-        }
-        Err(err) => Err(err),
-    }
+        Ok(envelope) => (extract_result_items(&envelope), true),
+        Err(err) if is_not_found_error(&err) => (
+            lesson_events_matching(client, workspace_id, project_id, lookup, search_limit).await?,
+            false,
+        ),
+        Err(err) => return Err(err),
+    };
+    let resolved = lookup::resolve_reference(
+        &LookupContext {
+            kind: LESSONS,
+            action,
+            retry,
+            hint: None,
+        },
+        lookup,
+        &lesson_candidates(&lessons),
+        || {
+            format!(
+                "No lessons found matching \"{}\". Use session(action=\"get_lessons\", query=\"{}\") to inspect candidates.",
+                lookup, lookup
+            )
+        },
+    )?;
+    Ok(match resolved {
+        Lookup::Found(found) => LessonLookup::Target(LessonTarget {
+            found,
+            lessons_api_available,
+        }),
+        Lookup::Candidates(candidates) => LessonLookup::Candidates(candidates),
+    })
 }
 
 // Lesson deduplication: 2-minute window to prevent duplicate captures.
@@ -12061,123 +12083,42 @@ fn extract_result_items(value: &Value) -> Vec<Value> {
     Vec::new()
 }
 
-fn normalize_lesson_lookup(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+/// Shown for a lesson that has no title.
+const UNTITLED_LESSON: &str = "Untitled lesson";
 
-#[derive(Debug, Clone)]
-struct RankedLessonMatch {
-    id: Uuid,
-    title: String,
-    score: i64,
-    exact: bool,
-}
-
-fn rank_lesson_matches(items: &[Value], lookup: &str) -> Vec<RankedLessonMatch> {
-    let raw = lookup.trim();
-    let normalized = normalize_lesson_lookup(raw);
-    if raw.is_empty() {
-        return Vec::new();
-    }
-
-    let mut ranked = Vec::new();
-    for lesson in items {
-        let id = lesson
-            .get("id")
-            .and_then(|v| v.as_str())
-            .and_then(|value| Uuid::parse_str(value).ok());
-        let Some(id) = id else { continue };
-
-        let title = extract_lesson_title(lesson);
-        let title_norm = normalize_lesson_lookup(&title);
-        let mut score = 0i64;
-        let mut exact = false;
-
-        if id.to_string().eq_ignore_ascii_case(raw) {
-            score = 10_000;
-            exact = true;
-        } else if !normalized.is_empty() && title_norm == normalized {
-            score = 9_000;
-            exact = true;
-        } else if !normalized.is_empty() && title_norm.contains(&normalized) {
-            score = 7_200;
-        } else if !normalized.is_empty()
-            && normalized.contains(&title_norm)
-            && title_norm.len() >= 8
-        {
-            score = 6_500;
-        } else if !normalized.is_empty() {
-            let terms: Vec<&str> = normalized.split_whitespace().collect();
-            let matched = terms
-                .iter()
-                .filter(|term| title_norm.contains(**term))
-                .count();
-            if matched > 0 {
-                score = 2_400 + (matched as i64 * 140);
-                if matched == terms.len() && !terms.is_empty() {
-                    score += 600;
-                }
-            }
-        }
-
-        if score > 0 {
-            ranked.push(RankedLessonMatch {
+/// The lessons a reference may name, by title. A lesson without a title is
+/// named only by its id.
+fn lesson_candidates(lessons: &[Value]) -> Vec<LookupCandidate> {
+    lessons
+        .iter()
+        .filter_map(|lesson| {
+            let id = lesson
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|value| Uuid::parse_str(value).ok())?;
+            let title = extract_lesson_title(lesson);
+            Some(LookupCandidate::new(
                 id,
-                title,
-                score,
-                exact,
-            });
-        }
-    }
-
-    ranked.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
-    ranked
+                if title == UNTITLED_LESSON { "" } else { &title },
+            ))
+        })
+        .collect()
 }
 
-fn format_lesson_disambiguation(lookup: &str, matches: &[RankedLessonMatch]) -> String {
-    let mut text = format!(
-        "Multiple lessons match \"{}\". Please retry with an explicit lesson_id:\n\n",
-        lookup
-    );
-    for (idx, item) in matches.iter().take(5).enumerate() {
-        text.push_str(&format!(
-            "{}. **{}** (id: {})\n",
-            idx + 1,
-            item.title,
-            item.id
-        ));
-    }
-    text
-}
-
-async fn resolve_lesson_event_id(
+/// Lessons stored as memory events, for a server without the typed `/lessons`
+/// endpoints: the lesson search first, the lesson event listing when that
+/// finds nothing.
+async fn lesson_events_matching(
     client: &ContextStreamClient,
     workspace_id: Option<Uuid>,
     project_id: Option<Uuid>,
     lookup: &str,
-    limit: Option<i64>,
-) -> Result<(Uuid, Option<String>)> {
-    if let Ok(id) = Uuid::parse_str(lookup.trim()) {
-        return Ok((id, None));
-    }
-
-    let search_limit = limit.unwrap_or(50).clamp(10, 100);
+    search_limit: i64,
+) -> Result<Vec<Value>> {
     let mut lessons = extract_result_items(
         &client
             .session_get_lessons(mcp_client::SessionGetLessonsParams {
-                query: Some(lookup.trim().to_string()),
+                query: Some(lookup.to_string()),
                 limit: Some(search_limit),
                 workspace_id,
                 project_id,
@@ -12202,36 +12143,7 @@ async fn resolve_lesson_event_id(
             .filter(is_lesson_result)
             .collect::<Vec<_>>();
     }
-
-    let ranked = rank_lesson_matches(&lessons, lookup);
-    pick_lesson_match(lookup, &ranked)
-}
-
-/// Single high-confidence match wins; several close matches return the
-/// disambiguation list as a validation error.
-fn pick_lesson_match(lookup: &str, ranked: &[RankedLessonMatch]) -> Result<(Uuid, Option<String>)> {
-    let best = ranked.first().ok_or_else(|| {
-        Error::Validation(format!(
-            "No lessons found matching \"{}\". Use session(action=\"get_lessons\", query=\"{}\") to inspect candidates.",
-            lookup, lookup
-        ))
-    })?;
-    let second_score = ranked.get(1).map(|m| m.score).unwrap_or_default();
-    if !best.exact && second_score > 0 && best.score <= second_score + 200 {
-        return Err(Error::Validation(format_lesson_disambiguation(
-            lookup, ranked,
-        )));
-    }
-
-    let note = if best.exact {
-        None
-    } else {
-        Some(format!(
-            "Resolved lesson \"{}\" to **{}** (id: {}).",
-            lookup, best.title, best.id
-        ))
-    };
-    Ok((best.id, note))
+    Ok(lessons)
 }
 
 fn extract_tags(item: &Value) -> Vec<String> {
@@ -12379,7 +12291,7 @@ fn extract_lesson_title(item: &Value) -> String {
                     })
                 })
         })
-        .unwrap_or_else(|| "Untitled lesson".to_string())
+        .unwrap_or_else(|| UNTITLED_LESSON.to_string())
 }
 
 fn extract_related_knowledge_title(item: &Value) -> String {
@@ -14664,7 +14576,7 @@ fn build_plan_candidate_listing(lookup: Option<&str>, candidates: &[Value]) -> (
 
     let mut text = match lookup {
         Some(query) => format!(
-            "No plan title or description matched '{query}'. {} plan(s) in scope — open one by id:\n",
+            "No plan title matched '{query}'. {} plan(s) in scope — open one by id:\n",
             shown.len()
         ),
         None => format!(
@@ -14708,122 +14620,6 @@ fn select_latest_from_plan_sets(plan_sets: &[&Value]) -> Option<Value> {
     select_latest_actionable_plan(&Value::Array(candidates))
 }
 
-fn normalize_plan_lookup(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-}
-
-fn is_plan_lookup_stopword(term: &str) -> bool {
-    matches!(
-        term,
-        "a" | "about"
-            | "after"
-            | "already"
-            | "an"
-            | "and"
-            | "are"
-            | "as"
-            | "be"
-            | "can"
-            | "check"
-            | "data"
-            | "do"
-            | "does"
-            | "for"
-            | "from"
-            | "has"
-            | "have"
-            | "if"
-            | "in"
-            | "into"
-            | "is"
-            | "it"
-            | "its"
-            | "look"
-            | "mcp"
-            | "of"
-            | "on"
-            | "or"
-            | "plan"
-            | "please"
-            | "pull"
-            | "retrieve"
-            | "run"
-            | "see"
-            | "should"
-            | "that"
-            | "the"
-            | "there"
-            | "this"
-            | "to"
-            | "tool"
-            | "was"
-            | "were"
-            | "with"
-    )
-}
-
-fn push_plan_lookup_term(term: &str, seen: &mut HashSet<String>, terms: &mut Vec<String>) {
-    let term = term.trim().to_ascii_lowercase();
-    if term.len() < 3 || is_plan_lookup_stopword(&term) {
-        return;
-    }
-
-    if seen.insert(term.clone()) {
-        terms.push(term.clone());
-    }
-
-    let singular = if term.ends_with("ies") && term.len() > 4 {
-        Some(format!("{}y", &term[..term.len() - 3]))
-    } else if term.ends_with('s') && term.len() > 4 {
-        Some(term.trim_end_matches('s').to_string())
-    } else {
-        None
-    };
-
-    if let Some(singular) = singular {
-        if singular.len() >= 3 && seen.insert(singular.clone()) {
-            terms.push(singular);
-        }
-    }
-}
-
-fn plan_lookup_terms(query: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut terms = Vec::new();
-    let mut current = String::new();
-
-    for ch in query.chars() {
-        if ch.is_alphanumeric() {
-            current.push(ch);
-        } else if !current.is_empty() {
-            push_plan_lookup_term(&current, &mut seen, &mut terms);
-            current.clear();
-        }
-    }
-
-    if !current.is_empty() {
-        push_plan_lookup_term(&current, &mut seen, &mut terms);
-    }
-
-    terms
-}
-
-fn plan_lookup_text(plan: &Value) -> String {
-    [
-        plan.get("title").and_then(|v| v.as_str()),
-        plan.get("content").and_then(|v| v.as_str()),
-        plan.get("description").and_then(|v| v.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join("\n")
-}
-
 fn collect_unique_plan_candidates(plan_sets: &[&Value]) -> Vec<Value> {
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -14844,110 +14640,109 @@ fn collect_unique_plan_candidates(plan_sets: &[&Value]) -> Vec<Value> {
     candidates
 }
 
-fn score_plan_candidate_for_query(plan: &Value, normalized_query: &str, terms: &[String]) -> i64 {
-    if normalized_query.is_empty() {
-        return 0;
-    }
+const PLANS: RecordKind<'static> = RecordKind::new("plan", "plans");
 
-    let title_norm = normalize_plan_lookup(plan_title(plan));
-    let text_norm = normalize_plan_lookup(&plan_lookup_text(plan));
+/// Statuses that leave a plan open. An update that sets any other status
+/// retires the plan.
+const OPEN_PLAN_STATUSES: &[&str] = &["draft", "active"];
 
-    if title_norm == normalized_query {
-        return 10_000;
-    }
-    if title_norm.contains(normalized_query) {
-        return 8_000;
-    }
-    if text_norm.contains(normalized_query) {
-        return 6_000;
-    }
-
-    let title_matches = terms
+/// The plans a reference may name, by title, each shown with its status and
+/// progress. A plan without a title is named only by its id.
+fn plan_lookup_candidates(plans: &[Value]) -> Vec<LookupCandidate> {
+    plans
         .iter()
-        .filter(|term| title_norm.contains(term.as_str()))
-        .count() as i64;
-    let text_matches = terms
-        .iter()
-        .filter(|term| text_norm.contains(term.as_str()))
-        .count() as i64;
-
-    if title_matches == 0 && text_matches == 0 {
-        return 0;
-    }
-
-    let mut score = title_matches * 240 + text_matches * 120;
-    if title_matches >= 2 {
-        score += 600;
-    }
-    if text_matches >= 3 {
-        score += 300;
-    }
-    score
+        .filter_map(|plan| {
+            let id = plan_id(plan).and_then(|id| Uuid::parse_str(id).ok())?;
+            let title = plan
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            Some(LookupCandidate::new(id, title).with_detail(format!(
+                "[{}] ({:.1}%)",
+                plan_status(plan),
+                plan_progress(plan)
+            )))
+        })
+        .collect()
 }
 
-fn select_named_plan_from_sets(plan_sets: &[&Value], query: &str) -> Option<Value> {
-    let normalized_query = normalize_plan_lookup(query);
-    if normalized_query.is_empty() {
-        return select_latest_from_plan_sets(plan_sets);
-    }
+/// What a plan title resolved to among the plans listed.
+#[derive(Debug)]
+enum NamedPlan {
+    /// The one plan the title names, and how well its title matches.
+    Found {
+        plan: Value,
+        grade: Option<lookup::MatchGrade>,
+    },
+    /// Plans the title fits equally well. None is picked.
+    Tied(lookup::Unresolved, Vec<Value>),
+    /// No plan title holds every word of the reference.
+    None,
+}
 
-    let candidates = collect_unique_plan_candidates(plan_sets);
-    let exact_title_matches = candidates
-        .iter()
-        .filter(|plan| normalize_plan_lookup(plan_title(plan)) == normalized_query)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !exact_title_matches.is_empty() {
-        return select_latest_actionable_plan(&Value::Array(exact_title_matches));
+/// Resolve a plan by title for a read, by the rule every reference follows
+/// (see `lookup`): the one plan with that exact title, or the one plan whose
+/// title holds every word. A plan's description is not searched, and a tie is
+/// returned as a tie instead of being broken by status or recency.
+fn select_named_plan_from_sets(plan_sets: &[&Value], query: &str) -> NamedPlan {
+    let plans = collect_unique_plan_candidates(plan_sets);
+    let take = |id: Uuid| {
+        plans
+            .iter()
+            .find(|plan| plan_id(plan).and_then(|raw| Uuid::parse_str(raw).ok()) == Some(id))
+            .cloned()
+    };
+    match lookup::resolve(query, &plan_lookup_candidates(&plans), PLANS, false) {
+        lookup::Outcome::Found { id, grade, .. } => match take(id) {
+            Some(plan) => NamedPlan::Found { plan, grade },
+            None => NamedPlan::None,
+        },
+        lookup::Outcome::Unresolved {
+            reason: reason @ (lookup::Unresolved::DuplicateTitle | lookup::Unresolved::Ambiguous),
+            candidates,
+        } => NamedPlan::Tied(
+            reason,
+            candidates
+                .iter()
+                .filter_map(|ranked| take(ranked.candidate.id))
+                .collect(),
+        ),
+        lookup::Outcome::Unresolved { .. } | lookup::Outcome::NoMatch => NamedPlan::None,
     }
+}
 
-    let title_matches = candidates
-        .iter()
-        .filter(|plan| normalize_plan_lookup(plan_title(plan)).contains(&normalized_query))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !title_matches.is_empty() {
-        return select_latest_actionable_plan(&Value::Array(title_matches));
-    }
-
-    let text_matches = candidates
-        .iter()
-        .filter(|plan| normalize_plan_lookup(&plan_lookup_text(plan)).contains(&normalized_query))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !text_matches.is_empty() {
-        return select_latest_actionable_plan(&Value::Array(text_matches));
-    }
-
-    let terms = plan_lookup_terms(query);
-    candidates
-        .into_iter()
-        .enumerate()
-        .filter_map(|(idx, plan)| {
-            let score = score_plan_candidate_for_query(&plan, &normalized_query, &terms);
-            if score > 0 {
-                Some((idx, score, plan))
-            } else {
-                None
-            }
-        })
-        .max_by(
-            |(left_idx, left_score, left), (right_idx, right_score, right)| {
-                (
-                    *left_score,
-                    !is_terminal_plan_status(plan_status(left)),
-                    plan_timestamp_key(left),
-                    std::cmp::Reverse(*left_idx),
-                )
-                    .cmp(&(
-                        *right_score,
-                        !is_terminal_plan_status(plan_status(right)),
-                        plan_timestamp_key(right),
-                        std::cmp::Reverse(*right_idx),
-                    ))
-            },
-        )
-        .map(|(_, _, plan)| plan)
+/// The answer when a plan title fits several plans equally well: the tied
+/// plans, none of them opened.
+fn build_plan_tie_listing(
+    query: &str,
+    reason: lookup::Unresolved,
+    tied: &[Value],
+) -> (String, Value) {
+    let shown: Vec<Value> = tied.iter().map(compact_plan_ref).collect();
+    let mut text = match reason {
+        lookup::Unresolved::DuplicateTitle => format!(
+            "{} plans are titled '{query}'; none was opened. Open one by id:\n",
+            shown.len()
+        ),
+        _ => format!(
+            "{} plans match '{query}' equally well; none was opened. Open one by id:\n",
+            shown.len()
+        ),
+    };
+    text.push_str(&format_plan_ref_lines(&shown, 15));
+    text.push_str(
+        "Then call session(action=\"get_plan\", plan_id=\"<id>\", include_tasks=true).\n",
+    );
+    let structured = serde_json::json!({
+        "plan_resolution": {
+            "mode": "ambiguous_candidates",
+            "reason": reason.as_str(),
+            "query": query,
+            "candidate_count": shown.len(),
+            "candidates": shown,
+        }
+    });
+    (text, structured)
 }
 
 fn plan_candidate_count(plans: &Value) -> usize {
@@ -15097,7 +14892,9 @@ impl ToolHandler for GetPlanTool {
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
-        let (plan_id, resolution_mode, plans_considered, scope_note) = if let Some(plan_id) = input
+        let (plan_id, resolution_mode, plans_considered, scope_note, title_match) = if let Some(
+            plan_id,
+        ) = input
             .plan_id
             .as_deref()
             .map(str::trim)
@@ -15107,6 +14904,7 @@ impl ToolHandler for GetPlanTool {
                 Uuid::parse_str(plan_id)
                     .map_err(|_| Error::Validation("Invalid plan_id".to_string()))?,
                 "explicit_id",
+                None,
                 None,
                 None,
             )
@@ -15154,16 +14952,25 @@ impl ToolHandler for GetPlanTool {
             } else {
                 None
             };
-            let resolved = if let Some(lookup) = lookup {
-                if let Some(workspace_plans) = workspace_plans.as_ref() {
-                    select_named_plan_from_sets(&[&plans, workspace_plans], lookup)
-                } else {
-                    select_named_plan_from_sets(&[&plans], lookup)
-                }
-            } else if let Some(workspace_plans) = workspace_plans.as_ref() {
-                select_latest_from_plan_sets(&[&plans, workspace_plans])
-            } else {
-                select_latest_actionable_plan(&plans)
+            let plan_sets: Vec<&Value> = std::iter::once(&plans)
+                .chain(workspace_plans.as_ref())
+                .collect();
+            let (resolved, title_match) = match lookup {
+                Some(lookup) => match select_named_plan_from_sets(&plan_sets, lookup) {
+                    NamedPlan::Found { plan, grade } => (Some(plan), grade),
+                    NamedPlan::Tied(reason, tied) => {
+                        // Several plans fit the title equally well: show them
+                        // and open none.
+                        let (text, structured) = build_plan_tie_listing(lookup, reason, &tied);
+                        let mut output = ToolResult::with_structured(text, structured);
+                        if let Some(note) = scope.note {
+                            output = output.with_prefix(format!("{}\n", note));
+                        }
+                        return Ok(output);
+                    }
+                    NamedPlan::None => (None, None),
+                },
+                None => (select_latest_from_plan_sets(&plan_sets), None),
             };
 
             let latest = match resolved {
@@ -15171,11 +14978,7 @@ impl ToolHandler for GetPlanTool {
                 None => {
                     // Never dead-end: hand back the in-scope plans so the agent can
                     // open one by id instead of giving up on a bare "not found".
-                    let candidates = if let Some(workspace_plans) = workspace_plans.as_ref() {
-                        collect_unique_plan_candidates(&[&plans, workspace_plans])
-                    } else {
-                        collect_unique_plan_candidates(&[&plans])
-                    };
+                    let candidates = collect_unique_plan_candidates(&plan_sets);
                     let (text, structured) = build_plan_candidate_listing(lookup, &candidates);
                     let mut output = ToolResult::with_structured(text, structured);
                     if let Some(note) = scope.note {
@@ -15204,6 +15007,7 @@ impl ToolHandler for GetPlanTool {
                 },
                 Some(plans_considered),
                 scope.note,
+                title_match,
             )
         };
 
@@ -15245,6 +15049,7 @@ impl ToolHandler for GetPlanTool {
                     "mode": resolution_mode,
                     "resolved_plan_id": plan_id,
                     "query": lookup,
+                    "match": title_match.map(lookup::MatchGrade::as_str),
                     "include_tasks": include_tasks,
                     "resolved_plan_empty": resolved_empty,
                     "alternatives": alternatives,
@@ -15378,7 +15183,7 @@ impl ToolHandler for UpdatePlanTool {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let mut lookup = input
+        let lookup = input
             .query
             .as_deref()
             .or(input.title_query.as_deref())
@@ -15386,59 +15191,13 @@ impl ToolHandler for UpdatePlanTool {
             .filter(|value| !value.is_empty())
             .map(str::to_string);
 
-        let (plan_id, resolution_note) = if let Some(raw) = explicit_id {
-            if let Ok(uuid) = Uuid::parse_str(raw) {
-                (uuid, None)
-            } else {
-                lookup = Some(raw.to_string());
-                let lookup_value = lookup.clone().unwrap_or_default();
-                let scope = resolve_read_scope(
-                    &self.client,
-                    self.session.as_ref(),
-                    input.workspace_id.as_deref(),
-                    input.project_id.as_deref(),
-                )
-                .await?;
-                let workspace_id = scope.workspace_id.ok_or_else(|| {
-                    Error::Validation(
-                        "workspace_id is required to resolve plans. Run init(folder_path=\"...\") or pass workspace_id.".to_string(),
-                    )
-                })?;
-                let project_id = scope.project_id;
-                let limit = input.limit.or(Some(100));
-                let plans = self
-                    .client
-                    .list_plans_filtered(
-                        workspace_id.into(),
-                        project_id,
-                        Some(lookup_value.as_str()),
-                        None,
-                        limit,
-                    )
-                    .await?;
-                let latest = select_named_plan_from_sets(&[&plans], &lookup_value).ok_or_else(|| {
-                    Error::Validation(format!(
-                        "No plan found matching '{}'. Try session(action=\"list_plans\", query=\"{}\") to inspect candidates.",
-                        lookup_value, lookup_value
-                    ))
-                })?;
-                let resolved = plan_id(&latest)
-                    .ok_or_else(|| Error::Validation("Resolved plan is missing an id".to_string()))
-                    .and_then(|value| {
-                        Uuid::parse_str(value).map_err(|_| {
-                            Error::Validation("Resolved plan has an invalid id".to_string())
-                        })
-                    })?;
-                (
-                    resolved,
-                    Some(format!(
-                        "Resolved plan matching '{}'. No manual plan_id was required.",
-                        lookup_value
-                    )),
-                )
-            }
+        let explicit_uuid = explicit_id.and_then(|raw| Uuid::parse_str(raw).ok());
+        let found = if let Some(uuid) = explicit_uuid {
+            lookup::Found::by_id(uuid)
         } else {
-            let lookup_value = lookup.ok_or_else(|| {
+            // A plan_id that is not a UUID is a title, like query and
+            // title_query.
+            let lookup_value = explicit_id.map(str::to_string).or(lookup).ok_or_else(|| {
                 Error::Validation(
                     "plan_id, query, or title is required for update_plan".to_string(),
                 )
@@ -15467,27 +15226,29 @@ impl ToolHandler for UpdatePlanTool {
                     limit,
                 )
                 .await?;
-            let latest = select_named_plan_from_sets(&[&plans], &lookup_value).ok_or_else(|| {
-                Error::Validation(format!(
-                    "No plan found matching '{}'. Try session(action=\"list_plans\", query=\"{}\") to inspect candidates.",
-                    lookup_value, lookup_value
-                ))
-            })?;
-            let resolved = plan_id(&latest)
-                .ok_or_else(|| Error::Validation("Resolved plan is missing an id".to_string()))
-                .and_then(|value| {
-                    Uuid::parse_str(value).map_err(|_| {
-                        Error::Validation("Resolved plan has an invalid id".to_string())
-                    })
-                })?;
-            (
-                resolved,
-                Some(format!(
-                    "Resolved plan matching '{}'. No manual plan_id was required.",
-                    lookup_value
-                )),
-            )
+            let (action, hint) = lookup::update_action(input.status.as_deref(), OPEN_PLAN_STATUSES);
+            let resolved = lookup::resolve_reference(
+                &LookupContext {
+                    kind: PLANS,
+                    action,
+                    retry: "session(action=\"update_plan\", plan_id=\"<id>\")",
+                    hint,
+                },
+                &lookup_value,
+                &plan_lookup_candidates(&collect_unique_plan_candidates(&[&plans])),
+                || {
+                    format!(
+                        "No plan found matching '{}'. Try session(action=\"list_plans\", query=\"{}\") to inspect candidates.",
+                        lookup_value, lookup_value
+                    )
+                },
+            )?;
+            match resolved {
+                Lookup::Found(found) => found,
+                Lookup::Candidates(candidates) => return Ok(candidates),
+            }
         };
+        let plan_id = found.id;
 
         let normalized_linked_items = normalize_plan_linked_items(input.linked_items.clone())?;
         let params = mcp_client::UpdatePlanParams {
@@ -15506,15 +15267,11 @@ impl ToolHandler for UpdatePlanTool {
             .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("Untitled");
-        let mut text = String::new();
-        if let Some(note) = resolution_note {
-            text.push_str(&format!("{}\n", note));
-        }
-        text.push_str(&format!(
+        let text = format!(
             "Plan updated: {}\nLinked refs: linked_items supports doc|diagram|runbook|handoff.",
             title
-        ));
-        Ok(ToolResult::with_structured(text, result))
+        );
+        Ok(found.tool_result(text, result))
     }
 
     fn metadata(&self) -> &ToolMetadata {
@@ -15742,7 +15499,11 @@ impl ToolHandler for ListPlansTool {
             result.clone()
         };
         let latest_plan_summary = if let Some(query) = query {
-            select_named_plan_from_sets(&[&combined_plans], query)
+            match select_named_plan_from_sets(&[&combined_plans], query) {
+                NamedPlan::Found { plan, .. } => Some(plan),
+                // The query names no single plan: the list below is the answer.
+                NamedPlan::Tied(..) | NamedPlan::None => None,
+            }
         } else {
             select_latest_actionable_plan(&combined_plans)
         };
@@ -16405,7 +16166,7 @@ const SESSION_TOOL_DESCRIPTION: &str = "Session and memory management — NOT fo
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const SESSION_TOOL_REFERENCE: &str = "Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). Lesson maintenance is supported via action='update_lesson', action='delete_lesson', and action='supersede_lesson' with lesson_id (UUID or lookup text); lessons go to the typed /lessons endpoints first and fall back to memory events only when the server answers 404 (stated with a [PARTIAL] line). DECISIONS: action='capture' with event_type='decision' plus rationale/alternatives/scope/confidence routes to the typed decision create (same as memory(action=\"create_decision\")). PAST SESSIONS LIVE HERE: transcripts of every prior session are captured + indexed and are queryable. `context()` auto-surfaces `[GROUNDING]` prior-work hits; when that grounding is fresh, relevant, and sufficient, do not immediately call action='recall' for the same request. Call action='recall' as the first explicit escalation when `[GROUNDING]` is absent, thin, stale, off-topic, or when the user explicitly requests broader or session-specific history. For after-the-fact durable saves, use action='retro_capture' with title plus content and/or query/transcript_id; it stores the capture rationale, source query, transcript IDs, and source snippets in provenance. Use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills + git) outside context(). Also `memory(action=\"list_transcripts\"|\"search_transcripts\"|\"get_transcript\")` for chronological + full-text access. Save a session_snapshot at turning points so the NEXT session can pick up: action='capture', event_type='session_snapshot'. To pick up earlier work call action='resume' (most recent earlier session; resume_id picks another) or action='resume_list' (recent sessions, newest first), always with session_id set to the id init returned, so your own session is left out. Daily Recaps run around 23:00 in the user's timezone, not at MCP session boundaries; use list_recaps for timestamped history and trigger_recap for a manual asynchronous run. Team/personal mode: action='set_account_mode' with account_mode=team|personal|auto. Actions: capture, retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons, update_lesson, delete_lesson, supersede_lesson, recall (retrieve past conversation context when auto-grounding is insufficient), ground (one-shot prior-work bundle — requires user_message or query), remember, user_context, summary, compress, delta, smart_search (searches MEMORY/conversation history only, not code), decision_trace, list_recaps, trigger_recap, restore_context, resume_list (recent sessions, newest first; pass session_id), resume (one session's saved state and newest messages; resume_id picks one, default latest; pass session_id), set_account_mode. Plan actions: capture_plan, get_plan, update_plan, list_plans. Use capture_plan for plans; do not use action='capture' with event_type='plan'. capture_plan requires structured steps and creates linked tasks by default with plan_id and plan_step_id. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats.";
+const SESSION_TOOL_REFERENCE: &str = "Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). Lesson maintenance is supported via action='update_lesson', action='delete_lesson', and action='supersede_lesson' with lesson_id (UUID or title; delete and supersede need a UUID or the exact title); lessons go to the typed /lessons endpoints first and fall back to memory events only when the server answers 404 (stated with a [PARTIAL] line). DECISIONS: action='capture' with event_type='decision' plus rationale/alternatives/scope/confidence routes to the typed decision create (same as memory(action=\"create_decision\")). PAST SESSIONS LIVE HERE: transcripts of every prior session are captured + indexed and are queryable. `context()` auto-surfaces `[GROUNDING]` prior-work hits; when that grounding is fresh, relevant, and sufficient, do not immediately call action='recall' for the same request. Call action='recall' as the first explicit escalation when `[GROUNDING]` is absent, thin, stale, off-topic, or when the user explicitly requests broader or session-specific history. For after-the-fact durable saves, use action='retro_capture' with title plus content and/or query/transcript_id; it stores the capture rationale, source query, transcript IDs, and source snippets in provenance. Use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills + git) outside context(). Also `memory(action=\"list_transcripts\"|\"search_transcripts\"|\"get_transcript\")` for chronological + full-text access. Save a session_snapshot at turning points so the NEXT session can pick up: action='capture', event_type='session_snapshot'. To pick up earlier work call action='resume' (most recent earlier session; resume_id picks another) or action='resume_list' (recent sessions, newest first), always with session_id set to the id init returned, so your own session is left out. Daily Recaps run around 23:00 in the user's timezone, not at MCP session boundaries; use list_recaps for timestamped history and trigger_recap for a manual asynchronous run. Team/personal mode: action='set_account_mode' with account_mode=team|personal|auto. Actions: capture, retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons, update_lesson, delete_lesson, supersede_lesson, recall (retrieve past conversation context when auto-grounding is insufficient), ground (one-shot prior-work bundle — requires user_message or query), remember, user_context, summary, compress, delta, smart_search (searches MEMORY/conversation history only, not code), decision_trace, list_recaps, trigger_recap, restore_context, resume_list (recent sessions, newest first; pass session_id), resume (one session's saved state and newest messages; resume_id picks one, default latest; pass session_id), set_account_mode. Plan actions: capture_plan, get_plan, update_plan, list_plans. Use capture_plan for plans; do not use action='capture' with event_type='plan'. capture_plan requires structured steps and creates linked tasks by default with plan_id and plan_step_id. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats.";
 
 #[async_trait]
 impl ToolHandler for SessionTool {
@@ -16685,16 +16446,22 @@ impl ToolHandler for SessionTool {
                     .project_id
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok());
-                let target = resolve_lesson_target(
+                let target = match resolve_lesson_target(
                     &self.client,
                     workspace_id,
                     project_id,
                     lesson_lookup.trim(),
                     input.limit,
+                    LookupAction::UPDATE,
+                    "session(action=\"update_lesson\", lesson_id=\"<id>\")",
                 )
-                .await?;
+                .await?
+                {
+                    LessonLookup::Target(target) => target,
+                    LessonLookup::Candidates(candidates) => return Ok(candidates),
+                };
                 let mut text = String::new();
-                if let Some(note) = target.note.as_deref() {
+                if let Some(note) = target.found.note.as_deref() {
                     text.push_str(&format!("{}\n", note));
                 }
                 // Typed lessons have no free-form body: a bare `content` is
@@ -16717,7 +16484,7 @@ impl ToolHandler for SessionTool {
                     ));
                 }
                 let typed_result = if target.lessons_api_available {
-                    match self.client.update_lesson(target.id, typed).await {
+                    match self.client.update_lesson(target.found.id, typed).await {
                         Ok(result) => Some(result),
                         Err(err) if is_not_found_error(&err) => None,
                         Err(err) => return Err(err),
@@ -16726,18 +16493,19 @@ impl ToolHandler for SessionTool {
                     None
                 };
                 match typed_result {
-                    Some(result) => {
-                        text.push_str(&format!("Lesson updated: {}.", target.id));
+                    Some(mut result) => {
+                        text.push_str(&format!("Lesson updated: {}.", target.found.id));
                         if content_as_prevention {
                             text.push_str("\nnote: `content` was applied to the lesson's prevention field (typed lessons have no free-form body).");
                         }
+                        target.found.annotate(&mut result);
                         Ok(ToolResult::with_structured(text, result))
                     }
                     None => {
-                        let result = self
+                        let mut result = self
                             .client
                             .update_memory_event(
-                                target.id,
+                                target.found.id,
                                 mcp_client::UpdateMemoryEventParams {
                                     title: input.title,
                                     content: input.content,
@@ -16747,8 +16515,9 @@ impl ToolHandler for SessionTool {
                             .await?;
                         text.push_str(&format!(
                             "Lesson updated: {id}.\n[PARTIAL] /lessons endpoint unavailable (404); updated the lesson event via PUT /memory/events/{id}.",
-                            id = target.id
+                            id = target.found.id
                         ));
+                        target.found.annotate(&mut result);
                         Ok(ToolResult::with_structured(text, result))
                     }
                 }
@@ -16765,20 +16534,23 @@ impl ToolHandler for SessionTool {
                     .project_id
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok());
-                let target = resolve_lesson_target(
+                let target = match resolve_lesson_target(
                     &self.client,
                     workspace_id,
                     project_id,
                     lesson_lookup.trim(),
                     input.limit,
+                    LookupAction::DELETE,
+                    "session(action=\"delete_lesson\", lesson_id=\"<id>\")",
                 )
-                .await?;
+                .await?
+                {
+                    LessonLookup::Target(target) => target,
+                    LessonLookup::Candidates(candidates) => return Ok(candidates),
+                };
                 let mut text = String::new();
-                if let Some(note) = target.note.as_deref() {
-                    text.push_str(&format!("{}\n", note));
-                }
                 let typed_result = if target.lessons_api_available {
-                    match self.client.delete_lesson(target.id).await {
+                    match self.client.delete_lesson(target.found.id).await {
                         Ok(result) => Some(result),
                         Err(err) if is_not_found_error(&err) => None,
                         Err(err) => return Err(err),
@@ -16788,14 +16560,14 @@ impl ToolHandler for SessionTool {
                 };
                 match typed_result {
                     Some(result) => {
-                        text.push_str(&format!("Lesson deleted: {}.", target.id));
+                        text.push_str(&format!("Lesson deleted: {}.", target.found.id));
                         Ok(ToolResult::with_structured(text, result))
                     }
                     None => {
-                        let result = self.client.delete_memory_event(target.id).await?;
+                        let result = self.client.delete_memory_event(target.found.id).await?;
                         text.push_str(&format!(
                             "Lesson deleted: {id}.\n[PARTIAL] /lessons endpoint unavailable (404); deleted the lesson event via DELETE /memory/events/{id}.",
-                            id = target.id
+                            id = target.found.id
                         ));
                         Ok(ToolResult::with_structured(text, result))
                     }
@@ -16813,31 +16585,40 @@ impl ToolHandler for SessionTool {
                     .project_id
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok());
-                let target = resolve_lesson_target(
+                let target = match resolve_lesson_target(
                     &self.client,
                     workspace_id,
                     project_id,
                     lesson_lookup.trim(),
                     input.limit,
+                    LookupAction::SUPERSEDE,
+                    "session(action=\"supersede_lesson\", lesson_id=\"<id>\")",
                 )
-                .await?;
+                .await?
+                {
+                    LessonLookup::Target(target) => target,
+                    LessonLookup::Candidates(candidates) => return Ok(candidates),
+                };
                 let successor_id = match input
                     .successor_id
                     .as_deref()
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                 {
-                    Some(lookup) => Some(
-                        resolve_lesson_target(
-                            &self.client,
-                            workspace_id,
-                            project_id,
-                            lookup,
-                            input.limit,
-                        )
-                        .await?
-                        .id,
-                    ),
+                    Some(lookup) => match resolve_lesson_target(
+                        &self.client,
+                        workspace_id,
+                        project_id,
+                        lookup,
+                        input.limit,
+                        LookupAction::SUPERSEDE,
+                        "session(action=\"supersede_lesson\", successor_id=\"<id>\")",
+                    )
+                    .await?
+                    {
+                        LessonLookup::Target(successor) => Some(successor.found.id),
+                        LessonLookup::Candidates(candidates) => return Ok(candidates),
+                    },
                     None => None,
                 };
                 if successor_id.is_none()
@@ -16857,12 +16638,9 @@ impl ToolHandler for SessionTool {
                     "category": input.category,
                     "keywords": input.keywords,
                 });
-                match self.client.supersede_lesson(target.id, body).await {
+                match self.client.supersede_lesson(target.found.id, body).await {
                     Ok(result) => {
                         let mut text = String::new();
-                        if let Some(note) = target.note.as_deref() {
-                            text.push_str(&format!("{}\n", note));
-                        }
                         let successor = successor_id
                             .map(|id| id.to_string())
                             .or_else(|| {
@@ -16873,12 +16651,12 @@ impl ToolHandler for SessionTool {
                                     .map(str::to_string)
                             })
                             .unwrap_or_else(|| "new lesson".to_string());
-                        text.push_str(&format!("Lesson superseded: {} → {}.", target.id, successor));
+                        text.push_str(&format!("Lesson superseded: {} → {}.", target.found.id, successor));
                         Ok(ToolResult::with_structured(text, result))
                     }
                     Err(err) if is_not_found_error(&err) => Err(Error::Validation(format!(
                         "supersede_lesson needs POST /lessons/{}/supersede, which this server does not expose (404). No events-based fallback exists; use update_lesson or delete_lesson instead.",
-                        target.id
+                        target.found.id
                     ))),
                     Err(err) => Err(err),
                 }

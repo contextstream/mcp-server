@@ -16,6 +16,7 @@ pub mod grounding;
 pub mod help;
 pub mod index_keeper;
 pub mod integrations;
+pub(crate) mod lookup;
 pub mod media;
 pub mod memory;
 pub mod project;
@@ -33,6 +34,8 @@ pub mod workspace_drift;
 
 #[cfg(test)]
 mod parity_eval_tests;
+#[cfg(test)]
+mod reference_resolution_tests;
 
 // Re-export all domain tools
 pub use answer::*;

@@ -875,8 +875,23 @@ mod format_doc_detail_tests {
 }
 
 mod doc_lookup_ranking_tests {
-    use super::{find_exact_doc_match, rank_docs_for_query, select_resolved_doc_match};
+    use super::{lookup, rank_docs_for_query, DOC};
     use serde_json::json;
+    use uuid::Uuid;
+
+    /// The doc a query opens. The doc search ranks the candidates; the shared
+    /// resolver decides whether exactly one of them is named.
+    fn named_doc(docs: &[serde_json::Value], query: &str) -> Option<Uuid> {
+        match lookup::resolve(
+            query,
+            &lookup::candidates_from_items(docs, DOC.title_fields),
+            DOC.kind,
+            false,
+        ) {
+            lookup::Outcome::Found { id, .. } => Some(id),
+            _ => None,
+        }
+    }
 
     #[test]
     fn ranks_exact_title_match_first() {
@@ -900,10 +915,11 @@ mod doc_lookup_ranking_tests {
     }
 
     #[test]
-    fn finds_exact_match_by_title_or_id() {
+    fn a_doc_is_named_by_its_title_or_its_id() {
+        let id = "60606060-6060-4060-8060-606060606060";
         let docs = vec![
             json!({
-                "id": "60606060-6060-4060-8060-606060606060",
+                "id": id,
                 "title": "Linode Infrastructure Migration - Complete State",
                 "doc_type": "spec"
             }),
@@ -913,17 +929,18 @@ mod doc_lookup_ranking_tests {
                 "doc_type": "general"
             }),
         ];
+        let expected = Uuid::parse_str(id).ok();
 
-        let by_title =
-            find_exact_doc_match(&docs, "linode infrastructure migration complete state");
-        assert!(by_title.is_some());
         assert_eq!(
-            by_title.and_then(|d| d.get("id")).and_then(|v| v.as_str()),
-            Some("60606060-6060-4060-8060-606060606060")
+            named_doc(&docs, "Linode Infrastructure Migration - Complete State"),
+            expected
         );
-
-        let by_id = find_exact_doc_match(&docs, "60606060-6060-4060-8060-606060606060");
-        assert!(by_id.is_some());
+        // The same words without the punctuation still open it for a read.
+        assert_eq!(
+            named_doc(&docs, "linode infrastructure migration complete state"),
+            expected
+        );
+        assert_eq!(named_doc(&docs, id), expected);
     }
 
     #[test]
@@ -958,48 +975,61 @@ mod doc_lookup_ranking_tests {
     }
 
     #[test]
-    fn resolves_unique_high_confidence_doc_match() {
+    fn opens_the_one_doc_whose_title_has_every_word_of_the_query() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let query = "show me the infrastructure guide ssh connection";
         let docs = rank_docs_for_query(
             vec![json!({
-                "id": "doc-1",
+                "id": id,
                 "title": "Infrastructure SSH Connection Guide",
                 "doc_type": "general"
             })],
-            "show me the infrastructure guide ssh connection",
+            query,
             10,
         );
 
-        let resolved =
-            select_resolved_doc_match(&docs, "show me the infrastructure guide ssh connection");
-        assert!(resolved.is_some());
-        assert_eq!(
-            resolved
-                .and_then(|doc| doc.get("id"))
-                .and_then(|value| value.as_str()),
-            Some("doc-1")
-        );
+        assert_eq!(named_doc(&docs, query), Uuid::parse_str(id).ok());
     }
 
     #[test]
-    fn does_not_resolve_ambiguous_doc_match() {
+    fn does_not_open_a_doc_when_two_titles_fit_the_query() {
+        let query = "infrastructure ssh guide";
         let docs = rank_docs_for_query(
             vec![
                 json!({
-                    "id": "doc-1",
+                    "id": "11111111-1111-4111-8111-111111111111",
                     "title": "Infrastructure SSH Connection Guide",
                     "doc_type": "general"
                 }),
                 json!({
-                    "id": "doc-2",
+                    "id": "22222222-2222-4222-8222-222222222222",
                     "title": "Infrastructure SSH Access Guide",
                     "doc_type": "general"
                 }),
             ],
-            "infrastructure ssh guide",
+            query,
             10,
         );
 
-        assert!(select_resolved_doc_match(&docs, "infrastructure ssh guide").is_none());
+        assert_eq!(docs.len(), 2);
+        assert_eq!(named_doc(&docs, query), None);
+    }
+
+    #[test]
+    fn does_not_open_a_doc_that_shares_only_some_words_with_the_query() {
+        let query = "deploy notes";
+        let docs = rank_docs_for_query(
+            vec![json!({
+                "id": "11111111-1111-4111-8111-111111111111",
+                "title": "Deploy runbook",
+                "doc_type": "runbook"
+            })],
+            query,
+            10,
+        );
+
+        assert_eq!(docs.len(), 1, "the doc is still offered as a match");
+        assert_eq!(named_doc(&docs, query), None);
     }
 }
 

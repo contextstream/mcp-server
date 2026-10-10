@@ -58,7 +58,10 @@ const PARITY_EVAL_CORPUS: &[EvalCase] = &[
         prompt: "supersede the ledger database node with the new content",
         expected_tool: "memory",
         expected_action: "supersede_node",
-        expected_markers: &["Resolved node \"ledger database\"", "Node superseded:"],
+        expected_markers: &[
+            "[CANDIDATES] \"ledger database\" is not the id or the exact title of any node; nothing was superseded.",
+            "Retry: memory(action=\"supersede_node\", node_id=\"<id>\")",
+        ],
     },
     EvalCase {
         id: "capture-lesson",
@@ -112,14 +115,14 @@ fn assert_case(id: &str, text: &str) {
 // Routing mock of the hosted API
 // ---------------------------------------------------------------------------
 
-struct Route {
+pub(super) struct Route {
     method: &'static str,
     path_contains: String,
     status: u16,
     body: String,
 }
 
-fn route(method: &'static str, path_contains: &str, status: u16, body: Value) -> Route {
+pub(super) fn route(method: &'static str, path_contains: &str, status: u16, body: Value) -> Route {
     Route {
         method,
         path_contains: path_contains.to_string(),
@@ -128,8 +131,8 @@ fn route(method: &'static str, path_contains: &str, status: u16, body: Value) ->
     }
 }
 
-struct MockApi {
-    base_url: String,
+pub(super) struct MockApi {
+    pub(super) base_url: String,
     requests: Arc<Mutex<Vec<String>>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -141,7 +144,7 @@ impl Drop for MockApi {
 }
 
 impl MockApi {
-    async fn start(routes: Vec<Route>) -> Self {
+    pub(super) async fn start(routes: Vec<Route>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock api");
@@ -192,11 +195,11 @@ impl MockApi {
         }
     }
 
-    fn requests(&self) -> Vec<String> {
+    pub(super) fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
 
-    fn saw(&self, needle: &str) -> bool {
+    pub(super) fn saw(&self, needle: &str) -> bool {
         self.requests().iter().any(|line| line.contains(needle))
     }
 
@@ -211,7 +214,7 @@ impl MockApi {
     }
 }
 
-fn client_and_session(
+pub(super) fn client_and_session(
     base_url: &str,
     workspace_id: Uuid,
     project_id: Option<Uuid>,
@@ -225,7 +228,7 @@ fn client_and_session(
     (client, session)
 }
 
-fn text_of(result: &ToolResult) -> String {
+pub(super) fn text_of(result: &ToolResult) -> String {
     result
         .content
         .iter()
@@ -236,7 +239,7 @@ fn text_of(result: &ToolResult) -> String {
         .unwrap_or_default()
 }
 
-fn scope_routes(workspace_id: Uuid, project_id: Option<Uuid>) -> Vec<Route> {
+pub(super) fn scope_routes(workspace_id: Uuid, project_id: Option<Uuid>) -> Vec<Route> {
     let mut routes = vec![route(
         "GET",
         &format!("/api/v1/workspaces/{workspace_id}"),
@@ -426,7 +429,7 @@ async fn decision_trace_without_typed_endpoint_says_no_answer() {
 }
 
 #[tokio::test]
-async fn supersede_node_resolves_lookup_text_and_lists_candidates_when_ambiguous() {
+async fn supersede_node_needs_an_exact_title_and_lists_candidates_otherwise() {
     let ws = Uuid::new_v4();
     let node_id = Uuid::new_v4();
     let new_id = Uuid::new_v4();
@@ -456,16 +459,37 @@ async fn supersede_node_resolves_lookup_text_and_lists_candidates_when_ambiguous
     let (client, session) = client_and_session(&api.base_url, ws, None);
     session.initialize(Some(ws), None, None, None).await;
     let tool = MemoryTool::new(client, session, mcp_types::atlas_layer::noop_layer());
+
+    // Part of a title names no node, even when only one node matches: the
+    // node is offered and nothing is superseded.
     let result = tool
         .execute(json!({"action": "supersede_node", "node_id": "ledger database", "new_content": "Use Postgres 16", "workspace_id": ws}))
         .await
+        .expect("candidates");
+    assert_case("supersede-by-text", &text_of(&result));
+    assert!(result.is_error);
+    let candidates = &result.structured_content.as_ref().unwrap()["candidates"];
+    assert_eq!(candidates.as_array().unwrap().len(), 1);
+    assert_eq!(candidates[0]["id"], json!(node_id));
+    assert!(
+        !api.saw("POST "),
+        "nothing may be written: {:?}",
+        api.requests()
+    );
+
+    // The exact title, letter case aside, supersedes.
+    let result = tool
+        .execute(json!({"action": "supersede_node", "node_id": "ledger DATABASE choice", "new_content": "Use Postgres 16", "workspace_id": ws}))
+        .await
         .expect("supersede");
-    let text = text_of(&result);
-    assert_case("supersede-by-text", &text);
-    assert!(text.contains(&format!("Node superseded: {node_id} → {new_id}.")));
+    assert!(!result.is_error);
+    assert_eq!(
+        text_of(&result),
+        format!("Node superseded: {node_id} → {new_id}.")
+    );
     assert!(api.saw(&format!("POST /api/v1/memory/nodes/{node_id}/supersede")));
 
-    // Ambiguous lookup: candidate list, nothing superseded.
+    // Two nodes whose titles contain the text: both listed, nothing superseded.
     let ambiguous = MockApi::start({
         let mut routes = scope_routes(ws, None);
         routes.push(route(
@@ -487,10 +511,7 @@ async fn supersede_node_resolves_lookup_text_and_lists_candidates_when_ambiguous
         .execute(json!({"action": "supersede_node", "node_id": "ledger database", "new_content": "x", "workspace_id": ws}))
         .await
         .expect("candidates");
-    let text = text_of(&result);
-    assert!(text.starts_with(
-        "[CANDIDATES] Multiple nodes match \"ledger database\"; nothing was superseded."
-    ));
+    assert_case("supersede-by-text", &text_of(&result));
     assert_eq!(
         result.structured_content.as_ref().unwrap()["candidates"]
             .as_array()
@@ -498,7 +519,7 @@ async fn supersede_node_resolves_lookup_text_and_lists_candidates_when_ambiguous
             .len(),
         2
     );
-    assert!(!ambiguous.saw("/supersede"));
+    assert!(!ambiguous.saw("POST "));
 }
 
 #[tokio::test]

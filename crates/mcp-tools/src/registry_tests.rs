@@ -289,6 +289,53 @@ mod execute_tests {
         }
     }
 
+    fn echoed_text(result: &ToolResult) -> String {
+        match &result.content[0] {
+            mcp_types::tool::ContentItem::Text { text } => text.clone(),
+            other => panic!("Expected Text content item, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn placeholder_scope_ids_never_reach_a_handler_except_init() {
+        let config = create_complete_config();
+        let mut registry = ToolRegistry::new(&config);
+        registry.register("scoped_tool", Arc::new(MockTool::new("scoped_tool")));
+        registry.register("init", Arc::new(MockTool::new("init")));
+
+        let real = "11111111-2222-4333-8444-555555555555";
+        let call = json!({
+            "workspace_id": "00000000-0000-0000-0000-000000000000",
+            "project_id": real,
+        });
+
+        let scoped = echoed_text(&registry.execute("scoped_tool", call.clone()).await.unwrap());
+        assert!(!scoped.contains("workspace_id"), "{scoped}");
+        assert!(scoped.contains(real), "a real id must survive: {scoped}");
+
+        // init reads the placeholder itself so it can report it.
+        let init = echoed_text(&registry.execute("init", call).await.unwrap());
+        assert!(
+            init.contains("00000000-0000-0000-0000-000000000000"),
+            "{init}"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_that_is_wrong_but_not_a_placeholder_is_left_for_the_handler() {
+        let config = create_complete_config();
+        let mut registry = ToolRegistry::new(&config);
+        registry.register("scoped_tool", Arc::new(MockTool::new("scoped_tool")));
+
+        let echoed = echoed_text(
+            &registry
+                .execute("scoped_tool", json!({"workspace_id": "engineering"}))
+                .await
+                .unwrap(),
+        );
+        assert!(echoed.contains("engineering"), "{echoed}");
+    }
+
     #[tokio::test]
     async fn test_execute_unknown_tool() {
         let config = create_test_config();

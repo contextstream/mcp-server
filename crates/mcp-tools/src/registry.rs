@@ -18,6 +18,21 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Drop a placeholder `workspace_id` / `project_id` (the all-zero UUID,
+/// `<current_workspace_id>`, an empty string) before a handler sees it, so the
+/// call runs in the session's own scope instead of failing with a 404 for a
+/// workspace that never existed. `init` is left alone: it reads the same
+/// placeholders itself so it can tell the agent what it ignored.
+fn ignore_placeholder_scope_ids(tool: &str, input: &mut Value) {
+    if tool == "init" {
+        return;
+    }
+    let removed = crate::domains::scope_resolution::strip_placeholder_scope_ids(input);
+    if !removed.is_empty() {
+        tracing::debug!(tool, ?removed, "ignored placeholder scope ids");
+    }
+}
+
 /// Tool handler trait.
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
@@ -533,7 +548,7 @@ impl ToolRegistry {
     }
 
     /// Execute a tool by name.
-    pub async fn execute(&self, name: &str, input: Value) -> Result<ToolResult> {
+    pub async fn execute(&self, name: &str, mut input: Value) -> Result<ToolResult> {
         if !self.is_tool_visible(name) {
             return Err(Error::Tool(format!("Unknown tool: {}", name)));
         }
@@ -545,6 +560,7 @@ impl ToolRegistry {
         if let Some(result) = self.plan_restriction_for_tool(&tool.metadata).await {
             return Ok(result);
         }
+        ignore_placeholder_scope_ids(name, &mut input);
 
         // Attribute downstream server-side compliance events to the agent's
         // model: resolve it from the file-backed session model cache (warmed by
@@ -848,7 +864,7 @@ impl ToolRegistry {
     }
 
     /// Execute an operation by name (router mode).
-    pub async fn execute_operation(&self, name: &str, input: Value) -> Result<ToolResult> {
+    pub async fn execute_operation(&self, name: &str, mut input: Value) -> Result<ToolResult> {
         let operation = self
             .operations
             .get(name)
@@ -857,6 +873,7 @@ impl ToolRegistry {
         if let Some(result) = self.plan_restriction_for_tool(&operation.metadata).await {
             return Ok(result);
         }
+        ignore_placeholder_scope_ids(name, &mut input);
 
         let observation =
             acceleration_observation_request(name, &input).map(|request| (request, Instant::now()));

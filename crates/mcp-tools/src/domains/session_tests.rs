@@ -6831,3 +6831,464 @@ async fn a_mistyped_session_action_is_told_about_the_resume_actions() {
         .to_string();
     assert!(error.contains("'resume_list', 'resume'"), "{error}");
 }
+
+// ============================================================================
+// Init scope resolution: placeholders, missing workspaces, unmatched folders
+// ============================================================================
+
+mod init_scope_resolution_tests {
+    use super::*;
+    use mcp_client::run_with_auth_override;
+    use mcp_types::AuthOverride;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    type Requests = Arc<Mutex<Vec<(String, Value)>>>;
+
+    /// A mock API that answers each request through `route(method_and_path,
+    /// body)` and records it. Stops when dropped.
+    struct ScopeMock {
+        address: std::net::SocketAddr,
+        requests: Requests,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for ScopeMock {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl ScopeMock {
+        async fn spawn(
+            route: impl Fn(&str, &Value) -> (u16, Value) + Send + Sync + 'static,
+        ) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests: Requests = Arc::default();
+            let recorded = requests.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    let (line, body) = loop {
+                        let mut chunk = [0u8; 4096];
+                        let Ok(count) = socket.read(&mut chunk).await else {
+                            break (String::new(), Value::Null);
+                        };
+                        if count == 0 {
+                            break (String::new(), Value::Null);
+                        }
+                        request.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&request[..end]).to_string();
+                            let length: usize = head
+                                .lines()
+                                .filter_map(|line| line.split_once(':'))
+                                .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, value)| value.trim().parse().unwrap())
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                let line = head.lines().next().unwrap_or_default();
+                                let mut words = line.split_whitespace();
+                                let method_and_path = format!(
+                                    "{} {}",
+                                    words.next().unwrap_or_default(),
+                                    words.next().unwrap_or_default()
+                                );
+                                let body =
+                                    serde_json::from_slice(&request[end + 4..end + 4 + length])
+                                        .unwrap_or(Value::Null);
+                                break (method_and_path, body);
+                            }
+                        }
+                    };
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let (status, payload) = route(&line, &body);
+                    recorded.lock().unwrap().push((line, body));
+                    let reason = if status == 200 { "OK" } else { "Not Found" };
+                    let payload = payload.to_string();
+                    let _ = socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                                payload.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                }
+            });
+            Self {
+                address,
+                requests,
+                task,
+            }
+        }
+
+        fn client_and_session(&self) -> (ContextStreamClient, Arc<SessionManager>) {
+            let mut config = TestFixtures::test_config();
+            config.api_url = format!("http://{}", self.address);
+            let client = ContextStreamClient::new(config.clone());
+            let session = Arc::new(SessionManager::new(client.clone(), config));
+            (client, session)
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(line, _)| line.clone())
+                .collect()
+        }
+
+        fn init_bodies(&self) -> Vec<Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(line, _)| line.starts_with("POST /api/v1/session/init"))
+                .map(|(_, body)| body.clone())
+                .collect()
+        }
+    }
+
+    const NIL: &str = "00000000-0000-0000-0000-000000000000";
+
+    fn workspace_json(id: Uuid, name: &str) -> Value {
+        json!({"id": id, "name": name, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"})
+    }
+
+    fn project_json(id: Uuid, workspace_id: Uuid, name: &str) -> Value {
+        json!({"id": id, "name": name, "workspace_id": workspace_id})
+    }
+
+    fn init_answer(workspace_id: Uuid, project_id: Uuid, project_name: &str) -> Value {
+        json!({
+            "workspace_id": workspace_id,
+            "project_id": project_id,
+            "session_id": "api-session",
+            "workspace": {"id": workspace_id, "name": "Engineering"},
+            "project": {"id": project_id, "name": project_name},
+        })
+    }
+
+    fn text_of(result: &mcp_types::tool::ToolResult) -> String {
+        result_text(result)
+    }
+
+    fn repairs_of(result: &mcp_types::tool::ToolResult) -> Vec<Value> {
+        result
+            .structured_content
+            .as_ref()
+            .and_then(|structured| structured.get("scope_repairs"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn an_all_zero_workspace_id_is_ignored_not_sent_to_the_api() {
+        let workspace_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let mock = ScopeMock::spawn(move |line, _| {
+            if line.starts_with("POST /api/v1/session/init") {
+                (200, init_answer(workspace_id, project_id, "mcp-server"))
+            } else {
+                (404, json!({"error": "not found"}))
+            }
+        })
+        .await;
+        let (client, session) = mock.client_and_session();
+
+        let result = InitTool::new(client, session)
+            .execute(json!({"workspace_id": NIL, "auto_update": false}))
+            .await
+            .expect("a placeholder workspace_id must not fail init");
+
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|call| call.contains(NIL)),
+            "the placeholder reached the API: {calls:?}"
+        );
+        let bodies = mock.init_bodies();
+        assert_eq!(bodies.len(), 1, "{calls:?}");
+        assert_ne!(
+            bodies[0]["workspace_id"], NIL,
+            "init must resolve the workspace, not forward the placeholder: {}",
+            bodies[0]
+        );
+
+        assert!(
+            text_of(&result).contains(&format!("Ignored workspace_id `{NIL}`")),
+            "{}",
+            text_of(&result)
+        );
+        let repairs = repairs_of(&result);
+        assert_eq!(repairs.len(), 1, "{repairs:?}");
+        assert_eq!(repairs[0]["reason"], "placeholder_ids");
+        assert_eq!(repairs[0]["ignored"]["workspace_id"], NIL);
+    }
+
+    #[tokio::test]
+    async fn template_text_for_both_ids_is_ignored_too() {
+        let workspace_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let mock = ScopeMock::spawn(move |line, _| {
+            if line.starts_with("POST /api/v1/session/init") {
+                (200, init_answer(workspace_id, project_id, "mcp-server"))
+            } else {
+                (404, json!({"error": "not found"}))
+            }
+        })
+        .await;
+        let (client, session) = mock.client_and_session();
+
+        let result = InitTool::new(client, session)
+            .execute(json!({
+                "workspace_id": "<current_workspace_id>",
+                "project_id": "<id>",
+                "auto_update": false,
+            }))
+            .await
+            .expect("template placeholders must not fail init");
+
+        let repairs = repairs_of(&result);
+        assert_eq!(repairs.len(), 1, "{repairs:?}");
+        assert_eq!(
+            repairs[0]["ignored"]["workspace_id"],
+            "<current_workspace_id>"
+        );
+        assert_eq!(repairs[0]["ignored"]["project_id"], "<id>");
+    }
+
+    #[tokio::test]
+    async fn a_real_workspace_id_is_used_and_nothing_is_reported() {
+        let workspace_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let mock = ScopeMock::spawn(move |line, _| {
+            if line.starts_with("POST /api/v1/session/init") {
+                (200, init_answer(workspace_id, project_id, "mcp-server"))
+            } else if line.starts_with(&format!("GET /api/v1/workspaces/{workspace_id}")) {
+                (200, workspace_json(workspace_id, "Engineering"))
+            } else {
+                (404, json!({"error": "not found"}))
+            }
+        })
+        .await;
+        let (client, session) = mock.client_and_session();
+
+        let result = InitTool::new(client, session)
+            .execute(json!({"workspace_id": workspace_id, "auto_update": false}))
+            .await
+            .expect("init");
+
+        assert!(repairs_of(&result).is_empty());
+        assert!(
+            !text_of(&result).contains("Ignored"),
+            "{}",
+            text_of(&result)
+        );
+        assert_eq!(
+            mock.init_bodies()[0]["workspace_id"],
+            workspace_id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_that_does_not_exist_is_set_aside_and_scope_is_resolved_instead() {
+        let missing_workspace = Uuid::new_v4();
+        let missing_project = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let mock = ScopeMock::spawn(move |line, _| {
+            if line.starts_with("POST /api/v1/session/init") {
+                (200, init_answer(workspace_id, project_id, "mcp-server"))
+            } else {
+                // Everything else, including the missing workspace, is a 404.
+                (404, json!({"error": "Not found: Workspace not found"}))
+            }
+        })
+        .await;
+        let (client, session) = mock.client_and_session();
+
+        let result = InitTool::new(client, session)
+            .execute(json!({
+                "workspace_id": missing_workspace,
+                "project_id": missing_project,
+                "auto_update": false,
+            }))
+            .await
+            .expect("a nonexistent workspace must be repaired, not surfaced as a 404");
+
+        let bodies = mock.init_bodies();
+        assert_eq!(bodies.len(), 1, "{:?}", mock.calls());
+        let sent = bodies[0].to_string();
+        assert!(
+            !sent.contains(&missing_workspace.to_string())
+                && !sent.contains(&missing_project.to_string()),
+            "the nonexistent ids must not reach session init: {sent}"
+        );
+
+        let text = text_of(&result);
+        assert!(
+            text.starts_with(&format!("Ignored workspace_id `{missing_workspace}`")),
+            "{text}"
+        );
+        assert!(text.contains("does not exist"), "{text}");
+        let repairs = repairs_of(&result);
+        assert_eq!(repairs[0]["reason"], "workspace_not_found");
+        assert_eq!(
+            repairs[0]["ignored"]["workspace_id"],
+            missing_workspace.to_string()
+        );
+        assert_eq!(
+            repairs[0]["ignored"]["project_id"],
+            missing_project.to_string()
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["workspace_id"],
+            workspace_id.to_string(),
+            "the resolved workspace is returned for the agent to carry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_that_exists_but_is_forbidden_is_still_an_error() {
+        let workspace_id = Uuid::new_v4();
+        let mock = ScopeMock::spawn(move |line, _| {
+            if line.starts_with(&format!("GET /api/v1/workspaces/{workspace_id}")) {
+                (403, json!({"error": "Forbidden"}))
+            } else {
+                (404, json!({"error": "not found"}))
+            }
+        })
+        .await;
+        let (client, session) = mock.client_and_session();
+
+        // The workspace exists but this caller may not use it. Guessing another
+        // one could put the session in someone else's data, so init fails.
+        let outcome = InitTool::new(client, session)
+            .execute(json!({"workspace_id": workspace_id, "auto_update": false}))
+            .await;
+        assert!(
+            outcome.is_err(),
+            "a forbidden workspace must not be repaired"
+        );
+        assert!(
+            mock.init_bodies().is_empty(),
+            "no session may be opened in another workspace: {:?}",
+            mock.calls()
+        );
+    }
+
+    fn pinned(workspace_id: Uuid, project_id: Uuid) -> AuthOverride {
+        AuthOverride {
+            workspace_id: Some(workspace_id),
+            project_id: Some(project_id),
+            ..Default::default()
+        }
+    }
+
+    /// Init on `folder` while the session is pinned to `pinned_project_name`,
+    /// with a workspace that also holds a project called `mcp-server`.
+    async fn init_in_pinned_session(
+        folder_name: &str,
+        pinned_project_name: &'static str,
+    ) -> (mcp_types::tool::ToolResult, Vec<String>) {
+        let workspace_id = Uuid::new_v4();
+        let pinned_project_id = Uuid::new_v4();
+        let other_project_id = Uuid::new_v4();
+        let mock = ScopeMock::spawn(move |line, _| {
+            if line.starts_with("POST /api/v1/session/init") {
+                (
+                    200,
+                    init_answer(workspace_id, pinned_project_id, pinned_project_name),
+                )
+            } else if line.starts_with(&format!("GET /api/v1/workspaces/{workspace_id}")) {
+                (200, workspace_json(workspace_id, "Engineering"))
+            } else if line.starts_with("GET /api/v1/projects?") {
+                (
+                    200,
+                    json!({
+                        "items": [
+                            project_json(pinned_project_id, workspace_id, pinned_project_name),
+                            project_json(other_project_id, workspace_id, "mcp-server"),
+                            project_json(Uuid::new_v4(), workspace_id, "billing"),
+                        ],
+                        "total": 3, "page": 1, "page_size": 200,
+                        "total_pages": 1, "has_next": false,
+                    }),
+                )
+            } else {
+                (404, json!({"error": "not found"}))
+            }
+        })
+        .await;
+        let (client, session) = mock.client_and_session();
+        let tool = InitTool::new(client, session);
+
+        let parent = tempfile::tempdir().expect("tempdir");
+        let folder = parent.path().join(folder_name);
+        std::fs::create_dir_all(&folder).expect("folder");
+        let folder = folder.to_string_lossy().to_string();
+
+        let result = run_with_auth_override(pinned(workspace_id, pinned_project_id), || async {
+            tool.execute(json!({
+                "folder_path": folder,
+                "auto_update": false,
+                "auto_index": false,
+                "include_recent_memory": false,
+                "include_decisions": false,
+            }))
+            .await
+        })
+        .await
+        .expect("init in a pinned session");
+        (result, mock.calls())
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_folder_in_a_pinned_session_says_so_and_names_likely_projects() {
+        let (result, calls) = init_in_pinned_session("mcp-server-wt", "contextcode").await;
+
+        let text = text_of(&result);
+        assert!(text.contains("[SCOPE_RESOLUTION]"), "{text}");
+        assert!(text.contains("`mcp-server-wt`"), "{text}");
+        assert!(text.contains("contextcode"), "{text}");
+        assert!(
+            text.contains("mcp-server ("),
+            "the near-name project is offered: {text}\ncalls: {calls:#?}"
+        );
+        assert!(
+            !text.contains("billing"),
+            "unrelated projects are not: {text}"
+        );
+        assert!(text.contains("project(action=\"create\""), "{text}");
+
+        let resolution = &result.structured_content.as_ref().unwrap()["scope_resolution"];
+        assert_eq!(resolution["status"], "inherited_unmatched_folder");
+        assert_eq!(resolution["using"]["project_name"], "contextcode");
+        assert_eq!(resolution["candidates"][0]["name"], "mcp-server");
+        assert_eq!(resolution["candidates"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_matches_the_pinned_project_gets_no_notice() {
+        let (result, _calls) = init_in_pinned_session("contextcode", "contextcode").await;
+
+        let text = text_of(&result);
+        assert!(!text.contains("[SCOPE_RESOLUTION]"), "{text}");
+        assert!(result
+            .structured_content
+            .as_ref()
+            .unwrap()
+            .get("scope_resolution")
+            .is_none());
+    }
+}

@@ -280,7 +280,7 @@ fn canonical_steps(harness_id: Option<HarnessId>) -> Vec<HarnessTeachingStep> {
         HarnessTeachingStep {
             id: HarnessTeachingStepId::InitializeOnce,
             title: "Initialize once".to_string(),
-            requirement: "Initialize before other ContextStream calls; reuse its scope/session id. workspace_id is mandatory for workspace-scoped calls: use IDs from managed rules or init/context and pass workspace_id explicitly to memory, session, entity, and task calls. Never rely on implicit session scope; omit only during initialization when unavailable.".to_string(),
+            requirement: "Initialize before other calls; reuse its scope/session id. workspace_id is mandatory for workspace-scoped calls: use IDs from managed rules or init/context and pass it explicitly to memory, session, entity, and task calls. Never rely on implicit session scope. Never send a placeholder id; with none, call init(folder_path) alone.".to_string(),
             canonical_calls: vec![init],
         },
         HarnessTeachingStep {

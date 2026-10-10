@@ -559,20 +559,56 @@ fn append_fingerprint_component(material: &mut Vec<u8>, label: &str, content: &s
     material.extend_from_slice(content.as_bytes());
 }
 
-fn global_rules_content(
-    editor: &Editor,
-    workspace_id: Option<&str>,
-    workspace_name: Option<&str>,
-) -> String {
+/// Identity lines the generated header carries after the opening tag.
+const WORKSPACE_IDENTITY_HEADER_PREFIXES: [&str; 3] =
+    ["# Workspace: ", "# Project: ", "# Workspace ID: "];
+
+/// Remove the `# Workspace:`, `# Project:` and `# Workspace ID:` header lines.
+///
+/// The generator fills them with placeholders (`Workspace`, `mcp`, the all-zero
+/// UUID) when it has no workspace, and an agent reading rules that name a
+/// workspace id passes it to `init`, which fails with `404 Workspace 0000…`.
+/// Rules that apply to every project have no workspace to name, so they name
+/// none and tell the agent to use the ids `init` returns.
+fn without_workspace_identity_header(content: &str) -> String {
+    let Some(start) = content.find(CONTEXTSTREAM_START) else {
+        return content.to_string();
+    };
+    let header_start = start + CONTEXTSTREAM_START.len();
+    // The header is the run of lines after the opening tag, up to a blank line.
+    let header_end = content[header_start..]
+        .find("\n\n")
+        .map_or(content.len(), |offset| header_start + offset);
+    let kept: Vec<&str> = content[header_start..header_end]
+        .split('\n')
+        .filter(|line| {
+            let line = line.trim_start();
+            !WORKSPACE_IDENTITY_HEADER_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .collect();
+    format!(
+        "{}{}{}",
+        &content[..header_start],
+        kept.join("\n"),
+        &content[header_end..]
+    )
+}
+
+/// Rules for the editor's global file. They apply to every project the editor
+/// opens, so they carry no workspace identity (see
+/// [`without_workspace_identity_header`]).
+fn global_rules_content(editor: &Editor) -> String {
     if *editor == Editor::Aider {
         return aider_read_pointer_block("~/.contextstream/rules.md");
     }
-    generate_rule_content(
+    without_workspace_identity_header(&generate_rule_content(
         editor,
-        workspace_id,
-        workspace_name,
+        None,
+        None,
         mode_for_editor(editor),
-    )
+    ))
 }
 
 fn project_rules_content(
@@ -618,7 +654,7 @@ fn compute_rules_bundle_hash(teaching_contract: &str) -> String {
         append_fingerprint_component(
             &mut material,
             &format!("{}:global", editor.id()),
-            &global_rules_content(editor, None, None),
+            &global_rules_content(editor),
         );
         append_fingerprint_component(
             &mut material,
@@ -1192,7 +1228,7 @@ pub fn write_editor_rules(editor: &Editor) -> Result<()> {
         ));
     }
 
-    let rules = global_rules_content(editor, None, None);
+    let rules = global_rules_content(editor);
 
     let primary = &paths[0];
     write_contextstream_block_to_path(primary, &rules, true)?;
@@ -1213,7 +1249,8 @@ pub fn write_editor_rules(editor: &Editor) -> Result<()> {
     if *editor == Editor::Aider {
         if let Some(home) = dirs::home_dir() {
             let shared = home.join(".contextstream").join("rules.md");
-            let shared_content = shared_rules_content(None, None, None);
+            let shared_content =
+                without_workspace_identity_header(&shared_rules_content(None, None, None));
             write_contextstream_block_to_path(&shared, &shared_content, true)?;
         }
     }
@@ -2422,8 +2459,8 @@ mod tests {
                 {
                     checked += 1;
                     assert_eq!(
-                        global_rules_content(left, Some("ws"), Some("Workspace")),
-                        global_rules_content(right, Some("ws"), Some("Workspace")),
+                        global_rules_content(left),
+                        global_rules_content(right),
                         "{} and {} share global rules but render different content",
                         left.id(),
                         right.id()
@@ -3145,11 +3182,7 @@ mod tests {
     fn every_editor_surface_uses_the_same_canonical_bundle_marker() {
         let expected = canonical_rules_bundle_hash();
         for editor in Editor::all() {
-            let global = global_rules_content(
-                editor,
-                Some("11111111-1111-1111-1111-111111111111"),
-                Some("Custom Workspace"),
-            );
+            let global = global_rules_content(editor);
             let project = project_rules_content(
                 editor,
                 Some("22222222-2222-2222-2222-222222222222"),
@@ -3172,7 +3205,7 @@ mod tests {
     #[test]
     fn aider_hash_marker_remains_a_yaml_comment() {
         for content in [
-            global_rules_content(&Editor::Aider, None, None),
+            global_rules_content(&Editor::Aider),
             project_rules_content(&Editor::Aider, None, None, None),
         ] {
             let stamped = stamp_block_with_canonical_rules_hash(&content);
@@ -4311,8 +4344,15 @@ mod tests {
                 && !rewritten.contains("11111111-2222-4333-8444-555555555555"),
             "stale workspace identity survived a global rewrite:\n{rewritten}"
         );
-        assert!(rewritten.contains(&format!("# Workspace: {DEFAULT_WORKSPACE_NAME}")));
-        assert!(rewritten.contains(&format!("# Workspace ID: {DEFAULT_WORKSPACE_ID}")));
+        // Global rules name no workspace at all: a placeholder here is what an
+        // agent passes to init, which then fails with 404 Workspace 0000… .
+        assert!(
+            !rewritten.contains("# Workspace: ")
+                && !rewritten.contains("# Workspace ID: ")
+                && !rewritten.contains("# Project: ")
+                && !rewritten.contains(DEFAULT_WORKSPACE_ID),
+            "global rules must carry no workspace identity:\n{rewritten}"
+        );
         assert!(rewritten.starts_with("my own notes above\n"), "{rewritten}");
         assert!(rewritten.contains("my own notes below"), "{rewritten}");
         assert_eq!(
@@ -4358,7 +4398,7 @@ mod resume_rules_tests {
         let mut checked = 0;
         for editor in Editor::all().iter() {
             for content in [
-                global_rules_content(editor, Some("ws"), Some("Workspace")),
+                global_rules_content(editor),
                 project_rules_content(editor, Some("ws"), Some("Workspace"), Some("proj")),
             ] {
                 // Pointer files and short bootstrap rules do not carry this list.
@@ -4390,5 +4430,102 @@ mod resume_rules_tests {
             }
         }
         assert!(checked >= 5, "only {checked} full rules files were checked");
+    }
+}
+
+#[cfg(test)]
+mod global_rules_identity_tests {
+    use super::*;
+
+    #[test]
+    fn no_editors_global_rules_name_a_workspace_or_a_project() {
+        let mut checked = 0;
+        for editor in Editor::all().iter() {
+            let content = global_rules_content(editor);
+            if !content.contains(CONTEXTSTREAM_START) {
+                continue; // pointer files carry no header
+            }
+            checked += 1;
+            let id = editor.id();
+            for needle in [
+                "# Workspace: ",
+                "# Workspace ID: ",
+                "# Project: ",
+                DEFAULT_WORKSPACE_ID,
+            ] {
+                assert!(
+                    !content.contains(needle),
+                    "{id}: global rules must not contain {needle:?}"
+                );
+            }
+            assert!(content.contains(CONTEXTSTREAM_END), "{id}");
+            // Dropping the header must leave the rules themselves intact. Aider's
+            // global file only points at the shared rules file, checked below.
+            if *editor != Editor::Aider {
+                assert!(
+                    content.contains("Initialize once")
+                        && content.contains("workspace_id is mandatory"),
+                    "{id}: teaching contract missing"
+                );
+            }
+        }
+        assert!(checked >= 5, "only {checked} editors were checked");
+    }
+
+    #[test]
+    fn aiders_shared_rules_file_carries_no_workspace_identity_either() {
+        let shared = without_workspace_identity_header(&shared_rules_content(None, None, None));
+        assert!(!shared.contains("# Workspace"), "{shared}");
+        assert!(!shared.contains("# Project: "), "{shared}");
+        assert!(!shared.contains(DEFAULT_WORKSPACE_ID), "{shared}");
+        assert!(shared.contains("workspace_id is mandatory"), "{shared}");
+        assert!(global_rules_content(&Editor::Aider).contains("~/.contextstream/rules.md"));
+    }
+
+    #[test]
+    fn project_rules_still_name_their_workspace() {
+        let content = project_rules_content(
+            &Editor::ClaudeCode,
+            Some("11111111-2222-4333-8444-555555555555"),
+            Some("Engineering"),
+            Some("mcp-server"),
+        );
+        assert!(content.contains("# Workspace: Engineering"));
+        assert!(content.contains("# Workspace ID: 11111111-2222-4333-8444-555555555555"));
+        assert!(content.contains("# Project: mcp-server"));
+    }
+
+    #[test]
+    fn only_the_header_lines_after_the_opening_tag_are_removed() {
+        let content = format!(
+            "---\nalwaysApply: true\n---\n{CONTEXTSTREAM_START}\n# Workspace: W\n# Project: mcp\n# Workspace ID: 0\n\n# ContextStream Rules\n# Project: this later line is rule text\nbody\n{CONTEXTSTREAM_END}\n"
+        );
+        let stripped = without_workspace_identity_header(&content);
+        assert_eq!(
+            stripped,
+            format!(
+                "---\nalwaysApply: true\n---\n{CONTEXTSTREAM_START}\n\n# ContextStream Rules\n# Project: this later line is rule text\nbody\n{CONTEXTSTREAM_END}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn content_without_a_header_or_an_opening_tag_is_unchanged() {
+        let no_tag = "read ~/.contextstream/rules.md\n".to_string();
+        assert_eq!(without_workspace_identity_header(&no_tag), no_tag);
+
+        let no_header =
+            format!("{CONTEXTSTREAM_START}\n\n# ContextStream Rules\n{CONTEXTSTREAM_END}\n");
+        assert_eq!(without_workspace_identity_header(&no_header), no_header);
+    }
+
+    #[test]
+    fn a_header_marker_comment_after_the_tag_survives() {
+        let content = format!(
+            "{CONTEXTSTREAM_START}\n{RULES_HASH_MARKER_PREFIX} 0123456789abcdef -->\n# Workspace: W\n# Project: mcp\n# Workspace ID: 0\n\n# ContextStream Rules\n{CONTEXTSTREAM_END}\n"
+        );
+        let stripped = without_workspace_identity_header(&content);
+        assert!(stripped.contains(RULES_HASH_MARKER_PREFIX), "{stripped}");
+        assert!(!stripped.contains("# Workspace"), "{stripped}");
     }
 }

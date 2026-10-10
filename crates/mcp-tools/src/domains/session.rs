@@ -3,6 +3,10 @@
 #[path = "recall_supplements.rs"]
 mod recall_supplements;
 
+use crate::domains::scope_resolution::{
+    self, classify_scope_id_arg, with_scope_repair, ScopeRepair, UnmatchedFolderScope,
+    SCOPE_REPAIRS_KEY,
+};
 use async_trait::async_trait;
 use mcp_client::{
     format_linked_summary, get_task_auth_override, normalize_linked_items_with_allowed_kinds,
@@ -2346,16 +2350,17 @@ impl ToolHandler for InitTool {
             input.repository_url.as_deref(),
             input.folder_path.as_deref(),
         )?;
-        let requested_workspace_id = input
-            .workspace_id
-            .as_ref()
-            .and_then(|s| Uuid::parse_str(s).ok());
-        let requested_project_id = input
-            .project_id
-            .as_ref()
-            .and_then(|s| Uuid::parse_str(s).ok());
+        // A placeholder (the all-zero UUID, `<current_workspace_id>`, "") is not
+        // a request for a workspace: it is what an agent sends when its rules
+        // held no real id. Treat it as no id, so folder resolution runs, and say
+        // so in the response.
+        let workspace_arg = classify_scope_id_arg(input.workspace_id.as_deref());
+        let project_arg = classify_scope_id_arg(input.project_id.as_deref());
+        let placeholder_repair = ScopeRepair::placeholders(&workspace_arg, &project_arg);
+        let explicit_workspace = workspace_arg.is_explicit();
+        let explicit_project = project_arg.is_explicit();
         let (mut requested_workspace_id, mut requested_project_id) =
-            apply_task_auth_scope(requested_workspace_id, requested_project_id);
+            apply_task_auth_scope(workspace_arg.valid(), project_arg.valid());
 
         // Preserve the auth/header-injected scope before the folder-switch drop
         // below clears it. On the hosted remote gateway, folder-based resolution
@@ -2377,8 +2382,8 @@ impl ToolHandler for InitTool {
         // default for them. Only init with a folder_path arg drops it.
         drop_inherited_scope_for_folder_init(
             input.folder_path.is_some(),
-            input.workspace_id.is_some(),
-            input.project_id.is_some(),
+            explicit_workspace,
+            explicit_project,
             &mut requested_workspace_id,
             &mut requested_project_id,
         );
@@ -2448,6 +2453,8 @@ impl ToolHandler for InitTool {
         let mut project_id = requested_project_id;
         let mut project_id_from_implicit_mapping = false;
         let mut scope_repair_note: Option<String> = None;
+        // An explicit project_id that was not found and was set aside.
+        let mut project_repair: Option<ScopeRepair> = None;
 
         tracing::debug!(
             target: "init_diag",
@@ -2530,8 +2537,38 @@ impl ToolHandler for InitTool {
                         local_workspace_name = Some(workspace.name);
                     }
                 }
+                // The caller named a workspace that does not exist. Failing with
+                // the API's 404 leaves the agent with no session, so run init
+                // again as if it had named none (folder binding, git remote,
+                // folder name) and tell it what was set aside. The retry carries
+                // no ids, so this arm cannot fire twice. A workspace that exists
+                // but is not accessible stays an error: guessing another one
+                // could put the session in the wrong account's data.
                 Err(err)
-                    if input.workspace_id.is_none()
+                    if workspace_arg.valid() == Some(candidate_workspace_id)
+                        && is_not_found_error(&err) =>
+                {
+                    let repair = ScopeRepair::workspace_not_found(
+                        candidate_workspace_id,
+                        project_arg.valid(),
+                    );
+                    tracing::debug!(
+                        target: "init_diag",
+                        requested_ws = %candidate_workspace_id,
+                        "[INIT_DIAG] requested workspace not found; re-resolving from folder"
+                    );
+                    let mut retry_input = serde_json::to_value(&input)
+                        .map_err(|e| Error::Validation(e.to_string()))?;
+                    if let Some(object) = retry_input.as_object_mut() {
+                        object.remove("workspace_id");
+                        object.remove("project_id");
+                    }
+                    self.client.clear_defaults(true, true).await;
+                    let result = self.execute(retry_input).await?;
+                    return Ok(with_scope_repair(result, &repair));
+                }
+                Err(err)
+                    if !explicit_workspace
                         && (is_not_found_error(&err) || is_scope_access_error(&err)) =>
                 {
                     scope_repair_note = Some(format!(
@@ -2566,10 +2603,14 @@ impl ToolHandler for InitTool {
                 }
             };
             if !valid_for_workspace {
-                scope_repair_note = Some(format!(
-                    "Local folder mapping project_id {} was stale; resolved current project from workspace data.",
-                    candidate_project_id
-                ));
+                if project_arg.valid() == Some(candidate_project_id) {
+                    project_repair = Some(ScopeRepair::project_not_found(candidate_project_id));
+                } else {
+                    scope_repair_note = Some(format!(
+                        "Local folder mapping project_id {} was stale; resolved current project from workspace data.",
+                        candidate_project_id
+                    ));
+                }
                 project_id = None;
                 local_project_name = None;
                 project_id_from_implicit_mapping = false;
@@ -3079,7 +3120,7 @@ impl ToolHandler for InitTool {
         } else {
             "Session initialized without a resolved workspace_id.".to_string()
         };
-        if let Some(proj) = project_name {
+        if let Some(proj) = project_name.as_deref() {
             text.push_str(&format!(", project: {}", proj));
         }
         if let Some(ws_id) = resolved_workspace_id {
@@ -3115,6 +3156,58 @@ impl ToolHandler for InitTool {
         }
         if let Some(note) = scope_repair_note.as_deref() {
             text.push_str(&format!("\n\n{}", note));
+        }
+        // Ids the caller sent that were set aside, in the text and in the
+        // structured result (Claude Code shows only the structured part).
+        let repairs: Vec<&ScopeRepair> = [placeholder_repair.as_ref(), project_repair.as_ref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        for repair in &repairs {
+            text.push_str(&format!("\n\n{}", repair.note()));
+        }
+        if !repairs.is_empty() {
+            if let Some(object) = result.as_object_mut() {
+                object.insert(
+                    SCOPE_REPAIRS_KEY.to_string(),
+                    Value::Array(repairs.iter().map(|repair| repair.to_value()).collect()),
+                );
+            }
+        }
+        // The folder matched nothing and the session fell back to the scope it
+        // was pinned to. That is right when the folder belongs to that project
+        // and wrong when it does not, and only the agent can tell which: name
+        // likely alternatives and the exact calls, but change nothing.
+        if restored_inherited_scope {
+            if let (Some(folder), Some(workspace), Some(project), Some(current_project_name)) = (
+                folder_path_owned.as_deref(),
+                resolved_workspace_id,
+                resolved_project_id,
+                project_name.as_deref(),
+            ) {
+                if !project_name_matches_folder(folder, current_project_name) {
+                    let candidates = scope_resolution::candidates_for_folder(
+                        &self.client,
+                        workspace,
+                        folder,
+                        Some(project),
+                    )
+                    .await;
+                    let unmatched = UnmatchedFolderScope {
+                        folder_path: folder,
+                        workspace_id: workspace,
+                        workspace_name: Some(workspace_name.as_str()),
+                        project_id: project,
+                        project_name: Some(current_project_name),
+                        candidates: &candidates,
+                    };
+                    text.push_str("\n\n");
+                    text.push_str(&unmatched.notice(concise_text));
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert("scope_resolution".to_string(), unmatched.to_value());
+                    }
+                }
+            }
         }
         // Init resolved this scope itself, so soft switch-hints are muted
         // unless the folder demonstrably belongs elsewhere. The notice (when

@@ -24,6 +24,7 @@ pub mod qa;
 pub mod reminder;
 pub(crate) mod result_cache;
 pub(crate) mod scope;
+pub(crate) mod scope_resolution;
 pub mod search;
 pub mod session;
 pub mod skill;

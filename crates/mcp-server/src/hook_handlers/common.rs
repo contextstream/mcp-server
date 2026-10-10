@@ -36,6 +36,23 @@ pub fn extract_age_suffix(json: &Value, key: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The longest prefix of `value` that is at most `max_bytes` long and ends on a
+/// character boundary. Slicing `&value[..max_bytes]` panics when a multi-byte
+/// character (emoji, CJK, accented letter) straddles the cut; this steps back
+/// to the start of that character instead.
+pub fn prefix_within_bytes(value: &str, max_bytes: usize) -> &str {
+    &value[..value.floor_char_boundary(max_bytes)]
+}
+
+/// `value` unchanged when it fits in `max_bytes`, otherwise its longest prefix
+/// of at most `max_bytes` that ends on a character boundary, followed by `...`.
+pub fn truncate_with_ellipsis(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    format!("{}...", prefix_within_bytes(value, max_bytes))
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
     pub api_key: String,
@@ -738,5 +755,81 @@ mod account_scrub_tests {
         let messages = vec![json!({"role": "user", "content": "issue 123456 and cbiq_secret"})];
         let out = scrub_account_setup_messages(messages);
         assert_eq!(out[0]["content"], "issue 123456 and [redacted-credential]");
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    /// An emoji (4 bytes), a CJK character (3) and an accented letter (2).
+    const MULTI_BYTE_CHARS: [&str; 3] = ["\u{1F600}", "\u{4E16}", "\u{E9}"];
+
+    #[test]
+    fn prefix_steps_back_to_the_start_of_a_straddling_character() {
+        for ch in MULTI_BYTE_CHARS {
+            for inside in 1..ch.len() {
+                let head = "a".repeat(10 - inside);
+                let value = format!("{head}{ch}tail");
+                assert_eq!(
+                    prefix_within_bytes(&value, 10),
+                    head,
+                    "{ch:?} cut {inside} byte(s) in"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_keeps_a_character_that_ends_exactly_at_the_limit() {
+        for ch in MULTI_BYTE_CHARS {
+            let head = "a".repeat(10 - ch.len());
+            let value = format!("{head}{ch}tail");
+            assert_eq!(prefix_within_bytes(&value, 10), format!("{head}{ch}"));
+        }
+    }
+
+    #[test]
+    fn prefix_handles_a_limit_inside_the_first_character_and_past_the_end() {
+        assert_eq!(prefix_within_bytes("\u{1F600}x", 3), "");
+        assert_eq!(prefix_within_bytes("\u{E9}x", 1), "");
+        assert_eq!(prefix_within_bytes("", 5), "");
+        assert_eq!(prefix_within_bytes("short", 100), "short");
+        assert_eq!(prefix_within_bytes("abc", 0), "");
+    }
+
+    #[test]
+    fn ellipsis_is_added_only_when_text_was_cut() {
+        assert_eq!(truncate_with_ellipsis("abcdef", 3), "abc...");
+        assert_eq!(truncate_with_ellipsis("abc", 3), "abc");
+        assert_eq!(truncate_with_ellipsis("abc", 10), "abc");
+        assert_eq!(truncate_with_ellipsis("abc", 0), "...");
+        assert_eq!(truncate_with_ellipsis("", 0), "");
+    }
+
+    #[test]
+    fn ellipsis_cut_never_splits_a_multi_byte_character() {
+        for ch in MULTI_BYTE_CHARS {
+            for inside in 1..ch.len() {
+                let head = "a".repeat(10 - inside);
+                let value = format!("{head}{ch}tail");
+                assert_eq!(
+                    truncate_with_ellipsis(&value, 10),
+                    format!("{head}..."),
+                    "{ch:?} cut {inside} byte(s) in"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_text_made_only_of_multi_byte_characters_stays_valid_utf8_at_every_limit() {
+        let value = "\u{1F600}\u{4E16}\u{E9}".repeat(8);
+        for limit in 0..=value.len() + 2 {
+            let cut = truncate_with_ellipsis(&value, limit);
+            let kept = cut.strip_suffix("...").unwrap_or(&cut);
+            assert!(kept.len() <= limit, "limit {limit}");
+            assert!(value.starts_with(kept), "limit {limit}");
+        }
     }
 }

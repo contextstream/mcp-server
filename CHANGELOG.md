@@ -1,5 +1,66 @@
 # Changelog
 
+## 1.0.20
+
+- Init: a placeholder id no longer fails the session. Agents started sessions
+  with `init` failing `404 Workspace 00000000-0000-0000-0000-000000000000 not
+  found`: the global rules files carried a placeholder `# Workspace ID:` header
+  (since #145) and rule 1 told agents to pass the ids in their rules, so `init`
+  took the all-zero id as a real request and skipped folder resolution. Now a
+  placeholder `workspace_id` or `project_id` (the all-zero UUID in any
+  spelling, an empty string, `<id>` or `{id}` templates, and `null`, `none`,
+  `nil` or `undefined`) is dropped before any tool handler runs, and `init`
+  reads it itself and reports what it ignored, in the text and in the
+  structured `scope_repairs` list. A
+  workspace that does not exist (404) is set aside and `init` runs again from the
+  folder, git remote and name instead of failing; a workspace that exists but is
+  forbidden is still an error, so a session never opens in another account's
+  data. A project that is not in the workspace is repaired with an accurate note
+  (38c2cf3).
+- Init: when the folder matches nothing and the session falls back to the scope
+  it was pinned to, `init` adds a `[SCOPE_RESOLUTION]` notice and a
+  `scope_resolution` block in the structured result. They name the pinned
+  project, up to five projects with similar names, and the exact calls to switch
+  or create one. It changes nothing, and stays silent when the folder name
+  matches the pinned project (38c2cf3).
+- Rules: global rules files (`CLAUDE.md`, `AGENTS.md` and the other editors'
+  global files, and Aider's shared file) no longer carry the `# Workspace:`,
+  `# Project:` and `# Workspace ID:` lines; project rules keep their real
+  workspace. Rule 1 now says never to send a placeholder id and to call
+  `init(folder_path)` alone when none is known. Rules reach a machine with
+  `contextstream-mcp update`; until then the runtime handling above covers the
+  old header (38c2cf3).
+- Delete and supersede act only on an id or an exact title. `memory(action=
+  "delete_doc", doc_id="deploy notes")` deleted "Deploy runbook" when that was the
+  only doc with "deploy" in its title, and the only sign was a "Resolved ..." line
+  in the text. One resolver now decides for every tool that takes an id or a
+  title (memory records, docs, decisions, lessons, plans, entities and skills): a
+  UUID is the record's id, and other text is graded against the titles the tool
+  listed (`exact_title`, `same_words`, `all_words`, `some_words`). Every delete,
+  every supersede, `complete_todo`, the retiring `decision_action` values
+  (`supersede`, `choose_successor`, `invalidate`), and an update that closes,
+  archives, completes or abandons a record need `exact_title`; a read or an edit
+  needs `all_words` or better, from exactly one record. Anything else changes
+  nothing and returns the candidates, as a tool result with `isError` and the same
+  list in the structured result. Two records with one exact title are both
+  returned. A resolved call says which record it took, in the text and under
+  `lookup_resolution` in the structured result (#162).
+- Lookup, what else changed with it (#162): records match on their title only (an
+  event without a title answered to its type and content, so `delete_all` on
+  "decision" removed every such event on the page; tasks, todos and diagrams fell
+  back to their description). Exact no longer ignores punctuation and no longer
+  compares only ASCII letters and digits. A lone partial match no longer resolves
+  for a read or an edit, and a tie is returned as a tie (plans took any shared
+  word and broke ties by status and recency). A pending todo can be completed by
+  title, and a second doc with the same title is no longer hidden by the caller's
+  `limit`. No input parameter is added, removed or retyped. An unresolved
+  reference used to be an error value, a JSON-RPC error on the hosted gateway; it
+  is now a tool result with `isError`. The rule is stated in the parameter text
+  of three tools (`action` of `memory` and `session`; `id` of `entity`; and
+  `diagram_id`, `event_id`, `task_id` and `todo_id` of `memory`); their short
+  descriptions are unchanged. That text reaches hosted clients when the hosted
+  gateway runs this version.
+
 ## 1.0.19
 
 - Connected apps: the `integration` tool now reaches the apps a person connects

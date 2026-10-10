@@ -67,7 +67,11 @@ impl RuntimeScope {
         Ok(Self {
             workspace_id,
             project_id,
-            session_id: state.session_id.or(state.api_session_id),
+            session_id: host_session_id(
+                input.session_id.as_deref(),
+                state.api_session_id.as_deref(),
+                state.session_id.as_deref(),
+            ),
         })
     }
 
@@ -84,10 +88,27 @@ impl RuntimeScope {
     fn session(&self, action: &str) -> Result<&str> {
         self.session_id.as_deref().ok_or_else(|| {
             Error::Validation(format!(
-                "{action} needs a session: run init first so the change is recorded under it"
+                "{action} needs the session id init returned, so the change is recorded under it: pass it as session_id (init's result names it). Run init first if you have not."
             ))
         })
     }
+}
+
+/// The host session an attach or edit is recorded under: the explicit
+/// `session_id`, else the id the API assigned at init (what snapshots and
+/// transcripts are stored under), else the local id this server keeps. A
+/// stateless client has no stored state, so only an explicit id reaches it.
+fn host_session_id(
+    explicit: Option<&str>,
+    api_assigned: Option<&str>,
+    local: Option<&str>,
+) -> Option<String> {
+    [explicit, api_assigned, local]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn parse_uuid(value: &str, field: &str) -> Result<Uuid> {
@@ -477,6 +498,46 @@ fn stale_revision_hint(error: Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_an_edit_is_recorded_under_prefers_what_init_returned() {
+        // An explicit id wins: a stateless client has nothing else.
+        assert_eq!(
+            host_session_id(Some("from-init"), None, None).as_deref(),
+            Some("from-init")
+        );
+        assert_eq!(
+            host_session_id(Some(" from-init "), Some("api"), Some("local")).as_deref(),
+            Some("from-init")
+        );
+        // Without one, the id the API assigned beats the server's local id.
+        assert_eq!(
+            host_session_id(None, Some("api"), Some("local")).as_deref(),
+            Some("api")
+        );
+        assert_eq!(
+            host_session_id(None, None, Some("local")).as_deref(),
+            Some("local")
+        );
+        // Blank values count as absent.
+        assert_eq!(
+            host_session_id(Some("  "), Some(""), Some("local")).as_deref(),
+            Some("local")
+        );
+        assert_eq!(host_session_id(Some(" "), None, None), None);
+    }
+
+    #[test]
+    fn an_edit_with_no_session_says_where_to_get_one() {
+        let scope = RuntimeScope {
+            workspace_id: Uuid::nil(),
+            project_id: None,
+            session_id: None,
+        };
+        let message = scope.session("edit").unwrap_err().to_string();
+        assert!(message.contains("session_id"), "{message}");
+        assert!(message.contains("init"), "{message}");
+    }
 
     #[test]
     fn agent_access_names_the_strongest_grant() {

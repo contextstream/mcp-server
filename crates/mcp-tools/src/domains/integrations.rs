@@ -140,6 +140,9 @@ pub struct IntegrationInput {
     pub arguments: Option<Value>,
     pub base_revisions: Option<Value>,
     pub idempotency_key: Option<String>,
+    /// The session id `init` returned. An edit is recorded under it; a client
+    /// that keeps no state between calls must pass it.
+    pub session_id: Option<String>,
 }
 
 /// Sort input for Notion.
@@ -177,7 +180,7 @@ const INTEGRATION_TOOL_DESCRIPTION: &str = "Integration operations for Slack, Gi
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const INTEGRATION_TOOL_REFERENCE: &str = "Integration operations for Slack, GitHub, Notion, Linear, Jira, and Figma, plus connected apps (Microsoft 365 Word/Excel/OneDrive, Google Workspace Docs/Sheets/Drive, Dropbox, Box, Slack, Notion, Linear, Figma). Provider: slack, github, notion, linear, jira, figma, microsoft, google_workspace, dropbox, box, all. Connected apps: apps (what is connected and whether agents may edit), find (live search by name; query), read (reference_id from an attached item, or connection_id + resource_id with the resource_type/mime_type/container find returned, or connection_id + operation + arguments), capabilities (operations and their arguments; connection_id), edit (connection_id + operation + arguments; applies when the person allows agent edits and returns a receipt; on a conflict read again and retry). Actions: status, search, stats, activity, contributors, knowledge, summary, connected (list connected integrations), channels (slack), discussions (slack), repos (github), issues (github/linear/jira), files (figma), create_page (notion), create_database (notion), list_databases (notion), search_pages (notion), get_page (notion), query_database (notion), update_page (notion), team_activity (team-only), team_search (team-only cross-provider search). Linear filters: team_id, status, priority, assignee. Jira filters: project_key, status, priority, issue_type, assignee. Figma filters: figma_project_id.";
+const INTEGRATION_TOOL_REFERENCE: &str = "Integration operations for Slack, GitHub, Notion, Linear, Jira, and Figma, plus connected apps (Microsoft 365 Word/Excel/OneDrive, Google Workspace Docs/Sheets/Drive, Dropbox, Box, Slack, Notion, Linear, Figma). Provider: slack, github, notion, linear, jira, figma, microsoft, google_workspace, dropbox, box, all. Connected apps: apps (what is connected and whether agents may edit), find (live search by name; query), read (reference_id from an attached item, or connection_id + resource_id with the resource_type/mime_type/container find returned, or connection_id + operation + arguments), capabilities (operations and their arguments; connection_id), edit (connection_id + operation + arguments + session_id, the id init returned when the client keeps no state between calls; applies when the person allows agent edits and returns a receipt; on a conflict read again and retry). Actions: status, search, stats, activity, contributors, knowledge, summary, connected (list connected integrations), channels (slack), discussions (slack), repos (github), issues (github/linear/jira), files (figma), create_page (notion), create_database (notion), list_databases (notion), search_pages (notion), get_page (notion), query_database (notion), update_page (notion), team_activity (team-only), team_search (team-only cross-provider search). Linear filters: team_id, status, priority, assignee. Jira filters: project_key, status, priority, issue_type, assignee. Figma filters: figma_project_id.";
 
 #[async_trait]
 impl ToolHandler for IntegrationTool {
@@ -861,6 +864,11 @@ impl ToolHandler for IntegrationTool {
             .string(
                 "idempotency_key",
                 "Reuse to retry the same edit safely",
+                false,
+            )
+            .string(
+                "session_id",
+                "Session id init returned (edit; pass it when the client keeps no state)",
                 false,
             )
             .build()

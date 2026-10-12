@@ -5890,9 +5890,16 @@ fn current_dir_search_root() -> Option<String> {
     best.map(|(_, _, normalized)| normalized)
 }
 
+/// The session's folder, when it is a checkout of the project being searched.
+///
+/// `session_project_id` is the project `init` resolved for that folder. On a
+/// hosted gateway it is the only evidence: the local mapping and index cannot
+/// be read there, and without it results were rooted at the project's stored
+/// path, the folder of whichever machine first indexed it.
 fn scoped_session_folder_path<'a>(
     session_folder_path: Option<&'a str>,
     session_folder_project_id: Option<Uuid>,
+    session_project_id: Option<Uuid>,
     local_index_project_id: Option<Uuid>,
     target_project_id: Option<Uuid>,
     local_project_root: Option<&'a str>,
@@ -5903,6 +5910,7 @@ fn scoped_session_folder_path<'a>(
     };
 
     if session_folder_project_id == Some(target_project_id)
+        || session_project_id == Some(target_project_id)
         || local_index_project_id == Some(target_project_id)
     {
         return Some(session_path);
@@ -11282,6 +11290,7 @@ impl SearchTool {
         let scoped_session_folder_path = scoped_session_folder_path(
             session_folder_path.as_deref(),
             resolved_folder_project_id,
+            state.project_id,
             local_index_project_id,
             target_project_id,
             local_project_root.as_deref(),

@@ -6685,9 +6685,10 @@ async fn resume_actions_never_offer_the_callers_own_session() {
 
 #[tokio::test]
 async fn resume_after_a_real_init_never_offers_the_session_the_api_just_opened() {
-    // Agents usually call init without a session id. The server then keeps a
-    // random local id while the API assigns its own and returns it, and the
-    // API's is the one snapshots are stored under.
+    // Agents usually call init without a session id, and over stdio there is
+    // no transport id either. The API assigns its own and returns it; the
+    // server adopts it, so the id init prints, the id later calls store
+    // snapshots and transcripts under, and the id resume leaves out are one.
     for action in ["resume_list", "resume"] {
         let workspace_id = Uuid::new_v4();
         let (address, server) = spawn_resume_mock(Some(json!({
@@ -6709,10 +6710,10 @@ async fn resume_after_a_real_init_never_offers_the_session_the_api_just_opened()
             state.api_session_id.as_deref(),
             Some("api-assigned-session")
         );
-        assert_ne!(
+        assert_eq!(
             state.session_id.as_deref(),
             Some("api-assigned-session"),
-            "the premise: the server's own id is a random local one"
+            "later calls must send the id init printed, not a random local one (#152)"
         );
 
         SessionTool::new(client, session, mcp_types::atlas_layer::noop_layer())
@@ -6725,6 +6726,31 @@ async fn resume_after_a_real_init_never_offers_the_session_the_api_just_opened()
             "{action}: the session init just opened is not a candidate to resume"
         );
     }
+}
+
+#[tokio::test]
+async fn init_keeps_the_session_id_the_caller_sent() {
+    let workspace_id = Uuid::new_v4();
+    let (address, server) = spawn_resume_mock(Some(json!({
+        "workspace_id": workspace_id,
+        "session_id": "api-assigned-session",
+    })))
+    .await;
+    let mut config = TestFixtures::test_config();
+    config.api_url = format!("http://{address}");
+    let client = ContextStreamClient::new(config.clone());
+    let session = Arc::new(SessionManager::new(client.clone(), config));
+
+    InitTool::new(client, session.clone())
+        .execute(json!({"auto_update": false, "session_id": "caller-session"}))
+        .await
+        .expect("init");
+    server.abort();
+    assert_eq!(
+        session.state().await.session_id.as_deref(),
+        Some("caller-session"),
+        "an id the caller sent wins over the one the API returns"
+    );
 }
 
 #[tokio::test]

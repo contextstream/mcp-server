@@ -834,6 +834,7 @@ fn main() -> Result<()> {
     }
 
     setup_logging(cli.verbose, cli.quiet);
+    restore_default_sigpipe(&cli.command);
 
     // Register the process-global teaching-bundle fingerprint so request
     // bodies, readiness, doctor, runtime staleness checks, and every editor
@@ -859,6 +860,31 @@ fn main() -> Result<()> {
             .block_on(run_command(command)),
     }
 }
+
+/// One-shot commands print for a person or a script, and the reader may close
+/// the pipe early (`about | head -2`). Rust ignores SIGPIPE, so `println!` then
+/// panics on the broken pipe and the process aborts with exit 134 (#159).
+/// Restore the default so these commands end quietly on SIGPIPE, as other
+/// CLIs do. The stdio server, the HTTP gateway, the sync bridge and editor
+/// hooks are left alone: they outlive their reader or own their stdout.
+///
+/// Sockets are unaffected: std and mio send with `MSG_NOSIGNAL` on Linux and
+/// set `SO_NOSIGPIPE` on Apple platforms. Must run before any thread exists.
+#[cfg(unix)]
+fn restore_default_sigpipe(command: &Option<Commands>) {
+    let keeps_ignoring = matches!(
+        command,
+        None | Some(Commands::Http { .. } | Commands::Hook { .. } | Commands::Watch)
+    );
+    if !keeps_ignoring {
+        // SAFETY: called from `main` before any tokio runtime or other thread
+        // exists, so no signal disposition is changed under a running thread.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe(_command: &Option<Commands>) {}
 
 /// Export the hook's event name and host arguments for the handlers.
 ///

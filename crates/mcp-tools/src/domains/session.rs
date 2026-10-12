@@ -2198,8 +2198,9 @@ fn context_pressure_notice(
 }
 
 /// The session id the API assigned at init, from the top level of its response.
-/// When the caller sends no id the API picks one, and snapshots and transcripts
-/// are stored under it, not under the random id the server keeps locally.
+/// When the caller sends no id the API picks one, and init adopts it as the
+/// server's own, so every later call stores its snapshots and transcripts
+/// under the id init printed.
 fn api_session_id_from(result: &Value) -> Option<String> {
     result
         .get("session_id")
@@ -2872,7 +2873,11 @@ impl ToolHandler for InitTool {
             });
         let relation_project_name = resolve_init_project_name(&result, local_project_name.clone());
 
-        // Update session manager with resolved IDs
+        // Update session manager with resolved IDs. When the caller sent no id
+        // (stdio has no transport id either), the API assigned one: adopt it,
+        // so later calls store transcripts and snapshots under the id init
+        // prints and resume leaves out, not under a random local one.
+        let api_session_id = api_session_id_from(&result);
         let folder_path_owned = input.folder_path.clone();
         self.session
             .initialize_with_session_id(
@@ -2880,17 +2885,15 @@ impl ToolHandler for InitTool {
                 resolved_project_id,
                 input.folder_path,
                 default_search_mode,
-                init_session_id.clone(),
+                init_session_id.clone().or_else(|| api_session_id.clone()),
             )
             .await;
         self.session
             .set_grounding_handle(extract_grounding_handle(&result))
             .await;
-        // The API's own id for this session: not the server's when the caller
-        // sent none, and the one resume must keep out of its results.
-        self.session
-            .set_api_session_id(api_session_id_from(&result))
-            .await;
+        // The API's own id for this session, and the one resume must keep out
+        // of its results.
+        self.session.set_api_session_id(api_session_id).await;
 
         // Update client defaults so all subsequent client methods have workspace/project IDs
         self.client

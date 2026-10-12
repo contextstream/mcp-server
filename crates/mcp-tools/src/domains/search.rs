@@ -3233,23 +3233,109 @@ fn push_unique_project_candidate(candidates: &mut Vec<Option<Uuid>>, candidate: 
     }
 }
 
-/// Check if the query likely asks for saved docs (memory/docs domain).
+/// Words that ask for a saved skill wherever they appear. Matched as whole
+/// words, so "sop" inside "isopod" or "desoplate" never counts.
+const SKILL_QUERY_WORDS: &[&str] = &["skill", "skills", "checklist", "checklists", "sop", "sops"];
+
+/// Words that put "workflow" in CI or YAML, where it names a pipeline file
+/// (`.github/workflows/ci.yml`, a Depot workflow), not a reusable skill.
+const CI_WORKFLOW_CONTEXT_WORDS: &[&str] = &[
+    "ci",
+    "cd",
+    "yaml",
+    "yml",
+    "actions",
+    "github",
+    "gitlab",
+    "depot",
+    "pipeline",
+    "pipelines",
+    "job",
+    "jobs",
+    "runner",
+    "runners",
+    "cron",
+    "dispatch",
+];
+
+/// Words that put "workflow" in code, such as the coach `workflow` tools, where
+/// the query is looking for source rather than a skill.
+const CODE_WORKFLOW_CONTEXT_WORDS: &[&str] = &[
+    "tool",
+    "tools",
+    "handler",
+    "function",
+    "fn",
+    "struct",
+    "impl",
+    "class",
+    "module",
+    "schema",
+    "implemented",
+    "defined",
+    "file",
+    "src",
+    "crate",
+    "crates",
+];
+
+/// The query's words, lowercased and split on whitespace and punctuation. An
+/// identifier such as `workflow_id` or a path such as `.github/workflows` stays
+/// one word, so it never matches a bare keyword.
+fn query_words(lower: &str) -> Vec<&str> {
+    lower
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ',' | ';'
+                        | ':'
+                        | '?'
+                        | '!'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '"'
+                        | '\''
+                        | '`'
+                )
+        })
+        .map(|word| word.trim_end_matches('.'))
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// Check if the query asks for a reusable workflow or skill, so search adds
+/// matching skills. Keywords match whole words only; "workflow" counts only
+/// outside CI, YAML and code contexts.
 fn is_skill_query(query: &str) -> bool {
     let lower = query.trim().to_lowercase();
     if lower.is_empty() {
         return false;
     }
+    let words = query_words(&lower);
+    let has_word = |list: &[&str]| words.iter().any(|word| list.contains(word));
 
-    let has_skill_keyword = [
-        "skill",
-        "skills",
-        "checklist",
-        "workflow",
-        "standard operating procedure",
-        "sop",
-    ]
-    .iter()
-    .any(|term| lower.contains(term));
+    let mentions_ci_or_yaml = has_word(CI_WORKFLOW_CONTEXT_WORDS)
+        || words.iter().any(|word| {
+            word.ends_with(".yml") || word.ends_with(".yaml") || word.contains(".github")
+        });
+    let mentions_code = has_word(CODE_WORKFLOW_CONTEXT_WORDS)
+        || words
+            .iter()
+            .any(|word| word.contains('/') || word.ends_with(".rs") || word.ends_with(".ts"));
+    let asks_for_workflow = words
+        .iter()
+        .any(|word| matches!(*word, "workflow" | "workflows"))
+        && !mentions_ci_or_yaml
+        && !mentions_code;
+
+    let has_skill_keyword = has_word(SKILL_QUERY_WORDS)
+        || asks_for_workflow
+        || lower.contains("standard operating procedure");
 
     let has_howto_workflow_intent = (lower.starts_with("how do i")
         || lower.starts_with("how to")
@@ -3260,7 +3346,7 @@ fn is_skill_query(query: &str) -> bool {
             "test",
         ]
         .iter()
-        .any(|term| lower.contains(term));
+        .any(|term| words.iter().any(|word| word.starts_with(term)));
 
     has_skill_keyword || has_howto_workflow_intent
 }

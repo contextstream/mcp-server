@@ -6473,6 +6473,39 @@ mod skill_query_tests {
     }
 
     #[test]
+    fn skill_query_matches_whole_words_and_skill_workflows() {
+        assert!(is_skill_query("what is our release workflow?"));
+        assert!(is_skill_query("deploy SOP"));
+        assert!(is_skill_query(
+            "the standard operating procedure for rotating keys"
+        ));
+        assert!(is_skill_query("Workflows for onboarding a new engineer"));
+    }
+
+    #[test]
+    fn skill_query_ignores_workflow_in_ci_yaml_and_code() {
+        // CI and YAML: a workflow here is a pipeline file.
+        assert!(!is_skill_query("why does the release workflow fail in CI"));
+        assert!(!is_skill_query("github actions workflow for tests"));
+        assert!(!is_skill_query("depot workflow dispatch"));
+        assert!(!is_skill_query("edit .github/workflows/ci.yml"));
+        assert!(!is_skill_query("workflow yaml schema"));
+        // Code: identifiers, paths and the coach `workflow` tools.
+        assert!(!is_skill_query("where is workflow_id parsed"));
+        assert!(!is_skill_query("WorkflowRunner struct"));
+        assert!(!is_skill_query("where is the workflow tool implemented"));
+        assert!(!is_skill_query("crates/mcp-tools/src/domains/workflow.rs"));
+    }
+
+    #[test]
+    fn skill_query_never_matches_keywords_inside_other_words() {
+        assert!(!is_skill_query("isopod renderer"));
+        assert!(!is_skill_query("parse the desoplate config"));
+        assert!(!is_skill_query("skillset matrix component"));
+        assert!(!is_skill_query("how do i find the latest commit"));
+    }
+
+    #[test]
     fn adaptive_skill_threshold_prefers_lower_cutoff_for_incident_queries() {
         assert_eq!(
             skill_score_threshold("how do i rollback production incident"),

@@ -122,6 +122,13 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
         .and_then(|s| s.parse::<AccountModePreference>().ok())
         .unwrap_or_default();
 
+    // Opt-in that re-enables caller-supplied local file paths on the HTTP
+    // gateway. Only `allow` enables it; anything else (including unset) keeps
+    // the hosted gateway from touching its own disk for caller-supplied paths.
+    let http_local_files = std::env::var("CONTEXTSTREAM_HTTP_LOCAL_FILES")
+        .map(|value| value.trim().eq_ignore_ascii_case("allow"))
+        .unwrap_or(false);
+
     Ok(Config {
         api_url,
         api_key,
@@ -146,6 +153,7 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
         hook_transcripts_enabled,
         tool_surface_profile,
         is_http_transport: false,
+        http_local_files,
         account_mode_preference,
     })
 }

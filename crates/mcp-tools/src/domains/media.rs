@@ -503,6 +503,11 @@ impl ToolHandler for MediaTool {
                 let opt_in = input.allow_broad.unwrap_or(false)
                     || mcp_client::broad_ingest_opt_in_from_env();
                 if let Some(file_path) = input.file_path.as_deref() {
+                    if !self.client.config().await.local_files_allowed() {
+                        return Err(Error::Validation(format!(
+                            "media(action=\"index\", file_path=\"{file_path}\") is disabled on the hosted MCP gateway because file_path reads the gateway host's own disk. Use external_url=... instead. (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)"
+                        )));
+                    }
                     let project_root = self.session.state().await.folder_path;
                     let root_path: Option<&Path> = project_root.as_deref().map(Path::new);
                     validate_media_index_file(Path::new(file_path), root_path, opt_in)?;

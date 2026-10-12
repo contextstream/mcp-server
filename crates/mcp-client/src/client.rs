@@ -362,6 +362,29 @@ impl Drop for ProjectIngestLease {
 }
 
 // ---------------------------------------------------------------------------
+// Hosted-gateway local filesystem policy
+// ---------------------------------------------------------------------------
+
+/// When true, this process runs as the hosted HTTP gateway without the
+/// operator opt-in, so filesystem helpers that act on caller-supplied paths
+/// must refuse or no-op rather than touch the gateway host's own disk. Set
+/// once at gateway startup; defaults to false so stdio/local and tests keep
+/// reading and writing local files exactly as before.
+static HTTP_LOCAL_FILES_DENIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publish the hosted-gateway local-files policy (called once at startup).
+pub fn set_local_files_denied(denied: bool) {
+    HTTP_LOCAL_FILES_DENIED.store(denied, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when caller-supplied local filesystem paths must not be read or
+/// written (hosted HTTP gateway without the operator opt-in).
+pub fn local_files_denied() -> bool {
+    HTTP_LOCAL_FILES_DENIED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
 // Per-request auth override via tokio task-local
 // ---------------------------------------------------------------------------
 
@@ -2110,6 +2133,9 @@ impl ContextStreamClient {
         project_id: Uuid,
         workspace_id: Uuid,
     ) -> Result<Option<LocalCheckoutSnapshot>> {
+        if local_files_denied() {
+            return Ok(None);
+        }
         Self::validate_directory_path_no_symlinks(Path::new(root_path)).map_err(|()| {
             Error::Validation(
                 "Checkout root contains a symlink or changed during validation".to_string(),
@@ -2513,6 +2539,9 @@ impl ContextStreamClient {
         root_path: &str,
         candidate_path: &str,
     ) -> TargetedFileDecision {
+        if local_files_denied() {
+            return TargetedFileDecision::Reject;
+        }
         let Some(relative) = Self::safe_project_relative_path(root_path, candidate_path, true)
         else {
             return TargetedFileDecision::Reject;
@@ -2633,6 +2662,9 @@ impl ContextStreamClient {
     }
 
     fn best_local_index_entry(folder_path: &str) -> Option<(String, serde_json::Value)> {
+        if local_files_denied() {
+            return None;
+        }
         let index_file = dirs::home_dir()?
             .join(".contextstream")
             .join("indexed-projects.json");
@@ -5784,8 +5816,16 @@ impl ContextStreamClient {
                 Error::Validation("workspace_id is required to authorize ingest_local".to_string())
             })?;
         let is_http = config.is_http_transport;
+        let local_files_allowed = config.local_files_allowed();
         let api_url = config.api_url.clone();
         drop(config);
+
+        if !local_files_allowed {
+            return Err(Error::Validation(format!(
+                "Direct local ingest of '{}' is disabled on the hosted MCP gateway because it would read the gateway host's own disk. Keep the editor on hosted MCP and let the managed sync bridge (or editor hooks / ContextStream Desktop) upload this checkout; verify with project(action=\"index_status\"). (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)",
+                params.path
+            )));
+        }
 
         // Hold this lease across the complete scan/upload/wait/commit sequence.
         // Acquiring it centrally covers every automatic and explicit caller and
@@ -8250,6 +8290,9 @@ impl ContextStreamClient {
     where
         F: FnOnce(&mut serde_json::Map<String, serde_json::Value>),
     {
+        if local_files_denied() {
+            return;
+        }
         let index_file = match dirs::home_dir() {
             Some(home) => home.join(".contextstream").join("indexed-projects.json"),
             None => {
@@ -8331,6 +8374,9 @@ impl ContextStreamClient {
     /// whole manifest would erase that proven delta. Full-scan callers that
     /// have a baseline invalidate only unchanged entries via a three-way merge.
     pub fn clear_index_status(folder_path: &str) {
+        if local_files_denied() {
+            return;
+        }
         let index_file = match dirs::home_dir() {
             Some(home) => home.join(".contextstream").join("indexed-projects.json"),
             None => return,
@@ -14666,9 +14712,16 @@ impl ContextStreamClient {
             .ok_or_else(|| {
                 Error::Validation("workspace_id is required for media operations".to_string())
             })?;
+        let local_files_allowed = config.local_files_allowed();
         drop(config);
 
         if let Some(file_path) = &params.file_path {
+            if !local_files_allowed {
+                return Err(Error::Validation(format!(
+                    "media(action=\"index\") cannot read local file_path '{}' on the hosted MCP gateway: it would read the gateway host's own disk. Pass external_url instead, or run a local MCP client. (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)",
+                    file_path
+                )));
+            }
             // Local file: use upload flow
             let path = std::path::Path::new(file_path);
             let filename = path

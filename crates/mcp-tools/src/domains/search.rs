@@ -10361,9 +10361,15 @@ impl SearchTool {
         }
 
         // Fail fast when no auth is configured so callers don't wait on long HTTP timeouts.
-        if !self.client.config().await.has_auth() {
+        let search_config = self.client.config().await;
+        if !search_config.has_auth() {
             return Err(Error::MissingCredentials);
         }
+        // On the hosted HTTP gateway, caller-supplied folder paths must not drive
+        // reads/writes of the gateway's own disk. Local filesystem enrichment and
+        // probing stay enabled for stdio/local and an opted-in local gateway.
+        let local_files_allowed = search_config.local_files_allowed();
+        drop(search_config);
 
         // Auto-resolve workspace/project from session if not provided
         let state = self.session.state().await;
@@ -10502,17 +10508,28 @@ impl SearchTool {
             explicit_project_id = None;
         }
         let mut session_folder_path = normalize_search_root(state.folder_path.as_deref());
-        let dirty_file_snapshot = read_dirty_file_snapshot(session_folder_path.as_deref());
+        let dirty_file_snapshot = read_dirty_file_snapshot(
+            session_folder_path
+                .as_deref()
+                .filter(|_| local_files_allowed),
+        );
         let mut local_git_worktree_dirty = dirty_file_snapshot.git_worktree_dirty;
         let mut activity_file_hints = dirty_file_snapshot.hints;
         let mut repair_file_hints = dirty_file_snapshot.repair_hints;
         let mut local_git_repository = session_folder_path
             .as_deref()
+            .filter(|_| local_files_allowed)
             .and_then(local_git_remote_url)
             .as_deref()
             .and_then(repo_identity_key);
-        let mut local_git_branch = session_folder_path.as_deref().and_then(git_branch_name);
-        let mut local_git_commit_sha = session_folder_path.as_deref().and_then(git_head_sha);
+        let mut local_git_branch = session_folder_path
+            .as_deref()
+            .filter(|_| local_files_allowed)
+            .and_then(git_branch_name);
+        let mut local_git_commit_sha = session_folder_path
+            .as_deref()
+            .filter(|_| local_files_allowed)
+            .and_then(git_head_sha);
         let mut activity_paths: Vec<String> = activity_file_hints
             .iter()
             .map(|hint| hint.display_path.clone())
@@ -10524,7 +10541,7 @@ impl SearchTool {
         // gate below can safely serve a folder-scoped repeat query when the
         // tree is in sync — and skip the cache the moment a local edit lands.
         let mut folder_index_indexed_at = match session_folder_path.as_deref() {
-            Some(p) if Path::new(p).is_dir() => {
+            Some(p) if local_files_allowed && Path::new(p).is_dir() => {
                 read_local_index_entry(p).and_then(|e| e.indexed_at)
             }
             _ => None,
@@ -10973,7 +10990,7 @@ impl SearchTool {
 
         // Phase 3: For identifier queries, spawn local ripgrep in parallel with
         // the API call so we have local results ready without extra latency.
-        let parallel_local_handle = if is_identifier_query(&input.query) {
+        let parallel_local_handle = if local_files_allowed && is_identifier_query(&input.query) {
             if let Some(ref sfp) = session_folder_path {
                 let folder = PathBuf::from(sfp.clone());
                 let query_clone = input.query.clone();
@@ -11481,8 +11498,15 @@ impl SearchTool {
             }
         }
 
-        let local_path_probe = resolve_local_path_probe(&input.query, folder_path.as_deref());
-        let local_index_entry = folder_path.as_deref().and_then(read_local_index_entry);
+        let local_path_probe = if local_files_allowed {
+            resolve_local_path_probe(&input.query, folder_path.as_deref())
+        } else {
+            None
+        };
+        let local_index_entry = folder_path
+            .as_deref()
+            .filter(|_| local_files_allowed)
+            .and_then(read_local_index_entry);
         let local_project_id_for_trust = local_index_entry
             .as_ref()
             .and_then(|entry| entry.project_id)
@@ -11580,7 +11604,7 @@ impl SearchTool {
         // Prune results for files deleted from the local working tree before
         // computing no_hits, so a drifted index never silently serves hits for
         // files that no longer exist. Guarded to local directories only.
-        if !scope_invalid {
+        if !scope_invalid && local_files_allowed {
             if let Some(ref fp) = folder_path {
                 let folder = Path::new(fp);
                 if folder.is_dir() {
@@ -11644,7 +11668,7 @@ impl SearchTool {
         let mut local_enrichment_diagnostic: Option<LocalEnrichDiagnostic> = None;
         // Local filesystem enrichment: supplement API results with live filesystem scanning.
         // Apply only when scope is stable and the query shape is likely to benefit.
-        if !scope_invalid {
+        if !scope_invalid && local_files_allowed {
             if let Some(ref fp) = folder_path {
                 let folder = PathBuf::from(fp);
                 let existing_paths: HashSet<String> = result
@@ -11854,7 +11878,11 @@ impl SearchTool {
         // Phase 5: Final ripgrep safety-net. When every API and enrichment path
         // yielded zero results and we have a folder path, run one last ripgrep
         // scan so we never return empty when Grep would have found something.
-        if no_hits && !scope_invalid && is_local_keyword_enrichment_query(&input.query) {
+        if no_hits
+            && !scope_invalid
+            && local_files_allowed
+            && is_local_keyword_enrichment_query(&input.query)
+        {
             if let Some(ref fp) = folder_path {
                 let folder = PathBuf::from(fp);
                 let query_for_last = input.query.clone();

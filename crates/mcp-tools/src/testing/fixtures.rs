@@ -273,6 +273,7 @@ impl TestFixtures {
             hook_transcripts_enabled: false,
             tool_surface_profile: mcp_types::config::ToolSurfaceProfile::Default,
             is_http_transport: false,
+            http_local_files: false,
             account_mode_preference: Default::default(),
         }
     }

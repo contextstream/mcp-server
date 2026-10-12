@@ -357,6 +357,9 @@ async fn git_commits_after_index(
 }
 
 async fn local_delta_summary(folder_path: Option<&str>) -> Option<LocalDeltaSummary> {
+    if mcp_client::local_files_denied() {
+        return None;
+    }
     let folder_path = folder_path?;
     if !std::path::Path::new(folder_path).is_dir() {
         return None;
@@ -601,6 +604,9 @@ fn spawn_init_background_ingest(
     project_id: Uuid,
     max_files: usize,
 ) -> bool {
+    if mcp_client::local_files_denied() {
+        return false;
+    }
     let Some(bound_workspace_id) =
         mcp_session::auto_init::checkout_binding_workspace(&folder_path, project_id)
     else {
@@ -738,6 +744,9 @@ fn folder_is_git_repo(folder_path: &str) -> bool {
 /// the local PostToolUse init bridge performs the equivalent install on the
 /// user's machine.
 fn spawn_git_hooks_install(folder_path: &str) {
+    if mcp_client::local_files_denied() {
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -1042,6 +1051,10 @@ async fn resolve_project_relations_for_folder(
             return relations;
         }
     };
+
+    if mcp_client::local_files_denied() {
+        return relations;
+    }
 
     let (_, child_names) = detect_multi_project_folder(folder_path);
     for child_name in child_names {
@@ -6945,6 +6958,9 @@ fn condense_context_for_concise(raw: &str) -> String {
 /// recent changes so the AI understands the current project state.
 /// Returns None if git is unavailable or the path isn't a git repo.
 async fn proactive_recent_changes(folder_path: &str) -> Option<String> {
+    if mcp_client::local_files_denied() {
+        return None;
+    }
     // Walk up to find .git
     let mut current = std::path::Path::new(folder_path);
     let git_root = loop {

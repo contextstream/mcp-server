@@ -897,6 +897,12 @@ impl SkillTool {
     async fn handle_import(&self, input: &SkillInput) -> Result<ToolResult> {
         // Read content from file_path if provided, otherwise use content field
         let content = if let Some(file_path) = &input.file_path {
+            if !self.client.config().await.local_files_allowed() {
+                return Err(Error::Validation(
+                    "skill(action=\"import\", file_path=...) is disabled on the hosted MCP gateway because file_path reads the gateway host's own disk. Pass the skill text directly as `content` instead. (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)"
+                        .to_string(),
+                ));
+            }
             tokio::fs::read_to_string(file_path)
                 .await
                 .map_err(|e| Error::Validation(format!("Failed to read file: {}", e)))?

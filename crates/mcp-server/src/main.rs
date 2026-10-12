@@ -3700,6 +3700,11 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
     let mut config = load_config()?;
     config.is_http_transport = true;
 
+    // Caller-supplied local filesystem paths must not drive reads/writes of the
+    // gateway's own disk. Publish the policy process-wide so the filesystem
+    // helpers in mcp-client/mcp-session that have no Config in hand honor it.
+    mcp_client::set_local_files_denied(!config.local_files_allowed());
+
     // Install the Prometheus recorder BEFORE any code path that emits
     // metrics — once the global recorder is set, every
     // `metrics::counter!` / `metrics::histogram!` macro in the dep tree

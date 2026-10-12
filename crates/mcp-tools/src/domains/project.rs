@@ -1233,6 +1233,11 @@ impl ProjectTool {
                 action
             ))
         })?;
+        if !self.client.config().await.local_files_allowed() {
+            return Err(Error::Validation(format!(
+                "project(action=\"{action}\", path=\"{path}\") is disabled on the hosted MCP gateway because it would read the gateway host's own disk. Keep the editor on hosted MCP and let the managed sync bridge (or editor hooks / ContextStream Desktop) upload this checkout; verify with project(action=\"index_status\"). To ingest from a local checkout, run a local MCP client. (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)"
+            )));
+        }
         validate_ingest_directory(&path, self.client.config().await.is_http_transport)?;
 
         let mut resolved_workspace_id = workspace_id;
@@ -2605,6 +2610,12 @@ impl ToolHandler for ProjectTool {
                 Ok(ToolResult::with_structured(format!("Found {} team projects.", count), result))
             }
             "recent_changes" => {
+                if !self.client.config().await.local_files_allowed() {
+                    return Err(Error::Validation(
+                        "project(action=\"recent_changes\") is disabled on the hosted MCP gateway because it reads the gateway host's own git repository. Run it from a local MCP client. (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)"
+                            .to_string(),
+                    ));
+                }
                 let repo_path = folder_path.clone()
                     .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()))
                     .ok_or_else(|| {

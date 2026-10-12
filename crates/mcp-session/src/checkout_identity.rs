@@ -505,6 +505,9 @@ pub fn current_checkout_fingerprint(
 pub fn current_repository_remote_identity(
     checkout_root: impl AsRef<Path>,
 ) -> Result<Option<RepositoryRemoteIdentity>, CheckoutIdentityError> {
+    if mcp_client::local_files_denied() {
+        return Ok(None);
+    }
     let layout = resolve_git_layout(checkout_root.as_ref())?;
     read_repository_remote_identity(&layout)
 }
@@ -714,6 +717,11 @@ pub(crate) fn validate_checkout_scope(
     expected_workspace_id: Option<Uuid>,
     expected_project_id: Option<Uuid>,
 ) -> Result<ValidatedCheckoutBinding, CheckoutIdentityError> {
+    if mcp_client::local_files_denied() {
+        return Err(CheckoutIdentityError::MissingLocalConfig(
+            checkout_root.as_ref().to_path_buf(),
+        ));
+    }
     let root = canonical_directory(checkout_root.as_ref())?;
     let config_path = safe_checkout_config_path(&root, false)?;
     let raw = fs::read_to_string(&config_path).map_err(|error| {

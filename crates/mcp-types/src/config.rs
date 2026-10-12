@@ -106,6 +106,13 @@ pub struct Config {
     #[serde(default)]
     pub is_http_transport: bool,
 
+    /// Operator opt-in that re-enables caller-supplied local filesystem paths
+    /// on the HTTP gateway (`CONTEXTSTREAM_HTTP_LOCAL_FILES=allow`). Intended
+    /// only for a private, locally-run thin gateway that shares the caller's
+    /// disk. Ignored (treated as allowed) for stdio/local transports.
+    #[serde(default)]
+    pub http_local_files: bool,
+
     /// Non-interactive default for team vs personal execution mode.
     #[serde(default)]
     pub account_mode_preference: AccountModePreference,
@@ -155,6 +162,7 @@ impl Default for Config {
             hook_transcripts_enabled: false,
             tool_surface_profile: ToolSurfaceProfile::default(),
             is_http_transport: false,
+            http_local_files: false,
             account_mode_preference: std::env::var("CONTEXTSTREAM_ACCOUNT_MODE")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -164,6 +172,16 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Whether tools may read or write caller-supplied local filesystem paths.
+    ///
+    /// Always true for stdio/local transports. On the HTTP gateway it is false
+    /// unless the operator opts in with `CONTEXTSTREAM_HTTP_LOCAL_FILES=allow`,
+    /// because a caller-supplied path would otherwise read or write the
+    /// gateway host's own disk on behalf of any authenticated caller.
+    pub fn local_files_allowed(&self) -> bool {
+        !self.is_http_transport || self.http_local_files
+    }
+
     /// Check if the config has valid authentication.
     pub fn has_auth(&self) -> bool {
         self.api_key.is_some() || self.jwt.is_some() || self.allow_header_auth

@@ -192,6 +192,9 @@ enum LocalConfigResolution {
 /// Looks for local config files (.contextstream/config.json) or
 /// uses global mappings from ~/.contextstream/mappings.json.
 pub async fn resolve_workspace(folder_path: &str) -> Option<WorkspaceMapping> {
+    if mcp_client::local_files_denied() {
+        return None;
+    }
     match resolve_local_config(folder_path).await {
         LocalConfigResolution::Valid(mapping) => Some(mapping),
         LocalConfigResolution::Absent => resolve_global_mapping(folder_path, false).await,
@@ -644,6 +647,9 @@ pub async fn persist_folder_mapping(
     project_id: Option<Uuid>,
     project_name: Option<&str>,
 ) {
+    if mcp_client::local_files_denied() {
+        return;
+    }
     let Ok(binding) = validate_checkout_scope(folder_path, Some(workspace_id), project_id) else {
         return;
     };
@@ -913,6 +919,11 @@ pub async fn establish_folder_binding(
     project_name: Option<&str>,
 ) -> std::result::Result<RepositoryFingerprint, CheckoutIdentityError> {
     let dir = Path::new(folder_path);
+    if mcp_client::local_files_denied() {
+        return Err(CheckoutIdentityError::InvalidCheckoutRoot(
+            dir.to_path_buf(),
+        ));
+    }
     let checkout_root = std::fs::canonicalize(dir)
         .map_err(|error| CheckoutIdentityError::io("canonicalize checkout root", dir, error))?;
     if !checkout_root.is_dir() {

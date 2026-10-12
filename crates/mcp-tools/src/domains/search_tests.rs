@@ -4484,10 +4484,38 @@ mod auto_mode_tests {
                 Some("/srv/projects/mcp"),
                 Some(mcp),
                 Some(mcp),
+                Some(mcp),
                 Some(other_project),
                 Some("/srv/example-repo"),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn test_hosted_session_folder_roots_results_for_its_own_project() {
+        // A hosted gateway reads no local mapping or index; init resolved the
+        // session's folder to the project being searched, so results are
+        // rooted there, not at the folder of the machine that first indexed
+        // the project.
+        let project = uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let session = scoped_session_folder_path(
+            Some("/data/dev/maker/contextstream"),
+            None,
+            Some(project),
+            None,
+            Some(project),
+            None,
+        );
+        assert_eq!(session, Some("/data/dev/maker/contextstream"));
+        assert_eq!(
+            resolve_effective_folder_path(
+                session,
+                Some("/home/core/dev/maker/contextstream"),
+                None,
+                false,
+            ),
+            Some("/data/dev/maker/contextstream".to_string())
         );
     }
 
@@ -4498,6 +4526,7 @@ mod auto_mode_tests {
         assert_eq!(
             scoped_session_folder_path(
                 Some("/srv/example-repo/web"),
+                None,
                 None,
                 None,
                 Some(canonical_project),

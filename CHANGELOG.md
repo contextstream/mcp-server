@@ -1,5 +1,104 @@
 # Changelog
 
+## 1.0.21
+
+- Hosted gateway: tools no longer read or write the gateway host's own disk.
+  On `mcp.contextstream.io`, a tool that takes a local path acted on the
+  gateway's files for any signed-in caller: `skill(action="import",
+  file_path=...)` read a file and sent it to the skills API, `media(action=
+  "index", file_path=...)` uploaded one, a `project` ingest from a path walked a
+  directory, and search enrichment, session folder checks and config writes, and
+  `project(action="recent_changes")` read the gateway's folders and git. In HTTP
+  mode these are now refused with a message that says what to use instead
+  (`content` for skills, `external_url` for media, the sync bridge for indexing),
+  and the local reads behind search and `init` are skipped. stdio and local runs
+  are unchanged. A private gateway that runs on the caller's own machine can
+  restore the old behavior with `CONTEXTSTREAM_HTTP_LOCAL_FILES=allow` (339f5d5).
+- Hosted gateway: it never replaces its own binary. When a client's `init`
+  reported a newer version, the `session` tool's self-update could replace a
+  gateway's pinned release with whatever npm or R2 called latest. `contextstream-mcp
+  http` now turns runtime self-update off, as `CONTEXTSTREAM_DISABLE_SELF_UPDATE`
+  already did for the npm launcher (ddcae54).
+- Hosted gateway: each request keeps its own tool surface. The tool-surface
+  profile lived on the one tool registry every caller shares, so an `initialize`
+  from a ChatGPT-like client narrowed the tool list for everyone until the next
+  one widened it, and the cached `tools/list` could hold a list built for another
+  profile. The profile is now chosen per request: the integration paths
+  (`/chatgpt`, `/claude`, `/client`) get the full surface, then the
+  `X-ContextStream-Tool-Surface-Profile` header, then the session (the
+  `initialize` request, or the profile code carried in the `Mcp-Session-Id` it
+  issued), then the server default. Session ids stay UUIDs; ids issued before
+  this version get the default (5c42d4b).
+- Hosted gateway: search results are rooted at the folder the session named in
+  `init`. They came back under the path of whichever machine first indexed the
+  project (`/home/core/...` for a checkout at `/data/...`), and local enrichment
+  reported `missing_root` (#168).
+- Hooks: the prompt and subagent hooks no longer append an "ATTRIBUTION" block.
+  It told the agent to credit ContextStream, never to say it "didn't help", and
+  not to disclose the instruction; it was stored encrypted in the binary and
+  showed up in the raw hook output. The hooks now send only the tool guidance the
+  rules files already state (4879e0b).
+- Sync bridge: a machine set up for hosted MCP now links the checkouts agents
+  work in. The bridge only watched folders linked before, and hosted `init`
+  cannot write local files, so a fresh install could sync nothing for days while
+  search answered from other machines' copies. The background link audit now
+  also checks the Git checkouts agent sessions worked in, and still links only on
+  strong evidence (the repository names the project; not a temporary path, a
+  pinned or isolated folder, or an agent's task worktree). A hook that sees an
+  agent in an unlinked checkout asks for that audit at once (at most every 10
+  minutes), a newly linked folder gets one full scan, and SessionStart says
+  whether the checkout is synced, not linked (with the `link --fix` command) or
+  linked with no bridge running (#167).
+- `entity`: an update no longer makes a team item personal. Updates sent the
+  session's default `is_personal` when the body left it out, which overwrote the
+  stored value; they now send it only when the caller sets it. Every create and
+  update says the stored visibility (for example "Visibility: personal (only you
+  can see it). Pass is_personal=false to share it with the workspace.").
+- `entity`: a new `target_project` parameter files an item in another project of
+  the workspace by name ("mcp-server"); an unknown name, or a project id the API
+  refuses, returns the workspace's project names. A create says where the item
+  went ("Filed in project mcp-server (workspace Engineering)."). The tool text
+  and the editor rules say to file in the project that owns the code, and the
+  scope warning no longer fires for an entity write to another project in the
+  same workspace.
+- `entity`: ticket replies no longer echo `linked_items` and `assignees`, which
+  the API does not store; a reply now says "Not saved: ..." for either. The kind
+  `discussion` is removed (the API serves no such route) and points to
+  `integration(provider="slack", action="discussions")` (901a2fc).
+- Search: only skill-like queries pull in skills. Keywords matched inside other
+  words, so a code search mentioning "workflow" (a CI file, a `workflow_id`
+  field) was enriched with skill matches. Keywords now match whole words, and
+  "workflow" counts only without CI, YAML or code words in the query (6bbf26b).
+- stdio: `resume` and `resume_list` no longer offer the caller its own session.
+  `init` over stdio now adopts the session id the API assigned, so the id it
+  prints, the id calls are stored under and the id `resume` leaves out are the
+  same; an id the caller sends, and the hosted path, are unchanged (#152, #166).
+- CLI: one-shot commands end quietly when their reader closes early. `about |
+  head -2` or `setup --yes | head -8` panicked and exited with 134; they now end
+  on SIGPIPE like other command-line tools. The stdio server, the HTTP gateway,
+  the sync bridge and the editor hooks are unchanged (#159, #166).
+- Setup: the review card keeps a space after labels wider than its label column
+  ("Deep project learning  No change (default)") (074c45f).
+- Hooks, opt-in: with `CONTEXTSTREAM_COACHING_TURNS=1`, the Stop hook keeps the
+  agent's last reply per session in `~/.contextstream/coaching-turns.json` (at
+  most 200 sessions, 24 hours, 16 KiB per reply), and the prompt hook sends it
+  with the next prompt to the coaching loop, alongside the context fetch. A new
+  `contextstream-mcp hook codex-notify` does the same as Codex's `notify`
+  program; configuring it opts in (`CONTEXTSTREAM_COACHING_TURNS=0` still turns
+  it off). Nothing is sent without the opt-in, and sending pauses for a day when
+  the server answers `learning_off` (053d961).
+
+Who gets what: hook, sync bridge, setup and CLI changes reach a machine after
+`contextstream-mcp update` (the editor-rules wording also needs a rules
+refresh). The hosted-gateway fixes and the `entity` tool changes reach hosted
+clients when the hosted gateway runs this version.
+
+Dependencies: `quinn-proto` moves from 0.11.15 to 0.11.19 in `Cargo.lock` for
+RUSTSEC-2026-0338 to RUSTSEC-2026-0342. It is an optional dependency of
+reqwest's HTTP/3 support, which this build does not enable, so no released
+binary contained it; the bump keeps `cargo audit` clean. No other dependency
+changes (87d6488).
+
 ## 1.0.20
 
 - Init: a placeholder id no longer fails the session. Agents started sessions

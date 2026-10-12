@@ -187,7 +187,10 @@ pub use client::{
     run_with_installation_id, run_with_mcp_session_id, run_with_model_id, run_with_session_key,
     spawn_with_task_context, CapturedTenantHome, TaskContextSnapshot, TENANT_HOME_SCOPE_HEADER,
 };
-pub use client::{local_files_denied, set_local_files_denied};
+pub use client::{
+    local_files_denied, runtime_self_update_disabled, set_local_files_denied,
+    set_runtime_self_update_disabled,
+};
 pub use ingest_guard::{
     broad_ingest_opt_in_from_env, validate_ingest_root, IngestRootAssessment, IngestRootOptions,
     IngestRootRejection, IngestRootRejectionReason, ALLOW_BROAD_INGEST_ENV, SENSITIVE_DIR_NAMES,

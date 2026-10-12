@@ -384,6 +384,23 @@ pub fn local_files_denied() -> bool {
     HTTP_LOCAL_FILES_DENIED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// When true, this process must never replace its own binary at runtime. The
+/// hosted HTTP gateway sets it at startup: its version is pinned by its
+/// release, so an upgrade must come through a repin, not through an
+/// `[VERSION_NOTICE]` that a client's session init happens to trigger.
+static RUNTIME_SELF_UPDATE_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn runtime self-update off for this process (called once at startup).
+pub fn set_runtime_self_update_disabled(disabled: bool) {
+    RUNTIME_SELF_UPDATE_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when this process must not update itself at runtime.
+pub fn runtime_self_update_disabled() -> bool {
+    RUNTIME_SELF_UPDATE_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // ---------------------------------------------------------------------------
 // Per-request auth override via tokio task-local
 // ---------------------------------------------------------------------------

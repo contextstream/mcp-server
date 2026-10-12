@@ -6,6 +6,16 @@ use crate::testing::TestFixtures;
 use mcp_types::tool::ToolCategory;
 use serde_json::json;
 
+#[test]
+fn self_update_is_off_on_the_hosted_gateway_and_under_a_launcher() {
+    assert!(self_update_disabled_for(true, None));
+    assert!(self_update_disabled_for(true, Some("0")));
+    assert!(self_update_disabled_for(false, Some("1")));
+    assert!(self_update_disabled_for(false, Some(" Yes ")));
+    assert!(!self_update_disabled_for(false, None));
+    assert!(!self_update_disabled_for(false, Some("0")));
+}
+
 // ============================================================================
 // Test Helpers
 // ============================================================================

@@ -1594,9 +1594,19 @@ fn should_schedule_auto_update_check() -> bool {
 }
 
 fn self_update_disabled() -> bool {
-    std::env::var("CONTEXTSTREAM_DISABLE_SELF_UPDATE")
-        .ok()
-        .is_some_and(|value| {
+    self_update_disabled_for(
+        mcp_client::runtime_self_update_disabled(),
+        std::env::var("CONTEXTSTREAM_DISABLE_SELF_UPDATE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Self-update is off when this process is the hosted HTTP gateway (its binary
+/// is pinned by its release) or when a launcher manages the runtime.
+fn self_update_disabled_for(runtime_disabled: bool, launcher_env: Option<&str>) -> bool {
+    runtime_disabled
+        || launcher_env.is_some_and(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on" | "enabled"

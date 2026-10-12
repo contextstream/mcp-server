@@ -3705,6 +3705,10 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
     // helpers in mcp-client/mcp-session that have no Config in hand honor it.
     mcp_client::set_local_files_denied(!config.local_files_allowed());
 
+    // The hosted gateway's binary is pinned by its release. A session init that
+    // reports a newer version must not make the gateway replace itself.
+    mcp_client::set_runtime_self_update_disabled(true);
+
     // Install the Prometheus recorder BEFORE any code path that emits
     // metrics — once the global recorder is set, every
     // `metrics::counter!` / `metrics::histogram!` macro in the dep tree
@@ -3818,6 +3822,16 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn the_http_gateway_never_updates_itself() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn run_http_server(")
+            .expect("run_http_server");
+        let body = &source[start..start + source[start..].find("\n}\n").expect("end")];
+        assert!(body.contains("mcp_client::set_runtime_self_update_disabled(true);"));
+    }
 
     #[test]
     fn should_refresh_project_rules_when_project_config_exists() {

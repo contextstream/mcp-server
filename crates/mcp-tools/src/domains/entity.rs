@@ -1448,9 +1448,9 @@ mod tests {
 
     #[test]
     fn every_entity_kind_maps_to_a_real_api_route() {
-        // The entity routes the contextstream API mounts under /api/v1
-        // (crates/contextstream-api/src/routes/v1/mod.rs). A kind whose path
-        // is missing here would send every call to a 404.
+        // The entity routes the ContextStream API mounts under /api/v1, from
+        // its v1 route table. A kind whose path is missing here would send
+        // every call to a 404.
         const API_ENTITY_ROUTES: &[&str] = &[
             "tickets",
             "handoffs",

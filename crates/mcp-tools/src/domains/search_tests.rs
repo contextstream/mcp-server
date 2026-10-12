@@ -4500,22 +4500,22 @@ mod auto_mode_tests {
         // the project.
         let project = uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
         let session = scoped_session_folder_path(
-            Some("/data/dev/maker/contextstream"),
+            Some("/srv/checkouts/acme-web"),
             None,
             Some(project),
             None,
             Some(project),
             None,
         );
-        assert_eq!(session, Some("/data/dev/maker/contextstream"));
+        assert_eq!(session, Some("/srv/checkouts/acme-web"));
         assert_eq!(
             resolve_effective_folder_path(
                 session,
-                Some("/home/core/dev/maker/contextstream"),
+                Some("/home/first-machine/src/acme-web"),
                 None,
                 false,
             ),
-            Some("/data/dev/maker/contextstream".to_string())
+            Some("/srv/checkouts/acme-web".to_string())
         );
     }
 

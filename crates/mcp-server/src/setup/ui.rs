@@ -487,9 +487,11 @@ impl Ui {
             .join(&self.faint(" · "))
     }
 
-    /// A label/value row inside a summary card.
+    /// A label/value row inside a summary card. Values start 12 columns in;
+    /// a label too wide for that column ("Deep project learning") still keeps
+    /// two spaces before its value instead of running into it.
     pub fn row(&self, label: &str, value: &str) -> String {
-        let pad = 12usize.saturating_sub(measure_text_width(label));
+        let pad = 12usize.saturating_sub(measure_text_width(label)).max(2);
         format!("{}{}{value}", self.faint(label), " ".repeat(pad))
     }
 
@@ -1032,6 +1034,21 @@ mod tests {
         let fill = "48;2;17;26;45";
         let after_first_reset = body.split(RESET).nth(2).expect("segment after styled span");
         assert!(after_first_reset.contains(fill), "{body:?}");
+    }
+
+    #[test]
+    fn rows_keep_a_gap_after_labels_wider_than_the_label_column() {
+        let ui = Ui::plain(80);
+        assert_eq!(ui.row("Indexing", "On"), "Indexing    On");
+        assert_eq!(ui.row("Connection", "Hosted"), "Connection  Hosted");
+        assert_eq!(
+            ui.row("Deep project learning", "No change (default)"),
+            "Deep project learning  No change (default)"
+        );
+        assert_eq!(
+            ui.row("Claude auto memory", "Keep on"),
+            "Claude auto memory  Keep on"
+        );
     }
 
     #[test]

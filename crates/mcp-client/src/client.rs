@@ -7,6 +7,7 @@ use mcp_types::{
         AnswerFeedbackRequestV1, AnswerFeedbackResponseV1, AnswerRequestV1, AnswerResponseV1,
     },
     api::*,
+    config::ToolSurfaceProfile,
     AccountContextSnapshot, AccountContextSource, AuthOverride, Config, ConfigOverride, Error,
     ErrorCode, Result, SessionKey, TeamDiscussion, TeamPriorityItem, TrafficClass,
     TranscriptTopicSignal,
@@ -736,6 +737,31 @@ pub fn get_task_mcp_session_id() -> Option<String> {
     TASK_MCP_SESSION_ID.try_with(|s| s.clone()).ok()
 }
 
+tokio::task_local! {
+    /// Per-request tool surface profile resolved by the HTTP transport (from
+    /// the request path, the `X-ContextStream-Tool-Surface-Profile` header, or
+    /// the session's `Mcp-Session-Id`). The hosted gateway serves every caller
+    /// from one shared `ToolRegistry`, so the surface rides the request rather
+    /// than the registry. Unset for stdio, where the registry's own profile
+    /// applies.
+    static TASK_TOOL_SURFACE_PROFILE: ToolSurfaceProfile;
+}
+
+/// Run a future scoped to one request's tool surface profile.
+pub async fn run_with_tool_surface_profile<F, Fut>(profile: ToolSurfaceProfile, f: F) -> Fut::Output
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future,
+{
+    TASK_TOOL_SURFACE_PROFILE.scope(profile, f()).await
+}
+
+/// Read the current request's tool surface profile, if any. `None` outside an
+/// HTTP request (CLI/stdio, background tasks, tests).
+pub fn get_task_tool_surface_profile() -> Option<ToolSurfaceProfile> {
+    TASK_TOOL_SURFACE_PROFILE.try_with(|profile| *profile).ok()
+}
+
 /// Run a future scoped to the managed installation that issued the hosted MCP
 /// request.
 pub async fn run_with_installation_id<F, Fut>(installation_id: Uuid, f: F) -> Fut::Output
@@ -809,6 +835,7 @@ pub struct TaskContextSnapshot {
     mcp_session_id: Option<String>,
     model_id: Option<String>,
     installation_id: Option<Uuid>,
+    tool_surface_profile: Option<ToolSurfaceProfile>,
 }
 
 pub fn capture_task_context() -> TaskContextSnapshot {
@@ -820,6 +847,7 @@ pub fn capture_task_context() -> TaskContextSnapshot {
         mcp_session_id: get_task_mcp_session_id(),
         model_id: get_task_model_id(),
         installation_id: get_task_installation_id(),
+        tool_surface_profile: get_task_tool_surface_profile(),
     }
 }
 
@@ -839,6 +867,11 @@ where
         if let Some(model_id) = context.model_id {
             let inner = scoped;
             scoped = Box::pin(async move { run_with_model_id(model_id, || inner).await });
+        }
+        if let Some(profile) = context.tool_surface_profile {
+            let inner = scoped;
+            scoped =
+                Box::pin(async move { run_with_tool_surface_profile(profile, || inner).await });
         }
         if let Some(installation_id) = context.installation_id {
             let inner = scoped;
@@ -899,19 +932,26 @@ mod task_context_tests {
                         run_with_mcp_session_id("mcp-session".to_string(), || async {
                             run_with_installation_id(Uuid::new_v4(), || async {
                                 run_with_model_id("gpt-5.5".to_string(), || async {
-                                    spawn_with_task_context(async {
-                                        (
-                                            get_task_session_key(),
-                                            get_task_caller_cache_identity(),
-                                            get_task_auth_override(),
-                                            get_task_config_override(),
-                                            get_task_mcp_session_id(),
-                                            get_task_model_id(),
-                                            get_task_installation_id(),
-                                        )
-                                    })
+                                    run_with_tool_surface_profile(
+                                        ToolSurfaceProfile::OpenaiAgentic,
+                                        || async {
+                                            spawn_with_task_context(async {
+                                                (
+                                                    get_task_session_key(),
+                                                    get_task_caller_cache_identity(),
+                                                    get_task_auth_override(),
+                                                    get_task_config_override(),
+                                                    get_task_mcp_session_id(),
+                                                    get_task_model_id(),
+                                                    get_task_installation_id(),
+                                                    get_task_tool_surface_profile(),
+                                                )
+                                            })
+                                            .await
+                                            .expect("detached task")
+                                        },
+                                    )
                                     .await
-                                    .expect("detached task")
                                 })
                                 .await
                             })
@@ -938,6 +978,7 @@ mod task_context_tests {
         assert_eq!(observed.4.as_deref(), Some("mcp-session"));
         assert_eq!(observed.5.as_deref(), Some("gpt-5.5"));
         assert!(observed.6.is_some());
+        assert_eq!(observed.7, Some(ToolSurfaceProfile::OpenaiAgentic));
     }
 }
 
@@ -16789,10 +16830,14 @@ impl ContextParams {
         if let Some(v) = self.client_name {
             obj.insert("client_name".into(), serde_json::Value::String(v));
         }
-        if let Some(v) = self
-            .tool_surface_profile
-            .or_else(|| Some(config.tool_surface_profile.as_str().to_string()))
-        {
+        if let Some(v) = self.tool_surface_profile.or_else(|| {
+            Some(
+                get_task_tool_surface_profile()
+                    .unwrap_or(config.tool_surface_profile)
+                    .as_str()
+                    .to_string(),
+            )
+        }) {
             obj.insert("tool_surface_profile".into(), serde_json::Value::String(v));
         }
         if let Some(v) = self.assistant_message {
@@ -17075,10 +17120,14 @@ impl SessionInitParams {
         if let Some(v) = self.client_name {
             json["client_name"] = serde_json::Value::String(v);
         }
-        if let Some(v) = self
-            .tool_surface_profile
-            .or_else(|| Some(config.tool_surface_profile.as_str().to_string()))
-        {
+        if let Some(v) = self.tool_surface_profile.or_else(|| {
+            Some(
+                get_task_tool_surface_profile()
+                    .unwrap_or(config.tool_surface_profile)
+                    .as_str()
+                    .to_string(),
+            )
+        }) {
             json["tool_surface_profile"] = serde_json::Value::String(v);
         }
         if let Some(v) = self.auto_index {

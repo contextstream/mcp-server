@@ -629,6 +629,46 @@ mod openai_agentic_surface_tests {
         );
     }
 
+    // The hosted HTTP transport scopes each request's profile as a task-local.
+    // Inside the scope it wins over the registry's own; outside it, and in a
+    // concurrent request with another profile, the registry is untouched.
+    #[tokio::test]
+    async fn test_request_surface_profile_wins_only_inside_its_scope() {
+        let mut registry = ToolRegistry::new(&create_complete_config());
+        registry.register("search", Arc::new(MockTool::new("search")));
+        registry.register("integration", Arc::new(MockTool::new("integration")));
+        let registry = Arc::new(registry);
+
+        let agentic = {
+            let registry = registry.clone();
+            mcp_client::run_with_tool_surface_profile(
+                ToolSurfaceProfile::OpenaiAgentic,
+                || async move {
+                    tokio::task::yield_now().await;
+                    (
+                        registry.tool_surface_profile(),
+                        registry.get("integration").is_some(),
+                    )
+                },
+            )
+        };
+        let full = {
+            let registry = registry.clone();
+            mcp_client::run_with_tool_surface_profile(ToolSurfaceProfile::Default, || async move {
+                tokio::task::yield_now().await;
+                (
+                    registry.tool_surface_profile(),
+                    registry.get("integration").is_some(),
+                )
+            })
+        };
+        let (agentic, full) = tokio::join!(agentic, full);
+
+        assert_eq!(agentic, (ToolSurfaceProfile::OpenaiAgentic, false));
+        assert_eq!(full, (ToolSurfaceProfile::Default, true));
+        assert_eq!(registry.tool_surface_profile(), ToolSurfaceProfile::Default);
+    }
+
     #[tokio::test]
     async fn test_openai_agentic_surface_hides_direct_execution_for_long_tail_tools() {
         let config = create_openai_agentic_config();

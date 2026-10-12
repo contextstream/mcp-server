@@ -798,8 +798,13 @@ impl ToolRegistry {
         self.consolidated_mode
     }
 
-    /// Get the active tool surface profile.
+    /// Get the active tool surface profile: the current request's profile when
+    /// the HTTP transport set one (see `mcp_client::run_with_tool_surface_profile`),
+    /// otherwise this registry's own.
     pub fn tool_surface_profile(&self) -> ToolSurfaceProfile {
+        if let Some(profile) = mcp_client::get_task_tool_surface_profile() {
+            return profile;
+        }
         *self
             .tool_surface_profile
             .read()
@@ -826,10 +831,9 @@ impl ToolRegistry {
     /// (explicit param/header or client-identity auto-detection). When it is
     /// `Some`, that profile is applied; when it is `None`, the registry falls
     /// back to its construction-time default instead of leaving whatever a
-    /// previous client set in place. This prevents global state bleed on a
-    /// shared multi-tenant process, where the registry is a long-lived
-    /// `Arc<ToolRegistry>` and `tool_surface_profile` was otherwise only ever
-    /// set, never reset.
+    /// previous client set in place. Used by stdio, which serves one client
+    /// per process; the hosted HTTP transport never changes the shared
+    /// registry and scopes each request's profile as a task-local instead.
     pub fn apply_initialize_surface_profile(&self, detected: Option<ToolSurfaceProfile>) {
         self.set_tool_surface_profile(detected.unwrap_or(self.default_tool_surface_profile));
     }

@@ -27,7 +27,8 @@ use futures::stream::{self, Stream};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use mcp_client::{
     get_task_config_override, run_with_auth_override, run_with_caller_cache_identity,
-    run_with_config_override, run_with_installation_id, run_with_session_key, ContextStreamClient,
+    run_with_config_override, run_with_installation_id, run_with_session_key,
+    run_with_tool_surface_profile, ContextStreamClient,
 };
 use mcp_session::SessionManager;
 use mcp_tools::ToolRegistry;
@@ -662,17 +663,23 @@ async fn handle_jsonrpc(
 
     let result = match request.method.as_str() {
         "initialize" => {
-            // Deterministic per-`initialize`: apply the detected profile, or
-            // fall back to the registry default. Never leave a previous
-            // client's auto-detected narrowing in place (global-state bleed).
-            state.registry.apply_initialize_surface_profile(
+            // The detected profile shapes this initialize result only. /rpc
+            // issues no session to carry it, and the shared registry serves
+            // every caller, so the registry is never changed.
+            let surface_profile = resolve_request_tool_surface_profile(
+                false,
+                get_task_config_override().and_then(|config| config.tool_surface_profile),
                 surface_profile_from_initialize_params(&request.params),
+                state.registry.default_tool_surface_profile(),
             );
             state
                 .telemetry
                 .update_initialize_hints(&request.params)
                 .await;
-            handle_initialize_method(&state, &request.params).await
+            run_with_tool_surface_profile(surface_profile, || {
+                handle_initialize_method(&state, &request.params)
+            })
+            .await
         }
         "tools/list" => handle_list_tools_method(&state, None).await,
         "tools/call" => {
@@ -741,7 +748,7 @@ async fn handle_mcp_streamable(
     Query(query): Query<McpQueryParams>,
     matched_path: Option<MatchedPath>,
     headers: HeaderMap,
-    Json(mut request): Json<JsonRpcRequest>,
+    Json(request): Json<JsonRpcRequest>,
 ) -> Response {
     // Integration-specific endpoints (/chatgpt, /claude, /client) must expose
     // the full ContextStream tool surface regardless of client auto-detection,
@@ -754,6 +761,44 @@ async fn handle_mcp_streamable(
         })
         .unwrap_or(false);
 
+    // One shared registry serves every caller, so the surface rides this
+    // request as a task-local and the registry itself is never changed.
+    let session_profile = if request.method == "initialize" {
+        surface_profile_from_initialize_params(&request.params)
+    } else if uses_stateless_http_contract(&headers, &request) {
+        // The stateless contract has no protocol session to remember one.
+        None
+    } else {
+        header_str(&headers, "mcp-session-id").and_then(surface_profile_from_session_id)
+    };
+    let surface_profile = resolve_request_tool_surface_profile(
+        force_full_surface,
+        header_str(&headers, "x-contextstream-tool-surface-profile")
+            .and_then(|value| value.parse::<ToolSurfaceProfile>().ok()),
+        session_profile,
+        state.registry.default_tool_surface_profile(),
+    );
+    run_with_tool_surface_profile(surface_profile, || {
+        serve_mcp_streamable(
+            state,
+            query,
+            force_full_surface,
+            surface_profile,
+            headers,
+            request,
+        )
+    })
+    .await
+}
+
+async fn serve_mcp_streamable(
+    state: HttpState,
+    query: McpQueryParams,
+    force_full_surface: bool,
+    surface_profile: ToolSurfaceProfile,
+    headers: HeaderMap,
+    mut request: JsonRpcRequest,
+) -> Response {
     // MCP requires Origin validation to prevent DNS-rebinding attacks. Native
     // clients generally omit Origin; browser clients must be same-origin,
     // explicitly configured, or one of the hosted client origins we support.
@@ -844,7 +889,7 @@ async fn handle_mcp_streamable(
 
     let is_initialize = request.method == "initialize";
     let response_session_id =
-        (is_initialize && !stateless_request).then(|| Uuid::new_v4().to_string());
+        (is_initialize && !stateless_request).then(|| mint_mcp_session_id(surface_profile));
 
     let tool_name = if request.method == "tools/call" {
         request
@@ -882,13 +927,6 @@ async fn handle_mcp_streamable(
         } else {
             None
         };
-    if !stateless_request && force_full_surface {
-        // Integration-specific legacy paths likewise select their complete
-        // surface on every request rather than inheriting global profile state.
-        state
-            .registry
-            .set_tool_surface_profile(ToolSurfaceProfile::Default);
-    }
     let result = match request.method.as_str() {
         "server/discover" => Ok(build_contextstream_stateless_discover_result()),
         "initialize" if stateless_request => Err(JsonRpcError {
@@ -899,14 +937,6 @@ async fn handle_mcp_streamable(
             data: None,
         }),
         "initialize" => {
-            if !force_full_surface {
-                // Deterministic per-`initialize`: apply the detected profile,
-                // or fall back to the registry default so a prior client's
-                // auto-detected narrowing can't persist (global-state bleed).
-                state.registry.apply_initialize_surface_profile(
-                    surface_profile_from_initialize_params(&request.params),
-                );
-            }
             state
                 .telemetry
                 .update_managed_initialize_hints_for_session(
@@ -1081,6 +1111,69 @@ async fn handle_mcp_streamable(
     }
 
     http_response
+}
+
+/// The tool surface for one request, first match wins:
+///
+/// 1. The integration paths (/chatgpt, /claude, /client): the full surface.
+/// 2. The `X-ContextStream-Tool-Surface-Profile` header.
+/// 3. The session's own choice: an initialize request's params, or the code in
+///    the `Mcp-Session-Id` that initialize issued.
+/// 4. The server's configured default.
+fn resolve_request_tool_surface_profile(
+    force_full_surface: bool,
+    header_profile: Option<ToolSurfaceProfile>,
+    session_profile: Option<ToolSurfaceProfile>,
+    default_profile: ToolSurfaceProfile,
+) -> ToolSurfaceProfile {
+    if force_full_surface {
+        return ToolSurfaceProfile::Default;
+    }
+    header_profile
+        .or(session_profile)
+        .unwrap_or(default_profile)
+}
+
+/// Marks an `Mcp-Session-Id` that carries a tool surface code.
+const SESSION_SURFACE_MARKER: u8 = 0xc5;
+
+fn surface_profile_code(profile: ToolSurfaceProfile) -> u8 {
+    match profile {
+        ToolSurfaceProfile::Default => 0,
+        ToolSurfaceProfile::OpenaiAgentic => 1,
+    }
+}
+
+/// Mint an initialize-era `Mcp-Session-Id` that carries the session's tool
+/// surface, so whichever replica serves a later request of the session needs
+/// no shared state to find it. The id stays a canonical UUID (version 8, the
+/// RFC 9562 custom layout): random bytes, then the marker and the code.
+fn mint_mcp_session_id(profile: ToolSurfaceProfile) -> String {
+    let mut bytes = *Uuid::new_v4().as_bytes();
+    bytes[14] = SESSION_SURFACE_MARKER;
+    bytes[15] = surface_profile_code(profile);
+    uuid::Builder::from_custom_bytes(bytes)
+        .into_uuid()
+        .to_string()
+}
+
+/// The tool surface an `Mcp-Session-Id` from [`mint_mcp_session_id`] carries.
+/// Ids minted before the code existed (version 4) carry none.
+fn surface_profile_from_session_id(session_id: &str) -> Option<ToolSurfaceProfile> {
+    let id = Uuid::parse_str(session_id.trim()).ok()?;
+    let bytes = id.as_bytes();
+    if id.get_version_num() != 8
+        || id.get_variant() != uuid::Variant::RFC4122
+        || bytes[14] != SESSION_SURFACE_MARKER
+    {
+        return None;
+    }
+    [
+        ToolSurfaceProfile::Default,
+        ToolSurfaceProfile::OpenaiAgentic,
+    ]
+    .into_iter()
+    .find(|profile| surface_profile_code(*profile) == bytes[15])
 }
 
 fn surface_profile_from_initialize_params(params: &Value) -> Option<ToolSurfaceProfile> {
@@ -3483,6 +3576,122 @@ mod tests {
         assert!(response["result"].get("resultType").is_none());
     }
 
+    // Ticket 7c787154: one registry serves every caller. A ChatGPT-like and a
+    // Claude-like session interleaved on one process each keep the surface
+    // their initialize chose, the registry is never changed, and the tools/list
+    // cache never holds a list built under another surface than its key's.
+    #[tokio::test]
+    async fn interleaved_http_sessions_keep_their_own_tool_surfaces() {
+        fn legacy_request(path: &str, session_id: Option<&str>, body: Value) -> Request<Body> {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            if let Some(session_id) = session_id {
+                builder = builder.header("mcp-session-id", session_id);
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        }
+        async fn initialize(app: &Router, client_name: &str) -> String {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": "initialize",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": mcp_types::MCP_PROTOCOL_2024_11_05,
+                    "clientInfo": {"name": client_name, "version": "1.0.0"},
+                    "capabilities": {}
+                }
+            });
+            let response = app
+                .clone()
+                .oneshot(legacy_request("/mcp", None, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.headers()["mcp-session-id"]
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+        async fn tool_names(app: &Router, path: &str, session_id: &str) -> Vec<String> {
+            let body =
+                json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list", "params": {}});
+            let response = app
+                .clone()
+                .oneshot(legacy_request(path, Some(session_id), body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            json_response(response).await["result"]["tools"]
+                .as_array()
+                .expect("tools array")
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect()
+        }
+        let has = |names: &[String], name: &str| names.iter().any(|n| n == name);
+
+        let state = create_protocol_test_state();
+        let registry = state.registry.clone();
+        let tools_list_cache = state.tools_list_cache.clone();
+        let app = create_router(state);
+
+        let chatgpt = initialize(&app, "chatgpt").await;
+        let claude = initialize(&app, "claude-code").await;
+        assert_eq!(
+            surface_profile_from_session_id(&chatgpt),
+            Some(ToolSurfaceProfile::OpenaiAgentic)
+        );
+        assert_eq!(
+            surface_profile_from_session_id(&claude),
+            Some(ToolSurfaceProfile::Default)
+        );
+
+        for _ in 0..2 {
+            let agentic = tool_names(&app, "/mcp", &chatgpt).await;
+            assert!(has(&agentic, "tool_search") && !has(&agentic, "entity"));
+            let full = tool_names(&app, "/mcp", &claude).await;
+            assert!(has(&full, "entity") && !has(&full, "tool_search"));
+        }
+        // An integration path serves the full surface even to an agentic
+        // session, and leaves that session's own surface alone.
+        let forced = tool_names(&app, "/chatgpt", &chatgpt).await;
+        assert!(has(&forced, "entity") && !has(&forced, "tool_search"));
+        assert!(has(
+            &tool_names(&app, "/mcp", &chatgpt).await,
+            "tool_search"
+        ));
+
+        assert_eq!(registry.tool_surface_profile(), ToolSurfaceProfile::Default);
+
+        let cache = tools_list_cache
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        assert_eq!(cache.len(), 2, "one list per surface");
+        for (key, list) in cache.iter() {
+            let names: Vec<String> = list["tools"]
+                .as_array()
+                .expect("tools array")
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect();
+            assert_eq!(
+                key.ends_with("surface=openai_agentic"),
+                has(&names, "tool_search"),
+                "{key}"
+            );
+            assert_eq!(
+                key.ends_with("surface=default"),
+                has(&names, "entity"),
+                "{key}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn stateless_http_endpoint_rejects_get_and_delete() {
         let mut state = create_protocol_test_state();
@@ -5320,6 +5529,57 @@ mod tests {
         use super::*;
         use crate::server::build_registry;
         use mcp_types::config::{Config, ToolSurfaceProfile};
+
+        #[test]
+        fn request_surface_follows_path_then_header_then_session_then_default() {
+            use ToolSurfaceProfile::{Default as Full, OpenaiAgentic as Agentic};
+            // An integration path always gets the full surface.
+            assert_eq!(
+                resolve_request_tool_surface_profile(true, Some(Agentic), Some(Agentic), Agentic),
+                Full
+            );
+            // The header beats the session.
+            assert_eq!(
+                resolve_request_tool_surface_profile(false, Some(Full), Some(Agentic), Agentic),
+                Full
+            );
+            // The session beats the server default.
+            assert_eq!(
+                resolve_request_tool_surface_profile(false, None, Some(Agentic), Full),
+                Agentic
+            );
+            assert_eq!(
+                resolve_request_tool_surface_profile(false, None, None, Agentic),
+                Agentic
+            );
+        }
+
+        #[test]
+        fn session_ids_carry_their_surface_and_stay_canonical_uuids() {
+            for profile in [
+                ToolSurfaceProfile::Default,
+                ToolSurfaceProfile::OpenaiAgentic,
+            ] {
+                let session_id = mint_mcp_session_id(profile);
+                let parsed = Uuid::parse_str(&session_id).expect("a UUID");
+                assert_eq!(parsed.to_string(), session_id, "canonical form");
+                assert_eq!(surface_profile_from_session_id(&session_id), Some(profile));
+                assert_ne!(mint_mcp_session_id(profile), session_id, "ids stay unique");
+            }
+
+            // Ids minted before the code existed, and anything else, carry none.
+            assert_eq!(
+                surface_profile_from_session_id(&Uuid::new_v4().to_string()),
+                None
+            );
+            assert_eq!(surface_profile_from_session_id("obsolete-session"), None);
+            let mut bytes = *Uuid::new_v4().as_bytes();
+            bytes[15] = 1;
+            let unmarked = uuid::Builder::from_custom_bytes(bytes)
+                .into_uuid()
+                .to_string();
+            assert_eq!(surface_profile_from_session_id(&unmarked), None);
+        }
 
         // Regression coverage for the codex-fugu "unsupported call: <tool>"
         // bug. Codex/Fugu connect with a gpt-5* model but are ordinary

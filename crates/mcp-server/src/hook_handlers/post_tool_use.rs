@@ -259,6 +259,22 @@ fn completes_session_init(normalized_tool_name: &str, tool_response: &Value) -> 
     matches!(normalized_tool_name, "init" | "context") && tool_call_succeeded(tool_response)
 }
 
+/// Whether the Git checkout at `cwd` lacks a verified link to the project the
+/// server resolved for it. Folders outside Git and agents' task worktrees are
+/// never linked automatically, so they need no audit.
+fn needs_link_audit(cwd: &str, workspace_id: Uuid, project_id: Option<Uuid>) -> bool {
+    let Some(layout) = mcp_session::checkout_repository_layout(cwd) else {
+        return false;
+    };
+    let root = layout.repository_root.to_string_lossy().to_string();
+    if crate::link::is_agent_worktree(&root) {
+        return false;
+    }
+    !project_id.is_some_and(|project_id| {
+        mcp_session::auto_init::checkout_binding_matches(&root, Some(workspace_id), project_id)
+    })
+}
+
 fn contextstream_post_tool_nudge(
     normalized_tool_name: &str,
     action: &str,
@@ -892,6 +908,12 @@ pub async fn handle() -> Result<()> {
                     project_id,
                     api_session_id.as_deref(),
                 );
+                // The bridge syncs only checkouts linked on this machine.
+                // Recorded above, this one is now in its next audit; ask for
+                // that audit now rather than in up to six hours.
+                if needs_link_audit(&cwd, workspace_id, project_id) {
+                    let _ = crate::watch::request_link_audit();
+                }
                 // Docs written before this init/context were promised a mirror.
                 if hook_feature_enabled("CONTEXTSTREAM_DOC_MIRROR_ENABLED") {
                     let _ = super::durable_capture::mirror_pending_docs(&host_session).await;
@@ -1879,6 +1901,49 @@ mod tests {
             &serde_json::json!({"isError": true}),
         );
         assert!(msg.is_none());
+    }
+
+    #[test]
+    fn a_git_checkout_without_a_verified_link_asks_the_bridge_for_an_audit() {
+        let directory = tempdir().unwrap();
+        let linked = directory.path().join("linked");
+        let project_id = Uuid::new_v4();
+        std::fs::create_dir_all(&linked).unwrap();
+        let workspace_id = write_repo_config(&linked, project_id);
+        let linked = linked.to_string_lossy();
+        assert!(!needs_link_audit(&linked, workspace_id, Some(project_id)));
+        // The server resolved another project, or none.
+        assert!(needs_link_audit(
+            &linked,
+            workspace_id,
+            Some(Uuid::new_v4())
+        ));
+        assert!(needs_link_audit(&linked, workspace_id, None));
+
+        let unlinked = directory.path().join("unlinked");
+        std::fs::create_dir_all(unlinked.join(".git")).unwrap();
+        assert!(needs_link_audit(
+            &unlinked.to_string_lossy(),
+            workspace_id,
+            Some(project_id)
+        ));
+
+        // Plain folders and agents' task worktrees are never linked
+        // automatically.
+        let plain = directory.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!needs_link_audit(
+            &plain.to_string_lossy(),
+            workspace_id,
+            Some(project_id)
+        ));
+        let task = directory.path().join("app/.claude/worktrees/agent-a1");
+        std::fs::create_dir_all(task.join(".git")).unwrap();
+        assert!(!needs_link_audit(
+            &task.to_string_lossy(),
+            workspace_id,
+            Some(project_id)
+        ));
     }
 }
 

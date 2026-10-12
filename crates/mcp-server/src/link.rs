@@ -152,6 +152,10 @@ async fn relink(root: &Path, target: &ScoredProject) -> Result<()> {
     )
     .await
     .map_err(|error| anyhow::anyhow!("could not link {}: {error}", root.display()))?;
+    // The bridge uploads a watched checkout's edits as they happen. A folder
+    // linked just now may hold a branch or edits the server has never seen,
+    // so its first sync covers the whole checkout.
+    let _ = crate::hook_handlers::dirty_drain::mark_watch_force_full(&root.to_string_lossy());
     Ok(())
 }
 
@@ -248,14 +252,9 @@ pub async fn audit_folders(
     outcomes
 }
 
-/// Folders this machine has linked or indexed: every existing directory in
-/// `mappings.json` and `indexed-projects.json`, reduced to checkout roots.
-pub fn known_folders() -> Vec<PathBuf> {
-    let Some(dir) = contextstream_dir() else {
-        return Vec::new();
-    };
+/// Folders listed in `mappings.json` and `indexed-projects.json`.
+fn registry_folders(mappings: &Value, indexed: &Value) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
-    let mappings = read_json(&dir.join("mappings.json"));
     if let Some(entries) = mappings
         .get("mappings")
         .and_then(Value::as_array)
@@ -268,10 +267,51 @@ pub fn known_folders() -> Vec<PathBuf> {
                 .map(str::to_string),
         );
     }
-    let indexed = read_json(&dir.join("indexed-projects.json"));
     if let Some(projects) = indexed.get("projects").and_then(Value::as_object) {
         paths.extend(projects.keys().cloned());
     }
+    paths
+}
+
+/// Folders an agent session worked in on this machine, from
+/// `session-scopes.json` (the hooks keep a day of sessions). A machine set up
+/// for hosted MCP has no other record of a checkout it never linked, so
+/// without these the bridge would never sync it.
+fn session_folders(session_scopes: &Value) -> Vec<String> {
+    session_scopes
+        .get("sessions")
+        .and_then(Value::as_object)
+        .map(|sessions| {
+            sessions
+                .values()
+                .filter_map(|scope| scope.get("cwd").and_then(Value::as_str))
+                .filter(|cwd| !cwd.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Worktrees a coding agent makes for one task and removes afterwards.
+pub(crate) fn is_agent_worktree(path: &str) -> bool {
+    path.replace('\\', "/").contains("/.claude/worktrees/")
+}
+
+fn auditable_root(root: &Path) -> bool {
+    root.parent().is_some() && Some(root) != dirs::home_dir().as_deref()
+}
+
+/// Folders this machine has linked or indexed (every existing directory in
+/// `mappings.json` and `indexed-projects.json`) and the Git checkouts agent
+/// sessions worked in, reduced to checkout roots.
+pub fn known_folders() -> Vec<PathBuf> {
+    let Some(dir) = contextstream_dir() else {
+        return Vec::new();
+    };
+    let paths = registry_folders(
+        &read_json(&dir.join("mappings.json")),
+        &read_json(&dir.join("indexed-projects.json")),
+    );
     let mut roots: Vec<PathBuf> = paths
         .into_iter()
         // Throwaway clones and worktrees under temporary directories are never
@@ -284,10 +324,23 @@ pub fn known_folders() -> Vec<PathBuf> {
                 .map(|layout| layout.repository_root)
                 .or_else(|| std::fs::canonicalize(&path).ok())
         })
-        .filter(|root| {
-            root.parent().is_some() && Some(root.as_path()) != dirs::home_dir().as_deref()
-        })
+        .filter(|root| auditable_root(root))
         .collect();
+    // Only Git checkouts: the automatic repair links a folder only when its
+    // repository names the project, which a plain folder never does.
+    roots.extend(
+        session_folders(&read_json(&dir.join("session-scopes.json")))
+            .into_iter()
+            .filter(|path| {
+                Path::new(path).is_dir()
+                    && !mcp_session::project_link::is_generated_path(path)
+                    && !is_agent_worktree(path)
+            })
+            .filter_map(|path| {
+                mcp_session::checkout_repository_layout(&path).map(|layout| layout.repository_root)
+            })
+            .filter(|root| auditable_root(root) && !is_agent_worktree(&root.to_string_lossy())),
+    );
     roots.sort();
     roots.dedup();
     roots
@@ -471,4 +524,46 @@ pub async fn run(command: LinkCommand) -> Result<bool> {
     Ok(outcomes.iter().all(|outcome| {
         outcome.relinked_to.is_some() || matches!(outcome.assessment.status, LinkStatus::Correct)
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn registry_folders_come_from_mappings_and_the_local_index() {
+        let mappings = json!({"mappings": [{"path": "/work/a"}, {"project_id": "x"}]});
+        let indexed = json!({"projects": {"/work/b": {"project_id": "y"}}});
+        assert_eq!(
+            registry_folders(&mappings, &indexed),
+            vec!["/work/a".to_string(), "/work/b".to_string()]
+        );
+        // The older mappings layout is a bare array.
+        assert_eq!(
+            registry_folders(&json!([{"path": "/work/c"}]), &Value::Null),
+            vec!["/work/c".to_string()]
+        );
+    }
+
+    #[test]
+    fn session_folders_are_where_agent_sessions_worked() {
+        let scopes = json!({"sessions": {
+            "a": {"cwd": "/work/app", "workspace_id": "w", "project_id": null},
+            "b": {"cwd": "  ", "workspace_id": "w"},
+            "c": {"workspace_id": "w"}
+        }});
+        assert_eq!(session_folders(&scopes), vec!["/work/app".to_string()]);
+        assert!(session_folders(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn agent_task_worktrees_are_recognised() {
+        assert!(is_agent_worktree("/work/app/.claude/worktrees/agent-a1b2"));
+        assert!(is_agent_worktree(
+            "C:\\work\\app\\.claude\\worktrees\\agent-a1"
+        ));
+        assert!(!is_agent_worktree("/work/app-wt/feature"));
+        assert!(!is_agent_worktree("/work/app/.claude"));
+    }
 }

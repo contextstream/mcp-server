@@ -4,6 +4,7 @@
 //! These replace the previous bash/curl scripts with fast, native Rust handlers.
 
 pub mod client_model_extractor;
+pub mod coaching_turn;
 pub mod common;
 pub mod compliance;
 pub mod dirty_drain;
@@ -417,6 +418,8 @@ pub async fn dispatch_hook(name: &str) -> Result<()> {
         "task-completed" => task_completed::handle().await,
         "teammate-idle" => teammate_idle::handle().await,
         "notification" => notification::handle().await,
+        // Codex `notify` program: hands finished turns to the coaching loop.
+        "codex-notify" => coaching_turn::handle_codex_notify().await,
         "permission-request" => permission_request::handle().await,
         "pre-compact" => pre_compact::handle().await,
         "post-compact" => post_compact::handle().await,

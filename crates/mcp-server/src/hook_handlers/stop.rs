@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 
-use super::common::{extract_cwd, load_config, post_memory_event};
+use super::common::{extract_cwd, host_session_key, load_config, post_memory_event};
 use super::{read_stdin_json, write_stdout_json, HookOutput};
 
 /// Handle the Stop hook.
@@ -56,6 +56,15 @@ pub async fn handle() -> Result<()> {
             &["hook", "stop", "checkpoint"],
         )
         .await;
+
+        // Keep the reply for the coaching loop; the next prompt hook sends it
+        // with the person's answer (see `coaching_turn`).
+        if super::coaching_turn::enabled() {
+            if let (Some(session), Some(reply)) = (host_session_key(&input), last_assistant_message)
+            {
+                super::coaching_turn::remember_reply(&session, reply);
+            }
+        }
     }
 
     // Stop hooks are side-effect only.

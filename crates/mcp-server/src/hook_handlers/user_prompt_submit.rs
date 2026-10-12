@@ -429,9 +429,46 @@ pub async fn handle() -> Result<()> {
             fallback_reminder()
         }
     };
-    let (base_context, _) = tokio::join!(
+    // Coaching loop: the reply the Stop hook kept is answered by this prompt.
+    // Sent alongside the context fetch so the prompt path does not wait on it.
+    let coaching_fut = async {
+        if !super::coaching_turn::enabled() || config.api_key.is_empty() {
+            return;
+        }
+        let Some(session) = super::common::host_session_key(&input) else {
+            return;
+        };
+        let Some(prompt) = input
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+        else {
+            return;
+        };
+        let Some((reply, turn_number)) = super::coaching_turn::take_reply(&session) else {
+            return;
+        };
+        super::coaching_turn::send(
+            &super::coaching_turn::Destination {
+                api_url: &config.api_url,
+                api_key: &config.api_key,
+                workspace_id: config.workspace_id.as_deref(),
+                project_id: config.project_id.as_deref(),
+            },
+            &super::coaching_turn::Turn {
+                session_id: &session,
+                turn_number,
+                user_message: prompt,
+                assistant_message: &reply,
+            },
+        )
+        .await;
+    };
+    let (base_context, _, ()) = tokio::join!(
         context_fut,
         super::dirty_drain::drain_best_effort(std::time::Duration::from_secs(2)),
+        coaching_fut,
     );
 
     // Append decoded attribution to every response

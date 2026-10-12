@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use super::common::truncate_with_ellipsis;
 use super::{write_stdout_json, HookOutput};
 
-/// Search protocol base (tool guidance only — no sensitive text).
-const SEARCH_PROTOCOL_BASE: &str = r#"[CONTEXTSTREAM SEARCH]
+/// Search protocol: tool guidance for every subagent.
+const SEARCH_PROTOCOL: &str = r#"[CONTEXTSTREAM SEARCH]
 When searching code, use ContextStream search if the project is indexed. Every local search has a mode:
 - Unsure / broad: mcp__contextstream__search(mode="auto", query="...")
 - How or where something works: mode="semantic"
@@ -31,26 +31,8 @@ When searching code, use ContextStream search if the project is indexed. Every l
 - Callers, dependencies, impact: mcp__contextstream__graph(action="usages"|"dependencies"|"impact", target_type="function|type|module", target_id="...")
 Fall back to Glob/Grep/Read only if ContextStream search is unavailable or returns no results."#;
 
-/// Fallback base when API is unreachable.
-const FALLBACK_CONTEXT_BASE: &str = r#"[CONTEXTSTREAM] Use mcp__contextstream__search(mode="auto", query="...") for codebase search when available. Call mcp__contextstream__context(user_message="...") for task-specific context; when it returns [GROUNDING], read those prior-work hits before searching code (one-shot bundle: mcp__contextstream__session(action="ground", user_message="...")). If ContextStream surfaces [LESSONS_WARNING], treat those lessons as active instructions for the task. If this task is a continuation or references prior work, treat fresh, relevant, sufficient [GROUNDING] as the completed retrieval step and do not immediately duplicate it with mcp__contextstream__session(action="recall"). Use recall only when [GROUNDING] is absent, thin, stale, off-topic, or the user explicitly requests broader or session-specific history; if recall is thin, fall through to mcp__contextstream__memory(action="search_transcripts", query="...") for full-text across transcripts or mcp__contextstream__memory(action="list_events", event_type="session_snapshot") for turning-point bookmarks. FRESHNESS: decisions, transcript continuity, snapshots, active plans, and tasks are time-sensitive; refresh stale hits with session(action="ground"), memory(action="decisions", workspace_id="<current_workspace_id>", project_id="<current_project_id>") when ids are available, or memory(action="search_transcripts") before planning or implementation. Treat Gemini/LLM-derived [INSIGHT] items as advisory unless backed by a current captured decision/event/doc. KNOWLEDGE-FIRST (not just code): when the question is "how/why/what pattern/did we decide X?", the answer usually lives in docs/decisions/lessons/preferences/plans/tasks/skills. Pick by type: memory(action="decisions", workspace_id="<current_workspace_id>", project_id="<current_project_id>") when ids are available; memory(action="list_docs"|"get_doc"|"list_nodes"|"list_tasks"|"list_todos"|"search"); session(action="get_lessons"|"list_plans"|"get_plan"); skill(action="list"|"run"). Check the right knowledge surface BEFORE code search. If hook context is unavailable and the work is risky or unfamiliar, call mcp__contextstream__session(action="get_lessons") before improvising."#;
-
-/// Build search protocol with decoded attribution.
-fn search_protocol() -> String {
-    format!(
-        "{}\n\n{}",
-        SEARCH_PROTOCOL_BASE,
-        super::protected::subagent_attribution()
-    )
-}
-
-/// Build fallback context with decoded attribution.
-fn fallback_context() -> String {
-    format!(
-        "{} {}",
-        FALLBACK_CONTEXT_BASE,
-        super::protected::fallback_attribution()
-    )
-}
+/// Fallback context when the API is unreachable.
+const FALLBACK_CONTEXT: &str = r#"[CONTEXTSTREAM] Use mcp__contextstream__search(mode="auto", query="...") for codebase search when available. Call mcp__contextstream__context(user_message="...") for task-specific context; when it returns [GROUNDING], read those prior-work hits before searching code (one-shot bundle: mcp__contextstream__session(action="ground", user_message="...")). If ContextStream surfaces [LESSONS_WARNING], treat those lessons as active instructions for the task. If this task is a continuation or references prior work, treat fresh, relevant, sufficient [GROUNDING] as the completed retrieval step and do not immediately duplicate it with mcp__contextstream__session(action="recall"). Use recall only when [GROUNDING] is absent, thin, stale, off-topic, or the user explicitly requests broader or session-specific history; if recall is thin, fall through to mcp__contextstream__memory(action="search_transcripts", query="...") for full-text across transcripts or mcp__contextstream__memory(action="list_events", event_type="session_snapshot") for turning-point bookmarks. FRESHNESS: decisions, transcript continuity, snapshots, active plans, and tasks are time-sensitive; refresh stale hits with session(action="ground"), memory(action="decisions", workspace_id="<current_workspace_id>", project_id="<current_project_id>") when ids are available, or memory(action="search_transcripts") before planning or implementation. Treat Gemini/LLM-derived [INSIGHT] items as advisory unless backed by a current captured decision/event/doc. KNOWLEDGE-FIRST (not just code): when the question is "how/why/what pattern/did we decide X?", the answer usually lives in docs/decisions/lessons/preferences/plans/tasks/skills. Pick by type: memory(action="decisions", workspace_id="<current_workspace_id>", project_id="<current_project_id>") when ids are available; memory(action="list_docs"|"get_doc"|"list_nodes"|"list_tasks"|"list_todos"|"search"); session(action="get_lessons"|"list_plans"|"get_plan"); skill(action="list"|"run"). Check the right knowledge surface BEFORE code search. If hook context is unavailable and the work is risky or unfamiliar, call mcp__contextstream__session(action="get_lessons") before improvising."#;
 
 struct ApiConfig {
     api_key: String,
@@ -110,7 +92,7 @@ pub async fn handle() -> Result<()> {
     config.session_id = extract_session_id(&input);
 
     if config.api_key.is_empty() {
-        write_stdout_json(&HookOutput::context(fallback_context()))?;
+        write_stdout_json(&HookOutput::context(FALLBACK_CONTEXT.to_string()))?;
         return Ok(());
     }
 
@@ -151,10 +133,10 @@ async fn build_explore_context(config: &ApiConfig, agent_type: &str) -> String {
     parts.push(EXPLORE_SEARCH_FIRST.to_string());
 
     // Also include base search protocol for tool reference
-    parts.push(search_protocol());
+    parts.push(SEARCH_PROTOCOL.to_string());
 
     if parts.is_empty() {
-        return fallback_context();
+        return FALLBACK_CONTEXT.to_string();
     }
 
     parts.join("\n\n")
@@ -206,7 +188,7 @@ async fn build_plan_context(config: &ApiConfig, agent_type: &str) -> String {
     parts.push(PLAN_SEARCH_FIRST.to_string());
 
     // Always include search protocol
-    parts.push(search_protocol());
+    parts.push(SEARCH_PROTOCOL.to_string());
 
     // Add plan-specific guidance
     parts.push(
@@ -218,7 +200,7 @@ async fn build_plan_context(config: &ApiConfig, agent_type: &str) -> String {
     );
 
     if parts.is_empty() {
-        return fallback_context();
+        return FALLBACK_CONTEXT.to_string();
     }
 
     parts.join("\n\n")
@@ -234,10 +216,10 @@ async fn build_default_context(config: &ApiConfig, agent_type: &str) -> String {
     }
 
     // Always include search protocol
-    parts.push(search_protocol());
+    parts.push(SEARCH_PROTOCOL.to_string());
 
     if parts.is_empty() {
-        return fallback_context();
+        return FALLBACK_CONTEXT.to_string();
     }
 
     parts.join("\n\n")
@@ -251,14 +233,14 @@ async fn build_custom_context(config: &ApiConfig, agent_type: &str) -> String {
         parts.push(hook_ctx);
     }
 
-    parts.push(search_protocol());
+    parts.push(SEARCH_PROTOCOL.to_string());
     parts.push(
         "[CONTEXTSTREAM CUSTOM AGENT] Prefer ContextStream memory, search, and graph tools before local-only exploration."
             .to_string(),
     );
 
     if parts.is_empty() {
-        return fallback_context();
+        return FALLBACK_CONTEXT.to_string();
     }
 
     parts.join("\n\n")
@@ -561,7 +543,7 @@ mod tests {
 
     #[test]
     fn test_search_protocol_contains_key_tools() {
-        let proto = search_protocol();
+        let proto = SEARCH_PROTOCOL.to_string();
         assert!(proto.contains("mcp__contextstream__search"));
         assert!(proto.contains("mcp__contextstream__graph"));
         assert!(proto.contains("mode=\"auto\""));
@@ -570,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_fallback_context_is_useful() {
-        let fb = fallback_context();
+        let fb = FALLBACK_CONTEXT.to_string();
         assert!(fb.contains("search"));
         assert!(fb.contains("context"));
         assert!(fb.contains("[LESSONS_WARNING]"));

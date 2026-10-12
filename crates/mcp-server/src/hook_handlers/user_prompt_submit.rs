@@ -14,7 +14,7 @@ use super::prompt_state;
 use super::save_intent;
 use super::{write_stdout_json, HookOutput};
 
-/// Static fallback reminder base (no sensitive text).
+/// Static fallback reminder base, sent when the hook API is unreachable.
 const FALLBACK_REMINDER_BASE: &str = r#"[CONTEXTSTREAM EXTENDED GUIDANCE]
 AUTO-GROUNDING: when `context()` returns `[GROUNDING]`, those lines are pre-ranked prior work for this message — read them before code search; skipping search is often correct. One-shot outside `context()`: mcp__contextstream__session(action="ground", user_message="...").
 PROJECT ROUTING: when `init()` or `context()` surfaces `[PROJECT_ROUTING]`, treat it as an active scope guardrail. If status is uncertain/ambiguous/needs_project_selection/needs_project_setup, do not do project-scoped search, memory, session, skill, indexing, or capture writes until you pass the selected `workspace_id`/`project_id`, rerun `init(folder_path="...")` or `context(folder_path="...")`, or ask the user to choose from surfaced candidates.
@@ -31,13 +31,9 @@ KNOWLEDGE FIRST (not just code): when the user asks "how/why/what pattern/did we
 PAST SESSIONS: when the user references prior work ("last time", "yesterday"), read any `[GROUNDING]` from your last `context()` first. Fresh, relevant, sufficient grounding completes the retrieval step; do not immediately duplicate it with session(action="recall"). Use recall only when grounding is absent, thin, stale, off-topic, or the user explicitly requests broader or session-specific history. For a bundled pack without waiting on context: session(action="ground", user_message="..."). If recall is thin, fall through to memory(action="search_transcripts", query="...") for full-text or memory(action="list_events", event_type="session_snapshot") for turning-point bookmarks. Save a session_snapshot at the end so the next session can pick up.
 RESUME: when the user asks to resume or pick up earlier work ("resume recent work", "pick up where we left off"), call session(action="resume", session_id="<the session_id init returned>") for the most recent earlier session, or session(action="resume_list", session_id="<the session_id init returned>") to choose. Always pass session_id (init's resume_hint names it) so your own session is left out."#;
 
-/// Build the full fallback reminder with decoded attribution.
+/// Build the full fallback reminder.
 fn fallback_reminder() -> String {
-    format!(
-        "{}\n{}\n[END]",
-        FALLBACK_REMINDER_BASE,
-        super::protected::prompt_attribution()
-    )
+    format!("{FALLBACK_REMINDER_BASE}\n[END]")
 }
 
 /// Compensation guidance for editors without full lifecycle hook coverage.
@@ -465,17 +461,10 @@ pub async fn handle() -> Result<()> {
         )
         .await;
     };
-    let (base_context, _, ()) = tokio::join!(
+    let (context, _, ()) = tokio::join!(
         context_fut,
         super::dirty_drain::drain_best_effort(std::time::Duration::from_secs(2)),
         coaching_fut,
-    );
-
-    // Append decoded attribution to every response
-    let context = format!(
-        "{}\n{}",
-        base_context,
-        super::protected::prompt_attribution()
     );
 
     let combined = build_context_message(editor, context, &input);

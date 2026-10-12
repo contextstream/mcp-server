@@ -2203,6 +2203,25 @@ fn allowed_before_context_without_clearing(
     is_contextstream_call && normalized_tool == "init"
 }
 
+/// Whether a call's workspace/project differs from this repo's configured
+/// scope in a way worth a warning. Filing or updating an entity in another
+/// project of the same workspace is deliberate: a ticket belongs to the project
+/// that owns the code it cites, not to the checkout the session started in.
+fn scope_mismatch_needs_warning(
+    tool_name: &str,
+    action: &str,
+    (req_ws, req_pid): (&str, &str),
+    (cfg_ws, cfg_pid): (&str, &str),
+) -> bool {
+    let same_workspace = req_ws.eq_ignore_ascii_case(cfg_ws);
+    if same_workspace && req_pid.eq_ignore_ascii_case(cfg_pid) {
+        return false;
+    }
+    let cross_project_entity_write =
+        tool_name == "entity" && matches!(action, "create" | "update") && same_workspace;
+    !cross_project_entity_write
+}
+
 fn is_scope_sensitive_contextstream_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -2608,7 +2627,12 @@ pub async fn handle() -> Result<()> {
                 compliance_config.workspace_id.as_deref(),
                 compliance_config.project_id.as_deref(),
             ) {
-                if req_ws != cfg_ws || req_pid != cfg_pid {
+                if scope_mismatch_needs_warning(
+                    &normalized_contextstream_tool,
+                    &contextstream_action(&tool_input),
+                    (req_ws, req_pid),
+                    (cfg_ws, cfg_pid),
+                ) {
                     emit_compliance(ComplianceEvent {
                         rule_key: compliance::RULE_SCOPE_ALIGNMENT,
                         rule_class: RuleClass::Procedural,
@@ -3481,6 +3505,40 @@ mod tests {
         assert!(!should_predrain_for_tool(true, "memory"));
         assert!(!should_predrain_for_tool(true, "init"));
         assert!(!should_predrain_for_tool(false, "search"));
+    }
+
+    #[test]
+    fn scope_warning_is_quiet_for_entity_writes_to_another_project_in_the_workspace() {
+        let config = ("ws-1", "contextstream");
+        // Filing a ticket in the project that owns the code is deliberate.
+        for action in ["create", "update"] {
+            assert!(!scope_mismatch_needs_warning(
+                "entity",
+                action,
+                ("ws-1", "mcp-server"),
+                config
+            ));
+        }
+        // Another workspace, or another tool, still warns.
+        assert!(scope_mismatch_needs_warning(
+            "entity",
+            "create",
+            ("ws-2", "mcp-server"),
+            config
+        ));
+        assert!(scope_mismatch_needs_warning(
+            "memory",
+            "create_doc",
+            ("ws-1", "mcp-server"),
+            config
+        ));
+        // A matching scope never warns.
+        assert!(!scope_mismatch_needs_warning(
+            "search",
+            "",
+            ("ws-1", "contextstream"),
+            config
+        ));
     }
 
     #[test]

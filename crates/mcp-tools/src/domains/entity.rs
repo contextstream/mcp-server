@@ -44,11 +44,13 @@
 
 use async_trait::async_trait;
 use mcp_client::{
-    append_ticket_extras, enrich_ticket_result_from_request, entity_kind_to_path,
-    normalize_ticket_body, ContextStreamClient, VALID_ENTITY_KINDS,
+    append_ticket_extras, entity_kind_to_path, format_ticket_fields_not_saved,
+    normalize_ticket_body, ticket_fields_not_saved, unsupported_entity_kind_reason,
+    ContextStreamClient, VALID_ENTITY_KINDS,
 };
 use mcp_session::SessionManager;
 use mcp_types::{
+    api::Project,
     atlas_layer::AtlasWarmCacheKind,
     tool::{ToolAnnotations, ToolCategory, ToolMetadata, ToolResult},
     AtlasLayer, Error, Result,
@@ -60,6 +62,7 @@ use uuid::Uuid;
 
 use crate::domains::account_mode::apply_is_personal_to_body;
 use crate::domains::lookup::{self, Lookup, LookupAction, LookupContext, RecordKind};
+use crate::domains::scope::{is_project_scope_error, is_scope_access_error};
 use crate::registry::ToolHandler;
 use crate::schema::SchemaBuilder;
 
@@ -88,6 +91,9 @@ pub struct EntityInput {
     pub workspace_id: Option<String>,
     /// Project scope. Defaults to the active project if omitted.
     pub project_id: Option<String>,
+    /// Project scope by name (e.g. "mcp-server"), resolved within the
+    /// workspace. An alternative to `project_id`.
+    pub target_project: Option<String>,
     /// Body for create / update. Free-form JSON forwarded to the API.
     pub body: Option<Value>,
     /// Query / filter params for list. Object whose keys map to query params.
@@ -180,6 +186,120 @@ impl EntityTool {
         }
 
         (ws, proj)
+    }
+
+    /// Resolve `target_project` (a project name such as "mcp-server") to a
+    /// project id within the workspace, so filing in another project needs no
+    /// raw UUID. A UUID is taken as is. An unknown name lists the workspace's
+    /// projects so the caller can pick one.
+    async fn resolve_target_project(
+        &self,
+        target_project: &str,
+        workspace_id: &Option<String>,
+    ) -> Result<String> {
+        let target = target_project.trim();
+        if Uuid::parse_str(target).is_ok() {
+            return Ok(target.to_string());
+        }
+        let projects = self.workspace_projects(workspace_id).await.map_err(|err| {
+            Error::Validation(format!(
+                "Could not list this workspace's projects to resolve target_project '{}': {}. \
+                 Pass project_id instead.",
+                target, err
+            ))
+        })?;
+        let key = project_name_key(target);
+        if let Some(project) = projects.iter().find(|p| project_name_key(&p.name) == key) {
+            return Ok(project.id.to_string());
+        }
+        Err(Error::Validation(format!(
+            "Unknown target_project '{}'. {}",
+            target,
+            describe_workspace_projects(&projects)
+        )))
+    }
+
+    async fn workspace_projects(&self, workspace_id: &Option<String>) -> Result<Vec<Project>> {
+        let workspace_id = workspace_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "no workspace is resolved; pass workspace_id or call init first".to_string(),
+                )
+            })?;
+        self.client
+            .list_all_projects(Some(workspace_id), 200, 1000)
+            .await
+    }
+
+    /// When the API refuses a project the caller named, list the workspace's
+    /// projects instead of passing on a bare 403. The API hides whether a
+    /// project exists, so a mistyped id otherwise reads like a permissions
+    /// problem.
+    async fn explain_project_refusal(
+        &self,
+        err: Error,
+        project_id: &str,
+        workspace_id: &Option<String>,
+    ) -> Error {
+        if !(is_scope_access_error(&err) || is_project_scope_error(&err)) {
+            return err;
+        }
+        let Ok(projects) = self.workspace_projects(workspace_id).await else {
+            return err;
+        };
+        if projects.iter().any(|p| p.id.to_string() == project_id) {
+            return err;
+        }
+        Error::Validation(format!(
+            "No project {} in this workspace (the API said: {}). {} Pass target_project with \
+             one of these names, or its project_id.",
+            project_id,
+            err,
+            describe_workspace_projects(&projects)
+        ))
+    }
+
+    /// Where an item went, by name where the API can tell and by id where
+    /// not, e.g. "project mcp-server (workspace Engineering)".
+    async fn describe_location(
+        &self,
+        workspace_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Option<String> {
+        let project = match project_id {
+            Some(id) => Some(match Uuid::parse_str(id) {
+                Ok(uuid) => self
+                    .client
+                    .get_project(uuid)
+                    .await
+                    .map(|p| p.name)
+                    .unwrap_or_else(|_| id.to_string()),
+                Err(_) => id.to_string(),
+            }),
+            None => None,
+        };
+        let workspace = match workspace_id {
+            Some(id) => Some(match Uuid::parse_str(id) {
+                Ok(uuid) => self
+                    .client
+                    .get_workspace(uuid)
+                    .await
+                    .map(|w| w.name)
+                    .unwrap_or_else(|_| id.to_string()),
+                Err(_) => id.to_string(),
+            }),
+            None => None,
+        };
+        match (project, workspace) {
+            (Some(project), Some(workspace)) => {
+                Some(format!("project {} (workspace {})", project, workspace))
+            }
+            (Some(project), None) => Some(format!("project {}", project)),
+            (None, Some(workspace)) => Some(format!("workspace {}, in no project", workspace)),
+            (None, None) => None,
+        }
     }
 
     /// Flatten a JSON `query` object plus explicit `workspace_id` /
@@ -365,6 +485,81 @@ fn extract_entity_object<'a>(kind: &str, result: &'a Value) -> &'a Value {
     result
 }
 
+/// A project name compared without case, spaces, underscores or hyphens, so
+/// "MCP Server", "mcp_server" and "mcp-server" name the same project.
+fn project_name_key(name: &str) -> String {
+    name.trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !matches!(ch, ' ' | '_' | '-'))
+        .collect()
+}
+
+/// The workspace's project names, for a caller who named one that doesn't
+/// exist.
+fn describe_workspace_projects(projects: &[Project]) -> String {
+    const MAX_NAMES: usize = 40;
+    if projects.is_empty() {
+        return "This workspace has no projects.".to_string();
+    }
+    let mut names: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
+    names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
+    let mut text = format!(
+        "Projects in this workspace: {}",
+        names
+            .iter()
+            .take(MAX_NAMES)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if names.len() > MAX_NAMES {
+        text.push_str(&format!(" … and {} more", names.len() - MAX_NAMES));
+    }
+    text.push('.');
+    text
+}
+
+/// A scope id (`workspace_id` / `project_id`) as the API stored it, falling
+/// back to what the request sent when the reply leaves it out.
+fn stored_scope_id(kind: &str, result: &Value, body: &Value, field: &str) -> Option<String> {
+    extract_entity_object(kind, result)
+        .get(field)
+        .or_else(|| body.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The visibility the API stored, said plainly so an item only its creator
+/// can see doesn't go unnoticed.
+fn visibility_line(kind: &str, result: &Value) -> Option<&'static str> {
+    let is_personal = extract_entity_object(kind, result)
+        .get("is_personal")
+        .and_then(Value::as_bool)?;
+    Some(if is_personal {
+        "Visibility: personal (only you can see it). Pass is_personal=false to share it with the workspace."
+    } else {
+        "Visibility: team (everyone in the workspace can see it)."
+    })
+}
+
+/// The lines every create and update reply ends with: the stored visibility,
+/// and any ticket field the API did not save.
+fn append_reply_notes(text: &mut String, kind: &str, body: &Value, result: &Value) {
+    if let Some(visibility) = visibility_line(kind, result) {
+        text.push('\n');
+        text.push_str(visibility);
+    }
+    if kind == "ticket" {
+        if let Some(not_saved) =
+            format_ticket_fields_not_saved(&ticket_fields_not_saved(body, result))
+        {
+            text.push('\n');
+            text.push_str(&not_saved);
+        }
+    }
+}
+
 /// One-line summary of a single entity for use in the LLM-visible text
 /// content of get / create / update responses. Produces something like
 /// `**Fix replication lag** (id: abc123) [bug] — open` so even clients that
@@ -451,7 +646,7 @@ fn format_entity_list(kind: &str, result: &Value) -> String {
 }
 
 /// Routing summary advertised as the tool description (<= 1024 chars).
-const ENTITY_TOOL_DESCRIPTION: &str = "Structured taxonomy entities — tickets, handoffs, incidents, releases, experiments, goals, key_results, sprints, reviews, risks, backlog_views. USE THIS TOOL for: 'create a handoff' / 'prepare a handoff' / 'hand this over' / 'continue with another agent' (kind=handoff, body={title, summary, scope, next_steps}; add to_user_id only when known and never invent it) · 'create a ticket' / 'file a bug' (kind=ticket) · 'log an incident' · 'track this release' · 'start an experiment' · 'create an OKR' (kind=goal/key_result) · 'plan a sprint' · 'design review' · 'log a risk'.\n\nNot this tool: memory(action=create_task) (todo), memory(action=create_doc, ...) (a runbook is a doc, not a handoff), session(action=capture, ...) (events). A generic handoff always creates entity(kind=handoff); additionally call capsule for a portable bundle or share link. HANDOFF.md or prose: local text is NOT the canonical handoff.\n\nActions: list | get | create | update | delete; per-kind fields: the `action` parameter.";
+const ENTITY_TOOL_DESCRIPTION: &str = "Tickets, handoffs, incidents, releases, experiments, goals, key_results, sprints, reviews, risks, backlog_views. USE THIS TOOL for: 'create a handoff' / 'prepare a handoff' / 'hand this over' / 'continue with another agent' (kind=handoff, body={title, summary, scope, next_steps}; add to_user_id only when known and never invent it) · 'create a ticket' / 'file a bug' (kind=ticket; file in the project that owns the code: target_project) · 'log an incident' · 'track this release' · 'start an experiment' · 'create an OKR' (kind=goal/key_result) · 'plan a sprint' · 'design review' · 'log a risk'.\n\nNot this tool: memory(action=create_task) (todo), memory(action=create_doc, ...) (a runbook is a doc, not a handoff), session(action=capture, ...) (events). A generic handoff always creates entity(kind=handoff); additionally call capsule for a portable bundle or share link. HANDOFF.md or prose: local text is NOT the canonical handoff.\n\nActions: list | get | create | update | delete; per-kind fields: see `action`.";
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
@@ -490,8 +685,13 @@ const ENTITY_TOOL_REFERENCE: &str = "Structured taxonomy entities — tickets, h
                   explicitly requests a local file, create the entity first and treat the file \
                   only as an additional artifact.\n\n\
                 Actions: list | get | create | update | delete. Body is free-form JSON \
-                forwarded to the API; see the API schema for per-kind fields. Defaults \
-                workspace_id/project_id to the active session scope when omitted."
+                forwarded to the API; see the API schema for per-kind fields. \
+                \n\nWHERE TO FILE: file a ticket in the project that owns the code it is \
+                about (the repository of the files it cites), not the session's current \
+                project. Pass target_project (a project name, e.g. \"mcp-server\") or \
+                project_id. When both are omitted, the item goes to the session's project; \
+                the reply names the project it was filed in. Updates send is_personal only \
+                when you set it."
                 ;
 
 #[async_trait]
@@ -505,6 +705,9 @@ impl ToolHandler for EntityTool {
 
         // Up-front kind validation so we fail fast with a useful error
         // (instead of leaking the URL-builder error from the client).
+        if let Some(reason) = unsupported_entity_kind_reason(&kind) {
+            return Err(Error::Validation(reason.to_string()));
+        }
         if entity_kind_to_path(&kind).is_none() {
             return Err(Error::Validation(format!(
                 "Unknown entity kind: '{}'. Valid kinds: {}",
@@ -513,11 +716,36 @@ impl ToolHandler for EntityTool {
             )));
         }
 
+        // `target_project` names the project instead of giving its id. It
+        // resolves within the workspace and then stands in for `project_id`.
+        let mut project_id = input
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        if let Some(target) = input
+            .target_project
+            .as_deref()
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+        {
+            let (ws, _) = self.resolve_scope(&input.workspace_id, &None).await;
+            let resolved = self.resolve_target_project(target, &ws).await?;
+            if let Some(explicit) = project_id.as_deref() {
+                if !explicit.eq_ignore_ascii_case(&resolved) {
+                    return Err(Error::Validation(format!(
+                        "target_project '{}' is project {}, but project_id is {}. Pass one of them.",
+                        target, resolved, explicit
+                    )));
+                }
+            }
+            project_id = Some(resolved);
+        }
+
         match action.as_str() {
             "list" => {
-                let (ws, proj) = self
-                    .resolve_scope(&input.workspace_id, &input.project_id)
-                    .await;
+                let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
                 let params = Self::build_list_params(&input.query, &ws, &proj);
                 let result = if let (Some(cache_kind), Some(ws_id)) = (
                     Self::warm_cache_kind(&kind),
@@ -554,9 +782,7 @@ impl ToolHandler for EntityTool {
             }
 
             "get" => {
-                let (ws, proj) = self
-                    .resolve_scope(&input.workspace_id, &input.project_id)
-                    .await;
+                let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
                 let lookup = input
                     .id
                     .as_deref()
@@ -625,10 +851,10 @@ impl ToolHandler for EntityTool {
                         "body must be a JSON object for create".to_string(),
                     ));
                 }
-                let (ws, proj) = self
-                    .resolve_scope(&input.workspace_id, &input.project_id)
-                    .await;
+                let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
                 Self::inject_scope_into_body(&mut body, &ws, &proj);
+                // A new item takes the session mode's visibility unless the
+                // caller set one; the reply says which it got.
                 let state = self.session.state().await;
                 apply_is_personal_to_body(
                     &mut body,
@@ -638,23 +864,36 @@ impl ToolHandler for EntityTool {
                 if kind == "ticket" {
                     normalize_ticket_body(&mut body)?;
                 }
-                let mut result = self.client.entity_create(&kind, body.clone()).await?;
-                if kind == "ticket" {
-                    enrich_ticket_result_from_request(&body, &mut result);
-                }
+                let result = match self.client.entity_create(&kind, body.clone()).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        return Err(match body.get("project_id").and_then(Value::as_str) {
+                            Some(refused) => self.explain_project_refusal(err, refused, &ws).await,
+                            None => err,
+                        });
+                    }
+                };
                 let summary = format_entity_summary(&kind, &result);
-                let text = if summary.is_empty() {
+                let mut text = if summary.is_empty() {
                     format!("Created {}.", kind)
                 } else {
                     format!("Created {}: {}", kind, summary)
                 };
+                let location = self
+                    .describe_location(
+                        stored_scope_id(&kind, &result, &body, "workspace_id").as_deref(),
+                        stored_scope_id(&kind, &result, &body, "project_id").as_deref(),
+                    )
+                    .await;
+                if let Some(location) = location {
+                    text.push_str(&format!("\nFiled in {}.", location));
+                }
+                append_reply_notes(&mut text, &kind, &body, &result);
                 Ok(ToolResult::with_structured(text, result))
             }
 
             "update" => {
-                let (ws, proj) = self
-                    .resolve_scope(&input.workspace_id, &input.project_id)
-                    .await;
+                let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
                 let lookup = input
                     .id
                     .as_deref()
@@ -689,32 +928,51 @@ impl ToolHandler for EntityTool {
                         "body must be a JSON object for update".to_string(),
                     ));
                 }
-                let state = self.session.state().await;
-                apply_is_personal_to_body(
-                    &mut body,
-                    state.active_execution_mode,
-                    state.team_context_degraded,
-                );
+                // An update sends `is_personal` only when the caller set it.
+                // The API keeps the stored visibility when the field is
+                // absent, and a session default here would quietly hide a
+                // team item.
                 if kind == "ticket" {
                     normalize_ticket_body(&mut body)?;
                 }
-                let mut result = self.client.entity_update(&kind, id, body.clone()).await?;
-                if kind == "ticket" {
-                    enrich_ticket_result_from_request(&body, &mut result);
-                }
+                let moved_to = body
+                    .get("project_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let result = match self.client.entity_update(&kind, id, body.clone()).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        return Err(match moved_to.as_deref() {
+                            Some(moved_to) => {
+                                self.explain_project_refusal(err, moved_to, &ws).await
+                            }
+                            None => err,
+                        });
+                    }
+                };
                 let summary = format_entity_summary(&kind, &result);
-                let text = if summary.is_empty() {
+                let mut text = if summary.is_empty() {
                     format!("Updated {} {}.", kind, id)
                 } else {
                     format!("Updated {}: {}", kind, summary)
                 };
+                if moved_to.is_some() {
+                    let location = self
+                        .describe_location(
+                            stored_scope_id(&kind, &result, &body, "workspace_id").as_deref(),
+                            stored_scope_id(&kind, &result, &body, "project_id").as_deref(),
+                        )
+                        .await;
+                    if let Some(location) = location {
+                        text.push_str(&format!("\nMoved to {}.", location));
+                    }
+                }
+                append_reply_notes(&mut text, &kind, &body, &result);
                 Ok(found.tool_result(text, result))
             }
 
             "delete" => {
-                let (ws, proj) = self
-                    .resolve_scope(&input.workspace_id, &input.project_id)
-                    .await;
+                let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
                 let lookup = input
                     .id
                     .as_deref()
@@ -806,7 +1064,14 @@ impl ToolHandler for EntityTool {
             )
             .uuid(
                 "project_id",
-                "Project ID. Defaults to the active project.",
+                "Project ID. Defaults to the active project. File an item in the project that \
+                 owns the code it is about, not the session's project.",
+                false,
+            )
+            .string(
+                "target_project",
+                "Project by name (e.g. \"mcp-server\"), resolved within the workspace; use \
+                 instead of project_id. An unknown name lists the workspace's projects.",
                 false,
             )
             .object(
@@ -862,6 +1127,373 @@ pub fn register_entity_tools(
 mod tests {
     use super::*;
     use mcp_types::Config;
+
+    const WORKSPACE_ID: &str = "11111111-1111-1111-1111-111111111111";
+    const SESSION_PROJECT_ID: &str = "22222222-2222-2222-2222-222222222222";
+    const MCP_SERVER_PROJECT_ID: &str = "33333333-3333-3333-3333-333333333333";
+    const TICKET_ID: &str = "44444444-4444-4444-4444-444444444444";
+
+    /// An entity tool whose API answers each request with the next canned
+    /// response, and a handle that yields the raw requests it received.
+    async fn entity_tool_with_http_sequence(
+        responses: Vec<(&'static str, Value)>,
+    ) -> (EntityTool, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind entity test listener");
+        let address = listener.local_addr().expect("entity test address");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.expect("accept entity request");
+                let mut buffer = vec![0_u8; 1024 * 1024];
+                let read = socket.read(&mut buffer).await.expect("read entity request");
+                requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write entity response");
+            }
+            requests
+        });
+
+        let config = Config {
+            api_url: format!("http://{address}"),
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        (EntityTool::new(client, session), server)
+    }
+
+    fn request_body(request: &str) -> Value {
+        let (_, body) = request.split_once("\r\n\r\n").expect("request body");
+        serde_json::from_str(body).expect("request body is JSON")
+    }
+
+    fn result_text(result: &ToolResult) -> &str {
+        match result.content.first() {
+            Some(mcp_types::tool::ContentItem::Text { text }) => text,
+            _ => "",
+        }
+    }
+
+    fn stored_ticket(is_personal: bool, project_id: &str) -> Value {
+        serde_json::json!({
+            "id": TICKET_ID,
+            "title": "Fix the hook",
+            "kind": "bug",
+            "status": "open",
+            "is_personal": is_personal,
+            "workspace_id": WORKSPACE_ID,
+            "project_id": project_id,
+        })
+    }
+
+    fn workspace_named(name: &str) -> Value {
+        serde_json::json!({
+            "id": WORKSPACE_ID,
+            "name": name,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        })
+    }
+
+    fn project_list() -> Value {
+        serde_json::json!({
+            "items": [
+                {"id": SESSION_PROJECT_ID, "name": "contextstream"},
+                {"id": MCP_SERVER_PROJECT_ID, "name": "mcp-server"},
+            ],
+            "total": 2
+        })
+    }
+
+    #[tokio::test]
+    async fn update_without_is_personal_leaves_visibility_to_the_api() {
+        let (tool, server) = entity_tool_with_http_sequence(vec![(
+            "200 OK",
+            stored_ticket(false, MCP_SERVER_PROJECT_ID),
+        )])
+        .await;
+
+        let result = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "update",
+                "id": TICKET_ID,
+                "workspace_id": WORKSPACE_ID,
+                "body": {"status": "resolved", "description": "Fixed."}
+            }))
+            .await
+            .expect("update succeeds");
+
+        let requests = server.await.expect("entity request server");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(&format!("PATCH /api/v1/tickets/{TICKET_ID} ")));
+        let body = request_body(&requests[0]);
+        assert!(
+            body.get("is_personal").is_none(),
+            "an update must not send a visibility the caller didn't set: {body}"
+        );
+        assert!(result_text(&result).contains("Visibility: team"));
+    }
+
+    #[tokio::test]
+    async fn update_with_is_personal_sends_it_unchanged() {
+        for is_personal in [true, false] {
+            let (tool, server) = entity_tool_with_http_sequence(vec![(
+                "200 OK",
+                stored_ticket(is_personal, MCP_SERVER_PROJECT_ID),
+            )])
+            .await;
+
+            tool.execute(serde_json::json!({
+                "kind": "handoff",
+                "action": "update",
+                "id": TICKET_ID,
+                "body": {"status": "accepted", "is_personal": is_personal}
+            }))
+            .await
+            .expect("update succeeds");
+
+            let requests = server.await.expect("entity request server");
+            assert_eq!(request_body(&requests[0])["is_personal"], is_personal);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_applies_the_mode_default_and_names_visibility_and_project() {
+        let (tool, server) = entity_tool_with_http_sequence(vec![
+            ("201 Created", stored_ticket(true, MCP_SERVER_PROJECT_ID)),
+            (
+                "200 OK",
+                serde_json::json!({"id": MCP_SERVER_PROJECT_ID, "name": "mcp-server"}),
+            ),
+            ("200 OK", workspace_named("Engineering")),
+        ])
+        .await;
+
+        let result = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "create",
+                "workspace_id": WORKSPACE_ID,
+                "project_id": MCP_SERVER_PROJECT_ID,
+                "body": {"title": "Fix the hook", "kind": "bug"}
+            }))
+            .await
+            .expect("create succeeds");
+
+        let requests = server.await.expect("entity request server");
+        assert!(requests[0].starts_with("POST /api/v1/tickets "));
+        let body = request_body(&requests[0]);
+        assert!(
+            body["is_personal"].is_boolean(),
+            "a create still applies the mode default: {body}"
+        );
+        assert_eq!(body["project_id"], MCP_SERVER_PROJECT_ID);
+        let text = result_text(&result);
+        assert!(
+            text.contains("Filed in project mcp-server (workspace Engineering)."),
+            "{text}"
+        );
+        assert!(text.contains("Visibility: personal (only you can see it)"));
+    }
+
+    #[tokio::test]
+    async fn create_with_target_project_files_in_that_project() {
+        let (tool, server) = entity_tool_with_http_sequence(vec![
+            ("200 OK", project_list()),
+            ("201 Created", stored_ticket(false, MCP_SERVER_PROJECT_ID)),
+            (
+                "200 OK",
+                serde_json::json!({"id": MCP_SERVER_PROJECT_ID, "name": "mcp-server"}),
+            ),
+            ("200 OK", workspace_named("Engineering")),
+        ])
+        .await;
+
+        let result = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "create",
+                "workspace_id": WORKSPACE_ID,
+                "target_project": "MCP Server",
+                "body": {"title": "Fix the hook", "kind": "bug"}
+            }))
+            .await
+            .expect("create succeeds");
+
+        let requests = server.await.expect("entity request server");
+        assert!(requests[0].starts_with("GET /api/v1/projects?workspace_id="));
+        assert_eq!(
+            request_body(&requests[1])["project_id"],
+            MCP_SERVER_PROJECT_ID
+        );
+        let text = result_text(&result);
+        assert!(
+            text.contains("Filed in project mcp-server (workspace Engineering)."),
+            "{text}"
+        );
+        assert!(text.contains("Visibility: team"));
+    }
+
+    #[tokio::test]
+    async fn unknown_target_project_lists_the_workspace_projects() {
+        let (tool, server) = entity_tool_with_http_sequence(vec![("200 OK", project_list())]).await;
+
+        let err = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "create",
+                "workspace_id": WORKSPACE_ID,
+                "target_project": "mcp-sever",
+                "body": {"title": "Fix the hook"}
+            }))
+            .await
+            .expect_err("an unknown project is refused")
+            .to_string();
+
+        server.await.expect("entity request server");
+        assert!(err.contains("Unknown target_project 'mcp-sever'"), "{err}");
+        assert!(err.contains("contextstream, mcp-server"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_project_id_lists_the_workspace_projects() {
+        let mistyped = "55555555-5555-5555-5555-555555555555";
+        let (tool, server) = entity_tool_with_http_sequence(vec![
+            (
+                "403 Forbidden",
+                serde_json::json!({"error": "No access to this project content"}),
+            ),
+            ("200 OK", project_list()),
+        ])
+        .await;
+
+        let err = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "create",
+                "workspace_id": WORKSPACE_ID,
+                "project_id": mistyped,
+                "body": {"title": "Fix the hook"}
+            }))
+            .await
+            .expect_err("the API refuses the project")
+            .to_string();
+
+        server.await.expect("entity request server");
+        assert!(
+            err.contains(&format!("No project {mistyped} in this workspace")),
+            "{err}"
+        );
+        assert!(err.contains("contextstream, mcp-server"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ticket_links_the_api_dropped_are_reported_not_echoed() {
+        let (tool, server) = entity_tool_with_http_sequence(vec![(
+            "200 OK",
+            stored_ticket(false, MCP_SERVER_PROJECT_ID),
+        )])
+        .await;
+
+        let result = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "update",
+                "id": TICKET_ID,
+                "body": {"linked_items": [{"kind": "doc", "id": "doc-1", "title_snapshot": "ADR"}]}
+            }))
+            .await
+            .expect("update succeeds");
+
+        let requests = server.await.expect("entity request server");
+        assert_eq!(request_body(&requests[0])["linked_items"][0]["kind"], "doc");
+        let text = result_text(&result);
+        assert!(text.contains("Not saved: linked_items"), "{text}");
+        assert!(!text.contains("linked: 1"), "{text}");
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("structured reply");
+        assert!(structured.get("linked_items").is_none());
+    }
+
+    #[tokio::test]
+    async fn discussion_kind_is_refused_with_where_to_go_instead() {
+        let session = Arc::new(SessionManager::new(
+            ContextStreamClient::new(Config::default()),
+            Config::default(),
+        ));
+        let tool = EntityTool::new(ContextStreamClient::new(Config::default()), session);
+        let err = tool
+            .execute(serde_json::json!({"kind": "discussion", "action": "list"}))
+            .await
+            .expect_err("discussion is not an entity kind")
+            .to_string();
+        assert!(err.contains("not supported"), "{err}");
+        assert!(err.contains("integration(provider=\"slack\""), "{err}");
+    }
+
+    #[test]
+    fn every_entity_kind_maps_to_a_real_api_route() {
+        // The entity routes the contextstream API mounts under /api/v1
+        // (crates/contextstream-api/src/routes/v1/mod.rs). A kind whose path
+        // is missing here would send every call to a 404.
+        const API_ENTITY_ROUTES: &[&str] = &[
+            "tickets",
+            "handoffs",
+            "backlog-views",
+            "incidents",
+            "releases",
+            "experiments",
+            "goals",
+            "key-results",
+            "sprints",
+            "reviews",
+            "risks",
+            "coordinations",
+        ];
+        for kind in VALID_ENTITY_KINDS {
+            let path = entity_kind_to_path(kind)
+                .unwrap_or_else(|| panic!("entity kind '{kind}' has no API path"));
+            assert!(
+                API_ENTITY_ROUTES.contains(&path),
+                "entity kind '{kind}' maps to /{path}, which the API does not serve"
+            );
+        }
+        assert!(!VALID_ENTITY_KINDS.contains(&"discussion"));
+        assert!(entity_kind_to_path("discussion").is_none());
+    }
+
+    #[test]
+    fn description_fits_openai_function_limit_and_says_where_to_file() {
+        let session = Arc::new(SessionManager::new(
+            ContextStreamClient::new(Config::default()),
+            Config::default(),
+        ));
+        let tool = EntityTool::new(ContextStreamClient::new(Config::default()), session);
+        let desc = tool.metadata().description.as_str();
+        assert!(desc.chars().count() <= 1024, "{}", desc.chars().count());
+        assert!(desc.contains("file in the project that owns the code"));
+        let schema = tool.input_schema();
+        assert!(schema["properties"]["target_project"].is_object());
+        let reference = schema["properties"]["action"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(reference.contains("not the session's current project"));
+    }
 
     #[test]
     fn metadata_description_carries_natural_language_trigger_phrases() {

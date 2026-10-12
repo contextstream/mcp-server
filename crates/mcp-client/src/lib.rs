@@ -32,6 +32,7 @@ pub use client::{
     entity_kind_to_path,
     feed_source_key,
     infer_memory_query_node_type,
+    unsupported_entity_kind_reason,
     // Workspace params
     BootstrapWorkspaceParams,
     CallPathParams,
@@ -209,11 +210,11 @@ pub use parity::{
 };
 pub use retry::IngestFailure;
 pub use ticket::{
-    append_ticket_extras, canonical_linked_item_kind, enrich_ticket_result_from_request,
-    format_linked_summary, format_ticket_assignee_summary, format_ticket_linked_summary,
+    append_ticket_extras, canonical_linked_item_kind, format_linked_summary,
+    format_ticket_assignee_summary, format_ticket_fields_not_saved, format_ticket_linked_summary,
     normalize_assignees, normalize_linked_items_with_allowed_kinds, normalize_ticket_body,
-    normalize_ticket_linked_items, summarize_ticket_linked_items, TicketLinkedSummary,
-    ASSIGNEE_ENTITY_TYPES, LINKED_ITEM_KINDS, PLAN_LINKED_ITEM_KINDS,
+    normalize_ticket_linked_items, summarize_ticket_linked_items, ticket_fields_not_saved,
+    TicketLinkedSummary, ASSIGNEE_ENTITY_TYPES, LINKED_ITEM_KINDS, PLAN_LINKED_ITEM_KINDS,
 };
 
 /// Process-wide lock for tests that read or mutate environment variables

@@ -19552,9 +19552,20 @@ pub const VALID_ENTITY_KINDS: &[&str] = &[
     "sprint",
     "review",
     "risk",
-    "discussion",
     "coordination",
 ];
+
+/// Why a kind the `entity` tool once accepted is no longer valid, with where
+/// to go instead. The API has no route for these kinds.
+pub fn unsupported_entity_kind_reason(kind: &str) -> Option<&'static str> {
+    match kind.to_lowercase().as_str() {
+        "discussion" | "discussions" => Some(
+            "Entity kind 'discussion' is not supported: the API has no discussion records. \
+             For Slack discussions use integration(provider=\"slack\", action=\"discussions\").",
+        ),
+        _ => None,
+    }
+}
 
 /// Map a kind string (with friendly aliases) to the API URL segment.
 pub fn entity_kind_to_path(kind: &str) -> Option<&'static str> {
@@ -19573,7 +19584,6 @@ pub fn entity_kind_to_path(kind: &str) -> Option<&'static str> {
         "sprint" | "sprints" => "sprints",
         "review" | "reviews" => "reviews",
         "risk" | "risks" => "risks",
-        "discussion" | "discussions" => "discussions",
         "coordination" | "coordinations" => "coordinations",
         _ => return None,
     })

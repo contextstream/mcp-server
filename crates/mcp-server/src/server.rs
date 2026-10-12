@@ -2525,8 +2525,11 @@ mod tests {
             "28a3c5485106a5720aa8c3774f0139a37eea775d316cbd994604bb721642a4cc",
         ),
         (
+            // Advanced for tickets 2c0e695e and 9e5c9232: `target_project`
+            // (a project name) was added, and `kind` lost `discussion`, which
+            // mapped to an API route that never existed, so every call failed.
             "entity",
-            "ebc7e45a08512c39d7ca4cbcc997108ea8a1ce20873ee9ff8e32d727396896f8",
+            "0f2e18be46f7b9065ecf20f360ccf647755f057259b6c84b4ab2a45fa3c22c30",
         ),
         (
             "feed",

@@ -257,51 +257,62 @@ pub fn normalize_linked_items_with_allowed_kinds(
     Ok(Value::Array(out))
 }
 
-/// When the API omits assignees/linked_items from create/update responses, merge
-/// them from the normalized request body so summaries remain useful.
-pub fn enrich_ticket_result_from_request(request_body: &Value, result: &mut Value) {
+/// Ticket fields the MCP accepts that the API may not store. The API ignores
+/// fields it does not know, so a field the request set and the reply lacks
+/// was dropped.
+const TICKET_FIELDS_CHECKED_AGAINST_REPLY: &[&str] = &["assignees", "linked_items"];
+
+/// The ticket fields this request set that the API's reply does not carry,
+/// meaning the API did not save them. The reply is never filled in from the
+/// request, so a summary only shows what was stored.
+pub fn ticket_fields_not_saved(request_body: &Value, result: &Value) -> Vec<&'static str> {
     let Some(req_obj) = request_body.as_object() else {
-        return;
+        return Vec::new();
     };
-    let Some(entity_obj) = find_ticket_entity_object_mut(result) else {
-        return;
-    };
-    for field in ["assignees", "linked_items"] {
-        let missing = !entity_obj.contains_key(field)
-            || entity_obj
-                .get(field)
-                .map(|v| {
-                    v.is_null() || (v.is_array() && v.as_array().is_some_and(|a| a.is_empty()))
-                })
-                .unwrap_or(true);
-        if missing {
-            if let Some(val) = req_obj.get(field) {
-                if !(val.is_null()
-                    || (val.is_array() && val.as_array().is_some_and(|a| a.is_empty())))
-                {
-                    entity_obj.insert(field.to_string(), val.clone());
-                }
-            }
-        }
+    let entity_obj = find_ticket_entity_object(result);
+    TICKET_FIELDS_CHECKED_AGAINST_REPLY
+        .iter()
+        .copied()
+        .filter(|field| has_items(req_obj.get(*field)))
+        .filter(|field| !has_items(entity_obj.and_then(|obj| obj.get(*field))))
+        .collect()
+}
+
+/// What to tell the agent about ticket fields the API did not save.
+pub fn format_ticket_fields_not_saved(fields: &[&str]) -> Option<String> {
+    let lines: Vec<&str> = fields
+        .iter()
+        .filter_map(|field| match *field {
+            "linked_items" => Some(
+                "Not saved: linked_items. The API does not store ticket links yet; \
+                 name the linked items in the description instead.",
+            ),
+            "assignees" => Some(
+                "Not saved: assignees. The API keeps a single assignee as assignee_id \
+                 (a user id); set assignee_id instead.",
+            ),
+            _ => None,
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn has_items(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(_) => true,
     }
 }
 
-fn find_ticket_entity_object_mut(result: &mut Value) -> Option<&mut Map<String, Value>> {
-    let nested_key = ["ticket", "data", "entity", "item", "result"]
-        .iter()
-        .find(|&&key| {
-            result
-                .as_object()
-                .and_then(|obj| obj.get(key))
-                .map(|v| v.is_object())
-                .unwrap_or(false)
-        })
-        .map(|k| k.to_string());
-
-    if let Some(key) = nested_key {
-        return result.get_mut(&key).and_then(|v| v.as_object_mut());
+fn find_ticket_entity_object(result: &Value) -> Option<&Map<String, Value>> {
+    let obj = result.as_object()?;
+    for key in ["ticket", "data", "entity", "item", "result"] {
+        if let Some(inner) = obj.get(key).and_then(Value::as_object) {
+            return Some(inner);
+        }
     }
-    result.as_object_mut()
+    Some(obj)
 }
 
 /// Human-readable assignee summary for ticket list/get text output.
@@ -532,38 +543,48 @@ mod tests {
     }
 
     #[test]
-    fn enrich_ticket_result_merges_missing_assignees_and_links() {
+    fn fields_the_api_dropped_are_reported_not_echoed() {
         let request = json!({
             "title": "Fix bug",
             "assignees": [{"email": "alice@example.com"}],
             "linked_items": [{"kind": "doc", "id": "doc-1", "title_snapshot": "ADR"}]
         });
-        let mut result = json!({
+        let result = json!({
             "ticket": {
                 "id": "t-1",
                 "title": "Fix bug",
                 "status": "open"
             }
         });
-        enrich_ticket_result_from_request(&request, &mut result);
-        let ticket = &result["ticket"];
-        assert_eq!(ticket["assignees"][0]["email"], "alice@example.com");
-        assert_eq!(ticket["linked_items"][0]["kind"], "doc");
+        assert_eq!(
+            ticket_fields_not_saved(&request, &result),
+            vec!["assignees", "linked_items"]
+        );
+        let text = format_ticket_fields_not_saved(&["assignees", "linked_items"]).unwrap();
+        assert!(text.contains("Not saved: linked_items"));
+        assert!(text.contains("Not saved: assignees"));
+        assert!(format_linked_summary(&result["ticket"]).is_none());
     }
 
     #[test]
-    fn enrich_ticket_result_preserves_api_echoed_fields() {
+    fn fields_the_api_returned_count_as_saved() {
         let request = json!({
             "assignees": [{"email": "alice@example.com"}],
             "linked_items": [{"kind": "doc", "id": "doc-1"}]
         });
-        let mut result = json!({
+        let result = json!({
             "id": "t-2",
             "assignees": [{"email": "bob@example.com"}],
             "linked_items": [{"kind": "plan", "id": "plan-1"}]
         });
-        enrich_ticket_result_from_request(&request, &mut result);
-        assert_eq!(result["assignees"][0]["email"], "bob@example.com");
-        assert_eq!(result["linked_items"][0]["kind"], "plan");
+        assert!(ticket_fields_not_saved(&request, &result).is_empty());
+        assert!(format_ticket_fields_not_saved(&[]).is_none());
+    }
+
+    #[test]
+    fn fields_the_request_left_out_or_cleared_are_not_reported() {
+        let request = json!({"title": "Fix bug", "linked_items": []});
+        let result = json!({"id": "t-3", "title": "Fix bug"});
+        assert!(ticket_fields_not_saved(&request, &result).is_empty());
     }
 }

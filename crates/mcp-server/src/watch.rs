@@ -65,6 +65,9 @@ const REENUMERATE_INTERVAL: Duration = Duration::from_secs(120);
 /// (see `crate::link`). The first check runs shortly after start.
 const LINK_AUDIT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const LINK_AUDIT_FIRST_DELAY: Duration = Duration::from_secs(120);
+/// The least time between two audits that hooks asked for (see
+/// `request_link_audit`). A folder no project matches asks on every turn.
+const LINK_AUDIT_REQUEST_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// How often the singleton lock's heartbeat timestamp is refreshed.
 const LOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -108,6 +111,7 @@ const WATCH_LOCK_FILE: &str = "watch.lock";
 const WATCH_HEARTBEAT_FILE: &str = "watch.heartbeat.json";
 const WATCH_STOP_REQUEST_FILE: &str = "watch.stop.json";
 const WATCH_RELOAD_REQUEST_FILE: &str = "watch.reload";
+const LINK_AUDIT_REQUEST_FILE: &str = "watch.link-audit";
 const BRIDGE_CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const BRIDGE_CONTROL_CLAIM_INTERVAL: Duration = Duration::from_secs(30);
 const BRIDGE_CONTROL_LEASE_SECONDS: u64 = 180;
@@ -909,15 +913,78 @@ pub fn request_sync_bridge_reload() -> Result<bool> {
 }
 
 fn consume_sync_bridge_reload_request_at(dir: &Path) -> bool {
-    let path = dir.join(WATCH_RELOAD_REQUEST_FILE);
-    match std::fs::remove_file(&path) {
+    consume_request_marker(&dir.join(WATCH_RELOAD_REQUEST_FILE), "reload")
+}
+
+fn consume_request_marker(path: &Path, kind: &str) -> bool {
+    match std::fs::remove_file(path) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => {
-            tracing::debug!("watch: could not consume reload request: {}", error);
+            tracing::debug!("watch: could not consume {kind} request: {}", error);
             false
         }
     }
+}
+
+/// Ask the running bridge to check which project each folder on this machine
+/// belongs to now, instead of at its next six-hourly audit.
+///
+/// Hooks call this when an agent works in a checkout that has no verified
+/// link here. The audit links it only when its Git repository names the
+/// project (see `crate::link`), and the bridge then syncs it. Like the reload
+/// marker, the request holds no path or scope and is consumed once.
+pub fn request_link_audit() -> Result<bool> {
+    let Some(dir) = contextstream_dir() else {
+        return Ok(false);
+    };
+    request_link_audit_at(&dir)
+}
+
+fn request_link_audit_at(dir: &Path) -> Result<bool> {
+    if probe_singleton_lock_at(dir) != LockProbe::Held {
+        return Ok(false);
+    }
+    crate::setup::safe_edit::write_owned_file_if_changed(
+        &dir.join(LINK_AUDIT_REQUEST_FILE),
+        "link-audit\n",
+    )?;
+    Ok(true)
+}
+
+/// Take a pending audit request, unless an audit is running (it may have
+/// listed the folders before the request's folder was recorded) or one was
+/// requested within the cooldown. A request left in place is taken later.
+fn take_link_audit_request_at(
+    dir: &Path,
+    audit_running: bool,
+    last_requested: Option<Instant>,
+    now: Instant,
+) -> bool {
+    !audit_running
+        && last_requested
+            .is_none_or(|last| now.saturating_duration_since(last) >= LINK_AUDIT_REQUEST_COOLDOWN)
+        && consume_request_marker(&dir.join(LINK_AUDIT_REQUEST_FILE), "link audit")
+}
+
+/// Run the background link audit unless one is already running. A repaired
+/// link changes which folders the bridge may sync, so the bridge reloads.
+fn spawn_link_audit(client: &ContextStreamClient, running: &Arc<AtomicBool>) {
+    if running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let client = client.clone();
+    let running = running.clone();
+    tokio::spawn(async move {
+        let relinked = crate::link::background_audit(&client).await;
+        if relinked > 0 {
+            let _ = request_sync_bridge_reload();
+        }
+        running.store(false, Ordering::Release);
+    });
 }
 
 fn consume_sync_bridge_stop_request_at(dir: &Path, lock: &SingletonLock) -> bool {
@@ -1975,6 +2042,7 @@ pub async fn run_watch() -> Result<()> {
     );
     link_audit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let link_audit_running = Arc::new(AtomicBool::new(false));
+    let mut last_requested_link_audit: Option<Instant> = None;
     let mut lock_tick = tokio::time::interval(LOCK_REFRESH_INTERVAL);
     lock_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut bridge_heartbeat_tick = tokio::time::interval(BRIDGE_CONTROL_HEARTBEAT_INTERVAL);
@@ -2049,6 +2117,18 @@ pub async fn run_watch() -> Result<()> {
                             "watch: reloaded managed checkout mappings"
                         );
                     }
+                    let now = Instant::now();
+                    if link_audit_enabled()
+                        && take_link_audit_request_at(
+                            &dir,
+                            link_audit_running.load(Ordering::Acquire),
+                            last_requested_link_audit,
+                            now,
+                        )
+                    {
+                        last_requested_link_audit = Some(now);
+                        spawn_link_audit(&client, &link_audit_running);
+                    }
                 }
                 let now = Instant::now();
                 let due = take_due_watch_projects(&pending, &inflight, &holds, now);
@@ -2102,22 +2182,8 @@ pub async fn run_watch() -> Result<()> {
                 lock.write_heartbeat(targets.len());
             }
             _ = link_audit_tick.tick() => {
-                if link_audit_enabled()
-                    && link_audit_running
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                {
-                    let client = client.clone();
-                    let running = link_audit_running.clone();
-                    tokio::spawn(async move {
-                        // A repaired link changes which folders the bridge
-                        // may sync; the next re-enumeration picks it up.
-                        let relinked = crate::link::background_audit(&client).await;
-                        if relinked > 0 {
-                            let _ = request_sync_bridge_reload();
-                        }
-                        running.store(false, Ordering::Release);
-                    });
+                if link_audit_enabled() {
+                    spawn_link_audit(&client, &link_audit_running);
                 }
             }
             _ = bridge_heartbeat_tick.tick() => {
@@ -2343,6 +2409,46 @@ mod tests {
             &first
         ));
         assert!(directory.path().join(WATCH_STOP_REQUEST_FILE).exists());
+    }
+
+    #[test]
+    fn link_audit_request_needs_a_running_bridge_and_waits_out_a_running_audit_or_cooldown() {
+        let directory = tempdir().expect("tempdir");
+        let marker = directory.path().join(LINK_AUDIT_REQUEST_FILE);
+        assert!(!request_link_audit_at(directory.path()).unwrap());
+        assert!(!marker.exists());
+
+        let _lock = acquire_singleton_lock_at(directory.path()).expect("lock");
+        assert!(request_link_audit_at(directory.path()).unwrap());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "link-audit\n");
+
+        let now = Instant::now();
+        assert!(!take_link_audit_request_at(
+            directory.path(),
+            true,
+            None,
+            now
+        ));
+        assert!(!take_link_audit_request_at(
+            directory.path(),
+            false,
+            Some(now),
+            now + Duration::from_secs(60)
+        ));
+        assert!(marker.exists(), "a request left in place is taken later");
+        assert!(take_link_audit_request_at(
+            directory.path(),
+            false,
+            Some(now),
+            now + LINK_AUDIT_REQUEST_COOLDOWN
+        ));
+        assert!(!marker.exists());
+        assert!(!take_link_audit_request_at(
+            directory.path(),
+            false,
+            None,
+            now
+        ));
     }
 
     #[test]

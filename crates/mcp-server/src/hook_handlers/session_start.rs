@@ -53,7 +53,14 @@ pub async fn handle() -> Result<()> {
     let config = load_config(&cwd);
 
     // Check index status for the current project
-    let index_info = check_index_status(&cwd);
+    let index_info = match check_index_status(&cwd) {
+        IndexInfo::NotIndexed => checkout_sync_status(&cwd).unwrap_or(IndexInfo::NotIndexed),
+        known => known,
+    };
+    if matches!(index_info, IndexInfo::NotLinked) {
+        // A folder an earlier session recorded is in the bridge's next audit.
+        let _ = crate::watch::request_link_audit();
+    }
 
     // Try to fetch compact restore state and startup context from API in
     // parallel so SessionStart can stay under the hook timeout budget.
@@ -112,6 +119,18 @@ pub async fn handle() -> Result<()> {
         IndexInfo::NotIndexed => {
             output_text.push_str("\n\u{2139} Project index not found yet \u{2014} use ContextStream search first (not Explore/Grep) to find code as it builds; fall back to local tools only if search itself returns nothing.\n");
             output_text.push_str("Keep hosted MCP configured, re-establish the intended checkout with `mcp__contextstream__init(folder_path=\"<folder>\")`, then run `mcp__contextstream__project(action=\"index\")`; the exact-checkout sync bridge supplies local bytes. Verify with `mcp__contextstream__project(action=\"index_status\")`.\n");
+        }
+        IndexInfo::Synced => {
+            output_text.push_str(
+                "\n\u{2713} This checkout is linked and the sync bridge uploads its changes as you edit, so search reflects it.\n",
+            );
+        }
+        IndexInfo::NotLinked => {
+            output_text.push_str("\n\u{26a0} This checkout is not linked to ContextStream on this machine, so the sync bridge uploads nothing from it. Search shows what other machines uploaded, which can be another branch or days old, and can miss code that exists only here.\n");
+            output_text.push_str("The bridge links it by itself when its Git repository names a project. To link it now, run `contextstream-mcp link --fix` in this folder (`--project-id <id>` if no project matches), then `mcp__contextstream__project(action=\"index\")`.\n");
+        }
+        IndexInfo::BridgeStopped => {
+            output_text.push_str("\n\u{26a0} This checkout is linked, but the ContextStream sync bridge is not running, so its changes are not uploaded and search can be out of date. Run `contextstream-mcp doctor --only-configured --repair --scope=all` to start it.\n");
         }
     }
 
@@ -282,6 +301,53 @@ enum IndexInfo {
     Stale,
     Indexing,
     NotIndexed,
+    /// The checkout is linked here and a running sync bridge uploads it.
+    Synced,
+    /// A Git checkout with no verified link on this machine: the bridge
+    /// uploads nothing from it.
+    NotLinked,
+    /// Linked, but no sync bridge is running to upload it.
+    BridgeStopped,
+}
+
+/// What the sync bridge does for the checkout at `folder_path`. Machines on
+/// hosted MCP never write `indexed-projects.json`, so this is how they know
+/// whether search reflects this checkout. `None` outside Git and in agents'
+/// task worktrees, which are never synced.
+fn checkout_sync_status(folder_path: &str) -> Option<IndexInfo> {
+    let layout = mcp_session::checkout_repository_layout(folder_path)?;
+    let root = layout.repository_root.to_string_lossy().to_string();
+    if crate::link::is_agent_worktree(&root) {
+        return None;
+    }
+    if !checkout_linked(&root) {
+        return Some(IndexInfo::NotLinked);
+    }
+    let health = crate::watch::sync_bridge_health();
+    let running = matches!(health.state, crate::watch::SyncBridgeHealthState::Running)
+        && health.target_count > 0;
+    Some(if running {
+        IndexInfo::Synced
+    } else {
+        IndexInfo::BridgeStopped
+    })
+}
+
+/// Whether the checkout-local config links `root` to its project with a
+/// verified repository fingerprint (what the bridge requires to sync it).
+fn checkout_linked(root: &str) -> bool {
+    std::fs::read_to_string(Path::new(root).join(".contextstream/config.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|config| {
+            config
+                .get("project_id")
+                .and_then(Value::as_str)
+                .and_then(|id| uuid::Uuid::parse_str(id.trim()).ok())
+        })
+        .is_some_and(|project_id| {
+            mcp_session::auto_init::checkout_binding_workspace(root, project_id).is_some()
+        })
 }
 
 fn check_index_status(folder_path: &str) -> IndexInfo {
@@ -605,6 +671,24 @@ mod tests {
             !src.contains(&disabled),
             "must not mark semantic search unavailable"
         );
+    }
+
+    #[test]
+    fn an_unlinked_git_checkout_is_reported_as_not_synced() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().join("app");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        assert!(matches!(
+            checkout_sync_status(&checkout.to_string_lossy()),
+            Some(IndexInfo::NotLinked)
+        ));
+        // Plain folders and agents' task worktrees keep the generic message.
+        let plain = directory.path().join("notes");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(checkout_sync_status(&plain.to_string_lossy()).is_none());
+        let task = checkout.join(".claude/worktrees/agent-a1");
+        std::fs::create_dir_all(task.join(".git")).unwrap();
+        assert!(checkout_sync_status(&task.to_string_lossy()).is_none());
     }
 
     #[test]

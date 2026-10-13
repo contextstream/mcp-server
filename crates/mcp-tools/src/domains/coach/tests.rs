@@ -53,7 +53,8 @@ impl Answer {
 
     fn replayed(data: Value) -> Self {
         Self {
-            headers: vec![("Idempotent-Replayed", "true".to_string())],
+            // As production sends it over HTTP/2: a lowercase name.
+            headers: vec![("idempotent-replayed", "true".to_string())],
             ..Self::ok(data)
         }
     }
@@ -305,8 +306,13 @@ fn packet() -> Value {
 
 fn comparison() -> Value {
     let side = |version: i64| {
+        // As the live API answers: the chain starts with the version itself.
+        let chain: Vec<Value> = (1..=version)
+            .rev()
+            .map(|v| json!({"id": OUTPUT_ID, "ref": format!("weekly-note#4/v{v}")}))
+            .collect();
         json!({"output": output(version), "job": {"id": JOB_ID, "ref": "weekly-note#4"}, "job_objective": "Week 42 note",
-               "chain": [], "carried": [], "feedback": [feedback()],
+               "chain": chain, "carried": [], "feedback": [feedback()],
                "written_from": {"goal_version": 2, "etag": "0123456789abcdef0123456789abcdef", "guidance_count": 1,
                                 "job_feedback_count": 1, "example_count": 0, "current": true}})
     };
@@ -449,6 +455,14 @@ fn api(request: &Recorded, _index: usize) -> Answer {
             json!({"feedback": saved, "guidance": guidance, "possible_repeats": [{"id": GUIDANCE_ID, "ref": "weekly-note/g1", "body": "Lead with the decision.", "similarity": 0.5}]})
         }),
         ("GET", "/feedback/weekly-note#4/f1") => Answer::ok(feedback()),
+        ("GET", "/feedback/weekly-note#2/f1") => Answer::ok({
+            let mut source = feedback();
+            source["ref"] = json!("weekly-note#2/f1");
+            source["scope"] = json!("workflow");
+            source["body"] = json!("Say what we decided first!");
+            source["interpretation"] = json!("Lead with the decision.");
+            source
+        }),
         ("POST", "/feedback/weekly-note#4/f1/rescope") => Answer::created(
             json!({"action": "feedback.rescope", "scope": request.body["scope"],
             "original": {"id": FEEDBACK_ID, "ref": "weekly-note#4/f1"}, "restated": {"id": FEEDBACK_ID, "ref": "weekly-note#4/f3"},
@@ -1459,6 +1473,31 @@ async fn compare_shows_both_versions_without_a_score() {
     let text = text_of(&result).to_ascii_lowercase();
     assert!(text.contains("no score"));
     assert!(!text.contains("score:"));
+    // A version revises the ones after it in the chain, never itself.
+    let text = text_of(&result);
+    assert!(text.contains("Revises: weekly-note#4/v1"), "{text}");
+    assert!(!text.contains("Revises: weekly-note#4/v2"), "{text}");
+    assert_eq!(text.matches("Revises:").count(), 1, "{text}");
+}
+
+#[tokio::test]
+async fn guidance_shows_the_persons_words_apart_from_its_text() {
+    let stub = Stub::start(Arc::new(api)).await;
+    let result = stub
+        .coach()
+        .read(serde_json::from_value(json!({"action": "get", "ref": "weekly-note/g1"})).unwrap())
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    assert!(text.contains("Lead with the decision."), "{text}");
+    assert!(
+        text.contains("Source (weekly-note#2/f1):\nYou said:\nSay what we decided first!"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Coach's reading (an interpretation): Lead with the decision."),
+        "{text}"
+    );
 }
 
 #[tokio::test]

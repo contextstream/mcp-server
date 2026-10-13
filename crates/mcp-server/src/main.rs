@@ -3788,6 +3788,8 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
     domains::help::register_help_tools(&mut registry, client.clone());
     domains::skill::register_skill_tools(&mut registry, client.clone(), session.clone());
     domains::qa::register_qa_tools(&mut registry, client.clone());
+    // Agent Coach Kit: registered here too, visible only on /coach.
+    domains::coach::register_coach_tools(&mut registry, client.clone());
 
     let tool_count = registry.len();
 
@@ -3831,6 +3833,20 @@ mod tests {
             .expect("run_http_server");
         let body = &source[start..start + source[start..].find("\n}\n").expect("end")];
         assert!(body.contains("mcp_client::set_runtime_self_update_disabled(true);"));
+    }
+
+    #[test]
+    fn the_http_gateway_serves_the_coach_tools() {
+        // The gateway builds its own registry, apart from `build_registry`;
+        // without this line /coach would list nothing.
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn run_http_server(")
+            .expect("run_http_server");
+        let body = &source[start..start + source[start..].find("\n}\n").expect("end")];
+        assert!(
+            body.contains("domains::coach::register_coach_tools(&mut registry, client.clone());")
+        );
     }
 
     #[test]

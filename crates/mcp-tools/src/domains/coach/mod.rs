@@ -1013,7 +1013,23 @@ impl Coach {
                 Ok(response) => {
                     let guidance: GuidanceView = response.view();
                     let mut out = Out::new();
-                    out.data("guidance", &guidance_item(&guidance));
+                    let mut body = guidance_item(&guidance);
+                    // Guidance starts as the coach's reading of the person's
+                    // words; show their words beside it, kept apart.
+                    if let Some(source) = guidance.source_feedback_ref() {
+                        if let Ok(response) = self.send(&CoachRequest::get_feedback(&source)).await
+                        {
+                            let feedback: FeedbackView = response.view();
+                            if !feedback.body.is_empty() {
+                                body.push_str(&format!("Source ({source}):\n"));
+                                body.push_str(&format::words_and_reading(
+                                    &feedback.body,
+                                    feedback.interpretation.as_deref(),
+                                ));
+                            }
+                        }
+                    }
+                    out.data("guidance", &body);
                     out.line(format!(
                             "Version {} ({}). Edit with workflow_save(action=\"edit_guidance\", guidance=\"{}\", expected_version={}).",
                             guidance.version,
@@ -2968,7 +2984,12 @@ fn compare_side(side: &mcp_client::coach::ComparedView, fallback: &str) -> (Stri
     if !side.job_objective.is_empty() {
         text.push_str(&format!("Job objective: {}\n", side.job_objective));
     }
-    let chain = side.chain();
+    // The API's chain starts with the version itself.
+    let chain: Vec<String> = side
+        .chain()
+        .into_iter()
+        .filter(|item| *item != reference)
+        .collect();
     if !chain.is_empty() {
         text.push_str(&format!("Revises: {}\n", chain.join(" <- ")));
     }

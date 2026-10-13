@@ -122,7 +122,9 @@ pub(crate) struct CardWorkflow {
 pub(crate) struct CardJob {
     #[serde(rename = "ref")]
     pub reference: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub objective: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub status: String,
 }
 

@@ -8,7 +8,7 @@
         "com.openai": {
           "auth": {
             "type": "oauth",
-            "client": { "mode": "dcr" },
+            "client": { "mode": "cimd" },
             "baseScopes": ["read:coach", "write:coach"]
           }
         }

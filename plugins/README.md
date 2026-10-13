@@ -35,7 +35,7 @@ These steps follow OpenAI's submission guide (developers.openai.com/plugins/depl
 5. **Record the walkthrough.** A video of the eight review cases, run with the reviewer account, at an accessible URL. Add it as `review.demo_recording_url` in `plugin.json` (and rebuild), or in the dashboard.
 6. **Choose the countries** (`publication.countries`, uppercase codes such as `US` and `GB`) if it shouldn't be available everywhere.
 7. **Upload the ZIP** and choose "With MCP":
-   - URL `https://mcp.contextstream.io/coach`, authentication OAuth. Dynamic client registration works today; switch `mcp.json` to `"mode": "cimd"` once ContextStream's authorization server advertises `client_id_metadata_document_supported`.
+   - URL `https://mcp.contextstream.io/coach`, authentication OAuth. `mcp.json` uses ChatGPT's Client ID Metadata Document (`"mode": "cimd"`), which ContextStream's authorization server supports since 2026-10-13 (it advertises `client_id_metadata_document_supported`). Dynamic client registration still works as a fallback.
    - Scan the tools. Expect `workflow` (read-only), `workflow_save`, and `workflow_delete` (destructive, asks for confirmation).
    - Content security: the card loads nothing from the network, so no connect or resource domains are needed.
 8. **Run all eight cases** with the reviewer account before submitting: five where the plugin should act, three where it should not (a one-off poem, deleting without confirmation, posting to Slack or email).

@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.0.22
+
+- Agent Coach Kit: a new `/coach` endpoint lets a person coach an agent on
+  recurring work from ChatGPT or Codex. It serves exactly three tools:
+  `workflow` (read-only: `capabilities`, `list`, `get`, `context`, `history`,
+  `compare`, `metrics`, `export`), `workflow_save` (append-only: create a
+  workflow, refine its goal, start a job, save an output as text, an https link
+  or a file the host hands over, add, rescope or retract feedback, edit or
+  import guidance, set effort, close, reopen or cancel a job, record a
+  verdict) and `workflow_delete` (one workflow, only with `confirm` set to its
+  slug; hidden at once, erased within 30 days). Every write carries an
+  operation id derived from its arguments, so a retry never saves twice, and
+  ends with one status line: `[COACH_SAVED]`, `[COACH_ALREADY_SAVED]`,
+  `[COACH_CONFLICT]` or `[COACH_NOT_SAVED]`. Replies name things by readable
+  reference (`weekly-note#4/v2`), keep the person's words ("You said") apart
+  from the coach's reading, and fence saved data as data, not instructions.
+  `/coach` has its own OAuth protected-resource metadata
+  (`/.well-known/oauth-protected-resource/coach`, scopes `read:coach` and
+  `write:coach`) and serves a ChatGPT widget (`ui://widget/coach.html`); hosts
+  without widgets get the same information as text. The coach tools stay off
+  every other surface; a server started with
+  `CONTEXTSTREAM_TOOL_SURFACE_PROFILE=coach` serves only them. Coach is a pilot:
+  accounts without it get `coach_not_enabled`, which is not treated as a
+  sign-in problem (3ccd4fe, 956e406).
+- Hosted gateway: the HTTP gateway registers the coach tools (it builds its own
+  tool registry, so `/coach` listed nothing there), `compare` no longer shows a
+  version as revising itself, and `get` on guidance shows the person's words
+  beside the coach's reading (956e406).
+- Tool results can carry `_meta`, which the transports merge into the
+  response's `_meta`; the coach tools use it to ask ChatGPT to sign the person
+  in after a 401 or 403 (3ccd4fe).
+- Agent Coach Kit for Codex Cloud (`kits/agent-coach-kit/codex-cloud`): Codex
+  Cloud tasks cannot load MCP servers, so a repo skill
+  (`.agents/skills/contextstream-coach/SKILL.md`) and a standard-library helper
+  (`scripts/coach.py`) call the coach REST API with the person's key from a
+  Codex network secret. The README covers the environment, network access, the
+  storage host for large media, every command, the save tags and the exit
+  codes. The kit lives in the repository; it is not part of the npm package or
+  the binaries (066161c, 2809dab).
+
+Who gets what: the coach tools reach ChatGPT and Codex when the hosted gateway
+runs this version; the default, OpenAI and consolidated tool lists do not
+change. No dependency changes.
+
 ## 1.0.21
 
 - Hosted gateway: tools no longer read or write the gateway host's own disk.

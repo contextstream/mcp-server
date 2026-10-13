@@ -33,7 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_API_URL = "https://api.contextstream.io"
 USER_AGENT = f"contextstream-coach-kit/{VERSION} (codex-cloud)"
 COACH = "/api/v1/coach"
@@ -918,6 +918,52 @@ def cmd_compare(api: Api, args) -> int:
     return EXIT_OK
 
 
+def _count(value) -> int:
+    return value if isinstance(value, int) else 0
+
+
+def cmd_metrics(api: Api, args) -> int:
+    """How the coaching is going, from real jobs only: never a quality score."""
+    data = read(api, f"{COACH}/workflows/{seg(args.workflow)}/metrics") or {}
+    if args.json:
+        print_json(data)
+        return EXIT_OK
+    workflow = ref_of(data.get("workflow"), args.workflow)
+    lines = [f"Coaching measures for {workflow} (counts from real jobs; no quality score):"]
+    for job in data.get("jobs") or []:
+        feedback = job.get("feedback") or {}
+        scope = feedback.get("by_scope") or {}
+        repeats = job.get("repeats") or {}
+        versions = _count(job.get("outputs"))
+        line = (f"- {ref_of(job.get('job'), '#' + str(job.get('number', '?')))} ({job.get('status', '?')}): "
+                f"{versions} version{'' if versions == 1 else 's'}, {_count(feedback.get('total'))} feedback "
+                f"({_count(scope.get('workflow'))} reusable, {_count(scope.get('job'))} this job only), "
+                f"repeated corrections {_count(repeats.get('confirmed'))} confirmed / "
+                f"{_count(repeats.get('likely'))} likely")
+        if _count(job.get("reported_leaks")):
+            line += f", {job['reported_leaks']} reported leak(s)"
+        verdict = job.get("verdict")
+        if isinstance(verdict, dict) and verdict.get("verdict"):
+            line += f", the person's verdict: {verdict['verdict']}"
+            if verdict.get("note"):
+                line += f' ("{verdict["note"]}")'
+        lines.append(line)
+    totals = data.get("totals") or {}
+    repeats = totals.get("repeats") or {}
+    lines.append(f"Totals: {_count(totals.get('jobs'))} jobs, {_count(totals.get('outputs'))} versions, "
+                 f"{_count(totals.get('feedback'))} feedback, repeated corrections "
+                 f"{_count(repeats.get('confirmed'))} confirmed / {_count(repeats.get('likely'))} likely.")
+    first, second = totals.get("avg_feedback_first_half"), totals.get("avg_feedback_second_half")
+    if isinstance(first, (int, float)) and isinstance(second, (int, float)):
+        lines.append(f"Feedback per job: {first:.1f} in the first half of the jobs, {second:.1f} in the second "
+                     "half (fewer can mean less correcting; ask the person rather than assume).")
+    audit = data.get("leak_audit")
+    leaks = audit.get("total") if isinstance(audit, dict) else None
+    lines.append(f"Context audit: {_count(leaks)} item(s) found outside their job or workflow.")
+    print("\n".join(lines))
+    return EXIT_OK
+
+
 def cmd_history(api: Api, args) -> int:
     wf = seg(args.workflow)
     history = {
@@ -1080,6 +1126,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("right", nargs="?")
     p = sub.add_parser("history", help="goal versions, guidance and feedback of a workflow")
     p.add_argument("workflow")
+    p = sub.add_parser("metrics", help="how the coaching is going: counts from real jobs, no quality score")
+    p.add_argument("workflow")
     p = sub.add_parser("export", help="everything in a workflow, as Markdown or JSON")
     p.add_argument("workflow")
     p.add_argument("--format", choices=["markdown", "json"], default="markdown")
@@ -1098,6 +1146,7 @@ COMMANDS = {
     "edit-guidance": cmd_edit_guidance, "retire-guidance": cmd_retire_guidance,
     "import-guidance": cmd_import_guidance, "set-effort": cmd_set_effort,
     "close-job": cmd_close_job, "verdict": cmd_verdict, "compare": cmd_compare, "history": cmd_history,
+    "metrics": cmd_metrics,
     "export": cmd_export, "delete-workflow": cmd_delete_workflow,
 }
 

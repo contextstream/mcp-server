@@ -88,4 +88,5 @@ Everything lives in the person's ContextStream account. `scripts/coach.py` talks
   - Retire it: `coach.py retire-guidance GUIDANCE --reason "..."`. Use `--remove` or `--restore` in place of retiring.
 - **Feedback they take back:** `coach.py retract-feedback FEEDBACK --reason "..."`.
 - **What changed over time:** `coach.py history WORKFLOW`. Export everything with `coach.py export WORKFLOW --format markdown`.
+- **How the coaching is going:** `coach.py metrics WORKFLOW` counts versions, feedback, repeated corrections and the person's verdicts from real jobs. Report the counts; never turn them into a score.
 - **Delete a workflow:** only when they ask, and only after they confirm: `coach.py delete-workflow WORKFLOW --confirm WORKFLOW`. It disappears at once and is erased within 30 days. Deleting their ContextStream account erases everything.

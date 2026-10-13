@@ -88,6 +88,7 @@ Run them as `python3 .agents/skills/contextstream-coach/scripts/coach.py ...`. `
 | `retire-guidance GUIDANCE [--remove\|--restore]` | retires, removes or restores guidance |
 | `import-guidance GUIDANCE --into WORKFLOW` | reuses guidance from another of your workflows |
 | `history WORKFLOW` | goal versions, guidance and all feedback |
+| `metrics WORKFLOW` | how the coaching is going, from real jobs: versions and feedback per job, repeated corrections, your verdicts, and the context audit; no quality score |
 | `export WORKFLOW --format markdown\|json [--out PATH]` | everything in a workflow |
 | `delete-workflow WORKFLOW --confirm SLUG` | deletes a workflow; refused unless the confirm is its slug |
 

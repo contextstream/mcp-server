@@ -585,6 +585,34 @@ class CoachCliTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             coach.main(["verdict", "n#2", "--verdict", "great"])
 
+    def test_metrics_prints_counts_from_real_jobs_and_no_score(self):
+        self.route("GET", "/api/v1/coach/workflows/n/metrics", ok({
+            "workflow": {"ref": "n"},
+            "jobs": [
+                {"job": {"ref": "n#1"}, "number": 1, "status": "closed", "outputs": 2,
+                 "feedback": {"total": 3, "by_scope": {"workflow": 2, "job": 1}},
+                 "repeats": {"confirmed": 0, "likely": 0}, "reported_leaks": 0, "audited_leaks": 0, "verdict": None},
+                {"job": {"ref": "n#2"}, "number": 2, "status": "closed", "outputs": 1,
+                 "feedback": {"total": 0, "by_scope": {}}, "repeats": {"confirmed": 0, "likely": 0},
+                 "reported_leaks": 0, "audited_leaks": 0,
+                 "verdict": {"verdict": "better", "note": "Right first time."}}],
+            "totals": {"jobs": 2, "outputs": 3, "feedback": 3, "repeats": {"confirmed": 0, "likely": 0},
+                       "avg_feedback_first_half": 3.0, "avg_feedback_second_half": 0.0},
+            "leak_audit": {"total": 0, "by_job": {}}}, 200))
+        code, out, _ = self.run_cli("metrics", "n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Coaching measures for n (counts from real jobs; no quality score):", out)
+        self.assertIn("- n#1 (closed): 2 versions, 3 feedback (2 reusable, 1 this job only), "
+                      "repeated corrections 0 confirmed / 0 likely", out)
+        self.assertIn("- n#2 (closed): 1 version, 0 feedback (0 reusable, 0 this job only), repeated corrections "
+                      '0 confirmed / 0 likely, the person\'s verdict: better ("Right first time.")', out)
+        self.assertIn("Feedback per job: 3.0 in the first half of the jobs, 0.0 in the second half", out)
+        self.assertIn("Context audit: 0 item(s) found outside their job or workflow.", out)
+        self.assertNotIn("score:", out.lower())
+        self.assertEqual(self.paths("GET"), ["/api/v1/coach/workflows/n/metrics"])
+        code, out, _ = self.run_cli("--json", "metrics", "n")
+        self.assertEqual(json.loads(out)["leak_audit"]["total"], 0)
+
     def test_export_prints_markdown_or_json(self):
         self.route("GET", "/api/v1/coach/workflows/n/export",
                    ok({"format": "markdown", "filename": "n-coach-export.md", "markdown": "# Weekly note\n"}, 200))

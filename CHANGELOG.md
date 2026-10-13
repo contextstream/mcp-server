@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.0.23
+
+- Agent Coach Kit: `workflow(action="compare")` marks feedback a version
+  carried that its own job kept for that job only. A later job's agent could
+  read such feedback in "what changed" as something to apply; it now reads
+  "(this job only; not for later jobs)" in the text and `job_only` on the card.
+  The compare reads back each carried item's scope (at most 12 reads, shared by
+  both sides); one it could not read is marked "(scope not checked; ask the
+  person before reusing it)", never guessed (22be1ee).
+- Agent Coach Kit card (`ui://widget/coach.html`) meets WCAG 2.1 AA: one
+  persistent `aria-live` region announces saves, the focus ring has at least
+  3:1 contrast in light and dark, the base size is relative, the card declares
+  `lang="en"` and honors `prefers-reduced-motion`, nothing scrolls sideways at
+  320 px, scrolling text panels take keyboard focus as named regions, and the
+  compare sides and button rows are labelled groups (22be1ee).
+- Agent Coach Kit for Codex Cloud (repository only): `save-output --carried
+  REF:HOW` records what each version carried, a new `verdict` command records
+  the person's verdict on an open or closed job, `metrics` shows how the
+  coaching is going from real jobs only (no quality score), and the skill asks
+  only about what is missing or changed (5a383d4, cd77a8f).
+- Agent Coach Kit package for the ChatGPT and Codex plugin directory
+  (`plugins/agent-coach-kit`, repository only): the plugin listing, the one
+  remote server `https://mcp.contextstream.io/coach` with OAuth (`read:coach`,
+  `write:coach`), the coaching skill, and `plugins/build_agent_coach_kit.py`,
+  which refuses a package that breaks a submission rule it can check. Nothing
+  has been submitted (e0bfb25).
+
+Who gets what: the compare label and the card reach ChatGPT and Codex when the
+hosted gateway runs this version. The kit and the plugin package live in the
+repository; they are not part of the npm package or the binaries. No
+dependency changes.
+
 ## 1.0.22
 
 - Agent Coach Kit: a new `/coach` endpoint lets a person coach an agent on

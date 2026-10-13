@@ -226,6 +226,43 @@ class CoachCliTest(unittest.TestCase):
         self.assertEqual(body["context_etag"], "a" * 32)
         self.assertEqual(body["carry_note"], "Kept the opening.")
         self.assertIn("[COACH_SAVED] version weekly-note#4/v2", out)
+        self.assertNotIn("carried", body)
+
+    def test_save_output_sends_what_it_carried_with_full_references(self):
+        self.route("POST", "/api/v1/coach/jobs/weekly-note%234/outputs", ok({"ref": "weekly-note#4/v2"}))
+        code, out, _ = self.run_cli(
+            "save-output", "weekly-note#4", "--revises", "weekly-note#4/v1",
+            "--carried", "g1:applied", "--carried", "#3/f2:kept", "--carried", "f1:adapted",
+            "--carried", "weekly-note/g4:not-applied", stdin="Draft 2\n")
+        self.assertEqual(code, 0, out)
+        body = self.bodies("POST", "/api/v1/coach/jobs/weekly-note%234/outputs")[0]
+        self.assertEqual(body["carried"], [
+            {"ref": "weekly-note/g1", "how": "applied"},
+            {"ref": "weekly-note#3/f2", "how": "kept"},
+            {"ref": "weekly-note#4/f1", "how": "adapted"},
+            {"ref": "weekly-note/g4", "how": "not_applied"},
+        ])
+        # What it carried is part of the request, so a different list is a different save.
+        self.run_cli("save-output", "weekly-note#4", "--revises", "weekly-note#4/v1",
+                     "--carried", "g1:applied", "--carried", "#3/f2:kept", "--carried", "f1:adapted",
+                     "--carried", "weekly-note/g4:not-applied", stdin="Draft 2\n")
+        self.run_cli("save-output", "weekly-note#4", "--revises", "weekly-note#4/v1",
+                     "--carried", "g1:kept", stdin="Draft 2\n")
+        ids = [b["operation_id"] for b in self.bodies("POST", "/api/v1/coach/jobs/weekly-note%234/outputs")]
+        self.assertEqual(ids[0], ids[1])
+        self.assertNotEqual(ids[0], ids[2])
+
+    def test_carried_items_are_checked_before_anything_is_sent(self):
+        for job, item in [("weekly-note#4", "g1:used"), ("weekly-note#4", "g1"),
+                          ("weekly-note#4", "v1:kept"), ("weekly-note#4", ":kept"),
+                          ("11111111-1111-4111-8111-111111111111", "g1:kept")]:
+            code, _, err = self.run_cli("save-output", job, "--carried", item, stdin="Draft\n")
+            self.assertEqual(code, coach.EXIT_USAGE, (job, item, err))
+        code, _, err = self.run_cli("save-output", "weekly-note#4", "--carried", "g1:kept",
+                                    "--carried", "weekly-note/g1:applied", stdin="Draft\n")
+        self.assertEqual(code, coach.EXIT_USAGE)
+        self.assertIn("twice", err)
+        self.assertEqual(Stub.log, [])
 
     def test_small_media_is_sent_inline_then_linked(self):
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
@@ -528,6 +565,25 @@ class CoachCliTest(unittest.TestCase):
         body = self.bodies("POST", "/api/v1/coach/jobs/n%231/verdicts")[0]
         self.assertEqual((body["verdict"], body["candidate"]), ("same", "n#1/v2"))
         self.assertIn("already closed", out)
+
+    def test_verdict_records_the_persons_words_on_any_job(self):
+        self.route("POST", "/api/v1/coach/jobs/n%232/verdicts",
+                   ok({"verdict": "better", "candidate": {"ref": "n#2/v1"}}))
+        said = "Better. It got the format right the first time."
+        code, out, _ = self.run_cli("verdict", "n#2", "--verdict", "better", "--said", said,
+                                    "--candidate", "n#2/v1")
+        self.assertEqual(code, 0, out)
+        body = self.bodies("POST", "/api/v1/coach/jobs/n%232/verdicts")[0]
+        self.assertEqual({k: v for k, v in body.items() if k != "operation_id"},
+                         {"verdict": "better", "note": said, "candidate": "n#2/v1"})
+        self.assertTrue(body["operation_id"].startswith("cli-"))
+        self.assertIn("[COACH_SAVED] verdict on n#2: better", out)
+        # The same verdict again replays the first save instead of adding a revision.
+        self.run_cli("verdict", "n#2", "--verdict", "better", "--note", said, "--candidate", "n#2/v1")
+        ids = [b["operation_id"] for b in self.bodies("POST", "/api/v1/coach/jobs/n%232/verdicts")]
+        self.assertEqual(ids[0], ids[1])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            coach.main(["verdict", "n#2", "--verdict", "great"])
 
     def test_export_prints_markdown_or_json(self):
         self.route("GET", "/api/v1/coach/workflows/n/export",

@@ -24,11 +24,11 @@ Everything lives in the person's ContextStream account. `scripts/coach.py` talks
 
 1. **Find the workflow** with `coach.py list`.
    - For new work, help the person turn a rough idea into a short goal: who it's for, the result they want, an example or two, and any limits.
-   - Then run `coach.py create --name "..." --goal "..."`.
+   - Show the goal you propose in one line and ask only about what's missing. Then run `coach.py create --name "..." --goal "..."`.
    - A rough goal is fine; it gets sharper as you go.
 2. **Propose the objective.**
-   - `coach.py get WORKFLOW` shows recent objectives, the guidance, what still needs attention, and any coaching preference the person set.
-   - Suggest this job's objective from that, and ask only about what changed or is missing.
+   - `coach.py get WORKFLOW` shows recent objectives, the guidance, what still needs attention in an open job, and any coaching preference the person set. Feedback it shows from earlier jobs is history: never apply it.
+   - Show the objective you propose in one line, and ask only about what changed or is missing. If the person asked for quick coaching, state it in that line and go on.
    - Then run `coach.py start-job WORKFLOW --objective "..."`. To pick up an open job, use `coach.py context JOB`.
 3. **Use what you were given.** The context holds the goal, the active guidance, this job's own feedback, and approved examples. Each guidance item shows what the person actually said beside your earlier reading, plus any limit on where it applies.
    - Apply each guidance item that fits this job. If its limit says it doesn't apply here, say so.
@@ -40,6 +40,7 @@ Everything lives in the person's ContextStream account. `scripts/coach.py` talks
    - An image, audio, video or document: `--media PATH` in place of `--file`.
    - A revision: add `--revises VERSION`.
    - The carry note says briefly what you kept from approvals and which feedback you applied.
+   - Name the same items with `--carried`, one each: `--carried g1:applied --carried f2:kept`. `g1` is guidance, `f2` this job's feedback, `#3/f1` an earlier job's; the how is kept, adapted, applied or not_applied. Items marked applied or kept stop showing as needing attention.
 5. **Show it** with its version reference. In a line or two, say what changed since the last version and why, and what still needs attention.
 6. **Save every reaction, without being asked.** When the person reacts to a version, save their words exactly:
    `coach.py add-feedback VERSION --kind correction|approval|direction --scope reusable|this-job --text "<their words>" --reading "<your reading>"`
@@ -50,7 +51,8 @@ Everything lives in the person's ContextStream account. `scripts/coach.py` talks
    - When they repeat something already in the guidance, add `--repeat-of GUIDANCE`. That shows the coaching didn't stick.
 7. **Revise or finish.**
    - When they're happy: `coach.py close-job JOB --used VERSION`.
-   - To compare with the last job: `coach.py compare JOB`. Then ask which is better, and record exactly what they decide with `--verdict better|same|worse`.
+   - To compare with the last job: `coach.py compare JOB`, then ask which is better.
+   - As soon as they say, record their verdict with their words: `coach.py verdict JOB --verdict better|same|worse --said "<their words>"`. Add `--candidate VERSION` when they judged a version other than the latest. It works before or after the job is closed.
    - Never choose the verdict yourself.
 
 ## Coaching well

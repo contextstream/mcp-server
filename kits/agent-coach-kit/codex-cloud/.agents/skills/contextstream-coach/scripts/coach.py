@@ -33,7 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_API_URL = "https://api.contextstream.io"
 USER_AGENT = f"contextstream-coach-kit/{VERSION} (codex-cloud)"
 COACH = "/api/v1/coach"
@@ -58,6 +58,8 @@ FEEDBACK_KINDS = {"correction": "correction", "approval": "partial_approval", "d
 FEEDBACK_SCOPES = {"reusable": "workflow", "this-job": "job"}
 SCOPE_WORDS = {"workflow": "reusable", "job": "this job only"}
 EFFORTS = ("quick", "explore", "clear")
+VERDICTS = ("better", "same", "worse")
+CARRY_HOWS = ("kept", "adapted", "applied", "not_applied")
 
 
 class CoachError(Exception):
@@ -455,6 +457,36 @@ def is_uuid(ref: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}", ref))
 
 
+def carried_items(job: str, items: list[str]) -> list[dict]:
+    """`--carried REF:HOW` items as the API takes them, with full references.
+    Short forms are read against the job: f2 is this job's feedback, #3/f1 an
+    earlier job's, g1 the workflow's guidance."""
+    job_ref = re.fullmatch(r"([^#/\s]+)#\d+", job)
+    carried, seen = [], set()
+    for item in items:
+        ref, sep, how = item.rpartition(":")
+        ref, how = ref.strip(), how.strip().lower().replace("-", "_")
+        if not sep or not ref or how not in CARRY_HOWS:
+            raise CoachError(f"--carried takes REF:HOW, with HOW one of {', '.join(CARRY_HOWS)}; "
+                             f"not {item!r}.", EXIT_USAGE)
+        if re.fullmatch(r"[^#/\s]+#\d+/f\d+|[^#/\s]+/g\d+", ref):
+            full = ref
+        elif re.fullmatch(r"f\d+|#\d+/f\d+|g\d+", ref):
+            if not job_ref:
+                raise CoachError(f"Name {ref!r} in full (like weekly-note#3/f2 or weekly-note/g1) "
+                                 "when the job is given by id.", EXIT_USAGE)
+            slug = job_ref.group(1)
+            full = {"f": f"{job}/{ref}", "#": f"{slug}{ref}", "g": f"{slug}/{ref}"}[ref[0]]
+        else:
+            raise CoachError(f"--carried names feedback (f2, #3/f1 or weekly-note#3/f2) or guidance "
+                             f"(g1 or weekly-note/g1); not {ref!r}.", EXIT_USAGE)
+        if full in seen:
+            raise CoachError(f"--carried names {full} twice.", EXIT_USAGE)
+        seen.add(full)
+        carried.append({"ref": full, "how": how})
+    return carried
+
+
 def put_file(url: str, data: bytes, headers: dict, sleep=time.sleep) -> None:
     """PUT the bytes to the presigned link with exactly its headers (no API key)."""
     opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_ssl_context()))
@@ -672,6 +704,8 @@ def cmd_save_output(api: Api, args) -> int:
         payload["source_output"] = op_payload["source_output"] = args.revises
     if args.carry_note:
         payload["carry_note"] = op_payload["carry_note"] = args.carry_note
+    if args.carried:
+        payload["carried"] = op_payload["carried"] = carried_items(args.job, args.carried)
     live = None
     if args.context_etag:
         payload["context_etag"] = op_payload["context_etag"] = args.context_etag
@@ -855,6 +889,20 @@ def cmd_close_job(api: Api, args) -> int:
     return report(args, tag, what, data, op)
 
 
+def cmd_verdict(api: Api, args) -> int:
+    """The person's verdict on a job's version against the last job's, open or closed."""
+    verdict = {"verdict": args.verdict}
+    if args.said:
+        verdict["note"] = args.said
+    if args.candidate:
+        verdict["candidate"] = args.candidate
+    if args.baseline:
+        verdict["baseline"] = args.baseline
+    tag, data, op = write(api, args, "POST", f"{COACH}/jobs/{seg(args.job)}/verdicts",
+                          "record_verdict", verdict)
+    return report(args, tag, f"verdict on {args.job}: {args.verdict}", data, op)
+
+
 def cmd_compare(api: Api, args) -> int:
     left, right = args.left, args.right
     if right is None:
@@ -970,6 +1018,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--caption")
     p.add_argument("--revises", help="the version this one revises, like weekly-note#4/v1")
     p.add_argument("--carry-note", help="what you kept from approvals and which feedback you applied")
+    p.add_argument("--carried", action="append", default=[], metavar="REF:HOW",
+                   help="feedback or guidance this version carried, and how (kept, adapted, applied "
+                        "or not_applied), like g1:applied or #3/f2:kept; repeat it for each item")
     p.add_argument("--context-etag")
     p = sub.add_parser("add-feedback", help="record the person's feedback, word for word")
     p.add_argument("output")
@@ -1015,8 +1066,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("close-job", help="close a job with the version used and the person's verdict")
     p.add_argument("job")
     p.add_argument("--used", help="the version the person used, like weekly-note#4/v2")
-    p.add_argument("--verdict", choices=["better", "same", "worse"])
+    p.add_argument("--verdict", choices=VERDICTS)
     p.add_argument("--note")
+    p = sub.add_parser("verdict", help="record the person's verdict after a comparison (open or closed job)")
+    p.add_argument("job")
+    p.add_argument("--verdict", required=True, choices=VERDICTS)
+    p.add_argument("--said", "--note", dest="said", help="the person's own words")
+    p.add_argument("--candidate", help="the version judged, like weekly-note#4/v1 (default: the version "
+                                       "used, else the latest)")
+    p.add_argument("--baseline", help="the version it was judged against (default: the last job's latest)")
     p = sub.add_parser("compare", help="compare a job's latest version with the last job's, or two versions")
     p.add_argument("left")
     p.add_argument("right", nargs="?")
@@ -1039,7 +1097,7 @@ COMMANDS = {
     "retract-feedback": cmd_retract_feedback, "rescope": cmd_rescope,
     "edit-guidance": cmd_edit_guidance, "retire-guidance": cmd_retire_guidance,
     "import-guidance": cmd_import_guidance, "set-effort": cmd_set_effort,
-    "close-job": cmd_close_job, "compare": cmd_compare, "history": cmd_history,
+    "close-job": cmd_close_job, "verdict": cmd_verdict, "compare": cmd_compare, "history": cmd_history,
     "export": cmd_export, "delete-workflow": cmd_delete_workflow,
 }
 

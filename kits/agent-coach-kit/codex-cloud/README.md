@@ -52,10 +52,11 @@ If your environment limits internet access to a list of domains, include `api.co
 
 Ask Codex something like: "Start a new job for my weekly-note workflow: this week's update on the onboarding release."
 
-- It proposes the job's objective from your goal and recent jobs, and asks only about what changed.
+- It proposes the job's objective in one line, from your goal and recent jobs, and asks only about what changed. For a new workflow it does the same with the goal.
 - It writes the draft with your guidance and approved examples, saves it as a version, and shows it to you.
 - You react in your own words. It saves your words on that version without asking, says whether it saved them for later jobs too or just this one, and you can change that.
-- It revises until you're happy, then closes the job with the version you used. If you compare with the last job, it records your verdict (better, same or worse); it never picks one for you.
+- Each revision says which guidance and feedback it applied, kept or adapted; what it applied or kept stops showing as still needing attention.
+- It revises until you're happy, then closes the job with the version you used. If you compare with the last job, it records your verdict (better, same or worse) in your words as soon as you give it; it never picks one for you.
 
 Next week, in a fresh task, the reusable feedback comes back on its own; one-off requests stay with the job they were about.
 
@@ -74,12 +75,14 @@ Run them as `python3 .agents/skills/contextstream-coach/scripts/coach.py ...`. `
 | `save-output JOB --file PATH` | saves a text draft as a new version (stdin without `--file`) |
 | `save-output JOB --url https://... [--file PATH]` | saves a link, with an optional text snapshot |
 | `save-output JOB --media PATH` | saves an image, audio, video or document |
+| `save-output ... --carried g1:applied --carried f2:kept` | says which guidance (`g1`) or feedback (`f2` this job's, `#3/f1` an earlier job's) the version carried, and how: kept, adapted, applied or not_applied |
 | `add-feedback VERSION --kind correction\|approval\|direction --scope reusable\|this-job --text "..." [--reading "..."]` | records your words verbatim, with the agent's reading kept apart; also `--excerpt`, `--from 0:34 --to 0:41`, `--repeat-of GUIDANCE`, `--picked` |
 | `rescope FEEDBACK --scope this-job\|reusable` | changes whether feedback reaches later jobs |
 | `retract-feedback FEEDBACK` | takes feedback back |
 | `set-effort WORKFLOW\|JOB --effort quick\|explore\|clear --said "..."` | the coaching effort you asked for, in your words |
 | `close-job JOB --used VERSION [--verdict better\|same\|worse --note "..."]` | closes a job with the version you used and your verdict |
 | `compare JOB` | this job's latest version next to the last job's |
+| `verdict JOB --verdict better\|same\|worse --said "..." [--candidate VERSION]` | records your verdict on the comparison, in your words, before or after the job is closed |
 | `refine-goal WORKFLOW --goal --reason` | a new goal version |
 | `edit-guidance GUIDANCE --text "..." [--applies-when "..."]` | edits guidance or limits where it applies |
 | `retire-guidance GUIDANCE [--remove\|--restore]` | retires, removes or restores guidance |

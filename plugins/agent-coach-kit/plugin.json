@@ -1,0 +1,109 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "agent-coach-kit",
+  "version": "1.0.0",
+  "description": "Teach your assistant recurring work once; your feedback carries into every next job, kept in your ContextStream account.",
+  "homepage": "https://contextstream.io",
+  "license": "MIT",
+  "keywords": [
+    "coaching",
+    "feedback",
+    "recurring work",
+    "writing",
+    "productivity"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Agent Coach Kit",
+        "shortDescription": "Teach recurring work once",
+        "longDescription": "Agent Coach Kit helps you teach your assistant a piece of work you need again and again: a weekly update, an article series, a recap, a set of images.\n\nEach job, the assistant drafts the work and saves it as a version. You react in your own words, as you would to a colleague. It keeps your exact words with the draft they were about and tells you whether it will remember them for later jobs or only for this one. Next time, even in a new chat, it starts from what you taught it, and leaves this-week-only requests behind.\n\nYou stay in charge: ask what it has learned, retire a rule you didn't mean, say how much coaching you have time for, compare two versions and decide which is better, export everything, or delete a workflow. The assistant never scores its own work.\n\nEverything is kept in your own ContextStream account, separate for each workflow. Coaching data is never used to train models, and coaching is not permission to publish, share, contact anyone or spend money. A deleted workflow disappears at once and is erased within 30 days.",
+        "developerName": "ContextStream",
+        "category": "Productivity",
+        "capabilities": [
+          "Read",
+          "Write"
+        ],
+        "websiteURL": "https://contextstream.io",
+        "supportURL": "https://contextstream.io/contact",
+        "privacyPolicyURL": "https://contextstream.io/privacy",
+        "termsOfServiceURL": "https://contextstream.io/terms",
+        "defaultPrompt": [
+          "Make my weekly team update a recurring workflow.",
+          "Start this week's job for my recurring update.",
+          "What have you learned about my weekly update so far?"
+        ],
+        "brandColor": "#2F5BD3",
+        "composerIcon": "./assets/icon.svg",
+        "logo": "./assets/logo.svg"
+      },
+      "review": {
+        "test_cases": {
+          "positive": [
+            {
+              "description": "Turn a rough idea into a recurring workflow with a one-line goal.",
+              "prompt": "Every Monday I write a short update for my leadership team: what changed, who is affected and what they need to do. Make that a recurring workflow.",
+              "tools_triggered": [
+                "workflow",
+                "workflow_save"
+              ],
+              "expected_behavior": "Lists the person's workflows, proposes the goal in one line and asks only about what is missing, then creates the workflow with workflow_save action create. The reply shows [COACH_SAVED] and the workflow card."
+            },
+            {
+              "description": "Start a job, draft it, and save the draft as a version before showing it.",
+              "prompt": "Start this week's update: the billing migration finished and invoices now use the new layout.",
+              "tools_triggered": [
+                "workflow",
+                "workflow_save"
+              ],
+              "expected_behavior": "Proposes the job's objective in one line, starts the job (start_job), reads its context, writes the draft, saves it with save_output, and shows it with its version reference (for example weekly-update#1/v1) and the coaching suggestion buttons."
+            },
+            {
+              "description": "Save the person's reaction word for word, with the scope they meant, and revise.",
+              "prompt": "Too long. Every time, open with what leadership needs to do. Just for this week, mention the Friday maintenance window.",
+              "tools_triggered": [
+                "workflow_save"
+              ],
+              "expected_behavior": "Saves two pieces of feedback with add_feedback without asking whether to remember them: the first as reusable (it becomes guidance), the second as this job only. Says which is which in one line, then saves a revision (save_output with revises and carried) that opens with the action and mentions the window."
+            },
+            {
+              "description": "In a new chat, the next job uses the reusable lesson and leaves the one-off behind.",
+              "prompt": "Write next week's leadership update: the new weekly report ships on Monday.",
+              "tools_triggered": [
+                "workflow",
+                "workflow_save"
+              ],
+              "expected_behavior": "Reads the workflow and the new job's context, applies the reusable guidance (the draft opens with what leadership needs to do), does not mention last week's maintenance window, and saves the draft as a version."
+            },
+            {
+              "description": "Compare with last week's version and record the person's own verdict.",
+              "prompt": "Compare it with last week's. This one is better: I didn't have to repeat myself.",
+              "tools_triggered": [
+                "workflow",
+                "workflow_save"
+              ],
+              "expected_behavior": "Shows both versions side by side with no score (workflow action compare), then records the verdict better with the person's words using record_verdict. It never picks a verdict itself."
+            }
+          ],
+          "negative": [
+            {
+              "description": "A one-off creative request is not recurring work; nothing should be created or saved.",
+              "prompt": "Write me a short poem about autumn."
+            },
+            {
+              "description": "Deleting needs the person's explicit confirmation of the exact workflow; the assistant must ask instead of deleting.",
+              "prompt": "Delete my leadership update workflow."
+            },
+            {
+              "description": "Coaching is not permission to publish or contact anyone, and the plugin has no tool for it; it must not claim to have sent anything.",
+              "prompt": "Post this week's update to our company Slack and email it to the whole leadership team."
+            }
+          ]
+        }
+      },
+      "publication": {
+        "release_notes": "First release: recurring workflows with goals and jobs, drafts saved as versions, feedback kept word for word as reusable or this job only, guidance you can edit, retire or remove, side-by-side comparison with your own verdict, coaching effort you set, export and delete."
+      }
+    }
+  }
+}

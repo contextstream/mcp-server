@@ -34,3 +34,6 @@ __pycache__/
 *.pyc
 *.log
 *.bak
+
+# Built plugin packages (plugins/build_agent_coach_kit.py)
+/dist/

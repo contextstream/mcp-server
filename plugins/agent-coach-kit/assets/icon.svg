@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Agent Coach Kit">
+  <rect width="512" height="512" rx="112" fill="#2F5BD3"/>
+  <path d="M128 136h256a32 32 0 0 1 32 32v148a32 32 0 0 1-32 32H240l-72 60v-60h-40a32 32 0 0 1-32-32V168a32 32 0 0 1 32-32z" fill="#FFFFFF"/>
+  <path d="M196 244l40 40 84-88" fill="none" stroke="#2F5BD3" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

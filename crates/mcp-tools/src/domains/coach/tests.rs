@@ -1481,6 +1481,63 @@ async fn compare_shows_both_versions_without_a_score() {
 }
 
 #[tokio::test]
+async fn compare_labels_this_job_only_feedback_so_it_is_not_reused() {
+    let stub = Stub::start(Arc::new(api)).await;
+    let result = stub
+        .coach()
+        .read(serde_json::from_value(json!({"action": "compare", "ref": "weekly-note#4"})).unwrap())
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    // Both versions carried weekly-note#4/f1, which the API says is this job only.
+    assert_eq!(
+        text.matches("Applied weekly-note#4/f1: shorter (this job only; not for later jobs)")
+            .count(),
+        2,
+        "{text}"
+    );
+    let card = result.structured_content.clone().unwrap();
+    assert_eq!(card["compare"]["left"]["changed"][0]["job_only"], true);
+    assert_eq!(card["compare"]["right"]["changed"][0]["job_only"], true);
+    // One read per carried feedback item, shared by both sides.
+    let reads = stub
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "GET" && request.path == "/feedback/weekly-note#4/f1")
+        .count();
+    assert_eq!(reads, 1);
+}
+
+#[tokio::test]
+async fn compare_never_guesses_a_scope_it_could_not_read() {
+    let stub = Stub::start(Arc::new(|request: &Recorded, index: usize| {
+        if request.method == "GET" && request.path == "/feedback/weekly-note#4/f1" {
+            return Answer::error(503, "unavailable", "try again", Value::Null);
+        }
+        api(request, index)
+    }))
+    .await;
+    let result = stub
+        .coach()
+        .read(serde_json::from_value(json!({"action": "compare", "ref": "weekly-note#4"})).unwrap())
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    assert!(
+        text.contains("Applied weekly-note#4/f1: shorter (scope not checked; ask the person before reusing it)"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("this job only; not for later jobs"),
+        "{text}"
+    );
+    let card = result.structured_content.clone().unwrap();
+    assert!(card["compare"]["left"]["changed"][0]
+        .get("job_only")
+        .is_none());
+}
+
+#[tokio::test]
 async fn guidance_shows_the_persons_words_apart_from_its_text() {
     let stub = Stub::start(Arc::new(api)).await;
     let result = stub

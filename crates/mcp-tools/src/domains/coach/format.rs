@@ -483,14 +483,63 @@ pub(crate) fn carried_line(item: &CarriedView) -> String {
     line
 }
 
+/// Marks a one-off in a comparison, so an agent never applies an earlier job's
+/// this-job-only feedback to a later job.
+pub(crate) const JOB_ONLY_TAG: &str = "(this job only; not for later jobs)";
+/// Marks carried feedback whose scope could not be read back.
+pub(crate) const UNCHECKED_SCOPE_TAG: &str =
+    "(scope not checked; ask the person before reusing it)";
+
+/// What a comparison knows about the scope of the feedback its versions carried.
+#[derive(Debug, Default)]
+pub(crate) struct CarriedScopes {
+    /// Feedback refs kept for their own job only.
+    pub job_only: std::collections::HashSet<String>,
+    /// Feedback refs whose scope could not be read.
+    pub unchecked: std::collections::HashSet<String>,
+}
+
+impl CarriedScopes {
+    pub(crate) fn tag(&self, item: &CarriedView) -> Option<&'static str> {
+        let reference = item.reference.as_deref()?;
+        if item.kind != "feedback" {
+            return None;
+        }
+        if self.job_only.contains(reference) {
+            Some(JOB_ONLY_TAG)
+        } else if self.unchecked.contains(reference) {
+            Some(UNCHECKED_SCOPE_TAG)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn is_job_only(&self, item: &CarriedView) -> bool {
+        self.tag(item) == Some(JOB_ONLY_TAG)
+    }
+}
+
 /// What changed in a version: the agent's carry note and carried items.
 pub(crate) fn changes_body(carry_note: Option<&str>, carried: &[CarriedView]) -> String {
+    changes_body_scoped(carry_note, carried, &CarriedScopes::default())
+}
+
+/// [`changes_body`], with each carried one-off labelled as such.
+pub(crate) fn changes_body_scoped(
+    carry_note: Option<&str>,
+    carried: &[CarriedView],
+    scopes: &CarriedScopes,
+) -> String {
     let mut text = String::new();
     if let Some(note) = carry_note.filter(|note| !note.trim().is_empty()) {
         text.push_str(&format!("Agent's note: {note}\n"));
     }
     for item in carried {
         text.push_str(&carried_line(item));
+        if let Some(tag) = scopes.tag(item) {
+            text.push(' ');
+            text.push_str(tag);
+        }
         text.push('\n');
         if let Some(words) = item
             .text

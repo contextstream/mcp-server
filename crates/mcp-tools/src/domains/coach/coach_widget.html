@@ -1,4 +1,5 @@
-<div id="coach-root" class="coach" role="region" aria-label="Agent Coach Kit"></div>
+<div id="coach-root" class="coach" role="region" aria-label="Agent Coach Kit" lang="en"></div>
+<div id="coach-live" class="coach-sr" role="status" aria-live="polite" aria-atomic="true"></div>
 <style>
   .coach {
     --bg: #ffffff;
@@ -11,9 +12,9 @@
     --good: #1d7a46;
     --warn: #9a5b00;
     --bad: #b3261e;
-    --focus: #f0a400;
+    --focus: #1a4fd6;
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    font-size: 17px;
+    font-size: 1.0625rem;
     line-height: 1.5;
     color: var(--text);
     background: var(--bg);
@@ -21,6 +22,7 @@
     padding: 16px;
     box-sizing: border-box;
     max-width: 100%;
+    overflow-wrap: anywhere;
   }
   .coach.dark {
     --bg: #17191d;
@@ -33,6 +35,7 @@
     --good: #6fd39a;
     --warn: #f0c060;
     --bad: #ff8a80;
+    --focus: #ffc94d;
   }
   @media (prefers-color-scheme: dark) {
     .coach:not(.light) {
@@ -46,6 +49,7 @@
       --good: #6fd39a;
       --warn: #f0c060;
       --bad: #ff8a80;
+      --focus: #ffc94d;
     }
   }
   .coach * { box-sizing: border-box; }
@@ -66,21 +70,27 @@
   .coach button {
     font: inherit; font-size: 0.95em; border-radius: 999px; padding: 8px 16px; cursor: pointer;
     border: 1px solid var(--line); background: var(--panel); color: var(--text); min-height: 44px;
+    max-width: 100%; white-space: normal; text-align: center; overflow-wrap: anywhere;
   }
   .coach button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
   .coach button:hover { filter: brightness(0.97); }
-  .coach button:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .coach :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .coach .text:focus-visible { outline-offset: -3px; }
   .coach .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 560px) { .coach .compare { grid-template-columns: 1fr; } }
   .coach .side h3 { margin-top: 4px; }
   .coach .said { border-left: 4px solid var(--accent); padding-left: 10px; white-space: pre-wrap; }
   .coach .reading { color: var(--muted); font-style: italic; }
   .coach .muted { color: var(--muted); }
+  .coach .tag { font-size: 0.85em; color: var(--warn); font-weight: 600; }
+  .coach-sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  @media (prefers-reduced-motion: reduce) { .coach *, .coach { transition: none !important; animation: none !important; scroll-behavior: auto !important; } }
 </style>
 <script>
 (function () {
   "use strict";
   var root = document.getElementById("coach-root");
+  var live = document.getElementById("coach-live");
 
   function el(tag, cls, text) {
     var node = document.createElement(tag);
@@ -119,9 +129,7 @@
   function stateBadge(state) {
     var label = STATES[state];
     if (!label) return null;
-    var node = el("span", "state " + state, label);
-    node.setAttribute("role", "status");
-    return node;
+    return el("span", "state " + state, label);
   }
 
   function section(parent, title) {
@@ -137,6 +145,12 @@
       add(parent, el("div", "label", "Coach's reading"));
       add(parent, el("p", "reading", reading));
     }
+  }
+
+  function changeItem(item) {
+    var li = el("li", "", item.how + " " + item.ref + (item.note ? ": " + item.note : ""));
+    if (item.job_only) add(li, el("span", "tag", " (this job only; not for later jobs)"));
+    return li;
   }
 
   function list(parent, items, render) {
@@ -184,7 +198,7 @@
       var changed = add(root, el("div", "panel"));
       if (data.carry_note) add(changed, el("p", "", data.carry_note));
       list(changed, data.changed, function (item) {
-        return el("li", "", item.how + " " + item.ref + (item.note ? ": " + item.note : ""));
+        return changeItem(item);
       });
     }
     if (data.feedback) {
@@ -211,6 +225,7 @@
 
   function renderSide(parent, side, label) {
     var box = add(parent, el("div", "panel side"));
+    box.setAttribute("role", "group");
     box.setAttribute("aria-label", label + ": " + side.ref);
     add(box, el("h3", "", label));
     add(box, el("div", "ref", side.ref + (side.job_ref ? "  ·  " + side.job_ref : "")));
@@ -219,9 +234,7 @@
     if (side.media) add(box, el("p", "muted", side.media));
     if (side.text) add(box, el("div", "text", side.text));
     if (side.carry_note) { add(box, el("div", "label", "Agent's note")); add(box, el("p", "", side.carry_note)); }
-    list(box, side.changed, function (item) {
-      return el("li", "", item.how + " " + item.ref + (item.note ? ": " + item.note : ""));
-    });
+    list(box, side.changed, changeItem);
     (side.feedback || []).forEach(function (item) {
       add(box, el("div", "ref", item.ref + " · " + item.kind + " · " + item.scope));
       words(box, item.you_said, item.reading);
@@ -233,9 +246,12 @@
     header(root, data);
     var cmp = data.compare;
     var grid = add(root, el("div", "compare"));
+    grid.setAttribute("role", "group");
+    grid.setAttribute("aria-label", "Two versions side by side");
     renderSide(grid, cmp.left, "Earlier");
     renderSide(grid, cmp.right, "Later");
     var picks = add(root, el("div", "actions"));
+    picks.setAttribute("role", "group");
     picks.setAttribute("aria-label", "Pick the better version");
     add(picks, button("I prefer " + cmp.left.ref, "I prefer " + cmp.left.ref + " over " + cmp.right.ref + ".", false));
     add(picks, button("I prefer " + cmp.right.ref, "I prefer " + cmp.right.ref + " over " + cmp.left.ref + ".", false));
@@ -267,11 +283,32 @@
     else renderCard(data);
     if (data.suggestions && data.suggestions.length) {
       var actions = add(root, el("div", "actions"));
+      actions.setAttribute("role", "group");
       actions.setAttribute("aria-label", "Coaching suggestions");
       data.suggestions.forEach(function (s, i) {
         add(actions, button(s.label, s.prompt, i === 0, s.label + ": starts this coaching step in the chat"));
       });
     }
+    focusableScrollers();
+    announce(data);
+  }
+
+  // A text panel that scrolls must be reachable by keyboard.
+  function focusableScrollers() {
+    Array.prototype.forEach.call(root.querySelectorAll(".text"), function (node) {
+      if (node.scrollHeight > node.clientHeight + 1) {
+        node.setAttribute("tabindex", "0");
+        node.setAttribute("role", "region");
+        node.setAttribute("aria-label", "Scrollable text");
+      }
+    });
+  }
+
+  // One persistent live region, so a re-render is announced once and reliably.
+  function announce(data) {
+    if (!live) return;
+    var said = [STATES[data.state] || "", data.message || ""].filter(Boolean).join(". ");
+    if (live.textContent !== said) live.textContent = said;
   }
 
   window.addEventListener("openai:set_globals", render, { passive: true });

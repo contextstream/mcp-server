@@ -54,11 +54,11 @@ use std::sync::Arc;
 
 use crate::registry::ToolHandler;
 use format::{
-    changes_body, effort_line, feedback_body, feedback_item, goal_body, guidance_body,
-    guidance_item, guidance_version_item, job_line, kind_label, media_line, open_items_body,
-    open_items_list, output_content, output_head, packet_feedback_item, packet_guidance_item,
-    packet_output_item, preview, recent_jobs_body, scope_label, status_line, verdict_line,
-    workflow_line, Out, SaveStatus, PREVIEW_CHARS,
+    changes_body, changes_body_scoped, effort_line, feedback_body, feedback_item, goal_body,
+    guidance_body, guidance_item, guidance_version_item, job_line, kind_label, media_line,
+    open_items_body, open_items_list, output_content, output_head, packet_feedback_item,
+    packet_guidance_item, packet_output_item, preview, recent_jobs_body, scope_label, status_line,
+    verdict_line, workflow_line, CarriedScopes, Out, SaveStatus, PREVIEW_CHARS,
 };
 use refs::RefKind;
 use widget::{
@@ -108,6 +108,8 @@ pub(crate) const DELETE_ACTIONS: &[&str] = &["delete"];
 const REPEATABLE_WINDOW_MINUTES: u64 = 10;
 const DEFAULT_LIMIT: i64 = 20;
 const MAX_LIMIT: i64 = 100;
+/// The most carried feedback items a comparison reads back to label one-offs.
+const MAX_SCOPE_LOOKUPS: usize = 12;
 const DEFAULT_PUBLIC_MCP_ORIGIN: &str = "https://mcp.contextstream.io";
 
 /// What a host connected to `/coach` is told at `initialize`.
@@ -797,6 +799,43 @@ impl Coach {
         }
     }
 
+    /// Reads back the scope of the feedback each compared version carried, so the
+    /// comparison can label one-offs. At most [`MAX_SCOPE_LOOKUPS`] reads.
+    async fn carried_scopes(&self, comparison: &Comparison) -> CarriedScopes {
+        let mut scopes = CarriedScopes::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for side in [&comparison.left, &comparison.right] {
+            let carried = if side.carried.is_empty() {
+                &side.output.carried
+            } else {
+                &side.carried
+            };
+            for item in carried.iter().filter(|item| item.kind == "feedback") {
+                if let Some(reference) = item.reference.as_deref() {
+                    seen.insert(reference.to_string());
+                }
+            }
+        }
+        for (index, reference) in seen.into_iter().enumerate() {
+            if index >= MAX_SCOPE_LOOKUPS {
+                scopes.unchecked.insert(reference);
+                continue;
+            }
+            match self.send(&CoachRequest::get_feedback(&reference)).await {
+                Ok(response) => {
+                    let feedback: FeedbackView = response.view();
+                    if feedback.scope == "job" {
+                        scopes.job_only.insert(reference);
+                    }
+                }
+                Err(_) => {
+                    scopes.unchecked.insert(reference);
+                }
+            }
+        }
+        scopes
+    }
+
     fn card_changes(output: &OutputView) -> Vec<CardChange> {
         output
             .carried
@@ -805,6 +844,7 @@ impl Coach {
                 how: item.how.replace('_', " "),
                 reference: item.reference.clone().unwrap_or_else(|| item.kind.clone()),
                 note: item.note.clone(),
+                job_only: false,
             })
             .collect()
     }
@@ -1509,7 +1549,8 @@ impl Coach {
             match self.send(&CoachRequest::compare(&left, &right)).await {
                 Ok(response) => {
                     let comparison: Comparison = response.view();
-                    render_comparison(&comparison, &left, &right)
+                    let scopes = self.carried_scopes(&comparison).await;
+                    render_comparison(&comparison, &left, &right, &scopes)
                 }
                 Err(failure) => self.read_failure(failure, &format!("{left} and {right}")),
             },
@@ -2973,7 +3014,11 @@ fn render_packet(packet: &ContextPacket) -> (String, Card) {
     (out.finish(), card)
 }
 
-fn compare_side(side: &mcp_client::coach::ComparedView, fallback: &str) -> (String, CompareSide) {
+fn compare_side(
+    side: &mcp_client::coach::ComparedView,
+    fallback: &str,
+    scopes: &CarriedScopes,
+) -> (String, CompareSide) {
     let output = &side.output;
     let reference = if output.reference.is_empty() {
         fallback.to_string()
@@ -3019,7 +3064,7 @@ fn compare_side(side: &mcp_client::coach::ComparedView, fallback: &str) -> (Stri
     } else {
         &side.carried
     };
-    let changes = changes_body(output.carry_note.as_deref(), carried);
+    let changes = changes_body_scoped(output.carry_note.as_deref(), carried, scopes);
     if !changes.is_empty() {
         text.push_str("What changed:\n");
         text.push_str(&changes);
@@ -3043,6 +3088,7 @@ fn compare_side(side: &mcp_client::coach::ComparedView, fallback: &str) -> (Stri
                 how: item.how.replace('_', " "),
                 reference: item.reference.clone().unwrap_or_else(|| item.kind.clone()),
                 note: item.note.clone(),
+                job_only: scopes.is_job_only(item),
             })
             .collect(),
         feedback: side
@@ -3054,9 +3100,14 @@ fn compare_side(side: &mcp_client::coach::ComparedView, fallback: &str) -> (Stri
     (text, card)
 }
 
-fn render_comparison(comparison: &Comparison, left_ref: &str, right_ref: &str) -> Reply {
-    let (left_text, left) = compare_side(&comparison.left, left_ref);
-    let (right_text, right) = compare_side(&comparison.right, right_ref);
+fn render_comparison(
+    comparison: &Comparison,
+    left_ref: &str,
+    right_ref: &str,
+    scopes: &CarriedScopes,
+) -> Reply {
+    let (left_text, left) = compare_side(&comparison.left, left_ref, scopes);
+    let (right_text, right) = compare_side(&comparison.right, right_ref, scopes);
     let mut out = Out::new();
     out.line(format!(
         "{} and {} side by side (no score; the person judges):",

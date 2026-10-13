@@ -148,6 +148,9 @@ pub(crate) struct CardChange {
     pub reference: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Feedback kept for its own job only: never something a later job applies.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub job_only: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -316,12 +319,86 @@ mod tests {
         assert!(html.contains("aria-label"));
         assert!(html.contains("prefers-color-scheme: dark"));
         assert!(html.contains("max-width: 560px"));
+        // WCAG 2.1 AA for an inline card.
+        assert!(html.contains(r#"lang="en""#));
+        assert!(
+            html.contains(r#"role="status" aria-live="polite""#),
+            "one persistent live region announces saves"
+        );
+        assert!(
+            html.contains("font-size: 1.0625rem"),
+            "relative base size, 17px by default"
+        );
+        assert!(html.contains("prefers-reduced-motion: reduce"));
+        assert!(
+            html.contains("overflow-wrap: anywhere"),
+            "nothing scrolls sideways at 320px"
+        );
+        assert!(html.contains("min-height: 44px"), "touch targets");
+        assert!(
+            html.contains(r#"setAttribute("tabindex", "0")"#),
+            "scrolling text takes focus"
+        );
+        assert!(html.contains(r#"setAttribute("role", "group")"#));
+        assert!(html.contains("(this job only; not for later jobs)"));
+        assert!(!html.contains("<div onclick"), "only real buttons act");
         // Data is placed with textContent, never parsed as HTML.
         assert!(!html.contains("innerHTML"));
         assert!(
             !html.contains("callTool"),
             "the widget never saves anything itself"
         );
+    }
+
+    /// The colour variables of one palette block (`.coach {` or `.coach.dark {`).
+    fn palette(block: &str) -> std::collections::HashMap<String, String> {
+        let html = widget_html();
+        let start = html.find(block).expect("palette block");
+        let end = start + html[start..].find('}').expect("block end");
+        html[start..end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim().trim_end_matches(';');
+                let (name, value) = line.split_once(':')?;
+                let value = value.trim();
+                (name.starts_with("--") && value.starts_with('#'))
+                    .then(|| (name.trim().to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    fn luminance(hex: &str) -> f64 {
+        let channel = |i: usize| {
+            let v = u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5)
+    }
+
+    fn contrast(a: &str, b: &str) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn both_palettes_meet_wcag_aa_contrast() {
+        for block in [".coach {", ".coach.dark {"] {
+            let p = palette(block);
+            for text in ["--text", "--muted", "--good", "--warn", "--bad"] {
+                for surface in ["--bg", "--panel"] {
+                    let ratio = contrast(&p[text], &p[surface]);
+                    assert!(ratio >= 4.5, "{block} {text} on {surface}: {ratio:.2}");
+                }
+            }
+            let button = contrast(&p["--accent-text"], &p["--accent"]);
+            assert!(button >= 4.5, "{block} primary button text: {button:.2}");
+            let focus = contrast(&p["--focus"], &p["--bg"]);
+            assert!(focus >= 3.0, "{block} focus ring: {focus:.2}");
+        }
     }
 
     #[test]

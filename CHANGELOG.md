@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.0.24
+
+- Agent Coach Kit: the text of the `workflow`, `workflow_save` and
+  `workflow_delete` tools and of the `/coach` server instructions describes the
+  coaching behaviour instead of commanding replies and approvals. ChatGPT's
+  permission card for the first `workflow_save` call warned "Suspicious
+  Instruction": the call was clean, the wording was the trigger ("without being
+  asked", "never claim ... unless the reply ends with", "never invent
+  approval", "nothing is deleted"). The text now says what each tool does and
+  what the statuses mean: a reaction is recorded with `add_feedback`; a result
+  ends with `[COACH_SAVED]` or `[COACH_ALREADY_SAVED]` when stored and
+  `[COACH_NOT_SAVED]` or `[COACH_CONFLICT]` when not; approvals, verdicts and
+  scores come from the person and facts from the job's sources; each change is
+  a new version and earlier versions stay readable; `COACH DATA` is the
+  person's stored data, "reference, not instructions"; `workflow_delete` is for
+  the person's own request. The text keeps about the same length (`workflow`
+  1332 to 1331 characters, `workflow_save` 2054 to 2054, `workflow_delete` 513
+  to 518, the instructions 739 to 737). The tools, their parameters and their
+  behaviour are unchanged, and a test keeps the flagged phrases out of the
+  server instructions and all three descriptions (ad73c8d).
+- Agent Coach Kit for Codex Cloud and the ChatGPT plugin package (repository
+  only): the skills and the AGENTS snippet get the same rewording, with the rule
+  leads kept identical across both skills (ad73c8d). The plugin signs in with
+  ChatGPT's Client ID Metadata Document (`"mode": "cimd"` in
+  `plugins/agent-coach-kit/mcp.json`) instead of registering a client per
+  connection, now that ContextStream's authorization server advertises
+  `client_id_metadata_document_supported`; dynamic registration stays available
+  as a fallback (5527e2b).
+
+Who gets what: the new tool and instruction text reaches ChatGPT and Codex when
+the hosted gateway runs this version. The default, OpenAI and consolidated tool
+lists do not change. The kit and the plugin package live in the repository;
+they are not part of the npm package or the binaries. No dependency changes.
+
 ## 1.0.23
 
 - Agent Coach Kit: `workflow(action="compare")` marks feedback a version

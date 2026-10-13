@@ -324,6 +324,10 @@ pub enum ToolSurfaceProfile {
     Default,
     /// OpenAI/GPT agentic mode with a compact default tool surface and discovery meta-tools.
     OpenaiAgentic,
+    /// Agent Coach Kit: only the three coaching tools (`workflow`,
+    /// `workflow_save`, `workflow_delete`). Served at `/coach`; a server
+    /// configured with it stays coach-only whatever a client asks for.
+    Coach,
 }
 
 impl FromStr for ToolSurfaceProfile {
@@ -333,6 +337,7 @@ impl FromStr for ToolSurfaceProfile {
         match s.trim().to_ascii_lowercase().as_str() {
             "default" | "standard" | "full" => Ok(Self::Default),
             "openai" | "openai_agentic" | "agentic" | "agentic_openai" => Ok(Self::OpenaiAgentic),
+            "coach" | "agent_coach_kit" => Ok(Self::Coach),
             _ => Err(()),
         }
     }
@@ -343,6 +348,7 @@ impl ToolSurfaceProfile {
         match self {
             Self::Default => "default",
             Self::OpenaiAgentic => "openai_agentic",
+            Self::Coach => "coach",
         }
     }
 }

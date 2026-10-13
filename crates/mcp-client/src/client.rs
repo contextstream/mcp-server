@@ -1082,6 +1082,15 @@ use uuid::Uuid;
 use crate::cache::{create_global_cache, ttl, CacheKey, GlobalCache};
 use crate::retry::{is_retryable_status, RetryConfig};
 
+/// One API response as sent: status, headers and the JSON body (a string
+/// when the body was not JSON, `null` when it was empty).
+#[derive(Debug, Clone)]
+pub struct RawJsonResponse {
+    pub status: u16,
+    pub headers: reqwest::header::HeaderMap,
+    pub body: serde_json::Value,
+}
+
 /// Paginated API response wrapper.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaginatedResponse<T> {
@@ -3666,6 +3675,102 @@ impl ContextStreamClient {
             .text()
             .await
             .map_err(|e| Error::Network(e.to_string()))
+    }
+
+    /// Send exactly one request and hand back its status, headers and JSON
+    /// body whatever the status. Only a connection failure or a timeout is an
+    /// error; retries and error mapping are the caller's (the coach client
+    /// needs the replay header, the stable error code and any
+    /// authentication challenge, which `request` folds away). No workspace
+    /// header is inferred.
+    pub(crate) async fn send_raw_json(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<RawJsonResponse> {
+        let config = self.config().await;
+        let task_auth = get_task_auth_override();
+        let auth: Option<&AuthOverride> = task_auth.as_ref();
+
+        let api_path = if path.starts_with("/api/") {
+            path.to_string()
+        } else {
+            format!("/api/v1{}", path)
+        };
+        let url = format!("{}{}", config.api_url.trim_end_matches('/'), api_path);
+
+        let mut req = match method {
+            "GET" => self.http.get(&url),
+            "POST" => self.http.post(&url),
+            "PUT" => self.http.put(&url),
+            "DELETE" => self.http.delete(&url),
+            "PATCH" => self.http.patch(&url),
+            _ => {
+                return Err(Error::Validation(format!(
+                    "Invalid HTTP method: {}",
+                    method
+                )))
+            }
+        };
+        req = req.header("Accept", "application/json");
+        req = req.header("User-Agent", &config.user_agent);
+        if let Some(key) = auth
+            .and_then(|a| a.api_key.as_ref())
+            .or(config.api_key.as_ref())
+        {
+            req = req.header("X-API-Key", key);
+        } else if let Some(jwt) = auth.and_then(|a| a.jwt.as_ref()).or(config.jwt.as_ref()) {
+            req = req.header("Authorization", format!("Bearer {}", jwt));
+        }
+        if let Some(traffic_class) = auth.and_then(|value| value.traffic_class) {
+            req = req.header(TrafficClass::HEADER_NAME, traffic_class.as_header_value());
+        }
+        if let Some(client) = auth.and_then(|value| value.client) {
+            req = req.header(CLIENT_HEADER, client.as_str());
+        }
+        req = with_edge_geography_headers(req);
+        if let Some(model_id) = get_task_model_id() {
+            req = req.header("X-ContextStream-Model", model_id);
+        }
+        if !config.is_http_transport {
+            for (key, value) in crate::activation::runtime_headers() {
+                req = req.header(key, value);
+            }
+        }
+        if let Some(body) = body {
+            req = req.json(body);
+        }
+
+        let response = req.timeout(timeout).send().await.map_err(|e| {
+            if e.is_timeout() {
+                Error::Timeout(timeout.as_secs())
+            } else if e.is_connect() {
+                Error::Network(format!("Connection failed: {}", e))
+            } else {
+                Error::Network(e.to_string())
+            }
+        })?;
+        observe_tenant_home_header(response.headers());
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Error::Network(e.to_string()))?;
+        let body = if bytes.iter().all(u8::is_ascii_whitespace) {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+            })
+        };
+        Ok(RawJsonResponse {
+            status,
+            headers,
+            body,
+        })
     }
 
     /// Parse a successful response.

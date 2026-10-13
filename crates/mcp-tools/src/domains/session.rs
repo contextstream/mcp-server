@@ -4467,6 +4467,7 @@ fn estimated_context_tool_wire_tokens_with_optional(
         content: vec![ContentItem::text(text)],
         structured_content: structured.cloned(),
         is_error: false,
+        meta: None,
     };
     let context = crate::wire_tokens::current_wire_response_context();
     crate::wire_tokens::canonical_tool_result_bytes(&result, &context)

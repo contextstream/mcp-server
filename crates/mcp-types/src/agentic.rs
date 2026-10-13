@@ -81,12 +81,15 @@ pub const META_RUNTIME_ID: &str = "runtime_id";
 pub const SURFACE_BROAD_DEFAULT: &str = "broad_default_surface";
 /// Analytics label for the compact OpenAI-oriented surface.
 pub const SURFACE_ADAPTIVE_OPENAI: &str = "adaptive_openai_surface";
+/// Analytics label for the Agent Coach Kit surface (`/coach`).
+pub const SURFACE_COACH: &str = "coach_surface";
 
 /// Normalize the configured tool surface to the analytics label.
 pub fn analytics_surface_profile(profile: ToolSurfaceProfile) -> &'static str {
     match profile {
         ToolSurfaceProfile::Default => SURFACE_BROAD_DEFAULT,
         ToolSurfaceProfile::OpenaiAgentic => SURFACE_ADAPTIVE_OPENAI,
+        ToolSurfaceProfile::Coach => SURFACE_COACH,
     }
 }
 

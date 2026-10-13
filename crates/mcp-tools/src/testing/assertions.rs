@@ -219,6 +219,7 @@ pub fn structured_result(text: &str, structured: Value) -> ToolResult {
         }],
         is_error: false,
         structured_content: Some(structured),
+        meta: None,
     }
 }
 

@@ -1,0 +1,280 @@
+<div id="coach-root" class="coach" role="region" aria-label="Agent Coach Kit"></div>
+<style>
+  .coach {
+    --bg: #ffffff;
+    --panel: #f6f7f9;
+    --text: #16181d;
+    --muted: #5b6270;
+    --line: #e2e5ea;
+    --accent: #2f5bd3;
+    --accent-text: #ffffff;
+    --good: #1d7a46;
+    --warn: #9a5b00;
+    --bad: #b3261e;
+    --focus: #f0a400;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 17px;
+    line-height: 1.5;
+    color: var(--text);
+    background: var(--bg);
+    border-radius: 18px;
+    padding: 16px;
+    box-sizing: border-box;
+    max-width: 100%;
+  }
+  .coach.dark {
+    --bg: #17191d;
+    --panel: #22252b;
+    --text: #eef0f3;
+    --muted: #a5acb8;
+    --line: #343843;
+    --accent: #8fb0ff;
+    --accent-text: #0f1a33;
+    --good: #6fd39a;
+    --warn: #f0c060;
+    --bad: #ff8a80;
+  }
+  @media (prefers-color-scheme: dark) {
+    .coach:not(.light) {
+      --bg: #17191d;
+      --panel: #22252b;
+      --text: #eef0f3;
+      --muted: #a5acb8;
+      --line: #343843;
+      --accent: #8fb0ff;
+      --accent-text: #0f1a33;
+      --good: #6fd39a;
+      --warn: #f0c060;
+      --bad: #ff8a80;
+    }
+  }
+  .coach * { box-sizing: border-box; }
+  .coach h2 { font-size: 1.15em; margin: 0 0 4px; }
+  .coach h3 { font-size: 1em; margin: 14px 0 6px; color: var(--muted); font-weight: 600; }
+  .coach p { margin: 4px 0; }
+  .coach .ref { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.9em; color: var(--muted); }
+  .coach .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; margin: 8px 0; }
+  .coach .text { white-space: pre-wrap; word-break: break-word; max-height: 22em; overflow: auto; }
+  .coach .state { display: inline-block; border-radius: 999px; padding: 2px 12px; font-size: 0.85em; font-weight: 600; border: 1px solid currentColor; }
+  .coach .state.saved, .coach .state.already_saved { color: var(--good); }
+  .coach .state.pending, .coach .state.conflict { color: var(--warn); }
+  .coach .state.failed { color: var(--bad); }
+  .coach .label { font-size: 0.85em; color: var(--muted); font-weight: 600; text-transform: none; }
+  .coach ul { margin: 4px 0; padding-left: 1.2em; }
+  .coach li { margin: 3px 0; }
+  .coach .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .coach button {
+    font: inherit; font-size: 0.95em; border-radius: 999px; padding: 8px 16px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel); color: var(--text); min-height: 44px;
+  }
+  .coach button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  .coach button:hover { filter: brightness(0.97); }
+  .coach button:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .coach .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 560px) { .coach .compare { grid-template-columns: 1fr; } }
+  .coach .side h3 { margin-top: 4px; }
+  .coach .said { border-left: 4px solid var(--accent); padding-left: 10px; white-space: pre-wrap; }
+  .coach .reading { color: var(--muted); font-style: italic; }
+  .coach .muted { color: var(--muted); }
+</style>
+<script>
+(function () {
+  "use strict";
+  var root = document.getElementById("coach-root");
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  function add(parent, child) { if (child) parent.appendChild(child); return child; }
+
+  function send(prompt) {
+    try {
+      if (window.openai && typeof window.openai.sendFollowUpMessage === "function") {
+        window.openai.sendFollowUpMessage({ prompt: prompt });
+      }
+    } catch (error) { /* the host decides; nothing is saved from here */ }
+  }
+
+  function button(label, prompt, primary, aria) {
+    var node = el("button", primary ? "primary" : "", label);
+    node.type = "button";
+    node.setAttribute("aria-label", aria || label);
+    node.addEventListener("click", function () { send(prompt); });
+    return node;
+  }
+
+  var STATES = {
+    saved: "Saved",
+    already_saved: "Already saved",
+    pending: "Not confirmed yet",
+    failed: "Not saved",
+    conflict: "Changed elsewhere",
+    read: ""
+  };
+
+  function stateBadge(state) {
+    var label = STATES[state];
+    if (!label) return null;
+    var node = el("span", "state " + state, label);
+    node.setAttribute("role", "status");
+    return node;
+  }
+
+  function section(parent, title) {
+    add(parent, el("h3", "", title));
+  }
+
+  function words(parent, said, reading) {
+    if (said) {
+      add(parent, el("div", "label", "You said"));
+      add(parent, el("div", "said", said));
+    }
+    if (reading) {
+      add(parent, el("div", "label", "Coach's reading"));
+      add(parent, el("p", "reading", reading));
+    }
+  }
+
+  function list(parent, items, render) {
+    if (!items || !items.length) return;
+    var ul = add(parent, el("ul"));
+    items.forEach(function (item) { add(ul, render(item)); });
+  }
+
+  function header(parent, data) {
+    var top = add(parent, el("div"));
+    if (data.workflow) {
+      add(top, el("h2", "", data.workflow.name || data.workflow.ref));
+      var line = data.workflow.ref + (data.workflow.goal_version ? "  ·  goal v" + data.workflow.goal_version : "");
+      add(top, el("div", "ref", line));
+    }
+    var badge = stateBadge(data.state);
+    if (badge) { add(top, el("div")).appendChild(badge); }
+  }
+
+  function renderCard(data) {
+    header(root, data);
+    if (data.workflow && data.workflow.goal) {
+      section(root, "Goal");
+      add(root, el("div", "panel text", data.workflow.goal));
+    }
+    if (data.job) {
+      section(root, "This job");
+      var job = add(root, el("div", "panel"));
+      add(job, el("div", "ref", data.job.ref + (data.job.status ? "  ·  " + data.job.status : "")));
+      if (data.job.objective) add(job, el("p", "text", data.job.objective));
+    }
+    if (data.effort) {
+      add(root, el("p", "muted", "Coaching effort: " + data.effort.effort + (data.effort.said ? " (you said “" + data.effort.said + "”)" : "")));
+    }
+    if (data.version) {
+      section(root, "This version");
+      var version = add(root, el("div", "panel"));
+      add(version, el("div", "ref", data.version.ref + " · " + data.version.kind));
+      if (data.version.url) add(version, el("p", "text", data.version.url));
+      if (data.version.media) add(version, el("p", "muted", data.version.media));
+      if (data.version.preview) add(version, el("div", "text", data.version.preview));
+    }
+    if (data.carry_note || (data.changed && data.changed.length)) {
+      section(root, "What changed");
+      var changed = add(root, el("div", "panel"));
+      if (data.carry_note) add(changed, el("p", "", data.carry_note));
+      list(changed, data.changed, function (item) {
+        return el("li", "", item.how + " " + item.ref + (item.note ? ": " + item.note : ""));
+      });
+    }
+    if (data.feedback) {
+      section(root, "Feedback saved");
+      var fb = add(root, el("div", "panel"));
+      add(fb, el("div", "ref", data.feedback.ref + " · " + data.feedback.kind + " · " + data.feedback.scope));
+      words(fb, data.feedback.you_said, data.feedback.reading);
+      if (data.feedback.guidance_ref) add(fb, el("p", "muted", "Saved as reusable guidance " + data.feedback.guidance_ref));
+    }
+    if (data.attention && data.attention.length) {
+      section(root, "Still needs attention");
+      var open = add(root, el("div", "panel"));
+      list(open, data.attention, function (item) {
+        var li = el("li");
+        add(li, el("span", "ref", item.ref + " "));
+        add(li, el("span", "", item.text));
+        return li;
+      });
+    } else if (data.view === "job_card" && data.version) {
+      add(root, el("p", "muted", "Nothing marked as still open."));
+    }
+    if (data.message) add(root, el("p", "muted", data.message));
+  }
+
+  function renderSide(parent, side, label) {
+    var box = add(parent, el("div", "panel side"));
+    box.setAttribute("aria-label", label + ": " + side.ref);
+    add(box, el("h3", "", label));
+    add(box, el("div", "ref", side.ref + (side.job_ref ? "  ·  " + side.job_ref : "")));
+    if (side.objective) add(box, el("p", "muted", side.objective));
+    if (side.url) add(box, el("p", "text", side.url));
+    if (side.media) add(box, el("p", "muted", side.media));
+    if (side.text) add(box, el("div", "text", side.text));
+    if (side.carry_note) { add(box, el("div", "label", "Agent's note")); add(box, el("p", "", side.carry_note)); }
+    list(box, side.changed, function (item) {
+      return el("li", "", item.how + " " + item.ref + (item.note ? ": " + item.note : ""));
+    });
+    (side.feedback || []).forEach(function (item) {
+      add(box, el("div", "ref", item.ref + " · " + item.kind + " · " + item.scope));
+      words(box, item.you_said, item.reading);
+    });
+    return box;
+  }
+
+  function renderCompare(data) {
+    header(root, data);
+    var cmp = data.compare;
+    var grid = add(root, el("div", "compare"));
+    renderSide(grid, cmp.left, "Earlier");
+    renderSide(grid, cmp.right, "Later");
+    var picks = add(root, el("div", "actions"));
+    picks.setAttribute("aria-label", "Pick the better version");
+    add(picks, button("I prefer " + cmp.left.ref, "I prefer " + cmp.left.ref + " over " + cmp.right.ref + ".", false));
+    add(picks, button("I prefer " + cmp.right.ref, "I prefer " + cmp.right.ref + " over " + cmp.left.ref + ".", false));
+  }
+
+  function renderList(data) {
+    add(root, el("h2", "", "Your coaching workflows"));
+    list(root, data.workflows, function (w) {
+      var li = el("li");
+      add(li, el("span", "", (w.name || w.ref) + " "));
+      add(li, el("span", "ref", w.ref + (w.job_count !== undefined ? " · " + w.job_count + " jobs" : "")));
+      return li;
+    });
+    if (!data.workflows || !data.workflows.length) add(root, el("p", "muted", "No workflows yet."));
+  }
+
+  function render() {
+    var data = (window.openai && window.openai.toolOutput) || null;
+    while (root.firstChild) root.removeChild(root.firstChild);
+    var theme = window.openai && window.openai.theme;
+    root.classList.toggle("dark", theme === "dark");
+    root.classList.toggle("light", theme === "light");
+    if (!data || typeof data !== "object") {
+      add(root, el("p", "muted", "Agent Coach Kit"));
+      return;
+    }
+    if (data.view === "compare" && data.compare) renderCompare(data);
+    else if (data.view === "list") renderList(data);
+    else renderCard(data);
+    if (data.suggestions && data.suggestions.length) {
+      var actions = add(root, el("div", "actions"));
+      actions.setAttribute("aria-label", "Coaching suggestions");
+      data.suggestions.forEach(function (s, i) {
+        add(actions, button(s.label, s.prompt, i === 0, s.label + ": starts this coaching step in the chat"));
+      });
+    }
+  }
+
+  window.addEventListener("openai:set_globals", render, { passive: true });
+  render();
+})();
+</script>

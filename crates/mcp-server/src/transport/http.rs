@@ -431,7 +431,25 @@ fn stateless_protocol_error_response(
 }
 
 fn is_streamable_mcp_path(path: &str) -> bool {
-    matches!(path, "/mcp" | "/chatgpt" | "/claude" | "/client")
+    matches!(
+        path,
+        "/mcp" | "/chatgpt" | "/claude" | "/client" | COACH_PATH
+    )
+}
+
+/// The Agent Coach Kit endpoint: only the three coach tools.
+const COACH_PATH: &str = "/coach";
+/// Its protected-resource metadata.
+const COACH_RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource/coach";
+
+/// The tool surface a path fixes, whatever the request asks for.
+fn path_surface_profile(path: &str) -> Option<ToolSurfaceProfile> {
+    match path {
+        // Integration paths have complete parity with the local MCP tool.
+        "/chatgpt" | "/claude" | "/client" => Some(ToolSurfaceProfile::Default),
+        COACH_PATH => Some(ToolSurfaceProfile::Coach),
+        _ => None,
+    }
 }
 
 /// Read current process RSS in kilobytes from /proc/self/status (Linux only).
@@ -488,6 +506,10 @@ pub fn create_router(state: HttpState) -> Router {
             "/.well-known/oauth-protected-resource",
             get(handle_oauth_protected_resource),
         )
+        .route(
+            COACH_RESOURCE_METADATA_PATH,
+            get(handle_coach_protected_resource),
+        )
         // RFC 8414 + OIDC discovery. Some OAuth clients (notably
         // claude.ai's MCP custom-connector flow) probe the *resource*
         // host directly for the authorization-server metadata as a
@@ -515,6 +537,9 @@ pub fn create_router(state: HttpState) -> Router {
         .route("/chatgpt", post(handle_mcp_streamable))
         .route("/claude", post(handle_mcp_streamable))
         .route("/client", post(handle_mcp_streamable))
+        // Agent Coach Kit: its own product surface (three tools, its own
+        // protected-resource metadata and scopes).
+        .route(COACH_PATH, post(handle_mcp_streamable))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -616,6 +641,11 @@ async fn handle_oauth_protected_resource(headers: HeaderMap) -> impl IntoRespons
     Json(oauth_protected_resource_metadata(&headers))
 }
 
+/// Protected resource metadata (RFC 9728) for the Agent Coach Kit endpoint.
+async fn handle_coach_protected_resource(headers: HeaderMap) -> impl IntoResponse {
+    Json(coach_protected_resource_metadata(&headers))
+}
+
 /// RFC 8414 / OIDC discovery served on the MCP host (mirrors what
 /// the actual authorization server publishes). Lets clients that
 /// probe the resource host directly find the right endpoints without
@@ -667,7 +697,7 @@ async fn handle_jsonrpc(
             // issues no session to carry it, and the shared registry serves
             // every caller, so the registry is never changed.
             let surface_profile = resolve_request_tool_surface_profile(
-                false,
+                None,
                 get_task_config_override().and_then(|config| config.tool_surface_profile),
                 surface_profile_from_initialize_params(&request.params),
                 state.registry.default_tool_surface_profile(),
@@ -752,14 +782,12 @@ async fn handle_mcp_streamable(
 ) -> Response {
     // Integration-specific endpoints (/chatgpt, /claude, /client) must expose
     // the full ContextStream tool surface regardless of client auto-detection,
-    // so the app/plugin has complete parity with the local MCP tool.
-    let force_full_surface = matched_path
+    // so the app/plugin has complete parity with the local MCP tool; /coach
+    // exposes only the Agent Coach Kit tools.
+    let path_profile = matched_path
         .as_ref()
-        .map(|p| {
-            let path = p.as_str();
-            path == "/chatgpt" || path == "/claude" || path == "/client"
-        })
-        .unwrap_or(false);
+        .and_then(|path| path_surface_profile(path.as_str()));
+    let force_full_surface = path_profile == Some(ToolSurfaceProfile::Default);
 
     // One shared registry serves every caller, so the surface rides this
     // request as a task-local and the registry itself is never changed.
@@ -772,7 +800,7 @@ async fn handle_mcp_streamable(
         header_str(&headers, "mcp-session-id").and_then(surface_profile_from_session_id)
     };
     let surface_profile = resolve_request_tool_surface_profile(
-        force_full_surface,
+        path_profile,
         header_str(&headers, "x-contextstream-tool-surface-profile")
             .and_then(|value| value.parse::<ToolSurfaceProfile>().ok()),
         session_profile,
@@ -928,7 +956,26 @@ async fn serve_mcp_streamable(
             None
         };
     let result = match request.method.as_str() {
+        "server/discover" if surface_profile == ToolSurfaceProfile::Coach => {
+            Ok(crate::server::build_coach_stateless_discover_result())
+        }
         "server/discover" => Ok(build_contextstream_stateless_discover_result()),
+        // The coach surface serves its ChatGPT component as a resource.
+        "resources/list" if surface_profile == ToolSurfaceProfile::Coach => {
+            Ok(crate::server::coach_resources_list())
+        }
+        "resources/templates/list" if surface_profile == ToolSurfaceProfile::Coach => {
+            Ok(crate::server::coach_resource_templates_list())
+        }
+        "resources/read" if surface_profile == ToolSurfaceProfile::Coach => {
+            crate::server::coach_resource_read(&request.params).map_err(|(code, message)| {
+                JsonRpcError {
+                    code,
+                    message,
+                    data: None,
+                }
+            })
+        }
         "initialize" if stateless_request => Err(JsonRpcError {
             code: -32601,
             message: format!(
@@ -1115,21 +1162,24 @@ async fn serve_mcp_streamable(
 
 /// The tool surface for one request, first match wins:
 ///
-/// 1. The integration paths (/chatgpt, /claude, /client): the full surface.
+/// 0. A server configured with the coach surface serves only that.
+/// 1. The path: the integration paths (/chatgpt, /claude, /client) get the
+///    full surface, /coach the Agent Coach Kit surface.
 /// 2. The `X-ContextStream-Tool-Surface-Profile` header.
 /// 3. The session's own choice: an initialize request's params, or the code in
 ///    the `Mcp-Session-Id` that initialize issued.
 /// 4. The server's configured default.
 fn resolve_request_tool_surface_profile(
-    force_full_surface: bool,
+    path_profile: Option<ToolSurfaceProfile>,
     header_profile: Option<ToolSurfaceProfile>,
     session_profile: Option<ToolSurfaceProfile>,
     default_profile: ToolSurfaceProfile,
 ) -> ToolSurfaceProfile {
-    if force_full_surface {
-        return ToolSurfaceProfile::Default;
+    if default_profile == ToolSurfaceProfile::Coach {
+        return ToolSurfaceProfile::Coach;
     }
-    header_profile
+    path_profile
+        .or(header_profile)
         .or(session_profile)
         .unwrap_or(default_profile)
 }
@@ -1141,6 +1191,7 @@ fn surface_profile_code(profile: ToolSurfaceProfile) -> u8 {
     match profile {
         ToolSurfaceProfile::Default => 0,
         ToolSurfaceProfile::OpenaiAgentic => 1,
+        ToolSurfaceProfile::Coach => 2,
     }
 }
 
@@ -1171,6 +1222,7 @@ fn surface_profile_from_session_id(session_id: &str) -> Option<ToolSurfaceProfil
     [
         ToolSurfaceProfile::Default,
         ToolSurfaceProfile::OpenaiAgentic,
+        ToolSurfaceProfile::Coach,
     ]
     .into_iter()
     .find(|profile| surface_profile_code(*profile) == bytes[15])
@@ -1316,7 +1368,7 @@ async fn execute_tool(state: &HttpState, name: &str, input: Value) -> Response {
     let registry = effective_registry(state).await;
     let wire_observation = mcp_tools::wire_tokens::WireTokenObservation::default();
 
-    if registry.is_router_mode() {
+    if registry.is_router_mode() && !registry.is_coach_surface() {
         match name {
             "operations" => {
                 return (
@@ -2078,7 +2130,8 @@ async fn handle_call_tool_method(
         validate_contextstream_meta_tool_arguments(name, &arguments).map_err(JsonRpcError::from)?;
     }
 
-    if registry.is_router_mode() {
+    // The coach surface has no router meta-tools: only its three tools run.
+    if registry.is_router_mode() && !registry.is_coach_surface() {
         match name {
             "operations" => {
                 return Ok(router_operations_response(registry.as_ref(), &arguments));
@@ -2509,9 +2562,14 @@ fn request_origin(headers: &HeaderMap) -> String {
     }
 }
 
-fn oauth_resource_metadata_url(headers: &HeaderMap) -> String {
+fn oauth_resource_metadata_url(headers: &HeaderMap, path: &str) -> String {
+    let metadata = if path == COACH_PATH {
+        COACH_RESOURCE_METADATA_PATH
+    } else {
+        "/.well-known/oauth-protected-resource"
+    };
     format!(
-        "{}/.well-known/oauth-protected-resource",
+        "{}{metadata}",
         request_origin(headers).trim_end_matches('/')
     )
 }
@@ -2523,8 +2581,24 @@ fn oauth_protected_resource_metadata(headers: &HeaderMap) -> Value {
     })
 }
 
+/// The Agent Coach Kit resource: `<origin>/coach`, with only the coach
+/// scopes, so a ChatGPT connector asks for nothing else.
+fn coach_protected_resource_metadata(headers: &HeaderMap) -> Value {
+    json!({
+        "resource": format!("{}{COACH_PATH}", request_origin(headers).trim_end_matches('/')),
+        "authorization_servers": [authorization_server_origin()],
+        "scopes_supported": [
+            mcp_client::coach::READ_SCOPE,
+            mcp_client::coach::WRITE_SCOPE
+        ],
+        "bearer_methods_supported": ["header"],
+        "resource_name": "Agent Coach Kit"
+    })
+}
+
 fn oauth_unauthorized_response(
     headers: &HeaderMap,
+    path: &str,
     error_description: &str,
     body_description: &str,
 ) -> Response {
@@ -2543,10 +2617,17 @@ fn oauth_unauthorized_response(
     )
         .into_response();
 
-    let www_authenticate = format!(
+    let mut www_authenticate = format!(
         r#"Bearer resource_metadata="{}""#,
-        oauth_resource_metadata_url(headers)
+        oauth_resource_metadata_url(headers, path)
     );
+    if path == COACH_PATH {
+        www_authenticate.push_str(&format!(
+            r#", scope="{} {}""#,
+            mcp_client::coach::READ_SCOPE,
+            mcp_client::coach::WRITE_SCOPE
+        ));
+    }
     if let Ok(value) = header::HeaderValue::from_str(&www_authenticate) {
         response
             .headers_mut()
@@ -2589,6 +2670,7 @@ pub async fn auth_middleware(
         || path == "/api/v1/health"
         || path == "/metrics"
         || path == "/.well-known/oauth-protected-resource"
+        || path == COACH_RESOURCE_METADATA_PATH
         || path == "/.well-known/oauth-authorization-server"
         || path == "/.well-known/openid-configuration"
     {
@@ -2623,6 +2705,7 @@ pub async fn auth_middleware(
                     warn!("JWT validation failed");
                     return Err(oauth_unauthorized_response(
                         &headers,
+                        path,
                         "Invalid or expired access token",
                         "Bearer token invalid or expired",
                     ));
@@ -2639,6 +2722,7 @@ pub async fn auth_middleware(
     {
         return Err(oauth_unauthorized_response(
             &headers,
+            path,
             "No access token provided",
             "Bearer token required",
         ));
@@ -5535,21 +5619,26 @@ mod tests {
             use ToolSurfaceProfile::{Default as Full, OpenaiAgentic as Agentic};
             // An integration path always gets the full surface.
             assert_eq!(
-                resolve_request_tool_surface_profile(true, Some(Agentic), Some(Agentic), Agentic),
+                resolve_request_tool_surface_profile(
+                    Some(Full),
+                    Some(Agentic),
+                    Some(Agentic),
+                    Agentic
+                ),
                 Full
             );
             // The header beats the session.
             assert_eq!(
-                resolve_request_tool_surface_profile(false, Some(Full), Some(Agentic), Agentic),
+                resolve_request_tool_surface_profile(None, Some(Full), Some(Agentic), Agentic),
                 Full
             );
             // The session beats the server default.
             assert_eq!(
-                resolve_request_tool_surface_profile(false, None, Some(Agentic), Full),
+                resolve_request_tool_surface_profile(None, None, Some(Agentic), Full),
                 Agentic
             );
             assert_eq!(
-                resolve_request_tool_surface_profile(false, None, None, Agentic),
+                resolve_request_tool_surface_profile(None, None, None, Agentic),
                 Agentic
             );
         }
@@ -5559,6 +5648,7 @@ mod tests {
             for profile in [
                 ToolSurfaceProfile::Default,
                 ToolSurfaceProfile::OpenaiAgentic,
+                ToolSurfaceProfile::Coach,
             ] {
                 let session_id = mint_mcp_session_id(profile);
                 let parsed = Uuid::parse_str(&session_id).expect("a UUID");
@@ -5710,5 +5800,334 @@ mod tests {
         assert_eq!(version.len(), 64);
         assert_eq!(identity("\n\t<>", "1"), None);
         assert_eq!(unrecognized_client_identity(&json!({})), None);
+    }
+
+    // ========================================================================
+    // Agent Coach Kit surface (/coach)
+    // ========================================================================
+
+    mod coach_surface_tests {
+        use super::*;
+        use crate::server::build_registry;
+        use mcp_types::config::{Config, Toolset};
+
+        /// As the hosted gateway runs: the complete toolset, consolidated.
+        fn hosted_state(require_auth: bool) -> HttpState {
+            let config = Config {
+                api_key: Some("test-api-key".to_string()),
+                is_http_transport: true,
+                toolset: Toolset::Complete,
+                consolidated_mode: true,
+                ..Config::default()
+            };
+            let client = ContextStreamClient::new(config.clone());
+            let session = Arc::new(SessionManager::new(client.clone(), config.clone()));
+            let registry = build_registry(&config, client.clone(), session.clone());
+            HttpState {
+                registry: Arc::new(registry),
+                client: client.clone(),
+                session: session.clone(),
+                jwt_secret: None,
+                require_auth,
+                telemetry: AgenticTelemetry::new(client, session),
+                tools_list_cache: Arc::new(RwLock::new(HashMap::new())),
+                concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+                metrics_handle: None,
+            }
+        }
+
+        fn post(
+            path: &str,
+            session_id: Option<&str>,
+            headers: &[(&str, &str)],
+            body: Value,
+        ) -> Request<Body> {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("host", "mcp.contextstream.io")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            if let Some(session_id) = session_id {
+                builder = builder.header("mcp-session-id", session_id);
+            }
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        }
+
+        async fn rpc(
+            app: &Router,
+            path: &str,
+            headers: &[(&str, &str)],
+            method: &str,
+            params: Value,
+        ) -> (StatusCode, HeaderMap, Value) {
+            let body = json!({"jsonrpc": "2.0", "id": method, "method": method, "params": params});
+            let response = app
+                .clone()
+                .oneshot(post(path, None, headers, body))
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            (status, headers, json_response(response).await)
+        }
+
+        fn names(list: &Value) -> Vec<String> {
+            let mut names: Vec<String> = list["result"]["tools"]
+                .as_array()
+                .expect("tools array")
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[tokio::test]
+        async fn coach_lists_exactly_the_three_coach_tools_with_their_component() {
+            let app = create_router(hosted_state(false));
+            let (status, headers, init) = rpc(
+                &app,
+                "/coach",
+                &[],
+                "initialize",
+                json!({"protocolVersion": mcp_types::MCP_PROTOCOL_2024_11_05,
+                       "clientInfo": {"name": "openai-mcp", "version": "1.0.0"}, "capabilities": {}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(init["result"]["serverInfo"]["name"], "agent-coach-kit");
+            assert_eq!(init["result"]["serverInfo"]["title"], "Agent Coach Kit");
+            assert!(init["result"]["capabilities"]["resources"].is_object());
+            assert!(init["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("verbatim"));
+            assert_eq!(init["result"]["toolCount"], 3);
+            let session = headers["mcp-session-id"].to_str().unwrap().to_string();
+            assert_eq!(
+                surface_profile_from_session_id(&session),
+                Some(ToolSurfaceProfile::Coach)
+            );
+
+            // A header asking for the full surface does not widen /coach.
+            let (_, _, list) = rpc(
+                &app,
+                "/coach",
+                &[("x-contextstream-tool-surface-profile", "default")],
+                "tools/list",
+                json!({}),
+            )
+            .await;
+            assert_eq!(
+                names(&list),
+                ["workflow", "workflow_delete", "workflow_save"]
+            );
+            for tool in list["result"]["tools"].as_array().unwrap() {
+                let name = tool["name"].as_str().unwrap();
+                let annotations = &tool["annotations"];
+                assert_eq!(annotations["openWorldHint"], false, "{name}");
+                match name {
+                    "workflow" => {
+                        assert_eq!(annotations["readOnlyHint"], true);
+                        assert_eq!(
+                            tool["_meta"]["openai/outputTemplate"],
+                            "ui://widget/coach.html"
+                        );
+                        assert_eq!(tool["securitySchemes"][0]["scopes"], json!(["read:coach"]));
+                    }
+                    "workflow_save" => {
+                        assert_eq!(annotations["readOnlyHint"], false);
+                        assert_eq!(annotations["destructiveHint"], false);
+                        assert_eq!(annotations["idempotentHint"], true);
+                        assert_eq!(
+                            tool["_meta"]["openai/outputTemplate"],
+                            "ui://widget/coach.html"
+                        );
+                        assert_eq!(tool["_meta"]["openai/fileParams"], json!(["file"]));
+                        assert_eq!(
+                            tool["_meta"]["securitySchemes"][0]["scopes"],
+                            json!(["write:coach"])
+                        );
+                    }
+                    _ => {
+                        assert_eq!(annotations["destructiveHint"], true);
+                        assert_eq!(tool["securitySchemes"][0]["scopes"], json!(["write:coach"]));
+                    }
+                }
+            }
+
+            // Every other surface stays as it was: no coach tools.
+            for (path, headers) in [
+                ("/mcp", vec![]),
+                (
+                    "/mcp",
+                    vec![("x-contextstream-tool-surface-profile", "openai_agentic")],
+                ),
+                ("/chatgpt", vec![]),
+                ("/claude", vec![]),
+            ] {
+                let (_, _, list) = rpc(&app, path, &headers, "tools/list", json!({})).await;
+                let names = names(&list);
+                assert!(!names.is_empty(), "{path}");
+                for coach_tool in ["workflow", "workflow_save", "workflow_delete"] {
+                    assert!(
+                        !names.iter().any(|n| n == coach_tool),
+                        "{path} lists {coach_tool}"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn coach_runs_no_tool_outside_its_surface() {
+            let app = create_router(hosted_state(false));
+            for name in ["memory", "execute_operation", "tool_search", "operations"] {
+                let (_, _, response) = rpc(
+                    &app,
+                    "/coach",
+                    &[],
+                    "tools/call",
+                    json!({"name": name, "arguments": {"action": "list"}}),
+                )
+                .await;
+                let refused =
+                    response.get("error").is_some() || response["result"]["isError"] == true;
+                assert!(refused, "{name} ran on /coach: {response}");
+            }
+        }
+
+        #[tokio::test]
+        async fn coach_serves_its_component_and_mcp_does_not() {
+            let app = create_router(hosted_state(false));
+            let (_, _, listed) = rpc(&app, "/coach", &[], "resources/list", json!({})).await;
+            assert_eq!(
+                listed["result"]["resources"][0]["uri"],
+                mcp_tools::domains::coach::WIDGET_URI
+            );
+            assert_eq!(
+                listed["result"]["resources"][0]["mimeType"],
+                "text/html+skybridge"
+            );
+            let (_, _, read) = rpc(
+                &app,
+                "/coach",
+                &[],
+                "resources/read",
+                json!({"uri": mcp_tools::domains::coach::WIDGET_URI}),
+            )
+            .await;
+            assert_eq!(
+                read["result"]["contents"][0]["mimeType"],
+                "text/html+skybridge"
+            );
+            assert!(read["result"]["contents"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("coach-root"));
+            let (_, _, missing) = rpc(
+                &app,
+                "/coach",
+                &[],
+                "resources/read",
+                json!({"uri": "ui://widget/nope.html"}),
+            )
+            .await;
+            assert_eq!(missing["error"]["code"], -32002);
+            let (_, _, mcp) = rpc(&app, "/mcp", &[], "resources/list", json!({})).await;
+            assert_eq!(mcp["error"]["code"], -32601);
+        }
+
+        #[tokio::test]
+        async fn coach_has_its_own_protected_resource_metadata_and_challenge() {
+            let app = create_router(hosted_state(true));
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/.well-known/oauth-protected-resource/coach")
+                        .header("host", "mcp.contextstream.io")
+                        .header("x-forwarded-proto", "https")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let metadata = json_response(response).await;
+            assert_eq!(metadata["resource"], "https://mcp.contextstream.io/coach");
+            assert_eq!(
+                metadata["scopes_supported"],
+                json!(["read:coach", "write:coach"])
+            );
+            assert_eq!(
+                metadata["authorization_servers"],
+                json!(["https://api.contextstream.io"])
+            );
+
+            let response = app
+                .clone()
+                .oneshot(post(
+                    "/coach",
+                    None,
+                    &[],
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers()[header::WWW_AUTHENTICATE]
+                    .to_str()
+                    .unwrap(),
+                r#"Bearer resource_metadata="https://mcp.contextstream.io/.well-known/oauth-protected-resource/coach", scope="read:coach write:coach""#
+            );
+            let body = json_response(response).await;
+            assert_eq!(
+                body["_meta"]["mcp/www_authenticate"]["error"],
+                "invalid_token"
+            );
+
+            // /mcp keeps its own challenge.
+            let response = app
+                .clone()
+                .oneshot(post(
+                    "/mcp",
+                    None,
+                    &[],
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers()[header::WWW_AUTHENTICATE]
+                    .to_str()
+                    .unwrap(),
+                r#"Bearer resource_metadata="https://mcp.contextstream.io/.well-known/oauth-protected-resource""#
+            );
+        }
+
+        #[test]
+        fn a_coach_only_server_never_widens() {
+            use ToolSurfaceProfile::{Coach, Default as Full};
+            assert_eq!(
+                resolve_request_tool_surface_profile(Some(Full), Some(Full), Some(Full), Coach),
+                Coach
+            );
+            assert_eq!(
+                resolve_request_tool_surface_profile(Some(Coach), Some(Full), None, Full),
+                Coach
+            );
+            assert_eq!(path_surface_profile("/coach"), Some(Coach));
+            assert_eq!(path_surface_profile("/mcp"), None);
+            assert!(is_streamable_mcp_path("/coach"));
+        }
     }
 }

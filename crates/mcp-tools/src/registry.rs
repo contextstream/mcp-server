@@ -457,6 +457,22 @@ impl ToolRegistry {
         let operation_input_schema = input_schema.clone();
         let operation_handler = handler.clone();
 
+        // The coach tools belong to their own surface (`/coach`): always
+        // registered, never filtered by toolset, bundle, router or
+        // consolidated mode, never an operation, and visible only when the
+        // surface profile is `Coach`.
+        if crate::domains::coach::is_coach_tool(name) {
+            self.tools.insert(
+                name.to_string(),
+                RegisteredTool {
+                    metadata,
+                    handler,
+                    input_schema,
+                },
+            );
+            return;
+        }
+
         // Check toolset filtering
         if !self.toolsets.is_allowed(name) {
             return;
@@ -835,7 +851,17 @@ impl ToolRegistry {
     /// per process; the hosted HTTP transport never changes the shared
     /// registry and scopes each request's profile as a task-local instead.
     pub fn apply_initialize_surface_profile(&self, detected: Option<ToolSurfaceProfile>) {
+        // A server configured as coach-only stays coach-only.
+        if self.default_tool_surface_profile == ToolSurfaceProfile::Coach {
+            self.set_tool_surface_profile(ToolSurfaceProfile::Coach);
+            return;
+        }
         self.set_tool_surface_profile(detected.unwrap_or(self.default_tool_surface_profile));
+    }
+
+    /// Whether the current surface profile is the Agent Coach Kit surface.
+    pub fn is_coach_surface(&self) -> bool {
+        self.tool_surface_profile() == ToolSurfaceProfile::Coach
     }
 
     /// Whether the current surface profile is OpenAI agentic mode.
@@ -911,6 +937,10 @@ impl ToolRegistry {
 
         for (name, tool) in &self.tools {
             let direct = self.is_tool_visible(name);
+            // Coach tools are found only where they are visible.
+            if !direct && crate::domains::coach::is_coach_tool(name) {
+                continue;
+            }
             if let Some(value) = self.search_candidate(name, tool, category, direct, &query) {
                 candidates.push(value);
             }
@@ -1090,9 +1120,11 @@ impl ToolRegistry {
         if !self.tools.contains_key(name) {
             return false;
         }
+        let coach = crate::domains::coach::is_coach_tool(name);
         match self.tool_surface_profile() {
-            ToolSurfaceProfile::Default => true,
-            ToolSurfaceProfile::OpenaiAgentic => is_openai_agentic_core_tool(name),
+            ToolSurfaceProfile::Default => !coach,
+            ToolSurfaceProfile::OpenaiAgentic => !coach && is_openai_agentic_core_tool(name),
+            ToolSurfaceProfile::Coach => coach,
         }
     }
 }

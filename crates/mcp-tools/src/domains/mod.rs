@@ -6,6 +6,7 @@ pub mod atlas_jobs;
 pub mod atlas_warm_cache;
 pub mod capsule;
 pub mod charts;
+pub mod coach;
 pub mod coordination;
 pub mod display_title;
 pub mod entity;

@@ -23,6 +23,12 @@ pub struct ToolResult {
     /// Whether this result is an error
     #[serde(default)]
     pub is_error: bool,
+
+    /// Result metadata for the host (`_meta`): hints such as
+    /// `openai/outputTemplate` or `mcp/www_authenticate`. Transports merge it
+    /// into the `_meta` object they emit.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl ToolResult {
@@ -32,6 +38,7 @@ impl ToolResult {
             content: vec![ContentItem::text(text)],
             structured_content: None,
             is_error: false,
+            meta: None,
         }
     }
 
@@ -45,6 +52,7 @@ impl ToolResult {
                 None
             },
             is_error: false,
+            meta: None,
         }
     }
 
@@ -54,6 +62,7 @@ impl ToolResult {
             content: vec![ContentItem::text(message)],
             structured_content: None,
             is_error: true,
+            meta: None,
         }
     }
 
@@ -75,6 +84,7 @@ impl ToolResult {
                 None
             },
             is_error: true,
+            meta: None,
         }
     }
 
@@ -149,6 +159,7 @@ impl ToolResult {
                 None
             },
             is_error: true,
+            meta: None,
         }
     }
 
@@ -198,7 +209,19 @@ impl ToolResult {
                 None
             },
             is_error: true,
+            meta: None,
         }
+    }
+
+    /// Merge `meta` into the result's `_meta`: object keys are added (a key
+    /// already present is replaced); a non-object replaces it whole.
+    pub fn with_meta(mut self, meta: Value) -> Self {
+        match (&mut self.meta, meta) {
+            (_, Value::Null) => {}
+            (Some(Value::Object(existing)), Value::Object(extra)) => existing.extend(extra),
+            (slot, meta) => *slot = Some(meta),
+        }
+        self
     }
 
     /// Add a prefix to the text content.

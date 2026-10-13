@@ -16,6 +16,7 @@ pub mod activation;
 pub mod auth;
 pub mod cache;
 pub mod client;
+pub mod coach;
 pub mod harness_readiness;
 pub mod harness_remote;
 pub mod ingest_guard;

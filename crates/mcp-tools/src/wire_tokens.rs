@@ -534,6 +534,18 @@ pub fn tool_result_payload(result: &ToolResult, context: &WireResponseContext) -
             }
         });
     }
+    // The tool's own result metadata (host hints such as an output template
+    // or an authentication challenge) joins the transport's `_meta`.
+    if let Some(Value::Object(meta)) = result.meta.as_ref() {
+        match response.get_mut("_meta") {
+            Some(Value::Object(existing)) => {
+                for (key, value) in meta {
+                    existing.insert(key.clone(), value.clone());
+                }
+            }
+            _ => response["_meta"] = Value::Object(meta.clone()),
+        }
+    }
     response
 }
 
@@ -921,11 +933,46 @@ mod tests {
     }
 
     #[test]
+    fn result_meta_joins_the_transport_meta() {
+        let result = ToolResult::text("hello").with_meta(json!({
+            "openai/outputTemplate": "ui://widget/example.html",
+            "mcp/www_authenticate": ["Bearer error=\"insufficient_scope\""],
+        }));
+        let titled = WireResponseContext::http_jsonrpc(
+            Some(json!(1)),
+            Some("Example".to_string()),
+            Some("⌬".to_string()),
+        );
+        let payload = tool_result_payload(&result, &titled);
+        assert_eq!(payload["_meta"]["contextstream"]["title"], "Example");
+        assert_eq!(
+            payload["_meta"]["openai/outputTemplate"],
+            "ui://widget/example.html"
+        );
+        assert_eq!(
+            payload["_meta"]["mcp/www_authenticate"][0],
+            "Bearer error=\"insufficient_scope\""
+        );
+
+        let untitled = WireResponseContext::http_jsonrpc(Some(json!(1)), None, None);
+        let payload = tool_result_payload(&result, &untitled);
+        assert_eq!(
+            payload["_meta"]["openai/outputTemplate"],
+            "ui://widget/example.html"
+        );
+        assert!(payload["_meta"].get("contextstream").is_none());
+
+        let plain = tool_result_payload(&ToolResult::text("hello"), &untitled);
+        assert!(plain.get("_meta").is_none());
+    }
+
+    #[test]
     fn http_structured_content_coerces_arrays_to_objects() {
         let result = ToolResult {
             content: vec![ContentItem::text("Found 1")],
             structured_content: Some(json!([{"id": "n1"}])),
             is_error: false,
+            meta: None,
         };
         let http = WireResponseContext::http_jsonrpc(Some(json!(1)), None, None);
         let payload = tool_result_payload(&result, &http);

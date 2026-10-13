@@ -117,6 +117,9 @@ pub fn build_registry(
     // Agent Q&A is registered unconditionally and returns a clean unavailable
     // response when its hosted backend is not configured.
     domains::qa::register_qa_tools(&mut registry, client.clone());
+    // Agent Coach Kit: registered everywhere, visible only on the coach
+    // surface (`/coach`, or CONTEXTSTREAM_TOOL_SURFACE_PROFILE=coach).
+    domains::coach::register_coach_tools(&mut registry, client.clone());
     domains::skill::register_skill_tools(&mut registry, client, session.clone());
     // Compatibility chart/job surfaces self-gate when no provider is available.
     domains::charts::register_charts_tools(&mut registry, session.clone());
@@ -522,7 +525,7 @@ fn contextstream_tool_extension(
 
 pub(crate) fn contextstream_tool_list_entry(tool: &mcp_tools::RegisteredTool) -> serde_json::Value {
     let meta = &tool.metadata;
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "name": meta.name,
         "title": meta.title,
         "description": meta.description,
@@ -536,7 +539,18 @@ pub(crate) fn contextstream_tool_list_entry(tool: &mcp_tools::RegisteredTool) ->
                 &meta.annotations
             )
         }
-    })
+    });
+    // Coach tools also declare their OAuth scopes and, for ChatGPT, the
+    // component that renders them and the file input they take.
+    if let Some((schemes, extra)) = domains::coach::descriptor_extras(&meta.name) {
+        entry["securitySchemes"] = schemes;
+        if let (Some(serde_json::Value::Object(target)), serde_json::Value::Object(extra)) =
+            (entry.get_mut("_meta"), extra)
+        {
+            target.extend(extra);
+        }
+    }
+    entry
 }
 
 fn contextstream_meta_tool_entry(
@@ -747,7 +761,8 @@ pub(crate) fn contextstream_tools_list(
         .map(contextstream_tool_list_entry)
         .collect();
 
-    if requested_category_matches(category, "router") {
+    // The coach surface is exactly its three tools: no discovery meta-tools.
+    if requested_category_matches(category, "router") && !registry.is_coach_surface() {
         if registry.is_router_mode() {
             tools.push(operations_meta_tool());
             tools.push(execute_operation_meta_tool());
@@ -1126,6 +1141,9 @@ async fn record_successful_runtime_evidence(
 
 fn initialize_tool_count(registry: &ToolRegistry) -> usize {
     let mut tool_count = registry.len();
+    if registry.is_coach_surface() {
+        return tool_count;
+    }
     if registry.is_router_mode() {
         tool_count += 2; // operations + execute_operation
     } else if registry.is_openai_agentic_surface() {
@@ -1180,6 +1198,9 @@ fn build_legacy_initialize_result_with_teaching(
     params: &serde_json::Value,
     protocol_teaching_enabled: bool,
 ) -> serde_json::Value {
+    if registry.is_coach_surface() {
+        return build_coach_initialize_result(registry, protocol_version);
+    }
     let mut result = serde_json::json!({
         "protocolVersion": protocol_version,
         "capabilities": {
@@ -1210,6 +1231,74 @@ fn build_legacy_initialize_result_with_teaching(
     }
 
     result
+}
+
+// ============================================================================
+// Agent Coach Kit surface
+// ============================================================================
+
+/// The name the coach surface introduces itself with.
+pub(crate) const COACH_SERVER_NAME: &str = "agent-coach-kit";
+
+/// `initialize` on the coach surface: Agent Coach Kit's own identity, its
+/// coaching instructions, and the component resource.
+pub(crate) fn build_coach_initialize_result(
+    registry: &ToolRegistry,
+    protocol_version: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": protocol_version,
+        "capabilities": {
+            "tools": { "listChanged": false },
+            "resources": { "listChanged": false }
+        },
+        "serverInfo": {
+            "name": COACH_SERVER_NAME,
+            "title": "Agent Coach Kit",
+            "version": mcp_types::config::VERSION
+        },
+        "instructions": domains::coach::COACH_SERVER_INSTRUCTIONS,
+        "toolCount": registry.len()
+    })
+}
+
+/// `server/discover` on the coach surface.
+pub(crate) fn build_coach_stateless_discover_result() -> serde_json::Value {
+    let mut result = mcp_types::build_stateless_discover_result(Some(
+        domains::coach::COACH_SERVER_INSTRUCTIONS.to_string(),
+    ));
+    if let Some(capabilities) = result
+        .get_mut("capabilities")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        capabilities.insert(
+            "resources".to_string(),
+            serde_json::json!({ "listChanged": false }),
+        );
+    }
+    result
+}
+
+/// `resources/list` on the coach surface: the ChatGPT component.
+pub(crate) fn coach_resources_list() -> serde_json::Value {
+    serde_json::json!({ "resources": [domains::coach::widget_resource()] })
+}
+
+/// `resources/templates/list` on the coach surface.
+pub(crate) fn coach_resource_templates_list() -> serde_json::Value {
+    serde_json::json!({ "resourceTemplates": [] })
+}
+
+/// `resources/read` on the coach surface, or the JSON-RPC error to answer.
+pub(crate) fn coach_resource_read(
+    params: &serde_json::Value,
+) -> std::result::Result<serde_json::Value, (i32, String)> {
+    let uri = params
+        .get("uri")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| (-32602, "Missing 'uri' parameter".to_string()))?;
+    domains::coach::read_widget_resource(uri)
+        .ok_or_else(|| (-32002, format!("Resource not found: {uri}")))
 }
 
 /// The finalized adapter is advertised only as one complete, tested unit.
@@ -1438,7 +1527,21 @@ async fn handle_request_dispatch(
     debug!("Handling request: method={}", method);
 
     match method {
+        "server/discover" if registry.is_coach_surface() => {
+            json_rpc_result(id, build_coach_stateless_discover_result())
+        }
         "server/discover" => json_rpc_result(id, build_contextstream_stateless_discover_result()),
+
+        "resources/list" if registry.is_coach_surface() => {
+            json_rpc_result(id, coach_resources_list())
+        }
+        "resources/templates/list" if registry.is_coach_surface() => {
+            json_rpc_result(id, coach_resource_templates_list())
+        }
+        "resources/read" if registry.is_coach_surface() => match coach_resource_read(&params) {
+            Ok(result) => json_rpc_result(id, result),
+            Err((code, message)) => json_rpc_error(id, code, &message),
+        },
 
         "initialize" => {
             // Deterministic per-`initialize`: apply the detected profile, or
@@ -1496,7 +1599,11 @@ async fn handle_request_dispatch(
             // Auto-init: if session isn't initialized and this isn't the init tool,
             // automatically trigger session init. This is the biggest difference-maker
             // for editors actually using ContextStream effectively.
-            if tool_name != "init" && tool_name != "context" && !session.is_initialized().await {
+            if tool_name != "init"
+                && tool_name != "context"
+                && !domains::coach::is_coach_tool(tool_name)
+                && !session.is_initialized().await
+            {
                 debug!(
                     "Auto-init: session not initialized, triggering init before '{}'",
                     tool_name
@@ -1537,8 +1644,8 @@ async fn handle_request_dispatch(
                 }
             }
 
-            // Handle router mode meta-operations
-            if registry.is_router_mode() {
+            // Handle router mode meta-operations (never on the coach surface)
+            if registry.is_router_mode() && !registry.is_coach_surface() {
                 match tool_name {
                     "operations" => {
                         return handle_router_operations(id, registry, arguments);
@@ -3125,6 +3232,13 @@ mod tests {
                 "openai-agentic",
                 Config {
                     tool_surface_profile: ToolSurfaceProfile::OpenaiAgentic,
+                    ..Config::default()
+                },
+            ),
+            (
+                "coach",
+                Config {
+                    tool_surface_profile: ToolSurfaceProfile::Coach,
                     ..Config::default()
                 },
             ),

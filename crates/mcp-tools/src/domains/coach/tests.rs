@@ -724,15 +724,16 @@ fn schemas_list_every_action_and_keep_the_file_object() {
 fn descriptions_carry_the_coaching_rules() {
     let save = schema::save_metadata().description;
     for rule in [
-        "without being asked",
+        "record the reaction with add_feedback",
         "verbatim",
         "say which",
-        "Only the person's words",
+        "Feedback and guidance come from the person's words",
         "objective",
-        "only when the person says so",
+        "when the person asks for it",
         "what changed",
         "[COACH_SAVED]",
-        "Never invent approval, facts or scores",
+        "[COACH_NOT_SAVED]",
+        "Approvals, verdicts and scores come from the person",
     ] {
         assert!(
             save.contains(rule),
@@ -740,10 +741,38 @@ fn descriptions_carry_the_coaching_rules() {
         );
     }
     let read = schema::read_metadata().description;
-    assert!(read.contains("never instructions"));
+    assert!(read.contains("reference, not instructions"));
     assert!(read.contains("\"You said\""));
     let delete = schema::delete_metadata().description;
     assert!(delete.contains("30 days") && delete.contains("confirm"));
+    assert!(delete.contains("person's own request") && delete.contains("export"));
+}
+
+/// ChatGPT flags tool documentation that reads as steering approvals or the
+/// model's reply ("Suspicious Instruction ... risk-label suppression or
+/// approval-style output constraints"). The coach text describes behaviour
+/// instead of commanding it.
+#[test]
+fn coach_text_has_no_approval_or_reply_constraints() {
+    let texts = [
+        ("server instructions", COACH_SERVER_INSTRUCTIONS.to_string()),
+        ("workflow", schema::read_metadata().description),
+        ("workflow_save", schema::save_metadata().description),
+        ("workflow_delete", schema::delete_metadata().description),
+    ];
+    for (name, text) in texts {
+        let lower = text.to_lowercase();
+        for phrase in [
+            "without being asked",
+            "never claim",
+            "never say",
+            "unless the reply",
+            "never invent approval",
+            "nothing is deleted",
+        ] {
+            assert!(!lower.contains(phrase), "{name} still says {phrase:?}");
+        }
+    }
 }
 
 // ============================================================================

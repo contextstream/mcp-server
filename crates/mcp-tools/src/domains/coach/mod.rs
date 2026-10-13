@@ -115,9 +115,9 @@ const DEFAULT_PUBLIC_MCP_ORIGIN: &str = "https://mcp.contextstream.io";
 /// What a host connected to `/coach` is told at `initialize`.
 pub const COACH_SERVER_INSTRUCTIONS: &str = "Agent Coach Kit: the person coaches you on work they ask for again and again. \
 Use `workflow` to read (start a job's draft from workflow(action=\"context\")), `workflow_save` to save, and `workflow_delete` only when the person asks to delete a whole workflow. \
-Save every reaction the person gives to a version, verbatim, without being asked; say whether you kept it for this job only or as reusable, and let them change it. \
-Only the person's words become feedback or guidance. Show what changed and what still needs attention. \
-Never claim a save unless the reply ends with [COACH_SAVED] or [COACH_ALREADY_SAVED], and never invent approval, facts or scores. \
+Record each reaction to a version verbatim with add_feedback, say if it is for this job only or later jobs, and let them change that. \
+Feedback and guidance come from the person's words. Show what changed and what still needs attention. \
+A save result ends with [COACH_SAVED] or [COACH_ALREADY_SAVED] when stored. Approvals, verdicts and scores come from the person; facts from the job's sources. \
 Coaching permission is not permission to publish, share, spend money or train models.";
 
 /// Whether `name` is one of the coach tools.

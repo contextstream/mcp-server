@@ -103,5 +103,35 @@ class PluginPackageTest(unittest.TestCase):
         broken(lambda copy: (copy / "assets" / "icon.svg").unlink())
 
 
+class ReviewRunSheetTest(unittest.TestCase):
+    """The run sheet and dry-run script stay in step with the manifest's review cases."""
+
+    def manifest(self):
+        return json.loads((PLUGINS / "agent-coach-kit" / "plugin.json").read_text())
+
+    def test_run_sheet_has_every_review_prompt_exactly(self):
+        sheet = (PLUGINS / "review" / "RUN-SHEET.md").read_text()
+        cases = self.manifest()["extensions"]["com.openai"]["review"]["test_cases"]
+        for case in cases["positive"] + cases["negative"]:
+            self.assertIn(case["prompt"], sheet, f"run sheet is missing: {case['prompt']}")
+
+    def test_prompts_do_not_ask_chatgpt_to_schedule_the_work(self):
+        # "recurring workflow" made ChatGPT create a scheduled task of its own in the account (2026-10-13).
+        face = self.manifest()["extensions"]["com.openai"]
+        prompts = list(face["interface"]["defaultPrompt"])
+        cases = face["review"]["test_cases"]
+        prompts += [case["prompt"] for case in cases["positive"] + cases["negative"]]
+        prompts += [case["description"] for case in cases["positive"] + cases["negative"]]
+        for prompt in prompts:
+            self.assertNotIn("recurring workflow", prompt.lower(), prompt)
+
+    def test_dry_run_script_compiles_and_never_prints_the_key(self):
+        path = PLUGINS / "review" / "dry_run.py"
+        source = path.read_text()
+        compile(source, str(path), "exec")
+        self.assertIsNone(re.search(r'print\([^)]*\bkey\b', source), 'the key must never be printed')
+        self.assertIsNone(re.search(r'\{(?:self\.)?key\}', source), 'the key must never be formatted into text')
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -29,8 +29,8 @@
         "privacyPolicyURL": "https://contextstream.io/privacy",
         "termsOfServiceURL": "https://contextstream.io/terms",
         "defaultPrompt": [
-          "Make my weekly team update a recurring workflow.",
-          "Start this week's job for my recurring update.",
+          "Set up my weekly team update as a workflow I can coach.",
+          "Start this week's job for my weekly update.",
           "What have you learned about my weekly update so far?"
         ],
         "brandColor": "#2F5BD3",
@@ -41,8 +41,8 @@
         "test_cases": {
           "positive": [
             {
-              "description": "Turn a rough idea into a recurring workflow with a one-line goal.",
-              "prompt": "Every Monday I write a short update for my leadership team: what changed, who is affected and what they need to do. Make that a recurring workflow.",
+              "description": "Turn a rough idea into a coaching workflow with a one-line goal.",
+              "prompt": "Every Monday I write a short update for my leadership team: what changed, who is affected and what they need to do. Set that up as a workflow I can coach.",
               "tools_triggered": [
                 "workflow",
                 "workflow_save"

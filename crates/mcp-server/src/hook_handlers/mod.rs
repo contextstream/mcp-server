@@ -39,6 +39,7 @@ pub mod task_completed;
 pub mod task_created;
 pub mod teammate_idle;
 pub mod user_prompt_submit;
+pub(crate) mod working_set;
 
 use anyhow::Result;
 use mcp_types::config::VERSION;

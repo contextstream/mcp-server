@@ -8294,6 +8294,136 @@ fn local_keyword_enrich_fallback(
     results
 }
 
+/// Most related projects searched per call, results kept per project, and
+/// the bound on each related search (the primary result never waits longer).
+const MAX_RELATED_SEARCH_PROJECTS: usize = 3;
+const RELATED_RESULTS_PER_PROJECT: usize = 5;
+const RELATED_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_500);
+
+struct RelatedProjectHits {
+    project: crate::domains::working_set::RelatedProject,
+    total: usize,
+    hits: Vec<mcp_types::api::SearchResult>,
+}
+
+/// One labelled search per related project of the session's working set, in
+/// parallel. Failures, timeouts, invalid scopes and empty results are dropped.
+async fn search_related_projects(
+    client: &ContextStreamClient,
+    requested_mode: SearchMode,
+    base_params: &SearchParams,
+    query: &str,
+    related: &[crate::domains::working_set::RelatedProject],
+) -> Vec<RelatedProjectHits> {
+    let searches = related
+        .iter()
+        .take(MAX_RELATED_SEARCH_PROJECTS)
+        .map(|project| {
+            let mut params = base_params.clone();
+            params.project_id = Some(project.id);
+            params.limit = Some(RELATED_RESULTS_PER_PROJECT as i64);
+            params.offset = None;
+            params.cursor = None;
+            // The checkout overlay and editor hints belong to the primary
+            // project's checkout.
+            params.installation_id = None;
+            params.checkout_locator = None;
+            params.hot_paths_hint = None;
+            async move {
+                let outcome = tokio::time::timeout(
+                    RELATED_SEARCH_TIMEOUT,
+                    run_search_for_mode(client, requested_mode, params, query, false),
+                )
+                .await;
+                match outcome {
+                    Ok(Ok((response, _, _)))
+                        if response.scope_is_valid() && !response.results.is_empty() =>
+                    {
+                        let total = response
+                            .total
+                            .map(|total| total as usize)
+                            .unwrap_or(response.results.len())
+                            .max(response.results.len());
+                        Some(RelatedProjectHits {
+                            project: project.clone(),
+                            total,
+                            hits: response
+                                .results
+                                .into_iter()
+                                .take(RELATED_RESULTS_PER_PROJECT)
+                                .collect(),
+                        })
+                    }
+                    _ => None,
+                }
+            }
+        });
+    futures::future::join_all(searches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn related_hit_snippet(hit: &mcp_types::api::SearchResult) -> String {
+    hit.content
+        .as_deref()
+        .or(hit.title.as_deref())
+        .and_then(|content| content.lines().map(str::trim).find(|line| !line.is_empty()))
+        .map(|line| line.chars().take(140).collect::<String>())
+        .unwrap_or_default()
+}
+
+/// Append the related-project section to the readable and structured output.
+fn append_related_project_results(
+    text: &mut String,
+    structured: &mut Value,
+    sections: &[RelatedProjectHits],
+) {
+    if sections.is_empty() {
+        return;
+    }
+    text.push_str(
+        "\n[RELATED_PROJECTS] Also found in related projects of this session (the primary project's results come first):\n",
+    );
+    let mut payload = Vec::new();
+    for section in sections {
+        text.push_str(&format!(
+            "  {} ({}): {} hit(s)\n",
+            section.project.name, section.project.id, section.total
+        ));
+        let mut hits = Vec::new();
+        for hit in &section.hits {
+            let location = match (hit.file_path.as_deref(), hit.start_line) {
+                (Some(path), Some(line)) => format!("{path}:{line}"),
+                (Some(path), None) => path.to_string(),
+                _ => hit.location.clone().unwrap_or_else(|| hit.id.clone()),
+            };
+            let snippet = related_hit_snippet(hit);
+            if snippet.is_empty() {
+                text.push_str(&format!("    {location}\n"));
+            } else {
+                text.push_str(&format!("    {location}  {snippet}\n"));
+            }
+            hits.push(serde_json::json!({
+                "file_path": hit.file_path,
+                "start_line": hit.start_line,
+                "snippet": snippet,
+            }));
+        }
+        payload.push(serde_json::json!({
+            "project_id": section.project.id,
+            "project_name": section.project.name,
+            "total": section.total,
+            "results": hits,
+        }));
+    }
+    text.push_str("Search one related project fully with project_id=<its id>.\n");
+    if let Some(object) = structured.as_object_mut() {
+        object.insert("related_project_results".to_string(), Value::Array(payload));
+    }
+}
+
 async fn run_search_for_mode(
     client: &ContextStreamClient,
     requested_mode: SearchMode,
@@ -13194,6 +13324,32 @@ impl SearchTool {
                         }
                     }
                 }
+            }
+        }
+
+        // Cross-project working set: the primary project's related projects
+        // get a labelled pass of their own after the primary result, so a
+        // session in one project also finds the code it calls in another.
+        if let Some(primary_id) = resolved_project_id.filter(|_| {
+            input.cursor.is_none()
+                && input.offset.unwrap_or(0) == 0
+                && !matches!(
+                    requested_mode,
+                    SearchMode::Team | SearchMode::Refactor | SearchMode::Crawl
+                )
+        }) {
+            let related =
+                crate::domains::working_set::related_projects_for(&self.client, primary_id).await;
+            if !related.is_empty() {
+                let sections = search_related_projects(
+                    &self.client,
+                    requested_mode,
+                    &base_params,
+                    &input.query,
+                    &related,
+                )
+                .await;
+                append_related_project_results(&mut text, &mut structured, &sections);
             }
         }
 

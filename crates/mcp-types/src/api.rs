@@ -808,6 +808,72 @@ pub struct ProjectRoutingContext {
     pub candidates: Vec<ProjectRoutingCandidate>,
 }
 
+/// A project in a session working set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkingSetProject {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    #[serde(default)]
+    pub project_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<Uuid>,
+}
+
+/// A related project: other code the same work touches.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkingSetEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    #[serde(default)]
+    pub project_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<Uuid>,
+    /// Registered checkout path (machine-specific hint).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How it joined: `message`, `activity` or `explicit`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub added_now: bool,
+}
+
+/// A project the user's message names without tying it to the work.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkingSetSuggestion {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    #[serde(default)]
+    pub project_name: String,
+}
+
+/// Primary project plus the related projects a session also touches,
+/// returned by init/context and the working-set endpoints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkingSetView {
+    #[serde(default)]
+    pub primary: WorkingSetProject,
+    #[serde(default)]
+    pub related: Vec<WorkingSetEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested: Vec<WorkingSetSuggestion>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub guidance: String,
+}
+
+impl WorkingSetView {
+    /// Ids of the related projects (primary excluded).
+    pub fn related_project_ids(&self) -> Vec<Uuid> {
+        self.related
+            .iter()
+            .filter_map(|entry| entry.project_id)
+            .filter(|id| Some(*id) != self.primary.project_id)
+            .collect()
+    }
+}
+
 /// Session context response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextResponse {
@@ -850,6 +916,9 @@ pub struct ContextResponse {
     /// Project-routing guidance when the API detects ambiguous or changed scope.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_routing: Option<ProjectRoutingContext>,
+    /// Primary project plus related projects this session also touches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_set: Option<WorkingSetView>,
     /// Active checkout selected for code-bearing context retrieval.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkout_scope: Option<CheckoutScopeStatus>,

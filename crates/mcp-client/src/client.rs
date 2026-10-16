@@ -5142,6 +5142,24 @@ impl ContextStreamClient {
         self.get(&format!("/projects/{}/statistics", id)).await
     }
 
+    /// The working set of project `id` for the caller: the related projects
+    /// work in this project also touches.
+    pub async fn project_working_set(&self, id: Uuid) -> Result<serde_json::Value> {
+        self.get(&format!("/projects/{}/working-set", id)).await
+    }
+
+    /// Add or remove related projects (`{"add": [...], "remove": [...],
+    /// "clear": bool}`; entries are project ids or names, or
+    /// `{"project", "source", "reason"}` objects).
+    pub async fn update_project_working_set(
+        &self,
+        id: Uuid,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.post(&format!("/projects/{}/working-set", id), body)
+            .await
+    }
+
     fn build_project_files_path(
         id: Uuid,
         page: Option<i64>,

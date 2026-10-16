@@ -971,6 +971,12 @@ pub struct ProjectInput {
     pub sections: Option<Value>,
     /// Claim from init's "write the brief" notice (for brief_update).
     pub claim_id: Option<String>,
+    /// Related projects to add to the working set (names or ids).
+    pub add: Option<Vec<String>>,
+    /// Related projects to remove from the working set (names or ids).
+    pub remove: Option<Vec<String>>,
+    /// Remove every related project from the working set.
+    pub clear: Option<bool>,
 }
 
 /// Unified project tool handler.
@@ -1129,7 +1135,110 @@ fn refresh_endpoint_is_unsupported(error: &Error) -> bool {
     )
 }
 
+/// Readable summary of a working-set read or update.
+fn working_set_text(
+    view: Option<&mcp_types::api::WorkingSetView>,
+    response: &Value,
+    changed: bool,
+) -> String {
+    let Some(view) = view else {
+        return "Working set unavailable.".to_string();
+    };
+    let primary = match view.primary.project_id {
+        Some(id) => format!("{} ({id})", view.primary.project_name),
+        None => view.primary.project_name.clone(),
+    };
+    let mut text = if view.related.is_empty() {
+        format!("Working set of {primary}: no related projects.")
+    } else {
+        let related = view
+            .related
+            .iter()
+            .map(|entry| {
+                let id = entry
+                    .project_id
+                    .map(|id| format!(" ({id}; {})", entry.sources.join("+")))
+                    .unwrap_or_default();
+                format!("{}{id}", entry.project_name)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "Working set of {primary}: related {related}. Search also covers the related projects (labelled). Keep {} as the primary project_id; save decisions, lessons, tickets and docs about a related project's code under that project's project_id.",
+            view.primary.project_name
+        )
+    };
+    if changed {
+        for (key, label) in [("added", "Added"), ("removed", "Removed")] {
+            let count = response
+                .get(key)
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if count > 0 {
+                text.push_str(&format!(" {label} {count}."));
+            }
+        }
+        if let Some(unresolved) = response.get("unresolved").and_then(Value::as_array) {
+            for item in unresolved {
+                let reference = item.get("reference").and_then(Value::as_str).unwrap_or("?");
+                let reason = item
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("not resolved");
+                text.push_str(&format!("\nNot changed: {reference} ({reason})."));
+            }
+        }
+    }
+    text
+}
+
 impl ProjectTool {
+    /// `working_set`: list, or add/remove related projects of `project_id`.
+    async fn working_set_action(
+        &self,
+        input: &ProjectInput,
+        project_id: Uuid,
+    ) -> Result<ToolResult> {
+        let clean = |values: &Option<Vec<String>>| {
+            values
+                .iter()
+                .flatten()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        };
+        let add = clean(&input.add);
+        let remove = clean(&input.remove);
+        let clear = input.clear.unwrap_or(false);
+        let changed = !add.is_empty() || !remove.is_empty() || clear;
+        let response = if changed {
+            self.client
+                .update_project_working_set(
+                    project_id,
+                    serde_json::json!({ "add": add, "remove": remove, "clear": clear }),
+                )
+                .await?
+        } else {
+            self.client.project_working_set(project_id).await?
+        };
+        let view_value = if changed {
+            response.get("working_set").cloned().unwrap_or(Value::Null)
+        } else {
+            response.clone()
+        };
+        let view = serde_json::from_value::<mcp_types::api::WorkingSetView>(view_value).ok();
+        if view.is_some() {
+            super::working_set::remember_related_projects(
+                project_id,
+                super::working_set::related_from_view(view.as_ref()),
+            );
+        }
+        Ok(ToolResult::with_structured(
+            working_set_text(view.as_ref(), &response, changed),
+            response,
+        ))
+    }
+
     /// `brief`, `brief_update`, and `brief_refresh` for one project.
     async fn project_brief_action(
         &self,
@@ -1852,11 +1961,11 @@ impl ProjectTool {
 }
 
 /// Routing summary advertised as the tool description (<= 1024 chars).
-const PROJECT_TOOL_DESCRIPTION: &str = "Project management. Actions: list, get, create, update, merge (combine duplicate projects), index (preferred hosted workflow via the managed sync bridge; requires_sync_bridge means repair the bridge while keeping hosted MCP), ingest_local (direct indexing only when this process can read the folder), index_status, index_history, overview, statistics, files, recent_changes, brief / brief_update / brief_refresh (the project brief every session starts with), team_projects. Destructive cleanup: delete (remove the project), purge (de-index everything but keep the record), forget_local (stop this machine re-indexing a folder; server data untouched), remove_paths (de-index exact paths). Full action reference: the `action` parameter.";
+const PROJECT_TOOL_DESCRIPTION: &str = "Project management. Actions: list, get, create, update, merge (combine duplicate projects), index (preferred hosted workflow via the managed sync bridge; requires_sync_bridge means repair the bridge while keeping hosted MCP), ingest_local (direct indexing only when this process can read the folder), index_status, index_history, overview, statistics, files, recent_changes, brief / brief_update / brief_refresh (the project brief every session starts with), working_set (related projects for cross-project work), team_projects. Destructive cleanup: delete (remove the project), purge (de-index everything but keep the record), forget_local (stop this machine re-indexing a folder; server data untouched), remove_paths (de-index exact paths). Full action reference: the `action` parameter.";
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const PROJECT_TOOL_REFERENCE: &str = "Project management. Actions: list, get, create, update, merge/combine duplicate projects, index (preferred hosted workflow: requests the registered managed sync bridge for the exact checkout, or ingests directly only when this process already has disk access; requires_sync_bridge means repair bridge/hooks/Desktop while keeping hosted MCP), delete (remove the project), purge (completely de-index a project — removes file_indices, code chunks, search vectors, and stored files but keeps the project record), forget_local (stop this machine from re-indexing a folder: removes its local mapping/registry entry and drops the active session's project scope; server data untouched), remove_paths (de-index specific files by exact path — deletes their vectors, indexed rows, and stored files server-side, but keeps the project; pass paths=[...]), overview, statistics, files, index_status, index_history (audit trail of indexed files), ingest_local (optional direct indexing only when this process can read the folder; reuses a unique credential-free Git repository match across machines/worktrees, otherwise creates a project and records that identity — pass skip_project_creation=true to disable creation), team_projects (list all team projects - team plans only), recent_changes (git log/diff for recent file changes), brief (the project brief every session starts with), brief_update (store brief sections; pass expected_version from the brief header), brief_refresh (rebuild the brief from the index).";
+const PROJECT_TOOL_REFERENCE: &str = "Project management. Actions: list, get, create, update, merge/combine duplicate projects, index (preferred hosted workflow: requests the registered managed sync bridge for the exact checkout, or ingests directly only when this process already has disk access; requires_sync_bridge means repair bridge/hooks/Desktop while keeping hosted MCP), delete (remove the project), purge (completely de-index a project — removes file_indices, code chunks, search vectors, and stored files but keeps the project record), forget_local (stop this machine from re-indexing a folder: removes its local mapping/registry entry and drops the active session's project scope; server data untouched), remove_paths (de-index specific files by exact path — deletes their vectors, indexed rows, and stored files server-side, but keeps the project; pass paths=[...]), overview, statistics, files, index_status, index_history (audit trail of indexed files), ingest_local (optional direct indexing only when this process can read the folder; reuses a unique credential-free Git repository match across machines/worktrees, otherwise creates a project and records that identity — pass skip_project_creation=true to disable creation), team_projects (list all team projects - team plans only), recent_changes (git log/diff for recent file changes), brief (the project brief every session starts with), brief_update (store brief sections; pass expected_version from the brief header), brief_refresh (rebuild the brief from the index), working_set (the primary project's related projects: other projects the same work also changes; search covers them, labelled; pass add=[...] / remove=[...] by name or id, or clear=true; with no changes it lists them).";
 
 #[async_trait]
 impl ToolHandler for ProjectTool {
@@ -2191,6 +2300,20 @@ impl ToolHandler for ProjectTool {
                 .await?
                 .project_id;
                 self.project_brief_action(&input, id).await
+            }
+            "working_set" => {
+                let id = resolve_read_project(
+                    &self.client,
+                    &self.session,
+                    "working_set",
+                    workspace_id,
+                    explicit_project_id,
+                    project_id,
+                    folder,
+                )
+                .await?
+                .project_id;
+                self.working_set_action(&input, id).await
             }
             "overview" => {
                 let id = resolve_read_project(
@@ -2706,7 +2829,7 @@ impl ToolHandler for ProjectTool {
                 Ok(ToolResult::with_structured(text, result))
             }
             _ => Err(Error::Validation(format!(
-                "Unknown action: {}. Available actions: list, get, create, update, merge, combine, index, delete, purge, forget_local, remove_paths, overview, statistics, files, index_status, index_history, ingest_local, team_projects, recent_changes.",
+                "Unknown action: {}. Available actions: list, get, create, update, merge, combine, index, delete, purge, forget_local, remove_paths, overview, statistics, files, index_status, index_history, ingest_local, team_projects, recent_changes, brief, brief_update, brief_refresh, working_set.",
                 input.action
             ))),
         }
@@ -2749,6 +2872,7 @@ impl ToolHandler for ProjectTool {
             "brief",
             "brief_update",
             "brief_refresh",
+            "working_set",
         ];
 
         SchemaBuilder::new()
@@ -2861,6 +2985,24 @@ impl ToolHandler for ProjectTool {
             .integer(
                 "limit",
                 "Maximum commits to return (for recent_changes, default: 10, max: 50)",
+                false,
+            )
+            // Working set fields
+            .array(
+                "add",
+                "Related projects to add, by name or id (for working_set)",
+                "string",
+                false,
+            )
+            .array(
+                "remove",
+                "Related projects to remove, by name or id (for working_set)",
+                "string",
+                false,
+            )
+            .boolean(
+                "clear",
+                "Remove every related project (for working_set)",
                 false,
             )
             .build()

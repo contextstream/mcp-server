@@ -3257,6 +3257,22 @@ impl ToolHandler for InitTool {
             text.push_str("\n\n");
             text.push_str(&project_routing_notice);
         }
+        {
+            let routing = parse_project_routing_from_value(&result);
+            let working_set = crate::domains::working_set::parse_working_set(&result);
+            if let Some(primary_id) = resolved_project_id {
+                crate::domains::working_set::remember_related_projects(
+                    primary_id,
+                    crate::domains::working_set::related_from_view(working_set.as_ref()),
+                );
+            }
+            crate::domains::working_set::apply_scope_alerts(
+                &mut text,
+                &mut result,
+                routing.as_ref(),
+                working_set.as_ref(),
+            );
+        }
 
         attach_scope_guidance(&mut result, resolved_workspace_id, resolved_project_id);
 
@@ -4869,9 +4885,13 @@ const CONTEXT_STRUCTURED_PROTECTED_ORDER: &[&str] = &[
     // `coordination_inbox` sorts early and would be removed before anything
     // else.
     "coordination_inbox",
+    // Primary and related projects for cross-project work.
+    "working_set",
     // This is the structured form of the tool's primary job. Preserve it
     // after duplicated context/summary fields and every diagnostic surface.
     "grounding_hits",
+    // Wrong-scope banners and the working-set line: dropped last.
+    "scope_alerts",
 ];
 
 fn record_context_wire_field(fields: &mut Vec<String>, field: &str) {
@@ -5397,12 +5417,26 @@ fn context_exact_fail_honest_result(
     fallback
 }
 
+/// Scope alerts are rebuilt on every emission (fresh, warm-cache or delta),
+/// so a wrong project scope stays visible until it is fixed.
+fn apply_context_scope_alerts(text: &mut String, structured: &mut Value) {
+    let routing = parse_project_routing_from_value(structured);
+    let working_set = crate::domains::working_set::parse_working_set(structured);
+    crate::domains::working_set::apply_scope_alerts(
+        text,
+        structured,
+        routing.as_ref(),
+        working_set.as_ref(),
+    );
+}
+
 fn context_wire_result(
-    text: String,
-    structured: Value,
+    mut text: String,
+    mut structured: Value,
     requested_tokens: usize,
     policy: &ContextWireTokenizerPolicy,
 ) -> ToolResult {
+    apply_context_scope_alerts(&mut text, &mut structured);
     let requested_tokens = requested_tokens.clamp(50, 4000);
     let target_tokens = requested_tokens.saturating_add(CONTEXT_WIRE_ENVELOPE_TOKENS);
     let exact_available = crate::wire_tokens::o200k_is_warm();
@@ -9898,6 +9932,12 @@ impl ToolHandler for ContextTool {
             grounding_state::mark_grounding_emitted_with_summary(fp, summary);
         }
 
+        if let Some(primary_id) = project_id {
+            crate::domains::working_set::remember_related_projects(
+                primary_id,
+                crate::domains::working_set::related_from_view(result.working_set.as_ref()),
+            );
+        }
         let mut structured = serde_json::to_value(&result).unwrap_or_default();
         attach_scope_guidance(&mut structured, workspace_id, project_id);
         if let Some(obj) = structured.as_object_mut() {

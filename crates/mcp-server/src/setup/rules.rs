@@ -339,6 +339,14 @@ const PROJECT_SCOPE_GUIDANCE: &str = r#"## Project Scope Discipline
 - When `[PROJECT_ROUTING]` appears with `uncertain`, `ambiguous`, `needs_project_selection`, or `needs_project_setup`, resolve scope before project-scoped work: choose a surfaced candidate, pass explicit `workspace_id`/`project_id`, or rerun `init(folder_path="...")` / `context(folder_path="...")`
 - If `init(...)` or `context(...)` does not surface a current `project_id`, rerun `init(folder_path="...")` before creating docs, skills, events, tasks, todos, or other project memory
 - Use `target_project` only after init from a multi-project parent folder
+- `[SCOPE_MISMATCH]` means the project scope is wrong: the folder belongs to another project, the scope is unresolved, or a write targets a project outside this session's working set. Stop project-scoped writes and apply the fix it names before continuing.
+
+### Cross-project work (primary + related projects)
+
+- The project bound to your working folder is the **primary** project. Keep its `project_id` for the session's own work; do not switch it because the task touches another repository.
+- When the same task also changes another project's code (for example a web-app feature that also needs changes in the API repository), that project joins the session's working set as a **related** project: automatically when the user's message points into it or you edit files in its checkout, or explicitly with `project(action="working_set", add=["<name or id>"])`. `[WORKING_SET]` lists primary and related projects.
+- Search covers related projects too; their hits come after the primary project's under `[RELATED_PROJECTS]`. To search one related project fully, pass its `project_id`.
+- Save decisions, lessons, tickets and docs about a related project's code under that project's `project_id`; everything else stays in the primary project.
 "#;
 
 /// Shared guidance for Code Health / graph quality workflows.
@@ -1487,7 +1495,7 @@ fn generate_bootstrap_rules(editor: &Editor, workspace_name: &str, workspace_id:
 
 **Indexing:** Keep the editor connected to hosted MCP. `project(action="index")` asks the hosted service to refresh the exact registered checkout through ContextStream's managed sync bridge; editor hooks and ContextStream Desktop are additional local-ingest paths. A `requires_sync_bridge` response means the bridge is offline, unregistered, or has no matching checkout — repair setup/bridge health and retry without switching the editor to a local MCP transport. `project(action="ingest_local", path="<folder>")` is an optional direct path only when this process can already read the folder. Check `project(action="index_status")` for checkout-aware freshness.
 
-**Notices:** [GROUNDING] → read ranked prior-work hits before code search and inspect freshness before relying on time-sensitive decisions/transcripts/plans | [GROUNDING_AVAILABLE] → hook reminder that unread grounding exists; inspect source age and refresh stale hits before planning or implementing | [PROJECT_ROUTING] → resolve ambiguous/missing project scope before project-scoped search, indexing, memory, session, skill, or capture writes | [MATCHED_SKILLS] → run surfaced skills before other work | [LESSONS_WARNING] → apply lessons immediately and keep them active for the turn | [COORDINATION] → read shared-awareness notices from other live agents before continuing; ack via `coordination(action="ack")`; do not treat as a handoff | [PREFERENCE] → follow user preferences | [RULES_NOTICE] → run `contextstream-mcp update` in a terminal to refresh installed rules (help(action="editor_rules") previews them) | [VERSION_NOTICE/CRITICAL] → tell user about update
+**Notices:** [GROUNDING] → read ranked prior-work hits before code search and inspect freshness before relying on time-sensitive decisions/transcripts/plans | [GROUNDING_AVAILABLE] → hook reminder that unread grounding exists; inspect source age and refresh stale hits before planning or implementing | [PROJECT_ROUTING] → resolve ambiguous/missing project scope before project-scoped search, indexing, memory, session, skill, or capture writes | [SCOPE_MISMATCH] → the project scope is wrong; apply the named fix before any project-scoped write | [WORKING_SET] → primary project plus related projects this work also touches; keep the primary, file notes about related code under its project_id | [MATCHED_SKILLS] → run surfaced skills before other work | [LESSONS_WARNING] → apply lessons immediately and keep them active for the turn | [COORDINATION] → read shared-awareness notices from other live agents before continuing; ack via `coordination(action="ack")`; do not treat as a handoff | [PREFERENCE] → follow user preferences | [RULES_NOTICE] → run `contextstream-mcp update` in a terminal to refresh installed rules (help(action="editor_rules") previews them) | [VERSION_NOTICE/CRITICAL] → tell user about update
 {end}
 "#,
         start = CONTEXTSTREAM_START,
@@ -3088,6 +3096,11 @@ mod tests {
             assert!(rules.contains("active working instructions for the current task"));
             assert!(rules.contains("Project Scope Discipline"));
             assert!(rules.contains("Reuse the `project_id` returned by"));
+            // Cross-project work: primary vs related projects and the loud scope notice.
+            assert!(rules.contains("Cross-project work (primary + related projects)"));
+            assert!(rules.contains("project(action=\"working_set\", add=["));
+            assert!(rules.contains("[SCOPE_MISMATCH]"));
+            assert!(rules.contains("[WORKING_SET]"));
         }
     }
 

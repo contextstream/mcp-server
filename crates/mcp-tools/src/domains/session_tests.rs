@@ -7430,3 +7430,73 @@ mod init_scope_resolution_tests {
             .is_none());
     }
 }
+
+#[test]
+fn context_scope_alerts_reach_structured_content_on_every_emission() {
+    let context = crate::wire_tokens::WireResponseContext::http_jsonrpc(
+        Some(json!("context-scope-alerts")),
+        None,
+        None,
+    );
+    let policy = ContextWireTokenizerPolicy {
+        decision: crate::wire_tokens::RolloutDecision {
+            mode: crate::wire_tokens::RolloutMode::Proxy,
+            compatibility: crate::wire_tokens::TokenizerCompatibility::VerifiedO200k,
+            measure_exact: false,
+            enforce_exact: false,
+            canary_selected: false,
+            canary_basis_points: 0,
+        },
+        context,
+    };
+    let current = uuid::Uuid::from_u128(0x11);
+    let other = uuid::Uuid::from_u128(0x22);
+    let structured = json!({
+        "context": "grounded evidence ".repeat(600),
+        "project_routing": {
+            "status": "uncertain",
+            "reason": "folder_bound_to_different_project",
+            "current_project_id": current,
+            "current_project_name": "acme-web",
+            "folder_path": "/work/acme-api",
+            "project_switch_signal": false,
+            "suggested_action": "Switch project scope to acme-api or pass the intended project_id explicitly.",
+            "candidates": [{"project_id": other, "project_name": "acme-api", "score": 1.0}]
+        },
+        "working_set": {
+            "primary": {"project_id": current, "project_name": "acme-web"},
+            "related": [],
+            "suggested": [{"project_id": uuid::Uuid::from_u128(0x33), "project_name": "acme-desktop"}]
+        }
+    });
+    // Twice: the alert is never deduplicated. The small budget forces the
+    // wire compaction; the alerts are the last structured field it drops.
+    for requested_tokens in [2_000, 300, 300] {
+        let result = context_wire_result(
+            "body".to_string(),
+            structured.clone(),
+            requested_tokens,
+            &policy,
+        );
+        let content = result.structured_content.as_ref().expect("structured");
+        let alerts = content["scope_alerts"].as_array().expect("scope_alerts");
+        assert!(
+            alerts[0]
+                .as_str()
+                .unwrap()
+                .starts_with("[SCOPE_MISMATCH] /work/acme-api belongs to acme-api ("),
+            "{alerts:?}"
+        );
+        assert!(alerts[1]
+            .as_str()
+            .unwrap()
+            .starts_with("[WORKING_SET] primary=acme-web ("));
+        let text = match result.content.first() {
+            Some(mcp_types::tool::ContentItem::Text { text }) => text.as_str(),
+            _ => "",
+        };
+        if requested_tokens == 2_000 {
+            assert!(text.starts_with("[SCOPE_MISMATCH]"), "{text}");
+        }
+    }
+}

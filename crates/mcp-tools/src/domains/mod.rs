@@ -31,6 +31,7 @@ pub mod search;
 pub mod session;
 pub mod skill;
 pub mod vcs;
+pub(crate) mod working_set;
 pub mod workspace;
 pub mod workspace_drift;
 

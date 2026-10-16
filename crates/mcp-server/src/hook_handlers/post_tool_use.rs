@@ -927,6 +927,19 @@ pub async fn handle() -> Result<()> {
         {
             super::prompt_state::clear_context_required(&cwd);
         }
+        // Keep this host session's copy of its working set in line with the
+        // server's, so PreToolUse can judge cross-project writes offline.
+        let carries_working_set = matches!(normalized_tool_name.as_str(), "init" | "context")
+            || (normalized_tool_name == "project"
+                && contextstream_action(&tool_input) == "working_set");
+        if carries_working_set && tool_call_succeeded(&tool_response) {
+            if let (Some(host_session), Some(response)) = (
+                super::common::host_session_key(&input),
+                response_json(&tool_response),
+            ) {
+                super::working_set::observe_tool_response(&host_session, &response);
+            }
+        }
     }
 
     // An approved plan-mode plan is saved to ContextStream. This is not a file
@@ -1067,10 +1080,16 @@ pub async fn handle() -> Result<()> {
         reached_drain
     };
     let host_session = host_session_id(&input);
-    let (mirror_notes, reached_drain) = tokio::join!(
+    let working_set_host = super::common::host_session_key(&input);
+    let (mut mirror_notes, reached_drain, working_set_note) = tokio::join!(
         mirror_repo_docs(&absolute_paths, host_session.as_deref()),
-        index_files
+        index_files,
+        super::working_set::observe_edits(working_set_host.as_deref(), &cwd, &absolute_paths)
     );
+    // Edits in another project's checkout: say so before anything else.
+    if let Some(note) = working_set_note {
+        mirror_notes.insert(0, note);
+    }
 
     // PostToolUse-tail drain: flush any edits recorded this turn that the
     // single-file push didn't commit (e.g. a MultiEdit fan-out, or a push that

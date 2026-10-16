@@ -230,11 +230,11 @@ struct MirrorState {
     entries: BTreeMap<String, MirrorEntry>,
 }
 
-fn state_dir() -> Option<PathBuf> {
+pub(crate) fn state_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".contextstream"))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -266,7 +266,7 @@ fn write_state_atomically<S: Serialize>(path: &Path, state: &S) -> std::io::Resu
 
 /// Read-modify-write a JSON state file under an advisory lock on a stable
 /// sibling, so parallel hooks never lose each other's entries.
-fn with_locked_json<S, T>(path: &Path, update: impl FnOnce(&mut S) -> T) -> Option<T>
+pub(crate) fn with_locked_json<S, T>(path: &Path, update: impl FnOnce(&mut S) -> T) -> Option<T>
 where
     S: Default + Serialize + serde::de::DeserializeOwned,
 {
@@ -499,6 +499,29 @@ fn folders_related(a: &str, b: &str) -> bool {
     !a.is_empty()
         && !b.is_empty()
         && (a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/")))
+}
+
+/// The workspace and project the server resolved for this host session
+/// (whatever folder it was initialized from), if a hook saw them within the
+/// last day.
+pub(crate) fn session_primary_scope(host_session_id: &str) -> Option<(Uuid, Uuid)> {
+    session_primary_scope_at(&session_scopes_path()?, host_session_id)
+}
+
+fn session_primary_scope_at(path: &Path, host_session_id: &str) -> Option<(Uuid, Uuid)> {
+    let bytes = std::fs::read(path).ok()?;
+    let state: SessionScopes = serde_json::from_slice(&bytes).ok()?;
+    let entry = state
+        .sessions
+        .get(&sha256_hex(host_session_id.as_bytes()))?;
+    let fresh = chrono::DateTime::parse_from_rfc3339(&entry.updated_at).is_ok_and(|updated| {
+        chrono::Utc::now().signed_duration_since(updated)
+            <= chrono::Duration::hours(SESSION_SCOPE_MAX_AGE_HOURS)
+    });
+    fresh
+        .then_some(entry.project_id)
+        .flatten()
+        .map(|project_id| (entry.workspace_id, project_id))
 }
 
 fn session_scope_at(
@@ -1208,6 +1231,12 @@ mod tests {
         assert_eq!(session_scope_at(&path, "host-1", "/repo/application"), None);
         assert_eq!(session_scope_at(&path, "host-1", "/other"), None);
         assert_eq!(session_scope_at(&path, "host-2", "/repo/app"), None);
+        // The session's primary project, whatever folder a hook asks from.
+        assert_eq!(
+            session_primary_scope_at(&path, "host-1"),
+            Some((workspace, project))
+        );
+        assert_eq!(session_primary_scope_at(&path, "host-2"), None);
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
             !raw.contains("host-1"),

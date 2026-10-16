@@ -2045,3 +2045,93 @@ mod registration_tests {
         assert_eq!(all_actions.len(), 19);
     }
 }
+
+#[tokio::test]
+async fn working_set_add_posts_references_and_reports_related_projects() {
+    let primary = uuid::Uuid::from_u128(0x11);
+    let related = uuid::Uuid::from_u128(0x22);
+    let response = json!({
+        "success": true,
+        "data": {
+            "working_set": {
+                "primary": {"project_id": primary, "project_name": "acme-web"},
+                "related": [{
+                    "project_id": related,
+                    "project_name": "acme-api",
+                    "sources": ["explicit"],
+                    "first_seen_at": "2026-10-16T00:00:00Z",
+                    "last_seen_at": "2026-10-16T00:00:00Z",
+                    "added_now": true
+                }],
+                "guidance": "Keep acme-web as the primary project."
+            },
+            "added": [related],
+            "removed": [],
+            "unresolved": [{"reference": "nope", "reason": "no accessible project with this name"}]
+        }
+    });
+    let (tool, server) =
+        project_tool_with_http_sequence(vec![("200 OK", response.to_string())]).await;
+    let input: ProjectInput = serde_json::from_value(json!({
+        "action": "working_set",
+        "add": ["acme-api", " nope ", ""]
+    }))
+    .expect("working set input");
+
+    let result = tool
+        .working_set_action(&input, primary)
+        .await
+        .expect("working set result");
+    let text = tool_result_text(&result);
+    assert!(text.starts_with("Working set of acme-web ("), "{text}");
+    assert!(
+        text.contains(&format!("related acme-api ({related}; explicit)")),
+        "{text}"
+    );
+    assert!(text.contains("Added 1."), "{text}");
+    assert!(
+        text.contains("Not changed: nope (no accessible project with this name)."),
+        "{text}"
+    );
+    let structured = result.structured_content.expect("structured result");
+    assert_eq!(
+        structured["working_set"]["related"][0]["project_name"],
+        "acme-api"
+    );
+
+    let requests = server.await.expect("working set request server");
+    assert!(requests[0].starts_with(&format!("POST /api/v1/projects/{primary}/working-set ")));
+    let body: serde_json::Value = serde_json::from_str(
+        requests[0]
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("working set body"),
+    )
+    .expect("working set body json");
+    assert_eq!(body["add"], json!(["acme-api", "nope"]));
+    assert_eq!(body["remove"], json!([]));
+    assert_eq!(body["clear"], json!(false));
+}
+
+#[tokio::test]
+async fn working_set_without_changes_reads_it() {
+    let primary = uuid::Uuid::from_u128(0x11);
+    let response = json!({
+        "data": {
+            "primary": {"project_id": primary, "project_name": "acme-web"},
+            "related": [],
+            "guidance": "Primary project is acme-web."
+        }
+    });
+    let (tool, server) =
+        project_tool_with_http_sequence(vec![("200 OK", response.to_string())]).await;
+    let input: ProjectInput =
+        serde_json::from_value(json!({"action": "working_set"})).expect("input");
+    let result = tool
+        .working_set_action(&input, primary)
+        .await
+        .expect("working set read");
+    assert!(tool_result_text(&result).contains("no related projects"));
+    let requests = server.await.expect("server");
+    assert!(requests[0].starts_with(&format!("GET /api/v1/projects/{primary}/working-set ")));
+}

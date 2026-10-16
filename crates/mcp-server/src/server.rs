@@ -2720,8 +2720,11 @@ mod tests {
             "afbb3233e8a5d08967ea18f4c6da6e9ee2d0f36e492a6faf12348c69ccbee025",
         ),
         (
+            // Additive: action=working_set with `add`, `remove` and `clear`
+            // (related projects for cross-project work). Every earlier field
+            // and action still accepted.
             "project",
-            "dbbff3e4eae3b034ff99646d3e9e72efb6c1a3adec3c81d6a1548304c0c440ed",
+            "24ebed24d7cf30248dfb89ce05e0f0c064db3f45b84f4dd63382afb789f63cda",
         ),
         (
             "qa",

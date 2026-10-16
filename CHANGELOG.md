@@ -2,6 +2,46 @@
 
 ## 1.0.25
 
+- Scope alerts you cannot miss. `init` and `context` now put a `scope_alerts`
+  array in the structured result as well as `[SCOPE_MISMATCH]` in the text,
+  because clients such as Claude Code hand the model only the structured part.
+  An alert covers a folder or repository that belongs to another project,
+  several projects claiming one repository, and a scope that is unresolved or
+  needs setup. It is rebuilt on every call and never deduplicated, so it stays
+  until the scope is fixed, and in the wire budget it is the last structured
+  field to be dropped (e1c49e6).
+- Working set: a session has a primary project (the one bound to the working
+  folder) and related projects the same work touches. The server returns
+  `working_set` (primary, related, suggested) with `init` and `context`, shown
+  as a `[WORKING_SET]` line. A project joins as related when your message names
+  its checkout, when an edit lands in its checkout, or with
+  `project(action="working_set", add=[...])`; `remove=[...]` and `clear=true`
+  take projects out. A folder that belongs to a related project is cross-project
+  work, not a mismatch. The `project` tool's input schema gains `add`, `remove`
+  and `clear`; every earlier field and action is still accepted (e1c49e6).
+- Search covers related projects: the primary project's results come first,
+  then a labelled `[RELATED_PROJECTS]` section (`related_project_results` in the
+  structured result) with up to 5 results from each of up to 3 related
+  projects, read within 2.5 seconds. The related list comes from a per-caller
+  cache that `init` and `context` fill (5 minutes) or one bounded API read, so it
+  works on the stateless hosted transport. To search one related project fully,
+  pass its `project_id` (e1c49e6).
+- Hooks judge scope. PostToolUse notices an edit in another linked checkout,
+  records that project as related on the server and in a local per-session
+  copy, and tells the agent once per project. PreToolUse checks every
+  scope-sensitive ContextStream call: a project outside the working set, or
+  another workspace, gets `[SCOPE_MISMATCH]` with the exact fix, reads included;
+  the primary and related projects are quiet, and tickets stay quiet inside the
+  workspace. This replaces the generic "Scope alignment warning", which also
+  fired on deliberate cross-project writes. The managed rules and the prompt
+  reminders explain primary and related projects and the two notices (e1c49e6).
+- Search keeps `duplicate_count` and `duplicate_locations` in compact output.
+  The API now folds identical chunks found at different paths into one result;
+  when the structured payload went over its budget the compact form kept only
+  an allowlist of metadata and dropped both fields. Compact output now keeps the
+  count and shows up to 5 `path:start-end` locations (then "+N more"), and the
+  text adds a line such as "identical chunk also in 5 other files: ...".
+  Uncompacted output is unchanged (b0deb40).
 - Agent Coach Kit: the `/coach` server instructions and the `workflow` and
   `workflow_save` descriptions now say when the kit applies. A host that adds
   the server by address (the pilot route) receives no skill file, so these
@@ -24,8 +64,27 @@
   boundary (repository only), and the review run sheet has the reviewer type
   the first case without choosing the plugin first, so the recording shows
   whether ChatGPT reaches for it unprompted (repository only).
-- Test fixtures in the search tests use neutral paths and documentation UUIDs
-  again, which the public-boundary check had flagged since 1.0.24's search fix.
+- Test fixtures in the compact-search tests use neutral paths and documentation
+  UUIDs (67a2f62); the public-boundary check had failed on `main` since those
+  tests were added (b0deb40).
+
+Who gets what: the scope alerts, the working set, the related-project search
+and the project tool's new parameters reach hosted clients when the hosted
+gateway runs this version, and need the ContextStream API that returns
+`working_set` (live). The hook behaviour and the new rules text reach a machine
+after `contextstream-mcp update` (the rules also need a rules refresh). The
+coach text reaches ChatGPT and Codex with the hosted gateway; the kit and the
+plugin package live in the repository and are not part of the npm package or
+the binaries.
+
+Dependencies: `rustls`, the TLS library the client and the hosted gateway use,
+moves from 0.23.45 to 0.23.46 in `Cargo.lock` for RUSTSEC-2026-0346 (`Debug`
+output of client session values exposed TLS secrets), RUSTSEC-2026-0347
+(buffered application data sent after an ECH rejection), RUSTSEC-2026-0348
+(Brotli certificate decompression could allocate up to 1 GiB before
+authentication) and RUSTSEC-2026-0349 (an unauthenticated ServerHello could
+downgrade later connections to classical key exchange), all published on
+2026-10-14. No other dependency changes.
 
 ## 1.0.24
 

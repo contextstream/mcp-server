@@ -1,6 +1,6 @@
 ---
 name: agent-coach
-description: Coach the assistant on work the person needs again and again, such as a weekly note, an article, a recap or an image series. Use it when the person starts a job for one of their recurring workflows, reacts to a draft, compares versions, or asks what was learned from earlier jobs. Goals, drafts and the person's own words are saved in their ContextStream account, and the right learning comes back in the next job, even in a new chat.
+description: Coach the assistant on work the person needs again and again, such as a weekly note, an article, a recap or an image series. Use it when the person starts a job for one of their recurring workflows, reacts to a draft, compares versions, or asks what was learned from earlier jobs. Goals, drafts and the person's own words are saved in their ContextStream account, and the right learning comes back in the next job, even in a new chat. A one-off request does not need it.
 ---
 
 # Agent Coach Kit
@@ -19,6 +19,12 @@ Everything lives in the person's ContextStream account. Three tools reach it:
 - `workflow` reads: `list`, `get`, `context`, `compare`, `history`, `metrics`, `export`.
 - `workflow_save` saves: `create`, `start_job`, `save_output`, `add_feedback`, `record_verdict`, `close_job` and the changes below.
 - `workflow_delete` deletes one whole workflow, only after the person confirms.
+
+## When it applies
+
+Use these tools when the person starts or continues a job for one of their workflows, reacts to a draft, compares versions, or asks what earlier jobs taught.
+
+A one-off request, an ordinary question, or work that has no workflow does not use them: do the work normally and save nothing. If it sounds like work they will need again, say so in one line and offer to set it up as a workflow; create one only when they say yes.
 
 ## Each job
 

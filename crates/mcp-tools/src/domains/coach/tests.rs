@@ -769,10 +769,32 @@ fn coach_text_has_no_approval_or_reply_constraints() {
             "unless the reply",
             "never invent approval",
             "nothing is deleted",
+            "do not use",
+            "never use",
+            "recurring workflow",
         ] {
             assert!(!lower.contains(phrase), "{name} still says {phrase:?}");
         }
     }
+}
+
+/// A host that adds the server by address gets no skill file: the server
+/// instructions and the tool descriptions are all it reads to decide when the
+/// kit applies, so both say when it does and that a one-off request does not.
+#[test]
+fn coach_text_says_when_the_kit_applies() {
+    let instructions = COACH_SERVER_INSTRUCTIONS.to_lowercase();
+    assert!(instructions.contains("start or continue a job"));
+    assert!(instructions.contains("react to a draft"));
+    assert!(
+        instructions.contains("a one-off request or an ordinary question uses none of these tools")
+    );
+    let read = schema::read_metadata().description.to_lowercase();
+    assert!(read.contains("start or continue a job"));
+    assert!(read.contains("a one-off request does not need it"));
+    let save = schema::save_metadata().description.to_lowercase();
+    assert!(save.contains("a one-off request is not saved here"));
+    assert!(save.contains("record_verdict (job, verdict better/same/worse"));
 }
 
 // ============================================================================

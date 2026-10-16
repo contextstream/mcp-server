@@ -133,5 +133,24 @@ class ReviewRunSheetTest(unittest.TestCase):
         self.assertIsNone(re.search(r'\{(?:self\.)?key\}', source), 'the key must never be formatted into text')
 
 
+class WhenToUseTest(unittest.TestCase):
+    """Every surface that tells an agent when to use the kit also says when not to."""
+
+    SNIPPET = ROOT / "kits" / "agent-coach-kit" / "codex-cloud" / "AGENTS.snippet.md"
+
+    def test_each_skill_has_the_boundary_in_its_description_and_a_section(self):
+        for path in (PLUGIN_SKILL, KIT_SKILL):
+            text = path.read_text()
+            frontmatter = text.split("---")[1]
+            self.assertIn("A one-off request does not need it.", frontmatter, path.name)
+            body = section(text, "When it applies")
+            self.assertIn("A one-off request, an ordinary question", body, path.name)
+            self.assertIn("create one only when they say yes", body, path.name)
+            self.assertLess(text.index("## When it applies"), text.index("## Each job"), path.name)
+
+    def test_the_agents_snippet_has_the_boundary(self):
+        self.assertIn("A one-off request or an ordinary question does not use the skill", self.SNIPPET.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

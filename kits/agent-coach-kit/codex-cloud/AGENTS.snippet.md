@@ -4,6 +4,7 @@ When the person starts a job for one of their recurring workflows, reacts to a d
 
 - Run `coach.py` commands with network access enabled. If one prints "needs network access", run the same command again with network enabled; it never saves twice.
 - Never print, echo or log `CONTEXTSTREAM_API_KEY`.
+- A one-off request or an ordinary question does not use the skill: do the work normally and save nothing.
 
 The hard rules:
 

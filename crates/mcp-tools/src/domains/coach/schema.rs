@@ -19,7 +19,8 @@ pub(super) fn read_metadata() -> ToolMetadata {
         name: WORKFLOW_TOOL.to_string(),
         title: "Coaching workflows".to_string(),
         description: format!(
-            "Agent Coach Kit: read the person's coaching workflows (recurring work they coach you on; not skills, not CI). Read-only. \
+            "Agent Coach Kit: read the person's coaching workflows (recurring work they coach you on, such as a weekly note or an article; not skills, not CI). \
+Use it when they start or continue a job for that work, react to a draft, compare versions or ask what earlier jobs taught; a one-off request does not need it. Read-only. \
 Actions: capabilities; list; get (ref: a workflow gives its goal, recent objectives, active guidance, open items and coaching effort; or a job, output, feedback or guidance ref); \
 context (job ref, or a workflow ref for its open job): the job packet to write from, read it before every draft and pass its context_etag to save_output; \
 history (goals, jobs, feedback incl. retracted, guidance incl. retired; kind narrows it); compare (a and b output refs, or a job ref for its last two versions; never a score); \
@@ -40,12 +41,12 @@ pub(super) fn save_metadata() -> ToolMetadata {
         name: WORKFLOW_SAVE_TOOL.to_string(),
         title: "Save coaching work".to_string(),
         description: format!(
-            "Agent Coach Kit: save coaching work. Each change is stored as a new version or event; earlier versions stay readable. \
+            "Agent Coach Kit: save coaching work for a workflow the person wants to keep coaching (a one-off request is not saved here). Each change is stored as a new version or event; earlier versions stay readable. \
 Actions: create (name, goal); refine_goal (workflow, goal, reason, expected_version); start_job (workflow, objective; returns the job packet); \
 save_output (job, and one of text, url or the attached file; plus context_etag, revises, carry_note, carried); \
 add_feedback (output, kind, scope, words, interpretation, picked, excerpt or time range, repeat_of); rescope_feedback; retract_feedback; \
 edit_guidance (guidance, expected_version, text, applies_when, change: retire/remove/restore); import_guidance (only when the person asks; sources); \
-set_effort (workflow or job; quick, explore or clear; words); close_job (job, used, optional verdict); reopen_job; cancel_job; record_verdict. {REFS} \
+set_effort (workflow or job; quick, explore or clear; words); close_job (job, used, optional verdict); reopen_job; cancel_job; record_verdict (job, verdict better/same/worse, note: their words, a judgement of a job or version as a whole). {REFS} \
 Usage: 1) When the person reacts to a version, record the reaction with add_feedback: words = their exact words, verbatim; interpretation = your reading, stored separately. \
 2) Choose the scope (workflow = reusable, becomes guidance; job = this job only) and say which in one line; the person can change it (rescope_feedback). \
 3) Feedback and guidance come from the person's words. Your own ideas and outside advice are suggestions, saved when the person picks one (picked=true, kind=direction). \

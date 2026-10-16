@@ -1,6 +1,6 @@
 ---
 name: contextstream-coach
-description: Coach this agent on work the person needs again and again, such as a weekly note, an article, a recap or an image series. Use it when the person starts a job for one of their workflows, reacts to a draft, or asks what was learned from earlier jobs. Goals, drafts and the person's own words are saved in their ContextStream account, and the right learning comes back in the next job, even in a fresh task.
+description: Coach this agent on work the person needs again and again, such as a weekly note, an article, a recap or an image series. Use it when the person starts a job for one of their workflows, reacts to a draft, or asks what was learned from earlier jobs. Goals, drafts and the person's own words are saved in their ContextStream account, and the right learning comes back in the next job, even in a fresh task. A one-off request does not need it.
 ---
 
 # Agent Coach Kit
@@ -19,6 +19,12 @@ Everything lives in the person's ContextStream account. `scripts/coach.py` talks
 - Run it as `python3 .agents/skills/contextstream-coach/scripts/coach.py`, written `coach.py` below.
 - `coach.py` needs network access. In Codex Cloud, run its commands with network access enabled. If one fails with "needs network access", run it again with network enabled.
 - Run `coach.py doctor` once per task. If it fails, show its message and stop; setup is in the kit's README.
+
+## When it applies
+
+Use this skill when the person starts or continues a job for one of their workflows, reacts to a draft, compares versions, or asks what earlier jobs taught.
+
+A one-off request, an ordinary question, or work that has no workflow does not use them: do the work normally and save nothing. If it sounds like work they will need again, say so in one line and offer to set it up as a workflow; create one only when they say yes.
 
 ## Each job
 

@@ -30,6 +30,13 @@ keeps them equal.
   account's Scheduled list. That is ChatGPT's feature, not the plugin's, but it looks like an action nobody
   asked for. The prompts below avoid it.
 
+## Does ChatGPT reach for the plugin on its own?
+
+Type case 1 once **without** choosing the plugin from the menu first, in a chat where it is simply installed.
+The video should show ChatGPT calling `workflow` by itself. If it answers from its own knowledge instead, that is
+a finding to fix in the server instructions and tool descriptions before submitting, not something to hide by
+picking the plugin by hand. Case N1 (the poem) is the opposite check: no tool call at all.
+
 ## The cases
 
 Run 1 to 3 in one chat. Run 4 in a **new** chat (the point is a session that remembers nothing). Run 5 in

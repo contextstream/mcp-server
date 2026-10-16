@@ -99,6 +99,10 @@ def main():
     flagged = [p for name, tool in tools.items() for p in BAD_PHRASES if p in tool.get("description", "").lower()]
     flagged += [p for p in BAD_PHRASES if p in c.instructions.lower()]
     check("tool text has none of the phrases ChatGPT flagged as suspicious instructions", not flagged, str(flagged))
+    check("the server instructions say when the kit applies and that a one-off request uses no tool",
+          "one-off" in c.instructions.lower() and "start or continue a job" in c.instructions.lower(), c.instructions[:200])
+    check("the workflow tool description says when to use it and that a one-off request does not need it",
+          "one-off" in tools["workflow"].get("description", "").lower(), "")
     check("workflow is read-only", tools["workflow"].get("annotations", {}).get("readOnlyHint") is True)
     check("workflow_delete is marked destructive", tools["workflow_delete"].get("annotations", {}).get("destructiveHint") is True)
 

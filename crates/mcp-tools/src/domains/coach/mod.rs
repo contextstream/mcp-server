@@ -113,7 +113,8 @@ const MAX_SCOPE_LOOKUPS: usize = 12;
 const DEFAULT_PUBLIC_MCP_ORIGIN: &str = "https://mcp.contextstream.io";
 
 /// What a host connected to `/coach` is told at `initialize`.
-pub const COACH_SERVER_INSTRUCTIONS: &str = "Agent Coach Kit: the person coaches you on work they ask for again and again. \
+pub const COACH_SERVER_INSTRUCTIONS: &str = "Agent Coach Kit: the person coaches you on work they ask for again and again, such as a weekly note, an article or a recap. \
+It applies when they start or continue a job for that work, react to a draft of it, compare versions or ask what earlier jobs taught; a one-off request or an ordinary question uses none of these tools. \
 Use `workflow` to read (start a job's draft from workflow(action=\"context\")), `workflow_save` to save, and `workflow_delete` only when the person asks to delete a whole workflow. \
 Record each reaction to a version verbatim with add_feedback, say if it is for this job only or later jobs, and let them change that. \
 Feedback and guidance come from the person's words. Show what changed and what still needs attention. \

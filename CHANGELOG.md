@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.0.25
+
+- Agent Coach Kit: the `/coach` server instructions and the `workflow` and
+  `workflow_save` descriptions now say when the kit applies. A host that adds
+  the server by address (the pilot route) receives no skill file, so these
+  texts are all it reads to decide when to use the kit, and they said what the
+  kit is but not when it applies. They now say it applies when the person
+  starts or continues a job for work they repeat, reacts to a draft, compares
+  versions or asks what earlier jobs taught, and that a one-off request or an
+  ordinary question uses none of the tools. The wording describes and does not
+  command, the form ChatGPT flagged in 1.0.23, and a test keeps "do not use",
+  "never use" and "recurring workflow" (which made ChatGPT create a scheduled
+  task of its own) out of all four texts.
+- `workflow_save` lists the parameters of `record_verdict` (the job, a verdict
+  of better, same or worse, and the person's words), so a verdict on a whole
+  job or version is not taken for feedback on its content.
+- The text grows, unlike 1.0.24: the instructions 737 to 985 characters,
+  `workflow` 1331 to 1528, `workflow_save` 2054 to 2237; `workflow_delete` is
+  unchanged at 518. The tools, their parameters and their behaviour are
+  unchanged.
+- The plugin skill, the Codex Cloud skill and the AGENTS snippet carry the same
+  boundary (repository only), and the review run sheet has the reviewer type
+  the first case without choosing the plugin first, so the recording shows
+  whether ChatGPT reaches for it unprompted (repository only).
+- Test fixtures in the search tests use neutral paths and documentation UUIDs
+  again, which the public-boundary check had flagged since 1.0.24's search fix.
+
 ## 1.0.24
 
 - Agent Coach Kit: the text of the `workflow`, `workflow_save` and

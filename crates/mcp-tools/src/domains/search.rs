@@ -1647,6 +1647,199 @@ fn compact_json_diagnostic(value: &Value, depth: usize) -> Value {
     }
 }
 
+/// Hybrid code search collapses identical chunks found at different paths into
+/// one result and lists the copies in its metadata: `duplicate_count` (other
+/// distinct locations of the same chunk) and `duplicate_locations` (up to 20
+/// `{file_path, start_line, end_line}` objects, plus `project_id` when it
+/// differs). Uncompacted output passes both through unchanged.
+///
+/// Under the structured budget `duplicate_count` is kept as is and
+/// `duplicate_locations` becomes at most this many `"path:start-end"` strings
+/// (` (project <id>)` appended for another project), followed by `"+N more"`
+/// when `duplicate_count` exceeds the entries shown. The compacted response
+/// says so in `structured_budget.duplicate_locations`.
+const COMPACT_DUPLICATE_LOCATIONS_MAX: usize = 5;
+const COMPACT_DUPLICATE_LOCATIONS_DOC: &str =
+    "compact: up to 5 \"path:start-end\" strings, then \"+N more\"";
+/// Copies named in the text rendering of one result.
+const TEXT_DUPLICATE_LOCATIONS_MAX: usize = 3;
+const DUPLICATE_LOCATION_PATH_MAX_CHARS: usize = 256;
+
+/// The copies of a collapsed result, read from its `metadata`.
+struct DuplicateLocations {
+    /// Other locations holding the identical chunk: `duplicate_count`, or the
+    /// number listed when the count is missing or smaller.
+    count: usize,
+    /// Every listed location as `path:start-end`, in rank order.
+    labels: Vec<String>,
+    /// Every listed location is a distinct file other than the result's own,
+    /// so the copies can be called files rather than locations.
+    distinct_files: bool,
+}
+
+fn duplicate_location_label(entry: &Value) -> Option<String> {
+    let object = match entry {
+        Value::String(text) => {
+            let text = text.trim();
+            return (!text.is_empty())
+                .then(|| truncate_json_string(text, DUPLICATE_LOCATION_PATH_MAX_CHARS));
+        }
+        Value::Object(object) => object,
+        _ => return None,
+    };
+    let path = object
+        .get("file_path")
+        .or_else(|| object.get("path"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    let mut label = truncate_json_string(path, DUPLICATE_LOCATION_PATH_MAX_CHARS);
+    let line = |field: &str| {
+        object
+            .get(field)
+            .and_then(Value::as_u64)
+            .filter(|line| *line > 0)
+    };
+    match (line("start_line"), line("end_line")) {
+        (Some(start), Some(end)) if end > start => label.push_str(&format!(":{start}-{end}")),
+        (Some(start), _) => label.push_str(&format!(":{start}")),
+        _ => {}
+    }
+    if let Some(project_id) = object
+        .get("project_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|project_id| !project_id.is_empty())
+    {
+        label.push_str(&format!(
+            " (project {})",
+            truncate_json_string(project_id, 64)
+        ));
+    }
+    Some(label)
+}
+
+fn duplicate_location_file_key(entry: &Value) -> Option<(String, String)> {
+    let normalize = |path: &str| path.trim().replace('\\', "/");
+    match entry {
+        Value::String(text) => Some((String::new(), normalize(text))),
+        Value::Object(object) => {
+            let path = object
+                .get("file_path")
+                .or_else(|| object.get("path"))
+                .and_then(Value::as_str)?;
+            let project_id = object
+                .get("project_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            Some((project_id, normalize(path)))
+        }
+        _ => None,
+    }
+}
+
+fn duplicate_locations_from_metadata(
+    metadata: &serde_json::Map<String, Value>,
+    own_path: Option<&str>,
+) -> Option<DuplicateLocations> {
+    let entries = metadata
+        .get("duplicate_locations")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let labels: Vec<String> = entries
+        .iter()
+        .filter_map(duplicate_location_label)
+        .collect();
+    let declared = metadata
+        .get("duplicate_count")
+        .and_then(Value::as_u64)
+        .map(|count| usize::try_from(count).unwrap_or(usize::MAX))
+        .unwrap_or_default();
+    let count = declared.max(labels.len());
+    if count == 0 {
+        return None;
+    }
+    // The result's own path may already be rooted at the session's checkout
+    // (`resolve_search_paths`) while the API lists copies repo-relative.
+    let own_path = own_path
+        .map(|path| path.trim().replace('\\', "/"))
+        .filter(|path| !path.is_empty());
+    let is_own_file = |(project_id, path): &(String, String)| {
+        project_id.is_empty()
+            && own_path.as_deref().is_some_and(|own| {
+                own == path || own.ends_with(&format!("/{}", path.trim_start_matches('/')))
+            })
+    };
+    let mut seen = HashSet::new();
+    let distinct_files = !labels.is_empty()
+        && entries.iter().all(|entry| {
+            duplicate_location_file_key(entry)
+                .is_some_and(|key| !is_own_file(&key) && seen.insert(key))
+        });
+    Some(DuplicateLocations {
+        count,
+        labels,
+        distinct_files,
+    })
+}
+
+fn result_duplicate_locations(item: &mcp_types::api::SearchResult) -> Option<DuplicateLocations> {
+    duplicate_locations_from_metadata(
+        item.metadata.as_ref()?.as_object()?,
+        item.file_path.as_deref(),
+    )
+}
+
+fn compact_duplicate_locations_value(duplicates: &DuplicateLocations) -> Value {
+    let mut entries: Vec<Value> = duplicates
+        .labels
+        .iter()
+        .take(COMPACT_DUPLICATE_LOCATIONS_MAX)
+        .cloned()
+        .map(Value::String)
+        .collect();
+    let more = duplicates.count.saturating_sub(entries.len());
+    if more > 0 {
+        entries.push(Value::String(format!("+{more} more")));
+    }
+    Value::Array(entries)
+}
+
+/// One indented text line naming a collapsed result's copies, e.g.
+/// `identical chunk also in 5 other files: a.py:1-9, b.py:1-9, c.py:1-9, +2 more`.
+fn duplicate_locations_text_line(
+    item: &mcp_types::api::SearchResult,
+    list_locations: bool,
+) -> Option<String> {
+    let duplicates = result_duplicate_locations(item)?;
+    let noun = match (duplicates.distinct_files, duplicates.count == 1) {
+        (true, true) => "other file",
+        (true, false) => "other files",
+        (false, true) => "other location",
+        (false, false) => "other locations",
+    };
+    let mut line = format!("   identical chunk also in {} {}", duplicates.count, noun);
+    if list_locations && !duplicates.labels.is_empty() {
+        let shown: Vec<&str> = duplicates
+            .labels
+            .iter()
+            .take(TEXT_DUPLICATE_LOCATIONS_MAX)
+            .map(String::as_str)
+            .collect();
+        line.push_str(": ");
+        line.push_str(&shown.join(", "));
+        let more = duplicates.count.saturating_sub(shown.len());
+        if more > 0 {
+            line.push_str(&format!(", +{more} more"));
+        }
+    }
+    line.push('\n');
+    Some(line)
+}
+
 fn compact_search_result_value(value: &Value) -> Value {
     let Some(source) = value.as_object() else {
         return compact_json_diagnostic(value, 0);
@@ -1675,6 +1868,7 @@ fn compact_search_result_value(value: &Value) -> Value {
         "snippet",
         "content_hash",
         "path",
+        "duplicate_count",
     ];
 
     let mut compact = serde_json::Map::new();
@@ -1698,7 +1892,7 @@ fn compact_search_result_value(value: &Value) -> Value {
         }
     }
     if let Some(metadata) = source.get("metadata").and_then(Value::as_object) {
-        let selected: serde_json::Map<String, Value> = METADATA_FIELDS
+        let mut selected: serde_json::Map<String, Value> = METADATA_FIELDS
             .iter()
             .filter_map(|field| {
                 metadata.get(*field).map(|value| {
@@ -1712,6 +1906,15 @@ fn compact_search_result_value(value: &Value) -> Value {
                 })
             })
             .collect();
+        if metadata.contains_key("duplicate_locations") {
+            let own_path = source.get("file_path").and_then(Value::as_str);
+            if let Some(duplicates) = duplicate_locations_from_metadata(metadata, own_path) {
+                selected.insert(
+                    "duplicate_locations".to_string(),
+                    compact_duplicate_locations_value(&duplicates),
+                );
+            }
+        }
         if !selected.is_empty() {
             compact.insert("metadata".to_string(), Value::Object(selected));
         }
@@ -1776,6 +1979,22 @@ fn insert_structured_budget_report(
         });
         if bytes_before.is_lower_bound {
             report["bytes_before_is_lower_bound"] = Value::Bool(true);
+        }
+        let compacted_duplicates =
+            object
+                .get("results")
+                .and_then(Value::as_array)
+                .is_some_and(|results| {
+                    results.iter().any(|result| {
+                        result
+                            .pointer("/metadata/duplicate_locations")
+                            .and_then(Value::as_array)
+                            .and_then(|entries| entries.first())
+                            .is_some_and(Value::is_string)
+                    })
+                });
+        if compacted_duplicates {
+            report["duplicate_locations"] = Value::String(COMPACT_DUPLICATE_LOCATIONS_DOC.into());
         }
         object.insert("structured_budget".to_string(), report);
     }
@@ -6858,6 +7077,9 @@ fn format_result_line(
         "{}. {}{}{}{}\n",
         index, kind_tag, location, lang_tag, score_str
     );
+    if let Some(duplicates) = duplicate_locations_text_line(item, show_content) {
+        line.push_str(&duplicates);
+    }
 
     if show_content {
         if let Some(content) = item.content.as_deref() {

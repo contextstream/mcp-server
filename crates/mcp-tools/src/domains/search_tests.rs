@@ -7183,3 +7183,322 @@ fn refused_or_paused_search_ingest_holds_that_checkout_only() {
         .unwrap()
         .contains_key(&(expired, folder.to_string())));
 }
+
+mod duplicate_collapse_output_tests {
+    //! Hybrid search folds identical chunks found at different paths into one
+    //! result whose metadata carries `duplicate_count` and
+    //! `duplicate_locations` (ContextStream API c25ff18b0). These tests pin how
+    //! the MCP output keeps both: unchanged when the payload fits, concise
+    //! under the structured budget, and named in the text rendering.
+    use super::*;
+
+    const REPRESENTATIVE: &str =
+        "eval/code-search/results/v2-2026-07-30/execution-harness-post/freshness_bench.py";
+    const COPIES: [&str; 5] = [
+        "eval/code-search/results/v3-2026-08-01/execution-harness-exhaustive/freshness_bench.py",
+        "eval/code-search/results/v3-2026-08-01/execution-harness-keyword/freshness_bench.py",
+        "eval/code-search/results/v3-2026-08-01/metric-harness/freshness_bench.py",
+        "eval/code-search/results/v2-2026-07-30/execution-harness-pre/freshness_bench.py",
+        "eval/code-search/results/v2-2026-07-30/metric-harness/freshness_bench.py",
+    ];
+
+    fn location(path: &str, start: u64, end: u64) -> Value {
+        json!({"file_path": path, "start_line": start, "end_line": end})
+    }
+
+    fn copy_locations() -> Vec<Value> {
+        COPIES.iter().map(|path| location(path, 127, 233)).collect()
+    }
+
+    /// The shape production returned on 2026-10-16 for "vscode extension api
+    /// client request retry handling": the folded row repeats its whole chunk
+    /// in `metadata.content`, which is what pushes real pages over budget.
+    fn collapsed_row(duplicate_count: u64, locations: Vec<Value>) -> Value {
+        json!({
+            "id": "1153ab2a-290e-45d4-ba10-c756eafd5f3b",
+            "file_path": REPRESENTATIVE,
+            "start_line": 127,
+            "language": "python",
+            "location": format!("{REPRESENTATIVE}:127 mod request"),
+            "score": 1.0,
+            "content": "def request(self, method, path, body=None):\n    ...",
+            "metadata": {
+                "chunk_type": "module",
+                "content": "def request(self):\n".repeat(400),
+                "start_line": 127,
+                "end_line": 233,
+                "point_type": "chunk",
+                "duplicate_count": duplicate_count,
+                "duplicate_locations": locations,
+            }
+        })
+    }
+
+    fn plain_row(index: usize) -> Value {
+        json!({
+            "id": format!("plain-{index}"),
+            "file_path": format!("src/module_{index}.rs"),
+            "start_line": 10,
+            "score": 0.5,
+            "content": format!("fn retry_{index}() {{}}\n{}", "body ".repeat(600)),
+            "metadata": {
+                "start_line": 10,
+                "end_line": 40,
+                "content": "body ".repeat(1_500),
+            }
+        })
+    }
+
+    fn oversized_page(first: Value) -> Value {
+        let mut results = vec![first];
+        results.extend((1..16).map(plain_row));
+        json!({"total": 16, "has_more": true, "next_offset": 16, "results": results})
+    }
+
+    fn expected_compact_labels() -> Vec<String> {
+        COPIES
+            .iter()
+            .map(|path| format!("{path}:127-233"))
+            .collect()
+    }
+
+    #[test]
+    fn full_output_keeps_both_fields_unchanged() {
+        let value = json!({
+            "total": 1,
+            "has_more": false,
+            "results": [{
+                "file_path": REPRESENTATIVE,
+                "start_line": 127,
+                "content": "def request(self): ...",
+                "metadata": {
+                    "start_line": 127,
+                    "end_line": 233,
+                    "duplicate_count": 5,
+                    "duplicate_locations": copy_locations(),
+                }
+            }]
+        });
+
+        let bounded =
+            budget_search_structured_value(value.clone(), SEARCH_STRUCTURED_OUTPUT_BUDGET_DEFAULT);
+
+        assert_eq!(
+            bounded, value,
+            "a payload that fits passes through unchanged"
+        );
+        assert!(bounded.get("structured_budget").is_none());
+        let metadata = &bounded["results"][0]["metadata"];
+        assert_eq!(metadata["duplicate_count"], 5);
+        assert_eq!(
+            metadata["duplicate_locations"][0],
+            location(COPIES[0], 127, 233)
+        );
+    }
+
+    #[test]
+    fn compact_output_keeps_the_count_and_lists_five_locations_then_the_rest() {
+        let mut locations = copy_locations();
+        locations.push(location("vendor/other/freshness_bench.py", 127, 233));
+        locations.push(json!({
+            "file_path": "eval/freshness_bench.py",
+            "start_line": 120,
+            "end_line": 226,
+            "project_id": "0d2f7c4e-0000-4000-8000-000000000001",
+        }));
+        let value = oversized_page(collapsed_row(7, locations));
+        let limit = SEARCH_STRUCTURED_OUTPUT_BUDGET_DEFAULT;
+        assert!(serde_json::to_vec(&value).unwrap().len() > limit);
+
+        let bounded = budget_search_structured_value(value, limit);
+
+        assert!(serde_json::to_vec(&bounded).unwrap().len() <= limit);
+        assert_eq!(bounded["structured_budget"]["applied"], true);
+        assert_eq!(
+            bounded["structured_budget"]["duplicate_locations"],
+            COMPACT_DUPLICATE_LOCATIONS_DOC
+        );
+        assert!(COMPACT_DUPLICATE_LOCATIONS_DOC
+            .contains(&format!("up to {COMPACT_DUPLICATE_LOCATIONS_MAX} ")));
+        let first = &bounded["results"][0];
+        assert_eq!(first["file_path"], REPRESENTATIVE);
+        let metadata = first["metadata"].as_object().unwrap();
+        assert_eq!(metadata["duplicate_count"], 7);
+        let mut expected: Vec<Value> = expected_compact_labels()
+            .into_iter()
+            .map(Value::String)
+            .collect();
+        expected.push(json!("+2 more"));
+        assert_eq!(metadata["duplicate_locations"], Value::Array(expected));
+        assert!(
+            metadata.get("content").is_none(),
+            "compaction still drops the repeated chunk text"
+        );
+        for row in bounded["results"].as_array().unwrap().iter().skip(1) {
+            assert!(row.pointer("/metadata/duplicate_count").is_none());
+            assert!(row.pointer("/metadata/duplicate_locations").is_none());
+        }
+    }
+
+    #[test]
+    fn compact_locations_name_another_project_and_count_beyond_the_api_cap() {
+        let mut locations = vec![json!({
+            "file_path": "lib/shared.rs",
+            "start_line": 3,
+            "end_line": 9,
+            "project_id": "0d2f7c4e-0000-4000-8000-000000000001",
+        })];
+        locations.extend((0..19).map(|index| location(&format!("copy/{index}.rs"), 3, 9)));
+        let row = json!({
+            "file_path": "src/shared.rs",
+            "metadata": {"duplicate_count": 29, "duplicate_locations": locations},
+        });
+
+        let compact = compact_search_result_value(&row);
+
+        let entries = compact["metadata"]["duplicate_locations"]
+            .as_array()
+            .unwrap();
+        assert_eq!(entries.len(), COMPACT_DUPLICATE_LOCATIONS_MAX + 1);
+        assert_eq!(
+            entries[0],
+            "lib/shared.rs:3-9 (project 0d2f7c4e-0000-4000-8000-000000000001)"
+        );
+        assert_eq!(entries[1], "copy/0.rs:3-9");
+        assert_eq!(entries[5], "+24 more");
+        assert_eq!(compact["metadata"]["duplicate_count"], 29);
+
+        let single_line = compact_search_result_value(&json!({
+            "file_path": "src/a.rs",
+            "metadata": {"duplicate_locations": [location("src/b.rs", 4, 4)]},
+        }));
+        assert_eq!(
+            single_line["metadata"]["duplicate_locations"],
+            json!(["src/b.rs:4"]),
+            "a missing count falls back to the listed copies"
+        );
+
+        let unlisted = compact_search_result_value(&json!({
+            "file_path": "src/a.rs",
+            "metadata": {"duplicate_count": 3, "duplicate_locations": []},
+        }));
+        assert_eq!(
+            unlisted["metadata"]["duplicate_locations"],
+            json!(["+3 more"])
+        );
+    }
+
+    #[test]
+    fn compact_output_without_duplicates_carries_no_field_doc() {
+        let bounded = budget_search_structured_value(
+            oversized_page(plain_row(0)),
+            SEARCH_STRUCTURED_OUTPUT_BUDGET_DEFAULT,
+        );
+        assert_eq!(bounded["structured_budget"]["applied"], true);
+        assert!(bounded["structured_budget"]
+            .get("duplicate_locations")
+            .is_none());
+        assert!(bounded["results"][0]
+            .pointer("/metadata/duplicate_locations")
+            .is_none());
+    }
+
+    fn search_result(value: Value) -> mcp_types::api::SearchResult {
+        serde_json::from_value(value).expect("search result fixture")
+    }
+
+    #[test]
+    fn text_rendering_says_also_in_n_other_files() {
+        let item = search_result(collapsed_row(5, copy_locations()));
+
+        let full = format_result_line(1, &item, true);
+        assert!(
+            full.starts_with(&format!(
+                "1. {REPRESENTATIVE}:127 [python] 100%\n   identical chunk also in 5 other files: {}, {}, {}, +2 more\n",
+                expected_compact_labels()[0],
+                expected_compact_labels()[1],
+                expected_compact_labels()[2],
+            )),
+            "{full}"
+        );
+
+        let minimal = format_result_line(1, &item, false);
+        assert_eq!(
+            minimal,
+            format!(
+                "1. {REPRESENTATIVE}:127 [python] 100%\n   identical chunk also in 5 other files\n"
+            )
+        );
+
+        let one = search_result(collapsed_row(1, vec![location(COPIES[0], 127, 233)]));
+        assert!(format_result_line(1, &one, true).contains(&format!(
+            "identical chunk also in 1 other file: {}\n",
+            expected_compact_labels()[0]
+        )));
+
+        let same_file = search_result(collapsed_row(
+            2,
+            vec![
+                location(REPRESENTATIVE, 300, 406),
+                location(COPIES[0], 127, 233),
+            ],
+        ));
+        assert!(format_result_line(1, &same_file, false)
+            .contains("identical chunk also in 2 other locations\n"));
+
+        // On a hosted session the result itself is rooted at the checkout
+        // while the API lists its copies repo-relative.
+        let mut rooted = same_file.clone();
+        rooted.file_path = Some(format!(
+            "/home/dev/dev/maker/contextstream/{REPRESENTATIVE}"
+        ));
+        assert!(format_result_line(1, &rooted, false)
+            .contains("identical chunk also in 2 other locations\n"));
+        let mut rooted_distinct = item.clone();
+        rooted_distinct.file_path = rooted.file_path.clone();
+        assert!(format_result_line(1, &rooted_distinct, false)
+            .contains("identical chunk also in 5 other files\n"));
+
+        let plain = search_result(plain_row(1));
+        assert!(!format_result_line(1, &plain, true).contains("identical chunk"));
+    }
+
+    #[test]
+    fn final_search_envelope_keeps_the_fields_in_structured_and_text() {
+        let value = oversized_page(collapsed_row(5, copy_locations()));
+        let response: SearchResponse = serde_json::from_value(value.clone()).unwrap();
+        let text: String = response
+            .results
+            .iter()
+            .enumerate()
+            .map(|(index, item)| format_result_line(index + 1, item, true))
+            .collect();
+
+        let result = bounded_search_tool_result(text, value);
+
+        assert!(serialized_tool_result_bytes(&result) <= search_tool_result_wire_budget());
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["structured_budget"]["applied"], true);
+        assert_eq!(structured["results"][0]["metadata"]["duplicate_count"], 5);
+        let labels: Vec<Value> = expected_compact_labels()
+            .into_iter()
+            .map(Value::String)
+            .collect();
+        assert_eq!(
+            structured["results"][0]["metadata"]["duplicate_locations"],
+            Value::Array(labels)
+        );
+        let text = result
+            .content
+            .iter()
+            .find_map(|item| match item {
+                ContentItem::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("text result");
+        assert!(
+            text.contains("identical chunk also in 5 other files: "),
+            "{text}"
+        );
+    }
+}

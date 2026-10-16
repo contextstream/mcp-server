@@ -7215,7 +7215,7 @@ mod duplicate_collapse_output_tests {
     /// in `metadata.content`, which is what pushes real pages over budget.
     fn collapsed_row(duplicate_count: u64, locations: Vec<Value>) -> Value {
         json!({
-            "id": "1153ab2a-290e-45d4-ba10-c756eafd5f3b",
+            "id": "00000000-0000-4000-8000-000000000042",
             "file_path": REPRESENTATIVE,
             "start_line": 127,
             "language": "python",
@@ -7304,7 +7304,7 @@ mod duplicate_collapse_output_tests {
             "file_path": "eval/freshness_bench.py",
             "start_line": 120,
             "end_line": 226,
-            "project_id": "0d2f7c4e-0000-4000-8000-000000000001",
+            "project_id": "00000000-0000-4000-8000-000000000062",
         }));
         let value = oversized_page(collapsed_row(7, locations));
         let limit = SEARCH_STRUCTURED_OUTPUT_BUDGET_DEFAULT;
@@ -7346,7 +7346,7 @@ mod duplicate_collapse_output_tests {
             "file_path": "lib/shared.rs",
             "start_line": 3,
             "end_line": 9,
-            "project_id": "0d2f7c4e-0000-4000-8000-000000000001",
+            "project_id": "00000000-0000-4000-8000-000000000062",
         })];
         locations.extend((0..19).map(|index| location(&format!("copy/{index}.rs"), 3, 9)));
         let row = json!({
@@ -7362,7 +7362,7 @@ mod duplicate_collapse_output_tests {
         assert_eq!(entries.len(), COMPACT_DUPLICATE_LOCATIONS_MAX + 1);
         assert_eq!(
             entries[0],
-            "lib/shared.rs:3-9 (project 0d2f7c4e-0000-4000-8000-000000000001)"
+            "lib/shared.rs:3-9 (project 00000000-0000-4000-8000-000000000062)"
         );
         assert_eq!(entries[1], "copy/0.rs:3-9");
         assert_eq!(entries[5], "+24 more");
@@ -7449,9 +7449,7 @@ mod duplicate_collapse_output_tests {
         // On a hosted session the result itself is rooted at the checkout
         // while the API lists its copies repo-relative.
         let mut rooted = same_file.clone();
-        rooted.file_path = Some(format!(
-            "/home/dev/dev/maker/contextstream/{REPRESENTATIVE}"
-        ));
+        rooted.file_path = Some(format!("/srv/checkouts/acme-web/{REPRESENTATIVE}"));
         assert!(format_result_line(1, &rooted, false)
             .contains("identical chunk also in 2 other locations\n"));
         let mut rooted_distinct = item.clone();

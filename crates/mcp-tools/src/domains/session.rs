@@ -1213,30 +1213,30 @@ pub(crate) async fn resolve_project_for_folder(
     resolve_project_from_catalog(&workspace_projects, folder_path)
 }
 
+const INVALID_REPOSITORY_URL: &str = "repository_url must identify a valid Git repository remote, such as https://github.com/org/repo.git or git@github.com:org/repo.git; omit it to resolve the project from folder_path";
+
+const IGNORED_REPOSITORY_URL: &str = "repository_url was ignored: it is not a Git repository remote (such as https://github.com/org/repo.git or git@github.com:org/repo.git), so the project was resolved from folder_path and the ids instead.";
+
 fn resolve_init_repository_url(
     explicit_repository_url: Option<&str>,
     folder_path: Option<&str>,
 ) -> Result<Option<String>> {
+    // Surrounding whitespace (a `git remote get-url` line with its newline) is
+    // trimmed and an empty value means "not given", so init resolves from the
+    // folder instead of failing. A value that is still not a remote fails.
+    let explicit_repository_url = explicit_repository_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if let Some(value) = explicit_repository_url {
-        if value.is_empty()
-            || value.trim() != value
-            || value.len() > 8 * 1024
-            || value.chars().any(char::is_control)
-        {
-            return Err(Error::Validation(
-                "repository_url must identify a valid Git repository remote".to_string(),
-            ));
+        if value.len() > 8 * 1024 || value.chars().any(char::is_control) {
+            return Err(Error::Validation(INVALID_REPOSITORY_URL.to_string()));
         }
         let identity = if value.starts_with("git-remote-v1:") {
             mcp_session::RepositoryRemoteIdentity::parse(value)
         } else {
             mcp_session::RepositoryRemoteIdentity::from_remote_url(value)
         }
-        .map_err(|_| {
-            Error::Validation(
-                "repository_url must identify a valid Git repository remote".to_string(),
-            )
-        })?;
+        .map_err(|_| Error::Validation(INVALID_REPOSITORY_URL.to_string()))?;
         return Ok(Some(identity.canonical_https_url()));
     }
 
@@ -2373,10 +2373,16 @@ impl ToolHandler for InitTool {
             })
             .or_else(mcp_client::get_task_mcp_session_id);
         let force = input.force.unwrap_or(false) || is_post_compact;
-        let repository_url = resolve_init_repository_url(
+        // A repository_url that is not a Git remote is set aside, not fatal:
+        // init resolves from folder_path (or the ids) and says what it ignored.
+        let (repository_url, repository_url_note) = match resolve_init_repository_url(
             input.repository_url.as_deref(),
             input.folder_path.as_deref(),
-        )?;
+        ) {
+            Ok(url) => (url, None),
+            Err(Error::Validation(_)) => (None, Some(IGNORED_REPOSITORY_URL)),
+            Err(err) => return Err(err),
+        };
         // A placeholder (the all-zero UUID, `<current_workspace_id>`, "") is not
         // a request for a workspace: it is what an agent sends when its rules
         // held no real id. Treat it as no id, so folder resolution runs, and say
@@ -3185,6 +3191,12 @@ impl ToolHandler for InitTool {
         }
         if let Some(note) = scope_repair_note.as_deref() {
             text.push_str(&format!("\n\n{}", note));
+        }
+        if let Some(note) = repository_url_note {
+            text.push_str(&format!("\n\n{}", note));
+            if let Some(object) = result.as_object_mut() {
+                object.insert("repository_url_ignored".to_string(), Value::Bool(true));
+            }
         }
         // Ids the caller sent that were set aside, in the text and in the
         // structured result (Claude Code shows only the structured part).

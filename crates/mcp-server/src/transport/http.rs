@@ -993,6 +993,9 @@ async fn serve_mcp_streamable(
                 )
                 .await;
             let result = handle_initialize_method(&state, &request.params).await;
+            if let (Ok(_), Some(session_id)) = (result.as_ref(), response_session_id.as_deref()) {
+                remember_session_client(session_id, &request.params);
+            }
             if result.is_ok() {
                 state
                     .telemetry
@@ -1024,6 +1027,10 @@ async fn serve_mcp_streamable(
             data: None,
         }),
     };
+
+    if let (Some(name), Err(error)) = (tool_name.as_deref(), result.as_ref()) {
+        log_failed_tool_call(&headers, name, error);
+    }
 
     // Acceleration signal emit — fire-and-forget so the tool's response
     // latency stays untouched. These events are non-canonical telemetry
@@ -2055,6 +2062,117 @@ fn loggable_client_token(raw: &str) -> Option<String> {
         .collect();
     let token = token.trim();
     (!token.is_empty()).then(|| token.to_string())
+}
+
+/// `clientInfo` (name, version) of recent MCP sessions, kept only so a failed
+/// tool call can be logged with the client that sent it. Never used for
+/// authorization. Bounded: cleared when it reaches [`SESSION_CLIENTS_MAX`].
+static SESSION_CLIENTS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (String, String)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+const SESSION_CLIENTS_MAX: usize = 10_000;
+
+/// The loggable `(name, version)` of any client, `("unknown", "")` when absent.
+fn loggable_client_identity(params: &Value) -> (String, String) {
+    let client = params
+        .get("clientInfo")
+        .or_else(|| params.get("client_info"));
+    let field = |key: &str| {
+        client
+            .and_then(|c| c.get(key))
+            .and_then(Value::as_str)
+            .and_then(loggable_client_token)
+    };
+    (
+        field("name").unwrap_or_else(|| "unknown".to_string()),
+        field("version").unwrap_or_default(),
+    )
+}
+
+fn remember_session_client(session_id: &str, params: &Value) {
+    let identity = loggable_client_identity(params);
+    if let Ok(mut clients) = SESSION_CLIENTS.lock() {
+        if clients.len() >= SESSION_CLIENTS_MAX {
+            clients.clear();
+        }
+        clients.insert(session_id.to_string(), identity);
+    }
+}
+
+fn session_client_identity(headers: &HeaderMap) -> (String, String) {
+    header_str(headers, "mcp-session-id")
+        .and_then(|id| SESSION_CLIENTS.lock().ok()?.get(id).cloned())
+        .unwrap_or_else(|| ("unknown".to_string(), String::new()))
+}
+
+/// A short class for a failed tool call's error, from its message prefix
+/// (`mcp_types::Error`'s display forms). Classes carry no argument values.
+fn tool_error_class(message: &str) -> String {
+    let m = message.trim_start();
+    if let Some(rest) = m.strip_prefix("Validation error: ") {
+        let sub = if rest.contains("do not match the tool's input schema") {
+            "schema_mismatch"
+        } else if rest.starts_with("invalid type") {
+            "invalid_type"
+        } else if rest.starts_with("missing field") {
+            "missing_field"
+        } else if rest.starts_with("unknown variant") || rest.starts_with("invalid value") {
+            "invalid_value"
+        } else if rest.starts_with("repository_url") {
+            "repository_url"
+        } else {
+            "other"
+        };
+        return format!("validation:{sub}");
+    }
+    if let Some(rest) = m.strip_prefix("HTTP error (") {
+        let status: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !status.is_empty() {
+            return format!("http:{status}");
+        }
+    }
+    for (prefix, class) in [
+        ("Network error", "network"),
+        ("Configuration error", "configuration"),
+        ("Tool error", "tool"),
+        ("Serialization error", "serialization"),
+        ("Invalid UUID", "invalid_uuid"),
+        ("IO error", "io"),
+        ("Rate limited", "rate_limited"),
+        ("Feature not available", "feature_unavailable"),
+        ("Integration not connected", "integration_not_connected"),
+        ("Request cancelled", "cancelled"),
+        ("Request timeout", "timeout"),
+        ("Missing 'name'", "missing_tool_name"),
+        ("Unknown tool", "unknown_tool"),
+    ] {
+        if m.starts_with(prefix) {
+            return class.to_string();
+        }
+    }
+    "other".to_string()
+}
+
+/// Log a failed tools/call: tool, JSON-RPC code, error class and client.
+/// Argument values and the error text (which can quote them) are never logged.
+fn log_failed_tool_call(headers: &HeaderMap, tool: &str, error: &JsonRpcError) {
+    let class = tool_error_class(&error.message);
+    let (client_name, client_version) = session_client_identity(headers);
+    let tool = loggable_client_token(tool).unwrap_or_else(|| "unknown".to_string());
+    metrics::counter!(
+        "mcp_tool_call_errors_total",
+        "tool" => tool.clone(),
+        "class" => class.clone(),
+    )
+    .increment(1);
+    warn!(
+        target: "contextstream::tool_errors",
+        tool = %tool,
+        error_code = error.code,
+        error_class = %class,
+        client_name = %client_name,
+        client_version = %client_version,
+        "tool call failed"
+    );
 }
 
 async fn handle_initialize_method(
@@ -5800,6 +5918,60 @@ mod tests {
         assert_eq!(version.len(), 64);
         assert_eq!(identity("\n\t<>", "1"), None);
         assert_eq!(unrecognized_client_identity(&json!({})), None);
+    }
+
+    #[test]
+    fn failed_tool_calls_are_classed_without_their_values() {
+        for (message, class) in [
+            (
+                "Validation error: invalid type: string \"maybe\", expected a boolean",
+                "validation:invalid_type",
+            ),
+            (
+                "Validation error: init: the arguments do not match the tool's input schema (invalid type: map, expected a string). `workspace_id` must be a string (got object).",
+                "validation:schema_mismatch",
+            ),
+            ("Validation error: missing field `query`", "validation:missing_field"),
+            (
+                "Validation error: repository_url must identify a valid Git repository remote",
+                "validation:repository_url",
+            ),
+            ("Validation error: something else", "validation:other"),
+            ("HTTP error (403): workspace not accessible", "http:403"),
+            ("Request timeout after 10 seconds", "timeout"),
+            ("Invalid UUID: abc", "invalid_uuid"),
+            ("a message that quotes secret-value", "other"),
+        ] {
+            let class_seen = tool_error_class(message);
+            assert_eq!(class_seen, class, "{message}");
+            assert!(!class_seen.contains("maybe") && !class_seen.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn failed_tool_calls_name_the_client_that_initialized_the_session() {
+        remember_session_client(
+            "tool-error-log-test-session",
+            &json!({"clientInfo": {"name": "mcporter", "version": "0.7.3"}}),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "mcp-session-id",
+            "tool-error-log-test-session".parse().unwrap(),
+        );
+        assert_eq!(
+            session_client_identity(&headers),
+            ("mcporter".to_string(), "0.7.3".to_string())
+        );
+        assert_eq!(
+            session_client_identity(&HeaderMap::new()),
+            ("unknown".to_string(), String::new())
+        );
+        // Unprintable client names are reduced like the unrecognized-client log.
+        assert_eq!(
+            loggable_client_identity(&json!({"clientInfo": {"name": "bot\n<x>", "version": 7}})),
+            ("botx".to_string(), String::new())
+        );
     }
 
     // ========================================================================

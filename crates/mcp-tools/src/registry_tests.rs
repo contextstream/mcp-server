@@ -1186,3 +1186,142 @@ fn test_capsule_is_exposed_to_standard_and_consolidated_toolsets() {
     assert!(STANDARD_TOOLS.contains(&"capsule"));
     assert!(CONSOLIDATED_TOOLS.contains(&"capsule"));
 }
+
+// ============================================================================
+// Input shapes (crate::input_shape) through the registry
+// ============================================================================
+
+/// A tool whose handler parses a typed struct, as InitTool does.
+struct TypedTool {
+    metadata: ToolMetadata,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct TypedInput {
+    workspace_id: Option<String>,
+    project_id: Option<String>,
+    session_id: Option<String>,
+    force: Option<bool>,
+    include_recent_memory: Option<bool>,
+    limit: Option<u32>,
+}
+
+impl TypedTool {
+    fn new(name: &str) -> Self {
+        Self {
+            metadata: ToolMetadata {
+                name: name.to_string(),
+                title: "Typed".to_string(),
+                description: "Typed input".to_string(),
+                category: ToolCategory::Session,
+                annotations: ToolAnnotations::read_only(),
+                is_pro: false,
+                required_tier: None,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for TypedTool {
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let parsed: TypedInput = serde_json::from_value(input)
+            .map_err(|e| mcp_types::Error::Validation(e.to_string()))?;
+        Ok(ToolResult::text(format!(
+            "ws={:?} proj={:?} session={:?} force={:?} memory={:?} limit={:?}",
+            parsed.workspace_id,
+            parsed.project_id,
+            parsed.session_id,
+            parsed.force,
+            parsed.include_recent_memory,
+            parsed.limit
+        )))
+    }
+
+    fn metadata(&self) -> &ToolMetadata {
+        &self.metadata
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "workspace_id": {"type": "string", "format": "uuid"},
+                "project_id": {"type": "string", "format": "uuid"},
+                "session_id": {"type": "string"},
+                "force": {"type": "boolean"},
+                "include_recent_memory": {"type": "boolean"},
+                "limit": {"type": "integer"}
+            }
+        })
+    }
+}
+
+mod input_shape_tests {
+    use super::*;
+
+    const W: &str = "11111111-2222-4333-8444-555555555555";
+    const P: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+
+    fn text(result: &ToolResult) -> String {
+        match &result.content[0] {
+            mcp_types::tool::ContentItem::Text { text } => text.clone(),
+            other => panic!("Expected Text content item, got {other:?}"),
+        }
+    }
+
+    fn registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new(&create_complete_config());
+        registry.register("typed_tool", Arc::new(TypedTool::new("typed_tool")));
+        registry
+    }
+
+    #[tokio::test]
+    async fn bridge_shapes_reach_the_handler_as_typed_values() {
+        let registry = registry();
+        for call in [
+            json!({"workspace_id": W, "project_id": P, "force": "true", "include_recent_memory": "false", "limit": "5", "session_id": 42}),
+            json!({"workspaceId": W, "projectId": P, "force": 1, "includeRecentMemory": "no", "limit": 5.0, "sessionId": "42"}),
+            json!({"arguments": {"workspace_id": {"id": W}, "project_id": [P], "force": "yes", "include_recent_memory": 0, "limit": " 5 ", "session_id": "42"}}),
+            json!({"workspace": {"id": W}, "project": {"id": P}, "force": "on", "include_recent_memory": "off", "limit": 5, "session_id": "42"}),
+        ] {
+            let out = text(
+                &registry
+                    .execute("typed_tool", call.clone())
+                    .await
+                    .unwrap_or_else(|e| panic!("{call}: {e}")),
+            );
+            assert_eq!(
+                out,
+                format!("ws=Some(\"{W}\") proj=Some(\"{P}\") session=Some(\"42\") force=Some(true) memory=Some(false) limit=Some(5)"),
+                "{call}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_and_null_arguments_are_fine() {
+        let registry = registry();
+        for call in [json!({}), Value::Null, json!({"force": null})] {
+            let out = text(&registry.execute("typed_tool", call).await.unwrap());
+            assert!(out.contains("force=None"), "{out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unusable_values_fail_with_the_field_and_type() {
+        let registry = registry();
+        let error = registry
+            .execute("typed_tool", json!({"workspace_id": W, "force": "maybe"}))
+            .await
+            .expect_err("an unparseable boolean still fails");
+        let message = error.to_string();
+        assert!(message.contains("typed_tool"), "{message}");
+        assert!(
+            message.contains("`force` must be a boolean (got string)"),
+            "{message}"
+        );
+        assert!(!message.contains(W), "values are not echoed: {message}");
+    }
+}

@@ -33,6 +33,63 @@ fn ignore_placeholder_scope_ids(tool: &str, input: &mut Value) {
     }
 }
 
+/// Normalize the argument shapes a client sent to the ones the tool's schema
+/// describes (see [`crate::input_shape`]), counting each rewrite so the
+/// clients that need it are visible. Returns the properties that still do not
+/// match the schema, for a clearer error if the handler rejects them.
+fn normalize_input_shape(tool: &str, schema: &Value, input: &mut Value) -> Vec<String> {
+    let changes = crate::input_shape::normalize_arguments(schema, input);
+    for change in &changes {
+        metrics::counter!(
+            "mcp_input_shape_normalized_total",
+            "tool" => tool.to_string(),
+            "kind" => change.kind,
+        )
+        .increment(1);
+    }
+    if !changes.is_empty() {
+        let fields: Vec<String> = changes
+            .iter()
+            .map(|c| {
+                if c.field.is_empty() {
+                    c.kind.to_string()
+                } else {
+                    format!("{}:{}", c.field, c.kind)
+                }
+            })
+            .collect();
+        tracing::info!(tool, changes = %fields.join(","), "input_shape_normalized");
+    }
+    crate::input_shape::schema_type_mismatches(schema, input)
+}
+
+/// A handler's argument-parsing error, made actionable: the tool, the fields
+/// whose type still differs from the schema, and what to send instead.
+fn explain_input_error(
+    tool: &str,
+    mismatches: &[String],
+    outcome: Result<ToolResult>,
+) -> Result<ToolResult> {
+    match outcome {
+        Err(Error::Validation(message))
+            if message.starts_with("invalid type")
+                || message.starts_with("invalid value")
+                || message.starts_with("missing field")
+                || message.starts_with("unknown variant") =>
+        {
+            let detail = if mismatches.is_empty() {
+                String::new()
+            } else {
+                format!(" {}.", mismatches.join("; "))
+            };
+            Err(Error::Validation(format!(
+                "{tool}: the arguments do not match the tool's input schema ({message}).{detail} Send each argument with the type tools/list advertises for {tool}."
+            )))
+        }
+        other => other,
+    }
+}
+
 /// Tool handler trait.
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
@@ -576,6 +633,7 @@ impl ToolRegistry {
         if let Some(result) = self.plan_restriction_for_tool(&tool.metadata).await {
             return Ok(result);
         }
+        let mismatches = normalize_input_shape(name, &tool.input_schema, &mut input);
         ignore_placeholder_scope_ids(name, &mut input);
 
         // Attribute downstream server-side compliance events to the agent's
@@ -597,6 +655,7 @@ impl ToolRegistry {
             }
             None => tool.handler.execute(input).await,
         };
+        let outcome = explain_input_error(name, &mismatches, outcome);
 
         if let Some((request, started)) = observation {
             self.report_acceleration_observation(request, started.elapsed(), outcome.as_ref());
@@ -903,11 +962,13 @@ impl ToolRegistry {
         if let Some(result) = self.plan_restriction_for_tool(&operation.metadata).await {
             return Ok(result);
         }
+        let mismatches = normalize_input_shape(name, &operation.input_schema, &mut input);
         ignore_placeholder_scope_ids(name, &mut input);
 
         let observation =
             acceleration_observation_request(name, &input).map(|request| (request, Instant::now()));
         let outcome = operation.handler.execute(input).await;
+        let outcome = explain_input_error(name, &mismatches, outcome);
         if let Some((request, started)) = observation {
             self.report_acceleration_observation(request, started.elapsed(), outcome.as_ref());
         }

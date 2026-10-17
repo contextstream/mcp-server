@@ -146,6 +146,37 @@ mod repository_project_resolution_tests {
     }
 
     #[test]
+    fn repository_remote_with_surrounding_whitespace_is_trimmed() {
+        // `git remote get-url origin` output keeps its newline when a bridge
+        // passes it through verbatim.
+        let normalized = resolve_init_repository_url(
+            Some("  https://github.com/contextstream/mcp-server.git\n"),
+            None,
+        )
+        .expect("trimmed remote");
+        assert_eq!(
+            normalized.as_deref(),
+            Some("https://github.com/contextstream/mcp-server.git")
+        );
+    }
+
+    #[test]
+    fn empty_repository_remote_means_not_given() {
+        for raw in ["", "   ", "\n"] {
+            assert_eq!(
+                resolve_init_repository_url(Some(raw), None).expect("empty is absent"),
+                None,
+                "{raw:?}"
+            );
+        }
+        let error = resolve_init_repository_url(Some("https://github.com/a/b\u{0}.git"), None)
+            .expect_err("a control character inside the remote still fails");
+        assert!(error
+            .to_string()
+            .contains("omit it to resolve the project from folder_path"));
+    }
+
+    #[test]
     fn repository_identity_bypasses_folder_name_preflight() {
         assert!(!should_resolve_project_by_folder_name(
             None,

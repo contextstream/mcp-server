@@ -905,3 +905,135 @@ mod call_path_compat_tests {
         assert_eq!(normalized["path"], json!(["legacy_a", "legacy_b"]));
     }
 }
+
+// ============================================================================
+// Call Path Text Rendering Tests
+// ============================================================================
+
+mod call_path_render_tests {
+    use super::{json, render_call_paths};
+
+    #[test]
+    fn renders_http_and_event_hops_and_counts_service_crossings() {
+        let result = json!({
+            "paths": [
+                {
+                    "functions": ["Purchase", "Complete", "GrantItems", "Grant", "GrantInventory"],
+                    "length": 4,
+                    "hops": [
+                        {"kind": "call"},
+                        {"kind": "call"},
+                        {"kind": "http", "via": "POST /inventory/grant"},
+                        {"kind": "call"}
+                    ]
+                },
+                {
+                    "functions": ["Purchase", "Publish", "OnPurchased", "GrantInventory"],
+                    "length": 3,
+                    "hops": [
+                        {"kind": "indirect"},
+                        {"kind": "event", "via": "purchase.completed"},
+                        {"kind": "call"}
+                    ]
+                }
+            ],
+            "path": ["Purchase", "Complete", "GrantItems", "Grant", "GrantInventory"],
+            "shortest_path_length": 3,
+            "total_paths_found": 2
+        });
+
+        let text = render_call_paths(&result, "Purchase", Some("GrantInventory"), None);
+        assert_eq!(
+            text,
+            "1. Purchase -> Complete -> GrantItems =http POST /inventory/grant=> Grant -> GrantInventory (4 steps)\n\
+             2. Purchase -(registers)-> Publish =event purchase.completed=> OnPurchased -> GrantInventory (3 steps)\n\
+             Crosses services: 1 HTTP hop(s), 1 event hop(s)."
+        );
+    }
+
+    #[test]
+    fn joins_with_calls_when_hops_are_missing() {
+        let result = json!({
+            "paths": [{"functions": ["a", "b", "c"], "length": 2}],
+            "path": ["a", "b", "c"],
+            "shortest_path_length": 2,
+            "total_paths_found": 1
+        });
+
+        let text = render_call_paths(&result, "a", Some("c"), Some(3));
+        assert_eq!(text, "1. a -> b -> c (2 steps)");
+    }
+
+    #[test]
+    fn joins_with_calls_when_hops_do_not_line_up() {
+        let result = json!({
+            "paths": [{
+                "functions": ["a", "b", "c"],
+                "length": 2,
+                "hops": [{"kind": "http", "via": "GET /b"}]
+            }]
+        });
+
+        let text = render_call_paths(&result, "a", Some("c"), None);
+        assert_eq!(text, "1. a -> b -> c (2 steps)");
+        assert!(!text.contains("Crosses services"));
+    }
+
+    #[test]
+    fn says_no_path_was_found_with_the_request_and_default_depth() {
+        let result = json!({
+            "paths": [],
+            "path": [],
+            "shortest_path_length": 0,
+            "total_paths_found": 0
+        });
+
+        assert_eq!(
+            render_call_paths(&result, "Purchase", Some("GrantInventory"), None),
+            "No call path found from Purchase to GrantInventory within depth 5."
+        );
+        assert_eq!(
+            render_call_paths(&result, "Purchase", Some("GrantInventory"), Some(8)),
+            "No call path found from Purchase to GrantInventory within depth 8."
+        );
+    }
+
+    #[test]
+    fn caps_the_listing_at_five_paths_and_counts_shared_crossings_once() {
+        let paths = (0..7)
+            .map(|index| {
+                json!({
+                    "functions": ["Checkout", format!("Step{}", index), "Charge", "Settle"],
+                    "length": 3,
+                    "hops": [
+                        {"kind": "call"},
+                        {"kind": "call"},
+                        {"kind": "http", "via": "POST /payments/settle"}
+                    ]
+                })
+            })
+            .collect::<Vec<_>>();
+        let result = json!({"paths": paths, "total_paths_found": 7});
+
+        let text = render_call_paths(&result, "Checkout", Some("Settle"), None);
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 7);
+        assert_eq!(
+            lines[0],
+            "1. Checkout -> Step0 -> Charge =http POST /payments/settle=> Settle (3 steps)"
+        );
+        assert!(lines[4].starts_with("5. Checkout -> Step4 "));
+        assert_eq!(lines[5], "...and 2 more paths in the structured result.");
+        assert_eq!(lines[6], "Crosses services: 1 HTTP hop(s), 0 event hop(s).");
+    }
+
+    #[test]
+    fn renders_the_legacy_path_when_paths_are_absent() {
+        let result = json!({"path": ["find_dependencies", "find_module_dependencies"]});
+
+        assert_eq!(
+            render_call_paths(&result, "find_dependencies", None, None),
+            "1. find_dependencies -> find_module_dependencies (1 step)"
+        );
+    }
+}

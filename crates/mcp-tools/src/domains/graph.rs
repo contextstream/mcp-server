@@ -975,6 +975,154 @@ fn normalize_call_path_result(mut result: Value) -> Value {
     result
 }
 
+/// Most call paths listed in the `call_path` text; the structured result keeps all.
+const CALL_PATH_TEXT_MAX_PATHS: usize = 5;
+
+/// The API's `max_depth` when the request leaves it out.
+const CALL_PATH_DEFAULT_MAX_DEPTH: i64 = 5;
+
+/// Text for `call_path`: one numbered line per path showing how each step is
+/// made, so an agent sees where a path crosses services over HTTP or an event.
+/// `hops[i]` joins `functions[i]` and `functions[i + 1]`; older APIs omit
+/// `hops`, and a path whose hops do not line up is joined with plain calls.
+fn render_call_paths(
+    result: &Value,
+    source_id: &str,
+    target_id: Option<&str>,
+    max_depth: Option<i64>,
+) -> String {
+    let mut paths = result
+        .get("paths")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|path| {
+            let functions = call_path_functions(path.get("functions")?);
+            let hops = path
+                .get("hops")
+                .and_then(|v| v.as_array())
+                .filter(|hops| hops.len() + 1 == functions.len());
+            (!functions.is_empty()).then_some((functions, hops))
+        })
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        // Older APIs return only the legacy first `path`.
+        let functions = result
+            .get("path")
+            .map(call_path_functions)
+            .unwrap_or_default();
+        if !functions.is_empty() {
+            paths.push((functions, None));
+        }
+    }
+
+    if paths.is_empty() {
+        let reported = result
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map_or(0, |paths| paths.len());
+        if reported > 0 {
+            // Paths without function names: only the length is known.
+            return format!(
+                "Found call path with {} nodes.",
+                call_path_node_count(result)
+            );
+        }
+        let target = target_id
+            .map(|target| format!(" to {}", target))
+            .unwrap_or_default();
+        return format!(
+            "No call path found from {}{} within depth {}.",
+            source_id,
+            target,
+            max_depth.unwrap_or(CALL_PATH_DEFAULT_MAX_DEPTH)
+        );
+    }
+
+    let mut lines = paths
+        .iter()
+        .take(CALL_PATH_TEXT_MAX_PATHS)
+        .enumerate()
+        .map(|(index, (functions, hops))| {
+            format!("{}. {}", index + 1, render_call_path_line(functions, *hops))
+        })
+        .collect::<Vec<_>>();
+    let more = paths.len().saturating_sub(CALL_PATH_TEXT_MAX_PATHS);
+    if more > 0 {
+        lines.push(format!(
+            "...and {} more path{} in the structured result.",
+            more,
+            if more == 1 { "" } else { "s" }
+        ));
+    }
+
+    // Count each crossing once, even when several paths share it.
+    let mut crossings = std::collections::BTreeSet::new();
+    for (functions, hops) in &paths {
+        for (index, hop) in hops.iter().flat_map(|hops| hops.iter()).enumerate() {
+            let kind = hop.get("kind").and_then(|v| v.as_str()).unwrap_or("call");
+            if matches!(kind, "http" | "event") {
+                let via = hop.get("via").and_then(|v| v.as_str()).unwrap_or("");
+                crossings.insert((kind, via, functions[index], functions[index + 1]));
+            }
+        }
+    }
+    if !crossings.is_empty() {
+        let http = crossings
+            .iter()
+            .filter(|(kind, ..)| *kind == "http")
+            .count();
+        lines.push(format!(
+            "Crosses services: {} HTTP hop(s), {} event hop(s).",
+            http,
+            crossings.len() - http
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn call_path_functions(functions: &Value) -> Vec<&str> {
+    functions
+        .as_array()
+        .map(|functions| functions.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default()
+}
+
+/// `Purchase -> Complete =http POST /inventory/grant=> Grant (2 steps)`.
+fn render_call_path_line(functions: &[&str], hops: Option<&Vec<Value>>) -> String {
+    let mut line = functions[0].to_string();
+    for (index, function) in functions.iter().enumerate().skip(1) {
+        match hops.map(|hops| &hops[index - 1]) {
+            Some(hop) => line.push_str(&call_path_hop_joiner(hop)),
+            None => line.push_str(" -> "),
+        }
+        line.push_str(function);
+    }
+    let steps = functions.len() - 1;
+    format!(
+        "{} ({} step{})",
+        line,
+        steps,
+        if steps == 1 { "" } else { "s" }
+    )
+}
+
+fn call_path_hop_joiner(hop: &Value) -> String {
+    let kind = hop.get("kind").and_then(|v| v.as_str()).unwrap_or("call");
+    let via = hop
+        .get("via")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|via| !via.is_empty());
+    match (kind, via) {
+        ("indirect", _) => " -(registers)-> ".to_string(),
+        ("http" | "event", Some(via)) => format!(" ={} {}=> ", kind, via),
+        ("http" | "event", None) => format!(" ={}=> ", kind),
+        _ => " -> ".to_string(),
+    }
+}
+
 fn looks_like_type_identifier(target_id: &str) -> bool {
     let mut chars = target_id.chars();
     matches!(chars.next(), Some(ch) if ch.is_ascii_uppercase())
@@ -1666,7 +1814,12 @@ impl ToolHandler for GraphTool {
                     (primary, false, None)
                 };
 
-                let path_len = call_path_node_count(&result);
+                let rendered = render_call_paths(
+                    &result,
+                    &source_id,
+                    input.target_id.as_deref(),
+                    input.max_depth,
+                );
                 let mut result = result;
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert(
@@ -1689,13 +1842,9 @@ impl ToolHandler for GraphTool {
                     }
                 }
                 let text = if cache_hit {
-                    format!(
-                        "[WARM_CACHE] graph_call_path served from regional cache (age {}ms)\nFound call path with {} nodes.",
-                        cache_age_ms.unwrap_or(0),
-                        path_len
-                    )
+                    warm_cache_prefixed_text("graph_call_path", cache_age_ms, rendered)
                 } else {
-                    format!("Found call path with {} nodes.", path_len)
+                    rendered
                 };
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note.as_deref() {

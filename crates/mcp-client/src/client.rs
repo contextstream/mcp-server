@@ -318,6 +318,85 @@ pub enum TargetedFileDecision {
     Reject,
 }
 
+/// Per-directory ignore files automatic ingest honours besides git's, lowest
+/// precedence first: Perforce's `.p4ignore`, then `.contextignore`, which wins
+/// when the two disagree.
+const INGEST_CUSTOM_IGNORE_FILENAMES: [&str; 2] = [".p4ignore", ".contextignore"];
+
+/// Folders Unity generates or builds into directly under a project root. They
+/// are pruned only there and only in a Unity project: `Assets/Scripts/Library`,
+/// or a `Library` folder in any other project, is source.
+const UNITY_GENERATED_ROOT_DIRS: [&str; 8] = [
+    "Library",
+    "Temp",
+    "Logs",
+    "UserSettings",
+    "MemoryCaptures",
+    "Build",
+    "Builds",
+    "obj",
+];
+
+/// Ingest rules that depend on what the root is rather than on a directory
+/// name. The full scan, the targeted writers (hooks, watcher, search repair)
+/// and the watcher's event filter all detect it from the same markers, so they
+/// agree on what is ingested.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IngestRootLayout {
+    /// A Plastic SCM / Unity Version Control workspace: `.plastic` at the root.
+    pub plastic_workspace: bool,
+    /// A Unity project: `ProjectSettings/ProjectVersion.txt` at the root.
+    pub unity_project: bool,
+}
+
+impl IngestRootLayout {
+    pub fn detect(root: &Path) -> Self {
+        Self {
+            plastic_workspace: root.join(".plastic").is_dir(),
+            unity_project: root
+                .join("ProjectSettings")
+                .join("ProjectVersion.txt")
+                .is_file(),
+        }
+    }
+
+    /// Plastic's workspace-root `ignore.conf`, read as gitignore. A file with
+    /// that name outside a Plastic workspace is unrelated config.
+    pub fn plastic_ignore_file(&self, root: &Path) -> Option<std::path::PathBuf> {
+        let path = root.join("ignore.conf");
+        (self.plastic_workspace && path.is_file()).then_some(path)
+    }
+
+    /// Whether an entry directly under the root is generated output.
+    pub fn skips_root_entry(&self, name: &str) -> bool {
+        self.unity_project && UNITY_GENERATED_ROOT_DIRS.contains(&name)
+    }
+
+    /// Whether automatic ingest prunes a project-relative path: a pruned
+    /// directory name at any depth, or generated output as its first
+    /// component.
+    pub fn prunes_relative_path(&self, relative: &str) -> bool {
+        let mut names = Path::new(relative)
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(value) => Some(value.to_str()),
+                _ => None,
+            })
+            .peekable();
+        if names
+            .peek()
+            .copied()
+            .flatten()
+            .is_some_and(|name| self.skips_root_entry(name))
+        {
+            return true;
+        }
+        names
+            .flatten()
+            .any(ContextStreamClient::should_skip_ingest_directory)
+    }
+}
+
 /// Process-wide project ingest lease. Every local ingest entry point funnels
 /// through `ingest_local_with_progress`, so this prevents the active refresh,
 /// search repair, hook drain, keep-warm daemon, setup, and explicit project
@@ -2490,12 +2569,14 @@ impl ContextStreamClient {
         candidate: &Path,
         relative: &str,
     ) -> std::result::Result<bool, ()> {
-        if Self::path_is_pruned_by_ingest_policy(relative) {
+        let layout = IngestRootLayout::detect(root);
+        if layout.prunes_relative_path(relative) {
             return Ok(true);
         }
 
         let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-        let mut ignore_files = vec![root.join(".gitignore"), root.join(".contextignore")];
+        let mut ignore_files = vec![root.join(".gitignore")];
+        ignore_files.extend(INGEST_CUSTOM_IGNORE_FILENAMES.map(|name| root.join(name)));
         match Self::git_common_dir_for_checkout(root) {
             Ok(Some(common_dir)) => ignore_files.push(common_dir.join("info").join("exclude")),
             Ok(None) => {}
@@ -2509,7 +2590,7 @@ impl ContextStreamClient {
                 };
                 current.push(part);
                 ignore_files.push(current.join(".gitignore"));
-                ignore_files.push(current.join(".contextignore"));
+                ignore_files.extend(INGEST_CUSTOM_IGNORE_FILENAMES.map(|name| current.join(name)));
             }
         }
         for ignore_file in ignore_files {
@@ -2525,6 +2606,23 @@ impl ContextStreamClient {
             return Ok(true);
         }
 
+        // The full scan applies Plastic's ignore.conf as its own filter, so
+        // another ignore file's `!` rule cannot re-include what it excludes.
+        if let Some(plastic_ignore) = layout.plastic_ignore_file(root) {
+            let mut plastic_builder = ignore::gitignore::GitignoreBuilder::new(root);
+            if plastic_builder.add(plastic_ignore).is_some() {
+                return Err(());
+            }
+            if plastic_builder
+                .build()
+                .map_err(|_| ())?
+                .matched_path_or_any_parents(candidate, false)
+                .is_ignore()
+            {
+                return Ok(true);
+            }
+        }
+
         // Match WalkBuilder's parent/global git-ignore behavior. Automatic
         // exact-file writers fail closed if ignore parsing is unavailable;
         // privacy takes precedence over an eager repair.
@@ -2532,7 +2630,7 @@ impl ContextStreamClient {
         while let Some(parent) = ancestor {
             let mut parent_builder = ignore::gitignore::GitignoreBuilder::new(parent);
             let mut found = false;
-            for filename in [".gitignore", ".contextignore"] {
+            for filename in std::iter::once(".gitignore").chain(INGEST_CUSTOM_IGNORE_FILENAMES) {
                 let path = parent.join(filename);
                 if path.is_file() {
                     found = true;
@@ -6247,8 +6345,13 @@ impl ContextStreamClient {
         // exist locally; otherwise upgrading the MCP only prevents new cache
         // files while every historical `.dev-data`/`.caches` row survives in
         // search forever.
+        let root_layout = IngestRootLayout::detect(Path::new(&local_root_abs));
         deleted_paths.retain(|relative| {
-            Self::should_tombstone_absence_candidate(Path::new(&local_root_abs), relative)
+            Self::should_tombstone_absence_candidate(
+                Path::new(&local_root_abs),
+                &root_layout,
+                relative,
+            )
         });
         deleted_paths.extend(scan.policy_deleted_paths.iter().cloned());
         let sensitive_cleanup_pending =
@@ -9720,6 +9823,19 @@ impl ContextStreamClient {
                 root_path
             )));
         }
+        let layout = IngestRootLayout::detect(root);
+        let plastic_ignore = layout.plastic_ignore_file(root).and_then(|path| {
+            let mut plastic_builder = ignore::gitignore::GitignoreBuilder::new(root);
+            if let Some(error) = plastic_builder.add(&path) {
+                debug!(
+                    "Applying the readable rules of {} while indexing {}: {}",
+                    path.display(),
+                    root_path,
+                    error
+                );
+            }
+            plastic_builder.build().ok()
+        });
         let mut builder = ignore::WalkBuilder::new(root);
         let root_for_filter = root.to_path_buf();
         builder
@@ -9729,19 +9845,28 @@ impl ContextStreamClient {
             .git_global(true)
             .git_exclude(true)
             .parents(true)
-            .sort_by_file_path(|left, right| left.cmp(right))
-            .add_custom_ignore_filename(".contextignore")
-            .filter_entry(move |entry| {
-                if entry.path() == root_for_filter {
-                    return true;
-                }
-                entry
-                    .path()
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| !Self::should_skip_ingest_directory(name))
-                    .unwrap_or(true)
-            });
+            .sort_by_file_path(|left, right| left.cmp(right));
+        for filename in INGEST_CUSTOM_IGNORE_FILENAMES {
+            builder.add_custom_ignore_filename(filename);
+        }
+        builder.filter_entry(move |entry| {
+            if entry.path() == root_for_filter {
+                return true;
+            }
+            let name = entry.path().file_name().and_then(|name| name.to_str());
+            if name.is_some_and(Self::should_skip_ingest_directory) {
+                return false;
+            }
+            if entry.depth() == 1 && name.is_some_and(|name| layout.skips_root_entry(name)) {
+                return false;
+            }
+            let is_dir = entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir());
+            !plastic_ignore
+                .as_ref()
+                .is_some_and(|matcher| matcher.matched(entry.path(), is_dir).is_ignore())
+        });
 
         let mut candidate_paths = Vec::new();
         let mut policy_deleted_paths = Vec::new();
@@ -10071,6 +10196,8 @@ impl ContextStreamClient {
             ".git"
                 | ".hg"
                 | ".svn"
+                // Plastic SCM / Unity Version Control workspace metadata.
+                | ".plastic"
                 | ".contextstream"
                 | ".cursor"
                 | ".windsurf"
@@ -10119,6 +10246,8 @@ impl ContextStreamClient {
                 | "venv"
                 | ".idea"
                 | ".vscode"
+                // Visual Studio's local solution state (.suo, IntelliSense databases).
+                | ".vs"
                 | ".DS_Store"
                 | "vendor"
                 | ".cache"
@@ -10155,23 +10284,15 @@ impl ContextStreamClient {
             || name.starts_with(".venv.")
     }
 
-    /// Return whether any component of a project-relative path is pruned by
-    /// the shared automatic-ingest policy.
-    fn path_is_pruned_by_ingest_policy(relative: &str) -> bool {
-        Path::new(relative)
-            .components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(value) => value.to_str(),
-                _ => None,
-            })
-            .any(Self::should_skip_ingest_directory)
-    }
-
     /// An absence candidate is safe to delete when it no longer exists, or
     /// when a newer ingest policy intentionally prunes it despite its presence
     /// on disk.
-    fn should_tombstone_absence_candidate(root: &Path, relative: &str) -> bool {
-        Self::path_is_pruned_by_ingest_policy(relative) || !root.join(relative).exists()
+    fn should_tombstone_absence_candidate(
+        root: &Path,
+        layout: &IngestRootLayout,
+        relative: &str,
+    ) -> bool {
+        layout.prunes_relative_path(relative) || !root.join(relative).exists()
     }
 
     /// Check if a file is a media file (image, audio, video, document).
@@ -25542,23 +25663,31 @@ mod tests {
             "{}\n",
         )?;
 
+        let layout = IngestRootLayout::detect(&root);
         assert!(
             ContextStreamClient::should_tombstone_absence_candidate(
                 &root,
+                &layout,
                 ".dev-data/sessions/turn.json",
             ),
             "an existing path newly covered by policy must be removed from the remote index"
         );
         assert!(ContextStreamClient::should_tombstone_absence_candidate(
             &root,
+            &layout,
             ".caches/npm/package.json",
         ));
         assert!(
-            !ContextStreamClient::should_tombstone_absence_candidate(&root, "src/existing.rs",),
+            !ContextStreamClient::should_tombstone_absence_candidate(
+                &root,
+                &layout,
+                "src/existing.rs",
+            ),
             "an existing source file must survive absence reconciliation"
         );
         assert!(ContextStreamClient::should_tombstone_absence_candidate(
             &root,
+            &layout,
             "src/deleted.rs",
         ));
 
@@ -25602,6 +25731,238 @@ mod tests {
         }
 
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn write_layout_files(root: &Path, relatives: &[&str]) -> std::io::Result<()> {
+        for relative in relatives {
+            let path = root.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, "public class Placeholder {}\n")?;
+        }
+        Ok(())
+    }
+
+    fn full_scan_paths(
+        root: &Path,
+    ) -> std::result::Result<Vec<String>, Box<dyn std::error::Error>> {
+        let client = ContextStreamClient::new(Config::default());
+        let scan = client.read_local_files(root.to_string_lossy().as_ref(), usize::MAX, false)?;
+        assert!(scan.complete);
+        Ok(scan
+            .files
+            .iter()
+            .filter_map(|file| file["path"].as_str().map(str::to_string))
+            .collect())
+    }
+
+    fn targeted_decision(root: &Path, relative: &str) -> TargetedFileDecision {
+        ContextStreamClient::targeted_text_file_decision(
+            root.to_string_lossy().as_ref(),
+            root.join(relative).to_string_lossy().as_ref(),
+        )
+    }
+
+    #[test]
+    fn unity_project_prunes_generated_root_folders_but_not_nested_ones(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        write_layout_files(
+            root,
+            &[
+                "ProjectSettings/ProjectVersion.txt",
+                "Assets/Scripts/Store.cs",
+                "Assets/Scripts/Library/Foo.cs",
+                "Library/PackageCache/com.unity.ugui/Runtime/Button.cs",
+                "Temp/Bee/Generated.cs",
+                "Logs/Packages-Update.log",
+                "UserSettings/EditorUserSettings.asset",
+                "MemoryCaptures/Capture.cs",
+                "Build/Player.cs",
+                "Builds/Player.cs",
+            ],
+        )?;
+
+        let indexed = full_scan_paths(root)?;
+        assert!(indexed.contains(&"Assets/Scripts/Store.cs".to_string()));
+        assert!(indexed.contains(&"Assets/Scripts/Library/Foo.cs".to_string()));
+        assert!(indexed.contains(&"ProjectSettings/ProjectVersion.txt".to_string()));
+        for generated in [
+            "Library/",
+            "Temp/",
+            "Logs/",
+            "UserSettings/",
+            "MemoryCaptures/",
+            "Build/",
+            "Builds/",
+        ] {
+            assert!(
+                !indexed.iter().any(|path| path.starts_with(generated)),
+                "{generated} is generated by Unity and must not be ingested: {indexed:?}"
+            );
+        }
+
+        let library_file = "Library/PackageCache/com.unity.ugui/Runtime/Button.cs";
+        assert!(matches!(
+            targeted_decision(root, library_file),
+            TargetedFileDecision::Delete(path) if path == library_file
+        ));
+        assert!(matches!(
+            targeted_decision(root, "Assets/Scripts/Library/Foo.cs"),
+            TargetedFileDecision::Upload(_)
+        ));
+
+        let layout = IngestRootLayout::detect(root);
+        assert!(layout.unity_project);
+        assert!(
+            ContextStreamClient::should_tombstone_absence_candidate(root, &layout, library_file),
+            "Library files indexed before this policy must be removed"
+        );
+        assert!(!ContextStreamClient::should_tombstone_absence_candidate(
+            root,
+            &layout,
+            "Assets/Scripts/Library/Foo.cs",
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn non_unity_project_keeps_its_library_folder(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        write_layout_files(root, &["Library/Foo.cs", "Temp/Bar.cs", "src/Main.cs"])?;
+
+        let indexed = full_scan_paths(root)?;
+        for kept in ["Library/Foo.cs", "Temp/Bar.cs", "src/Main.cs"] {
+            assert!(indexed.contains(&kept.to_string()), "{kept}: {indexed:?}");
+        }
+        assert!(matches!(
+            targeted_decision(root, "Library/Foo.cs"),
+            TargetedFileDecision::Upload(_)
+        ));
+        assert!(!IngestRootLayout::detect(root).prunes_relative_path("Library/Foo.cs"));
+        Ok(())
+    }
+
+    #[test]
+    fn p4ignore_patterns_are_honoured_below_contextignore(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        write_layout_files(
+            root,
+            &[
+                "src/Game.cs",
+                "src/Game.generated.cs",
+                "src/Keep.generated.cs",
+                "src/local.cs",
+                "ThirdParty/Lib.cs",
+            ],
+        )?;
+        std::fs::write(root.join(".p4ignore"), "*.generated.cs\nThirdParty/\n")?;
+        std::fs::write(root.join("src/.p4ignore"), "local.cs\n")?;
+        std::fs::write(root.join(".contextignore"), "!Keep.generated.cs\n")?;
+
+        let indexed = full_scan_paths(root)?;
+        assert!(indexed.contains(&"src/Game.cs".to_string()));
+        assert!(
+            indexed.contains(&"src/Keep.generated.cs".to_string()),
+            ".contextignore takes precedence over .p4ignore: {indexed:?}"
+        );
+        for ignored in ["src/Game.generated.cs", "src/local.cs", "ThirdParty/Lib.cs"] {
+            assert!(
+                !indexed.contains(&ignored.to_string()),
+                "{ignored}: {indexed:?}"
+            );
+            assert!(matches!(
+                targeted_decision(root, ignored),
+                TargetedFileDecision::Delete(path) if path == ignored
+            ));
+        }
+        for kept in ["src/Game.cs", "src/Keep.generated.cs"] {
+            assert!(matches!(
+                targeted_decision(root, kept),
+                TargetedFileDecision::Upload(_)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plastic_ignore_conf_applies_only_in_a_plastic_workspace(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        write_layout_files(
+            root,
+            &["Generated/Proxy.cs", "src/Cache.tmp.cs", "src/Shop.cs"],
+        )?;
+        std::fs::write(root.join("ignore.conf"), "Generated\n*.tmp.cs\n")?;
+
+        // Without `.plastic` a file named ignore.conf is someone else's config.
+        let indexed = full_scan_paths(root)?;
+        for kept in ["Generated/Proxy.cs", "src/Cache.tmp.cs", "src/Shop.cs"] {
+            assert!(indexed.contains(&kept.to_string()), "{kept}: {indexed:?}");
+        }
+        assert!(matches!(
+            targeted_decision(root, "Generated/Proxy.cs"),
+            TargetedFileDecision::Upload(_)
+        ));
+
+        write_layout_files(root, &[".plastic/plastic.workspace"])?;
+        let indexed = full_scan_paths(root)?;
+        assert!(indexed.contains(&"src/Shop.cs".to_string()));
+        for ignored in ["Generated/Proxy.cs", "src/Cache.tmp.cs"] {
+            assert!(
+                !indexed.contains(&ignored.to_string()),
+                "{ignored}: {indexed:?}"
+            );
+            assert!(matches!(
+                targeted_decision(root, ignored),
+                TargetedFileDecision::Delete(path) if path == ignored
+            ));
+        }
+        assert!(matches!(
+            targeted_decision(root, "src/Shop.cs"),
+            TargetedFileDecision::Upload(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plastic_and_visual_studio_metadata_are_never_ingested(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        write_layout_files(
+            root,
+            &[
+                ".plastic/plastic.selector",
+                ".plastic/plastic.workspace",
+                ".vs/Game/v17/DocumentLayout.json",
+                "Assets/Scripts/Store.cs",
+            ],
+        )?;
+
+        let indexed = full_scan_paths(root)?;
+        assert_eq!(indexed, vec!["Assets/Scripts/Store.cs".to_string()]);
+        for metadata in [
+            ".plastic/plastic.selector",
+            ".vs/Game/v17/DocumentLayout.json",
+        ] {
+            assert!(matches!(
+                targeted_decision(root, metadata),
+                TargetedFileDecision::Delete(path) if path == metadata
+            ));
+        }
+        assert!(ContextStreamClient::should_skip_ingest_directory(
+            ".plastic"
+        ));
+        assert!(ContextStreamClient::should_skip_ingest_directory(".vs"));
         Ok(())
     }
 

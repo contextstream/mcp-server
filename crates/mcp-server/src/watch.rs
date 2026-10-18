@@ -19,9 +19,11 @@
 //!   ensures only one watcher runs even if several editors try to launch one.
 //! - **Debounced + coalesced.** Rapid saves within the quiet window collapse
 //!   into a single re-ingest per project.
-//! - **Ignore-aware.** Event paths under build/VCS dirs are ignored up front;
-//!   the actual ingest additionally honors `.gitignore` / `.contextignore` /
-//!   git excludes and the file-size cap (via `read_local_files`).
+//! - **Ignore-aware.** Event paths under build/VCS dirs, and under a Unity
+//!   project's generated root folders, are ignored up front; the actual ingest
+//!   additionally honors `.gitignore` / `.p4ignore` / `.contextignore`, a
+//!   Plastic workspace's `ignore.conf`, git excludes and the file-size cap
+//!   (via `read_local_files`).
 //! - **Non-billed.** Ingests are marked `background: true` + `origin: "watch"`,
 //!   landing in the system lane (mirrors the keep-warm daemon's
 //!   `keep_warm_daemon` origin) so the watcher never charges user credits.
@@ -35,8 +37,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use mcp_client::{
-    ContextStreamClient, IngestFailure, IngestLocalParams, SyncBridgeCheckoutRegistration,
-    SyncBridgeRefreshClaim, TargetedFileDecision,
+    ContextStreamClient, IngestFailure, IngestLocalParams, IngestRootLayout,
+    SyncBridgeCheckoutRegistration, SyncBridgeRefreshClaim, TargetedFileDecision,
 };
 use mcp_types::config::VERSION;
 use serde::{Deserialize, Serialize};
@@ -689,6 +691,16 @@ fn path_has_ignored_component(path: &Path) -> bool {
             .map(ContextStreamClient::should_skip_ingest_directory)
             .unwrap_or(false)
     })
+}
+
+/// Root-aware half of the up-front filter: folders a name alone cannot rule
+/// out, such as the `Library` Unity regenerates at a project's root.
+fn path_is_pruned_for_target(path: &Path, target: &WatchTarget) -> bool {
+    let root = Path::new(&target.folder_path);
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.to_str())
+        .is_some_and(|relative| IngestRootLayout::detect(root).prunes_relative_path(relative))
 }
 
 // ===========================================================================
@@ -2062,6 +2074,9 @@ pub async fn run_watch() -> Result<()> {
                     continue;
                 }
                 if let Some(target) = resolve_target_for_path(&path, &targets) {
+                    if path_is_pruned_for_target(&path, target) {
+                        continue;
+                    }
                     let path_string = path.to_string_lossy().into_owned();
                     let requires_full_repair = dirty_drain::record_dirty_paths(
                         &target.folder_path,
@@ -3317,6 +3332,43 @@ mod tests {
                 "{path} should wake the watcher"
             );
         }
+    }
+
+    #[test]
+    fn unity_generated_root_folders_do_not_wake_the_watcher() {
+        let unity = tempdir().unwrap();
+        let plain = tempdir().unwrap();
+        std::fs::create_dir_all(unity.path().join("ProjectSettings")).unwrap();
+        std::fs::write(
+            unity.path().join("ProjectSettings/ProjectVersion.txt"),
+            "m_EditorVersion: 6000.0.23f1\n",
+        )
+        .unwrap();
+        let target = |root: &Path| WatchTarget {
+            folder_path: root.to_string_lossy().into_owned(),
+            project_id: pid_a(),
+            workspace_id: None,
+        };
+
+        let unity_target = target(unity.path());
+        for generated in [
+            "Library/ArtifactDB",
+            "Temp/Bee/x.cs",
+            "Logs/AssetImportWorker0.log",
+        ] {
+            assert!(
+                path_is_pruned_for_target(&unity.path().join(generated), &unity_target),
+                "{generated} should not wake the watcher"
+            );
+        }
+        assert!(!path_is_pruned_for_target(
+            &unity.path().join("Assets/Scripts/Library/Foo.cs"),
+            &unity_target,
+        ));
+        assert!(!path_is_pruned_for_target(
+            &plain.path().join("Library/Foo.cs"),
+            &target(plain.path()),
+        ));
     }
 
     #[test]

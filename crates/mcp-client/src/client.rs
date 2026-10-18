@@ -568,6 +568,49 @@ pub fn get_task_edge_geography() -> Option<mcp_types::EdgeGeography> {
 }
 
 tokio::task_local! {
+    /// API attempts sent inside the current tool call and their summed wall
+    /// time to response headers, for the gateway's per-call timing line.
+    static TASK_API_CALLS: std::cell::Cell<(u32, u64)>;
+}
+
+/// API traffic one tool call made: attempts sent (retries included) and the
+/// sum of their times to response headers. Concurrent requests overlap, so
+/// the sum can exceed the call's wall time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApiCallStats {
+    pub calls: u32,
+    pub elapsed_ms_sum: u64,
+}
+
+/// Run `future`, counting the API requests made in its task.
+pub async fn run_counting_api_calls<F>(future: F) -> (F::Output, ApiCallStats)
+where
+    F: std::future::Future,
+{
+    TASK_API_CALLS
+        .scope(std::cell::Cell::new((0, 0)), async move {
+            let output = future.await;
+            let (calls, elapsed_ms_sum) = TASK_API_CALLS.with(|cell| cell.get());
+            (
+                output,
+                ApiCallStats {
+                    calls,
+                    elapsed_ms_sum,
+                },
+            )
+        })
+        .await
+}
+
+fn record_api_attempt(elapsed: Duration) {
+    let _ = TASK_API_CALLS.try_with(|cell| {
+        let (calls, total) = cell.get();
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        cell.set((calls.saturating_add(1), total.saturating_add(elapsed_ms)));
+    });
+}
+
+tokio::task_local! {
     /// The tenant home region the API named on the responses made inside the
     /// current request (`x-contextstream-tenant-home-region`), with the scope
     /// tokens the same response named. The HTTP transport publishes them on
@@ -1160,6 +1203,153 @@ use uuid::Uuid;
 
 use crate::cache::{create_global_cache, ttl, CacheKey, GlobalCache};
 use crate::retry::{is_retryable_status, RetryConfig};
+
+/// Request header that carries one key per logical write. Retries of the
+/// same write resend the same key, so an API that stores keys can answer a
+/// replay with the original result instead of creating a second record.
+pub const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
+
+/// Response header with which the API says it stores idempotency keys for
+/// the write routes. Only after an origin has said so is a write that may
+/// have reached the server retried.
+pub const IDEMPOTENCY_SUPPORT_HEADER: &str = "x-contextstream-idempotency";
+
+/// Timeout for the agent-facing memory, planning, doc and entity writes.
+/// Their API handlers finish in milliseconds; a write that has not answered
+/// in 10 s is stuck, and waiting the general 30 s only holds the agent.
+pub const WRITE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Route families whose non-GET requests are agent-facing writes: they get
+/// an idempotency key, the write timeout and the write retry policy. Every
+/// other request (search and context POSTs, ingest uploads, project deletes)
+/// keeps the general policy.
+const AGENT_WRITE_ROUTE_ROOTS: &[&str] = &[
+    "plans",
+    "tasks",
+    "docs",
+    "memory/events",
+    "memory/decisions",
+    "memory/nodes",
+    "lessons",
+    "todos",
+    "diagrams",
+    "reminders",
+    "tickets",
+    "handoffs",
+    "backlog-views",
+    "incidents",
+    "releases",
+    "experiments",
+    "goals",
+    "key-results",
+    "sprints",
+    "reviews",
+    "risks",
+    "coordinations",
+];
+
+/// Write-family routes that carry bulk payloads and keep the general timeout.
+const AGENT_WRITE_ROUTE_EXCLUSIONS: &[&str] = &["memory/events/ingest"];
+
+/// Final path segments of write-family routes that run an LLM pipeline
+/// (`POST /memory/events/:id/distill`) and keep the general policy.
+const AGENT_WRITE_LLM_SUFFIXES: &[&str] = &["/distill"];
+
+fn route_matches_root(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether `method` on `api_path` (`/api/v1/...`, query allowed) is one of
+/// the agent-facing writes.
+pub fn is_agent_write_request(method: &str, api_path: &str) -> bool {
+    if method.eq_ignore_ascii_case("GET") {
+        return false;
+    }
+    let path = api_path
+        .strip_prefix("/api/v1/")
+        .or_else(|| api_path.strip_prefix("/api/"))
+        .unwrap_or_else(|| api_path.trim_start_matches('/'));
+    let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    if AGENT_WRITE_ROUTE_EXCLUSIONS
+        .iter()
+        .any(|excluded| route_matches_root(path, excluded))
+        || AGENT_WRITE_LLM_SUFFIXES
+            .iter()
+            .any(|suffix| path.ends_with(suffix))
+    {
+        return false;
+    }
+    AGENT_WRITE_ROUTE_ROOTS
+        .iter()
+        .any(|root| route_matches_root(path, root))
+}
+
+/// API origins that have answered with `x-contextstream-idempotency: 1`.
+fn idempotency_origins() -> &'static Mutex<std::collections::HashSet<String>> {
+    static ORIGINS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    ORIGINS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn normalized_api_origin(api_url: &str) -> String {
+    api_url.trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// Record that `api_url` stores idempotency keys when a response says so.
+pub(crate) fn observe_idempotency_support(api_url: &str, headers: &reqwest::header::HeaderMap) {
+    let supported = headers
+        .get(IDEMPOTENCY_SUPPORT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "1");
+    if supported {
+        if let Ok(mut origins) = idempotency_origins().lock() {
+            origins.insert(normalized_api_origin(api_url));
+        }
+    }
+}
+
+/// Whether `api_url` has advertised idempotency-key storage in this process.
+pub fn api_supports_idempotency(api_url: &str) -> bool {
+    idempotency_origins()
+        .lock()
+        .map(|origins| origins.contains(&normalized_api_origin(api_url)))
+        .unwrap_or(false)
+}
+
+/// How a failed attempt of a request may be retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptFailure {
+    /// The connection was never established: nothing reached the server.
+    NotSent,
+    /// The request may have reached the server (timeout, reset, a 5xx
+    /// produced after the handler ran).
+    MaybeApplied,
+    /// The server refused the request without running it (429, 503).
+    Refused,
+}
+
+/// Whether a failed attempt may be retried at all. Reads keep the general
+/// policy; an agent write that may already have been applied is retried only
+/// when the API stores idempotency keys, so a retry can never create a
+/// second plan, doc, task or event.
+fn retry_permitted(is_write: bool, failure: AttemptFailure, idempotency_supported: bool) -> bool {
+    if !is_write {
+        return true;
+    }
+    match failure {
+        AttemptFailure::NotSent | AttemptFailure::Refused => true,
+        AttemptFailure::MaybeApplied => idempotency_supported,
+    }
+}
+
+fn status_attempt_failure(status: u16) -> AttemptFailure {
+    match status {
+        429 | 503 => AttemptFailure::Refused,
+        _ => AttemptFailure::MaybeApplied,
+    }
+}
 
 /// One API response as sent: status, headers and the JSON body (a string
 /// when the body was not JSON, `null` when it was empty).
@@ -3552,6 +3742,13 @@ impl ContextStreamClient {
             }
         }
 
+        // One idempotency key per logical write, reused by every retry of
+        // it below (the retries resend this same built request).
+        let is_write = is_agent_write_request(method, &api_path);
+        if is_write && !request_options_has_header(&options, IDEMPOTENCY_KEY_HEADER) {
+            req = req.header(IDEMPOTENCY_KEY_HEADER, Uuid::new_v4().to_string());
+        }
+
         // Add body
         if let Some(ref b) = body {
             if let Ok(body_json) = serde_json::to_value(b) {
@@ -3562,9 +3759,14 @@ impl ContextStreamClient {
             debug!("{} {} (no body)", method, url);
         }
 
-        // Default 30s for most API calls. Long-running operations (e.g. context/smart
-        // with LLM calls) should pass explicit longer timeouts via RequestOptions.
-        let timeout = options.timeout.unwrap_or(Duration::from_secs(30));
+        // Default 30s for most API calls; 10s for agent writes. Long-running
+        // operations (e.g. context/smart with LLM calls) should pass explicit
+        // longer timeouts via RequestOptions.
+        let timeout = options.timeout.unwrap_or(if is_write {
+            WRITE_REQUEST_TIMEOUT
+        } else {
+            Duration::from_secs(30)
+        });
         req = req.timeout(timeout);
 
         // Execute with retries
@@ -3584,12 +3786,21 @@ impl ContextStreamClient {
                 tokio::time::sleep(delay).await;
             }
 
-            let response = match req.try_clone().unwrap().send().await {
+            let attempt_started = std::time::Instant::now();
+            let sent = req.try_clone().unwrap().send().await;
+            record_api_attempt(attempt_started.elapsed());
+            let response = match sent {
                 Ok(resp) => {
                     observe_tenant_home_header(resp.headers());
+                    observe_idempotency_support(&config.api_url, resp.headers());
                     resp
                 }
                 Err(e) => {
+                    let failure = if e.is_connect() {
+                        AttemptFailure::NotSent
+                    } else {
+                        AttemptFailure::MaybeApplied
+                    };
                     let error = if e.is_timeout() {
                         Error::Timeout(timeout.as_secs())
                     } else if e.is_connect() {
@@ -3598,7 +3809,14 @@ impl ContextStreamClient {
                         Error::Network(e.to_string())
                     };
 
-                    if error.is_retryable() && attempt < max_retries {
+                    if error.is_retryable()
+                        && attempt < max_retries
+                        && retry_permitted(
+                            is_write,
+                            failure,
+                            api_supports_idempotency(&config.api_url),
+                        )
+                    {
                         if let Some(delay) = self.retry_config.delay_before_retry(&error, attempt) {
                             retry_delay = Some(delay);
                             attempt += 1;
@@ -3620,7 +3838,14 @@ impl ContextStreamClient {
             let error = self.parse_error(response).await;
             debug!("Error response: {:?}", error);
 
-            if is_retryable_status(status.as_u16()) && attempt < max_retries {
+            if is_retryable_status(status.as_u16())
+                && attempt < max_retries
+                && retry_permitted(
+                    is_write,
+                    status_attempt_failure(status.as_u16()),
+                    api_supports_idempotency(&config.api_url),
+                )
+            {
                 // A server-requested wait beyond the in-request cap is handed
                 // back to the caller as RateLimited instead of slept here.
                 if let Some(delay) = self.retry_config.delay_before_retry(&error, attempt) {
@@ -4415,6 +4640,22 @@ impl ContextStreamClient {
     }
 
     /// Get a workspace by ID.
+    /// The workspace as cached for the current caller, without a request.
+    pub fn cached_workspace(&self, id: Uuid) -> Option<Workspace> {
+        let cache_key =
+            current_client_cache_identity().map(|caller| Self::workspace_cache_key(&caller, id));
+        self.cached_response(cache_key.as_ref())
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    /// The project as cached for the current caller, without a request.
+    pub fn cached_project(&self, id: Uuid) -> Option<Project> {
+        let cache_key =
+            current_client_cache_identity().map(|caller| Self::project_cache_key(&caller, id));
+        self.cached_response(cache_key.as_ref())
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
     pub async fn get_workspace(&self, id: Uuid) -> Result<Workspace> {
         let cache_key =
             current_client_cache_identity().map(|caller| Self::workspace_cache_key(&caller, id));
@@ -18074,6 +18315,11 @@ pub struct CapturePlanParams {
     pub project_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_personal: Option<bool>,
+    /// Linked tasks to create in the plan's own request. An API that
+    /// supports it answers with `created_tasks`; an older API ignores the
+    /// field and the caller creates the tasks itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<serde_json::Value>>,
 }
 
 /// Plan step.
@@ -18103,6 +18349,7 @@ impl CapturePlanParams {
             "workspace_id": workspace_id,
             "project_id": project_id,
             "is_personal": self.is_personal,
+            "tasks": self.tasks,
         }))
     }
 }
@@ -20824,6 +21071,200 @@ mod tests {
         config.api_url = format!("http://{addr}");
         config.api_key = Some("test-key".to_string());
         (ContextStreamClient::new(config), server)
+    }
+
+    /// Like `client_with_http_sequence`, with extra raw response header lines.
+    async fn client_with_http_sequence_headers(
+        responses: Vec<(&'static str, &'static str, String)>,
+    ) -> (ContextStreamClient, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP sequence listener");
+        let addr = listener.local_addr().expect("HTTP sequence listener addr");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for (status, extra_headers, body) in responses {
+                let (mut socket, _) = listener.accept().await.expect("accept HTTP request");
+                let mut buffer = vec![0u8; 1024 * 1024];
+                let read = socket.read(&mut buffer).await.expect("read HTTP request");
+                requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write HTTP response");
+            }
+            requests
+        });
+
+        let mut config = Config::default();
+        config.api_url = format!("http://{addr}");
+        config.api_key = Some("test-key".to_string());
+        (ContextStreamClient::new(config), server)
+    }
+
+    fn request_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    #[test]
+    fn agent_write_routes_are_classified_by_method_and_route_family() {
+        for (method, path) in [
+            ("POST", "/api/v1/plans"),
+            ("POST", "/api/v1/tasks"),
+            ("PATCH", "/api/v1/tasks/5c1e"),
+            ("POST", "/api/v1/docs"),
+            ("PATCH", "/api/v1/docs/5c1e"),
+            ("POST", "/api/v1/memory/events"),
+            ("POST", "/api/v1/memory/decisions"),
+            ("POST", "/api/v1/lessons"),
+            ("POST", "/api/v1/tickets"),
+            ("POST", "/api/v1/goals/5c1e/key-results"),
+            ("DELETE", "/api/v1/memory/events/5c1e?hard=false"),
+        ] {
+            assert!(is_agent_write_request(method, path), "{method} {path}");
+        }
+        for (method, path) in [
+            ("GET", "/api/v1/plans"),
+            ("GET", "/api/v1/docs/5c1e"),
+            ("POST", "/api/v1/search/hybrid"),
+            ("POST", "/api/v1/context/smart"),
+            ("POST", "/api/v1/memory/search"),
+            ("POST", "/api/v1/memory/events/ingest"),
+            ("POST", "/api/v1/memory/events/5c1e/distill"),
+            ("POST", "/api/v1/projects/5c1e/files/ingest"),
+            ("DELETE", "/api/v1/projects/5c1e"),
+            ("POST", "/api/v1/plansx"),
+        ] {
+            assert!(!is_agent_write_request(method, path), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn writes_that_may_have_applied_retry_only_with_idempotency_support() {
+        use AttemptFailure::*;
+        for failure in [NotSent, MaybeApplied, Refused] {
+            assert!(
+                retry_permitted(false, failure, false),
+                "reads keep retrying"
+            );
+        }
+        assert!(retry_permitted(true, NotSent, false));
+        assert!(retry_permitted(true, Refused, false));
+        assert!(!retry_permitted(true, MaybeApplied, false));
+        assert!(retry_permitted(true, MaybeApplied, true));
+        assert_eq!(status_attempt_failure(429), Refused);
+        assert_eq!(status_attempt_failure(503), Refused);
+        for status in [408, 500, 502, 504] {
+            assert_eq!(status_attempt_failure(status), MaybeApplied);
+        }
+    }
+
+    #[tokio::test]
+    async fn write_is_not_retried_after_a_5xx_without_idempotency_support() {
+        let (client, server) = client_with_http_sequence_headers(vec![(
+            "500 Internal Server Error",
+            "",
+            r#"{"error":{"code":"internal","message":"boom"}}"#.to_string(),
+        )])
+        .await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(900),
+            client.post::<serde_json::Value, _>("/docs", serde_json::json!({"title": "t"})),
+        )
+        .await
+        .expect("a write that may have applied must not enter retry backoff");
+        assert!(matches!(result, Err(Error::Http { status: 500, .. })));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1, "exactly one attempt");
+        let key = request_header(&requests[0], IDEMPOTENCY_KEY_HEADER)
+            .expect("writes carry an idempotency key");
+        assert!(Uuid::parse_str(key).is_ok());
+    }
+
+    #[tokio::test]
+    async fn refused_write_is_retried_with_the_same_idempotency_key() {
+        let (client, server) = client_with_http_sequence_headers(vec![
+            (
+                "503 Service Unavailable",
+                "",
+                r#"{"error":{"code":"unavailable","message":"later"}}"#.to_string(),
+            ),
+            ("201 Created", "", r#"{"data":{"id":"d1"}}"#.to_string()),
+        ])
+        .await;
+        let created: serde_json::Value = client
+            .post("/docs", serde_json::json!({"title": "t"}))
+            .await
+            .expect("the retry succeeds");
+        assert_eq!(created["id"], "d1");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            request_header(&requests[0], IDEMPOTENCY_KEY_HEADER),
+            request_header(&requests[1], IDEMPOTENCY_KEY_HEADER),
+            "a retry is the same logical write"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_may_retry_after_the_origin_advertises_idempotency() {
+        let (client, server) = client_with_http_sequence_headers(vec![
+            (
+                "201 Created",
+                "x-contextstream-idempotency: 1\r\n",
+                r#"{"data":{"id":"d1"}}"#.to_string(),
+            ),
+            (
+                "502 Bad Gateway",
+                "",
+                r#"{"error":{"code":"bad_gateway","message":"edge"}}"#.to_string(),
+            ),
+            (
+                "201 Created",
+                "x-contextstream-idempotency: 1\r\n",
+                r#"{"data":{"id":"d2"}}"#.to_string(),
+            ),
+        ])
+        .await;
+        let _: serde_json::Value = client
+            .post("/docs", serde_json::json!({"title": "a"}))
+            .await
+            .unwrap();
+        let second: serde_json::Value = client
+            .post("/docs", serde_json::json!({"title": "b"}))
+            .await
+            .expect("retried after the 502 because replays are deduplicated");
+        assert_eq!(second["id"], "d2");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_ne!(
+            request_header(&requests[0], IDEMPOTENCY_KEY_HEADER),
+            request_header(&requests[1], IDEMPOTENCY_KEY_HEADER),
+            "separate writes get separate keys"
+        );
+        assert_eq!(
+            request_header(&requests[1], IDEMPOTENCY_KEY_HEADER),
+            request_header(&requests[2], IDEMPOTENCY_KEY_HEADER)
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_carry_no_idempotency_key() {
+        let (client, server) =
+            client_with_http_sequence_headers(vec![("200 OK", "", r#"{"data":[]}"#.to_string())])
+                .await;
+        let _: serde_json::Value = client.get("/plans").await.unwrap();
+        let requests = server.await.unwrap();
+        assert!(request_header(&requests[0], IDEMPOTENCY_KEY_HEADER).is_none());
     }
 
     #[tokio::test]

@@ -7531,3 +7531,142 @@ fn context_scope_alerts_reach_structured_content_on_every_emission() {
         }
     }
 }
+
+mod plan_task_batch_tests {
+    use super::*;
+
+    fn blueprint(step: &str, order: i64) -> PlanTaskBlueprint {
+        PlanTaskBlueprint {
+            title: format!("Task {step}"),
+            description: format!("Do {step}."),
+            priority: "medium".to_string(),
+            status: "pending".to_string(),
+            plan_step_id: Some(step.to_string()),
+            tags: Some(vec!["t".to_string()]),
+            order: Some(order),
+        }
+    }
+
+    #[test]
+    fn inline_task_wire_carries_the_task_fields() {
+        let wire = plan_task_wire(&blueprint("plan-step-2", 2), Some(true));
+        assert_eq!(
+            wire,
+            json!({
+                "title": "Task plan-step-2",
+                "description": "Do plan-step-2.",
+                "priority": "medium",
+                "status": "pending",
+                "plan_step_id": "plan-step-2",
+                "tags": ["t"],
+                "order": 2,
+                "is_personal": true
+            })
+        );
+    }
+
+    #[test]
+    fn batch_tasks_are_used_only_when_the_api_created_one_per_blueprint() {
+        let blueprints = vec![blueprint("plan-step-1", 1), blueprint("plan-step-2", 2)];
+        let plan = json!({
+            "id": "p",
+            "created_tasks": [
+                {"id": "t1", "title": "Task plan-step-1", "status": "pending", "plan_step_id": "plan-step-1"},
+                {"id": "t2", "title": "Task plan-step-2", "status": "pending", "plan_step_id": "plan-step-2"}
+            ]
+        });
+        let created = batch_created_tasks(&plan, &blueprints).expect("batch accepted");
+        assert_eq!(created[1]["id"], "t2");
+        assert_eq!(created[1]["plan_step_id"], "plan-step-2");
+
+        // An older API answers without created_tasks.
+        assert!(batch_created_tasks(&json!({"id": "p"}), &blueprints).is_none());
+        // A count that does not match, or a task without an id, is not trusted.
+        let short = json!({"created_tasks": [{"id": "t1"}]});
+        assert!(batch_created_tasks(&short, &blueprints).is_none());
+        let no_id = json!({"created_tasks": [{"id": "t1"}, {"title": "x"}]});
+        assert!(batch_created_tasks(&no_id, &blueprints).is_none());
+    }
+
+    #[test]
+    fn plan_task_concurrency_defaults_to_six_and_is_clamped() {
+        assert_eq!(plan_task_concurrency_from(None), 6);
+        assert_eq!(plan_task_concurrency_from(Some("1".into())), 1);
+        assert_eq!(plan_task_concurrency_from(Some(" 3 ".into())), 3);
+        assert_eq!(plan_task_concurrency_from(Some("0".into())), 1);
+        assert_eq!(plan_task_concurrency_from(Some("999".into())), 16);
+        assert_eq!(plan_task_concurrency_from(Some("many".into())), 6);
+    }
+
+    #[tokio::test]
+    async fn fallback_task_creation_keeps_step_order_and_reports_failures() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0_u8; 64 * 1024];
+                let read = socket.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let body: Value =
+                    serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                let step = body["plan_step_id"].as_str().unwrap().to_string();
+                let (status, reply) = if step == "plan-step-2" {
+                    (
+                        "400 Bad Request",
+                        json!({"error": {"code": "bad", "message": "refused"}}),
+                    )
+                } else {
+                    (
+                        "201 Created",
+                        json!({"data": {"id": format!("task-{step}")}}),
+                    )
+                };
+                let reply = reply.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                bodies.push(body);
+            }
+            bodies
+        });
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{address}");
+        let client = ContextStreamClient::new(config);
+
+        let (created, errors) = create_plan_tasks_concurrently(
+            &client,
+            Uuid::new_v4(),
+            vec![
+                blueprint("plan-step-1", 1),
+                blueprint("plan-step-2", 2),
+                blueprint("plan-step-3", 3),
+            ],
+            None,
+            None,
+            None,
+            3,
+        )
+        .await;
+
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies.len(), 3);
+        for body in &bodies {
+            let order = body["order"].as_i64().unwrap();
+            assert_eq!(
+                body["plan_step_id"],
+                format!("plan-step-{order}"),
+                "each task keeps its own order"
+            );
+        }
+        let ids: Vec<&str> = created.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["task-plan-step-1", "task-plan-step-3"]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("Task plan-step-2: "), "{errors:?}");
+    }
+}

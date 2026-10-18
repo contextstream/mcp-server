@@ -292,14 +292,32 @@ impl EntityTool {
             }),
             None => None,
         };
-        match (project, workspace) {
-            (Some(project), Some(workspace)) => {
-                Some(format!("project {} (workspace {})", project, workspace))
-            }
-            (Some(project), None) => Some(format!("project {}", project)),
-            (None, Some(workspace)) => Some(format!("workspace {}, in no project", workspace)),
-            (None, None) => None,
-        }
+        format_location(project, workspace)
+    }
+
+    /// `describe_location` from the client cache only: names that the
+    /// scope resolution already fetched, ids otherwise. Never waits on a
+    /// request, so a create's reply is not held for a cosmetic line.
+    fn describe_location_cached(
+        &self,
+        workspace_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Option<String> {
+        let project = project_id.map(|id| {
+            Uuid::parse_str(id)
+                .ok()
+                .and_then(|uuid| self.client.cached_project(uuid))
+                .map(|p| p.name)
+                .unwrap_or_else(|| id.to_string())
+        });
+        let workspace = workspace_id.map(|id| {
+            Uuid::parse_str(id)
+                .ok()
+                .and_then(|uuid| self.client.cached_workspace(uuid))
+                .map(|w| w.name)
+                .unwrap_or_else(|| id.to_string())
+        });
+        format_location(project, workspace)
     }
 
     /// Flatten a JSON `query` object plus explicit `workspace_id` /
@@ -522,6 +540,18 @@ fn describe_workspace_projects(projects: &[Project]) -> String {
 
 /// A scope id (`workspace_id` / `project_id`) as the API stored it, falling
 /// back to what the request sent when the reply leaves it out.
+/// "project mcp-server (workspace Engineering)", from names or ids.
+fn format_location(project: Option<String>, workspace: Option<String>) -> Option<String> {
+    match (project, workspace) {
+        (Some(project), Some(workspace)) => {
+            Some(format!("project {} (workspace {})", project, workspace))
+        }
+        (Some(project), None) => Some(format!("project {}", project)),
+        (None, Some(workspace)) => Some(format!("workspace {}, in no project", workspace)),
+        (None, None) => None,
+    }
+}
+
 fn stored_scope_id(kind: &str, result: &Value, body: &Value, field: &str) -> Option<String> {
     extract_entity_object(kind, result)
         .get(field)
@@ -879,12 +909,12 @@ impl ToolHandler for EntityTool {
                 } else {
                     format!("Created {}: {}", kind, summary)
                 };
-                let location = self
-                    .describe_location(
-                        stored_scope_id(&kind, &result, &body, "workspace_id").as_deref(),
-                        stored_scope_id(&kind, &result, &body, "project_id").as_deref(),
-                    )
-                    .await;
+                // Names come from the cache the scope resolution filled;
+                // the reply never waits on extra lookups after the write.
+                let location = self.describe_location_cached(
+                    stored_scope_id(&kind, &result, &body, "workspace_id").as_deref(),
+                    stored_scope_id(&kind, &result, &body, "project_id").as_deref(),
+                );
                 if let Some(location) = location {
                     text.push_str(&format!("\nFiled in {}.", location));
                 }
@@ -1272,14 +1302,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_applies_the_mode_default_and_names_visibility_and_project() {
-        let (tool, server) = entity_tool_with_http_sequence(vec![
-            ("201 Created", stored_ticket(true, MCP_SERVER_PROJECT_ID)),
-            (
-                "200 OK",
-                serde_json::json!({"id": MCP_SERVER_PROJECT_ID, "name": "mcp-server"}),
-            ),
-            ("200 OK", workspace_named("Engineering")),
-        ])
+        // No lookups follow the write: uncached names are reported by id.
+        let (tool, server) = entity_tool_with_http_sequence(vec![(
+            "201 Created",
+            stored_ticket(true, MCP_SERVER_PROJECT_ID),
+        )])
         .await;
 
         let result = tool
@@ -1301,12 +1328,57 @@ mod tests {
             "a create still applies the mode default: {body}"
         );
         assert_eq!(body["project_id"], MCP_SERVER_PROJECT_ID);
+        assert_eq!(requests.len(), 1, "the reply does not wait on lookups");
+        let text = result_text(&result);
+        assert!(
+            text.contains(&format!(
+                "Filed in project {MCP_SERVER_PROJECT_ID} (workspace {WORKSPACE_ID})."
+            )),
+            "{text}"
+        );
+        assert!(text.contains("Visibility: personal (only you can see it)"));
+    }
+
+    #[tokio::test]
+    async fn create_names_the_location_from_names_already_cached() {
+        let (tool, server) = entity_tool_with_http_sequence(vec![
+            (
+                "200 OK",
+                serde_json::json!({"id": MCP_SERVER_PROJECT_ID, "name": "mcp-server"}),
+            ),
+            ("200 OK", workspace_named("Engineering")),
+            ("201 Created", stored_ticket(true, MCP_SERVER_PROJECT_ID)),
+        ])
+        .await;
+        let result =
+            mcp_client::run_with_caller_cache_identity("entity-test".to_string(), || async {
+                tool.client
+                    .get_project(Uuid::parse_str(MCP_SERVER_PROJECT_ID).unwrap())
+                    .await
+                    .expect("project cached");
+                tool.client
+                    .get_workspace(Uuid::parse_str(WORKSPACE_ID).unwrap())
+                    .await
+                    .expect("workspace cached");
+                tool.execute(serde_json::json!({
+                    "kind": "ticket",
+                    "action": "create",
+                    "workspace_id": WORKSPACE_ID,
+                    "project_id": MCP_SERVER_PROJECT_ID,
+                    "body": {"title": "Fix the hook", "kind": "bug"}
+                }))
+                .await
+            })
+            .await
+            .expect("create succeeds");
+        let requests = server.await.expect("entity request server");
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("POST /api/v1/tickets "));
         let text = result_text(&result);
         assert!(
             text.contains("Filed in project mcp-server (workspace Engineering)."),
             "{text}"
         );
-        assert!(text.contains("Visibility: personal (only you can see it)"));
     }
 
     #[tokio::test]
@@ -1314,11 +1386,6 @@ mod tests {
         let (tool, server) = entity_tool_with_http_sequence(vec![
             ("200 OK", project_list()),
             ("201 Created", stored_ticket(false, MCP_SERVER_PROJECT_ID)),
-            (
-                "200 OK",
-                serde_json::json!({"id": MCP_SERVER_PROJECT_ID, "name": "mcp-server"}),
-            ),
-            ("200 OK", workspace_named("Engineering")),
         ])
         .await;
 
@@ -1341,7 +1408,9 @@ mod tests {
         );
         let text = result_text(&result);
         assert!(
-            text.contains("Filed in project mcp-server (workspace Engineering)."),
+            text.contains(&format!(
+                "Filed in project {MCP_SERVER_PROJECT_ID} (workspace {WORKSPACE_ID})."
+            )),
             "{text}"
         );
         assert!(text.contains("Visibility: team"));

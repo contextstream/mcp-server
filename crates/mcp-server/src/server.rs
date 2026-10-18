@@ -2679,7 +2679,7 @@ mod tests {
             // successor_id) plus the `create_decision` / `decision_action`
             // enum values. Every earlier field and action still accepted.
             "memory",
-            "264725d6678660d75850166288d84af6a09bad9b04c482318374f5d833b55a54",
+            "845f1df8c09b2eb710d625909c4594781b59770fdb1a233c7e2b714079ded3c7",
         ),
         (
             "memory_complete_todo",
@@ -2713,7 +2713,7 @@ mod tests {
         ),
         (
             "memory_update_doc",
-            "7725b8a5114fa31238e2d7a7f57fc12a91d612ebcee08ac5312c98a82e8124dc",
+            "309cc52b1a02a6376007278fbbedb60f8110a3901167b8c032080b366b7acd5e",
         ),
         (
             "memory_update_task",

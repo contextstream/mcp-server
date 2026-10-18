@@ -118,7 +118,7 @@ Every workspace-scoped call below must include `workspace_id="<current_workspace
 - "list tasks" → `memory(action="list_tasks", workspace_id="<current_workspace_id>", project_id="<current_project_id>")`
 - "list todos" → `memory(action="list_todos")`
 - "list plans" → `session(action="list_plans", workspace_id="<current_workspace_id>", project_id="<current_project_id>")`
-- "save plan" / "capture plan" / "store plan" → `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"scope, concrete work, acceptance criteria, verification"}], create_tasks=true, workspace_id="<current_workspace_id>", project_id="<current_project_id>")` — **NEVER** save plans with `session(action="capture", event_type="plan")` or `memory(action="create_event", event_type="plan")`
+- "save plan" / "capture plan" / "store plan" → `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"what changes, where, how it is verified (1-3 sentences)"}], create_tasks=true, workspace_id="<current_workspace_id>", project_id="<current_project_id>")` — **NEVER** save plans with `session(action="capture", event_type="plan")` or `memory(action="create_event", event_type="plan")`
 - "list events" → `memory(action="list_events")`
 - "show snapshots" / "list snapshots" → `memory(action="list_events", event_type="session_snapshot")`
 - "save snapshot" → `session(action="capture", event_type="session_snapshot", title="...", content="...")`
@@ -200,27 +200,27 @@ const PLANS_AND_TASKS_GUIDANCE: &str = r#"## Plans and Tasks
 - `memory(action="create_event", event_type="plan", ...)`
 - local `plan.md`, `.windsurf/plans`, `.cursor/plans`, `TodoWrite`, `todo_list`, or `plan_mode_respond` as the durable record
 
-**Save comprehensive plans with the plan API:**
+**Save plans with the plan API:**
 ```
 session(action="capture_plan",
   title="...",
-  description="scope, constraints, affected areas, acceptance criteria, verification strategy",
+  description="goal and scope in a few sentences",
   goals=["clear success criterion", "..."],
   steps=[
-    {"id":"plan-step-1","title":"...","order":1,"description":"scope, concrete work, files/modules if known, acceptance criteria, verification"}
+    {"id":"plan-step-1","title":"...","order":1,"description":"what changes, where, how it is verified (1-3 sentences)"}
   ],
   create_tasks=true,
   workspace_id="<current_workspace_id>",
   project_id="<current_project_id>")
 ```
 
-Plan step descriptions must be detailed enough for a fresh agent to execute without re-asking: include scope, concrete work, affected files/modules if known, acceptance criteria, verification/test commands, and risks or rollback notes when relevant.
+Keep plan steps short: a clear title plus one to three sentences on what changes, where, and how it is verified. Decisions and lessons: state the point in a few sentences. Do not restate context you already captured; every word in a tool call is generated while the user waits. Edit existing docs with `memory(action="update_doc", doc_id="...", ops=[...])` (append, prepend, replace_section, str_replace) instead of resending the whole document.
 
 `capture_plan` creates one linked task per step by default. If tasks are created manually, every plan task must include:
 ```
 memory(action="create_task",
   title="...",
-  description="concrete work, acceptance criteria, verification",
+  description="what to do and how it is verified (1-3 sentences)",
   plan_id="<plan uuid>",
   plan_step_id="plan-step-1",
   priority="medium",
@@ -1768,8 +1768,8 @@ const WINDSURF_SUPPLEMENT: &str = r#"
 - **Do NOT** write plan files to `.windsurf/plans/` — they disappear across sessions
 - **Do NOT** use `exitplanmode` without first saving the plan to ContextStream
 - **Do NOT** save plans as `session(action="capture", event_type="plan")` or `memory(action="create_event", event_type="plan")`
-- **ALWAYS** save comprehensive plans to ContextStream: `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"scope, concrete work, acceptance criteria, verification"}], create_tasks=true)`
-- **ALWAYS** create actionable tasks in ContextStream with detailed descriptions: `memory(action="create_task", title="...", description="concrete work, acceptance criteria, verification", plan_id="...", plan_step_id="...", priority="medium", task_status="pending")`
+- **ALWAYS** save plans to ContextStream: `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"what changes, where, how it is verified (1-3 sentences)"}], create_tasks=true)`
+- **ALWAYS** create actionable tasks in ContextStream: `memory(action="create_task", title="...", description="what to do and how it is verified (1-3 sentences)", plan_id="...", plan_step_id="...", priority="medium", task_status="pending")`
 - **ALWAYS** list and update task state through ContextStream: `memory(action="list_tasks", plan_id="...")` and `memory(action="update_task", task_id="...", task_status="in_progress|completed|blocked")`
 - **ALWAYS** link tasks to their plan with `plan_id` and, when available, `plan_step_id`
 
@@ -1810,8 +1810,8 @@ const CURSOR_SUPPLEMENT: &str = r#"
 - **Do NOT** use `SwitchMode` to plan mode without saving the plan to ContextStream afterward
 - **Do NOT** use `TodoWrite` for plans — use `session(action="capture_plan")` and `memory(action="create_task")` instead
 - **Do NOT** save plans as `session(action="capture", event_type="plan")` or `memory(action="create_event", event_type="plan")`
-- **ALWAYS** save comprehensive plans: `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"scope, concrete work, acceptance criteria, verification"}], create_tasks=true)`
-- **ALWAYS** create linked tasks with details: `memory(action="create_task", title="...", description="concrete work, acceptance criteria, verification", plan_id="...", plan_step_id="...", priority="medium", task_status="pending")`
+- **ALWAYS** save plans: `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"what changes, where, how it is verified (1-3 sentences)"}], create_tasks=true)`
+- **ALWAYS** create linked tasks: `memory(action="create_task", title="...", description="what to do and how it is verified (1-3 sentences)", plan_id="...", plan_step_id="...", priority="medium", task_status="pending")`
 
 ### Todos: Use ContextStream, Not Built-in Tools
 - **Do NOT** use `TodoWrite` for persistent todos — use `memory(action="create_todo", title="...", todo_priority="high|medium|low")`
@@ -1855,8 +1855,8 @@ const AGENTS_MD_SUPPLEMENT: &str = r#"
 - **Do NOT** use a built-in plan mode's output (e.g. Codex `plan_mode_respond`) as the persistent plan record — save the plan to ContextStream instead
 - **Do NOT** use built-in todo/plan tools (`TodoWrite`, `todo_list`, `plan_mode_respond`) for persistent plans or tasks
 - **Do NOT** save plans as `session(action="capture", event_type="plan")` or `memory(action="create_event", event_type="plan")`
-- **ALWAYS** save comprehensive plans: `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"scope, concrete work, acceptance criteria, verification"}], create_tasks=true)`
-- **ALWAYS** create linked tasks with details: `memory(action="create_task", title="...", description="concrete work, acceptance criteria, verification", plan_id="...", plan_step_id="...", priority="medium", task_status="pending")`"#;
+- **ALWAYS** save plans: `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"what changes, where, how it is verified (1-3 sentences)"}], create_tasks=true)`
+- **ALWAYS** create linked tasks: `memory(action="create_task", title="...", description="what to do and how it is verified (1-3 sentences)", plan_id="...", plan_step_id="...", priority="medium", task_status="pending")`"#;
 
 const COPILOT_SUPPLEMENT: &str = r#"
 ---
@@ -1864,7 +1864,7 @@ const COPILOT_SUPPLEMENT: &str = r#"
 
 - Keep this file concise; put detailed workflows in `.github/skills/contextstream-workflow/SKILL.md`
 - Use ContextStream plans/tasks as the persistent record of work
-- Save plans with `session(action="capture_plan", ..., create_tasks=true)`, not generic plan events; linked tasks need plan_id, plan_step_id, detailed descriptions, priority, and status
+- Save plans with `session(action="capture_plan", ..., create_tasks=true)`, not generic plan events; linked tasks need plan_id, plan_step_id, a short description, priority, and status
 - Before code discovery, use `search(mode="auto", query="...")`
 "#;
 
@@ -1915,8 +1915,8 @@ const CLAUDE_SUPPLEMENT: &str = r#"
 ### Planning: Use ContextStream, Not Built-in Tools
 - **Do NOT** create markdown plan files or use `TodoWrite` — they vanish across sessions
 - **Do NOT** save plans as `session(action="capture", event_type="plan")` or `memory(action="create_event", event_type="plan")`
-- **ALWAYS** save comprehensive plans: `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"scope, concrete work, acceptance criteria, verification"}], create_tasks=true)`
-- **ALWAYS** create linked tasks with details: `memory(action="create_task", title="...", description="concrete work, acceptance criteria, verification", plan_id="...", plan_step_id="...", priority="medium", task_status="pending")`"#;
+- **ALWAYS** save plans: `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"what changes, where, how it is verified (1-3 sentences)"}], create_tasks=true)`
+- **ALWAYS** create linked tasks: `memory(action="create_task", title="...", description="what to do and how it is verified (1-3 sentences)", plan_id="...", plan_step_id="...", priority="medium", task_status="pending")`"#;
 
 /// Supplement for editors without hooks.
 /// These editors need explicit guidance since there's no automatic enforcement.
@@ -2095,13 +2095,13 @@ session(action="recall", query="what were we doing before compaction")
 ```
 session(action="capture_plan",
   title="...",
-  description="scope, constraints, affected areas, acceptance criteria, verification strategy",
+  description="goal and scope in a few sentences",
   goals=["..."],
-  steps=[{"id":"plan-step-1","title":"...","order":1,"description":"scope, concrete work, files/modules if known, acceptance criteria, verification"}],
+  steps=[{"id":"plan-step-1","title":"...","order":1,"description":"what changes, where, how it is verified (1-3 sentences)"}],
   create_tasks=true)
 memory(action="create_task",
   title="...",
-  description="concrete work, acceptance criteria, verification",
+  description="what to do and how it is verified (1-3 sentences)",
   plan_id="<plan uuid>",
   plan_step_id="plan-step-1",
   priority="medium",

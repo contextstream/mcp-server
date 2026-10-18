@@ -882,6 +882,7 @@ async fn capture_plan_inner(
             workspace_id: scope.workspace_id,
             project_id: scope.project_id,
             is_personal: None,
+            tasks: None,
         })
         .await
         .ok()?;

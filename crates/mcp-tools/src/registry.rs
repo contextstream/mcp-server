@@ -255,6 +255,206 @@ fn acceleration_observation_action(name: &str, input: &Value) -> Option<&'static
     }
 }
 
+/// Bounded `capture:<event_type>` label; unknown event types fold to
+/// `capture:other`.
+fn capture_action_label(input: &Value) -> &'static str {
+    match input
+        .get("event_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some("decision") => "capture:decision",
+        Some("preference") => "capture:preference",
+        Some("insight") => "capture:insight",
+        Some("uncategorized") => "capture:uncategorized",
+        Some("note") => "capture:note",
+        Some("general") => "capture:general",
+        Some("manual_note") => "capture:manual_note",
+        Some("implementation") => "capture:implementation",
+        Some("operation") => "capture:operation",
+        Some("command_execution") => "capture:command_execution",
+        Some("file_operation") => "capture:file_operation",
+        Some("task") => "capture:task",
+        Some("bug") => "capture:bug",
+        Some("feature") => "capture:feature",
+        Some("correction") => "capture:correction",
+        Some("lesson") => "capture:lesson",
+        Some("warning") => "capture:warning",
+        Some("frustration") => "capture:frustration",
+        Some("conversation") => "capture:conversation",
+        Some("session_snapshot") => "capture:session_snapshot",
+        _ => "capture:other",
+    }
+}
+
+/// Bounded `<action>:<kind>` label for entity writes.
+fn entity_write_action_label(input: &Value) -> Option<&'static str> {
+    let kind = input
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    Some(match (input_action(input)?, kind) {
+        ("create", "ticket") => "create:ticket",
+        ("create", "handoff") => "create:handoff",
+        ("create", "backlog_view") => "create:backlog_view",
+        ("create", "incident") => "create:incident",
+        ("create", "release") => "create:release",
+        ("create", "experiment") => "create:experiment",
+        ("create", "goal") => "create:goal",
+        ("create", "key_result") => "create:key_result",
+        ("create", "sprint") => "create:sprint",
+        ("create", "review") => "create:review",
+        ("create", "risk") => "create:risk",
+        ("create", "coordination") => "create:coordination",
+        ("create", _) => "create:other",
+        ("update", "ticket") => "update:ticket",
+        ("update", "handoff") => "update:handoff",
+        ("update", "backlog_view") => "update:backlog_view",
+        ("update", "incident") => "update:incident",
+        ("update", "release") => "update:release",
+        ("update", "experiment") => "update:experiment",
+        ("update", "goal") => "update:goal",
+        ("update", "key_result") => "update:key_result",
+        ("update", "sprint") => "update:sprint",
+        ("update", "review") => "update:review",
+        ("update", "risk") => "update:risk",
+        ("update", "coordination") => "update:coordination",
+        ("update", _) => "update:other",
+        ("delete", "ticket") => "delete:ticket",
+        ("delete", "handoff") => "delete:handoff",
+        ("delete", "backlog_view") => "delete:backlog_view",
+        ("delete", "incident") => "delete:incident",
+        ("delete", "release") => "delete:release",
+        ("delete", "experiment") => "delete:experiment",
+        ("delete", "goal") => "delete:goal",
+        ("delete", "key_result") => "delete:key_result",
+        ("delete", "sprint") => "delete:sprint",
+        ("delete", "review") => "delete:review",
+        ("delete", "risk") => "delete:risk",
+        ("delete", "coordination") => "delete:coordination",
+        ("delete", _) => "delete:other",
+        _ => return None,
+    })
+}
+
+/// `(tool, action)` metric labels for the agent-facing writes, all from
+/// fixed allowlists. These feed the latency histogram only; the acceleration
+/// signal stream stays limited to hot reads.
+fn write_observation_labels(name: &str, input: &Value) -> Option<(&'static str, &'static str)> {
+    match name {
+        "session" => Some((
+            "session",
+            match input_action(input)? {
+                "capture" => capture_action_label(input),
+                "capture_lesson" => "capture_lesson",
+                "capture_plan" => "capture_plan",
+                "update_plan" => "update_plan",
+                "retro_capture" => "retro_capture",
+                "remember" => "remember",
+                "update_lesson" => "update_lesson",
+                "delete_lesson" => "delete_lesson",
+                "supersede_lesson" => "supersede_lesson",
+                _ => return None,
+            },
+        )),
+        "memory" => Some((
+            "memory",
+            match input_action(input)? {
+                "create_doc" => "create_doc",
+                "update_doc" => "update_doc",
+                "delete_doc" => "delete_doc",
+                "create_task" => "create_task",
+                "update_task" => "update_task",
+                "delete_task" => "delete_task",
+                "reorder_tasks" => "reorder_tasks",
+                "create_event" => "create_event",
+                "update_event" => "update_event",
+                "delete_event" => "delete_event",
+                "create_decision" => "create_decision",
+                "decision_action" => "decision_action",
+                "create_node" => "create_node",
+                "update_node" => "update_node",
+                "delete_node" => "delete_node",
+                "supersede_node" => "supersede_node",
+                "create_todo" => "create_todo",
+                "update_todo" => "update_todo",
+                "delete_todo" => "delete_todo",
+                "complete_todo" => "complete_todo",
+                "create_diagram" => "create_diagram",
+                "update_diagram" => "update_diagram",
+                "delete_diagram" => "delete_diagram",
+                "create_roadmap" => "create_roadmap",
+                "import_batch" => "import_batch",
+                "distill_event" => "distill_event",
+                _ => return None,
+            },
+        )),
+        "entity" => Some(("entity", entity_write_action_label(input)?)),
+        "capture_plan" => Some(("capture_plan", "capture_plan")),
+        "session_capture" => Some(("session_capture", capture_action_label(input))),
+        "session_capture_lesson" => Some(("session_capture_lesson", "capture_lesson")),
+        "session_remember" => Some(("session_remember", "remember")),
+        "memory_create_doc" => Some(("memory_create_doc", "create_doc")),
+        "memory_update_doc" => Some(("memory_update_doc", "update_doc")),
+        "memory_delete_doc" => Some(("memory_delete_doc", "delete_doc")),
+        "memory_create_task" => Some(("memory_create_task", "create_task")),
+        "memory_update_task" => Some(("memory_update_task", "update_task")),
+        "memory_create_event" => Some(("memory_create_event", "create_event")),
+        "memory_create_todo" => Some(("memory_create_todo", "create_todo")),
+        "memory_complete_todo" => Some(("memory_complete_todo", "complete_todo")),
+        _ => None,
+    }
+}
+
+/// Bounded action label for one tool call, for the gateway's per-call
+/// timing log and telemetry: the hot-read label, else the write label, else
+/// `other`. Never echoes arbitrary input.
+pub fn tool_call_action_label(name: &str, input: &Value) -> &'static str {
+    acceleration_observation_action(name, input)
+        .or_else(|| write_observation_labels(name, input).map(|(_, action)| action))
+        .unwrap_or("other")
+}
+
+type WriteTiming = ((&'static str, &'static str), Instant);
+
+fn write_timing_start(name: &str, input: &Value, observed_as_read: bool) -> Option<WriteTiming> {
+    if observed_as_read {
+        return None;
+    }
+    write_observation_labels(name, input).map(|labels| (labels, Instant::now()))
+}
+
+/// Latency histogram for an agent-facing write (no acceleration signal).
+fn record_write_timing(
+    timing: Option<WriteTiming>,
+    outcome: std::result::Result<&ToolResult, &Error>,
+) {
+    let Some(((tool, action), started)) = timing else {
+        return;
+    };
+    let outcome_label = if outcome_is_degraded(outcome) {
+        "degraded"
+    } else {
+        "ok"
+    };
+    let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as f64;
+    metrics::histogram!(
+        "mcp_tool_execution_latency_ms",
+        "tool" => tool,
+        "action" => action,
+        "outcome" => outcome_label,
+    )
+    .record(latency_ms);
+    metrics::counter!(
+        "mcp_tool_execution_total",
+        "tool" => tool,
+        "action" => action,
+        "outcome" => outcome_label,
+    )
+    .increment(1);
+}
+
 fn cache_layer_for_call(name: &str, input: &Value) -> Option<&'static str> {
     match name {
         "search" | "search_semantic" | "search_hybrid" | "search_keyword" => {
@@ -648,6 +848,7 @@ impl ToolRegistry {
             .and_then(mcp_session::session_model_cache::lookup);
         let observation =
             acceleration_observation_request(name, &input).map(|request| (request, Instant::now()));
+        let write_timing = write_timing_start(name, &input, observation.is_some());
 
         let outcome = match model_id {
             Some(model_id) => {
@@ -660,6 +861,7 @@ impl ToolRegistry {
         if let Some((request, started)) = observation {
             self.report_acceleration_observation(request, started.elapsed(), outcome.as_ref());
         }
+        record_write_timing(write_timing, outcome.as_ref());
         self.report_activation_outcome(name, tool.metadata.category.as_str(), outcome.as_ref())
             .await;
         outcome
@@ -967,11 +1169,13 @@ impl ToolRegistry {
 
         let observation =
             acceleration_observation_request(name, &input).map(|request| (request, Instant::now()));
+        let write_timing = write_timing_start(name, &input, observation.is_some());
         let outcome = operation.handler.execute(input).await;
         let outcome = explain_input_error(name, &mismatches, outcome);
         if let Some((request, started)) = observation {
             self.report_acceleration_observation(request, started.elapsed(), outcome.as_ref());
         }
+        record_write_timing(write_timing, outcome.as_ref());
         self.report_activation_outcome(
             name,
             operation.metadata.category.as_str(),
@@ -1194,8 +1398,8 @@ impl ToolRegistry {
 mod acceleration_observation_tests {
     use super::{
         acceleration_observation_action, acceleration_observation_request, cache_observation,
-        request_scope, resolved_observation_scope, AccelerationObservationRequest,
-        CacheObservation, ToolRegistry,
+        request_scope, resolved_observation_scope, tool_call_action_label,
+        write_observation_labels, AccelerationObservationRequest, CacheObservation, ToolRegistry,
     };
     use async_trait::async_trait;
     use mcp_types::{
@@ -1288,6 +1492,65 @@ mod acceleration_observation_tests {
             )
             .and_then(|request| request.cache_layer),
             Some("mcp_search_result_cache")
+        );
+    }
+
+    #[test]
+    fn write_actions_get_bounded_timing_labels() {
+        assert_eq!(
+            write_observation_labels("memory", &json!({"action": "create_task"})),
+            Some(("memory", "create_task"))
+        );
+        assert_eq!(
+            write_observation_labels(
+                "session",
+                &json!({"action": "capture", "event_type": "decision"})
+            ),
+            Some(("session", "capture:decision"))
+        );
+        assert_eq!(
+            write_observation_labels(
+                "session",
+                &json!({"action": "capture", "event_type": "attacker-label"})
+            ),
+            Some(("session", "capture:other"))
+        );
+        assert_eq!(
+            write_observation_labels("entity", &json!({"action": "create", "kind": "ticket"})),
+            Some(("entity", "create:ticket"))
+        );
+        assert_eq!(
+            write_observation_labels("entity", &json!({"action": "create", "kind": "zzz"})),
+            Some(("entity", "create:other"))
+        );
+        assert_eq!(
+            write_observation_labels("entity", &json!({"action": "list", "kind": "ticket"})),
+            None
+        );
+        assert_eq!(
+            write_observation_labels("capture_plan", &json!({})),
+            Some(("capture_plan", "capture_plan"))
+        );
+        assert_eq!(
+            write_observation_labels("memory", &json!({"action": "attacker-label"})),
+            None
+        );
+        // Reads keep their hot-read label; unknown calls fold to `other`.
+        assert_eq!(
+            tool_call_action_label("search", &json!({"mode": "keyword"})),
+            "keyword"
+        );
+        assert_eq!(
+            tool_call_action_label("memory", &json!({"action": "create_doc"})),
+            "create_doc"
+        );
+        assert_eq!(
+            tool_call_action_label("vcs", &json!({"action": "x"})),
+            "other"
+        );
+        // Writes never enter the acceleration signal stream.
+        assert!(
+            acceleration_observation_request("memory", &json!({"action": "create_doc"})).is_none()
         );
     }
 

@@ -1780,14 +1780,14 @@ fn shell_search_suggestion(tool: &str, command: &str) -> SearchSuggestion {
 /// Build a session plan capture call snippet.
 fn plan_capture_call(editor: &EditorFormat) -> String {
     format!(
-        "{}(action=\"capture_plan\", title=\"...\", description=\"scope, constraints, affected areas, acceptance criteria, verification\", goals=[...], steps=[{{\"id\":\"plan-step-1\",\"title\":\"...\",\"order\":1,\"description\":\"scope, concrete work, acceptance criteria, verification\"}}], create_tasks=true)",
+        "{}(action=\"capture_plan\", title=\"...\", description=\"goal and scope in a few sentences\", goals=[...], steps=[{{\"id\":\"plan-step-1\",\"title\":\"...\",\"order\":1,\"description\":\"what changes, where, how it is verified (1-3 sentences)\"}}], create_tasks=true)",
         session_tool_name(editor)
     )
 }
 
 fn plan_task_create_call(editor: &EditorFormat) -> String {
     format!(
-        "{}(action=\"create_task\", title=\"...\", description=\"concrete work, acceptance criteria, verification\", plan_id=\"...\", plan_step_id=\"plan-step-1\", priority=\"medium\", task_status=\"pending\")",
+        "{}(action=\"create_task\", title=\"...\", description=\"what to do and how it is verified (1-3 sentences)\", plan_id=\"...\", plan_step_id=\"plan-step-1\", priority=\"medium\", task_status=\"pending\")",
         contextstream_tool_name(editor, "memory")
     )
 }
@@ -2014,7 +2014,7 @@ fn capture_plan_quality_block_message(
     let steps = tool_input.get("steps").and_then(|value| value.as_array());
     let Some(steps) = steps.filter(|steps| !steps.is_empty()) else {
         return Some(format!(
-            "capture_plan requires detailed structured steps. Use {} and let create_tasks=true create linked tasks.",
+            "capture_plan requires structured steps. Use {} and let create_tasks=true create linked tasks.",
             plan_capture_call(editor)
         ));
     };
@@ -2022,7 +2022,7 @@ fn capture_plan_quality_block_message(
     for step in steps {
         if !string_value_has_detail(step.get("description"), 6, 35) {
             return Some(format!(
-                "Each capture_plan step needs a useful description with scope, concrete work, acceptance criteria, and verification. Use {}.",
+                "Each capture_plan step needs a short description: what changes, where, and how it is verified (one to three sentences). Use {}.",
                 plan_capture_call(editor)
             ));
         }
@@ -2031,37 +2031,15 @@ fn capture_plan_quality_block_message(
     None
 }
 
+/// Operations whose work continues in the background after the call
+/// returns, so the agent should check completion before relying on them.
+/// Memory, doc, plan and task writes are synchronous: their reply means the
+/// write is committed, so they get no extra guidance (asking the model to
+/// narrate progress around them only cost output tokens and turns).
 fn is_visibility_sensitive_contextstream_call(normalized_tool: &str, action: &str) -> bool {
     match normalized_tool {
-        "memory" => matches!(
-            action,
-            "create_node"
-                | "update_node"
-                | "create_event"
-                | "update_event"
-                | "import_batch"
-                | "create_task"
-                | "update_task"
-                | "create_todo"
-                | "update_todo"
-                | "create_diagram"
-                | "update_diagram"
-                | "create_doc"
-                | "update_doc"
-                | "create_roadmap"
-        ),
-        "session" => matches!(
-            action,
-            "capture" | "capture_lesson" | "remember" | "capture_plan" | "update_plan"
-        ),
         "project" => matches!(action, "index" | "ingest_local"),
         "media" => action == "index",
-        // Dedicated tool names that may be exposed in some editors.
-        "session_capture"
-        | "session_capture_lesson"
-        | "session_remember"
-        | "capture_plan"
-        | "update_plan" => true,
         _ => false,
     }
 }
@@ -2829,18 +2807,14 @@ pub async fn handle() -> Result<()> {
         );
         let msg = if let Some(follow_up_call) = follow_up {
             format!(
-                "User visibility requirement: this ContextStream operation ({}) can take a few seconds \
-                 or run in background. Post a brief progress update before and after the tool call \
-                 (for example: 'Saving to ContextStream...' then 'Saved successfully'). \
-                 If the response is queued/accepted, tell the user processing continues in background \
-                 and verify completion with {}.",
+                "This ContextStream operation ({}) continues in the background after the call \
+                 returns. Check completion with {} before relying on its results.",
                 op_label, follow_up_call
             )
         } else {
             format!(
-                "User visibility requirement: this ContextStream operation ({}) can take a few seconds \
-                 or run in background. Post a brief progress update before and after the tool call \
-                 (for example: 'Saving to ContextStream...' then 'Saved successfully').",
+                "This ContextStream operation ({}) continues in the background after the call \
+                 returns.",
                 op_label
             )
         };
@@ -3646,7 +3620,7 @@ mod tests {
         .expect("thin capture_plan should be blocked");
 
         assert!(msg.contains("Each capture_plan step"));
-        assert!(msg.contains("acceptance criteria"));
+        assert!(msg.contains("how it is verified"));
     }
 
     fn hook_input_with_transcript(prompt: &str) -> (tempfile::TempDir, Value) {
@@ -3999,15 +3973,31 @@ mod tests {
     }
 
     #[test]
-    fn visibility_sensitive_includes_background_memory_writes() {
+    fn visibility_guidance_is_only_for_background_operations() {
+        for (tool, action) in [
+            ("memory", "create_task"),
+            ("memory", "create_doc"),
+            ("memory", "update_doc"),
+            ("session", "capture"),
+            ("session", "capture_plan"),
+            ("session", "capture_lesson"),
+            ("capture_plan", ""),
+            ("session_capture", ""),
+            ("memory", "list_docs"),
+        ] {
+            assert!(
+                !is_visibility_sensitive_contextstream_call(tool, action),
+                "{tool} {action} is synchronous"
+            );
+        }
         assert!(is_visibility_sensitive_contextstream_call(
-            "memory",
-            "create_task"
+            "project", "index"
         ));
-        assert!(!is_visibility_sensitive_contextstream_call(
-            "memory",
-            "list_docs"
+        assert!(is_visibility_sensitive_contextstream_call(
+            "project",
+            "ingest_local"
         ));
+        assert!(is_visibility_sensitive_contextstream_call("media", "index"));
     }
 
     #[test]

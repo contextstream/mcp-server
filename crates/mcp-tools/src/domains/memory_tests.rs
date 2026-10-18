@@ -686,6 +686,7 @@ mod read_scope_resolution_tests {
             node_id: None,
             title: None,
             content: None,
+            ops: None,
             event_type: None,
             event_id: Some(Uuid::new_v4().to_string()),
             delete_all: None,

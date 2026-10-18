@@ -3081,6 +3081,10 @@ pub struct MemoryInput {
     pub node_id: Option<String>,
     pub title: Option<String>,
     pub content: Option<String>,
+    /// update_doc: patch operations applied to the current content instead
+    /// of a full `content` replacement.
+    #[serde(default)]
+    pub ops: Option<Vec<super::doc_ops::DocPatchOp>>,
     // Event fields
     pub event_type: Option<String>,
     pub event_id: Option<String>,
@@ -3313,7 +3317,7 @@ const MEMORY_TOOL_DESCRIPTION: &str = "Persistent memory storage — docs, runbo
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const MEMORY_TOOL_REFERENCE: &str = "Persistent memory storage — docs, runbooks, specs, ADRs, RFCs, decisions, lessons, preferences, tasks, todos, knowledge nodes, transcripts. NOT for codebase/file search.\n\n⚠️ FINDING A DOC, RUNBOOK, SPEC, OR ARCHITECTURE NOTE? USE THIS TOOL — NOT `find`, `ls`, `grep`, or filesystem searches. ContextStream docs/runbooks/specs/decisions/lessons live ONLY in this tool's storage (Postgres + indexes), NEVER on disk under ~/.claude, /tmp, or the project tree. If the user mentions 'the doc on X', 'our runbook for Y', 'the design spec', 'the ADR/RFC', 'a postmortem', 'the architecture note', 'why we decided Z' — go through:\n  · memory(action=\"search\", query=\"…\") — hybrid across docs + nodes (try this first when unsure)\n  · memory(action=\"list_docs\", query=\"…\") then memory(action=\"get_doc\", doc_id=\"<id-or-title>\")\n  · memory(action=\"decisions\", query=\"…\") for past architectural decisions\n  · session(action=\"recall\", query=\"…\") if it might be in past-session transcripts\nFalling back to filesystem tools to find a ContextStream doc is wrong — the doc is not on disk.\n\nCodebase / source / files? Use the `search` tool, not memory.\n\nPlans? Use session(action=\"capture_plan\") instead of memory(action=\"create_event\", event_type=\"plan\"). Plan tasks should be created with plan_id, plan_step_id, priority/status, and detailed descriptions.\n\nDISTINCT FROM (don't use memory for these):\n· entity(kind=ticket|handoff|incident|release|experiment|goal|key_result|sprint|review|risk|backlog_view) — structured taxonomy entities with their own status timelines and per-kind fields. When the user says 'create a ticket', 'file a bug', 'create a handoff', 'log an incident', 'track this release' — that's `entity`, not memory(create_task).\n· session(action=capture_lesson|capture|recall|capture_plan) — lessons / decisions / snapshots / plans tied to the current session.\n· capsule(...) — portable context bundles for cross-agent handoffs.\n\nThis tool's `create_task` is a lightweight project-tracking todo with priority/status — NOT a 'ticket'. This tool's `create_task` should include plan_id and plan_step_id when the task belongs to a plan. This tool's `create_doc(doc_type=runbook)` is a versioned markdown doc — NOT a 'handoff'.\n\nNode actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node (a *_id argument takes an id or a title: get/update take a title that names one record; delete, supersede and complete need an id or the exact title; anything else returns a [CANDIDATES] list and changes nothing). Query actions: search (searches memory nodes and relevant docs together, not code), decisions (typed envelope: query, category, sort=recency|relevance, status=active|superseded|disputed|verified|all, since, offset, limit), timeline, summary. Decision actions: create_decision (title, content, rationale, alternatives, scope, confidence, supersedes, category, tags), decision_action (decision_id or lookup text + decision_action=supersede|dispute|verify|invalidate|choose_successor, successor_id, reason). Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch. Task actions: create_task, get_task, update_task, delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram (diagram_type values: flowchart, sequence, class, er, gantt, mindmap, pie, other — use sequence for API/request flows and er for data models). Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap (doc_type values: roadmap, spec, runbook, adr, rfc, postmortem, retro, release_notes, playbook, prd, user_story, persona, interview, design_spec, critique, glossary, oncall_schedule, slo, q_and_a, changelog, style_guide, general — `get_doc` accepts ID or natural-language title query). Transcript actions: list_transcripts, get_transcript, search_transcripts, search_archive, delete_transcript. `search_archive` queries the cold storage tier for transcripts past the hot-retention window (remote/hosted deployments only). Team actions: team_tasks, team_todos, team_diagrams, team_docs.";
+const MEMORY_TOOL_REFERENCE: &str = "Persistent memory storage — docs, runbooks, specs, ADRs, RFCs, decisions, lessons, preferences, tasks, todos, knowledge nodes, transcripts. NOT for codebase/file search.\n\n⚠️ FINDING A DOC, RUNBOOK, SPEC, OR ARCHITECTURE NOTE? USE THIS TOOL — NOT `find`, `ls`, `grep`, or filesystem searches. ContextStream docs/runbooks/specs/decisions/lessons live ONLY in this tool's storage (Postgres + indexes), NEVER on disk under ~/.claude, /tmp, or the project tree. If the user mentions 'the doc on X', 'our runbook for Y', 'the design spec', 'the ADR/RFC', 'a postmortem', 'the architecture note', 'why we decided Z' — go through:\n  · memory(action=\"search\", query=\"…\") — hybrid across docs + nodes (try this first when unsure)\n  · memory(action=\"list_docs\", query=\"…\") then memory(action=\"get_doc\", doc_id=\"<id-or-title>\")\n  · memory(action=\"decisions\", query=\"…\") for past architectural decisions\n  · session(action=\"recall\", query=\"…\") if it might be in past-session transcripts\nFalling back to filesystem tools to find a ContextStream doc is wrong — the doc is not on disk.\n\nCodebase / source / files? Use the `search` tool, not memory.\n\nPlans? Use session(action=\"capture_plan\") instead of memory(action=\"create_event\", event_type=\"plan\"). Plan tasks should be created with plan_id, plan_step_id, priority/status, and a short description.\n\nDISTINCT FROM (don't use memory for these):\n· entity(kind=ticket|handoff|incident|release|experiment|goal|key_result|sprint|review|risk|backlog_view) — structured taxonomy entities with their own status timelines and per-kind fields. When the user says 'create a ticket', 'file a bug', 'create a handoff', 'log an incident', 'track this release' — that's `entity`, not memory(create_task).\n· session(action=capture_lesson|capture|recall|capture_plan) — lessons / decisions / snapshots / plans tied to the current session.\n· capsule(...) — portable context bundles for cross-agent handoffs.\n\nThis tool's `create_task` is a lightweight project-tracking todo with priority/status — NOT a 'ticket'. This tool's `create_task` should include plan_id and plan_step_id when the task belongs to a plan. This tool's `create_doc(doc_type=runbook)` is a versioned markdown doc — NOT a 'handoff'.\n\nNode actions: create_node, get_node, update_node, delete_node, list_nodes, supersede_node (a *_id argument takes an id or a title: get/update take a title that names one record; delete, supersede and complete need an id or the exact title; anything else returns a [CANDIDATES] list and changes nothing). Query actions: search (searches memory nodes and relevant docs together, not code), decisions (typed envelope: query, category, sort=recency|relevance, status=active|superseded|disputed|verified|all, since, offset, limit), timeline, summary. Decision actions: create_decision (title, content, rationale, alternatives, scope, confidence, supersedes, category, tags), decision_action (decision_id or lookup text + decision_action=supersede|dispute|verify|invalidate|choose_successor, successor_id, reason). Event actions: create_event, get_event, update_event, delete_event, list_events, distill_event, import_batch. Task actions: create_task, get_task, update_task, delete_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, delete_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram, delete_diagram (diagram_type values: flowchart, sequence, class, er, gantt, mindmap, pie, other — use sequence for API/request flows and er for data models). Doc actions: create_doc, list_docs, get_doc, update_doc, delete_doc, create_roadmap (doc_type values: roadmap, spec, runbook, adr, rfc, postmortem, retro, release_notes, playbook, prd, user_story, persona, interview, design_spec, critique, glossary, oncall_schedule, slo, q_and_a, changelog, style_guide, general — `get_doc` accepts ID or natural-language title query; to change part of a doc, `update_doc` takes ops=[...] (append, prepend, replace_section, str_replace) instead of the whole content). Transcript actions: list_transcripts, get_transcript, search_transcripts, search_archive, delete_transcript. `search_archive` queries the cold storage tier for transcripts past the hot-retention window (remote/hosted deployments only). Team actions: team_tasks, team_todos, team_diagrams, team_docs.";
 
 #[async_trait]
 impl ToolHandler for MemoryTool {
@@ -5280,9 +5284,34 @@ impl ToolHandler for MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
+                let applied_ops = input.ops.as_ref().map(Vec::len);
+                let content = match (input.content, input.ops) {
+                    (Some(_), Some(_)) => {
+                        return Err(Error::Validation(
+                            "update_doc takes either content (the whole new document) or ops \
+                             (edits to the current content), not both"
+                                .to_string(),
+                        ))
+                    }
+                    (content, None) => content,
+                    (None, Some(ops)) => {
+                        // Read the current content directly (not the warm
+                        // doc cache) so the edits apply to what is stored.
+                        // The API has no update precondition, so a write
+                        // landing between this read and the update below
+                        // (a few milliseconds) would be overwritten.
+                        let current = self.client.get_doc(id).await?;
+                        let current_content = current
+                            .get("content")
+                            .or_else(|| current.get("data").and_then(|data| data.get("content")))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        Some(super::doc_ops::apply_doc_ops(current_content, &ops)?)
+                    }
+                };
                 let params = UpdateDocParams {
                     title: input.title,
-                    content: input.content,
+                    content,
                     doc_type: input.doc_type,
                 };
                 let mut result = self.client.update_doc(id, params).await?;
@@ -5302,7 +5331,15 @@ impl ToolHandler for MemoryTool {
                         }),
                     );
                 }
-                let text = format!("Doc updated: {}.\nProgress: completed.", id);
+                let text = match applied_ops {
+                    Some(count) => format!(
+                        "Doc updated: {} ({} edit{} applied).\nProgress: completed.",
+                        id,
+                        count,
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    None => format!("Doc updated: {}.\nProgress: completed.", id),
+                };
                 Ok(found.tool_result(text, result))
             }
             "delete_doc" => {
@@ -5437,7 +5474,7 @@ impl ToolHandler for MemoryTool {
                         "user_visibility_hint".to_string(),
                         serde_json::json!({
                             "announce_now": "Roadmap saved successfully.",
-                            "note": "If this operation takes time, provide an in-progress update before running it."
+                            "note": "Roadmap creation is synchronous and complete when this response is returned."
                         }),
                     );
                 }
@@ -6158,7 +6195,8 @@ impl ToolHandler for MemoryTool {
                 false,
             )
             .string("title", "Title (for create/update operations)", false)
-            .string("content", "Content (for create/update operations)", false)
+            .string("content", "Content (for create/update operations). For update_doc prefer ops, which sends only the change.", false)
+            .property("ops", super::doc_ops::doc_ops_schema(), false)
             .string(
                 "new_content",
                 "New content (for supersede_node; also accepted as the body for update_node)",
@@ -6256,7 +6294,7 @@ impl ToolHandler for MemoryTool {
             )
             .string(
                 "description",
-                "Description (for create_task/update_task only). For plan tasks, include concrete work, acceptance criteria, and verification. For todos, use 'content' instead.",
+                "Description (for create_task/update_task only). For plan tasks, say what to do and how it is verified in one to three sentences. For todos, use 'content' instead.",
                 false,
             )
             .string("priority", "Priority (for task operations)", false)
@@ -6570,7 +6608,12 @@ pub fn register_memory_tools(
                 .description("Update an existing doc in ContextStream memory")
                 .string("doc_id", "Doc ID", true)
                 .string("title", "New title (optional)", false)
-                .string("content", "New content (optional)", false)
+                .string(
+                    "content",
+                    "New whole content (optional). To change part of a doc, use ops instead.",
+                    false,
+                )
+                .property("ops", super::doc_ops::doc_ops_schema(), false)
                 .string_enum(
                     "doc_type",
                     "New doc type (optional)",
@@ -6633,7 +6676,7 @@ pub fn register_memory_tools(
                 .string("title", "Task title", true)
                 .string(
                     "description",
-                    "Concrete work, acceptance criteria, verification",
+                    "What to do and how it is verified (one to three sentences)",
                     false,
                 )
                 .uuid("plan_id", "Linked plan ID", false)

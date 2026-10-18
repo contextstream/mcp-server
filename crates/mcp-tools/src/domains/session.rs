@@ -10108,7 +10108,7 @@ fn is_reserved_plan_event_type(event_type: Option<&str>) -> bool {
 
 fn reserved_plan_event_error() -> Error {
     Error::Validation(
-        "event_type=\"plan\" is reserved for the plan API. Use action=\"capture_plan\" with a detailed description, goals, structured steps, and linked tasks instead of generic session capture."
+        "event_type=\"plan\" is reserved for the plan API. Use action=\"capture_plan\" with a short description, goals and structured steps instead of generic session capture."
             .to_string(),
     )
 }
@@ -14109,8 +14109,7 @@ fn capture_plan_quality_warnings(input: &CapturePlanInput) -> Vec<String> {
     let mut warnings = Vec::new();
     if !text_has_detail(input.description.as_deref(), 10, 80) {
         warnings.push(
-            "Plan description is thin; include scope, constraints, affected areas, and verification."
-                .to_string(),
+            "Plan description is thin; say the goal and scope in a few sentences.".to_string(),
         );
     }
     if input
@@ -14125,7 +14124,7 @@ fn capture_plan_quality_warnings(input: &CapturePlanInput) -> Vec<String> {
         for step in steps {
             if !text_has_detail(step.description.as_deref(), 8, 50) {
                 warnings.push(format!(
-                    "Step '{}' description is thin; include files/modules, acceptance criteria, and test expectations.",
+                    "Step '{}' description is thin; say what changes, where, and how it is verified in one to three sentences.",
                     step.id
                 ));
             }
@@ -14135,7 +14134,7 @@ fn capture_plan_quality_warnings(input: &CapturePlanInput) -> Vec<String> {
         for task in tasks {
             if !text_has_detail(task.description.as_deref(), 8, 50) {
                 warnings.push(format!(
-                    "Task '{}' description is thin; include concrete work, acceptance criteria, and verification.",
+                    "Task '{}' description is thin; say what to do and how it is verified in one to three sentences.",
                     task.title
                 ));
             }
@@ -14265,6 +14264,133 @@ fn json_id(value: &Value) -> Option<&str> {
         .or_else(|| value.get("data")?.get("id")?.as_str())
 }
 
+/// Default number of linked-task creates in flight when the API does not
+/// create a plan's tasks in the plan request itself.
+const DEFAULT_PLAN_TASK_CONCURRENCY: usize = 6;
+const MAX_PLAN_TASK_CONCURRENCY: usize = 16;
+
+/// `CONTEXTSTREAM_PLAN_TASK_CONCURRENCY` (1 = one task at a time).
+fn plan_task_concurrency() -> usize {
+    plan_task_concurrency_from(std::env::var("CONTEXTSTREAM_PLAN_TASK_CONCURRENCY").ok())
+}
+
+fn plan_task_concurrency_from(raw: Option<String>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(1, MAX_PLAN_TASK_CONCURRENCY))
+        .unwrap_or(DEFAULT_PLAN_TASK_CONCURRENCY)
+}
+
+/// One linked task as sent inline with `POST /plans` (`tasks[]`). An API
+/// that creates the tasks in the plan's transaction answers with
+/// `created_tasks`; an older API ignores the field.
+fn plan_task_wire(task: &PlanTaskBlueprint, is_personal: Option<bool>) -> Value {
+    let mut wire = serde_json::json!({
+        "title": task.title,
+        "description": task.description,
+        "priority": task.priority,
+        "status": task.status,
+    });
+    if let Some(obj) = wire.as_object_mut() {
+        if let Some(step) = &task.plan_step_id {
+            obj.insert("plan_step_id".to_string(), Value::String(step.clone()));
+        }
+        if let Some(tags) = &task.tags {
+            obj.insert("tags".to_string(), serde_json::json!(tags));
+        }
+        if let Some(order) = task.order {
+            obj.insert("order".to_string(), serde_json::json!(order));
+        }
+        if let Some(is_personal) = is_personal {
+            obj.insert("is_personal".to_string(), Value::Bool(is_personal));
+        }
+    }
+    wire
+}
+
+/// The tasks an API created inside the plan request, summarised in step
+/// order, when it created exactly one per blueprint. `None` means the API
+/// did not create them (an older API) and the caller must.
+fn batch_created_tasks(plan: &Value, blueprints: &[PlanTaskBlueprint]) -> Option<Vec<Value>> {
+    let created = plan.get("created_tasks")?.as_array()?;
+    if created.len() != blueprints.len() || blueprints.is_empty() {
+        return None;
+    }
+    created
+        .iter()
+        .zip(blueprints)
+        .map(|(task, blueprint)| {
+            let id = task.get("id")?.as_str()?;
+            Some(serde_json::json!({
+                "id": id,
+                "title": task.get("title").and_then(Value::as_str).unwrap_or(&blueprint.title),
+                "status": task.get("status").and_then(Value::as_str).unwrap_or(&blueprint.status),
+                "plan_step_id": task
+                    .get("plan_step_id")
+                    .and_then(Value::as_str)
+                    .or(blueprint.plan_step_id.as_deref()),
+            }))
+        })
+        .collect()
+}
+
+/// Create a plan's linked tasks with at most `concurrency` requests in
+/// flight. Results come back in blueprint (step) order; each task keeps its
+/// own `order`, so creation order does not matter.
+async fn create_plan_tasks_concurrently(
+    client: &ContextStreamClient,
+    plan_id: Uuid,
+    blueprints: Vec<PlanTaskBlueprint>,
+    is_personal: Option<bool>,
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    concurrency: usize,
+) -> (Vec<Value>, Vec<String>) {
+    use futures::stream::StreamExt;
+
+    let mut outcomes: Vec<(usize, std::result::Result<Value, String>)> =
+        futures::stream::iter(blueprints.into_iter().enumerate())
+            .map(|(index, task)| async move {
+                let title = task.title.clone();
+                let create_params = mcp_client::CreateTaskParams {
+                    title: task.title,
+                    description: Some(task.description),
+                    content: None,
+                    priority: Some(task.priority.clone()),
+                    status: Some(task.status.clone()),
+                    plan_id: Some(plan_id),
+                    plan_step_id: task.plan_step_id.clone(),
+                    tags: task.tags,
+                    order: task.order,
+                    is_personal,
+                    workspace_id,
+                    project_id,
+                };
+                let outcome = match client.create_task(create_params).await {
+                    Ok(task_result) => Ok(serde_json::json!({
+                        "id": json_id(&task_result).unwrap_or("unknown"),
+                        "title": title,
+                        "status": task.status,
+                        "plan_step_id": task.plan_step_id,
+                    })),
+                    Err(err) => Err(format!("{}: {}", title, err)),
+                };
+                (index, outcome)
+            })
+            .buffer_unordered(concurrency.max(1))
+            .collect()
+            .await;
+    outcomes.sort_by_key(|(index, _)| *index);
+    let mut created = Vec::new();
+    let mut errors = Vec::new();
+    for (_, outcome) in outcomes {
+        match outcome {
+            Ok(task) => created.push(task),
+            Err(error) => errors.push(error),
+        }
+    }
+    (created, errors)
+}
+
 fn normalize_plan_linked_items(
     linked_items: Option<Vec<serde_json::Value>>,
 ) -> Result<Option<Vec<serde_json::Value>>> {
@@ -14326,6 +14452,12 @@ impl ToolHandler for CapturePlanTool {
             session_state.team_context_degraded,
         );
         let normalized_linked_items = normalize_plan_linked_items(input.linked_items.clone())?;
+        let inline_tasks = (!task_blueprints.is_empty()).then(|| {
+            task_blueprints
+                .iter()
+                .map(|task| plan_task_wire(task, input.is_personal))
+                .collect::<Vec<_>>()
+        });
 
         let mut params = mcp_client::CapturePlanParams {
             title: input.title.clone(),
@@ -14337,6 +14469,7 @@ impl ToolHandler for CapturePlanTool {
             workspace_id: scope.workspace_id,
             project_id: scope.project_id,
             is_personal,
+            tasks: inline_tasks,
         };
 
         let started = Instant::now();
@@ -14366,42 +14499,35 @@ impl ToolHandler for CapturePlanTool {
         let mut created_tasks = Vec::new();
         let mut task_creation_errors = Vec::new();
         if !task_blueprints.is_empty() {
-            match Uuid::parse_str(&plan_id) {
-                Ok(plan_uuid) => {
-                    for task in task_blueprints {
-                        let title = task.title.clone();
-                        let create_params = mcp_client::CreateTaskParams {
-                            title: task.title,
-                            description: Some(task.description),
-                            content: None,
-                            priority: Some(task.priority.clone()),
-                            status: Some(task.status.clone()),
-                            plan_id: Some(plan_uuid),
-                            plan_step_id: task.plan_step_id.clone(),
-                            tags: task.tags,
-                            order: task.order,
-                            is_personal: input.is_personal,
-                            workspace_id: scope.workspace_id,
-                            project_id: scope.project_id,
-                        };
-                        match self.client.create_task(create_params).await {
-                            Ok(task_result) => {
-                                created_tasks.push(serde_json::json!({
-                                    "id": json_id(&task_result).unwrap_or("unknown"),
-                                    "title": title,
-                                    "status": task.status,
-                                    "plan_step_id": task.plan_step_id,
-                                }));
-                            }
-                            Err(err) => task_creation_errors.push(format!("{}: {}", title, err)),
-                        }
+            if let Some(batch) = batch_created_tasks(&result, &task_blueprints) {
+                // The API created every task in the plan's own transaction.
+                created_tasks = batch;
+            } else {
+                match Uuid::parse_str(&plan_id) {
+                    Ok(plan_uuid) => {
+                        let (created, errors) = create_plan_tasks_concurrently(
+                            &self.client,
+                            plan_uuid,
+                            task_blueprints,
+                            input.is_personal,
+                            scope.workspace_id,
+                            scope.project_id,
+                            plan_task_concurrency(),
+                        )
+                        .await;
+                        created_tasks = created;
+                        task_creation_errors = errors;
                     }
+                    Err(_) => task_creation_errors.push(
+                        "Plan response did not include a valid UUID, so linked tasks were not created."
+                            .to_string(),
+                    ),
                 }
-                Err(_) => task_creation_errors.push(
-                    "Plan response did not include a valid UUID, so linked tasks were not created."
-                        .to_string(),
-                ),
             }
+        }
+        // The full task objects are summarised in linked_task_creation.
+        if let Some(obj) = result.as_object_mut() {
+            obj.remove("created_tasks");
         }
 
         enrich_plan_linked_items_from_request(normalized_linked_items.as_ref(), &mut result);
@@ -14419,7 +14545,7 @@ impl ToolHandler for CapturePlanTool {
                 "user_visibility_hint".to_string(),
                 serde_json::json!({
                     "announce_now": "Plan saved successfully.",
-                    "note": "For slower plan saves, provide an in-progress update before running capture_plan."
+                    "note": "Plan and linked task creation is synchronous and complete when this response is returned."
                 }),
             );
             obj.insert(
@@ -14470,7 +14596,7 @@ impl ToolHandler for CapturePlanTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "capture_plan".to_string(),
             title: "Capture Plan".to_string(),
-            description: "Save the canonical ContextStream implementation plan. Use this instead of session(action=\"capture\", event_type=\"plan\") or memory events. Provide a detailed description, goals, structured steps, and linked task details; by default the tool creates one linked task per step with plan_id and plan_step_id.".to_string(),
+            description: "Save the canonical ContextStream implementation plan. Use this instead of session(action=\"capture\", event_type=\"plan\") or memory events. Provide a short description, goals and structured steps (each step a clear title plus one to three sentences); by default the tool creates one linked task per step with plan_id and plan_step_id.".to_string(),
             category: ToolCategory::Session,
             annotations: ToolAnnotations::write(),
             is_pro: false,
@@ -14484,7 +14610,7 @@ impl ToolHandler for CapturePlanTool {
             .string("title", "Plan title", true)
             .string(
                 "description",
-                "Detailed plan description: scope, constraints, affected areas, acceptance criteria, and verification strategy",
+                "Plan description: the goal and scope in a few sentences",
                 false,
             )
             .array("goals", "Plan goals / success criteria", "string", false)
@@ -14492,14 +14618,14 @@ impl ToolHandler for CapturePlanTool {
                 "steps",
                 serde_json::json!({
                     "type": "array",
-                    "description": "Structured plan steps. Required for useful plans; each description should include scope, concrete work, files/modules if known, acceptance criteria, and verification.",
+                    "description": "Structured plan steps. Required for useful plans; each description says what changes, where, and how it is verified in one to three sentences.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "id": { "type": "string", "description": "Stable step id such as plan-step-1" },
                             "title": { "type": "string", "description": "Actionable step title" },
                             "order": { "type": "integer", "description": "Sort order" },
-                            "description": { "type": "string", "description": "Detailed step scope, concrete work, acceptance criteria, and verification" },
+                            "description": { "type": "string", "description": "What the step changes, where, and how it is verified (one to three sentences)" },
                             "estimated_effort": { "type": "string" }
                         },
                         "required": ["id", "title", "order", "description"]
@@ -14511,12 +14637,12 @@ impl ToolHandler for CapturePlanTool {
                 "tasks",
                 serde_json::json!({
                     "type": "array",
-                    "description": "Optional explicit tasks to create after the plan is saved. If omitted and create_tasks is true, one task is derived from each step. Tasks should include rich descriptions and plan_step_id when known.",
+                    "description": "Optional explicit tasks to create after the plan is saved. If omitted and create_tasks is true, one task is derived from each step. Tasks need a short description and plan_step_id when known.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "title": { "type": "string" },
-                            "description": { "type": "string", "description": "Concrete task work, acceptance criteria, and verification" },
+                            "description": { "type": "string", "description": "What to do and how it is verified (one to three sentences)" },
                             "priority": { "type": "string", "description": "Task priority; defaults to medium" },
                             "task_status": { "type": "string", "description": "Task status; defaults to pending" },
                             "plan_step_id": { "type": "string", "description": "Step id this task implements" },
@@ -17529,7 +17655,7 @@ impl ToolHandler for SessionTool {
             )
             .string(
                 "description",
-                "Description (for capture_plan, update_plan). For capture_plan include scope, constraints, affected areas, acceptance criteria, and verification strategy.",
+                "Description (for capture_plan, update_plan). For capture_plan, the goal and scope in a few sentences.",
                 false,
             )
             .array("goals", "Goals (for capture_plan, update_plan)", "string", false)
@@ -17537,14 +17663,14 @@ impl ToolHandler for SessionTool {
                 "steps",
                 serde_json::json!({
                     "type": "array",
-                    "description": "Structured plan steps (for capture_plan, update_plan). Each step should include scope, concrete work, files/modules if known, acceptance criteria, and verification. update_plan replaces the complete list: omit to preserve, [] to clear. Preserve stable ids used by existing tasks; updating steps does not create or relink tasks.",
+                    "description": "Structured plan steps (for capture_plan, update_plan). Each step description says what changes, where, and how it is verified in one to three sentences. update_plan replaces the complete list: omit to preserve, [] to clear. Preserve stable ids used by existing tasks; updating steps does not create or relink tasks.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "id": { "type": "string", "description": "Stable step id such as plan-step-1" },
                             "title": { "type": "string", "description": "Actionable step title" },
                             "order": { "type": "integer" },
-                            "description": { "type": "string", "description": "Detailed step scope, concrete work, acceptance criteria, and verification" },
+                            "description": { "type": "string", "description": "What the step changes, where, and how it is verified (one to three sentences)" },
                             "estimated_effort": { "type": "string" }
                         },
                         "required": ["id", "title", "order", "description"]
@@ -17561,7 +17687,7 @@ impl ToolHandler for SessionTool {
                         "type": "object",
                         "properties": {
                             "title": { "type": "string" },
-                            "description": { "type": "string", "description": "Concrete task work, acceptance criteria, and verification" },
+                            "description": { "type": "string", "description": "What to do and how it is verified (one to three sentences)" },
                             "priority": { "type": "string" },
                             "task_status": { "type": "string" },
                             "plan_step_id": { "type": "string" },

@@ -1262,7 +1262,7 @@ mod input_shape_tests {
     use super::*;
 
     const W: &str = "11111111-2222-4333-8444-555555555555";
-    const P: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+    const P: &str = "66666666-6666-4666-8666-666666666666";
 
     fn text(result: &ToolResult) -> String {
         match &result.content[0] {

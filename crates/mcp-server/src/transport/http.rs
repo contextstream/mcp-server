@@ -928,6 +928,14 @@ async fn serve_mcp_streamable(
     } else {
         None
     };
+    // Bounded action label (fixed allowlists; never raw input) for the
+    // per-call timing line and telemetry.
+    let tool_action: Option<&'static str> = tool_name.as_deref().map(|name| {
+        mcp_tools::registry::tool_call_action_label(
+            name,
+            request.params.get("arguments").unwrap_or(&Value::Null),
+        )
+    });
 
     // Atlas Stream Processing wiring — capture the call's start so a
     // post-dispatch tool_call event can carry duration_ms. The actual
@@ -955,81 +963,95 @@ async fn serve_mcp_streamable(
         } else {
             None
         };
-    let result = match request.method.as_str() {
-        "server/discover" if surface_profile == ToolSurfaceProfile::Coach => {
-            Ok(crate::server::build_coach_stateless_discover_result())
-        }
-        "server/discover" => Ok(build_contextstream_stateless_discover_result()),
-        // The coach surface serves its ChatGPT component as a resource.
-        "resources/list" if surface_profile == ToolSurfaceProfile::Coach => {
-            Ok(crate::server::coach_resources_list())
-        }
-        "resources/templates/list" if surface_profile == ToolSurfaceProfile::Coach => {
-            Ok(crate::server::coach_resource_templates_list())
-        }
-        "resources/read" if surface_profile == ToolSurfaceProfile::Coach => {
-            crate::server::coach_resource_read(&request.params).map_err(|(code, message)| {
-                JsonRpcError {
-                    code,
-                    message,
-                    data: None,
-                }
-            })
-        }
-        "initialize" if stateless_request => Err(JsonRpcError {
-            code: -32601,
-            message: format!(
-                "Method not found: initialize is not part of MCP {MCP_PROTOCOL_2026_07_28}"
-            ),
-            data: None,
-        }),
-        "initialize" => {
-            state
-                .telemetry
-                .update_managed_initialize_hints_for_session(
-                    &request.params,
-                    response_session_id.as_deref(),
-                    managed_runtime_identity,
-                )
-                .await;
-            let result = handle_initialize_method(&state, &request.params).await;
-            if let (Ok(_), Some(session_id)) = (result.as_ref(), response_session_id.as_deref()) {
-                remember_session_client(session_id, &request.params);
+    let (result, api_calls) = mcp_client::run_counting_api_calls(async {
+        match request.method.as_str() {
+            "server/discover" if surface_profile == ToolSurfaceProfile::Coach => {
+                Ok(crate::server::build_coach_stateless_discover_result())
             }
-            if result.is_ok() {
+            "server/discover" => Ok(build_contextstream_stateless_discover_result()),
+            // The coach surface serves its ChatGPT component as a resource.
+            "resources/list" if surface_profile == ToolSurfaceProfile::Coach => {
+                Ok(crate::server::coach_resources_list())
+            }
+            "resources/templates/list" if surface_profile == ToolSurfaceProfile::Coach => {
+                Ok(crate::server::coach_resource_templates_list())
+            }
+            "resources/read" if surface_profile == ToolSurfaceProfile::Coach => {
+                crate::server::coach_resource_read(&request.params).map_err(|(code, message)| {
+                    JsonRpcError {
+                        code,
+                        message,
+                        data: None,
+                    }
+                })
+            }
+            "initialize" if stateless_request => Err(JsonRpcError {
+                code: -32601,
+                message: format!(
+                    "Method not found: initialize is not part of MCP {MCP_PROTOCOL_2026_07_28}"
+                ),
+                data: None,
+            }),
+            "initialize" => {
                 state
                     .telemetry
-                    .emit_managed_connected_readiness(
+                    .update_managed_initialize_hints_for_session(
+                        &request.params,
                         response_session_id.as_deref(),
-                        workspace_id_for_stream,
-                        project_id_for_stream,
+                        managed_runtime_identity,
                     )
                     .await;
+                let result = handle_initialize_method(&state, &request.params).await;
+                if let (Ok(_), Some(session_id)) = (result.as_ref(), response_session_id.as_deref())
+                {
+                    remember_session_client(session_id, &request.params);
+                }
+                if result.is_ok() {
+                    state
+                        .telemetry
+                        .emit_managed_connected_readiness(
+                            response_session_id.as_deref(),
+                            workspace_id_for_stream,
+                            project_id_for_stream,
+                        )
+                        .await;
+                }
+                result
             }
-            result
+            "tools/list" => handle_list_tools_method(&state, request_registry.clone()).await,
+            "tools/call" => {
+                handle_call_tool_method(
+                    &state,
+                    request.params,
+                    request.id.clone(),
+                    wire_observation.clone(),
+                    stateless_request,
+                    request_registry,
+                )
+                .await
+            }
+            "ping" if !stateless_request => Ok(serde_json::json!({})),
+            _ => Err(JsonRpcError {
+                code: -32601,
+                message: format!("Method not found: {}", request.method),
+                data: None,
+            }),
         }
-        "tools/list" => handle_list_tools_method(&state, request_registry.clone()).await,
-        "tools/call" => {
-            handle_call_tool_method(
-                &state,
-                request.params,
-                request.id.clone(),
-                wire_observation.clone(),
-                stateless_request,
-                request_registry,
-            )
-            .await
-        }
-        "ping" if !stateless_request => Ok(serde_json::json!({})),
-        _ => Err(JsonRpcError {
-            code: -32601,
-            message: format!("Method not found: {}", request.method),
-            data: None,
-        }),
-    };
+    })
+    .await;
 
     if let (Some(name), Err(error)) = (tool_name.as_deref(), result.as_ref()) {
         log_failed_tool_call(&headers, name, error);
+    }
+    if let Some(name) = tool_name.as_deref() {
+        log_tool_call_timing(
+            &headers,
+            name,
+            tool_action.unwrap_or("other"),
+            tool_call_started.elapsed(),
+            result.is_ok(),
+            api_calls,
+        );
     }
 
     // Acceleration signal emit — fire-and-forget so the tool's response
@@ -1040,8 +1062,10 @@ async fn serve_mcp_streamable(
     if let (Some(name), Some(ws)) = (tool_name.as_deref(), workspace_id_for_stream) {
         let outcome = if result.is_ok() { "ok" } else { "error" };
         let elapsed_ms = tool_call_started.elapsed().as_millis() as u64;
+        let action = tool_action.unwrap_or("other");
         let payload = serde_json::json!({
             "tool_name": name,
+            "action": action,
             "outcome": outcome,
             "duration_ms": elapsed_ms,
         });
@@ -1053,7 +1077,7 @@ async fn serve_mcp_streamable(
                 payload,
             );
             event.tool = Some(name.to_string());
-            event.action = Some("tools/call".to_string());
+            event.action = Some(action.to_string());
             event.provider = Some("mcp_http".to_string());
             event.latency_ms = Some(elapsed_ms);
             event.degraded = Some(result.is_err());
@@ -2154,6 +2178,31 @@ fn tool_error_class(message: &str) -> String {
 
 /// Log a failed tools/call: tool, JSON-RPC code, error class and client.
 /// Argument values and the error text (which can quote them) are never logged.
+/// One info line per tools/call with its timing. Labels only: tool name,
+/// bounded action, outcome, API attempt count and summed API time, client.
+fn log_tool_call_timing(
+    headers: &HeaderMap,
+    tool: &str,
+    action: &'static str,
+    elapsed: std::time::Duration,
+    ok: bool,
+    api_calls: mcp_client::ApiCallStats,
+) {
+    let (client_name, _) = session_client_identity(headers);
+    let tool = loggable_client_token(tool).unwrap_or_else(|| "unknown".to_string());
+    info!(
+        target: "contextstream::tool_timing",
+        tool = %tool,
+        action = action,
+        duration_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+        outcome = if ok { "ok" } else { "error" },
+        api_calls = api_calls.calls,
+        api_ms_sum = api_calls.elapsed_ms_sum,
+        client_name = %client_name,
+        "tool call timing"
+    );
+}
+
 fn log_failed_tool_call(headers: &HeaderMap, tool: &str, error: &JsonRpcError) {
     let class = tool_error_class(&error.message);
     let (client_name, client_version) = session_client_identity(headers);

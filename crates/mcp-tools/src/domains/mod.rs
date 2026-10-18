@@ -9,6 +9,7 @@ pub mod charts;
 pub mod coach;
 pub mod coordination;
 pub mod display_title;
+pub mod doc_ops;
 pub mod entity;
 pub mod feed;
 pub mod flash;

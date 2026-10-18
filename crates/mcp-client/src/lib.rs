@@ -104,6 +104,7 @@ pub use client::{
     // Project params
     IngestLocalParams,
     IngestProgressEvent,
+    IngestRootLayout,
     IntegrationActivityParams,
     // Integration params
     IntegrationSearchParams,

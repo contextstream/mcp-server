@@ -310,18 +310,21 @@ pub const DECISION_CONFLICT_RULE_VERBOSE: &str = "⚠️ [DECISION_CONFLICT] A d
 /// attaches any overlapping decision to this one afterwards.
 pub const DECISION_CONFLICT_CHECK_PENDING: &str = "[CONFLICT_CHECK_PENDING] The decision is saved, but the check for overlapping decisions was still running when it was answered; any conflict is attached to this decision within a few seconds. Before relying on it, look at it again with memory(action=\"decisions\").";
 
-/// Whether the API answered a decision capture before its conflict check
-/// finished: `possible_conflicts_status: "deferred"` at the top level, in
-/// `metadata`, or under `data` / `decision`.
-pub fn decision_conflict_check_pending(value: &Value) -> bool {
-    fn deferred(v: &Value) -> bool {
+/// Said on a decision capture whose conflict check could not run
+/// (`possible_conflicts_status: "unavailable"`): nobody has looked for an
+/// overlapping decision.
+pub const DECISION_CONFLICT_CHECK_UNAVAILABLE: &str = "[CONFLICT_CHECK_UNAVAILABLE] The decision is saved, but the check for overlapping decisions could not run. Look for an earlier decision on the same subject with memory(action=\"decisions\", query=...) before relying on this one.";
+
+/// The API's `possible_conflicts_status` on a decision capture response,
+/// read from the top level, `metadata`, or under `data` / `decision`.
+pub fn decision_conflict_check_status(value: &Value) -> Option<&str> {
+    fn status(v: &Value) -> Option<&str> {
         v.get("possible_conflicts_status")
             .or_else(|| {
                 v.get("metadata")
                     .and_then(|m| m.get("possible_conflicts_status"))
             })
             .and_then(Value::as_str)
-            == Some("deferred")
     }
     [
         Some(value),
@@ -331,7 +334,23 @@ pub fn decision_conflict_check_pending(value: &Value) -> bool {
     ]
     .into_iter()
     .flatten()
-    .any(deferred)
+    .find_map(status)
+}
+
+/// Whether the API answered a decision capture before its conflict check
+/// finished (`possible_conflicts_status: "deferred"`).
+pub fn decision_conflict_check_pending(value: &Value) -> bool {
+    decision_conflict_check_status(value) == Some("deferred")
+}
+
+/// The agent-facing line for a capture whose conflict check is still
+/// running or could not run; `None` when it ran (or the API predates it).
+pub fn decision_conflict_check_notice(value: &Value) -> Option<(&'static str, &'static str)> {
+    match decision_conflict_check_status(value) {
+        Some("deferred") => Some(("pending", DECISION_CONFLICT_CHECK_PENDING)),
+        Some("unavailable") => Some(("unavailable", DECISION_CONFLICT_CHECK_UNAVAILABLE)),
+        _ => None,
+    }
 }
 
 /// Render the API's `possible_conflicts` flag on a decision-shaped value
@@ -1335,6 +1354,24 @@ mod tests {
         assert!(!decision_conflict_check_pending(
             &json!({"title": "old api"})
         ));
+        assert_eq!(
+            decision_conflict_check_notice(
+                &json!({"data": {"possible_conflicts_status": "unavailable"}})
+            )
+            .map(|(state, _)| state),
+            Some("unavailable")
+        );
+        assert_eq!(
+            decision_conflict_check_notice(
+                &json!({"metadata": {"possible_conflicts_status": "deferred"}})
+            )
+            .map(|(state, _)| state),
+            Some("pending")
+        );
+        assert!(
+            decision_conflict_check_notice(&json!({"possible_conflicts_status": "checked"}))
+                .is_none()
+        );
     }
 
     #[test]

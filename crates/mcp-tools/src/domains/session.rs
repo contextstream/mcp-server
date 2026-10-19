@@ -10185,16 +10185,16 @@ impl ToolHandler for SessionCaptureTool {
             .get("metadata")
             .or_else(|| result.get("data").and_then(|d| d.get("metadata")))
             .and_then(crate::domains::grounding::decision_conflict_note);
-        let conflict_check_pending =
-            crate::domains::grounding::decision_conflict_check_pending(&result);
+        let conflict_check_notice =
+            crate::domains::grounding::decision_conflict_check_notice(&result);
         if let Some(obj) = result.as_object_mut() {
             obj.insert(
                 "operation_status".to_string(),
-                if conflict_check_pending {
+                if let Some((check_state, _)) = conflict_check_notice {
                     serde_json::json!({
                         "operation": "session_capture",
                         "state": "completed",
-                        "conflict_check": "pending"
+                        "conflict_check": check_state
                     })
                 } else {
                     serde_json::json!({
@@ -10228,9 +10228,9 @@ impl ToolHandler for SessionCaptureTool {
                 input.title, event_id
             ),
         };
-        if conflict_check_pending {
+        if let Some((_, notice)) = conflict_check_notice {
             text.push('\n');
-            text.push_str(crate::domains::grounding::DECISION_CONFLICT_CHECK_PENDING);
+            text.push_str(notice);
         }
         let mut output = ToolResult::with_structured(text, result);
         if let Some(note) = scope.note {

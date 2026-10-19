@@ -1303,6 +1303,19 @@ fn idempotency_origins() -> &'static Mutex<std::collections::HashMap<String, std
     ORIGINS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Response header on an answer the API replayed from a stored idempotency
+/// key instead of running the request again.
+pub const IDEMPOTENT_REPLAY_HEADER: &str = "x-contextstream-idempotent-replay";
+
+/// Whether this response is a replay of a stored outcome. Retrying it only
+/// replays the same outcome again, so it is never retried.
+pub fn response_is_idempotent_replay(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(IDEMPOTENT_REPLAY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "1")
+}
+
 /// Whether this response says the API stored (or will replay) the request's
 /// idempotency key.
 pub fn response_advertises_idempotency(headers: &reqwest::header::HeaderMap) -> bool {
@@ -3873,6 +3886,7 @@ impl ContextStreamClient {
             // applied only when this very response says the API kept its
             // idempotency key; an edge or proxy 5xx never says so.
             let response_keeps_key = response_advertises_idempotency(response.headers());
+            let response_is_replay = response_is_idempotent_replay(response.headers());
 
             // Handle error response
             let error = self.parse_error(response).await;
@@ -3880,6 +3894,7 @@ impl ContextStreamClient {
 
             if is_retryable_status(status.as_u16())
                 && attempt < max_retries
+                && !response_is_replay
                 && retry_permitted(
                     is_write,
                     status_attempt_failure(status.as_u16()),
@@ -21369,6 +21384,24 @@ mod tests {
             !api_supports_idempotency(api_url),
             "a keyless write answer resets"
         );
+    }
+
+    #[tokio::test]
+    async fn replayed_write_error_is_not_retried() {
+        let (client, server) = client_with_http_sequence_headers(vec![(
+            "500 Internal Server Error",
+            "x-contextstream-idempotency: 1\r\nx-contextstream-idempotent-replay: 1\r\n",
+            r#"{"error":{"code":"internal","message":"stored outcome"}}"#.to_string(),
+        )])
+        .await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(900),
+            client.post::<serde_json::Value, _>("/docs", serde_json::json!({"title": "t"})),
+        )
+        .await
+        .expect("a replayed outcome must not enter retry backoff");
+        assert!(matches!(result, Err(Error::Http { status: 500, .. })));
+        assert_eq!(server.await.unwrap().len(), 1, "a replay is final");
     }
 
     #[tokio::test]

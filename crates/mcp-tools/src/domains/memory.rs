@@ -2517,20 +2517,20 @@ pub async fn execute_create_decision(
                 text.push_str(" — deduplicated against an existing decision");
             }
             text.push_str(".\nProgress: completed.");
-            let conflict_check_pending =
-                crate::domains::grounding::decision_conflict_check_pending(&result);
-            if conflict_check_pending {
+            let conflict_check_notice =
+                crate::domains::grounding::decision_conflict_check_notice(&result);
+            if let Some((_, notice)) = conflict_check_notice {
                 text.push('\n');
-                text.push_str(crate::domains::grounding::DECISION_CONFLICT_CHECK_PENDING);
+                text.push_str(notice);
             }
             if let Some(obj) = result.as_object_mut() {
                 obj.insert(
                     "operation_status".to_string(),
-                    if conflict_check_pending {
+                    if let Some((check_state, _)) = conflict_check_notice {
                         serde_json::json!({
                             "operation": "create_decision",
                             "state": "completed",
-                            "conflict_check": "pending"
+                            "conflict_check": check_state
                         })
                     } else {
                         serde_json::json!({"operation": "create_decision", "state": "completed"})

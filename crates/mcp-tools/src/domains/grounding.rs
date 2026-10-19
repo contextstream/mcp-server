@@ -305,6 +305,35 @@ pub const DECISION_CONFLICT_RULE_COMPACT: &str = "\n  [DECISION_CONFLICT] A ⚠�
 /// Verbose form of [`DECISION_CONFLICT_RULE_COMPACT`].
 pub const DECISION_CONFLICT_RULE_VERBOSE: &str = "⚠️ [DECISION_CONFLICT] A decision above overlaps another session's decision on the same subject. Do not pick one silently: confirm with the user which stands, then supersede the other via memory(action=\"decisions\") decision actions.\n";
 
+/// Said on a decision capture the API answered before its conflict check
+/// finished (`possible_conflicts_status: "deferred"`): the check goes on and
+/// attaches any overlapping decision to this one afterwards.
+pub const DECISION_CONFLICT_CHECK_PENDING: &str = "[CONFLICT_CHECK_PENDING] The decision is saved, but the check for overlapping decisions was still running when it was answered; any conflict is attached to this decision within a few seconds. Before relying on it, look at it again with memory(action=\"decisions\").";
+
+/// Whether the API answered a decision capture before its conflict check
+/// finished: `possible_conflicts_status: "deferred"` at the top level, in
+/// `metadata`, or under `data` / `decision`.
+pub fn decision_conflict_check_pending(value: &Value) -> bool {
+    fn deferred(v: &Value) -> bool {
+        v.get("possible_conflicts_status")
+            .or_else(|| {
+                v.get("metadata")
+                    .and_then(|m| m.get("possible_conflicts_status"))
+            })
+            .and_then(Value::as_str)
+            == Some("deferred")
+    }
+    [
+        Some(value),
+        value.get("data"),
+        value.get("decision"),
+        value.get("data").and_then(|d| d.get("decision")),
+    ]
+    .into_iter()
+    .flatten()
+    .any(deferred)
+}
+
 /// Render the API's `possible_conflicts` flag on a decision-shaped value
 /// (a recent-decision preview, a capture response, or a recall hit whose
 /// `metadata` carries the flag). `None` when there is nothing to warn about.
@@ -1291,6 +1320,21 @@ mod tests {
         assert!(note.contains("today"), "{note}");
         assert!(decision_conflict_note(&json!({"title": "clean"})).is_none());
         assert!(decision_conflict_note(&json!({"possible_conflicts": []})).is_none());
+        assert!(decision_conflict_check_pending(
+            &json!({"possible_conflicts_status": "deferred"})
+        ));
+        assert!(decision_conflict_check_pending(
+            &json!({"metadata": {"possible_conflicts_status": "deferred"}})
+        ));
+        assert!(decision_conflict_check_pending(
+            &json!({"decision": {"possible_conflicts_status": "deferred"}})
+        ));
+        assert!(!decision_conflict_check_pending(
+            &json!({"possible_conflicts_status": "checked"})
+        ));
+        assert!(!decision_conflict_check_pending(
+            &json!({"title": "old api"})
+        ));
     }
 
     #[test]

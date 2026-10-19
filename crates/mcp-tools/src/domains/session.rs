@@ -10185,13 +10185,23 @@ impl ToolHandler for SessionCaptureTool {
             .get("metadata")
             .or_else(|| result.get("data").and_then(|d| d.get("metadata")))
             .and_then(crate::domains::grounding::decision_conflict_note);
+        let conflict_check_pending =
+            crate::domains::grounding::decision_conflict_check_pending(&result);
         if let Some(obj) = result.as_object_mut() {
             obj.insert(
                 "operation_status".to_string(),
-                serde_json::json!({
-                    "operation": "session_capture",
-                    "state": "completed"
-                }),
+                if conflict_check_pending {
+                    serde_json::json!({
+                        "operation": "session_capture",
+                        "state": "completed",
+                        "conflict_check": "pending"
+                    })
+                } else {
+                    serde_json::json!({
+                        "operation": "session_capture",
+                        "state": "completed"
+                    })
+                },
             );
             let announce = match conflict_note.as_deref() {
                 Some(note) => format!(
@@ -10208,7 +10218,7 @@ impl ToolHandler for SessionCaptureTool {
                 }),
             );
         }
-        let text = match conflict_note.as_deref() {
+        let mut text = match conflict_note.as_deref() {
             Some(note) => format!(
                 "Captured: {} (ID: {}).\nProgress: completed.\n[DECISION_CONFLICT] {} Confirm with the user which decision stands before relying on either; supersede the loser.",
                 input.title, event_id, note
@@ -10218,6 +10228,10 @@ impl ToolHandler for SessionCaptureTool {
                 input.title, event_id
             ),
         };
+        if conflict_check_pending {
+            text.push('\n');
+            text.push_str(crate::domains::grounding::DECISION_CONFLICT_CHECK_PENDING);
+        }
         let mut output = ToolResult::with_structured(text, result);
         if let Some(note) = scope.note {
             output = output.with_prefix(format!("{}\n", note));

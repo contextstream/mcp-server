@@ -1287,34 +1287,69 @@ pub fn is_agent_write_request(method: &str, api_path: &str) -> bool {
         .any(|root| route_matches_root(path, root))
 }
 
-/// API origins that have answered with `x-contextstream-idempotency: 1`.
-fn idempotency_origins() -> &'static Mutex<std::collections::HashSet<String>> {
-    static ORIGINS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    ORIGINS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+/// How long an origin's `x-contextstream-idempotency: 1` is trusted for a
+/// write that got no response at all (timeout, reset). A write that did get
+/// a response is judged by that response alone (see
+/// [`response_advertises_idempotency`]).
+pub const IDEMPOTENCY_SUPPORT_TTL: Duration = Duration::from_secs(120);
+
+/// API origins with the time they last answered a request with
+/// `x-contextstream-idempotency: 1`. Any agent-write response without the
+/// header removes the origin again, so a rollback of the API (or a route
+/// that stops storing keys) is noticed on the next write.
+fn idempotency_origins() -> &'static Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static ORIGINS: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        OnceLock::new();
+    ORIGINS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Whether this response says the API stored (or will replay) the request's
+/// idempotency key.
+pub fn response_advertises_idempotency(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(IDEMPOTENCY_SUPPORT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "1")
 }
 
 fn normalized_api_origin(api_url: &str) -> String {
     api_url.trim_end_matches('/').to_ascii_lowercase()
 }
 
-/// Record that `api_url` stores idempotency keys when a response says so.
-pub(crate) fn observe_idempotency_support(api_url: &str, headers: &reqwest::header::HeaderMap) {
-    let supported = headers
-        .get(IDEMPOTENCY_SUPPORT_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.trim() == "1");
-    if supported {
-        if let Ok(mut origins) = idempotency_origins().lock() {
-            origins.insert(normalized_api_origin(api_url));
+/// Note what a response says about idempotency-key storage at `api_url`:
+/// the header refreshes the origin; an agent-write response without it
+/// forgets the origin. Responses to other routes, which never carry the
+/// header, change nothing.
+pub(crate) fn observe_idempotency_support(
+    api_url: &str,
+    headers: &reqwest::header::HeaderMap,
+    is_agent_write: bool,
+) {
+    let supported = response_advertises_idempotency(headers);
+    if !supported && !is_agent_write {
+        return;
+    }
+    if let Ok(mut origins) = idempotency_origins().lock() {
+        let origin = normalized_api_origin(api_url);
+        if supported {
+            origins.insert(origin, std::time::Instant::now());
+        } else {
+            origins.remove(&origin);
         }
     }
 }
 
-/// Whether `api_url` has advertised idempotency-key storage in this process.
+/// Whether `api_url` advertised idempotency-key storage within the last
+/// [`IDEMPOTENCY_SUPPORT_TTL`] and no agent write has been answered without
+/// it since. Used only for writes that got no response.
 pub fn api_supports_idempotency(api_url: &str) -> bool {
     idempotency_origins()
         .lock()
-        .map(|origins| origins.contains(&normalized_api_origin(api_url)))
+        .map(|origins| {
+            origins
+                .get(&normalized_api_origin(api_url))
+                .is_some_and(|seen| seen.elapsed() <= IDEMPOTENCY_SUPPORT_TTL)
+        })
         .unwrap_or(false)
 }
 
@@ -3792,7 +3827,7 @@ impl ContextStreamClient {
             let response = match sent {
                 Ok(resp) => {
                     observe_tenant_home_header(resp.headers());
-                    observe_idempotency_support(&config.api_url, resp.headers());
+                    observe_idempotency_support(&config.api_url, resp.headers(), is_write);
                     resp
                 }
                 Err(e) => {
@@ -3834,6 +3869,11 @@ impl ContextStreamClient {
                 return self.parse_response(response).await;
             }
 
+            // A write answered with an error is retried after it may have
+            // applied only when this very response says the API kept its
+            // idempotency key; an edge or proxy 5xx never says so.
+            let response_keeps_key = response_advertises_idempotency(response.headers());
+
             // Handle error response
             let error = self.parse_error(response).await;
             debug!("Error response: {:?}", error);
@@ -3843,7 +3883,7 @@ impl ContextStreamClient {
                 && retry_permitted(
                     is_write,
                     status_attempt_failure(status.as_u16()),
-                    api_supports_idempotency(&config.api_url),
+                    response_keeps_key,
                 )
             {
                 // A server-requested wait beyond the in-request cap is handed
@@ -21271,7 +21311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_may_retry_after_the_origin_advertises_idempotency() {
+    async fn write_error_without_the_header_is_not_retried_even_after_an_advertisement() {
         let (client, server) = client_with_http_sequence_headers(vec![
             (
                 "201 Created",
@@ -21282,6 +21322,67 @@ mod tests {
                 "502 Bad Gateway",
                 "",
                 r#"{"error":{"code":"bad_gateway","message":"edge"}}"#.to_string(),
+            ),
+        ])
+        .await;
+        let _: serde_json::Value = client
+            .post("/docs", serde_json::json!({"title": "a"}))
+            .await
+            .unwrap();
+        let api_url = client.config().await.api_url.clone();
+        assert!(api_supports_idempotency(&api_url));
+        let second = tokio::time::timeout(
+            Duration::from_millis(900),
+            client.post::<serde_json::Value, _>("/docs", serde_json::json!({"title": "b"})),
+        )
+        .await
+        .expect("an edge 5xx must not enter retry backoff");
+        assert!(matches!(second, Err(Error::Http { status: 502, .. })));
+        assert_eq!(server.await.unwrap().len(), 2, "no retry of the 502");
+        assert!(
+            !api_supports_idempotency(&api_url),
+            "a write answered without the header forgets the origin"
+        );
+    }
+
+    #[test]
+    fn idempotency_trust_expires_and_ignores_non_write_responses() {
+        let api_url = "https://idempotency-ttl.test";
+        let mut advertised = reqwest::header::HeaderMap::new();
+        advertised.insert(IDEMPOTENCY_SUPPORT_HEADER, "1".parse().unwrap());
+        let plain = reqwest::header::HeaderMap::new();
+        assert!(!api_supports_idempotency(api_url));
+        observe_idempotency_support(api_url, &advertised, true);
+        assert!(api_supports_idempotency(api_url));
+        observe_idempotency_support(api_url, &plain, false);
+        assert!(api_supports_idempotency(api_url), "a read never resets");
+        if let Ok(mut origins) = idempotency_origins().lock() {
+            origins.insert(
+                normalized_api_origin(api_url),
+                std::time::Instant::now() - IDEMPOTENCY_SUPPORT_TTL - Duration::from_secs(1),
+            );
+        }
+        assert!(!api_supports_idempotency(api_url), "the trust expires");
+        observe_idempotency_support(api_url, &advertised, true);
+        observe_idempotency_support(api_url, &plain, true);
+        assert!(
+            !api_supports_idempotency(api_url),
+            "a keyless write answer resets"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_error_that_keeps_its_key_is_retried_with_the_same_key() {
+        let (client, server) = client_with_http_sequence_headers(vec![
+            (
+                "201 Created",
+                "x-contextstream-idempotency: 1\r\n",
+                r#"{"data":{"id":"d1"}}"#.to_string(),
+            ),
+            (
+                "500 Internal Server Error",
+                "x-contextstream-idempotency: 1\r\n",
+                r#"{"error":{"code":"internal","message":"kept"}}"#.to_string(),
             ),
             (
                 "201 Created",

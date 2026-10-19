@@ -1037,3 +1037,118 @@ mod call_path_render_tests {
         );
     }
 }
+
+// ============================================================================
+// Knowledge that refers to code
+// ============================================================================
+
+#[test]
+fn code_knowledge_text_groups_by_type_and_says_how_each_refers() {
+    let result = json!({
+        "target": {"id": "services/inventory/store.go::Store.GrantInventory"},
+        "knowledge": [
+            {"node": {"id": "d1", "node_type": "decision", "summary": "Grants are idempotent per receipt"}, "reason": "code_ref"},
+            {"node": {"id": "l1", "node_type": "lesson", "summary": "Retry storms double-granted items"}, "reason": "mentions_path"},
+            {"node": {"id": "d2", "node_type": "decision", "summary": "Store.GrantInventory must stay idempotent"}, "reason": "mentions_symbol"}
+        ],
+        "events": [{"event_type": "task", "title": "Make grants idempotent", "reason": "code_ref"}],
+        "docs": [{"title": "Inventory runbook", "reason": "mentions_path"}]
+    });
+    assert_eq!(
+        render_code_knowledge(&result),
+        "Knowledge that refers to services/inventory/store.go::Store.GrantInventory:\n\
+         Decisions (2):\n\
+         1. Grants are idempotent per receipt (records a reference to it; d1)\n\
+         2. Store.GrantInventory must stay idempotent (names it; d2)\n\
+         Lessons (1):\n\
+         1. Retry storms double-granted items (names its file; l1)\n\
+         Tasks and notes (1):\n\
+         1. [task] Make grants idempotent (records a reference to it)\n\
+         Docs (1):\n\
+         1. Inventory runbook (names its file)"
+    );
+}
+
+#[test]
+fn code_knowledge_text_says_when_nothing_refers_to_the_code() {
+    let result = json!({"target": {"id": "src/x.rs"}, "knowledge": [], "events": [], "docs": []});
+    assert_eq!(
+        render_code_knowledge(&result),
+        "No decisions, lessons, tasks or docs refer to src/x.rs yet."
+    );
+}
+
+#[test]
+fn related_decisions_text_lists_each_decision() {
+    let result = json!([
+        {"id": "d1", "summary": "Use Postgres for the graph"},
+        {"id": "d2", "summary": "Keep Neo4j for parity checks"}
+    ]);
+    assert_eq!(
+        render_related_decisions(&result),
+        "Related decisions (2):\n1. Use Postgres for the graph (d1)\n2. Keep Neo4j for parity checks (d2)"
+    );
+    assert_eq!(
+        render_related_decisions(&json!([])),
+        "No decisions are related to this node."
+    );
+}
+
+#[test]
+fn neighborhood_text_lists_items_by_distance_with_their_links() {
+    let result = json!({
+        "center": {"kind": "event", "subtype": "plan", "title": "Make grants idempotent", "id": "p"},
+        "neighbors": [
+            {"item": {"kind": "knowledge", "subtype": "decision", "title": "Grants are idempotent per receipt", "id": "d"},
+             "depth": 1, "relation": "links", "direction": "out"},
+            {"item": {"kind": "event", "subtype": "task", "title": "Add the receipt key", "id": "t"},
+             "depth": 1, "relation": "part_of", "direction": "in"},
+            {"item": {"kind": "code", "title": "services/inventory/store.go::Store.GrantInventory", "id": "services/inventory/store.go::Store.GrantInventory"},
+             "depth": 2, "relation": "about", "direction": "out"}
+        ]
+    });
+    assert_eq!(
+        render_neighborhood(&result),
+        "Linked to [plan] Make grants idempotent:\n\
+         Directly (2):\n\
+         1. [decision] Grants are idempotent per receipt (-> links; d)\n\
+         2. [task] Add the receipt key (<- part_of; t)\n\
+         2 links away (1):\n\
+         1. [code] services/inventory/store.go::Store.GrantInventory (-> about; services/inventory/store.go::Store.GrantInventory)"
+    );
+    assert_eq!(
+        render_neighborhood(
+            &json!({"center": {"kind": "doc", "title": "Runbook"}, "neighbors": []})
+        ),
+        "Nothing is linked to [doc] Runbook."
+    );
+}
+
+#[test]
+fn item_path_text_follows_each_link_in_the_direction_it_was_walked() {
+    let result = json!({
+        "items": [
+            {"id": "d", "kind": "knowledge", "subtype": "decision", "title": "Grants are idempotent"},
+            {"id": "p", "kind": "event", "subtype": "plan", "title": "Make grants idempotent"},
+            {"id": "h", "kind": "handoff", "title": "Hand over grants"},
+            {"id": "b", "kind": "ticket", "subtype": "bug", "title": "Double grants"}
+        ],
+        "links": [
+            {"from": {"kind": "event", "id": "p"}, "to": {"kind": "knowledge", "id": "d"}, "relation": "links"},
+            {"from": {"kind": "handoff", "id": "h"}, "to": {"kind": "event", "id": "p"}, "relation": "links"},
+            {"from": {"kind": "handoff", "id": "h"}, "to": {"kind": "ticket", "id": "b"}, "relation": "links"}
+        ]
+    });
+    assert_eq!(
+        render_item_path(&result),
+        "Path (3 links):\n\
+         [decision] Grants are idempotent\n  \
+         <- links [plan] Make grants idempotent\n  \
+         <- links [handoff] Hand over grants\n  \
+         -> links [bug] Double grants"
+    );
+    assert_eq!(
+        render_item_path(&Value::Null),
+        "No path links these items within reach."
+    );
+}

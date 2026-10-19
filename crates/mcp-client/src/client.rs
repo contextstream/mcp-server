@@ -13481,6 +13481,61 @@ impl ContextStreamClient {
         self.post("/graph/knowledge/related", body).await
     }
 
+    /// The items linked to one memory item of any kind (knowledge node, plan, task, note, doc,
+    /// ticket, handoff), and the code they name, nearest first.
+    pub async fn graph_neighborhood(
+        &self,
+        item_id: Uuid,
+        workspace_id: Option<Uuid>,
+        max_depth: Option<i64>,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "item_id": item_id,
+            "workspace_id": workspace_id,
+            "max_depth": max_depth,
+            "limit": limit,
+        });
+        self.post("/graph/knowledge/neighborhood", body).await
+    }
+
+    /// The shortest chain of links between two memory items of any kinds.
+    pub async fn graph_item_path(
+        &self,
+        from_id: Uuid,
+        to_id: Uuid,
+        workspace_id: Option<Uuid>,
+        max_depth: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "from_id": from_id,
+            "to_id": to_id,
+            "workspace_id": workspace_id,
+            "max_depth": max_depth,
+        });
+        self.post("/graph/knowledge/item-path", body).await
+    }
+
+    /// The decisions, lessons and other knowledge, the tasks and notes, and the docs that refer
+    /// to a piece of code: a code graph id (`src/store.rs::Store.grant`) or a file path.
+    pub async fn graph_code_knowledge(
+        &self,
+        project_id: Uuid,
+        workspace_id: Option<Uuid>,
+        target_id: &str,
+        node_types: &[&str],
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "project_id": project_id,
+            "workspace_id": workspace_id,
+            "target_id": target_id,
+            "node_types": node_types,
+            "limit": limit,
+        });
+        self.post("/graph/knowledge/code", body).await
+    }
+
     /// Ingest/build the code graph.
     pub async fn graph_ingest(
         &self,

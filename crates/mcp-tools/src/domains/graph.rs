@@ -760,6 +760,20 @@ impl ToolHandler for GraphImpactTool {
             }
         }
 
+        if let Some(knowledge) = result.get("linked_knowledge").and_then(|v| v.as_array()) {
+            if !knowledge.is_empty() {
+                text.push_str("\nWhy it is this way (team knowledge that refers to it):\n");
+                for (i, item) in knowledge.iter().take(10).enumerate() {
+                    let node_type = item
+                        .get("node_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("note");
+                    let summary = item.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                    text.push_str(&format!("{}. [{}] {}\n", i + 1, node_type, summary));
+                }
+            }
+        }
+
         // A8b: stamp warm-cache provenance on the structured envelope
         // without changing the response shape clients consume.
         let mut result = result;
@@ -1121,6 +1135,220 @@ fn call_path_hop_joiner(hop: &Value) -> String {
         ("http" | "event", None) => format!(" ={}=> ", kind),
         _ => " -> ".to_string(),
     }
+}
+
+/// Text for the knowledge that refers to a piece of code (`/graph/knowledge/code`): knowledge
+/// nodes grouped by type, then tasks and notes, then docs, each with how it refers to the code.
+fn render_code_knowledge(result: &Value) -> String {
+    let target = result
+        .get("target")
+        .and_then(|t| t.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("the code");
+    let reason = |item: &Value| match item.get("reason").and_then(|v| v.as_str()) {
+        Some("code_ref") => "records a reference to it",
+        Some("code_ref_file") => "records a reference to its file",
+        Some("mentions_symbol") => "names it",
+        Some("mentions_path") => "names its file",
+        Some("mentions_name") => "names it by name",
+        _ => "refers to it",
+    };
+    let list = |key: &str| {
+        result
+            .get(key)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let knowledge = list("knowledge");
+    let events = list("events");
+    let docs = list("docs");
+    if knowledge.is_empty() && events.is_empty() && docs.is_empty() {
+        return format!("No decisions, lessons, tasks or docs refer to {target} yet.");
+    }
+    let mut lines = vec![format!("Knowledge that refers to {target}:")];
+    let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
+    for item in &knowledge {
+        let node_type = item
+            .get("node")
+            .and_then(|n| n.get("node_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("note")
+            .to_string();
+        match groups.iter_mut().find(|(t, _)| *t == node_type) {
+            Some((_, items)) => items.push(item),
+            None => groups.push((node_type, vec![item])),
+        }
+    }
+    for (node_type, items) in &groups {
+        lines.push(format!("{} ({}):", plural_heading(node_type), items.len()));
+        for (i, item) in items.iter().enumerate() {
+            let node = item.get("node").cloned().unwrap_or(Value::Null);
+            let summary = node.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+            let id = node.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            lines.push(format!("{}. {} ({}; {})", i + 1, summary, reason(item), id));
+        }
+    }
+    if !events.is_empty() {
+        lines.push(format!("Tasks and notes ({}):", events.len()));
+        for (i, item) in events.iter().enumerate() {
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(untitled)");
+            let kind = item
+                .get("event_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("event");
+            lines.push(format!(
+                "{}. [{}] {} ({})",
+                i + 1,
+                kind,
+                title,
+                reason(item)
+            ));
+        }
+    }
+    if !docs.is_empty() {
+        lines.push(format!("Docs ({}):", docs.len()));
+        for (i, item) in docs.iter().enumerate() {
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(untitled)");
+            lines.push(format!("{}. {} ({})", i + 1, title, reason(item)));
+        }
+    }
+    lines.join("\n")
+}
+
+fn plural_heading(node_type: &str) -> String {
+    let mut chars = node_type.chars();
+    let head: String = chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default();
+    if head.ends_with('s') {
+        head
+    } else {
+        format!("{head}s")
+    }
+}
+
+/// `[decision] Grants are idempotent` for an item of a neighbourhood or path.
+fn item_label(item: &Value) -> String {
+    let kind = item
+        .get("subtype")
+        .and_then(|v| v.as_str())
+        .or_else(|| item.get("kind").and_then(|v| v.as_str()))
+        .unwrap_or("item");
+    let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    format!("[{kind}] {title}")
+}
+
+/// Text for the items around one item (`/graph/knowledge/neighborhood`), by distance.
+fn render_neighborhood(result: &Value) -> String {
+    let center = result.get("center").cloned().unwrap_or(Value::Null);
+    let neighbors = result
+        .get("neighbors")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if neighbors.is_empty() {
+        return format!("Nothing is linked to {}.", item_label(&center));
+    }
+    let mut lines = vec![format!("Linked to {}:", item_label(&center))];
+    let mut depth_seen = 0;
+    let mut n = 0;
+    for neighbor in &neighbors {
+        let depth = neighbor.get("depth").and_then(|v| v.as_u64()).unwrap_or(1);
+        if depth != depth_seen {
+            depth_seen = depth;
+            n = 0;
+            let count = neighbors
+                .iter()
+                .filter(|x| x.get("depth").and_then(|v| v.as_u64()) == Some(depth))
+                .count();
+            lines.push(if depth == 1 {
+                format!("Directly ({count}):")
+            } else {
+                format!("{depth} links away ({count}):")
+            });
+        }
+        n += 1;
+        let item = neighbor.get("item").cloned().unwrap_or(Value::Null);
+        let relation = neighbor
+            .get("relation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("linked");
+        let arrow = match neighbor.get("direction").and_then(|v| v.as_str()) {
+            Some("in") => format!("<- {relation}"),
+            _ => format!("-> {relation}"),
+        };
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        lines.push(format!("{n}. {} ({arrow}; {id})", item_label(&item)));
+    }
+    lines.join("\n")
+}
+
+/// Text for a chain of links between two items (`/graph/knowledge/item-path`).
+fn render_item_path(result: &Value) -> String {
+    let items = result
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let links = result
+        .get("links")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if items.is_empty() {
+        return "No path links these items within reach.".to_string();
+    }
+    let mut lines = vec![
+        format!(
+            "Path ({} link{}):",
+            links.len(),
+            if links.len() == 1 { "" } else { "s" }
+        ),
+        item_label(&items[0]),
+    ];
+    for (index, link) in links.iter().enumerate() {
+        let previous_id = items[index].get("id").and_then(|v| v.as_str());
+        let from_id = link
+            .get("from")
+            .and_then(|f| f.get("id"))
+            .and_then(|v| v.as_str());
+        let relation = link
+            .get("relation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("linked");
+        let arrow = if from_id == previous_id {
+            format!("-> {relation}")
+        } else {
+            format!("<- {relation}")
+        };
+        if let Some(next) = items.get(index + 1) {
+            lines.push(format!("  {arrow} {}", item_label(next)));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Text for the decisions related to a knowledge node.
+fn render_related_decisions(result: &Value) -> String {
+    let nodes = result.as_array().cloned().unwrap_or_default();
+    if nodes.is_empty() {
+        return "No decisions are related to this node.".to_string();
+    }
+    let mut lines = vec![format!("Related decisions ({}):", nodes.len())];
+    for (i, node) in nodes.iter().enumerate() {
+        let summary = node.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+        let id = node.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        lines.push(format!("{}. {} ({})", i + 1, summary, id));
+    }
+    lines.join("\n")
 }
 
 fn looks_like_type_identifier(target_id: &str) -> bool {
@@ -1591,20 +1819,41 @@ impl ToolHandler for GraphTool {
         match input.action.to_lowercase().as_str() {
             "related" => {
                 let node_id = input.node_id.ok_or_else(|| Error::Validation("node_id is required for related action".to_string()))?;
-                let related_input = GraphRelatedInput {
-                    node_id,
-                    workspace_id: input.workspace_id.clone(),
-                    project_id: input.project_id.clone(),
-                    max_depth: input.max_depth,
-                    relation_types: input.relation_types,
-                };
-                let tool = GraphRelatedTool::with_session_atlas_and_acceleration(
-                    self.client.clone(),
-                    self.session.clone(),
-                    self.atlas_layer.clone(),
-                    self.acceleration_layer.clone(),
-                );
-                tool.execute(serde_json::to_value(&related_input).unwrap()).await
+                // Relation types filter the knowledge graph proper; otherwise walk every kind.
+                if input.relation_types.as_ref().is_some_and(|t| !t.is_empty()) {
+                    let related_input = GraphRelatedInput {
+                        node_id,
+                        workspace_id: input.workspace_id.clone(),
+                        project_id: input.project_id.clone(),
+                        max_depth: input.max_depth,
+                        relation_types: input.relation_types,
+                    };
+                    let tool = GraphRelatedTool::with_session_atlas_and_acceleration(
+                        self.client.clone(),
+                        self.session.clone(),
+                        self.atlas_layer.clone(),
+                        self.acceleration_layer.clone(),
+                    );
+                    return tool.execute(serde_json::to_value(&related_input).unwrap()).await;
+                }
+                let item_id = Uuid::parse_str(&node_id)
+                    .map_err(|_| Error::Validation("node_id must be a valid UUID".to_string()))?;
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let result = self
+                    .client
+                    .graph_neighborhood(item_id, scope.workspace_id, input.max_depth, None)
+                    .await?;
+                let mut output = ToolResult::with_structured(render_neighborhood(&result), result);
+                if let Some(note) = scope.note.as_deref() {
+                    output = output.with_prefix(format!("{}\n", note));
+                }
+                Ok(output)
             }
             "dependencies" | "deps" => {
                 let target_type = input.target_type.unwrap_or_else(|| "function".to_string());
@@ -1864,23 +2113,12 @@ impl ToolHandler for GraphTool {
                     input.project_id.as_deref(),
                 )
                 .await?;
+                // Items of any kinds: knowledge nodes, plans, tasks, notes, docs, tickets, handoffs.
                 let result = self
                     .client
-                    .graph_path(
-                        source_uuid,
-                        target_uuid,
-                        scope.workspace_id,
-                        scope.project_id,
-                        input.max_depth,
-                    )
+                    .graph_item_path(source_uuid, target_uuid, scope.workspace_id, input.max_depth)
                     .await?;
-                let path_len = result.get("path").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                let text = if path_len > 0 {
-                    format!("Found path with {} nodes.", path_len)
-                } else {
-                    "No path found between the nodes.".to_string()
-                };
-                let mut output = ToolResult::with_structured(text, result);
+                let mut output = ToolResult::with_structured(render_item_path(&result), result);
                 if let Some(note) = scope.note.as_deref() {
                     output = output.with_prefix(format!("{}\n", note));
                 }
@@ -2408,11 +2646,11 @@ impl ToolHandler for GraphTool {
                 Ok(output)
             }
             "decisions" => {
-                // List decisions related to a node
-                let node_id = input.node_id
-                    .as_ref()
-                    .and_then(|s| Uuid::parse_str(s).ok())
-                    .ok_or_else(|| Error::Validation("node_id is required for decisions action".to_string()))?;
+                if input.node_id.is_none() && input.target_id.is_none() {
+                    return Err(Error::Validation(
+                        "decisions needs node_id (a knowledge node) or target_id (code: a function, type or constant id, or a file path)".to_string(),
+                    ));
+                }
                 let scope = resolve_read_scope(
                     &self.client,
                     self.session.as_ref(),
@@ -2420,16 +2658,47 @@ impl ToolHandler for GraphTool {
                     input.project_id.as_deref(),
                 )
                 .await?;
-                let params = GraphRelatedParams {
-                    node_id,
-                    workspace_id: scope.workspace_id,
-                    project_id: scope.project_id,
-                    max_depth: input.max_depth,
-                    relation_types: Some(vec!["decision".to_string()]),
+                let knowledge_node = input.node_id.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+                let (text, result) = match (knowledge_node, input.target_id.as_deref().or(input.node_id.as_deref())) {
+                    // A knowledge node: the decisions related to it.
+                    (Some(node_id), _) if input.target_id.is_none() => {
+                        let params = GraphRelatedParams {
+                            node_id,
+                            workspace_id: scope.workspace_id,
+                            project_id: scope.project_id,
+                            max_depth: input.max_depth,
+                            relation_types: Some(vec!["decision".to_string()]),
+                        };
+                        let result = self.client.graph_related(params).await?;
+                        (render_related_decisions(&result), result)
+                    }
+                    // Code (a function, type or constant id, or a file path): the decisions,
+                    // lessons and constraints that refer to it, with its tasks and docs.
+                    (_, Some(target)) => {
+                        let project_id = scope.project_id.ok_or_else(|| {
+                            Error::Validation(
+                                "project_id is required for the decisions about code".to_string(),
+                            )
+                        })?;
+                        let result = self
+                            .client
+                            .graph_code_knowledge(
+                                project_id,
+                                scope.workspace_id,
+                                target,
+                                &["decision", "lesson", "constraint"],
+                                None,
+                            )
+                            .await?;
+                        (render_code_knowledge(&result), result)
+                    }
+                    _ => {
+                        return Err(Error::Validation(
+                            "decisions needs node_id (a knowledge node) or target_id (code: a function, type or constant id, or a file path)".to_string(),
+                        ))
+                    }
                 };
-                let result = self.client.graph_related(params).await?;
-                let mut output =
-                    ToolResult::with_structured("Decisions retrieved.".to_string(), result);
+                let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note.as_deref() {
                     output = output.with_prefix(format!("{}\n", note));
                 }
@@ -2514,7 +2783,7 @@ impl ToolHandler for GraphTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "graph".to_string(),
             title: "Code Graph Analysis".to_string(),
-            description: "Code graph structural analysis and Code Health dashboard retrieval. NOT for searching code by content/keywords (use the 'search' tool for that). Actions: dependencies (module deps), impact (change impact), call_path (function call path), related (related graph nodes), path (path between nodes), decisions (decisions linked to a graph node), ingest (build graph), outbox_status and outbox_canary (relationship storage graph outbox operations), circular_dependencies, unused_code, complexity_metrics, quality_trends, quality_history, quality_freshness, quality_snapshot, contradictions, usages (reverse deps — find all files that use/render a component, type, or function). Use the quality_* actions when the user asks for dashboard Code Health data, scan history, trends, freshness, or recommendations.".to_string(),
+            description: "Code graph structural analysis and Code Health dashboard retrieval. NOT for searching code by content/keywords (use the 'search' tool for that). Actions: dependencies (module deps), impact (change impact), call_path (function call path), related (what links to any memory item — knowledge node, plan, task, note, doc, ticket or handoff — and the code it names; relation_types restricts it to knowledge relations), path (the chain of links between two memory items of any kinds), decisions (with target_id = a function, type or constant id or a file path: the decisions, lessons, constraints, tasks and docs that refer to that code; with node_id = a knowledge node: its related decisions), ingest (build graph), outbox_status and outbox_canary (relationship storage graph outbox operations), circular_dependencies, unused_code, complexity_metrics, quality_trends, quality_history, quality_freshness, quality_snapshot, contradictions, usages (reverse deps — find all files that use/render a component, type, or function). Use the quality_* actions when the user asks for dashboard Code Health data, scan history, trends, freshness, or recommendations.".to_string(),
             category: ToolCategory::Graph,
             // The unified surface includes ingest, outbox canary, and
             // quality_snapshot actions. Dedicated query-only graph tools remain
@@ -2594,7 +2863,7 @@ impl ToolHandler for GraphTool {
             )
             .string(
                 "target_id",
-                "Target identifier (for dependencies/impact/call_path)",
+                "Target identifier (for dependencies/impact/call_path; for decisions, a function, type or constant id or a file path)",
                 false,
             )
             // Impact specific
@@ -2611,7 +2880,7 @@ impl ToolHandler for GraphTool {
             // Related fields
             .uuid(
                 "node_id",
-                "Node UUID (for related/contradictions/decisions/code_drift)",
+                "Knowledge node UUID (for related/contradictions/decisions/code_drift)",
                 false,
             )
             .boolean(

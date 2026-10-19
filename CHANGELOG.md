@@ -1,5 +1,128 @@
 # Changelog
 
+## 1.0.26
+
+- Agent writes are faster and safer to repeat. A write to plans, tasks, docs,
+  memory events, decisions and nodes, lessons, todos, diagrams, reminders and
+  the entity kinds (tickets, handoffs, incidents, releases, experiments,
+  goals, key results, sprints, reviews, risks, backlog views, coordination
+  items) now has a 10 second timeout (it was 30) and carries an
+  `Idempotency-Key` that is the same on every retry of that write. A write
+  that may already have reached the server (a timeout, a reset after the
+  request was sent, or a 408, 500, 502 or 504 answer) is no longer retried,
+  unless that same response says `x-contextstream-idempotency: 1`; a write that
+  got no answer at all is retried only if the origin said so within the last
+  120 seconds and no later write was answered without it.
+  An answer marked `x-contextstream-idempotent-replay: 1` is never retried,
+  because it only repeats the stored outcome. Connect failures before the
+  request is sent, 429 and 503 are still retried, and reads keep their
+  policy. Bulk event ingest and event distillation keep the general policy.
+  There is no setting for the timeout or the retry rule (83eee4e, 7fc5c04,
+  a471460).
+- `session(action="capture_plan")` sends the plan and its tasks in one
+  request, up to 100 tasks. When the API answers with the created tasks they
+  are the linked tasks and no per-task call is made. A larger plan, or an API
+  that does not create them, falls back to one request per task with at most 6
+  in flight (`CONTEXTSTREAM_PLAN_TASK_CONCURRENCY`, 1 to 16, 1 means one at a
+  time). Results and errors stay in step order, and a failed plan request is
+  never followed by a second plan (83eee4e, a53a661).
+- `memory(action="update_doc")` and `memory_update_doc` take `ops` instead of
+  the whole document: `append`, `prepend`, `replace_section` (a heading, with
+  or without its hashes; replaces the body up to the next heading of the same
+  or a higher level; headings inside code fences are ignored; a missing or
+  ambiguous heading is an error) and `str_replace` (exactly one match).
+  `content` and `ops` cannot be sent together. The server has no precondition
+  on a doc update, so a write that lands in the few milliseconds between the
+  read and the update would be overwritten (83eee4e).
+- A decision capture says when its conflict check did not finish. When the API
+  answers before the check ran, `session(action="capture")` and
+  `memory(action="create_decision")` add `[CONFLICT_CHECK_PENDING]` and set
+  `operation_status.conflict_check` to `pending`; when the check was
+  unavailable they add `[CONFLICT_CHECK_UNAVAILABLE]` and `unavailable`. Before
+  this, both read as a capture with no conflicts (7fc5c04, a471460).
+- Tools accept the argument shapes that MCP bridges send. Every tool's
+  arguments are matched to its advertised schema before the handler reads
+  them: JSON-string or null arguments and `arguments`, `args`, `input` or
+  `params` envelopes are unwrapped; camelCase and kebab-case keys move to the
+  schema key (never over one that is present); `{"workspace": {"id": ...}}`
+  and `{"project": {"id": ...}}` fill `workspace_id` and `project_id`; and
+  values follow the property's type (booleans from `"true"`, `"false"`, 0 and
+  1; integers and numbers from numeric strings; strings from scalars, from
+  `{"id": ...}` or from a one-item array; arrays and objects from a JSON
+  string). Ids are only moved between keys, never invented, and the API still
+  checks every id. A value that still does not fit is refused as before, and
+  the message now names the tool and the fields that differ from the schema,
+  without their values. `init` trims `repository_url`, treats an empty one as
+  absent, and sets aside one that is not a Git remote with a note and
+  `repository_url_ignored` instead of failing (1bf2ede).
+- `graph` reads the team's decisions as well as the code. `action="decisions"`
+  with a file path or a code id as `target_id` lists the decisions, lessons and
+  constraints that refer to that code, how each refers to it, then its tasks,
+  notes and docs; with `node_id` it lists the related decisions.
+  `action="related"` without `relation_types` shows what links to any
+  knowledge node, plan, task, note, doc, ticket or handoff and the code it
+  names, by distance and direction. `action="path"` shows the chain of links
+  between two items of any kind (it used to read a field the API never
+  returned and always answered that there was no path). The impact text adds
+  "Why it is this way": the decisions, lessons and constraints about the
+  target. The tool description stays within the 1,024 characters that some
+  model providers accept (d8e442d, 7cd453c).
+- `graph(action="call_path")` shows where a path crosses services. The text
+  lists up to five paths, one numbered line each, marking an HTTP or event
+  hop with its route or topic, then `Crosses services: N HTTP hop(s), M event
+  hop(s).`; further paths are left to the structured result. The structured
+  result and the `[WARM_CACHE]` first line are unchanged, and an API that sends
+  no hops gets the plain arrow chain (580abdd).
+- Local ingest understands Perforce, Plastic SCM and Unity. `.p4ignore` is
+  honoured wherever `.contextignore` is, below it in precedence. In a Plastic
+  workspace (a `.plastic` folder at the ingest root) the root `ignore.conf` is
+  read as gitignore rules; elsewhere a file with that name is left alone.
+  `.plastic` and `.vs` are never ingested. In a Unity project (a
+  `ProjectSettings/ProjectVersion.txt` at the root) `Library`, `Temp`, `Logs`,
+  `UserSettings`, `MemoryCaptures`, `Build`, `Builds` and `obj` are skipped
+  directly under the root only, so nested folders with those names, and those
+  folders in other projects, are still ingested. Files under those folders
+  that an earlier version indexed are dropped by the absence check, and the
+  file watcher no longer wakes for Unity's `Library` churn (580abdd).
+- The hosted gateway logs and counts what it was blind to. A failed
+  `tools/call` is logged under the target `contextstream::tool_errors` with the
+  tool, the JSON-RPC code, an error class such as `validation:invalid_type` or
+  `http:403` and the client's name and version, and counted in
+  `mcp_tool_call_errors_total{tool,class}`. Each rewrite of an argument shape
+  is counted in `mcp_input_shape_normalized_total{tool,kind}` and logged as
+  `input_shape_normalized` with field names only. Every `tools/call` writes one
+  `tool call timing` line under `contextstream::tool_timing` (tool, action,
+  duration, outcome, API calls and their time, client name), the execution
+  latency metrics now cover the write tools, and the acceleration signal
+  carries the real action. Argument values, content and error text are never
+  logged (1bf2ede, 83eee4e).
+- Hooks and rules ask for less text. The PreToolUse hook no longer says that
+  memory, doc, plan and task writes "can take a few seconds" or asks the model
+  to post progress updates around them, because those writes are synchronous;
+  the notice stays for `project` `index` and `ingest_local` and for `media`
+  `index`, which continue in the background. The managed editor rules and the
+  `capture_plan`, `create_task`, `session` and `memory` tool text ask for short
+  plan steps (a title and one to three sentences on what changes, where and how
+  it is verified), short decisions and lessons, and `update_doc` ops for doc
+  edits (83eee4e).
+- Test fixtures no longer trip the public-boundary check. An input-shape test
+  used a UUID outside the documentation fixtures that the check allows
+  (83eee4e), and a graph test named a graph database in its sample text
+  (6b2fe6b); the check had failed on `main` since that test was added (d8e442d).
+
+Who gets what: the write policy, `capture_plan`, `update_doc` ops, the
+conflict notices, the argument shapes and the graph text reach hosted clients
+when the hosted gateway runs this version, and the graph actions need the
+ContextStream API's new `/graph/knowledge` routes. An older API ignores the
+idempotency header and the inline `tasks` field, so those changes degrade to
+the previous behaviour there. The Perforce, Plastic and Unity ingest rules, the
+write policy on a local machine, the hook change and the new rules text reach a
+machine after `contextstream-mcp update` (the rules also need a rules refresh).
+
+Dependencies: none changed. `Cargo.toml` and `Cargo.lock` are untouched since
+1.0.25. Dependabot's open pull requests (#173, #174) are not part of this
+release.
+
 ## 1.0.25
 
 - Scope alerts you cannot miss. `init` and `context` now put a `scope_alerts`

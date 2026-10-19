@@ -1082,11 +1082,11 @@ fn code_knowledge_text_says_when_nothing_refers_to_the_code() {
 fn related_decisions_text_lists_each_decision() {
     let result = json!([
         {"id": "d1", "summary": "Use Postgres for the graph"},
-        {"id": "d2", "summary": "Keep Neo4j for parity checks"}
+        {"id": "d2", "summary": "Keep the old store for parity checks"}
     ]);
     assert_eq!(
         render_related_decisions(&result),
-        "Related decisions (2):\n1. Use Postgres for the graph (d1)\n2. Keep Neo4j for parity checks (d2)"
+        "Related decisions (2):\n1. Use Postgres for the graph (d1)\n2. Keep the old store for parity checks (d2)"
     );
     assert_eq!(
         render_related_decisions(&json!([])),

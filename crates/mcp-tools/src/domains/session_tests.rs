@@ -7590,6 +7590,10 @@ mod plan_task_batch_tests {
 
     #[test]
     fn plan_task_concurrency_defaults_to_six_and_is_clamped() {
+        assert!(!inline_plan_tasks_allowed(0));
+        assert!(inline_plan_tasks_allowed(1));
+        assert!(inline_plan_tasks_allowed(100));
+        assert!(!inline_plan_tasks_allowed(101));
         assert_eq!(plan_task_concurrency_from(None), 6);
         assert_eq!(plan_task_concurrency_from(Some("1".into())), 1);
         assert_eq!(plan_task_concurrency_from(Some(" 3 ".into())), 3);

@@ -14280,6 +14280,17 @@ fn plan_task_concurrency_from(raw: Option<String>) -> usize {
         .unwrap_or(DEFAULT_PLAN_TASK_CONCURRENCY)
 }
 
+/// The API creates at most this many tasks inside the plan request and
+/// refuses a larger batch with 400, writing nothing. A larger plan sends no
+/// inline tasks and creates them one request each, as with an older API.
+const MAX_INLINE_PLAN_TASKS: usize = 100;
+
+/// Whether a plan with `count` linked tasks sends them inline with
+/// `POST /plans`.
+fn inline_plan_tasks_allowed(count: usize) -> bool {
+    count > 0 && count <= MAX_INLINE_PLAN_TASKS
+}
+
 /// One linked task as sent inline with `POST /plans` (`tasks[]`). An API
 /// that creates the tasks in the plan's transaction answers with
 /// `created_tasks`; an older API ignores the field.
@@ -14452,7 +14463,7 @@ impl ToolHandler for CapturePlanTool {
             session_state.team_context_degraded,
         );
         let normalized_linked_items = normalize_plan_linked_items(input.linked_items.clone())?;
-        let inline_tasks = (!task_blueprints.is_empty()).then(|| {
+        let inline_tasks = inline_plan_tasks_allowed(task_blueprints.len()).then(|| {
             task_blueprints
                 .iter()
                 .map(|task| plan_task_wire(task, input.is_personal))

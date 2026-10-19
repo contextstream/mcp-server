@@ -42,17 +42,20 @@
   this, both read as a capture with no conflicts (7fc5c04, a471460).
 - Tools accept the argument shapes that MCP bridges send. Every tool's
   arguments are matched to its advertised schema before the handler reads
-  them: JSON-string or null arguments and `arguments`, `args`, `input` or
-  `params` envelopes are unwrapped; camelCase and kebab-case keys move to the
-  schema key (never over one that is present); `{"workspace": {"id": ...}}`
-  and `{"project": {"id": ...}}` fill `workspace_id` and `project_id`; and
+  them: an envelope key (`arguments`, `args`, `input` or `params`) that holds
+  the arguments as an object or as a JSON string is unwrapped (a `tools/call`
+  whose own `arguments` is not an object is still refused with `-32602`);
+  camelCase and kebab-case keys move to the schema key (never over one that is
+  present); `{"workspace": {"id": ...}}` and `{"project": {"id": ...}}` fill
+  `workspace_id` and `project_id`; and
   values follow the property's type (booleans from `"true"`, `"false"`, 0 and
   1; integers and numbers from numeric strings; strings from scalars, from
   `{"id": ...}` or from a one-item array; arrays and objects from a JSON
   string). Ids are only moved between keys, never invented, and the API still
   checks every id. A value that still does not fit is refused as before, and
-  the message now names the tool and the fields that differ from the schema,
-  without their values. `init` trims `repository_url`, treats an empty one as
+  the message now also names the tool and lists the fields whose type differs
+  from the schema (it still quotes the offending value, as before). `init`
+  trims `repository_url`, treats an empty one as
   absent, and sets aside one that is not a Git remote with a note and
   `repository_url_ignored` instead of failing (1bf2ede).
 - `graph` reads the team's decisions as well as the code. `action="decisions"`
@@ -87,15 +90,17 @@
 - The hosted gateway logs and counts what it was blind to. A failed
   `tools/call` is logged under the target `contextstream::tool_errors` with the
   tool, the JSON-RPC code, an error class such as `validation:invalid_type` or
-  `http:403` and the client's name and version, and counted in
-  `mcp_tool_call_errors_total{tool,class}`. Each rewrite of an argument shape
-  is counted in `mcp_input_shape_normalized_total{tool,kind}` and logged as
-  `input_shape_normalized` with field names only. Every `tools/call` writes one
-  `tool call timing` line under `contextstream::tool_timing` (tool, action,
-  duration, outcome, API calls and their time, client name), the execution
-  latency metrics now cover the write tools, and the acceleration signal
-  carries the real action. Argument values, content and error text are never
-  logged (1bf2ede, 83eee4e).
+  `http:403` and, for a client that opened a session with `initialize`, its
+  name and version (a stateless request logs the client as `unknown`), and
+  counted in `mcp_tool_call_errors_total{tool,class}`. Each rewrite of an
+  argument shape is counted in `mcp_input_shape_normalized_total{tool,kind}`
+  and logged as `input_shape_normalized` with field names only. Every
+  `tools/call` writes one `tool call timing` line under
+  `contextstream::tool_timing` (tool, action, duration, outcome, API calls and
+  their time, client name when there is a session), the execution latency
+  metrics now cover the write tools, and the acceleration signal carries the
+  real action. Argument values, content and error text are never logged
+  (1bf2ede, 83eee4e).
 - Hooks and rules ask for less text. The PreToolUse hook no longer says that
   memory, doc, plan and task writes "can take a few seconds" or asks the model
   to post progress updates around them, because those writes are synchronous;

@@ -1181,6 +1181,138 @@ pub fn deduplicate_results(response: &mut SearchResponse) -> usize {
     removed
 }
 
+/// Fold file-level rows (`start_line` 0) into a chunk row of the same file.
+///
+/// Lines are 1-based, so a row at line 0 is the indexer's file-level summary
+/// record, not a chunk. When the same file (same project, when rows name one)
+/// also has a chunk row, the summary is a second copy of the same hit: it
+/// would double the count and spend half the `limit` on twins. The chunk row
+/// keeps the better rank and score of the pair. A file-level row with no
+/// chunk row is kept. Returns the number of rows folded and lowers `total` by
+/// the same amount.
+pub fn fold_file_level_twins(response: &mut SearchResponse) -> usize {
+    use std::collections::HashMap;
+
+    fn row_key(item: &mcp_types::api::SearchResult) -> Option<(String, String)> {
+        let path = item
+            .file_path
+            .as_deref()
+            .map(canonicalize_repo_path)
+            .filter(|path| !path.is_empty())?;
+        let project = item
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("project_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        Some((project, path))
+    }
+
+    fn start_line(item: &mcp_types::api::SearchResult) -> Option<i64> {
+        item.start_line.or_else(|| {
+            item.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("start_line"))
+                .and_then(serde_json::Value::as_i64)
+        })
+    }
+
+    let is_file_level = |item: &mcp_types::api::SearchResult| start_line(item) == Some(0);
+    let mut first_chunk_row: HashMap<(String, String), usize> = HashMap::new();
+    for (index, item) in response.results.iter().enumerate() {
+        if start_line(item).is_some_and(|line| line > 0) {
+            if let Some(key) = row_key(item) {
+                first_chunk_row.entry(key).or_insert(index);
+            }
+        }
+    }
+    if first_chunk_row.is_empty() {
+        return 0;
+    }
+
+    let rows = std::mem::take(&mut response.results);
+    let mut slots: Vec<Option<mcp_types::api::SearchResult>> = rows.into_iter().map(Some).collect();
+    let mut folded = 0usize;
+    for index in 0..slots.len() {
+        let Some(item) = slots[index].as_ref() else {
+            continue;
+        };
+        if !is_file_level(item) {
+            continue;
+        }
+        let Some(&twin_index) = row_key(item)
+            .as_ref()
+            .and_then(|key| first_chunk_row.get(key))
+        else {
+            continue;
+        };
+        let Some(file_row) = slots[index].take() else {
+            continue;
+        };
+        folded += 1;
+        if twin_index > index {
+            // The summary outranked its chunk: move the chunk row up into the
+            // summary's place so the file keeps its rank.
+            if let Some(mut chunk_row) = slots[twin_index].take() {
+                chunk_row.score = match (chunk_row.score, file_row.score) {
+                    (Some(chunk), Some(file)) => Some(chunk.max(file)),
+                    (chunk, file) => chunk.or(file),
+                };
+                slots[index] = Some(chunk_row);
+            }
+        } else if let Some(chunk_row) = slots[twin_index].as_mut() {
+            if let (Some(chunk), Some(file)) = (chunk_row.score, file_row.score) {
+                chunk_row.score = Some(chunk.max(file));
+            }
+        }
+    }
+    response.results = slots.into_iter().flatten().collect();
+
+    if folded > 0 {
+        let remaining = response.results.len() as i64;
+        response.total = Some(
+            response
+                .total
+                .map(|total| total.saturating_sub(folded as i64))
+                .unwrap_or(remaining)
+                .max(remaining),
+        );
+        debug!("Folded {} file-level duplicate row(s)", folded);
+    }
+    folded
+}
+
+/// Keep the header count honest when the server's `total` counts rows it did
+/// not return. A page shorter than the requested limit, with no continuation,
+/// is the last page, so the true total is `offset + rows`.
+pub fn clamp_total_to_final_page(
+    response: &mut SearchResponse,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> bool {
+    let rows = response.results.len() as i64;
+    let Some(total) = response.total else {
+        return false;
+    };
+    let Some(limit) = limit.filter(|limit| *limit > 0) else {
+        return false;
+    };
+    let last_page = rows > 0
+        && rows < limit
+        && response.has_more != Some(true)
+        && response.next_offset.is_none()
+        && response.next_cursor.is_none()
+        && response.count_is_lower_bound != Some(true);
+    let page_total = offset.unwrap_or(0).max(0) + rows;
+    if last_page && total > page_total {
+        response.total = Some(page_total);
+        return true;
+    }
+    false
+}
+
 /// Deduplicate the paths list by canonical form.
 pub fn deduplicate_paths(response: &mut SearchResponse) -> usize {
     use std::collections::HashSet;

@@ -11,6 +11,16 @@
   the execute bit on a managed hook that lacks it. `doctor` has a new
   `git_hooks` check that fails when a managed hook is not executable, so it no
   longer reports HEALTHY in that state (#179).
+- Search no longer returns every file twice after `project(action="ingest_local")`
+  or the background refresh that `init` starts. The index also holds a
+  file-level summary row for each file at line 0. When the same file (in the
+  same project) also has a chunk row, the summary row is folded into it: the
+  chunk row keeps the better rank and score, and the header count drops by
+  one for each row folded. A file-level row with no chunk row is shown as
+  `path (file-level match)` instead of `path:0`. When the API's `total`
+  counts rows it did not return on a short last page (semantic search said
+  "4 results" and showed 2), the header shows the rows actually returned
+  (#183).
 
 ## 1.0.26
 

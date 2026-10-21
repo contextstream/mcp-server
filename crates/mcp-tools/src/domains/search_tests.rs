@@ -5943,8 +5943,8 @@ mod registration_tests {
 
 mod scope_path_resolution_tests {
     use crate::domains::scope::{
-        canonicalize_repo_path, deduplicate_paths, deduplicate_results, resolve_search_paths,
-        resolve_to_absolute_path,
+        canonicalize_repo_path, clamp_total_to_final_page, deduplicate_paths, deduplicate_results,
+        fold_file_level_twins, resolve_search_paths, resolve_to_absolute_path,
     };
     use mcp_types::api::{SearchResponse, SearchResult};
 
@@ -6214,6 +6214,145 @@ mod scope_path_resolution_tests {
         assert_eq!(response.results.len(), 2);
         assert_eq!(response.results[0].id, "1");
         assert_eq!(response.results[1].id, "3");
+    }
+
+    fn row(id: &str, path: &str, line: i64, score: f64) -> SearchResult {
+        SearchResult {
+            id: id.into(),
+            file_path: Some(path.into()),
+            start_line: Some(line),
+            score: Some(score),
+            content: Some("def greet():".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn folds_file_level_rows_into_the_chunk_row_of_the_same_file() {
+        // Issue #183: after ingest_local every file came back twice, at :1
+        // and at a phantom :0, and the header counted both.
+        let mut response = SearchResponse {
+            results: vec![
+                row("a1", "app.py", 1, 1.0),
+                row("a0", "app.py", 0, 0.9),
+                row("n1", "NOTES.md", 1, 0.8),
+                row("n0", "NOTES.md", 0, 0.7),
+            ],
+            total: Some(4),
+            ..Default::default()
+        };
+
+        assert_eq!(fold_file_level_twins(&mut response), 2);
+        let ids: Vec<_> = response.results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["a1", "n1"]);
+        assert_eq!(response.total, Some(2));
+    }
+
+    #[test]
+    fn a_file_level_row_that_outranks_its_chunk_hands_the_rank_to_the_chunk() {
+        let mut response = SearchResponse {
+            results: vec![
+                row("r0", "README.md", 0, 1.0),
+                row("x1", "src/x.rs", 4, 0.8),
+                row("r1", "README.md", 1, 0.59),
+            ],
+            total: Some(3),
+            ..Default::default()
+        };
+
+        assert_eq!(fold_file_level_twins(&mut response), 1);
+        let rows: Vec<_> = response
+            .results
+            .iter()
+            .map(|r| (r.id.as_str(), r.start_line, r.score))
+            .collect();
+        assert_eq!(
+            rows,
+            [("r1", Some(1), Some(1.0)), ("x1", Some(4), Some(0.8))]
+        );
+        assert_eq!(response.total, Some(2));
+    }
+
+    #[test]
+    fn keeps_file_level_rows_without_a_chunk_row_or_from_another_project() {
+        let mut lone = row("l0", "assets/logo.png", 0, 0.9);
+        lone.metadata = Some(serde_json::json!({"project_id": "p"}));
+        let mut other_project = row("o0", "lib.rs", 0, 0.8);
+        other_project.metadata = Some(serde_json::json!({"project_id": "q"}));
+        let mut own_chunk = row("p1", "lib.rs", 1, 0.7);
+        own_chunk.metadata = Some(serde_json::json!({"project_id": "p"}));
+        let mut response = SearchResponse {
+            results: vec![lone, other_project, own_chunk],
+            total: Some(3),
+            ..Default::default()
+        };
+
+        assert_eq!(fold_file_level_twins(&mut response), 0);
+        assert_eq!(response.results.len(), 3);
+        assert_eq!(response.total, Some(3));
+    }
+
+    #[test]
+    fn folding_keeps_a_paginated_total_above_the_page() {
+        let mut response = SearchResponse {
+            results: vec![row("a1", "app.py", 1, 1.0), row("a0", "app.py", 0, 0.9)],
+            total: Some(40),
+            has_more: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(fold_file_level_twins(&mut response), 1);
+        assert_eq!(response.total, Some(39));
+    }
+
+    #[test]
+    fn a_short_final_page_sets_the_total_to_the_rows_returned() {
+        // Semantic search said "4 results" and rendered 2.
+        let mut response = SearchResponse {
+            results: vec![row("a1", "app.py", 1, 1.0), row("n1", "NOTES.md", 1, 0.8)],
+            total: Some(4),
+            ..Default::default()
+        };
+        assert!(clamp_total_to_final_page(&mut response, Some(10), None));
+        assert_eq!(response.total, Some(2));
+
+        let mut second_page = SearchResponse {
+            results: vec![row("a1", "app.py", 1, 1.0)],
+            total: Some(30),
+            ..Default::default()
+        };
+        assert!(clamp_total_to_final_page(
+            &mut second_page,
+            Some(10),
+            Some(20)
+        ));
+        assert_eq!(second_page.total, Some(21));
+    }
+
+    #[test]
+    fn a_full_or_continued_page_keeps_the_server_total() {
+        let full_page = || SearchResponse {
+            results: vec![row("a1", "app.py", 1, 1.0), row("n1", "NOTES.md", 1, 0.8)],
+            total: Some(40),
+            ..Default::default()
+        };
+        let mut response = full_page();
+        assert!(!clamp_total_to_final_page(&mut response, Some(2), None));
+        assert_eq!(response.total, Some(40));
+
+        let mut continued = SearchResponse {
+            has_more: Some(true),
+            ..full_page()
+        };
+        assert!(!clamp_total_to_final_page(&mut continued, Some(10), None));
+        assert_eq!(continued.total, Some(40));
+
+        let mut cursor = SearchResponse {
+            next_cursor: Some("c".into()),
+            ..full_page()
+        };
+        assert!(!clamp_total_to_final_page(&mut cursor, Some(10), None));
+        assert_eq!(cursor.total, Some(40));
     }
 
     #[test]
@@ -7405,6 +7544,33 @@ mod duplicate_collapse_output_tests {
 
     fn search_result(value: Value) -> mcp_types::api::SearchResult {
         serde_json::from_value(value).expect("search result fixture")
+    }
+
+    #[test]
+    fn text_rendering_never_shows_line_zero() {
+        let file_level = search_result(json!({
+            "id": "r0",
+            "file_path": "README.md",
+            "start_line": 0,
+            "language": "markdown",
+            "score": 1.0,
+        }));
+        assert_eq!(
+            format_result_line(1, &file_level, false),
+            "1. README.md (file-level match) [markdown] 100%\n"
+        );
+
+        let chunk = search_result(json!({
+            "id": "r1",
+            "file_path": "README.md",
+            "start_line": 1,
+            "language": "markdown",
+            "score": 0.59,
+        }));
+        assert_eq!(
+            format_result_line(1, &chunk, false),
+            "1. README.md:1 [markdown] 59%\n"
+        );
     }
 
     #[test]

@@ -7027,10 +7027,11 @@ fn format_result_line(
             .and_then(|v| v.as_i64())
     });
     let location = if !file_path.is_empty() {
-        if let Some(line) = start_line {
-            format!("{}:{}", file_path, line)
-        } else {
-            file_path.to_string()
+        match start_line {
+            // Lines are 1-based: line 0 is the file-level summary record.
+            Some(line) if line > 0 => format!("{}:{}", file_path, line),
+            Some(_) => format!("{} (file-level match)", file_path),
+            None => file_path.to_string(),
         }
     } else {
         // A pathless hit must still render a usable reference — never a
@@ -11843,7 +11844,24 @@ impl SearchTool {
                 }
             }
         }
+        // Clamp before any row is folded: the last-page test compares the
+        // rows the server sent with the limit asked for.
+        crate::domains::scope::clamp_total_to_final_page(
+            &mut result,
+            resolved_limit,
+            resolved_offset,
+        );
         let dedup_count = crate::domains::scope::deduplicate_results(&mut result);
+        let file_level_folds = crate::domains::scope::fold_file_level_twins(&mut result);
+        if file_level_folds > 0 {
+            mode_fallback_note = append_note(
+                mode_fallback_note,
+                &format!(
+                    "Folded {} file-level row(s) into a chunk row of the same file.",
+                    file_level_folds
+                ),
+            );
+        }
         if dedup_count > 0 {
             mode_fallback_note = append_note(
                 mode_fallback_note,

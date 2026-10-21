@@ -1590,6 +1590,12 @@ async fn handle_request_dispatch(
         "tools/call" => {
             // Call a tool
             let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if let Some(message) = mcp_tools::input_shape::tools_call_arguments_error(
+                tool_name,
+                params.get("arguments"),
+            ) {
+                return json_rpc_error(id, -32602, &message);
+            }
             let arguments = params
                 .get("arguments")
                 .cloned()
@@ -3415,6 +3421,40 @@ mod tests {
         ));
         let telemetry = AgenticTelemetry::new(client.as_ref().clone(), session.clone());
         (registry, client, session, telemetry)
+    }
+
+    #[tokio::test]
+    async fn stdio_tools_call_non_object_arguments_are_invalid_params() {
+        let (registry, client, session, telemetry) = protocol_test_runtime();
+        for (arguments, got) in [
+            (
+                serde_json::json!("[1,2]"),
+                "a string that is not a JSON object",
+            ),
+            (serde_json::json!(5), "an integer"),
+            (serde_json::json!([1]), "an array"),
+        ] {
+            let response = handle_request(
+                &registry,
+                &client,
+                &session,
+                &telemetry,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "memory", "arguments": arguments}
+                }),
+                mcp_tools::wire_tokens::WireTokenObservation::default(),
+            )
+            .await;
+            let response: serde_json::Value =
+                serde_json::from_str(&response).expect("valid JSON-RPC response");
+            assert_eq!(response["error"]["code"], -32602, "{arguments}: {response}");
+            assert!(response.get("result").is_none(), "{response}");
+            let message = response["error"]["message"].as_str().unwrap();
+            assert!(message.contains(&format!("(got {got})")), "{message}");
+        }
     }
 
     #[test]

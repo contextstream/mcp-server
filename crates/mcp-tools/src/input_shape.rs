@@ -333,6 +333,26 @@ fn article(ty: &str) -> String {
     }
 }
 
+/// Why a `tools/call` request's own `params.arguments` is refused as invalid
+/// params (`-32602`), or None when it is accepted.
+///
+/// An object is accepted, and so are the two shapes [`normalize_arguments`]
+/// rewrites: absent or `null` arguments (read as no arguments) and a JSON
+/// string holding an object. Anything else (a number, a boolean, an array, or
+/// a string that is not a JSON object) is refused before the tool runs.
+pub fn tools_call_arguments_error(tool: &str, arguments: Option<&Value>) -> Option<String> {
+    let got = match arguments? {
+        Value::Null | Value::Object(_) => return None,
+        Value::String(text) if parse_json_container(text, true).is_some() => return None,
+        Value::String(_) => "a string that is not a JSON object".to_string(),
+        other => article(json_type(other)),
+    };
+    Some(format!(
+        "Invalid params: tools/call arguments for {tool} must be an object (got {got}). \
+         Send the arguments as a JSON object with the fields tools/list advertises for {tool}."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +577,39 @@ mod tests {
         let mut input = json!({"workspace_id": null, "force": null});
         assert!(normalize_arguments(&init_schema(), &mut input).is_empty());
         assert!(schema_type_mismatches(&init_schema(), &input).is_empty());
+    }
+
+    #[test]
+    fn tools_call_arguments_must_be_an_object() {
+        for accepted in [
+            None,
+            Some(json!(null)),
+            Some(json!({})),
+            Some(json!({"action": "list"})),
+            Some(json!("{\"action\": \"list\"}")),
+        ] {
+            assert_eq!(
+                tools_call_arguments_error("memory", accepted.as_ref()),
+                None,
+                "{accepted:?}"
+            );
+        }
+        for (refused, got) in [
+            (json!("[1,2]"), "a string that is not a JSON object"),
+            (json!("plain text"), "a string that is not a JSON object"),
+            (json!(5), "an integer"),
+            (json!(1.5), "a number"),
+            (json!(true), "a boolean"),
+            (json!([1]), "an array"),
+        ] {
+            let message = tools_call_arguments_error("memory", Some(&refused))
+                .unwrap_or_else(|| panic!("{refused} must be refused"));
+            assert!(message.contains(&format!("(got {got})")), "{message}");
+            assert!(
+                message.contains("tools/list advertises for memory"),
+                "{message}"
+            );
+        }
     }
 
     #[test]

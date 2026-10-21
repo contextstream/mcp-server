@@ -2289,6 +2289,15 @@ async fn handle_call_tool_method(
             data: None,
         })?;
 
+    if let Some(message) =
+        mcp_tools::input_shape::tools_call_arguments_error(name, params.get("arguments"))
+    {
+        return Err(JsonRpcError {
+            code: -32602,
+            message,
+            data: None,
+        });
+    }
     let arguments = params
         .get("arguments")
         .cloned()
@@ -5509,6 +5518,39 @@ mod tests {
 
             assert_eq!(json["error"]["code"], -32602);
             assert!(json["error"]["message"].as_str().unwrap().contains("name"));
+        }
+
+        #[tokio::test]
+        async fn test_jsonrpc_tools_call_non_object_arguments_are_invalid_params() {
+            for (arguments, got) in [
+                (json!("[1,2]"), "a string that is not a JSON object"),
+                (json!(5), "an integer"),
+                (json!([1]), "an array"),
+            ] {
+                let app = create_router(create_test_state());
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {"name": "memory", "arguments": arguments}
+                });
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rpc")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap();
+
+                let response = app.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+                assert_eq!(json["error"]["code"], -32602, "{arguments}: {json}");
+                let message = json["error"]["message"].as_str().unwrap();
+                assert!(message.contains(&format!("(got {got})")), "{message}");
+                assert!(json.get("result").is_none_or(Value::is_null), "{json}");
+            }
         }
 
         #[tokio::test]

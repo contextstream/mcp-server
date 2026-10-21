@@ -37,6 +37,14 @@
   `.p4ignore`, Plastic `ignore.conf` or the Unity root folders no longer
   reaches the agent through it. The setup screen and the docs name both
   files (#182).
+- A `tools/call` whose own `arguments` is not an object is refused with
+  JSON-RPC `-32602` (Invalid params) on stdio and over HTTP, as the 1.0.26
+  notes said. Before, the hosted gateway answered `-32603` and stdio answered
+  a tool result with `isError: true`. The refused shapes are a number, a
+  boolean, an array and a string that is not a JSON object; the message names
+  the tool and the type that was sent. Absent or `null` arguments still mean
+  no arguments, and a JSON string that holds an object is still unwrapped.
+  Other argument errors keep their codes (#184).
 
 ## 1.0.26
 

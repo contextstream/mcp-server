@@ -45,6 +45,26 @@
   the tool and the type that was sent. Absent or `null` arguments still mean
   no arguments, and a JSON string that holds an object is still unwrapped.
   Other argument errors keep their codes (#184).
+- Search keeps the session's project on the hosted and HTTP transport (#180).
+  With no folder pin and no local index (always the case on the gateway, which
+  has no checkout on disk), a search without `project_id` queued a
+  workspace-wide search ahead of the project that `init` or the
+  `X-ContextStream-Project-Id` header resolved, so other projects' files
+  could come back as if they were in the current checkout. Only known projects
+  are candidates now. A project the read scope confirmed exists is never
+  widened to the workspace when its search fails; the call returns an error
+  that names the project and says the search was not widened. Team searches
+  and an unconfirmed, possibly stale session project can still widen.
+- A search served outside the session's project says so in the text, even in
+  concise mode: `[SCOPE_WIDENED]` names where it ran, each row from another
+  project is labelled `[other project <id>]`, and a row the API did not
+  attribute is labelled `[project not reported]`. Result rows keep the API's
+  `project_id`, and the structured result carries `scope_widened`.
+- `scope_reliability.reason` no longer reports `scope_mismatch_reindexing`
+  for a project whose canonical index is ready when the exact checkout cannot
+  be attested (the gateway cannot read one); it reports
+  `checkout_not_attested` with `scope_match: true`. A widened search reports
+  `workspace_scope` or `other_project_scope`.
 
 ## 1.0.26
 

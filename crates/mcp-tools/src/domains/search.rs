@@ -3446,6 +3446,173 @@ fn should_allow_workspace_scope_fallback(
     is_team_query(&query_lower)
 }
 
+/// Whether a search whose project-scoped candidates all failed (NotFound /
+/// Forbidden) may self-heal by retrying at a broader scope.
+///
+/// The retry exists for a stale session `project_id` (a renamed or deleted
+/// project, a workspace switch). It must never widen a non-team search away
+/// from a project the read scope just confirmed exists and is accessible
+/// (init, the `X-ContextStream-Project-Id` header or the folder mapping): that
+/// failure is transient (an index rebuild after a deploy or a newly linked
+/// project), and widening shows another project's files as if they were in
+/// this checkout (#180).
+fn can_retry_broader_scope_after_project_failures(
+    requested_mode: SearchMode,
+    query: &str,
+    explicit_project_id: Option<Uuid>,
+    confirmed_project_id: Option<Uuid>,
+    candidate_project_ids: &[Option<Uuid>],
+    explicit_workspace_id: Option<Uuid>,
+    base_workspace_id: Option<Uuid>,
+) -> bool {
+    if explicit_project_id.is_some() {
+        return false;
+    }
+    let confirmed_project_failed = confirmed_project_id
+        .is_some_and(|confirmed| candidate_project_ids.contains(&Some(confirmed)));
+    if confirmed_project_failed
+        && !should_allow_workspace_scope_fallback(requested_mode, query, true)
+    {
+        return false;
+    }
+    !candidate_project_ids.contains(&None)
+        || (explicit_workspace_id.is_none() && base_workspace_id.is_some())
+}
+
+/// Project that produced a result row, when the API reports one (top-level
+/// `project_id`, or `metadata.project_id`).
+fn result_row_project_id(item: &mcp_types::api::SearchResult) -> Option<&str> {
+    item.project_id
+        .as_deref()
+        .or_else(|| {
+            item.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("project_id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|project_id| !project_id.is_empty())
+}
+
+/// Label for a result row of a search that left the expected project scope:
+/// rows from another project name it, and rows the API did not attribute say
+/// so, so the agent never takes them for files in the current checkout.
+fn widened_scope_row_label(
+    item: &mcp_types::api::SearchResult,
+    expected_project_id: Option<Uuid>,
+) -> Option<String> {
+    match result_row_project_id(item) {
+        Some(row_project) => {
+            let same_project = expected_project_id
+                .is_some_and(|expected| row_project.eq_ignore_ascii_case(&expected.to_string()));
+            (!same_project)
+                .then(|| format!("[other project {}]", truncate_json_string(row_project, 64)))
+        }
+        None => Some("[project not reported]".to_string()),
+    }
+}
+
+/// Insert a widened-scope label at the end of a rendered row's first line.
+fn label_widened_scope_row(line: String, label: Option<&str>) -> String {
+    let Some(label) = label else {
+        return line;
+    };
+    match line.find('\n') {
+        Some(end) => format!("{} {}{}", &line[..end], label, &line[end..]),
+        None => format!("{} {}", line, label),
+    }
+}
+
+/// Always-rendered notice for a search that ran outside the project the
+/// session resolved. `None` when the search stayed in that project, or when no
+/// project was resolved (a plain workspace search).
+fn widened_scope_notice(
+    expected_project_id: Option<Uuid>,
+    resolved_project_id: Option<Uuid>,
+    requested_mode: SearchMode,
+) -> Option<String> {
+    let expected = expected_project_id?;
+    if resolved_project_id == Some(expected) {
+        return None;
+    }
+    let (ran_in, why) = match (requested_mode, resolved_project_id) {
+        (SearchMode::Team, Some(other)) => (
+            format!("in project `{}`", other),
+            "team search checks other projects",
+        ),
+        (SearchMode::Team, None) => (
+            "at workspace scope".to_string(),
+            "team search checks other projects",
+        ),
+        (_, Some(other)) => (
+            format!("in project `{}`", other),
+            "the current project had no matches",
+        ),
+        (_, None) => (
+            "at workspace scope".to_string(),
+            "the project-scoped search could not be used",
+        ),
+    };
+    Some(format!(
+        "[SCOPE_WIDENED] This search ran {} instead of the current project `{}` ({}). Rows from another project are labelled; do not treat them as files in this checkout. Pass project_id to search only the current project.",
+        ran_in, expected, why
+    ))
+}
+
+struct ScopeReliabilityInputs {
+    scope_invalid: bool,
+    health_scope_match: bool,
+    health_freshness: Option<&'static str>,
+    drift_detected: bool,
+    scope_widened: bool,
+    resolved_project_id: Option<Uuid>,
+    canonical_index_ready: bool,
+}
+
+/// `(scope_match, reason)` for the structured `scope_reliability` field.
+///
+/// `scope_mismatch_reindexing` is reserved for a resolved project whose index
+/// really does not match. A search that left the session's project reports
+/// `workspace_scope` / `other_project_scope`, and a project whose canonical
+/// index the API reports ready, but whose exact checkout the caller cannot
+/// attest (the hosted gateway has no local checkout to read), is not a scope
+/// mismatch (#180).
+fn scope_reliability_reason(inputs: ScopeReliabilityInputs) -> (bool, &'static str) {
+    if inputs.scope_invalid {
+        return (inputs.health_scope_match, "scope_invalid");
+    }
+    if inputs.scope_widened {
+        let reason = if inputs.resolved_project_id.is_some() {
+            "other_project_scope"
+        } else {
+            "workspace_scope"
+        };
+        return (false, reason);
+    }
+    if !inputs.health_scope_match {
+        let checkout_unattested = inputs.resolved_project_id.is_some()
+            && inputs.canonical_index_ready
+            && inputs.health_freshness == Some("missing");
+        if checkout_unattested {
+            return (true, "checkout_not_attested");
+        }
+        return (false, "scope_mismatch_reindexing");
+    }
+    if inputs.drift_detected {
+        return (true, "drift");
+    }
+    (true, "ok")
+}
+
+/// Whether the search response itself reports the searched project's
+/// canonical index as ready.
+fn search_result_reports_canonical_ready(result: &SearchResponse) -> bool {
+    result
+        .project_index_state
+        .as_deref()
+        .is_some_and(|state| state.eq_ignore_ascii_case("ready"))
+}
+
 fn push_unique_project_candidate(candidates: &mut Vec<Option<Uuid>>, candidate: Option<Uuid>) {
     if !candidates.contains(&candidate) {
         candidates.push(candidate);
@@ -11361,9 +11528,22 @@ impl SearchTool {
             // must be tried before the local index mapping or inherited
             // session scope. Reroutes past the pin are flagged loudly below
             // via [PROJECT_ROUTING].
-            push_unique_project_candidate(&mut candidate_project_ids, resolved_folder_project_id);
-            push_unique_project_candidate(&mut candidate_project_ids, local_index_project_id);
-            push_unique_project_candidate(&mut candidate_project_ids, project_id);
+            //
+            // Only known projects are candidates here. A missing folder pin or
+            // local index (always the case on the hosted gateway, which has no
+            // checkout on disk) must not queue a workspace-wide `None` search
+            // ahead of the session's project: its hits would win and show
+            // other projects' files as this checkout's (#180).
+            for candidate in [
+                resolved_folder_project_id,
+                local_index_project_id,
+                project_id,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                push_unique_project_candidate(&mut candidate_project_ids, Some(candidate));
+            }
             if candidate_project_ids.is_empty() {
                 push_unique_project_candidate(&mut candidate_project_ids, None);
             }
@@ -11481,6 +11661,7 @@ impl SearchTool {
         );
         let mut selected: Option<SelectedSearchAttempt> = None;
         let mut explicit_scope_had_no_results = false;
+        let mut last_candidate_error: Option<(Option<Uuid>, String)> = None;
         for (idx, candidate_project_id) in candidate_project_ids.iter().enumerate() {
             let mut params = base_params.clone();
             params.project_id = *candidate_project_id;
@@ -11542,8 +11723,10 @@ impl SearchTool {
                         ));
                     }
                 }
-                Err(err) if is_not_found_error(&err) => continue,
-                Err(err) if is_access_denied_error(&err) => continue,
+                Err(err) if is_not_found_error(&err) || is_access_denied_error(&err) => {
+                    last_candidate_error = Some((*candidate_project_id, err.to_string()));
+                    continue;
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -11556,9 +11739,17 @@ impl SearchTool {
         // `init` call — which most agents won't do mid-task. Falling back to
         // a workspace-scoped search instead lets the call succeed with a
         // soft note, matching the resilience the user asked for.
-        let can_retry_broader_scope = explicit_project_id.is_none()
-            && (!candidate_project_ids.contains(&None)
-                || (explicit_workspace_id.is_none() && base_params.workspace_id.is_some()));
+        // A project the read scope confirmed is never widened for a non-team
+        // query (#180); only an unconfirmed, possibly stale one self-heals.
+        let can_retry_broader_scope = can_retry_broader_scope_after_project_failures(
+            requested_mode,
+            &input.query,
+            explicit_project_id,
+            shared_scope.project_id,
+            &candidate_project_ids,
+            explicit_workspace_id,
+            base_params.workspace_id,
+        );
         if selected.is_none() && can_retry_broader_scope {
             let mut workspace_params = base_params.clone();
             workspace_params.project_id = None;
@@ -11615,6 +11806,16 @@ impl SearchTool {
             mut mode_fallback_note,
         ) =
             selected.ok_or_else(|| {
+                if let (Some(confirmed), Some((Some(failed), err))) =
+                    (shared_scope.project_id, last_candidate_error.as_ref())
+                {
+                    if *failed == confirmed {
+                        return Error::Validation(format!(
+                            "Search in project {} failed ({}). The project exists, so this search was not widened to the workspace. Its index may be rebuilding: retry shortly or check project(action=\"index_status\").",
+                            confirmed, err
+                        ));
+                    }
+                }
                 let base = "Project not found for current context. Call init(...) in this folder or pass a valid project_id explicitly.";
                 if let Some(note) = shared_scope.note.as_deref() {
                     Error::Validation(format!("{} {}", note, base))
@@ -12615,6 +12816,17 @@ impl SearchTool {
             });
         }
 
+        // A search that left the project the session resolved (#180) says so
+        // in the text, even in concise mode, and labels every row that is not
+        // from that project.
+        let scope_widened_notice =
+            widened_scope_notice(project_id, resolved_project_id, requested_mode);
+        let widened_row_label = |item: &mcp_types::api::SearchResult| {
+            scope_widened_notice
+                .as_ref()
+                .and_then(|_| widened_scope_row_label(item, project_id))
+        };
+
         // Format results matching TypeScript output format
         let mut text = String::new();
         let total = result.total.unwrap_or(result.results.len() as i64);
@@ -12641,6 +12853,10 @@ impl SearchTool {
             text.push_str(warning);
             text.push('\n');
         }
+        if let Some(notice) = scope_widened_notice.as_deref() {
+            text.push_str(notice);
+            text.push('\n');
+        }
         if let Some(note) = index_origin_note.as_deref() {
             text.push_str(note);
             text.push('\n');
@@ -12659,6 +12875,7 @@ impl SearchTool {
             text.push('\n');
         }
         if project_routing_warning.is_some()
+            || scope_widened_notice.is_some()
             || index_origin_note.is_some()
             || index_trust_warning.is_some()
             || output_budget_note.is_some()
@@ -12932,7 +13149,10 @@ impl SearchTool {
                         break;
                     }
                     idx += 1;
-                    text.push_str(&format_result_line(idx, item, show_content));
+                    text.push_str(&label_widened_scope_row(
+                        format_result_line(idx, item, show_content),
+                        widened_row_label(item).as_deref(),
+                    ));
                 }
                 if omitted_rows > 0 {
                     let next_offset = resolved_offset.unwrap_or(0).max(0) as usize + idx;
@@ -13094,15 +13314,18 @@ impl SearchTool {
                     .as_ref()
                     .map(|health| (health.scope_match, health.drift_detected))
                     .unwrap_or((true, false));
-                let reason = if scope_invalid {
-                    "scope_invalid"
-                } else if !scope_match {
-                    "scope_mismatch_reindexing"
-                } else if drift_detected {
-                    "drift"
-                } else {
-                    "ok"
-                };
+                let (scope_match, reason) = scope_reliability_reason(ScopeReliabilityInputs {
+                    scope_invalid,
+                    health_scope_match: scope_match,
+                    health_freshness: index_health.as_ref().map(|health| health.freshness),
+                    drift_detected,
+                    scope_widened: scope_widened_notice.is_some(),
+                    resolved_project_id,
+                    canonical_index_ready: search_result_reports_canonical_ready(&result),
+                });
+                if let Some(notice) = scope_widened_notice.as_deref() {
+                    obj.insert("scope_widened".to_string(), serde_json::json!(notice));
+                }
                 obj.insert(
                     "scope_reliability".to_string(),
                     serde_json::json!({

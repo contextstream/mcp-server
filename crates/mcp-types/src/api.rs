@@ -127,6 +127,10 @@ pub struct SearchResult {
     /// `local_overlay_filesystem`, and `atlas_search_lucene`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Project that produced this row, when the API reports it (workspace and
+    /// team searches span several projects).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 /// Structured details about why a requested scope could not be used.

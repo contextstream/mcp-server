@@ -1766,6 +1766,7 @@ mod auto_mode_tests {
                     breadcrumb: None,
                     metadata: None,
                     origin: None,
+                    project_id: None,
                 })
                 .collect(),
             total: Some(scores.len() as i64),
@@ -7713,5 +7714,437 @@ mod duplicate_collapse_output_tests {
             text.contains("identical chunk also in 5 other files: "),
             "{text}"
         );
+    }
+}
+
+// ============================================================================
+// Scope widening (#180)
+// ============================================================================
+
+mod scope_widening_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    type Route = Box<dyn Fn(&str, &str) -> (u16, String) + Send + Sync>;
+
+    /// Path-routed API stub: answers every request with `route(request_line,
+    /// body)` until dropped, and records each request line and body.
+    struct RoutedServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<(String, String)>>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl RoutedServer {
+        fn spawn(route: Route) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind routed server");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (recorded, stopped) = (requests.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    };
+                    stream.set_nonblocking(false).ok();
+                    let mut request = Vec::new();
+                    let (line, body) = loop {
+                        let mut chunk = [0u8; 8_192];
+                        let read = stream.read(&mut chunk).unwrap_or(0);
+                        if read == 0 {
+                            break (String::new(), String::new());
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&request[..end]).to_string();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            let line = headers.lines().next().unwrap_or_default().to_string();
+                            let body = String::from_utf8_lossy(&request[end + 4..end + 4 + length])
+                                .to_string();
+                            break (line, body);
+                        }
+                    };
+                    let (status, response_body) = route(&line, &body);
+                    recorded.lock().unwrap().push((line, body));
+                    let response = format!(
+                        "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                        if status == 200 { "OK" } else { "ERROR" },
+                        response_body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            Self {
+                base_url,
+                requests,
+                stop,
+            }
+        }
+
+        fn search_bodies(&self) -> Vec<Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(line, _)| line.contains("/search/"))
+                .filter_map(|(_, body)| serde_json::from_str(body).ok())
+                .collect()
+        }
+    }
+
+    impl Drop for RoutedServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A hosted-gateway search tool: HTTP transport (no local files), no
+    /// default scope, against `base_url`.
+    fn gateway_tool(base_url: &str) -> (SearchTool, Arc<SessionManager>) {
+        let mut config = TestFixtures::test_config();
+        config.api_url = base_url.to_string();
+        config.default_workspace_id = None;
+        config.default_project_id = None;
+        config.is_http_transport = true;
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        let index_keeper = create_mock_index_keeper(&client, &session);
+        (
+            SearchTool::new(
+                client,
+                session.clone(),
+                index_keeper,
+                mcp_types::atlas_layer::noop_layer(),
+            ),
+            session,
+        )
+    }
+
+    fn project_body(project_id: Uuid, workspace_id: Uuid) -> String {
+        json!({
+            "id": project_id,
+            "name": "p",
+            "workspace_id": workspace_id,
+        })
+        .to_string()
+    }
+
+    fn text_of(result: &ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|item| match item {
+                ContentItem::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn key_only_auth() -> mcp_types::config::AuthOverride {
+        mcp_types::config::AuthOverride {
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Routes for a workspace where project P exists but its project-scoped
+    /// search fails transiently (404), while a workspace-wide search would
+    /// return project Q's file `f`.
+    fn failing_project_search_routes(project: Uuid, workspace: Uuid, other: Uuid) -> Route {
+        Box::new(move |line, body| {
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            if line.contains("/search/") {
+                let body: Value = serde_json::from_str(body).unwrap_or_default();
+                if body.get("project_id").and_then(Value::as_str).is_some() {
+                    return (404, json!({"error": "not found"}).to_string());
+                }
+                return (200, workspace_rows(other));
+            }
+            (404, json!({"error": "not found"}).to_string())
+        })
+    }
+
+    /// A workspace-wide result: project Q's `f` (attributed) and a row the API
+    /// did not attribute to a project.
+    fn workspace_rows(other: Uuid) -> String {
+        json!({
+            "results": [
+                {"id": "q-f", "file_path": "f", "start_line": 1, "content": "hi", "score": 1.0, "project_id": other},
+                {"id": "x", "file_path": "CLAUDE.md", "start_line": 62, "content": "hi there", "score": 0.5}
+            ],
+            "total": 2,
+            "scope_reason": "workspace_scope",
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn confirmed_project_failure_never_widens_a_non_team_search() {
+        let project = Some(Uuid::new_v4());
+        let workspace = Some(Uuid::new_v4());
+        let candidates = vec![project];
+        assert!(!can_retry_broader_scope_after_project_failures(
+            SearchMode::Hybrid,
+            "hi",
+            None,
+            project,
+            &candidates,
+            None,
+            workspace,
+        ));
+        // A team search may still widen.
+        assert!(can_retry_broader_scope_after_project_failures(
+            SearchMode::Team,
+            "hi",
+            None,
+            project,
+            &candidates,
+            None,
+            workspace,
+        ));
+        // An unconfirmed (possibly stale) session project still self-heals.
+        assert!(can_retry_broader_scope_after_project_failures(
+            SearchMode::Hybrid,
+            "hi",
+            None,
+            None,
+            &candidates,
+            None,
+            workspace,
+        ));
+        // An explicit project_id never widens.
+        assert!(!can_retry_broader_scope_after_project_failures(
+            SearchMode::Hybrid,
+            "hi",
+            project,
+            None,
+            &candidates,
+            None,
+            workspace,
+        ));
+    }
+
+    #[test]
+    fn widened_notice_and_row_labels_name_the_other_project() {
+        let expected = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(widened_scope_notice(Some(expected), Some(expected), SearchMode::Hybrid).is_none());
+        assert!(widened_scope_notice(None, None, SearchMode::Hybrid).is_none());
+        let notice = widened_scope_notice(Some(expected), None, SearchMode::Hybrid).unwrap();
+        assert!(notice.starts_with("[SCOPE_WIDENED]"), "{notice}");
+        assert!(notice.contains("at workspace scope"), "{notice}");
+        assert!(notice.contains(&expected.to_string()), "{notice}");
+        let related =
+            widened_scope_notice(Some(expected), Some(other), SearchMode::Hybrid).unwrap();
+        assert!(
+            related.contains(&format!("in project `{other}`")),
+            "{related}"
+        );
+
+        let foreign = SearchResult {
+            file_path: Some("f".to_string()),
+            project_id: Some(other.to_string()),
+            ..Default::default()
+        };
+        let own = SearchResult {
+            file_path: Some("lib.rs".to_string()),
+            metadata: Some(json!({"project_id": expected.to_string()})),
+            ..Default::default()
+        };
+        let unattributed = SearchResult {
+            file_path: Some("CLAUDE.md".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            widened_scope_row_label(&foreign, Some(expected)).as_deref(),
+            Some(format!("[other project {other}]").as_str())
+        );
+        assert_eq!(widened_scope_row_label(&own, Some(expected)), None);
+        assert_eq!(
+            widened_scope_row_label(&unattributed, Some(expected)).as_deref(),
+            Some("[project not reported]")
+        );
+        assert_eq!(
+            label_widened_scope_row(
+                "1. f:1 [unknown] 100%\n   hi\n".to_string(),
+                Some("[other project x]")
+            ),
+            "1. f:1 [unknown] 100% [other project x]\n   hi\n"
+        );
+    }
+
+    #[test]
+    fn scope_reliability_reports_a_ready_unattested_checkout_without_a_mismatch() {
+        let base = || ScopeReliabilityInputs {
+            scope_invalid: false,
+            health_scope_match: false,
+            health_freshness: Some("missing"),
+            drift_detected: false,
+            scope_widened: false,
+            resolved_project_id: Some(Uuid::nil()),
+            canonical_index_ready: true,
+        };
+        assert_eq!(
+            scope_reliability_reason(base()),
+            (true, "checkout_not_attested")
+        );
+        assert_eq!(
+            scope_reliability_reason(ScopeReliabilityInputs {
+                canonical_index_ready: false,
+                ..base()
+            }),
+            (false, "scope_mismatch_reindexing")
+        );
+        assert_eq!(
+            scope_reliability_reason(ScopeReliabilityInputs {
+                scope_widened: true,
+                resolved_project_id: None,
+                ..base()
+            }),
+            (false, "workspace_scope")
+        );
+        assert_eq!(
+            scope_reliability_reason(ScopeReliabilityInputs {
+                health_scope_match: true,
+                ..base()
+            }),
+            (true, "ok")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn header_project_search_after_a_transient_failure_is_not_widened() {
+        let (workspace, project, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let server = RoutedServer::spawn(failing_project_search_routes(project, workspace, other));
+        let (tool, _session) = gateway_tool(&server.base_url);
+
+        // Stateless Streamable HTTP: a fresh session bucket per request, so
+        // the project arrives only as the setup-written header.
+        let auth = mcp_types::config::AuthOverride {
+            workspace_id: Some(workspace),
+            project_id: Some(project),
+            ..key_only_auth()
+        };
+        let outcome = mcp_client::run_with_auth_override(auth, || {
+            tool.execute(json!({"query": "hi", "limit": 5, "mode": "hybrid"}))
+        })
+        .await;
+
+        let message = outcome
+            .expect_err("a failed confirmed-project search must not widen")
+            .to_string();
+        assert!(message.contains(&project.to_string()), "{message}");
+        assert!(message.contains("not widened"), "{message}");
+        let bodies = server.search_bodies();
+        assert!(!bodies.is_empty(), "the project search must run");
+        assert!(
+            bodies
+                .iter()
+                .all(|body| body["project_id"] == json!(project.to_string())),
+            "every search request stays in the header project: {bodies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn init_resolved_project_search_after_a_transient_failure_is_not_widened() {
+        let (workspace, project, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let server = RoutedServer::spawn(failing_project_search_routes(project, workspace, other));
+        let (tool, session) = gateway_tool(&server.base_url);
+        // The session bucket kept init's resolved scope; the search passes no
+        // project_id.
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+
+        let outcome = mcp_client::run_with_auth_override(key_only_auth(), || {
+            tool.execute(json!({"query": "hi", "limit": 5, "mode": "hybrid"}))
+        })
+        .await;
+
+        assert!(outcome.is_err(), "search must not widen to workspace scope");
+        let bodies = server.search_bodies();
+        assert!(!bodies.is_empty(), "the project search must run");
+        assert!(
+            bodies
+                .iter()
+                .all(|body| body["project_id"] == json!(project.to_string())),
+            "{bodies:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn search_served_by_another_project_says_so_and_labels_its_rows() {
+        let (workspace, project, related) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        // P exists but has no match for "hi"; the related project R has one.
+        let server = RoutedServer::spawn(Box::new(move |line, body| {
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            if line.contains("/search/") {
+                let body: Value = serde_json::from_str(body).unwrap_or_default();
+                if body["project_id"] == json!(related.to_string()) {
+                    return (200, workspace_rows(related));
+                }
+                return (200, json!({"results": [], "total": 0}).to_string());
+            }
+            (404, json!({"error": "not found"}).to_string())
+        }));
+        let (tool, session) = gateway_tool(&server.base_url);
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        session
+            .set_project_relations(HashMap::from([(
+                "r".to_string(),
+                mcp_session::RelatedProjectInfo {
+                    project_id: related.to_string(),
+                    name: "r".to_string(),
+                    path: "/r".to_string(),
+                    relation: mcp_session::ProjectRelationKind::Sibling,
+                },
+            )]))
+            .await;
+
+        let result = mcp_client::run_with_auth_override(key_only_auth(), || {
+            tool.execute(json!({"query": "hi", "limit": 5, "mode": "hybrid"}))
+        })
+        .await
+        .expect("the related project serves the search");
+
+        let text = text_of(&result);
+        assert!(text.contains("[SCOPE_WIDENED]"), "{text}");
+        assert!(text.contains(&format!("in project `{related}`")), "{text}");
+        assert!(
+            text.contains(&format!("[other project {related}]")),
+            "{text}"
+        );
+        assert!(text.contains("[project not reported]"), "{text}");
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(
+            structured["scope_reliability"]["reason"],
+            "other_project_scope"
+        );
+        assert!(structured["scope_widened"].is_string());
     }
 }

@@ -459,7 +459,13 @@ mod tests {
     use std::process::Command;
     use tempfile::tempdir;
 
-    fn init_repo(dir: &Path) {
+    /// Initialise a test repository. The returned guard holds the shared
+    /// environment lock for the rest of the test: other tests swap HOME and
+    /// PATH, which change the hook binary path and whether `git` resolves.
+    fn init_repo(dir: &Path) -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let run = |args: &[&str]| {
             let ok = Command::new("git")
                 .arg("-C")
@@ -474,6 +480,7 @@ mod tests {
         run(&["init", "-q"]);
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test"]);
+        guard
     }
 
     fn read(path: &Path) -> String {
@@ -483,7 +490,7 @@ mod tests {
     #[test]
     fn install_is_idempotent_single_block() {
         let temp = tempdir().unwrap();
-        init_repo(temp.path());
+        let _env = init_repo(temp.path());
 
         install_git_hooks(temp.path()).expect("install 1");
         install_git_hooks(temp.path()).expect("install 2");
@@ -503,7 +510,7 @@ mod tests {
     #[test]
     fn preserves_and_chains_existing_user_hook() {
         let temp = tempdir().unwrap();
-        init_repo(temp.path());
+        let _env = init_repo(temp.path());
         let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let post_commit = hooks_dir.join("post-commit");
@@ -523,7 +530,7 @@ mod tests {
     #[test]
     fn honors_core_hooks_path() {
         let temp = tempdir().unwrap();
-        init_repo(temp.path());
+        let _env = init_repo(temp.path());
         let custom = temp.path().join("my-hooks");
         Command::new("git")
             .arg("-C")
@@ -540,7 +547,7 @@ mod tests {
     #[test]
     fn uninstall_strips_managed_and_removes_owned_files() {
         let temp = tempdir().unwrap();
-        init_repo(temp.path());
+        let _env = init_repo(temp.path());
         let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
         std::fs::create_dir_all(&hooks_dir).unwrap();
         // pre-existing user post-commit; managed-only pre-push.
@@ -572,7 +579,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempdir().unwrap();
-        init_repo(temp.path());
+        let _env = init_repo(temp.path());
         let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let post_commit = hooks_dir.join("post-commit");
@@ -612,7 +619,7 @@ mod tests {
     #[test]
     fn fresh_install_without_existing_hooks_creates_executable_hooks() {
         let temp = tempdir().unwrap();
-        init_repo(temp.path());
+        let _env = init_repo(temp.path());
         let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
         for name in HOOK_NAMES {
             assert!(!hooks_dir.join(name).exists(), "{name} must start absent");
@@ -634,7 +641,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempdir().unwrap();
-        init_repo(temp.path());
+        let _env = init_repo(temp.path());
         install_git_hooks(temp.path()).expect("install");
         let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
         // The state every repo set up by 1.0.0-1.0.26 was left in.
@@ -661,7 +668,7 @@ mod tests {
     #[test]
     fn managed_hooks_status_ignores_unmanaged_hooks() {
         let temp = tempdir().unwrap();
-        init_repo(temp.path());
+        let _env = init_repo(temp.path());
         let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
         std::fs::create_dir_all(&hooks_dir).unwrap();
         std::fs::write(hooks_dir.join("post-commit"), "#!/bin/sh\necho user\n").unwrap();
@@ -674,7 +681,7 @@ mod tests {
     #[test]
     fn uninstall_preserves_user_edits_made_after_install() {
         let temp = tempdir().unwrap();
-        init_repo(temp.path());
+        let _env = init_repo(temp.path());
         let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let post_commit = hooks_dir.join("post-commit");
@@ -699,7 +706,7 @@ mod tests {
     #[test]
     fn upgraded_generated_hook_uninstalls_without_shebang_or_backup_debris() {
         let temp = tempdir().unwrap();
-        init_repo(temp.path());
+        let _env = init_repo(temp.path());
         let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
         let post_commit = hooks_dir.join("post-commit");
 
@@ -716,7 +723,7 @@ mod tests {
     #[test]
     fn sentinel_text_inside_a_user_command_is_not_ownership() {
         let temp = tempdir().unwrap();
-        init_repo(temp.path());
+        let _env = init_repo(temp.path());
         let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let post_commit = hooks_dir.join("post-commit");

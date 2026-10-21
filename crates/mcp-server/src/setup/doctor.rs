@@ -3198,6 +3198,11 @@ mod tests {
     fn git_hooks_check_fails_for_non_executable_managed_hooks() {
         use std::os::unix::fs::PermissionsExt;
 
+        // Other tests swap HOME and PATH; hold the shared lock so `git` and the
+        // hook binary path resolve the same way for the whole test.
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let git_init = std::process::Command::new("git")
             .arg("-C")

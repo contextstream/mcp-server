@@ -264,7 +264,74 @@ fn install_one(path: &Path, name: &str, binary: &str) -> Result<()> {
     };
     let new_content = desired_hook_content(existing.as_deref(), name, binary)?;
     safe_edit::write_executable_if_unchanged(path, &new_content, existing.as_deref())?;
+    // An unchanged hook is not rewritten, so repair the mode separately:
+    // releases up to 1.0.26 created new managed hooks as 0600, and Git skips
+    // hooks that are not executable.
+    if !safe_edit::is_dry_run() {
+        ensure_executable(path)?;
+    }
     Ok(())
+}
+
+/// Add the execute bits (to at least 0755) to a managed hook that has none.
+#[cfg(unix)]
+fn ensure_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    if mode & 0o111 == 0 {
+        std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode((mode | 0o755) & 0o7777),
+        )
+        .with_context(|| format!("Could not make git hook {} executable", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// State of the managed hooks in one repository, for `doctor`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedHooksStatus {
+    /// Hook files that carry the managed block.
+    pub installed: Vec<PathBuf>,
+    /// Managed hook files that Git will skip because they are not executable.
+    pub not_executable: Vec<PathBuf>,
+}
+
+/// Inspect the managed hooks for `repo_root`. Returns `None` when the hooks
+/// directory cannot be resolved.
+pub fn managed_hooks_status(repo_root: &Path) -> Option<ManagedHooksStatus> {
+    let hooks_dir = resolve_hooks_dir(repo_root)?;
+    let mut status = ManagedHooksStatus::default();
+    for name in HOOK_NAMES {
+        let path = hooks_dir.join(name);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if !matches!(managed_block_bounds(&content), Ok(Some(_))) {
+            continue;
+        }
+        if !is_executable(&path) {
+            status.not_executable.push(path.clone());
+        }
+        status.installed.push(path);
+    }
+    Some(status)
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    true
 }
 
 fn desired_hook_content(existing: Option<&str>, name: &str, binary: &str) -> Result<String> {
@@ -533,6 +600,75 @@ mod tests {
                 & 0o777,
             0o640
         );
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_install_without_existing_hooks_creates_executable_hooks() {
+        let temp = tempdir().unwrap();
+        init_repo(temp.path());
+        let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
+        for name in HOOK_NAMES {
+            assert!(!hooks_dir.join(name).exists(), "{name} must start absent");
+        }
+
+        install_git_hooks(temp.path()).expect("install");
+
+        for name in HOOK_NAMES {
+            assert_eq!(mode(&hooks_dir.join(name)), 0o755, "{name} mode");
+        }
+        let status = managed_hooks_status(temp.path()).unwrap();
+        assert_eq!(status.installed.len(), HOOK_NAMES.len());
+        assert!(status.not_executable.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reinstall_repairs_a_non_executable_managed_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        init_repo(temp.path());
+        install_git_hooks(temp.path()).expect("install");
+        let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
+        // The state every repo set up by 1.0.0-1.0.26 was left in.
+        for name in HOOK_NAMES {
+            std::fs::set_permissions(hooks_dir.join(name), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let status = managed_hooks_status(temp.path()).unwrap();
+        assert_eq!(status.not_executable.len(), HOOK_NAMES.len());
+        let before = read(&hooks_dir.join("post-commit"));
+
+        install_git_hooks(temp.path()).expect("repair");
+
+        for name in HOOK_NAMES {
+            assert_eq!(mode(&hooks_dir.join(name)), 0o755, "{name} mode");
+        }
+        assert_eq!(read(&hooks_dir.join("post-commit")), before);
+        assert!(managed_hooks_status(temp.path())
+            .unwrap()
+            .not_executable
+            .is_empty());
+    }
+
+    #[test]
+    fn managed_hooks_status_ignores_unmanaged_hooks() {
+        let temp = tempdir().unwrap();
+        init_repo(temp.path());
+        let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(hooks_dir.join("post-commit"), "#!/bin/sh\necho user\n").unwrap();
+
+        let status = managed_hooks_status(temp.path()).unwrap();
+        assert!(status.installed.is_empty());
+        assert!(status.not_executable.is_empty());
     }
 
     #[test]

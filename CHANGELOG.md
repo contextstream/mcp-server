@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Local Git capture hooks run again in repositories that had no hook before
+  setup. Since 1.0.0, setup created a new `post-commit`, `pre-push`,
+  `post-checkout` or `post-merge` hook with mode 0600, so Git skipped it and
+  no commit, push, checkout or merge reached ContextStream. New managed hooks
+  are now created 0755, and `setup`, `init`, `update`,
+  `contextstream-mcp git-hooks` and `doctor --repair --scope project` restore
+  the execute bit on a managed hook that lacks it. `doctor` has a new
+  `git_hooks` check that fails when a managed hook is not executable, so it no
+  longer reports HEALTHY in that state (#179).
+
 ## 1.0.26
 
 - Agent writes are faster and safer to repeat. A write to plans, tasks, docs,

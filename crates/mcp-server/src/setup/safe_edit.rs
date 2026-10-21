@@ -1044,6 +1044,10 @@ fn write_if_changed_impl_with_permissions(
         std::fs::create_dir_all(parent)?;
     }
 
+    // Explicitly requested permissions (an executable Git hook) win over the
+    // private default for newly created files; otherwise a new hook would be
+    // staged as 0600 and Git would silently skip it.
+    let explicit_permissions = replacement_permissions.is_some();
     let original_permissions = replacement_permissions.or_else(|| {
         std::fs::metadata(path)
             .ok()
@@ -1056,7 +1060,7 @@ fn write_if_changed_impl_with_permissions(
             std::fs::set_permissions(&tmp, permissions)?;
         }
         #[cfg(unix)]
-        if existing.is_none() || force_private_permissions {
+        if force_private_permissions || (existing.is_none() && !explicit_permissions) {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         }
@@ -2122,6 +2126,21 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_created_executable_files_keep_the_requested_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("post-commit");
+        write_executable_if_unchanged(&path, "#!/bin/sh\nexit 0\n", None).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
         );
     }
 

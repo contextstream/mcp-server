@@ -286,6 +286,10 @@ pub struct DoctorReport {
     /// Whether the project folder is linked to the right ContextStream project.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_link: Option<SurfaceCheck>,
+    /// Whether the managed Local Git capture hooks in the project repository
+    /// are executable. Absent when the project has no managed hooks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_hooks: Option<SurfaceCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repair: Option<DoctorRepairReport>,
     pub pass: usize,
@@ -2344,6 +2348,25 @@ async fn run_repairs(options: &DoctorOptions, targets: &[Editor]) -> DoctorRepai
             }
         }
     }
+    if options.scope.include_project() {
+        // Refresh managed git hooks that are already installed, which also
+        // restores the execute bit on hooks earlier releases created as 0600.
+        // Never installs hooks into a repository that has none.
+        if let Some(repo_root) = options
+            .project_path
+            .as_deref()
+            .and_then(super::git_hooks::resolve_repo_root)
+        {
+            let has_managed = super::git_hooks::managed_hooks_status(&repo_root)
+                .is_some_and(|status| !status.installed.is_empty());
+            if has_managed {
+                operations.push("git_hooks");
+                if let Err(error) = super::git_hooks::install_git_hooks(&repo_root) {
+                    failures.push(format!("git_hooks: {error}"));
+                }
+            }
+        }
+    }
     if options.scope.include_global() {
         operations.push("hooks");
         if let Err(error) = super::update_hooks_scoped("global", Some(targets), true).await {
@@ -2511,6 +2534,13 @@ async fn build_report_for_targets(
         }
         _ => None,
     };
+    let git_hooks = match (
+        options.scope.include_project(),
+        options.project_path.as_deref(),
+    ) {
+        (true, Some(project_path)) => check_git_hooks(project_path),
+        _ => None,
+    };
     let credentials = credential_probe.check;
 
     let mut pass = 0;
@@ -2523,6 +2553,7 @@ async fn build_report_for_targets(
         .chain(std::iter::once(&installation))
         .chain(std::iter::once(&credentials))
         .chain(project_link.iter())
+        .chain(git_hooks.iter())
     {
         match check.status {
             CheckStatus::Pass => pass += 1,
@@ -2544,12 +2575,49 @@ async fn build_report_for_targets(
         installation,
         credentials,
         project_link,
+        git_hooks,
         repair,
         pass,
         warn,
         fail,
         skipped,
     }
+}
+
+/// Whether the managed Local Git capture hooks will run. Git silently skips a
+/// hook that is not executable, so a present-but-0600 hook means capture is
+/// off while setup still reports it as on.
+fn check_git_hooks(project_path: &Path) -> Option<SurfaceCheck> {
+    const SURFACE: &str = "git_hooks";
+    let repo_root = super::git_hooks::resolve_repo_root(project_path)?;
+    let status = super::git_hooks::managed_hooks_status(&repo_root)?;
+    let hooks_dir = status.installed.first()?.parent();
+    if status.not_executable.is_empty() {
+        return Some(SurfaceCheck::pass(
+            SURFACE,
+            format!(
+                "{} managed Local Git capture hook(s) are executable",
+                status.installed.len()
+            ),
+            hooks_dir,
+        ));
+    }
+    let names: Vec<String> = status
+        .not_executable
+        .iter()
+        .filter_map(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
+    Some(SurfaceCheck::problem(
+        SURFACE,
+        CheckStatus::Fail,
+        format!(
+            "managed hook(s) are not executable, so Git skips them and Local Git capture does not run: {}",
+            names.join(", ")
+        ),
+        hooks_dir,
+        "contextstream-mcp doctor --repair --scope project",
+    ))
 }
 
 /// Which ContextStream project the folder should be linked to, from the
@@ -2764,6 +2832,9 @@ pub async fn run_doctor(options: DoctorOptions, json: bool, support: bool) -> Re
     print_check(&report.credentials, "");
     if let Some(project_link) = &report.project_link {
         print_check(project_link, "");
+    }
+    if let Some(git_hooks) = &report.git_hooks {
+        print_check(git_hooks, "");
     }
     println!();
     for editor_report in &report.editors {
@@ -3122,6 +3193,39 @@ mod tests {
         assert!(validate_entry_shape(&Editor::Cursor, &json!({})).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn git_hooks_check_fails_for_non_executable_managed_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git_init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(temp.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("git runs");
+        assert!(git_init.success());
+
+        // A repository without managed hooks gets no git_hooks check at all.
+        assert!(check_git_hooks(temp.path()).is_none());
+
+        crate::setup::git_hooks::install_git_hooks(temp.path()).expect("install");
+        let healthy = check_git_hooks(temp.path()).expect("managed hooks are checked");
+        assert_eq!(healthy.status, CheckStatus::Pass, "{}", healthy.detail);
+
+        let repo_root = crate::setup::git_hooks::resolve_repo_root(temp.path()).unwrap();
+        let hooks_dir = crate::setup::git_hooks::resolve_hooks_dir(&repo_root).unwrap();
+        let post_commit = hooks_dir.join("post-commit");
+        std::fs::set_permissions(&post_commit, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let broken = check_git_hooks(temp.path()).expect("managed hooks are checked");
+        assert_eq!(broken.status, CheckStatus::Fail);
+        assert!(broken.detail.contains("post-commit"), "{}", broken.detail);
+        assert!(!broken.detail.contains("pre-push"), "{}", broken.detail);
+        assert!(broken.fix.is_some());
+    }
+
     #[test]
     fn mcp_config_file_check_reports_missing_parse_and_entry_states() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3305,6 +3409,7 @@ mod tests {
             }],
             installation: SurfaceCheck::pass("installation", "ok", None),
             project_link: None,
+            git_hooks: None,
             credentials: SurfaceCheck::skipped("credentials", "not checked"),
             repair: None,
             pass: 2,
@@ -3366,6 +3471,7 @@ mod tests {
         };
         let report = DoctorReport {
             project_link: None,
+            git_hooks: None,
             schema_version: DOCTOR_REPORT_SCHEMA_VERSION,
             targeting: DoctorTargeting {
                 scope: DoctorScope::All,
@@ -3586,6 +3692,7 @@ mod tests {
             }],
             installation: SurfaceCheck::pass("installation", "ok", None),
             project_link: None,
+            git_hooks: None,
             credentials: SurfaceCheck::pass("credentials", "ok", None),
             repair: None,
             pass: 2,

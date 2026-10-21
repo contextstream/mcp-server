@@ -21,6 +21,22 @@
   counts rows it did not return on a short last page (semantic search said
   "4 results" and showed 2), the header shows the rows actually returned
   (#183).
+- `.contextstream/ignore` now excludes files from indexing, as the setup
+  privacy screen and `docs/data-handling.md` have said. Until now ingest
+  read only `.contextignore` and `.p4ignore`, so files excluded the documented
+  way were uploaded and searchable. The file holds gitignore-style rules
+  relative to the project root and applies as its own filter, like Plastic's
+  `ignore.conf`, so no `!` rule in another ignore file can re-include what it
+  excludes. Every ingest path honours it: setup's background index, `init`'s
+  auto-index, `project(action="index"|"ingest_local")`, the hook drain and
+  the file watcher. A file that an ignore rule now excludes but that an
+  earlier index uploaded is dropped by the next complete index, as the
+  Unity `Library/` files were in 1.0.26. Keyword search's local disk
+  fallback (ripgrep or the built-in walker) applies the same ignore rules as
+  ingest, so content excluded by `.contextignore`, `.contextstream/ignore`,
+  `.p4ignore`, Plastic `ignore.conf` or the Unity root folders no longer
+  reaches the agent through it. The setup screen and the docs name both
+  files (#182).
 
 ## 1.0.26
 

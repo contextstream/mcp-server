@@ -8091,10 +8091,16 @@ fn local_keyword_enrich_rg_checked(
         if existing_paths.contains(&relative) && !include_existing_path_matches {
             continue;
         }
-        if seen_paths.contains(&relative) {
+        if !seen_paths.insert(relative.clone()) {
             continue;
         }
-        seen_paths.insert(relative.clone());
+        // Apply the ingest ignore rules (`.contextignore`,
+        // `.contextstream/ignore`, `.p4ignore`, Plastic, Unity), which
+        // ripgrep does not know about, so excluded content never reaches
+        // the agent through this disk scan.
+        if ContextStreamClient::ingest_ignores_relative_path(folder_path, &relative) {
+            continue;
+        }
 
         let line_number = data.get("line_number").and_then(|n| n.as_i64());
         let match_text = data
@@ -8228,6 +8234,9 @@ fn local_keyword_enrich_fallback(
             if !path_matches_file_type_filter(path, filter) {
                 continue;
             }
+        }
+        if ContextStreamClient::ingest_ignores_relative_path(folder_path, &relative) {
+            continue;
         }
 
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");

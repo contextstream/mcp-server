@@ -323,6 +323,12 @@ pub enum TargetedFileDecision {
 /// when the two disagree.
 const INGEST_CUSTOM_IGNORE_FILENAMES: [&str; 2] = [".p4ignore", ".contextignore"];
 
+/// Project-level exclusion file that setup and the data-handling docs tell
+/// users to create, read as gitignore with patterns relative to the project
+/// root. It is applied as its own filter, so no other ignore file's `!` rule
+/// can re-include what it excludes.
+pub const INGEST_PROJECT_IGNORE_FILE: &str = ".contextstream/ignore";
+
 /// Folders Unity generates or builds into directly under a project root. They
 /// are pruned only there and only in a Unity project: `Assets/Scripts/Library`,
 /// or a `Library` folder in any other project, is source.
@@ -365,6 +371,17 @@ impl IngestRootLayout {
     pub fn plastic_ignore_file(&self, root: &Path) -> Option<std::path::PathBuf> {
         let path = root.join("ignore.conf");
         (self.plastic_workspace && path.is_file()).then_some(path)
+    }
+
+    /// Root-level ignore files that each apply as a separate filter on top of
+    /// the per-directory ignore stack: Plastic's `ignore.conf` and the
+    /// project's `.contextstream/ignore`.
+    pub fn root_filter_ignore_files(&self, root: &Path) -> Vec<std::path::PathBuf> {
+        let project_ignore = root.join(INGEST_PROJECT_IGNORE_FILE);
+        self.plastic_ignore_file(root)
+            .into_iter()
+            .chain(project_ignore.is_file().then_some(project_ignore))
+            .collect()
     }
 
     /// Whether an entry directly under the root is generated output.
@@ -2844,14 +2861,15 @@ impl ContextStreamClient {
             return Ok(true);
         }
 
-        // The full scan applies Plastic's ignore.conf as its own filter, so
-        // another ignore file's `!` rule cannot re-include what it excludes.
-        if let Some(plastic_ignore) = layout.plastic_ignore_file(root) {
-            let mut plastic_builder = ignore::gitignore::GitignoreBuilder::new(root);
-            if plastic_builder.add(plastic_ignore).is_some() {
+        // The full scan applies Plastic's ignore.conf and the project's
+        // `.contextstream/ignore` as their own filters, so another ignore
+        // file's `!` rule cannot re-include what they exclude.
+        for filter_file in layout.root_filter_ignore_files(root) {
+            let mut filter_builder = ignore::gitignore::GitignoreBuilder::new(root);
+            if filter_builder.add(filter_file).is_some() {
                 return Err(());
             }
-            if plastic_builder
+            if filter_builder
                 .build()
                 .map_err(|_| ())?
                 .matched_path_or_any_parents(candidate, false)
@@ -10120,18 +10138,22 @@ impl ContextStreamClient {
             )));
         }
         let layout = IngestRootLayout::detect(root);
-        let plastic_ignore = layout.plastic_ignore_file(root).and_then(|path| {
-            let mut plastic_builder = ignore::gitignore::GitignoreBuilder::new(root);
-            if let Some(error) = plastic_builder.add(&path) {
-                debug!(
-                    "Applying the readable rules of {} while indexing {}: {}",
-                    path.display(),
-                    root_path,
-                    error
-                );
-            }
-            plastic_builder.build().ok()
-        });
+        let root_filters = layout
+            .root_filter_ignore_files(root)
+            .into_iter()
+            .filter_map(|path| {
+                let mut filter_builder = ignore::gitignore::GitignoreBuilder::new(root);
+                if let Some(error) = filter_builder.add(&path) {
+                    debug!(
+                        "Applying the readable rules of {} while indexing {}: {}",
+                        path.display(),
+                        root_path,
+                        error
+                    );
+                }
+                filter_builder.build().ok()
+            })
+            .collect::<Vec<_>>();
         let mut builder = ignore::WalkBuilder::new(root);
         let root_for_filter = root.to_path_buf();
         builder
@@ -10159,9 +10181,9 @@ impl ContextStreamClient {
             let is_dir = entry
                 .file_type()
                 .is_some_and(|file_type| file_type.is_dir());
-            !plastic_ignore
-                .as_ref()
-                .is_some_and(|matcher| matcher.matched(entry.path(), is_dir).is_ignore())
+            !root_filters
+                .iter()
+                .any(|matcher| matcher.matched(entry.path(), is_dir).is_ignore())
         });
 
         let mut candidate_paths = Vec::new();
@@ -10581,14 +10603,29 @@ impl ContextStreamClient {
     }
 
     /// An absence candidate is safe to delete when it no longer exists, or
-    /// when a newer ingest policy intentionally prunes it despite its presence
-    /// on disk.
+    /// when a newer ingest policy or an ignore rule (for example a
+    /// `.contextstream/ignore` added after the file was indexed) intentionally
+    /// excludes it despite its presence on disk.
     fn should_tombstone_absence_candidate(
         root: &Path,
         layout: &IngestRootLayout,
         relative: &str,
     ) -> bool {
-        layout.prunes_relative_path(relative) || !root.join(relative).exists()
+        let candidate = root.join(relative);
+        layout.prunes_relative_path(relative)
+            || !candidate.exists()
+            || Self::targeted_path_is_ignored(root, &candidate, relative) == Ok(true)
+    }
+
+    /// Whether automatic ingest excludes a project-relative path through its
+    /// ignore rules (`.gitignore`, `.p4ignore`, `.contextignore`,
+    /// `.contextstream/ignore`, Plastic `ignore.conf`, Unity output and pruned
+    /// directories). Local search fallbacks use this so content ingest skips
+    /// never reaches an agent through a disk scan. Fails closed: an ignore
+    /// file that cannot be evaluated excludes the path.
+    pub fn ingest_ignores_relative_path(root: &Path, relative: &str) -> bool {
+        let candidate = root.join(relative);
+        Self::targeted_path_is_ignored(root, &candidate, relative) != Ok(false)
     }
 
     /// Check if a file is a media file (image, audio, video, document).
@@ -26519,6 +26556,67 @@ mod tests {
                 TargetedFileDecision::Upload(_)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn contextstream_ignore_excludes_files_from_every_ingest_path(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        write_layout_files(
+            root,
+            &[
+                "src/ok.py",
+                "secret/creds.txt",
+                "prod.env.txt",
+                "src/a.env.txt",
+            ],
+        )?;
+        std::fs::create_dir_all(root.join(".contextstream"))?;
+        std::fs::write(
+            root.join(INGEST_PROJECT_IGNORE_FILE),
+            "secret/\n*.env.txt\n",
+        )?;
+        // A `!` rule in another ignore file cannot re-include what the
+        // project's `.contextstream/ignore` excludes.
+        std::fs::write(root.join(".contextignore"), "!prod.env.txt\n")?;
+
+        let indexed = full_scan_paths(root)?;
+        assert!(indexed.contains(&"src/ok.py".to_string()), "{indexed:?}");
+        for ignored in ["secret/creds.txt", "prod.env.txt", "src/a.env.txt"] {
+            assert!(
+                !indexed.contains(&ignored.to_string()),
+                "{ignored}: {indexed:?}"
+            );
+            assert!(matches!(
+                targeted_decision(root, ignored),
+                TargetedFileDecision::Delete(path) if path == ignored
+            ));
+            assert!(ContextStreamClient::ingest_ignores_relative_path(
+                root, ignored
+            ));
+            // A copy indexed before the rule was added is dropped by the
+            // absence check even though the file is still on disk.
+            assert!(ContextStreamClient::should_tombstone_absence_candidate(
+                root,
+                &IngestRootLayout::detect(root),
+                ignored
+            ));
+        }
+        assert!(matches!(
+            targeted_decision(root, "src/ok.py"),
+            TargetedFileDecision::Upload(_)
+        ));
+        assert!(!ContextStreamClient::ingest_ignores_relative_path(
+            root,
+            "src/ok.py"
+        ));
+        assert!(!ContextStreamClient::should_tombstone_absence_candidate(
+            root,
+            &IngestRootLayout::detect(root),
+            "src/ok.py"
+        ));
         Ok(())
     }
 

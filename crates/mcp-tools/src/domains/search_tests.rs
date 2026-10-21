@@ -1707,6 +1707,7 @@ mod tokenizer_wire_tests {
 // ============================================================================
 
 mod auto_mode_tests {
+    use super::local_keyword_enrich_fallback;
     use super::{
         apply_symbol_anchor_rerank, bounded_existing_search_tool_result,
         bounded_search_tool_result, budget_search_structured_value,
@@ -3753,6 +3754,54 @@ mod auto_mode_tests {
         assert!(results.iter().all(|item| item.score == Some(1.0)));
 
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn test_local_keyword_enrich_skips_files_excluded_from_ingest() {
+        use std::collections::HashSet;
+
+        let temp_root = tempfile::tempdir().unwrap();
+        let root = temp_root.path();
+        std::fs::create_dir_all(root.join(".contextstream")).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".contextstream/ignore"), "secret/\n").unwrap();
+        std::fs::write(root.join(".contextignore"), "private.txt\n").unwrap();
+        std::fs::write(root.join("secret/creds.txt"), "excluded_marker_token=one\n").unwrap();
+        std::fs::write(root.join("private.txt"), "excluded_marker_token=two\n").unwrap();
+        std::fs::write(root.join("src/ok.txt"), "excluded_marker_token=ok\n").unwrap();
+
+        let paths = |results: Vec<mcp_types::api::SearchResult>| {
+            let mut paths = results
+                .into_iter()
+                .filter_map(|item| item.file_path)
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        let expected = vec!["src/ok.txt".to_string()];
+
+        let enriched = local_keyword_enrich(
+            root,
+            "excluded_marker_token",
+            &HashSet::new(),
+            None,
+            0,
+            400,
+            false,
+        );
+        assert_eq!(paths(enriched), expected);
+
+        let walked = local_keyword_enrich_fallback(
+            root,
+            "excluded_marker_token",
+            &HashSet::new(),
+            None,
+            0,
+            400,
+            false,
+        );
+        assert_eq!(paths(walked), expected);
     }
 
     #[test]

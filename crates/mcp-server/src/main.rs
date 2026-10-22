@@ -3694,8 +3694,6 @@ fn configured_http_metrics_builder() -> Result<metrics_exporter_prometheus::Prom
 }
 
 async fn run_http_server(host: &str, port: u16) -> Result<()> {
-    use mcp_tools::{domains, ToolRegistry};
-
     // Load configuration
     let mut config = load_config()?;
     config.is_http_transport = true;
@@ -3739,57 +3737,12 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
     ));
     session.register_session_refresh_hook().await;
 
-    // Create tool registry and register all tools
-    let mut registry = ToolRegistry::new(&config);
-
-    // Legacy wire-compatibility layer; public builds always install a no-op.
-    let atlas_layer = mcp_server::atlas::build_atlas_layer();
-    registry.set_atlas_layer(atlas_layer.clone());
-
-    let acceleration_layer = mcp_server::acceleration::build_acceleration_layer();
-    registry.set_acceleration_layer(acceleration_layer.clone());
-
-    // Register domain tools
-    let index_keeper = std::sync::Arc::new(domains::index_keeper::IndexKeeper::new(
-        client.clone(),
-        session.clone(),
-        atlas_layer,
-        acceleration_layer,
-    ));
-    domains::session::register_session_tools(
-        &mut registry,
-        client.clone(),
-        session.clone(),
-        index_keeper.clone(),
-    );
-    domains::flash::register_flash_tools(&mut registry, client.clone(), session.clone());
-    domains::search::register_search_tools(
-        &mut registry,
-        client.clone(),
-        session.clone(),
-        index_keeper,
-    );
-    domains::memory::register_memory_tools(&mut registry, client.clone(), session.clone());
-    domains::graph::register_graph_tools(&mut registry, client.clone(), session.clone());
-    domains::workspace::register_workspace_tools(&mut registry, client.clone());
-    domains::project::register_project_tools(&mut registry, client.clone(), session.clone());
-    domains::integrations::register_integration_tools(
-        &mut registry,
-        client.clone(),
-        session.clone(),
-    );
-    domains::reminder::register_reminder_tools(&mut registry, client.clone());
-    domains::coordination::register_coordination_tools(&mut registry, client.clone());
-    // Phase 1-3 taxonomy expansion: unified entity CRUD across tickets,
-    // handoffs, backlog_views, incidents, releases, experiments, goals,
-    // key_results, sprints, reviews, risks.
-    domains::entity::register_entity_tools(&mut registry, client.clone(), session.clone());
-    domains::media::register_media_tools(&mut registry, client.clone(), session.clone());
-    domains::help::register_help_tools(&mut registry, client.clone());
-    domains::skill::register_skill_tools(&mut registry, client.clone(), session.clone());
-    domains::qa::register_qa_tools(&mut registry, client.clone());
-    // Agent Coach Kit: registered here too, visible only on /coach.
-    domains::coach::register_coach_tools(&mut registry, client.clone());
+    // The same registry the stdio server and the per-request HTTP registries use
+    // (server::build_registry). A list of its own here drifted: answer, feed, vcs,
+    // capsule, chart and async_job were never added, so a fresh gateway listed six
+    // tools fewer than a per-request registry, and tools/list depended on which kind
+    // of request filled its cache first.
+    let registry = server::build_registry(&config, client.clone(), session.clone());
 
     let tool_count = registry.len();
 
@@ -3836,17 +3789,19 @@ mod tests {
     }
 
     #[test]
-    fn the_http_gateway_serves_the_coach_tools() {
-        // The gateway builds its own registry, apart from `build_registry`;
-        // without this line /coach would list nothing.
+    fn the_http_gateway_builds_the_shared_registry() {
+        // One registry builder for every transport: the gateway must not keep a
+        // list of its own (it drifted once and dropped six hosted tools).
         let source = include_str!("main.rs");
         let start = source
             .find("async fn run_http_server(")
             .expect("run_http_server");
         let body = &source[start..start + source[start..].find("\n}\n").expect("end")];
-        assert!(
-            body.contains("domains::coach::register_coach_tools(&mut registry, client.clone());")
-        );
+        assert!(body.contains(
+            "let registry = server::build_registry(&config, client.clone(), session.clone());"
+        ));
+        assert!(!body.contains("ToolRegistry::new("));
+        assert!(!body.contains("::register_"));
     }
 
     #[test]

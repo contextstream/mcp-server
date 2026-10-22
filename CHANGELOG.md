@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.0.28
+
+- A gateway that calls the ContextStream API directly can now present the API's
+  forwarder secret. Set `CONTEXTSTREAM_API_FORWARDER_SECRET` and every request
+  the client sends to the configured API URL (reads and writes, through any
+  of the client's three request paths) carries it in the `x-contextmail-forwarder`
+  header. Until now such a gateway, for example the one that runs beside an API
+  color and calls the app on loopback, got `403 {"error":"forbidden"}` on every
+  call, because the API's origin gate wants that header and only the edge
+  adds it. The variable is opt-in: unset, empty or blank means no header and no
+  change. The value is trimmed, read once when the first request is built, sent
+  as a sensitive header (it is redacted in debug output) and never logged. A
+  value that is not a legal header value is not sent and one warning names the
+  variable, not the value. Nothing else reads it, so a gateway behind the edge,
+  and every stdio install, needs no setting. Device login and sign-up requests
+  do not carry the header (#192).
+- Nothing else changed: no tool, schema or description differs from 1.0.27, and
+  there are no dependency changes.
+
 ## 1.0.27
 
 - Security: TLS trust. `rustls-webpki` 0.103.15 to 0.103.16

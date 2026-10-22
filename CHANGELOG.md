@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- The hosted HTTP gateway now serves `answer`, `feed`, `vcs`, `capsule`,
+  `chart` and `async_job` to every client. The gateway built its startup tool
+  registry from a list of its own that never gained these six, while the
+  per-request registries (a config override, the stateless transport) used
+  the shared `build_registry`. `tools/list` was cached once per process under a
+  key that did not say which registry built it, so whichever request came first
+  decided the list until the next restart: a gateway could list the six and
+  then answer `Unknown tool` when a session client called them, or not list
+  them at all after a restart. The gateway now uses `build_registry`, and the
+  cache key includes the registry's tool names.
 - Local Git capture hooks run again in repositories that had no hook before
   setup. Since 1.0.0, setup created a new `post-commit`, `pre-push`,
   `post-checkout` or `post-merge` hook with mode 0600, so Git skipped it and

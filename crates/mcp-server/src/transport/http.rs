@@ -1601,12 +1601,18 @@ async fn tools_list_cache_key(state: &HttpState, registry: &ToolRegistry) -> Str
     let mut config = effective_config(state).await;
     config.tool_surface_profile = registry.tool_surface_profile();
 
+    // The registry's own tool names are part of the key: a per-request registry
+    // (a config override, the stateless transport) must never be served another
+    // registry's cached list, nor fill the shared registry's entry.
+    let mut names = registry.names();
+    names.sort_unstable();
     format!(
-        "toolset={}|progressive={}|router={}|consolidated={}|surface={}",
+        "toolset={}|progressive={}|router={}|consolidated={}|tools={}|surface={}",
         toolset_cache_label(config.toolset),
         config.progressive_mode,
         config.router_mode,
         config.consolidated_mode,
+        names.join(","),
         config.tool_surface_profile.as_str()
     )
 }
@@ -6097,6 +6103,73 @@ mod tests {
                 concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
                 metrics_handle: None,
             }
+        }
+
+        fn tool_names(response: &Value) -> Vec<String> {
+            response["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .map(|tool| tool["name"].as_str().expect("name").to_string())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn the_hosted_surface_lists_the_tools_build_registry_registers() {
+            // The gateway once kept a registry list of its own that never gained
+            // answer, feed, vcs and capsule (nor chart and async_job, which also
+            // need the acceleration connection): a fresh gateway listed them only
+            // after a per-request registry had filled the tools/list cache.
+            let state = hosted_state(false);
+            let names = tool_names(&handle_list_tools_method(&state, None).await.expect("list"));
+            for name in ["answer", "feed", "vcs", "capsule"] {
+                assert!(
+                    names.iter().any(|listed| listed == name),
+                    "{name} missing: {names:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_per_request_registry_never_shares_another_registrys_tools_list() {
+            // tools/list is cached per process. A registry with other tools (a
+            // config override, the stateless transport) under the same config must
+            // get its own entry, whichever registry asks first.
+            let state = hosted_state(false);
+            let config = Config {
+                api_key: Some("test-api-key".to_string()),
+                is_http_transport: true,
+                toolset: Toolset::Complete,
+                consolidated_mode: true,
+                ..Config::default()
+            };
+            let mut smaller = mcp_tools::ToolRegistry::new(&config);
+            mcp_tools::domains::help::register_help_tools(&mut smaller, state.client.clone());
+            let smaller = Arc::new(smaller);
+
+            let small_first = tool_names(
+                &handle_list_tools_method(&state, Some(smaller.clone()))
+                    .await
+                    .expect("list"),
+            );
+            let full = tool_names(&handle_list_tools_method(&state, None).await.expect("list"));
+            assert_eq!(small_first, vec!["help".to_string()]);
+            assert!(
+                full.len() > small_first.len(),
+                "the shared registry got the smaller list: {full:?}"
+            );
+            assert_eq!(
+                tool_names(
+                    &handle_list_tools_method(&state, Some(smaller))
+                        .await
+                        .expect("list")
+                ),
+                small_first
+            );
+            assert_eq!(
+                tool_names(&handle_list_tools_method(&state, None).await.expect("list")),
+                full
+            );
         }
 
         fn post(

@@ -3780,6 +3780,7 @@ impl ContextStreamClient {
             }
         }
         req = with_edge_geography_headers(req);
+        req = with_api_forwarder_header(req);
 
         // Forward the agent's model so server-side compliance events attribute
         // to the real model instead of the `unknown` bucket. Set by the tool
@@ -4022,6 +4023,7 @@ impl ContextStreamClient {
             }
         }
         req = with_edge_geography_headers(req);
+        req = with_api_forwarder_header(req);
 
         // Forward the agent's model so server-side compliance events attribute
         // to the real model instead of the `unknown` bucket. Set by the tool
@@ -4127,6 +4129,7 @@ impl ContextStreamClient {
             req = req.header(CLIENT_HEADER, client.as_str());
         }
         req = with_edge_geography_headers(req);
+        req = with_api_forwarder_header(req);
         if let Some(model_id) = get_task_model_id() {
             req = req.header("X-ContextStream-Model", model_id);
         }
@@ -20094,6 +20097,51 @@ fn extract_error_code(body: &serde_json::Value) -> Option<String> {
     body.get("code").and_then(|c| c.as_str()).map(String::from)
 }
 
+/// Environment variable naming the API's forwarder secret, for a gateway that
+/// calls the API directly instead of through the ContextStream edge (the
+/// gateway embedded beside the API, on loopback). The API's origin gate
+/// answers 403 to any request without it; the edge Workers add it to
+/// everything they forward, so a gateway behind the edge needs none.
+pub const API_FORWARDER_SECRET_ENV: &str = "CONTEXTSTREAM_API_FORWARDER_SECRET";
+/// The header the API's origin gate reads the forwarder secret from.
+pub const API_FORWARDER_SECRET_HEADER: &str = "x-contextmail-forwarder";
+
+/// The forwarder secret as a sensitive header value, read once. Unset, empty,
+/// or not a valid header value: none, and requests go out as before. The value
+/// is never logged; a malformed one is reported by the variable name only.
+fn api_forwarder_secret() -> Option<&'static reqwest::header::HeaderValue> {
+    static SECRET: OnceLock<Option<reqwest::header::HeaderValue>> = OnceLock::new();
+    SECRET
+        .get_or_init(|| {
+            parse_api_forwarder_secret(std::env::var(API_FORWARDER_SECRET_ENV).ok().as_deref())
+        })
+        .as_ref()
+}
+
+fn parse_api_forwarder_secret(raw: Option<&str>) -> Option<reqwest::header::HeaderValue> {
+    let secret = raw.map(str::trim).filter(|value| !value.is_empty())?;
+    match reqwest::header::HeaderValue::from_str(secret) {
+        Ok(mut value) => {
+            value.set_sensitive(true);
+            Some(value)
+        }
+        Err(_) => {
+            warn!("{API_FORWARDER_SECRET_ENV} is not a valid header value; not sending it");
+            None
+        }
+    }
+}
+
+/// Present the API's forwarder secret, when one is configured. Only the three
+/// request builders that target `config.api_url` call this, so the secret goes
+/// to the configured API and nowhere else.
+fn with_api_forwarder_header(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match api_forwarder_secret() {
+        Some(secret) => req.header(API_FORWARDER_SECRET_HEADER, secret.clone()),
+        None => req,
+    }
+}
+
 /// Forward what the edge knew about the caller's location, when the transport
 /// scoped it. The API keeps only the canonical values, so this never carries
 /// arbitrary caller text.
@@ -21053,6 +21101,48 @@ fn api_url_host_is_loopback(api_url: &str) -> bool {
     host.parse::<std::net::IpAddr>()
         .map(|ip| ip.is_loopback())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod api_forwarder_secret_tests {
+    use super::{
+        parse_api_forwarder_secret, with_api_forwarder_header, API_FORWARDER_SECRET_HEADER,
+    };
+
+    #[test]
+    fn unset_or_blank_sends_nothing() {
+        assert!(parse_api_forwarder_secret(None).is_none());
+        assert!(parse_api_forwarder_secret(Some("")).is_none());
+        assert!(parse_api_forwarder_secret(Some("   ")).is_none());
+    }
+
+    #[test]
+    fn a_secret_is_trimmed_and_marked_sensitive() {
+        let value =
+            parse_api_forwarder_secret(Some(" a-forwarder-secret-of-32-chars-ok\n")).unwrap();
+        assert_eq!(value.as_bytes(), b"a-forwarder-secret-of-32-chars-ok");
+        assert!(value.is_sensitive());
+        assert!(!format!("{value:?}").contains("forwarder-secret"));
+    }
+
+    #[test]
+    fn a_malformed_secret_is_refused() {
+        assert!(parse_api_forwarder_secret(Some("bad\u{7f}value")).is_none());
+    }
+
+    #[test]
+    fn the_header_is_the_one_the_api_origin_gate_reads() {
+        assert_eq!(API_FORWARDER_SECRET_HEADER, "x-contextmail-forwarder");
+    }
+
+    #[test]
+    fn without_the_variable_no_header_is_added() {
+        // The test process does not set CONTEXTSTREAM_API_FORWARDER_SECRET.
+        let request = with_api_forwarder_header(reqwest::Client::new().get("http://127.0.0.1:9/x"))
+            .build()
+            .unwrap();
+        assert!(request.headers().get(API_FORWARDER_SECRET_HEADER).is_none());
+    }
 }
 
 #[cfg(test)]

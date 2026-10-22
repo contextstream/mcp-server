@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 1.0.27
+
+- Security: TLS trust. `rustls-webpki` 0.103.15 to 0.103.16
+  (RUSTSEC-2026-0382) and `webpki-roots` 1.0.7 to 1.0.10 (RUSTSEC-2026-0381).
+  The earlier versions can accept certificate paths through distrusted emSign
+  intermediates whose private keys are now known, and the older root list
+  includes `emSign ECC Root CA - G3`. Both crates are compiled into the binary
+  through `reqwest`, so 1.0.26 carries the affected versions. Update with
+  `contextstream-mcp update` (fe2ed5f).
 
 - The hosted HTTP gateway now serves `answer`, `feed`, `vcs`, `capsule`,
   `chart` and `async_job` to every client. The gateway built its startup tool
@@ -13,14 +21,15 @@
   them at all after a restart. The gateway now uses `build_registry`, and the
   cache key includes the registry's tool names.
 - Local Git capture hooks run again in repositories that had no hook before
-  setup. Since 1.0.0, setup created a new `post-commit`, `pre-push`,
+  setup. Up to 1.0.26, setup created a new `post-commit`, `pre-push`,
   `post-checkout` or `post-merge` hook with mode 0600, so Git skipped it and
   no commit, push, checkout or merge reached ContextStream. New managed hooks
   are now created 0755, and `setup`, `init`, `update`,
   `contextstream-mcp git-hooks` and `doctor --repair --scope project` restore
-  the execute bit on a managed hook that lacks it. `doctor` has a new
-  `git_hooks` check that fails when a managed hook is not executable, so it no
-  longer reports HEALTHY in that state (#179).
+  the execute bit on a managed hook that lacks it (`doctor --repair` still
+  needs a configured editor or `--editors`, and leaves a `.contextstream.bak`
+  copy of each hook it repairs). `doctor` has a new `git_hooks` check that
+  fails when a managed hook is not executable (#179).
 - Search no longer returns every file twice after `project(action="ingest_local")`
   or the background refresh that `init` starts. The index also holds a
   file-level summary row for each file at line 0. When the same file (in the
@@ -48,13 +57,16 @@
   reaches the agent through it. The setup screen and the docs name both
   files (#182).
 - A `tools/call` whose own `arguments` is not an object is refused with
-  JSON-RPC `-32602` (Invalid params) on stdio and over HTTP, as the 1.0.26
-  notes said. Before, the hosted gateway answered `-32603` and stdio answered
-  a tool result with `isError: true`. The refused shapes are a number, a
-  boolean, an array and a string that is not a JSON object; the message names
-  the tool and the type that was sent. Absent or `null` arguments still mean
-  no arguments, and a JSON string that holds an object is still unwrapped.
-  Other argument errors keep their codes (#184).
+  JSON-RPC `-32602` (Invalid params) on stdio and over a legacy HTTP session,
+  as the 1.0.26 notes said. Before, a legacy HTTP session got `-32603` and
+  stdio got a tool result with `isError: true`. The refused shapes are a
+  number, a boolean, an array and a string that is not a JSON object; the
+  message names the tool and the type that was sent. Absent or `null`
+  arguments still mean no arguments, and a JSON string that holds an object is
+  still unwrapped, on those two transports. The stateless 2026-07-28 HTTP
+  transport is unchanged: it already refused these with `-32602` and its own
+  shorter message, and it also refuses `null` and a JSON string. Other
+  argument errors keep their codes (#184).
 - Search keeps the session's project on the hosted and HTTP transport (#180).
   With no folder pin and no local index (always the case on the gateway, which
   has no checkout on disk), a search without `project_id` queued a
@@ -69,12 +81,22 @@
   concise mode: `[SCOPE_WIDENED]` names where it ran, each row from another
   project is labelled `[other project <id>]`, and a row the API did not
   attribute is labelled `[project not reported]`. Result rows keep the API's
-  `project_id`, and the structured result carries `scope_widened`.
+  `project_id`, and the structured result carries the notice as `scope_widened`.
 - `scope_reliability.reason` no longer reports `scope_mismatch_reindexing`
   for a project whose canonical index is ready when the exact checkout cannot
   be attested (the gateway cannot read one); it reports
   `checkout_not_attested` with `scope_match: true`. A widened search reports
   `workspace_scope` or `other_project_scope`.
+- Dependencies: `Cargo.lock` only, no `Cargo.toml` change. `tokio` 1.53.1 to
+  1.54.1 (1.54.0 is yanked for a race in `tokio::time::Interval`,
+  RUSTSEC-2026-0384; it was on `main` but in no release), `hyper` 1.11.1 to
+  1.12.0, `serde_json` 1.0.151 to 1.0.154, `uuid` 1.27.0 to 1.28.0,
+  `schemars` and `schemars_derive` 1.2.2 to 1.2.3, `sha2` 0.11.0 to 0.11.1,
+  `libc` 0.2.190 to 0.2.191, `toml_edit` 0.25.15 to 0.25.17 with
+  `toml_datetime`, `toml_parser` and `toml_writer`, and `want` 0.3.1 to 0.3.2
+  (#185).
+- Not in the binary: the GitHub Actions pin updates in the legacy workflows
+  (#174) and a test-lock fix for the git hook tests (556546f).
 
 ## 1.0.26
 

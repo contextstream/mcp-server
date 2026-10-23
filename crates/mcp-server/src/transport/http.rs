@@ -3316,6 +3316,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_call_relays_an_oregon_home_and_its_scope() {
+        // An Oregon-homed tenant's scoped tools/call: the edge routes the
+        // caller's next calls to us-oregon only if this header reaches it.
+        let headers = tool_call_tenant_home_headers(
+            tenant_home_api(Some("us-oregon"), Some(SCOPE_WORKSPACE)).await,
+        )
+        .await;
+        assert_eq!(headers[TENANT_HOME_REGION_HEADER], "us-oregon");
+        assert_eq!(
+            headers[mcp_client::TENANT_HOME_SCOPE_HEADER],
+            SCOPE_WORKSPACE
+        );
+
+        let headers =
+            tool_call_tenant_home_headers(tenant_home_api(Some("us-virginia"), None).await).await;
+        assert_eq!(headers[TENANT_HOME_REGION_HEADER], "us-virginia");
+    }
+
+    #[tokio::test]
     async fn tool_call_relays_neither_header_when_the_api_named_no_home() {
         let headers =
             tool_call_tenant_home_headers(tenant_home_api(None, Some(SCOPE_WORKSPACE)).await).await;

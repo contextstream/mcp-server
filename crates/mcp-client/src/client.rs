@@ -683,17 +683,46 @@ pub(crate) fn observe_tenant_home_header(headers: &reqwest::header::HeaderMap) {
     let Some(home) = headers
         .get("x-contextstream-tenant-home-region")
         .and_then(|value| value.to_str().ok())
-        .and_then(mcp_types::NearestRegion::from_header_value)
+        .and_then(canonical_tenant_home)
     else {
         return;
     };
     let captured = CapturedTenantHome {
-        home: home.as_header_value().to_string(),
+        home: home.to_string(),
         scopes: tenant_home_scopes(headers),
     };
     let _ = TASK_TENANT_HOME.try_with(|cell| {
         *cell.borrow_mut() = Some(captured);
     });
+}
+
+/// Every home region the API can name (`Region::ALL` in the API's region
+/// module) and the Cloudflare MCP gateway can route to (`ORIGIN_NAMES` in its
+/// Worker). This is deliberately not `NearestRegion`: that type is the edge's
+/// suggestion for homing a NEW tenant and stays limited to the regions open
+/// for that, while a tenant home relayed here only lets the edge send an
+/// existing tenant's next calls to where its data already lives. Parsing the
+/// home through `NearestRegion` dropped `us-virginia` and `us-oregon`, so the
+/// gateway published no home for any tenant on the AWS regions and every
+/// Oregon-homed MCP call stayed on the default (Virginia) origin.
+const TENANT_HOME_REGIONS: [&str; 6] = [
+    "ovh-west",
+    "ovh-east",
+    "eu-ams",
+    "us-ohio",
+    "us-virginia",
+    "us-oregon",
+];
+
+/// The canonical name of a tenant home header value, or None for anything
+/// outside [`TENANT_HOME_REGIONS`]. Case-insensitive and trimmed, as the API's
+/// own parser is; nothing else is aliased.
+fn canonical_tenant_home(value: &str) -> Option<&'static str> {
+    let value = value.trim().to_ascii_lowercase();
+    TENANT_HOME_REGIONS
+        .iter()
+        .copied()
+        .find(|region| *region == value)
 }
 
 /// The scope tokens on a response, lowercased, when there is exactly one
@@ -835,6 +864,32 @@ mod tenant_home_capture_tests {
         ] {
             let got = capture(vec![response_headers(Some("eu-ams"), &scopes)]).await;
             assert_eq!(got, captured("eu-ams", None), "scopes {scopes:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_home_the_api_names_is_captured_including_the_aws_regions() {
+        // us-oregon and us-virginia were dropped before (parsed as the edge's
+        // NearestRegion), so no AWS-homed tenant's home ever reached the edge.
+        for home in [
+            "ovh-west",
+            "ovh-east",
+            "eu-ams",
+            "us-ohio",
+            "us-virginia",
+            "us-oregon",
+        ] {
+            let got = capture(vec![response_headers(Some(home), &[WORKSPACE])]).await;
+            assert_eq!(got, captured(home, Some(WORKSPACE)), "home {home}");
+        }
+        let got = capture(vec![response_headers(Some(" US-Oregon "), &[])]).await;
+        assert_eq!(got, captured("us-oregon", None));
+        for unknown in ["us-west-2", "oregon", "us-oregon-1", "us_oregon", ""] {
+            assert_eq!(
+                capture(vec![response_headers(Some(unknown), &[WORKSPACE])]).await,
+                None,
+                "home {unknown:?}"
+            );
         }
     }
 

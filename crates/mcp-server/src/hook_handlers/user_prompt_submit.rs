@@ -380,6 +380,11 @@ struct ApiConfig {
     workspace_id: Option<String>,
     project_id: Option<String>,
     session_id: Option<String>,
+    /// The prompt, collapsed and capped, so the turn checks in for coordination.
+    task_summary: Option<String>,
+    /// The ContextStream session `init` named for this host session, so the
+    /// hook and the agent's own `context()` calls share one coordination identity.
+    coordination_session_id: Option<String>,
 }
 
 /// Handle the UserPromptSubmit hook.
@@ -410,6 +415,13 @@ pub async fn handle() -> Result<()> {
 
     let mut config = load_config(&cwd);
     config.session_id = extract_session_id(&input);
+    if coordination_checkin_enabled() {
+        config.task_summary = prompt_task_summary(&input);
+        config.coordination_session_id = config
+            .session_id
+            .as_deref()
+            .and_then(super::durable_capture::session_api_session_id);
+    }
 
     // Try fast API call if we have credentials. Reconcile unflushed local
     // edits (P6 content freshness) concurrently with the context fetch, with a
@@ -472,11 +484,14 @@ pub async fn handle() -> Result<()> {
     Ok(())
 }
 
-/// Fetch hook context from the fast /api/v1/context/hook endpoint.
-/// Returns None if the API is unreachable or returns an error.
-async fn fetch_hook_context(config: &ApiConfig, editor: EditorFormat, cwd: &str) -> Option<String> {
-    let url = format!("{}/api/v1/context/hook", config.api_url);
-
+/// Body for POST /api/v1/context/hook. The prompt's summary rides along so the
+/// server checks this session in for live coordination on every turn, without
+/// relying on the model to call `context()`.
+fn hook_context_body(
+    config: &ApiConfig,
+    editor: EditorFormat,
+    cwd: &str,
+) -> serde_json::Map<String, Value> {
     let mut body = serde_json::Map::new();
     if let Some(ref ws_id) = config.workspace_id {
         body.insert("workspace_id".to_string(), Value::String(ws_id.clone()));
@@ -498,6 +513,46 @@ async fn fetch_hook_context(config: &ApiConfig, editor: EditorFormat, cwd: &str)
         "editor".to_string(),
         Value::String(editor.as_api_str().to_string()),
     );
+    if let Some(ref summary) = config.task_summary {
+        body.insert("task_summary".to_string(), Value::String(summary.clone()));
+    }
+    if let Some(ref session) = config.coordination_session_id {
+        body.insert(
+            "coordination_session_id".to_string(),
+            Value::String(session.clone()),
+        );
+    }
+
+    body
+}
+
+/// `CONTEXTSTREAM_COORDINATION_CHECKIN=false` keeps prompts out of the hook request.
+fn coordination_checkin_enabled() -> bool {
+    !std::env::var("CONTEXTSTREAM_COORDINATION_CHECKIN").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// The turn's prompt as a single line, capped at the 500 characters the server
+/// keeps for a coordination summary.
+fn prompt_task_summary(input: &Value) -> Option<String> {
+    let collapsed = input
+        .get("prompt")
+        .and_then(Value::as_str)?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!collapsed.is_empty()).then(|| collapsed.chars().take(500).collect())
+}
+
+/// Fetch hook context from the fast /api/v1/context/hook endpoint.
+/// Returns None if the API is unreachable or returns an error.
+async fn fetch_hook_context(config: &ApiConfig, editor: EditorFormat, cwd: &str) -> Option<String> {
+    let url = format!("{}/api/v1/context/hook", config.api_url);
+    let body = hook_context_body(config, editor, cwd);
 
     let client = super::api_http_client();
     let response = client
@@ -611,6 +666,8 @@ fn load_config(cwd: &str) -> ApiConfig {
         workspace_id,
         project_id,
         session_id: None,
+        task_summary: None,
+        coordination_session_id: None,
     }
 }
 
@@ -638,6 +695,52 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_summary_is_one_capped_line() {
+        let input = serde_json::json!({"prompt": "  Change order.total\n\tto integer cents  "});
+        assert_eq!(
+            prompt_task_summary(&input).as_deref(),
+            Some("Change order.total to integer cents")
+        );
+        assert_eq!(
+            prompt_task_summary(&serde_json::json!({"prompt": "   "})),
+            None
+        );
+        assert_eq!(prompt_task_summary(&serde_json::json!({})), None);
+        let long = serde_json::json!({"prompt": "word ".repeat(300)});
+        assert_eq!(prompt_task_summary(&long).unwrap().chars().count(), 500);
+    }
+
+    #[test]
+    fn hook_request_carries_the_summary_only_when_present() {
+        let mut config = ApiConfig {
+            api_key: "key".to_string(),
+            api_url: "https://api.example".to_string(),
+            workspace_id: Some("ws".to_string()),
+            project_id: None,
+            session_id: Some("claude-session".to_string()),
+            task_summary: None,
+            coordination_session_id: None,
+        };
+        let body = hook_context_body(&config, EditorFormat::Claude, "/repo");
+        assert!(!body.contains_key("task_summary"));
+        assert_eq!(body["session_id"], "claude-session");
+        assert_eq!(body["hook_type"], "user_prompt_submit");
+
+        config.task_summary = Some("Add free shipping when order.total is $50 or more".to_string());
+        let body = hook_context_body(&config, EditorFormat::Claude, "/repo");
+        assert_eq!(
+            body["task_summary"],
+            "Add free shipping when order.total is $50 or more"
+        );
+        assert!(!body.contains_key("coordination_session_id"));
+
+        config.coordination_session_id = Some("api-session-7".to_string());
+        let body = hook_context_body(&config, EditorFormat::Claude, "/repo");
+        assert_eq!(body["coordination_session_id"], "api-session-7");
+        assert_eq!(body["session_id"], "claude-session");
+    }
 
     #[test]
     fn detects_cline_like_editor_format() {

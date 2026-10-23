@@ -1786,11 +1786,21 @@ fn write_contextignore(path: &std::path::Path, lines: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The binary an update just installed, once `run_update` has located it.
+static UPDATED_BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 async fn run_post_update_command_with_installed_binary(
     args: &[&str],
     description: &str,
 ) -> Result<()> {
-    let install_path = expected_install_path();
+    // After an install the new binary is wherever the installer put it; with
+    // nothing installed, the running binary is already the current one.
+    let install_path = UPDATED_BINARY
+        .get()
+        .cloned()
+        .or_else(|| std::env::current_exe().ok())
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(expected_install_path);
     let status = std::process::Command::new(&install_path)
         .args(args)
         .stdin(std::process::Stdio::inherit())
@@ -2716,6 +2726,75 @@ fn expected_install_path() -> String {
     }
 }
 
+/// The running binary's directory, unless it is the hooks' managed copy under
+/// `~/.contextstream`, which the installer refreshes on its own.
+fn running_binary_dir() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let dir = exe.parent()?.to_path_buf();
+    if dirs::home_dir().is_some_and(|home| dir.starts_with(home.join(".contextstream"))) {
+        return None;
+    }
+    Some(dir)
+}
+
+fn dir_is_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".contextstream-write-probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Where an update should install so it replaces the binary that is running:
+/// its own directory when this user can write there. Otherwise the installer
+/// decides (its default, then a per-user directory when sudo is unavailable),
+/// and an explicit `CONTEXTSTREAM_INSTALL_DIR` is inherited unchanged.
+fn update_install_dir() -> Option<std::path::PathBuf> {
+    if std::env::var_os("CONTEXTSTREAM_INSTALL_DIR").is_some_and(|dir| !dir.is_empty()) {
+        return None;
+    }
+    running_binary_dir().filter(|dir| dir_is_writable(dir))
+}
+
+/// Directories the installer can have written to, most specific first.
+fn unix_install_dirs() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::var_os("CONTEXTSTREAM_INSTALL_DIR").filter(|dir| !dir.is_empty()) {
+        candidates.push(std::path::PathBuf::from(dir));
+    }
+    candidates.extend(running_binary_dir());
+    candidates.push(std::path::PathBuf::from("/usr/local/bin"));
+    candidates.extend(dirs::home_dir().map(|home| home.join(".local").join("bin")));
+    let mut unique = Vec::new();
+    for dir in candidates {
+        if !unique.contains(&dir) {
+            unique.push(dir);
+        }
+    }
+    unique
+}
+
+/// The installed binary that reports `version` (any existing one when empty).
+fn located_installed_binary(version: &str) -> Option<std::path::PathBuf> {
+    unix_install_dirs()
+        .into_iter()
+        .map(|dir| dir.join(binary_name()))
+        .filter(|path| path.is_file())
+        .find(|path| {
+            version.is_empty()
+                || query_binary_version(&path.to_string_lossy())
+                    .is_some_and(|reported| reported.contains(version))
+        })
+}
+
 /// Binary name with platform-appropriate extension.
 fn binary_name() -> &'static str {
     if cfg!(windows) {
@@ -2729,8 +2808,8 @@ fn binary_name() -> &'static str {
 /// location. If a stale copy shadows the new install, attempt to remove it
 /// (user-writable) or warn the user (system paths).
 /// Returns the verified version string from the resolved binary, or None on failure.
-fn verify_and_fix_binary_path(_expected_version: &str) -> Option<String> {
-    let expected_install = expected_install_path();
+fn verify_and_fix_binary_path(expected_install: &str, expected_version: &str) -> Option<String> {
+    let expected_install = expected_install.to_string();
     let resolved = match which::which("contextstream-mcp") {
         Ok(p) => p,
         Err(_) => {
@@ -2757,8 +2836,16 @@ fn verify_and_fix_binary_path(_expected_version: &str) -> Option<String> {
         return query_binary_version(&resolved.to_string_lossy());
     }
 
-    // PATH resolves to a different binary — shadowing detected
+    // PATH resolves to a different binary. Another copy of the same release
+    // is not stale and must never be removed.
     let resolved_str = resolved.to_string_lossy();
+    if !expected_version.is_empty() {
+        if let Some(version) = query_binary_version(&resolved_str) {
+            if version.contains(expected_version) {
+                return Some(version);
+            }
+        }
+    }
     eprintln!(
         "Warning: PATH resolves contextstream-mcp to '{}' instead of '{}'.",
         resolved_str, expected_install
@@ -2958,7 +3045,12 @@ async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
-            .env("CONTEXTSTREAM_INSTALL_SKIP_SETUP", "true");
+            .env("CONTEXTSTREAM_INSTALL_SKIP_SETUP", "true")
+            // Tells the installer this updater verifies wherever it installs.
+            .env("CONTEXTSTREAM_UPDATER", "2");
+        if let Some(dir) = update_install_dir() {
+            cmd.env("CONTEXTSTREAM_INSTALL_DIR", dir);
+        }
         let status = cmd.status();
 
         match status {
@@ -2976,8 +3068,15 @@ async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
     }
 
     // Verify the install: check for PATH shadowing and report actual version
-    let verified_version = verify_and_fix_binary_path(&latest);
-    let install_path = expected_install_path();
+    let install_path = if cfg!(windows) {
+        expected_install_path()
+    } else {
+        located_installed_binary(&latest)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(expected_install_path)
+    };
+    let _ = UPDATED_BINARY.set(std::path::PathBuf::from(&install_path));
+    let verified_version = verify_and_fix_binary_path(&install_path, &latest);
 
     match verified_version {
         Some(version_str) => {
@@ -3777,6 +3876,50 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn update_check_keeps_a_shadowing_copy_of_the_new_release() {
+        use std::os::unix::fs::PermissionsExt;
+        // HOME and PATH are process-wide; any env-changing test here takes this lock.
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _env = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempdir().expect("home");
+        let fake = |dir: &std::path::Path, version: &str| {
+            std::fs::create_dir_all(dir).expect("dir");
+            let path = dir.join("contextstream-mcp");
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\necho 'contextstream-mcp {version}'\n"),
+            )
+            .expect("fake binary");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            path
+        };
+        // The installer fell back to ~/.local/bin, which PATH resolves first;
+        // the check expected another directory holding the same release.
+        let user_copy = fake(&home.path().join(".local/bin"), "9.9.9");
+        let expected = fake(&home.path().join("system/bin"), "9.9.9");
+        let (old_home, old_path) = (std::env::var_os("HOME"), std::env::var_os("PATH"));
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("PATH", home.path().join(".local/bin"));
+
+        let verified = verify_and_fix_binary_path(&expected.to_string_lossy(), "9.9.9");
+
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(verified.as_deref(), Some("contextstream-mcp 9.9.9"));
+        assert!(
+            user_copy.exists(),
+            "a copy of the new release must never be removed"
+        );
+    }
 
     #[test]
     fn the_http_gateway_never_updates_itself() {

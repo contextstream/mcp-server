@@ -1,0 +1,225 @@
+{
+  "about": "The MCP gateway's answer to every OPTIONS request, as its real CorsLayer gives it (mcp-server repository, crates/mcp-server/src/transport/http.rs create_router: allow_origin Any, allow_methods Any, allow_headers Any). The MCP gateway Worker answers OPTIONS itself (deploy/cloudflare/shared/cors-preflight.ts). The mcp-server repository's `cors_preflight_contract` test holds the same cases against its layer; the Worker's tests compare against this file, header for header. Keep the two copies identical. (tower-http 0.6.11 there sends no Vary with a wildcard origin; the API's 0.6.8 does.)",
+  "service": "mcp",
+  "cases": [
+    {
+      "name": "streamable-post",
+      "note": "a browser MCP client's usual preflight",
+      "method": "OPTIONS",
+      "path": "/mcp",
+      "headers": {
+        "origin": "https://claude.ai",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "authorization,content-type,mcp-session-id,mcp-protocol-version"
+      },
+      "expect": {
+        "status": 200,
+        "body": "",
+        "headers": {
+          "access-control-allow-headers": "*",
+          "access-control-allow-methods": "*",
+          "access-control-allow-origin": "*",
+          "content-length": "0"
+        }
+      }
+    },
+    {
+      "name": "per-client-endpoint",
+      "note": "one of the per-client endpoints",
+      "method": "OPTIONS",
+      "path": "/claude",
+      "headers": {
+        "origin": "https://app.contextstream.io",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "content-type"
+      },
+      "expect": {
+        "status": 200,
+        "body": "",
+        "headers": {
+          "access-control-allow-headers": "*",
+          "access-control-allow-methods": "*",
+          "access-control-allow-origin": "*",
+          "content-length": "0"
+        }
+      }
+    },
+    {
+      "name": "rest-tool-call",
+      "note": "any origin: allow_origin Any",
+      "method": "OPTIONS",
+      "path": "/api/v1/tools/call",
+      "headers": {
+        "origin": "https://evil.example",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "x-api-key,content-type"
+      },
+      "expect": {
+        "status": 200,
+        "body": "",
+        "headers": {
+          "access-control-allow-headers": "*",
+          "access-control-allow-methods": "*",
+          "access-control-allow-origin": "*",
+          "content-length": "0"
+        }
+      }
+    },
+    {
+      "name": "well-known-get",
+      "note": "OAuth discovery, before the auth middleware",
+      "method": "OPTIONS",
+      "path": "/.well-known/oauth-protected-resource",
+      "headers": {
+        "origin": "https://claude.ai",
+        "access-control-request-method": "GET"
+      },
+      "expect": {
+        "status": 200,
+        "body": "",
+        "headers": {
+          "access-control-allow-headers": "*",
+          "access-control-allow-methods": "*",
+          "access-control-allow-origin": "*",
+          "content-length": "0"
+        }
+      }
+    },
+    {
+      "name": "opaque-null-origin",
+      "note": "an opaque origin",
+      "method": "OPTIONS",
+      "path": "/mcp",
+      "headers": {
+        "origin": "null",
+        "access-control-request-method": "POST"
+      },
+      "expect": {
+        "status": 200,
+        "body": "",
+        "headers": {
+          "access-control-allow-headers": "*",
+          "access-control-allow-methods": "*",
+          "access-control-allow-origin": "*",
+          "content-length": "0"
+        }
+      }
+    },
+    {
+      "name": "private-network",
+      "note": "no access-control-allow-private-network: the layer never grants it",
+      "method": "OPTIONS",
+      "path": "/mcp",
+      "headers": {
+        "origin": "https://app.contextstream.io",
+        "access-control-request-method": "POST",
+        "access-control-request-private-network": "true"
+      },
+      "expect": {
+        "status": 200,
+        "body": "",
+        "headers": {
+          "access-control-allow-headers": "*",
+          "access-control-allow-methods": "*",
+          "access-control-allow-origin": "*",
+          "content-length": "0"
+        }
+      }
+    },
+    {
+      "name": "missing-origin",
+      "note": "no Origin header: answered the same",
+      "method": "OPTIONS",
+      "path": "/mcp",
+      "headers": {
+        "access-control-request-method": "POST"
+      },
+      "expect": {
+        "status": 200,
+        "body": "",
+        "headers": {
+          "access-control-allow-headers": "*",
+          "access-control-allow-methods": "*",
+          "access-control-allow-origin": "*",
+          "content-length": "0"
+        }
+      }
+    },
+    {
+      "name": "not-a-preflight",
+      "note": "OPTIONS without Access-Control-Request-Method: the layer still answers it",
+      "method": "OPTIONS",
+      "path": "/mcp",
+      "headers": {
+        "origin": "https://app.contextstream.io"
+      },
+      "expect": {
+        "status": 200,
+        "body": "",
+        "headers": {
+          "access-control-allow-headers": "*",
+          "access-control-allow-methods": "*",
+          "access-control-allow-origin": "*",
+          "content-length": "0"
+        }
+      }
+    },
+    {
+      "name": "bare-options-health",
+      "note": "OPTIONS with no CORS headers at all",
+      "method": "OPTIONS",
+      "path": "/health",
+      "headers": {},
+      "expect": {
+        "status": 200,
+        "body": "",
+        "headers": {
+          "access-control-allow-headers": "*",
+          "access-control-allow-methods": "*",
+          "access-control-allow-origin": "*",
+          "content-length": "0"
+        }
+      }
+    },
+    {
+      "name": "any-method",
+      "note": "allow_methods Any: answered *",
+      "method": "OPTIONS",
+      "path": "/mcp",
+      "headers": {
+        "origin": "https://app.contextstream.io",
+        "access-control-request-method": "TRACE"
+      },
+      "expect": {
+        "status": 200,
+        "body": "",
+        "headers": {
+          "access-control-allow-headers": "*",
+          "access-control-allow-methods": "*",
+          "access-control-allow-origin": "*",
+          "content-length": "0"
+        }
+      }
+    },
+    {
+      "name": "unknown-path",
+      "note": "answered before routing",
+      "method": "OPTIONS",
+      "path": "/no/such/route",
+      "headers": {
+        "origin": "https://app.contextstream.io",
+        "access-control-request-method": "GET"
+      },
+      "expect": {
+        "status": 200,
+        "body": "",
+        "headers": {
+          "access-control-allow-headers": "*",
+          "access-control-allow-methods": "*",
+          "access-control-allow-origin": "*",
+          "content-length": "0"
+        }
+      }
+    }
+  ]
+}

@@ -77,6 +77,13 @@ struct ScanEpochState {
 
 /// Stable local scope for a checkout hash manifest.
 ///
+/// Digest domain of a version-2 authoritative snapshot (contextstream
+/// `projects.rs`, 6c9b061a3). Version 1 reconciles a whole project and is
+/// never sent by this client.
+const AUTHORITATIVE_SNAPSHOT_V2_DOMAIN: &[u8] = b"contextstream:authoritative-index-snapshot:v2\0";
+/// The most paths the server accepts in one snapshot.
+const AUTHORITATIVE_SNAPSHOT_MAX_PATHS: usize = 250_000;
+
 /// A backend project may be indexed from multiple workspaces, machines, and
 /// worktrees. Project UUID alone is therefore not enough to identify which
 /// local filesystem snapshot a manifest describes. The scope digest binds the
@@ -7563,6 +7570,41 @@ impl ContextStreamClient {
                 Self::mark_sensitive_cleanup_completed(project_id);
             }
         }
+        // A complete forced or hosted refresh also tells the server which
+        // paths this checkout holds, so rows the checkout no longer has (a file
+        // an out-of-order job resurrected, a delete that never arrived) are
+        // removed. Sent only after every content batch committed: a partial,
+        // failed or still-pending scan never sends one, or the server would
+        // delete real files.
+        let authoritative_snapshot = if Self::authoritative_snapshot_eligible(
+            force,
+            origin.as_deref(),
+            effective_scan_complete,
+            total_failed,
+            wait_summary.pending_jobs,
+        ) {
+            self.send_checkout_authoritative_snapshot(
+                project_id,
+                expected_workspace_id,
+                background,
+                origin.as_deref(),
+                initial_checkout_snapshot
+                    .as_ref()
+                    .map(|snapshot| &snapshot.provenance),
+                // A bounded scan's complete epoch keeps every path it saw; a
+                // single-pass scan's inventory is the paths it fingerprinted.
+                Some(&scan.observed_paths.clone().unwrap_or_else(|| {
+                    scan_fingerprints
+                        .keys()
+                        .cloned()
+                        .collect::<std::collections::HashSet<_>>()
+                })),
+                &desired_manifest.hashes,
+            )
+            .await
+        } else {
+            serde_json::json!({ "sent": false, "reason": "not_eligible" })
+        };
         let final_indexed = wait_summary.files_indexed.max(total_uploaded);
         on_progress(IngestProgressEvent::Complete {
             files_uploaded: total_uploaded,
@@ -7635,6 +7677,7 @@ impl ContextStreamClient {
             "content_bytes_read": content_bytes_read,
             "metadata_reused_files": reused_files,
             "scan_complete": effective_scan_complete,
+            "authoritative_snapshot": authoritative_snapshot,
             "deleted_paths_sent": deleted_path_count,
             "job_ids": total_job_ids,
             "progress_urls": progress_urls,
@@ -7643,6 +7686,189 @@ impl ContextStreamClient {
             "committed": pending_jobs == 0,
             "server_processing_status": server_processing_status,
         }))
+    }
+
+    /// Whether a finished scan may send an authoritative snapshot: only a
+    /// forced or hosted refresh whose scan was complete (uncapped, nothing
+    /// deferred), whose every file committed, and with no job still pending.
+    /// Anything less is not this checkout's whole inventory, and the server
+    /// deletes every row of this checkout that the snapshot does not name.
+    fn authoritative_snapshot_eligible(
+        force: bool,
+        origin: Option<&str>,
+        scan_complete: bool,
+        files_failed: i64,
+        pending_jobs: i64,
+    ) -> bool {
+        (force || origin == Some("hosted_refresh"))
+            && scan_complete
+            && files_failed == 0
+            && pending_jobs == 0
+    }
+
+    /// The server's canonical form of an ingest path
+    /// (`contextstream_ingest_pipeline::canonicalize_ingest_path`): forward
+    /// slashes, no `.` segments, `..` resolved in memory.
+    fn canonical_snapshot_path(path: &str) -> String {
+        let slash_normalized = path.replace('\\', "/");
+        let mut components: Vec<&str> = Vec::new();
+        for part in slash_normalized.split('/') {
+            if part.is_empty() || part == "." {
+                continue;
+            }
+            if part == ".." {
+                components.pop();
+                continue;
+            }
+            components.push(part);
+        }
+        if components.is_empty() {
+            slash_normalized.trim_start_matches("./").to_string()
+        } else {
+            components.join("/")
+        }
+    }
+
+    /// SHA-256 over `domain || u64_be(count) || (u64_be(len) || utf8)*` for
+    /// sorted, unique canonical paths, as the server computes it.
+    fn authoritative_snapshot_digest(domain: &[u8], paths: &[String]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        hasher.update((paths.len() as u64).to_be_bytes());
+        for path in paths {
+            hasher.update((path.len() as u64).to_be_bytes());
+            hasher.update(path.as_bytes());
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    /// A version-2 `authoritative_snapshot` for this checkout: its sorted
+    /// canonical paths and their digest, and the checkout identity the server
+    /// reconciles (the `machine_id` and `git_branch` every uploaded file
+    /// carries). Version 2 is the only one sent: a server that does not know
+    /// it refuses it, while version 1 reconciles the whole project. `None`
+    /// for no paths or more than the server accepts.
+    fn authoritative_snapshot_v2(
+        paths: impl IntoIterator<Item = String>,
+        machine_id: &str,
+        git_branch: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        let mut paths = paths
+            .into_iter()
+            .map(|path| Self::canonical_snapshot_path(&path))
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() || paths.len() > AUTHORITATIVE_SNAPSHOT_MAX_PATHS {
+            return None;
+        }
+        let digest = Self::authoritative_snapshot_digest(AUTHORITATIVE_SNAPSHOT_V2_DOMAIN, &paths);
+        Some(serde_json::json!({
+            "schema_version": 2,
+            "complete": true,
+            "file_count": paths.len(),
+            "paths_sha256": digest,
+            "paths": paths,
+            "checkout": {
+                "machine_id": machine_id,
+                "git_branch": git_branch,
+            },
+        }))
+    }
+
+    /// Send this checkout's authoritative snapshot as one request with no
+    /// files, after its content batches committed. The paths are those the
+    /// complete scan observed that the committed manifest holds. A refusal is
+    /// reported, never raised: the content is already committed, and the
+    /// server deletes nothing for a snapshot it refuses.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_checkout_authoritative_snapshot(
+        &self,
+        project_id: Uuid,
+        expected_workspace_id: Uuid,
+        background: bool,
+        origin: Option<&str>,
+        checkout: Option<&CheckoutProvenance>,
+        observed_paths: Option<&std::collections::HashSet<String>>,
+        committed: &std::collections::HashMap<String, String>,
+    ) -> serde_json::Value {
+        let Some(observed) = observed_paths else {
+            return serde_json::json!({ "sent": false, "reason": "inventory_unavailable" });
+        };
+        let Some(machine_id) = checkout
+            .and_then(|checkout| checkout.machine_id.clone())
+            .or_else(Self::machine_id)
+            .filter(|machine_id| !machine_id.trim().is_empty())
+        else {
+            return serde_json::json!({ "sent": false, "reason": "machine_identity_unavailable" });
+        };
+        let paths = observed
+            .iter()
+            .filter(|path| committed.contains_key(*path))
+            .cloned();
+        let Some(snapshot) = Self::authoritative_snapshot_v2(
+            paths,
+            &machine_id,
+            checkout.and_then(|checkout| checkout.git_branch.as_deref()),
+        ) else {
+            return serde_json::json!({ "sent": false, "reason": "empty_or_oversized" });
+        };
+        let file_count = snapshot["file_count"].clone();
+        let mut body = match Self::ingest_batch_body(
+            expected_workspace_id,
+            &[],
+            None,
+            checkout,
+            false,
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                return serde_json::json!({ "sent": false, "reason": "body", "error": error.to_string() })
+            }
+        };
+        body["authoritative_snapshot"] = snapshot;
+        let mut extra_headers: Vec<(String, String)> = Vec::new();
+        if background {
+            extra_headers.push(("x-contextstream-background".to_string(), "true".to_string()));
+        }
+        if let Some(origin) = origin {
+            extra_headers.push((
+                "x-contextstream-ingest-origin".to_string(),
+                origin.to_string(),
+            ));
+        }
+        match self
+            .post_with_options::<serde_json::Value, _>(
+                &format!("/projects/{}/files/ingest", project_id),
+                body,
+                RequestOptions {
+                    extra_headers: if extra_headers.is_empty() {
+                        None
+                    } else {
+                        Some(extra_headers)
+                    },
+                    timeout: Some(Duration::from_secs(60)),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(result) => serde_json::json!({
+                "sent": true,
+                "file_count": file_count,
+                "job_id": result.get("job_id").cloned().unwrap_or(serde_json::Value::Null),
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %error,
+                    "authoritative snapshot was refused; no rows were reconciled"
+                );
+                serde_json::json!({ "sent": false, "reason": "refused", "error": error.to_string() })
+            }
+        }
     }
 
     /// Delegate ingestion to the API server's ingest-from-path endpoint.
@@ -24505,6 +24731,257 @@ mod tests {
         let requests = server.await.expect("HTTP sequence task");
         assert!(
             requests.iter().all(|request| !request.starts_with("POST ")),
+            "{requests:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_home);
+    }
+
+    // Pinned by the server (contextstream projects.rs, 6c9b061a3) so clients
+    // can check their framing: the v1 vector proves the framing, the v2 one
+    // the domain this client sends.
+    #[test]
+    fn authoritative_snapshot_digest_matches_the_server_vectors() {
+        let paths = vec!["README.md".to_string(), "src/lib.rs".to_string()];
+        assert_eq!(
+            ContextStreamClient::authoritative_snapshot_digest(
+                b"contextstream:authoritative-index-snapshot:v1\0",
+                &paths
+            ),
+            "a4a7e20f706d267e1d61fb4234f425b41123b937af25cd8b6dee52f86e739491"
+        );
+        let snapshot = ContextStreamClient::authoritative_snapshot_v2(
+            ["src/lib.rs", "./README.md", "README.md", "src\\lib.rs"]
+                .into_iter()
+                .map(str::to_string),
+            "machine-a",
+            Some("main"),
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot["schema_version"], 2);
+        assert_eq!(snapshot["complete"], true);
+        assert_eq!(snapshot["file_count"], 2);
+        assert_eq!(
+            snapshot["paths"],
+            serde_json::json!(["README.md", "src/lib.rs"])
+        );
+        assert_eq!(
+            snapshot["paths_sha256"],
+            "e8e796f155d969c9ee235de03c59e8ae5c1f19af167024da0e2c93872c467e49"
+        );
+        assert_eq!(
+            snapshot["checkout"],
+            serde_json::json!({ "machine_id": "machine-a", "git_branch": "main" })
+        );
+        let detached =
+            ContextStreamClient::authoritative_snapshot_v2(["a.rs".to_string()], "machine-a", None)
+                .expect("snapshot");
+        assert_eq!(detached["checkout"]["git_branch"], serde_json::Value::Null);
+        assert!(ContextStreamClient::authoritative_snapshot_v2(
+            std::iter::empty::<String>(),
+            "machine-a",
+            None
+        )
+        .is_none());
+        assert!(ContextStreamClient::authoritative_snapshot_v2(
+            (0..=AUTHORITATIVE_SNAPSHOT_MAX_PATHS).map(|index| format!("f{index}.rs")),
+            "machine-a",
+            None
+        )
+        .is_none());
+    }
+
+    // The server deletes every row of this checkout a snapshot does not name,
+    // so anything short of a whole, committed inventory must never send one.
+    #[test]
+    fn only_a_complete_committed_forced_or_hosted_refresh_sends_a_snapshot() {
+        let eligible = ContextStreamClient::authoritative_snapshot_eligible;
+        assert!(eligible(true, None, true, 0, 0));
+        assert!(eligible(false, Some("hosted_refresh"), true, 0, 0));
+        for (case, ok) in [
+            ("partial or capped scan", eligible(true, None, false, 0, 0)),
+            ("a failed file", eligible(true, None, true, 1, 0)),
+            ("a job still pending", eligible(true, None, true, 0, 1)),
+            (
+                "keep_warm",
+                eligible(false, Some("keep_warm_daemon"), true, 0, 0),
+            ),
+            ("watch", eligible(false, Some("watch"), true, 0, 0)),
+            (
+                "explicit ingest without force",
+                eligible(false, None, true, 0, 0),
+            ),
+        ] {
+            assert!(!ok, "{case} must not send a snapshot");
+        }
+    }
+
+    fn request_body(request: &str) -> serde_json::Value {
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or("");
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null)
+    }
+
+    // A forced refresh sends its content, then one files:[] request carrying
+    // the v2 snapshot of what it committed.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forced_refresh_sends_its_snapshot_after_the_content_committed() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-snapshot-v2-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("create temp home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let root = initialize_bound_ingest_fixture(&temp_home, project_id, workspace_id)
+            .expect("initialize checkout");
+        let committed = serde_json::json!({ "files_indexed": 1, "committed": true }).to_string();
+        let status = primary_attestation_fixture(project_id, workspace_id, 43, 'c').to_string();
+        let (client, server) = client_with_http_sequence(vec![
+            ("200 OK", committed.clone()),
+            ("200 OK", status),
+            ("200 OK", committed),
+        ])
+        .await;
+        let result = client
+            .ingest_local(IngestLocalParams {
+                path: root.to_string_lossy().to_string(),
+                workspace_id: Some(workspace_id),
+                project_id: Some(project_id),
+                force: Some(true),
+                include_media: Some(false),
+                ..Default::default()
+            })
+            .await
+            .expect("forced refresh");
+        assert_eq!(result["authoritative_snapshot"]["sent"], true, "{result}");
+        let requests = server.await.expect("HTTP sequence task");
+        let ingests = requests
+            .iter()
+            .filter(|request| {
+                request.starts_with(&format!("POST /api/v1/projects/{project_id}/files/ingest "))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ingests.len(), 2, "{requests:?}");
+        // The content batch carries no snapshot; the last request carries
+        // only the snapshot.
+        assert!(request_body(ingests[0])
+            .get("authoritative_snapshot")
+            .is_none());
+        let last = request_body(ingests[1]);
+        assert_eq!(last["files"], serde_json::json!([]));
+        let snapshot = &last["authoritative_snapshot"];
+        assert_eq!(snapshot["schema_version"], 2);
+        assert_eq!(snapshot["paths"], serde_json::json!(["lib.rs"]));
+        assert_eq!(
+            snapshot["paths_sha256"],
+            ContextStreamClient::authoritative_snapshot_digest(
+                AUTHORITATIVE_SNAPSHOT_V2_DOMAIN,
+                &["lib.rs".to_string()]
+            )
+        );
+        let machine = snapshot["checkout"]["machine_id"]
+            .as_str()
+            .expect("machine id");
+        assert!(!machine.trim().is_empty());
+        let uploaded = request_body(ingests[0]);
+        assert_eq!(uploaded["files"][0]["machine_id"].as_str(), Some(machine));
+        assert_eq!(
+            snapshot["checkout"]["git_branch"],
+            uploaded["files"][0]
+                .get("git_branch")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        );
+
+        let _ = std::fs::remove_dir_all(temp_home);
+    }
+
+    // A refresh whose content failed is not this checkout's inventory: it
+    // must not send a snapshot (the server would delete real files).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_forced_refresh_never_sends_a_snapshot() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home = std::env::temp_dir().join(format!(
+            "contextstream-snapshot-v2-failed-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_home).expect("create temp home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let root = initialize_bound_ingest_fixture(&temp_home, project_id, workspace_id)
+            .expect("initialize checkout");
+        let partial = serde_json::json!({
+            "files_indexed": 0,
+            "committed": true,
+            "status": "partial",
+            "files_failed": 1,
+        })
+        .to_string();
+        // Answers every request with the partial result and keeps them all,
+        // however many the client sends.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = seen.clone();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = vec![0u8; 1024 * 1024];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
+                    partial.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let mut config = Config::default();
+        config.api_url = format!("http://{addr}");
+        config.api_key = Some("test-key".to_string());
+        let client = ContextStreamClient::new(config);
+        let _ = client
+            .ingest_local(IngestLocalParams {
+                path: root.to_string_lossy().to_string(),
+                workspace_id: Some(workspace_id),
+                project_id: Some(project_id),
+                force: Some(true),
+                include_media: Some(false),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a failed file fails the refresh");
+        server.abort();
+        let requests = seen.lock().unwrap().clone();
+        assert!(
+            requests.iter().any(|request| request
+                .starts_with(&format!("POST /api/v1/projects/{project_id}/files/ingest "))),
+            "{requests:?}"
+        );
+        assert!(
+            requests.iter().all(|request| request_body(request)
+                .get("authoritative_snapshot")
+                .is_none()),
             "{requests:?}"
         );
 

@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.0.29
+
+- Hosted gateway: the tenant home the API names on a response
+  (`x-contextstream-tenant-home-region`) is relayed for every region the API
+  can name, `us-virginia` and `us-oregon` included. It was parsed with the
+  three-name vocabulary the edge uses to suggest a home for a new tenant, so
+  the home of every tenant on the AWS regions was dropped and the edge never
+  learned it: an Oregon-homed tenant's calls kept going to the default
+  (Virginia) origin. The suggestion for new tenants is unchanged.
+- `contextstream-mcp update` installs where the running binary lives when that
+  directory is writable, verifies the binary that reports the new version
+  wherever the installer put it, and never deletes a copy that already reports
+  the new version. It used to install to `/usr/local/bin` only, fail without
+  sudo, and then remove a fresh `~/.local/bin` install as stale.
+- Setup keeps a project `.mcp.json` that carries an API key out of git: when
+  the written entry has a key it adds the file to `.git/info/exclude` (local
+  only, never `.gitignore`) unless git already tracks or ignores it.
+- The Claude Code prompt hook sends the prompt (collapsed, at most 500
+  characters) as `task_summary` and, once init has named one, the agent's
+  ContextStream session as `coordination_session_id`, so the session checks in
+  for live coordination on every turn and pending notices show on the next
+  one. `CONTEXTSTREAM_COORDINATION_CHECKIN=false` keeps prompts out of the
+  hook request.
+- No tool is added or removed.
+
 ## 1.0.28
 
 - A gateway that calls the ContextStream API directly can now present the API's

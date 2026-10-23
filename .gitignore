@@ -37,3 +37,6 @@ __pycache__/
 
 # Built plugin packages (plugins/build_agent_coach_kit.py)
 /dist/
+
+# Depot agent runs (scripts/dev/depot-run writes one-off workflows here)
+.depot/agent-runs/

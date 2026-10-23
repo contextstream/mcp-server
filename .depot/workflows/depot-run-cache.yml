@@ -1,0 +1,94 @@
+name: depot-run setup cache
+
+# The only writer of the setup caches that scripts/dev/depot-run restores (contextstream's
+# docs/runbooks/depot-run.md): a recent git object base and the toolchain/crates bundle. It runs on main from
+# a clean checkout, builds each bundle before any repository code runs, and saves it under an
+# immutable key; a key that already exists is left as it is. Agent runs only read these entries.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - rust-toolchain.toml
+      - Cargo.lock
+      - scripts/dev/depot-run
+      - .depot/workflows/depot-run-cache.yml
+  schedule:
+    - cron: '53 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: depot-run-cache
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Only a clean checkout of main writes the caches
+        id: keys
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != refs/heads/main ]; then echo "not main ($GITHUB_REF): nothing is written" >&2; exit 1; fi
+          if [ -n "$(git status --porcelain)" ]; then echo "the checkout differs from its commit (a patched run?): nothing is written" >&2; exit 1; fi
+          scripts/dev/depot-run --cache-keys | tee -a "$GITHUB_OUTPUT"
+          scripts/dev/depot-run --setup-script > "$RUNNER_TEMP/depot-run-setup.sh"
+      - name: Is today's git base saved?
+        id: have-git
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.depot-run-cache/git
+          key: ${{ steps.keys.outputs.git }}
+          lookup-only: true
+      - name: Is this toolchain and crates bundle saved?
+        id: have-deps
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.depot-run-cache/deps
+          key: ${{ steps.keys.outputs.deps }}
+          lookup-only: true
+      - name: Is this npm cache saved?
+        id: have-npm
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.npm/_cacache
+          key: ${{ steps.keys.outputs.npm }}
+          lookup-only: true
+      - name: Node
+        if: steps.have-deps.outputs.cache-hit != 'true' || steps.have-npm.outputs.cache-hit != 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ steps.keys.outputs.node_version }}
+      - name: Build the missing bundles
+        env:
+          DEPOT_RUN_SEED_GIT: ${{ steps.have-git.outputs.cache-hit != 'true' && '1' || '0' }}
+          DEPOT_RUN_SEED_DEPS: ${{ steps.have-deps.outputs.cache-hit != 'true' && '1' || '0' }}
+          DEPOT_RUN_SEED_NPM: ${{ steps.have-npm.outputs.cache-hit != 'true' && hashFiles('package-lock.json') != '' && '1' || '0' }}
+        run: bash "$RUNNER_TEMP/depot-run-setup.sh" seed
+      - name: Save the git base
+        if: steps.have-git.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.depot-run-cache/git
+          key: ${{ steps.keys.outputs.git }}
+      - name: Save the toolchain and crates bundle
+        if: steps.have-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.depot-run-cache/deps
+          key: ${{ steps.keys.outputs.deps }}
+      - name: Save the npm cache
+        if: steps.have-npm.outputs.cache-hit != 'true' && hashFiles('package-lock.json') != ''
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.npm/_cacache
+          key: ${{ steps.keys.outputs.npm }}

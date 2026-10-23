@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+# Run a build or test command on a Depot CI runner instead of this machine.
+#
+#   scripts/dev/depot-run [--full] [--cpus N] [--timeout MIN] [--label TEXT] [--npm-cache]
+#                         [--no-cache] [--print] -- <command...>
+#
+# The command runs from the repository root of the current checkout. Depot uploads your local
+# commits and uncommitted edits as a patch, so the runner sees your working tree, not just main.
+# New untracked files are marked intent-to-add for the upload and unmarked afterwards.
+#
+# Sizing: a focused run (a check, one crate's tests, one test) keeps the default 16 CPUs and a
+# 90-minute timeout. A full suite (cargo test --workspace, clippy on everything) takes --full:
+# 32 CPUs and 120 minutes. --cpus and --timeout override both.
+#
+#   --full         32 CPUs and a 120-minute timeout, for full test suites
+#   --cpus N       runner size: 4, 8, 16 (default), 32 or 64; overrides --full
+#   --timeout MIN  job timeout in minutes (default 90, or 120 with --full)
+#   --label TEXT   name shown in Depot (default: the command)
+#   --no-cache     cold setup: skip the setup caches (to compare, or to rule them out)
+#   --print        print the generated workflow and exit
+#
+# Setup caches. A run restores, from Depot Cache (scoped to this repository), a recent git object
+# base for the checkout, then the Rust toolchain named by rust-toolchain.toml, the crates.io
+# registry for Cargo.lock, Node, the mold/cmake packages and the pinned sccache. Runs only READ
+# these caches. One workflow on main writes them (.depot/workflows/depot-run-cache.yml), from a
+# clean checkout and before any repository code runs, under immutable keys. So concurrent runs
+# cannot corrupt them, a patch never reaches them, and a miss or a cache outage only means the
+# slower setup. This is the mcp-server copy of contextstream's scripts/dev/depot-run (runbook:
+# docs/runbooks/depot-run.md there).
+#
+# Rust compiles go through sccache. This repository has no B2 compile-cache secret, so sccache
+# uses the cache Depot provides in every job; with SCCACHE_B2_KEY_ID/SCCACHE_B2_KEY set as Depot
+# CI secrets it would use the B2 bucket contextstream-build-cache, prefix agent/mcp-server-linux-amd64/.
+#
+# Exit status: 0 only when the run finished successfully; 1 when it failed, 3 when Depot ran
+# without your local changes, 4 when no run id came back, 5 when Depot denied access.
+#
+# Internal: --cache-keys prints this checkout's cache keys and --setup-script prints the runner
+# setup script; the cache workflow uses both, so keys and setup come from this one file.
+set -euo pipefail
+# The whole script is one compound command, so bash parses it before running anything: editing
+# this file while a run of it is still waiting cannot change what that run executes.
+{
+
+# Pinned tools. Changing any of these changes the cache keys, and the cache workflow on main
+# rebuilds the bundle on its next run.
+SCCACHE_VERSION=v0.18.0
+SCCACHE_SHA256=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+NODE_VERSION=22.23.2
+APT_PACKAGES="build-essential pkg-config libssl-dev libpq-dev cmake clang mold protobuf-compiler"
+NPM_LOCK=package-lock.json
+CACHE_ACTION=actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+
+cpus=""
+timeout=""
+full=0
+label=""
+print_only=0
+use_cache=1
+npm_cache=auto
+mode=run
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --full) full=1; shift ;;
+    --cpus) cpus="$2"; shift 2 ;;
+    --timeout) timeout="$2"; shift 2 ;;
+    --label) label="$2"; shift 2 ;;
+    --npm-cache) npm_cache=1; shift ;;
+    --no-npm-cache) npm_cache=0; shift ;;
+    --no-cache) use_cache=0; shift ;;
+    --print) print_only=1; shift ;;
+    --cache-keys) mode=keys; shift ;;
+    --setup-script) mode=setup; shift ;;
+    --) shift; break ;;
+    -h|--help) sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "depot-run: unknown option $1 (put the command after --)" >&2; exit 2 ;;
+  esac
+done
+
+sha16() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi | cut -c1-16; }
+
+# Cache keys for the checkout at $1. The tools key covers everything the bundle's tools depend on;
+# the deps key adds Cargo.lock. Restores fall back to the newest bundle with the same tools.
+cache_keys() {
+  local dir=$1 spec tools lock npm
+  spec="bundle-v1 linux-x64 ubuntu-24.04 sccache=$SCCACHE_VERSION:$SCCACHE_SHA256 node=$NODE_VERSION apt=$APT_PACKAGES"
+  tools=$( { echo "$spec"; cat "$dir/rust-toolchain.toml" 2>/dev/null || echo no-toolchain-file; } | sha16)
+  lock=$( { cat "$dir/Cargo.lock" 2>/dev/null || echo no-lockfile; } | sha16)
+  npm=$( { cat "$dir/$NPM_LOCK" 2>/dev/null || echo no-npm-lockfile; } | sha16)
+  echo "deps=depot-run-deps-v1-$tools-$lock"
+  echo "deps_prefix=depot-run-deps-v1-$tools-"
+  echo "npm=depot-run-npm-v1-$npm"
+  echo "git=depot-run-git-v1-$(date -u +%Y%m%d)"
+  echo "node_version=$NODE_VERSION"
+}
+
+# The script every runner executes: `pre` before the checkout, `tools` after it, `seed` only in
+# the cache workflow. It is printed with the pinned versions above it, so the generated workflow
+# and the cache workflow run the same code.
+setup_script() {
+  printf 'DEPOT_RUN_SCCACHE_VERSION=%q\nDEPOT_RUN_SCCACHE_SHA256=%q\nDEPOT_RUN_NODE_VERSION=%q\nDEPOT_RUN_APT_PACKAGES=%q\nDEPOT_RUN_NPM_LOCK=%q\n' \
+    "$SCCACHE_VERSION" "$SCCACHE_SHA256" "$NODE_VERSION" "$APT_PACKAGES" "$NPM_LOCK"
+  cat <<'SETUP'
+set -euo pipefail
+C="$HOME/.depot-run-cache"
+RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}
+CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
+log() { echo "depot-run-cache: $*"; }
+now() { date +%s.%N; }
+since() { awk -v a="$1" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1fs", b - a }'; }
+
+# unpack ARCHIVE DEST GLOB...: extract into a temporary directory beside DEST, then move each
+# matching entry into DEST unless DEST already has it. A damaged archive (zstd checks its frame
+# checksum) changes nothing in DEST.
+unpack() {
+  local archive=$1 dest=$2 tmp rel pattern moved=0; shift 2
+  [ -s "$archive" ] || return 1
+  mkdir -p "$dest"
+  tmp=$(mktemp -d "$dest/.depot-run-unpack.XXXXXX")
+  if ! zstd -d -q -c "$archive" | tar -C "$tmp" -xf -; then chmod -R u+w "$tmp" 2>/dev/null; rm -rf "$tmp" || true; return 1; fi
+  for pattern in "$@"; do
+    while IFS= read -r rel; do
+      [ -n "$rel" ] && [ ! -e "$dest/$rel" ] || continue
+      mkdir -p "$(dirname "$dest/$rel")"
+      # Moving a directory to a new parent needs write permission on it (read-only Hermit packages).
+      chmod u+w "$tmp/$rel" 2>/dev/null || true
+      mv "$tmp/$rel" "$dest/$rel"; moved=1
+    done < <(cd "$tmp" && compgen -G "$pattern" || true)
+  done
+  chmod -R u+w "$tmp" 2>/dev/null || true; rm -rf "$tmp"
+  [ "$moved" = 1 ]
+}
+
+toolchain_name() {
+  local channel
+  channel=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)
+  [ -n "$channel" ] && echo "$channel-x86_64-unknown-linux-gnu"
+}
+
+# Before actions/checkout: seed the workspace's .git with the cached object base, so the depth-1
+# fetch downloads only what changed since that base instead of the whole tree. Anything wrong
+# with the base leaves no .git behind and the checkout clones as usual.
+pre() {
+  local w=$GITHUB_WORKSPACE base t
+  t=$(now)
+  if [ -s "$C/git/git.tzst" ] && [ -s "$C/git/base" ] && [ ! -e "$w/.git" ]; then
+    base=$(cat "$C/git/base")
+    trap 'rm -rf "$w/.git"' ERR
+    if [[ "$base" =~ ^[0-9a-f]{40}$ ]] && mkdir -p "$w" && git init -q "$w" \
+      && git -C "$w" remote add origin "${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY" \
+      && zstd -d -q -c "$C/git/git.tzst" | tar -C "$w/.git" -xf - \
+      && git -C "$w" cat-file -e "$base^{tree}" 2>/dev/null \
+      && git -C "$w" update-ref refs/depot-run/base "$base"; then
+      log "git: checkout seeded from base ${base:0:12} ($(since "$t"))"
+    else
+      rm -rf "$w/.git"; log "git: cached base unusable; full checkout"
+    fi
+    trap - ERR
+  else
+    log "git: no cached base; full checkout"
+  fi
+  rm -rf "$C/git"
+  t=$(now)
+  if [ -n "${RUNNER_TOOL_CACHE:-}" ] && unpack "$C/deps/node.tzst" "$RUNNER_TOOL_CACHE" "node/$DEPOT_RUN_NODE_VERSION"; then
+    log "node: $DEPOT_RUN_NODE_VERSION from cache ($(since "$t"))"
+  fi
+}
+
+# After the checkout: the build tools. Each one comes from the restored bundle when it is there
+# and valid, and otherwise from its normal source; the outcome is the same either way.
+tools() {
+  local d=$C/deps t tc tgz src
+  git update-ref -d refs/depot-run/base 2>/dev/null || true
+  # apt runs in the background while the other tools unpack; the step waits for it below.
+  apt_install "$d" & local apt_pid=$!
+
+  t=$(now); tgz=$d/sccache.tgz; src=cache
+  if ! { [ -s "$tgz" ] && echo "$DEPOT_RUN_SCCACHE_SHA256  $tgz" | sha256sum -c --quiet - >/dev/null 2>&1; }; then
+    tgz=/tmp/sccache.tgz; src=github
+    curl -fsSL --retry 3 --max-time 120 -o "$tgz" \
+      "https://github.com/mozilla/sccache/releases/download/$DEPOT_RUN_SCCACHE_VERSION/sccache-$DEPOT_RUN_SCCACHE_VERSION-x86_64-unknown-linux-musl.tar.gz"
+    echo "$DEPOT_RUN_SCCACHE_SHA256  $tgz" | sha256sum -c --quiet -
+  fi
+  tar -xzf "$tgz" -C /tmp
+  sudo install -m 0755 "/tmp/sccache-$DEPOT_RUN_SCCACHE_VERSION-x86_64-unknown-linux-musl/sccache" /usr/local/bin/sccache
+  [ "$tgz" = /tmp/sccache.tgz ] || cp "$tgz" /tmp/sccache.tgz
+  log "sccache: $DEPOT_RUN_SCCACHE_VERSION from $src, sha256 verified ($(since "$t"))"
+
+  if [ -f rust-toolchain.toml ]; then
+    t=$(now); src=rustup
+    tc=$(toolchain_name || true)
+    if [ -n "$tc" ] && [ ! -e "$RUSTUP_HOME/toolchains/$tc" ] \
+      && unpack "$d/rustup.tzst" "$RUSTUP_HOME" "toolchains/$tc" "update-hashes/$tc"; then src=cache; fi
+    # A no-op for a complete cached toolchain; otherwise rustup installs it from the official dist.
+    rustup toolchain install >/dev/null 2>&1 || rustup show >/dev/null
+    log "rust: ${tc:-toolchain} from $src ($(since "$t"))"
+  fi
+
+  if [ -f Cargo.lock ]; then
+    t=$(now)
+    if unpack "$d/cargo.tzst" "$CARGO_HOME" 'registry/index/*' 'registry/cache/*' 'git/db/*'; then
+      log "cargo: registry index and crate archives from cache ($(since "$t"))"
+    else
+      log "cargo: no cached registry; cargo downloads what the command needs"
+    fi
+  fi
+  wait "$apt_pid"
+  rm -rf "$d"
+}
+
+apt_install() {
+  local d=$1 t src missing=() p
+  t=$(now)
+  for p in $DEPOT_RUN_APT_PACKAGES; do
+    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'ok installed' || missing+=("$p")
+  done
+  [ ${#missing[@]} -gt 0 ] || return 0
+  src=mirror
+  # apt checks every cached .deb against its package lists before using it.
+  if compgen -G "$d/debs/*.deb" >/dev/null; then sudo cp "$d"/debs/*.deb /var/cache/apt/archives/; src=cache; fi
+  if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}" >/tmp/depot-run-apt.log 2>&1; then
+    src=mirror-after-update
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}" >/tmp/depot-run-apt.log 2>&1
+  fi
+  log "apt: ${missing[*]} from $src ($(since "$t"))"
+}
+
+start_sccache() {
+  # Without the B2 secret (a repository it is not scoped to) sccache falls back to the cache
+  # Depot provides in every job (SCCACHE_WEBDAV_ENDPOINT), or to local disk without that.
+  if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+    unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+  fi
+  sccache --start-server >/dev/null
+}
+
+# Cache workflow only: install everything the slow way from a clean main checkout, then pack the
+# bundles the runs restore. Nothing here runs repository code: cargo fetch downloads and checks
+# crates against Cargo.lock without building, npm ci runs with --ignore-scripts.
+# The bundles go exactly where the runs restore them from ($C/git, $C/deps), because a cache
+# entry is tied to its path.
+seed() {
+  local t tc
+  if [ "${DEPOT_RUN_SEED_GIT:-0}" = 1 ]; then
+    t=$(now)
+    [ "$(git count-objects -v | sed -n 's/^count: //p')" = 0 ] || { echo "seed: loose git objects present; refusing" >&2; return 1; }
+    rm -rf "$C/git"; mkdir -p "$C/git"
+    tar -C .git -cf - objects/pack shallow | zstd -T0 -1 -q -o "$C/git/git.tzst"
+    git rev-parse HEAD > "$C/git/base"
+    log "seed git: base $(cut -c1-12 "$C/git/base"), $(du -sh "$C/git" | cut -f1) ($(since "$t"))"
+  fi
+  if [ "${DEPOT_RUN_SEED_DEPS:-0}" = 1 ]; then
+    rm -rf "$C/deps"
+    sudo sh -c 'rm -f /var/cache/apt/archives/*.deb'
+    tools
+    t=$(now); mkdir -p "$C/deps/debs"
+    if compgen -G "/var/cache/apt/archives/*.deb" >/dev/null; then cp /var/cache/apt/archives/*.deb "$C/deps/debs/"; fi
+    cp /tmp/sccache.tgz "$C/deps/sccache.tgz"
+    if [ -d "$RUNNER_TOOL_CACHE/node/$DEPOT_RUN_NODE_VERSION" ]; then
+      tar -C "$RUNNER_TOOL_CACHE" -cf - "node/$DEPOT_RUN_NODE_VERSION" | zstd -T0 -3 -q -o "$C/deps/node.tzst"
+    fi
+    if [ -f rust-toolchain.toml ] && tc=$(toolchain_name) && [ -d "$RUSTUP_HOME/toolchains/$tc" ]; then
+      # The HTML docs (about half the toolchain) are left out; nothing in a build reads them.
+      (cd "$RUSTUP_HOME" && tar --exclude="toolchains/$tc/share/doc" -cf - "toolchains/$tc" $(ls -d "update-hashes/$tc" 2>/dev/null)) \
+        | zstd -T0 -3 -q -o "$C/deps/rustup.tzst"
+    fi
+    if [ -f Cargo.lock ]; then
+      cargo fetch --locked >/dev/null
+      (cd "$CARGO_HOME" && tar -cf - registry/index registry/cache $(ls -d git/db 2>/dev/null)) | zstd -T0 -3 -q -o "$C/deps/cargo.tzst"
+    fi
+    log "seed deps: $(cd "$C/deps" && du -sh -- * | tr '\t\n' ': ') ($(since "$t"))"
+  fi
+  if [ "${DEPOT_RUN_SEED_NPM:-0}" = 1 ] && [ -f "$DEPOT_RUN_NPM_LOCK" ]; then
+    t=$(now)
+    (cd "$(dirname "$DEPOT_RUN_NPM_LOCK")" && npm ci --ignore-scripts --no-audit --no-fund >/dev/null)
+    rm -rf "$HOME/.npm/_cacache/tmp"
+    log "seed npm: $(du -sh "$HOME/.npm/_cacache" | cut -f1) ($(since "$t"))"
+  fi
+}
+
+case "${1:-}" in
+  pre) pre ;;
+  tools) tools; start_sccache ;;
+  seed) seed ;;
+  *) echo "usage: setup.sh pre|tools|seed" >&2; exit 2 ;;
+esac
+SETUP
+}
+
+if [[ $mode == setup ]]; then setup_script; exit 0; fi
+root=$(git rev-parse --show-toplevel)
+if [[ $mode == keys ]]; then cache_keys "$root"; exit 0; fi
+
+[[ $# -gt 0 ]] || { echo "depot-run: no command given (usage: depot-run [opts] -- <command...>)" >&2; exit 2; }
+[[ -n "$cpus" ]] || { [[ $full -eq 1 ]] && cpus=32 || cpus=16; }
+[[ -n "$timeout" ]] || { [[ $full -eq 1 ]] && timeout=120 || timeout=90; }
+case "$cpus" in 4|8|16|32|64) ;; *) echo "depot-run: --cpus must be 4, 8, 16, 32 or 64" >&2; exit 2 ;; esac
+[[ "$timeout" =~ ^[0-9]+$ ]] || { echo "depot-run: --timeout must be a number of minutes" >&2; exit 2; }
+if [[ $npm_cache == auto ]]; then
+  npm_cache=0
+  [[ " $* " =~ [^[:alnum:]_-](npm|npx|pnpm|yarn|node)[^[:alnum:]_-] ]] && npm_cache=1
+fi
+[[ -f "$root/$NPM_LOCK" ]] || npm_cache=0
+
+remote=$(git -C "$root" remote get-url origin)
+repo=$(printf '%s' "$remote" | sed -E 's#^(ssh://)?(git@github\.com[:/]|https://github\.com/)##; s#\.git$##')
+cmd=$(printf '%q ' "$@")
+[[ -n "$label" ]] || label=$(printf '%s' "$*" | cut -c1-80)
+cmd_b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
+label_yaml=$(printf '%s' "$label" | sed "s/'/''/g")
+keys=$(cache_keys "$root")
+key() { printf '%s\n' "$keys" | sed -n "s/^$1=//p"; }
+
+restore_steps=""
+if [[ $use_cache -eq 1 ]]; then
+  # Restores never fail the run: a miss, an error or a timeout only means the slower setup. They
+  # write separate directories, so they run side by side (Depot CI parallel steps).
+  restore_steps="      - fail-fast: false
+        parallel:
+          - name: Restore the cached git base
+            continue-on-error: true
+            timeout-minutes: 3
+            uses: ${CACHE_ACTION}
+            env:
+              SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
+            with:
+              path: ~/.depot-run-cache/git
+              key: depot-run-git-v1-newest
+              restore-keys: depot-run-git-v1-
+          - name: Restore the cached toolchains and crates
+            continue-on-error: true
+            timeout-minutes: 3
+            uses: ${CACHE_ACTION}
+            env:
+              SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
+            with:
+              path: ~/.depot-run-cache/deps
+              key: $(key deps)
+              restore-keys: |
+                $(key deps_prefix)
+                depot-run-deps-v1-
+"
+  if [[ $npm_cache -eq 1 ]]; then
+    restore_steps+="          - name: Restore the cached npm packages
+            continue-on-error: true
+            timeout-minutes: 3
+            uses: ${CACHE_ACTION}
+            env:
+              SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
+            with:
+              path: ~/.npm/_cacache
+              key: $(key npm)
+              restore-keys: depot-run-npm-v1-
+"
+  fi
+fi
+# The setup script travels base64-encoded in the job environment, so the job log does not repeat
+# its 250 lines on every run; `depot-run --setup-script` prints it.
+setup_b64=$(setup_script | base64 | tr -d '\n')
+
+# depot reads git state from the workflow file's own directory, so the generated file must live
+# inside this checkout (.depot/agent-runs/ is gitignored and never travels in the patch).
+mkdir -p "$root/.depot/agent-runs"
+workflow=$(mktemp "$root/.depot/agent-runs/run-XXXXXX")
+mv "$workflow" "$workflow.yml"; workflow="$workflow.yml"
+trap 'rm -f "$workflow"' EXIT
+cat > "$workflow" <<EOF
+name: 'depot-run: ${label_yaml}'
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: depot-ubuntu-24.04-${cpus}
+    timeout-minutes: ${timeout}
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '1'
+      RUST_MIN_STACK: '16777216'
+      RUSTFLAGS: -C linker=clang -C link-arg=-fuse-ld=mold
+      RUSTC_WRAPPER: sccache
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      AGENT_CMD_B64: ${cmd_b64}
+      DEPOT_RUN_SETUP_B64: ${setup_b64}
+    steps:
+${restore_steps}      - name: Prepare the checkout from the cached base
+        continue-on-error: true
+        run: |
+          mkdir -p ~/.depot-run-cache
+          printf '%s' "\$DEPOT_RUN_SETUP_B64" | base64 -d > ~/.depot-run-cache/setup.sh
+          bash ~/.depot-run-cache/setup.sh pre
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 1
+          clean: false
+          persist-credentials: false
+      - name: Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '${NODE_VERSION}'
+      - name: Toolchains and shared compile cache
+        env:
+          SCCACHE_BUCKET: contextstream-build-cache
+          SCCACHE_ENDPOINT: https://s3.us-east-005.backblazeb2.com
+          SCCACHE_REGION: us-east-005
+          SCCACHE_S3_KEY_PREFIX: agent/mcp-server-linux-amd64/
+          SCCACHE_IDLE_TIMEOUT: '0'
+          AWS_ACCESS_KEY_ID: \${{ secrets.SCCACHE_B2_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: \${{ secrets.SCCACHE_B2_KEY }}
+        run: bash ~/.depot-run-cache/setup.sh tools
+      - name: Command
+        shell: bash
+        run: bash -c "\$(printf '%s' "\$AGENT_CMD_B64" | base64 -d)"
+      - name: Compile cache stats
+        if: always()
+        run: sccache --show-stats 2>/dev/null | grep -E 'Compile requests|Cache hits|Cache misses|Cache errors|Cache location' || true
+EOF
+
+if [[ $print_only -eq 1 ]]; then cat "$workflow"; exit 0; fi
+
+# depot needs origin/HEAD to find the merge base for the patch; without it the run silently
+# uses main as pushed and drops your local changes.
+git -C "$root" symbolic-ref -q refs/remotes/origin/HEAD >/dev/null || git -C "$root" remote set-head origin --auto >/dev/null
+cd "$root"
+out=$(mktemp "${TMPDIR:-/tmp}/depot-run-out.XXXXXX")
+# The patch is `git diff <merge-base>`, which only sees tracked files. Mark new untracked files
+# intent-to-add for the upload, then unmark exactly those afterwards.
+new_files=()
+while IFS= read -r -d '' f; do new_files+=("$f"); done < <(git ls-files -z --others --exclude-standard)
+unmark() { [[ ${#new_files[@]} -eq 0 ]] || git reset -q -- "${new_files[@]}" 2>/dev/null || true; }
+# `depot ci run -f` prints the run id, then streams the job log. The stream can stall and never
+# return after the job has ended (seen 2026-10-23: runs held for over an hour), so it runs in the
+# background for the live log only, and the verdict comes from `depot ci status --wait`.
+follow_pid=""
+stop_follow() {
+  [[ -n "$follow_pid" ]] || return 0
+  pkill -P "$follow_pid" 2>/dev/null || true; kill "$follow_pid" 2>/dev/null || true
+  wait "$follow_pid" 2>/dev/null || true; follow_pid=""
+}
+trap 'stop_follow; unmark; rm -f "$workflow" "$out"' EXIT
+[[ ${#new_files[@]} -eq 0 ]] || git add -N -- "${new_files[@]}"
+for attempt in 1 2 3 4; do
+  : > "$out"
+  ( depot ci run --repo "$repo" --forge github --workflow "$workflow" -f 2>&1 | tee "$out" ) &
+  follow_pid=$!
+  while ! grep -q '^Run:' "$out" && kill -0 "$follow_pid" 2>/dev/null; do sleep 0.5; done
+  # Depot's patch cache sometimes fails to finalize an upload; nothing has started then, so retry.
+  grep -q '^failed to upload patch' "$out" || break
+  stop_follow
+  echo "depot-run: patch upload failed (attempt $attempt), retrying" >&2
+  sleep $((attempt * 15))
+done
+unmark; new_files=()
+run_id=$(sed -n 's/^Run: *//p' "$out" | head -1)
+if grep -qi 'permission_denied' "$out"; then
+  stop_follow
+  echo "depot-run: Depot answered permission_denied for $repo: the owner must add the repository to the Depot GitHub app" >&2
+  exit 5
+fi
+if grep -q 'skipping patch' "$out"; then
+  stop_follow
+  [[ -z "$run_id" ]] || depot ci cancel "$run_id" >/dev/null 2>&1 || true
+  echo "depot-run: Depot would run WITHOUT your local changes (see the warning above), so run ${run_id:-?} was cancelled" >&2
+  exit 3
+fi
+[[ -n "$run_id" ]] || { stop_follow; echo "depot-run: could not find the run id in depot's output" >&2; exit 4; }
+verdict=0
+depot ci status "$run_id" --wait >/dev/null 2>&1 || verdict=1
+# Let the live log finish printing; if it stalled, stop it and print the part it missed.
+for _ in $(seq 40); do kill -0 "$follow_pid" 2>/dev/null || break; sleep 0.5; done
+if kill -0 "$follow_pid" 2>/dev/null; then
+  stop_follow
+  shown=$(sed -n '/^View in Depot:/,$p' "$out" | grep -vc '^View in Depot:\|^Waiting for logs from job' || true)
+  echo "depot-run: the live log stream stalled; the rest of the job log follows" >&2
+  depot ci logs "$run_id" 2>/dev/null | tail -n +"$((shown + 1))" || echo "depot-run: see depot ci logs $run_id" >&2
+fi
+if [[ $verdict -eq 0 ]]; then
+  echo "depot-run: run $run_id finished OK" >&2
+else
+  echo "depot-run: run $run_id FAILED ($(depot ci status "$run_id" --output json 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get("status"))' 2>/dev/null || echo unknown))" >&2
+  exit 1
+fi
+exit 0
+}

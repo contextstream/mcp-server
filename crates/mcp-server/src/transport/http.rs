@@ -475,12 +475,20 @@ fn read_rss_kb() -> Option<u64> {
 // Server
 // ============================================================================
 
-/// Create the HTTP router.
-pub fn create_router(state: HttpState) -> Router {
-    let cors = CorsLayer::new()
+/// The CORS layer of the HTTP router. It answers EVERY OPTIONS request itself (tower-http's CorsLayer returns at once
+/// for any OPTIONS), the same for any origin and path, so the ContextStream MCP gateway Worker answers OPTIONS at the
+/// edge with exactly this answer. The contract is `transport/cors/mcp-preflight.json`, a copy of the contextstream
+/// repository's deploy/cloudflare/shared/cors/mcp-preflight.json; `cors_preflight_contract` pins it to this layer.
+pub(crate) fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+}
+
+/// Create the HTTP router.
+pub fn create_router(state: HttpState) -> Router {
+    let cors = cors_layer();
 
     let api_routes = Router::new()
         // JSON-RPC endpoint
@@ -6484,5 +6492,102 @@ mod tests {
             assert_eq!(path_surface_profile("/mcp"), None);
             assert!(is_streamable_mcp_path("/coach"));
         }
+    }
+}
+
+#[cfg(test)]
+mod cors_preflight_contract {
+    //! The ContextStream MCP gateway Worker answers OPTIONS itself (no round trip, no dependency on an origin's
+    //! hostname). Its answer is pinned to this layer through `transport/cors/mcp-preflight.json`, identical to the
+    //! contextstream repository's deploy/cloudflare/shared/cors/mcp-preflight.json, whose Worker tests check the edge
+    //! against it. This test drives `cors_layer()` over every case and requires the exact status, headers and body.
+    use super::cors_layer;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use std::collections::BTreeMap;
+    use tower::ServiceExt as _;
+
+    const FIXTURE: &str = include_str!("cors/mcp-preflight.json");
+
+    async fn answer(case: &serde_json::Value) -> serde_json::Value {
+        let app = Router::new()
+            .fallback(|| async { (StatusCode::NOT_FOUND, "routed past the CORS layer") })
+            .layer(cors_layer());
+        let mut request = Request::builder()
+            .method(case["method"].as_str().expect("method"))
+            .uri(case["path"].as_str().expect("path"));
+        for (name, value) in case["headers"].as_object().expect("headers") {
+            request = request.header(name.as_str(), value.as_str().expect("header value"));
+        }
+        let response = app
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let mut headers = BTreeMap::new();
+        for (name, value) in response.headers() {
+            let previous = headers.insert(
+                name.as_str().to_string(),
+                value.to_str().unwrap().to_string(),
+            );
+            assert!(previous.is_none(), "{name} sent twice");
+        }
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        serde_json::json!({
+            "status": status,
+            "body": String::from_utf8(body.to_vec()).unwrap(),
+            "headers": headers,
+        })
+    }
+
+    #[tokio::test]
+    async fn every_fixture_case_is_what_the_mcp_cors_layer_answers() {
+        let fixture: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        let cases = fixture["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 8, "the fixture lost its cases");
+        let names: std::collections::BTreeSet<_> = cases
+            .iter()
+            .map(|case| case["name"].as_str().unwrap().to_string())
+            .collect();
+        for required in [
+            "missing-origin",
+            "private-network",
+            "not-a-preflight",
+            "opaque-null-origin",
+        ] {
+            assert!(
+                names.contains(required),
+                "the fixture must cover {required}"
+            );
+        }
+        let mut mismatches = Vec::new();
+        for case in cases {
+            assert_eq!(case["method"], "OPTIONS", "{}", case["name"]);
+            let got = answer(case).await;
+            if got != case["expect"] {
+                mismatches.push(format!(
+                    "{}:\n  fixture {}\n  layer   {}",
+                    case["name"], case["expect"], got
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "the MCP CORS layer no longer answers as the edge does (update this fixture, the contextstream copy and \
+             deploy/cloudflare/shared/cors-preflight.ts together):\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_options_request_is_routed_past_the_layer() {
+        let case = serde_json::json!({"method": "POST", "path": "/mcp",
+            "headers": {"origin": "https://claude.ai"}});
+        let got = answer(&case).await;
+        assert_eq!(got["status"], 404);
+        assert_eq!(got["body"], "routed past the CORS layer");
     }
 }

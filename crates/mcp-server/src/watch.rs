@@ -1540,13 +1540,51 @@ async fn flush_project_targeted(
         return WatchFlushOutcome::NotSent(None);
     };
 
-    let uploaded = delta.files.len();
+    // Send only content the checkout's committed manifest does not already
+    // record. A save that keeps the bytes, or a touch, sends nothing: such
+    // no-ops were 98.1% of watcher jobs over 7 days (2026-10-23). Deletions
+    // are always sent.
+    let partition = ContextStreamClient::partition_unchanged_exact_files(
+        &target.folder_path,
+        target.project_id,
+        expected_workspace_id,
+        delta.files,
+    );
+    let unchanged = partition.unchanged_paths.len();
+    if partition.files.is_empty() && delta.deleted_paths.is_empty() {
+        tracing::debug!(
+            "watch: {} reported file(s) in {} already hold their committed content; nothing sent",
+            unchanged,
+            target.folder_path
+        );
+        // Settle the observed versions as committed: the server holds exactly
+        // these bytes.
+        return if finalize_reserved_watch_submission(
+            &target.folder_path,
+            &reservation,
+            true,
+            &[],
+            Some(true),
+        ) {
+            WatchFlushOutcome::NotSent(None)
+        } else {
+            WatchFlushOutcome::NotSent(Some(retry()))
+        };
+    }
+    let _ = dirty_drain::record_pending_submission_content(
+        &target.folder_path,
+        &reservation,
+        &partition.content_hashes,
+        &delta.deleted_paths,
+    );
+
+    let uploaded = partition.files.len();
     let deletions = delta.deleted_paths.len();
     match client
         .ingest_files_from_hook(
             target.project_id,
             expected_workspace_id,
-            delta.files,
+            partition.files,
             delta.deleted_paths,
             true,
             Some(WATCH_ORIGIN),
@@ -1559,10 +1597,11 @@ async fn flush_project_targeted(
         Ok(outcome) => {
             let committed = outcome.committed;
             tracing::info!(
-                "watch: pushed {} changed + {} deleted file(s) for {} ({} rejected, committed={})",
+                "watch: pushed {} changed + {} deleted file(s) for {} ({} unchanged not sent, {} rejected, committed={})",
                 uploaded,
                 deletions,
                 target.folder_path,
+                unchanged,
                 delta.rejected,
                 committed
             );
@@ -1912,6 +1951,21 @@ where
     Ok(())
 }
 
+/// Whether a filesystem event can mean a file's content, or its existence,
+/// changed. Reads (open, close after reading) and metadata-only changes
+/// (`touch`, chmod, xattrs) cannot, and used to queue an upload of unchanged
+/// bytes. A close after writing is kept: a write through mmap reports nothing
+/// else on Linux. Anything else, including unknown kinds, is kept.
+fn event_may_change_content(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode, ModifyKind};
+    match kind {
+        notify::EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        notify::EventKind::Access(_) => false,
+        notify::EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        _ => true,
+    }
+}
+
 /// Run the long-lived watcher. Returns `Ok(())` when disabled, when another
 /// watcher already holds the singleton lock, or on shutdown signal.
 /// launchd sets `XPC_SERVICE_NAME` to the job label for every job it starts.
@@ -1995,6 +2049,7 @@ pub async fn run_watch() -> Result<()> {
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         match res {
+            Ok(event) if !event_may_change_content(&event.kind) => {}
             Ok(event) => {
                 if let Err(marked) = forward_notify_paths_with(event.paths, &tx, &roots, |root| {
                     dirty_drain::mark_watch_force_full(root)
@@ -2738,6 +2793,37 @@ mod tests {
             watch_submission_mode(*force_full, false, changed.len()),
             PendingSubmissionMode::Full
         );
+    }
+
+    #[test]
+    fn reads_and_metadata_only_events_do_not_queue_uploads() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
+            RenameMode,
+        };
+        use notify::EventKind;
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+        ] {
+            assert!(!event_may_change_content(&kind), "{kind:?}");
+        }
+        for kind in [
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            EventKind::Create(CreateKind::File),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Any,
+            EventKind::Other,
+        ] {
+            assert!(event_may_change_content(&kind), "{kind:?}");
+        }
     }
 
     #[test]

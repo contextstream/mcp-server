@@ -3082,6 +3082,117 @@ impl ContextStreamClient {
         TargetedFileDecision::Upload(payload)
     }
 
+    /// Split exact upload payloads by whether this checkout's committed hash
+    /// manifest already records their content. Returns the payloads to send
+    /// and the paths left out, with the content hash of each payload that is
+    /// sent (for the receipt that records it once the upload commits).
+    ///
+    /// The manifest records only content the server committed, so a save or
+    /// touch that leaves a file's bytes as they were needs no request (98.1%
+    /// of watcher jobs were such no-ops, 2026-10-23). Deletions are not
+    /// payloads and are never filtered. Fails open: when the checkout scope or
+    /// its manifest cannot be read, every payload is kept.
+    pub fn partition_unchanged_exact_files(
+        local_root: &str,
+        project_id: Uuid,
+        expected_workspace_id: Uuid,
+        files: Vec<serde_json::Value>,
+    ) -> ExactFilePartition {
+        let manifest = Self::local_checkout_guard(local_root, project_id, expected_workspace_id)
+            .ok()
+            .and_then(|guard| {
+                Self::hash_manifest_scope(
+                    local_root,
+                    project_id,
+                    expected_workspace_id,
+                    guard.as_deref(),
+                )
+                .ok()
+            })
+            .map(|scope| Self::read_hash_manifest_data(&scope).hashes)
+            .unwrap_or_default();
+        let mut partition = ExactFilePartition::default();
+        for file in files {
+            let path = file.get("path").and_then(serde_json::Value::as_str);
+            let content = file.get("content").and_then(serde_json::Value::as_str);
+            match (path, content) {
+                (Some(path), Some(content)) => {
+                    let hash = Self::sha256_hex(content);
+                    if manifest.get(path) == Some(&hash) {
+                        partition.unchanged_paths.push(path.to_string());
+                    } else {
+                        partition.content_hashes.insert(path.to_string(), hash);
+                        partition.files.push(file);
+                    }
+                }
+                _ => partition.files.push(file),
+            }
+        }
+        partition
+    }
+
+    /// SHA-256 of each exact upload payload's content, by relative path, in
+    /// the form the hash manifest stores.
+    pub fn exact_upload_content_hashes(
+        files: &[serde_json::Value],
+    ) -> std::collections::BTreeMap<String, String> {
+        files
+            .iter()
+            .filter_map(|file| {
+                let path = file.get("path").and_then(serde_json::Value::as_str)?;
+                let content = file.get("content").and_then(serde_json::Value::as_str)?;
+                Some((path.to_string(), Self::sha256_hex(content)))
+            })
+            .collect()
+    }
+
+    /// Record exact uploads (content hashes and deletions) in this checkout's
+    /// hash manifest once their asynchronous ingest jobs completed. Without
+    /// this, every file the watcher or a hook uploaded asynchronously stayed
+    /// unknown to the manifest, and the next full scan (keep_warm) sent it
+    /// again. Returns false when the checkout scope cannot be resolved.
+    pub fn record_committed_exact_upload(
+        local_root: &str,
+        project_id: Uuid,
+        expected_workspace_id: Uuid,
+        content_hashes: &std::collections::BTreeMap<String, String>,
+        deleted_paths: &[String],
+    ) -> bool {
+        if content_hashes.is_empty() && deleted_paths.is_empty() {
+            return true;
+        }
+        let Ok(guard) = Self::local_checkout_guard(local_root, project_id, expected_workspace_id)
+        else {
+            return false;
+        };
+        let Ok(scope) = Self::hash_manifest_scope(
+            local_root,
+            project_id,
+            expected_workspace_id,
+            guard.as_deref(),
+        ) else {
+            return false;
+        };
+        let Some(path) = Self::hash_manifest_path(&scope) else {
+            return false;
+        };
+        Self::with_local_state_lock(&path, || {
+            let mut data = Self::read_hash_manifest_data_unlocked(&path, &scope);
+            for deleted in deleted_paths {
+                data.hashes.remove(deleted);
+                data.fingerprints.remove(deleted);
+            }
+            for (file, hash) in content_hashes {
+                data.hashes.insert(file.clone(), hash.clone());
+                // The uploaded bytes may already be older than the live file;
+                // the next full scan rereads it rather than trusting a stat.
+                data.fingerprints.remove(file);
+            }
+            Self::write_hash_manifest_data_unlocked_checked(&path, &scope, &data).is_ok()
+        })
+        .unwrap_or(false)
+    }
+
     pub fn targeted_text_file_payload(
         root_path: &str,
         candidate_path: &str,
@@ -6967,6 +7078,90 @@ impl ContextStreamClient {
                 }));
             }
 
+            // Background lanes (keep_warm_daemon, watch) found nothing changed
+            // locally. A server generation that differs from the one this
+            // checkout last proved is normal: another checkout, machine or a
+            // server job (an embedding drain resets the manifest digest)
+            // committed since. Re-uploading every file for that made 92.8% of
+            // keep_warm and 98.1% of watch jobs no-ops over 7 days (2026-10-23).
+            // Repair only when the server shows it is missing files: a state
+            // other than ready/indexing, or fewer indexed files than this
+            // checkout's committed manifest. Forced and hosted refreshes still
+            // repair every file.
+            if !force && !reroot && Self::is_background_ingest_origin(origin.as_deref()) {
+                if !cached_fingerprints_stable {
+                    // A file changed while this scan ran; the watcher records
+                    // the edit and the next pass sends only that file.
+                    return Ok(serde_json::json!({
+                        "status": "deferred",
+                        "files_indexed": 0,
+                        "files_skipped": skipped,
+                        "files_compacted": compacted_files,
+                        "files_deferred": 0,
+                        "total_files": total_files,
+                        "files_hashed": content_files_read,
+                        "content_bytes_read": content_bytes_read,
+                        "metadata_reused_files": reused_files,
+                        "scan_complete": false,
+                        "committed": true,
+                        "pending_jobs": 0,
+                        "server_generation_verified": false,
+                        "message": "Files changed during the background scan; the next pass sends them"
+                    }));
+                }
+                let full_status = if Self::attestation_state_is_serving(&status) {
+                    self.project_index_status(project_id).await.ok()
+                } else {
+                    None
+                };
+                if Self::server_holds_local_manifest(full_status.as_ref(), new_hashes.len()) {
+                    if scan.complete {
+                        match remote_attestation.as_deref() {
+                            Some(attestation) => Self::write_verified_index_status(
+                                &params.path,
+                                project_id,
+                                attestation,
+                            ),
+                            None => {
+                                Self::write_index_status_at(&params.path, project_id, Utc::now())
+                            }
+                        }
+                    }
+                    let desired_manifest = HashManifestData {
+                        hashes: new_hashes,
+                        fingerprints: new_fingerprints,
+                    };
+                    let _ = Self::merge_hash_manifest_data_three_way(
+                        &manifest_scope,
+                        &manifest_base_data,
+                        &desired_manifest,
+                    );
+                    Self::apply_scan_cursor_update(&scan.cursor_update);
+                    on_progress(IngestProgressEvent::Complete {
+                        files_uploaded: 0,
+                        files_indexed: 0,
+                        total_files,
+                        skipped_files: skipped,
+                    });
+                    return Ok(serde_json::json!({
+                        "status": "success",
+                        "files_indexed": 0,
+                        "files_skipped": skipped,
+                        "files_compacted": compacted_files,
+                        "files_deferred": 0,
+                        "total_files": total_files,
+                        "files_hashed": content_files_read,
+                        "content_bytes_read": content_bytes_read,
+                        "metadata_reused_files": reused_files,
+                        "scan_complete": scan.complete,
+                        "committed": true,
+                        "pending_jobs": 0,
+                        "server_generation_verified": false,
+                        "message": "All files unchanged; the server holds at least this checkout's files, so nothing was re-sent"
+                    }));
+                }
+            }
+
             tracing::info!(
                 project_id = %project_id,
                 "Local manifest had no matching committed server generation; repairing every current file"
@@ -8788,6 +8983,49 @@ impl ContextStreamClient {
         let indexed_at = info.get("indexed_at")?.as_str()?;
         let indexed_time = chrono::DateTime::parse_from_rfc3339(indexed_at).ok()?;
         Some(indexed_time.with_timezone(&chrono::Utc))
+    }
+
+    /// Origins of automatic background refreshes. They never repair a whole
+    /// checkout on an unverified server generation alone.
+    fn is_background_ingest_origin(origin: Option<&str>) -> bool {
+        matches!(origin, Some("keep_warm_daemon") | Some("watch"))
+    }
+
+    /// Whether an attestation-view status describes a serving index (ready,
+    /// or indexing a newer generation over a committed one).
+    fn attestation_state_is_serving(status: &serde_json::Value) -> bool {
+        let status = status
+            .get("data")
+            .filter(|data| data.is_object())
+            .unwrap_or(status);
+        matches!(
+            status
+                .get("project_index_state")
+                .and_then(serde_json::Value::as_str),
+            Some("ready") | Some("indexing")
+        )
+    }
+
+    /// Whether the full index status counts at least `local_files` indexed
+    /// files. `indexed_files` there is the larger of the certified manifest
+    /// count and the live searchable row count, so it stays meaningful while
+    /// the manifest digest is uncertified. Missing or malformed counts fail
+    /// closed (repair).
+    fn server_holds_local_manifest(
+        full_status: Option<&serde_json::Value>,
+        local_files: usize,
+    ) -> bool {
+        let Some(status) = full_status else {
+            return false;
+        };
+        let status = status
+            .get("data")
+            .filter(|data| data.is_object())
+            .unwrap_or(status);
+        status
+            .get("indexed_files")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|indexed| indexed > 0 && indexed >= local_files as i64)
     }
 
     fn local_server_index_attestation(folder_path: &str) -> Option<String> {
@@ -19384,6 +19622,17 @@ pub struct IndexSettingsParams {
     pub conflict_resolution: Option<String>,
 }
 
+/// Exact upload payloads split by [`ContextStreamClient::partition_unchanged_exact_files`].
+#[derive(Debug, Default, Clone)]
+pub struct ExactFilePartition {
+    /// Payloads whose content the manifest does not record; send these.
+    pub files: Vec<serde_json::Value>,
+    /// SHA-256 of each payload in `files`, by relative path.
+    pub content_hashes: std::collections::BTreeMap<String, String>,
+    /// Paths whose content the committed manifest already records.
+    pub unchanged_paths: Vec<String>,
+}
+
 /// Ingest local parameters.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct IngestLocalParams {
@@ -24160,6 +24409,284 @@ mod tests {
         assert!(ContextStreamClient::read_hash_manifest(&scope).is_empty());
 
         let _ = std::fs::remove_dir_all(temp_home);
+    }
+
+    // The watcher sends only content the committed manifest does not record.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_uploads_skip_committed_content_and_record_async_commits() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-exact-skip-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("create temp home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let root = initialize_bound_ingest_fixture(&temp_home, project_id, workspace_id)
+            .expect("initialize checkout");
+        let root_text = root.to_string_lossy().to_string();
+        let committed = "pub fn ready() -> bool { true }\n";
+        let edited = "pub fn ready() -> bool { false }\n";
+
+        // A save that kept the committed bytes is left out; an edit is kept
+        // with its hash; a payload without content is kept as it was.
+        let partition = ContextStreamClient::partition_unchanged_exact_files(
+            &root_text,
+            project_id,
+            workspace_id,
+            vec![
+                serde_json::json!({"path": "lib.rs", "content": committed}),
+                serde_json::json!({"path": "new.rs", "content": edited}),
+                serde_json::json!({"path": "odd.rs"}),
+            ],
+        );
+        assert_eq!(partition.unchanged_paths, vec!["lib.rs".to_string()]);
+        assert_eq!(partition.files.len(), 2);
+        assert_eq!(
+            partition.content_hashes,
+            std::collections::BTreeMap::from([(
+                "new.rs".to_string(),
+                ContextStreamClient::sha256_hex(edited)
+            )])
+        );
+        // Another project's scope has no manifest: everything is kept.
+        let other = ContextStreamClient::partition_unchanged_exact_files(
+            &root_text,
+            Uuid::new_v4(),
+            workspace_id,
+            vec![serde_json::json!({"path": "lib.rs", "content": committed})],
+        );
+        assert!(other.unchanged_paths.is_empty());
+        assert_eq!(other.files.len(), 1);
+
+        // The watcher uploaded an edit asynchronously and its job completed.
+        std::fs::write(root.join("lib.rs"), edited).expect("edit lib.rs");
+        assert!(ContextStreamClient::record_committed_exact_upload(
+            &root_text,
+            project_id,
+            workspace_id,
+            &ContextStreamClient::exact_upload_content_hashes(&[
+                serde_json::json!({"path": "lib.rs", "content": edited})
+            ]),
+            &["gone.rs".to_string()],
+        ));
+        let scope = bound_manifest_scope(&root, project_id, workspace_id);
+        let manifest = ContextStreamClient::read_hash_manifest(&scope);
+        assert_eq!(
+            manifest.get("lib.rs"),
+            Some(&ContextStreamClient::sha256_hex(edited))
+        );
+        assert!(!manifest.contains_key("gone.rs"));
+
+        // The next full background scan sends nothing for that file.
+        let status = primary_attestation_fixture(project_id, workspace_id, 42, 'a');
+        let attestation =
+            ContextStreamClient::committed_index_attestation(&status).expect("attestation");
+        ContextStreamClient::write_verified_index_status(&root_text, project_id, &attestation);
+        let (client, server) =
+            client_with_http_sequence(vec![("200 OK", status.to_string())]).await;
+        let result = client
+            .ingest_local(IngestLocalParams {
+                path: root_text.clone(),
+                workspace_id: Some(workspace_id),
+                project_id: Some(project_id),
+                force: Some(false),
+                include_media: Some(false),
+                background: Some(true),
+                origin: Some("keep_warm_daemon".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("unchanged scan");
+        assert_eq!(result["files_indexed"], 0);
+        let requests = server.await.expect("HTTP sequence task");
+        assert!(
+            requests.iter().all(|request| !request.starts_with("POST ")),
+            "{requests:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_home);
+    }
+
+    /// Runs one background (`origin`) scan of the unchanged fixture checkout
+    /// against `responses` and returns the result (or error) and the requests.
+    async fn background_unchanged_scan(
+        temp_home: &Path,
+        project_id: Uuid,
+        workspace_id: Uuid,
+        origin: &str,
+        responses: Vec<(&'static str, String)>,
+    ) -> (Result<serde_json::Value>, Vec<String>, std::path::PathBuf) {
+        let root = initialize_bound_ingest_fixture(temp_home, project_id, workspace_id)
+            .expect("initialize checkout");
+        let (client, server) = client_with_http_sequence(responses).await;
+        let result = client
+            .ingest_local(IngestLocalParams {
+                path: root.to_string_lossy().to_string(),
+                workspace_id: Some(workspace_id),
+                project_id: Some(project_id),
+                force: Some(false),
+                include_media: Some(false),
+                background: Some(true),
+                origin: Some(origin.to_string()),
+                ..Default::default()
+            })
+            .await;
+        (result, server.await.expect("HTTP sequence task"), root)
+    }
+
+    fn full_index_status_fixture(project_id: Uuid, workspace_id: Uuid, indexed: i64) -> String {
+        serde_json::json!({
+            "project_id": project_id,
+            "workspace_id": workspace_id,
+            "status": "completed",
+            "project_index_state": "ready",
+            "indexed": indexed > 0,
+            "indexed_files": indexed,
+        })
+        .to_string()
+    }
+
+    // keep_warm_daemon re-sent whole checkouts whenever another writer had
+    // moved the server generation: 92.8% of its jobs were no-ops (2026-10-23).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn keep_warm_does_not_resend_an_unchanged_checkout_for_a_moved_generation() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-keepwarm-noop-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("create temp home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let moved = primary_attestation_fixture(project_id, workspace_id, 99, 'b');
+        let (result, requests, root) = background_unchanged_scan(
+            &temp_home,
+            project_id,
+            workspace_id,
+            "keep_warm_daemon",
+            vec![
+                ("200 OK", moved.to_string()),
+                (
+                    "200 OK",
+                    full_index_status_fixture(project_id, workspace_id, 7),
+                ),
+            ],
+        )
+        .await;
+        let result = result.expect("unchanged keep-warm scan succeeds without uploading");
+        assert_eq!(result["files_indexed"], 0);
+        assert_eq!(result["server_generation_verified"], false);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests.iter().all(|request| !request.starts_with("POST ")));
+        assert!(
+            requests[1].starts_with(&format!("GET /api/v1/projects/{project_id}/index/status "))
+        );
+        // The manifest still proves lib.rs, and the moved generation is adopted
+        // so the next tick does not ask again.
+        let scope = bound_manifest_scope(&root, project_id, workspace_id);
+        assert!(ContextStreamClient::read_hash_manifest(&scope).contains_key("lib.rs"));
+        assert_eq!(
+            ContextStreamClient::local_server_index_attestation(root.to_string_lossy().as_ref()),
+            ContextStreamClient::committed_index_attestation(&moved)
+        );
+
+        let _ = std::fs::remove_dir_all(temp_home);
+    }
+
+    // An embedding drain sets committed_manifest_digest to NULL, so there is no
+    // attestation at all; the watcher must not re-send the checkout for that.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn watch_full_scan_does_not_resend_while_the_server_manifest_is_uncertified() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-watch-uncert-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("create temp home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let mut uncertified = primary_attestation_fixture(project_id, workspace_id, 99, 'b');
+        uncertified["project_index_state"] = serde_json::json!("ready");
+        uncertified["committed"] = serde_json::json!(false);
+        uncertified["committed_manifest_digest"] = serde_json::Value::Null;
+        uncertified["committed_manifest_file_count"] = serde_json::json!(0);
+        let (result, requests, _root) = background_unchanged_scan(
+            &temp_home,
+            project_id,
+            workspace_id,
+            "watch",
+            vec![
+                ("200 OK", uncertified.to_string()),
+                (
+                    "200 OK",
+                    full_index_status_fixture(project_id, workspace_id, 1),
+                ),
+            ],
+        )
+        .await;
+        result.expect("unchanged watch scan succeeds without uploading");
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests.iter().all(|request| !request.starts_with("POST ")));
+
+        let _ = std::fs::remove_dir_all(temp_home);
+    }
+
+    // When the server holds fewer files than this checkout committed, or its
+    // index is not serving, a background scan still repairs every file.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_scan_still_repairs_when_the_server_lost_files_or_is_not_serving() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        for (case, origin) in [("lost", "keep_warm_daemon"), ("partial", "watch")] {
+            let temp_home = std::env::temp_dir()
+                .join(format!("contextstream-bg-repair-{case}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&temp_home).expect("create temp home");
+            std::env::set_var("HOME", &temp_home);
+            let project_id = Uuid::new_v4();
+            let workspace_id = Uuid::new_v4();
+            let mut moved = primary_attestation_fixture(project_id, workspace_id, 99, 'b');
+            let stop = (
+                "400 Bad Request",
+                r#"{"error":"stop after proving repair upload"}"#.to_string(),
+            );
+            let responses = if case == "lost" {
+                vec![
+                    ("200 OK", moved.to_string()),
+                    (
+                        "200 OK",
+                        full_index_status_fixture(project_id, workspace_id, 0),
+                    ),
+                    stop,
+                ]
+            } else {
+                moved["project_index_state"] = serde_json::json!("partial");
+                vec![("200 OK", moved.to_string()), stop]
+            };
+            let (result, requests, _root) =
+                background_unchanged_scan(&temp_home, project_id, workspace_id, origin, responses)
+                    .await;
+            result.expect_err("fixture stops after the repair request");
+            let post = requests.last().expect("repair request");
+            assert!(
+                post.starts_with(&format!("POST /api/v1/projects/{project_id}/files/ingest ")),
+                "{case}: {requests:?}"
+            );
+            assert!(post.contains("lib.rs"), "{case}");
+            let _ = std::fs::remove_dir_all(temp_home);
+        }
     }
 
     #[allow(clippy::await_holding_lock)]

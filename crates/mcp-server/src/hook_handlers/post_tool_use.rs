@@ -1320,6 +1320,12 @@ async fn index_written_file(cwd: &str, absolute_path: &str) -> bool {
                 return false;
             };
             let client = build_hook_client(&fresh_config);
+            let _ = super::dirty_drain::record_pending_submission_content(
+                &ledger_root,
+                &reservation,
+                &ContextStreamClient::exact_upload_content_hashes(&files),
+                &deleted_paths,
+            );
 
             // Automatic edits are checkout-scoped and never replace another
             // machine/worktree overlay.

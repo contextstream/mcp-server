@@ -72,6 +72,8 @@ pub use client::{
     CreateTodoParams,
     // Help params
     EditorRulesParams,
+    // Project params
+    ExactFilePartition,
     ExportSkillParams,
     // Context Feed params
     FeedCreateParams,
@@ -101,7 +103,6 @@ pub use client::{
     ImportMemoryEventsParams,
     ImportSkillParams,
     IndexSettingsParams,
-    // Project params
     IngestLocalParams,
     IngestProgressEvent,
     IngestRootLayout,

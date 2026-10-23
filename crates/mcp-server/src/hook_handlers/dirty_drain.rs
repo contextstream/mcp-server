@@ -584,6 +584,12 @@ struct PendingSubmission {
     jobs_completed: bool,
     reserved: bool,
     submitted_at: Option<DateTime<Utc>>,
+    /// SHA-256 of each file this submission sent, by relative path. Recorded
+    /// in the checkout's hash manifest once its jobs complete, so a later full
+    /// scan does not send the same bytes again.
+    content_hashes: BTreeMap<String, String>,
+    /// Relative paths this submission deleted, for the same manifest update.
+    deleted_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -706,6 +712,29 @@ fn pending_submissions_for_root(data: &Value, root: &str) -> Vec<PendingSubmissi
                     .and_then(Value::as_str)
                     .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
                     .map(|timestamp| timestamp.with_timezone(&Utc)),
+                content_hashes: value
+                    .get("content_hashes")
+                    .and_then(Value::as_object)
+                    .map(|hashes| {
+                        hashes
+                            .iter()
+                            .filter_map(|(path, hash)| {
+                                hash.as_str().map(|hash| (path.clone(), hash.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                deleted_paths: value
+                    .get("deleted_paths")
+                    .and_then(Value::as_array)
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
         })
         .collect()
@@ -1038,6 +1067,59 @@ pub(crate) fn finalize_pending_submission(
         (true, true)
     })
     .unwrap_or(false)
+}
+
+/// Keep the exact content a reserved submission sends (content hashes of
+/// its files and the paths it deletes). When its jobs complete,
+/// `reconcile_pending_submissions` records them in the checkout's hash
+/// manifest; before, files sent by the watcher or a hook asynchronously were
+/// unknown to the manifest and the next full scan (keep_warm) sent them again.
+pub(crate) fn record_pending_submission_content(
+    root: &str,
+    reservation: &PendingSubmissionReservation,
+    content_hashes: &BTreeMap<String, String>,
+    deleted_paths: &[String],
+) -> bool {
+    with_locked_dirty_ledger(|ledger| {
+        let changed = set_submission_content(
+            ledger,
+            root,
+            &reservation.key,
+            content_hashes,
+            deleted_paths,
+        );
+        (changed, changed)
+    })
+    .unwrap_or(false)
+}
+
+fn set_submission_content(
+    data: &mut Value,
+    root: &str,
+    key: &str,
+    content_hashes: &BTreeMap<String, String>,
+    deleted_paths: &[String],
+) -> bool {
+    let Some(receipt) = data
+        .get_mut("workspaces")
+        .and_then(Value::as_object_mut)
+        .and_then(|workspaces| workspaces.get_mut(root))
+        .and_then(|entry| entry.get_mut("pending_submissions"))
+        .and_then(Value::as_object_mut)
+        .and_then(|submissions| submissions.get_mut(key))
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    receipt.insert(
+        "content_hashes".to_string(),
+        serde_json::json!(content_hashes),
+    );
+    receipt.insert(
+        "deleted_paths".to_string(),
+        serde_json::json!(deleted_paths),
+    );
+    true
 }
 
 pub(crate) fn cancel_pending_submission(
@@ -1509,11 +1591,23 @@ async fn reconcile_pending_submissions(
                 .extend(submission.path_versions.keys().cloned());
             continue;
         };
+        let completed = matches!(resolution, PendingResolution::Completed);
         let (applied, retry_required) = with_locked_dirty_ledger(|ledger| {
             let outcome = apply_pending_resolution(ledger, ledger_root, &submission, resolution);
             (outcome, outcome.0)
         })
         .unwrap_or((false, false));
+        if applied && completed {
+            // The server committed exactly these bytes; record them so the
+            // next full scan of this checkout does not send them again.
+            let _ = ContextStreamClient::record_committed_exact_upload(
+                tracked_root,
+                project_id,
+                workspace_id,
+                &submission.content_hashes,
+                &submission.deleted_paths,
+            );
+        }
         if applied && retry_required {
             summary.watch_retries.push(WatchSubmissionRetry {
                 paths: submission.path_versions.keys().cloned().collect(),
@@ -1737,6 +1831,12 @@ async fn drain_tracked_roots(root_filter: Option<&Path>, force_sync: bool) {
         ) else {
             continue;
         };
+        let _ = record_pending_submission_content(
+            &root,
+            &reservation,
+            &ContextStreamClient::exact_upload_content_hashes(&batch.files),
+            &batch.deleted_paths,
+        );
 
         match post_ingest_batch(
             &fresh_cfg,
@@ -2044,6 +2144,44 @@ mod tests {
             pending[0].path_versions.get("/home/u/proj/a.rs"),
             Some(&"2026-06-09T00:00:01Z".to_string())
         );
+    }
+
+    #[test]
+    fn submission_content_round_trips_for_the_manifest_update_on_completion() {
+        let root = "/home/u/proj";
+        let mut data = json!({
+            "workspaces": { root: { "files": { "/home/u/proj/a.rs": "v1" } } }
+        });
+        assert!(add_pending_submission(
+            &mut data,
+            root,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            &[Uuid::new_v4()],
+            &["/home/u/proj/a.rs".to_string()],
+        ));
+        let before = pending_submissions_for_root(&data, root).remove(0);
+        assert!(before.content_hashes.is_empty() && before.deleted_paths.is_empty());
+        let hashes = BTreeMap::from([("a.rs".to_string(), "ab".repeat(32))]);
+        let deleted = vec!["b.rs".to_string()];
+        assert!(set_submission_content(
+            &mut data,
+            root,
+            &before.key,
+            &hashes,
+            &deleted
+        ));
+        assert!(!set_submission_content(
+            &mut data, root, "missing", &hashes, &deleted
+        ));
+
+        let restored: Value = serde_json::from_str(&serde_json::to_string(&data).unwrap()).unwrap();
+        let after = pending_submissions_for_root(&restored, root).remove(0);
+        assert_eq!(after.content_hashes, hashes);
+        assert_eq!(after.deleted_paths, deleted);
+        // The completion check compares the receipt it polled with the stored
+        // one, so the recorded content must survive that comparison.
+        assert!(pending_submission_is_current(&restored, root, &after));
     }
 
     #[test]

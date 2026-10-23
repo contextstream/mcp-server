@@ -4028,13 +4028,84 @@ fn write_project_mcp_config_with_transport_mode(
         )?
     };
     apply_managed_config_metadata(editor, &mut server, &identity);
+    let carries_key = [Some(api_key), remote_auth_api_key]
+        .into_iter()
+        .flatten()
+        .filter(|key| !key.trim().is_empty())
+        .any(|key| server.to_string().contains(key));
 
     insert_contextstream_server(&mut config, server_path, server)?;
 
     safe_edit::commit(&mcp_path, &loaded, &config)?;
+    if carries_key {
+        keep_secret_config_out_of_git(project_path, &mcp_path);
+    }
     record_configured_evidence(editor);
 
     Ok(())
+}
+
+/// A project MCP file that carries the API key must not be committed by a
+/// routine `git add -A`. Exclude it locally (`.git/info/exclude`, never the
+/// shared `.gitignore`) unless the repository already tracks or ignores it.
+/// Best-effort: outside a Git checkout, or without `git`, nothing changes.
+fn keep_secret_config_out_of_git(project_path: &Path, config_path: &Path) {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(project_path)
+            .args(args)
+            .output()
+            .ok()
+    };
+    let Some(output) = git(&["rev-parse", "--show-toplevel", "--git-path", "info/exclude"])
+        .filter(|output| output.status.success())
+    else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let (Some(top), Some(exclude)) = (lines.next(), lines.next()) else {
+        return;
+    };
+    let exclude = if Path::new(exclude).is_absolute() {
+        PathBuf::from(exclude)
+    } else {
+        project_path.join(exclude)
+    };
+    let (Ok(top), Ok(config)) = (
+        std::fs::canonicalize(top),
+        std::fs::canonicalize(config_path),
+    ) else {
+        return;
+    };
+    let Ok(relative) = config.strip_prefix(&top) else {
+        return;
+    };
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let tracked = git(&["ls-files", "--error-unmatch", "--", &relative])
+        .is_some_and(|output| output.status.success());
+    let ignored =
+        git(&["check-ignore", "-q", "--", &relative]).is_some_and(|output| output.status.success());
+    if tracked || ignored {
+        return;
+    }
+    let entry = format!("/{relative}");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == entry) {
+        return;
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str("# ContextStream: this MCP config holds an API key\n");
+    updated.push_str(&entry);
+    updated.push('\n');
+    if let Some(parent) = exclude.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&exclude, updated);
 }
 
 /// Write workspace config to .contextstream/config.json in the project.
@@ -4937,6 +5008,62 @@ mod tests {
     use crate::env_test_mutex;
     use mcp_types::config::DEFAULT_API_URL;
     use std::ffi::OsString;
+
+    #[test]
+    fn key_bearing_project_config_is_excluded_from_git_once() {
+        let repo = tempfile::tempdir().expect("repo");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        let config = repo.path().join(".mcp.json");
+        std::fs::write(&config, "{}").expect("config");
+
+        keep_secret_config_out_of_git(repo.path(), &config);
+        keep_secret_config_out_of_git(repo.path(), &config);
+        let exclude =
+            std::fs::read_to_string(repo.path().join(".git/info/exclude")).expect("exclude");
+        assert_eq!(
+            exclude.lines().filter(|line| *line == "/.mcp.json").count(),
+            1
+        );
+        let status = String::from_utf8(git(&["status", "--porcelain"]).stdout).expect("utf8");
+        assert!(
+            !status.contains(".mcp.json"),
+            "git still offers the key file: {status}"
+        );
+        assert!(
+            !repo.path().join(".gitignore").exists(),
+            "the shared .gitignore is left alone"
+        );
+    }
+
+    #[test]
+    fn tracked_project_config_is_left_alone() {
+        let repo = tempfile::tempdir().expect("repo");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        let config = repo.path().join(".mcp.json");
+        std::fs::write(&config, "{}").expect("config");
+        assert!(git(&["add", ".mcp.json"]).status.success());
+
+        keep_secret_config_out_of_git(repo.path(), &config);
+        let exclude =
+            std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap_or_default();
+        assert!(!exclude.contains("/.mcp.json"));
+    }
 
     struct EnvVarGuard {
         key: &'static str,

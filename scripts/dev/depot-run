@@ -28,9 +28,9 @@
 # slower setup. This is the mcp-server copy of contextstream's scripts/dev/depot-run (runbook:
 # docs/runbooks/depot-run.md there).
 #
-# Rust compiles go through sccache. This repository has no B2 compile-cache secret, so sccache
-# uses the cache Depot provides in every job; with SCCACHE_B2_KEY_ID/SCCACHE_B2_KEY set as Depot
-# CI secrets it would use the B2 bucket contextstream-build-cache, prefix agent/mcp-server-linux-amd64/.
+# Rust compiles go through sccache on the cache Depot provides in every job (Depot Cache over
+# WebDAV). DEPOT_RUN_SCCACHE=b2 selects the B2 bucket contextstream-build-cache (prefix
+# agent/mcp-server-linux-amd64/), which needs the Depot CI secrets SCCACHE_B2_KEY_ID/SCCACHE_B2_KEY.
 #
 # Exit status: 0 only when the run finished successfully; 1 when it failed, 3 when Depot ran
 # without your local changes, 4 when no run id came back, 5 when Depot denied access.
@@ -227,9 +227,10 @@ apt_install() {
 }
 
 start_sccache() {
-  # Without the B2 secret (a repository it is not scoped to) sccache falls back to the cache
-  # Depot provides in every job (SCCACHE_WEBDAV_ENDPOINT), or to local disk without that.
-  if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+  # Depot configures its own sccache cache in every job (SCCACHE_WEBDAV_*), and that is the
+  # default. With DEPOT_RUN_SCCACHE=b2 this step also gets the B2 bucket settings and key, which
+  # take precedence; without the key it falls back to Depot's cache.
+  if [ "${DEPOT_RUN_SCCACHE:-depot}" = b2 ] && [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
     unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
   fi
   sccache --start-server >/dev/null
@@ -303,6 +304,25 @@ if [[ $npm_cache == auto ]]; then
 fi
 [[ -f "$root/$NPM_LOCK" ]] || npm_cache=0
 
+# Compile cache: Depot's own (the default) or, with DEPOT_RUN_SCCACHE=b2, the B2 bucket. Only the
+# B2 opt-in puts bucket settings and secret references into the workflow.
+sccache_backend=${DEPOT_RUN_SCCACHE:-depot}
+case "$sccache_backend" in
+  depot) sccache_env="        env:
+          SCCACHE_IDLE_TIMEOUT: '0'
+" ;;
+  b2) sccache_env="        env:
+          SCCACHE_IDLE_TIMEOUT: '0'
+          DEPOT_RUN_SCCACHE: b2
+          SCCACHE_BUCKET: contextstream-build-cache
+          SCCACHE_ENDPOINT: https://s3.us-east-005.backblazeb2.com
+          SCCACHE_REGION: us-east-005
+          SCCACHE_S3_KEY_PREFIX: agent/mcp-server-linux-amd64/
+          AWS_ACCESS_KEY_ID: \${{ secrets.SCCACHE_B2_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: \${{ secrets.SCCACHE_B2_KEY }}
+" ;;
+  *) echo "depot-run: DEPOT_RUN_SCCACHE must be depot or b2" >&2; exit 2 ;;
+esac
 remote=$(git -C "$root" remote get-url origin)
 repo=$(printf '%s' "$remote" | sed -E 's#^(ssh://)?(git@github\.com[:/]|https://github\.com/)##; s#\.git$##')
 cmd=$(printf '%q ' "$@")
@@ -402,16 +422,8 @@ ${restore_steps}      - name: Prepare the checkout from the cached base
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '${NODE_VERSION}'
-      - name: Toolchains and shared compile cache
-        env:
-          SCCACHE_BUCKET: contextstream-build-cache
-          SCCACHE_ENDPOINT: https://s3.us-east-005.backblazeb2.com
-          SCCACHE_REGION: us-east-005
-          SCCACHE_S3_KEY_PREFIX: agent/mcp-server-linux-amd64/
-          SCCACHE_IDLE_TIMEOUT: '0'
-          AWS_ACCESS_KEY_ID: \${{ secrets.SCCACHE_B2_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: \${{ secrets.SCCACHE_B2_KEY }}
-        run: bash ~/.depot-run-cache/setup.sh tools
+      - name: Toolchains and compile cache
+${sccache_env}        run: bash ~/.depot-run-cache/setup.sh tools
       - name: Command
         shell: bash
         run: bash -c "\$(printf '%s' "\$AGENT_CMD_B64" | base64 -d)"

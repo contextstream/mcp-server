@@ -7613,45 +7613,65 @@ impl ContextStreamClient {
             skipped_files: skipped,
         });
 
-        // Trigger graph build after successful file ingest (fire-and-forget).
-        // The graph worker will build dependency/call graphs for code intelligence.
-        let graph_status = match self
-            .require_fresh_project_workspace(project_id, expected_workspace_id, "post_ingest_graph")
-            .await
-        {
-            Err(error) => {
-                tracing::warn!(
-                    project_id = %project_id,
-                    error = %error,
-                    "Graph ingest skipped because current project ownership was not proven"
-                );
-                "skipped".to_string()
-            }
-            Ok(()) => match self
-                .graph_ingest(Some(expected_workspace_id), Some(project_id), Some(false))
+        // Trigger a graph build after a file ingest that changed the project (fire-and-forget).
+        // The graph worker builds dependency/call graphs for code intelligence. A run that
+        // uploaded and deleted nothing has nothing new to graph: asking anyway rebuilt the same
+        // revision after every watch scan, and each rebuild was charged (2026-10-23, QuantKenobi:
+        // 50 credits every 2-5 minutes).
+        let project_changed = Self::ingest_run_changed_project(
+            total_uploaded,
+            deleted_path_count,
+            uploaded_batches.iter().any(|batch| batch.job_id.is_some()),
+            authoritative_snapshot
+                .get("sent")
+                .and_then(|sent| sent.as_bool())
+                .unwrap_or(false),
+        );
+        let graph_status = if !project_changed {
+            "not_required".to_string()
+        } else {
+            match self
+                .require_fresh_project_workspace(
+                    project_id,
+                    expected_workspace_id,
+                    "post_ingest_graph",
+                )
                 .await
             {
-                Ok(result) => {
-                    let status = result
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    tracing::debug!(
-                        "Graph ingest triggered for project {}: {}",
-                        project_id,
-                        status
-                    );
-                    status.to_string()
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        "Graph ingest trigger skipped for project {}: {}",
-                        project_id,
-                        e
+                Err(error) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        error = %error,
+                        "Graph ingest skipped because current project ownership was not proven"
                     );
                     "skipped".to_string()
                 }
-            },
+                Ok(()) => match self
+                    .graph_ingest(Some(expected_workspace_id), Some(project_id), Some(false))
+                    .await
+                {
+                    Ok(result) => {
+                        let status = result
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        tracing::debug!(
+                            "Graph ingest triggered for project {}: {}",
+                            project_id,
+                            status
+                        );
+                        status.to_string()
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Graph ingest trigger skipped for project {}: {}",
+                            project_id,
+                            e
+                        );
+                        "skipped".to_string()
+                    }
+                },
+            }
         };
 
         let pending_jobs = wait_summary.pending_jobs;
@@ -7686,6 +7706,18 @@ impl ContextStreamClient {
             "committed": pending_jobs == 0,
             "server_processing_status": server_processing_status,
         }))
+    }
+
+    /// Whether an ingest run changed what the server holds for the project, so its code graph
+    /// needs a build: files uploaded, paths deleted, a batch committed, or an authoritative
+    /// snapshot sent (which removes rows the checkout no longer has).
+    fn ingest_run_changed_project(
+        files_uploaded: i64,
+        deleted_paths: usize,
+        committed_batch: bool,
+        authoritative_snapshot_sent: bool,
+    ) -> bool {
+        files_uploaded > 0 || deleted_paths > 0 || committed_batch || authoritative_snapshot_sent
     }
 
     /// Whether a finished scan may send an authoritative snapshot: only a
@@ -24814,6 +24846,21 @@ mod tests {
         ] {
             assert!(!ok, "{case} must not send a snapshot");
         }
+    }
+
+    // A watch scan that changed nothing asked for a graph build anyway, and the server charged
+    // 50 credits for each identical rebuild (2026-10-23). Only a run that changed the project asks.
+    #[test]
+    fn only_an_ingest_run_that_changed_the_project_asks_for_a_graph_build() {
+        let changed = ContextStreamClient::ingest_run_changed_project;
+        assert!(
+            !changed(0, 0, false, false),
+            "nothing uploaded, deleted or committed"
+        );
+        assert!(changed(3, 0, false, false), "files uploaded");
+        assert!(changed(0, 1, false, false), "a path deleted");
+        assert!(changed(0, 0, true, false), "a batch committed");
+        assert!(changed(0, 0, false, true), "an authoritative snapshot sent");
     }
 
     fn request_body(request: &str) -> serde_json::Value {

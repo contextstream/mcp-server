@@ -23,6 +23,41 @@
   for live coordination on every turn and pending notices show on the next
   one. `CONTEXTSTREAM_COORDINATION_CHECKIN=false` keeps prompts out of the
   hook request.
+- Background ingest stops re-sending files that did not change (68ec5d0).
+  A background scan (the keep-warm lane and the watcher's full scans, when not
+  forced) that finds the server's index generation moved while this checkout
+  is unchanged now keeps its hash manifest, adopts the server's generation and
+  sends nothing. It still repairs when the server shows files missing: an index
+  state other than ready or indexing, or fewer indexed files than this
+  checkout's committed manifest. Forced and hosted refreshes still re-send
+  every file. Files the watcher or a hook uploaded asynchronously are recorded
+  in the manifest when their jobs complete, so the next full scan does not send
+  them again. The watcher sends only files whose content hash differs from the
+  manifest; a save or touch that leaves the bytes unchanged sends nothing,
+  deletions and renames are always sent, and read-only access events and
+  metadata-only events (touch, chmod, xattr) no longer queue a flush.
+- A complete forced or hosted refresh sends a v2 authoritative snapshot
+  (#194). After every content batch has committed, the client sends one more
+  request with no files that lists the paths this checkout holds (sorted,
+  unique, SHA-256 over the server's v2 framing), with the checkout's
+  `machine_id` and `git_branch`, so the server can drop rows of that checkout
+  that are no longer on disk. Before, a forced refresh re-uploaded every file
+  but never said which paths remained, so a stale row stayed searchable. It is
+  sent only when the refresh is forced or hosted, the scan was complete,
+  uncapped and deferred nothing, no file failed and no job is pending; a
+  partial or failed scan never sends one. A server without v2 refuses it and
+  deletes nothing. The result reports `authoritative_snapshot.sent` and, when
+  false, `reason`. A hosted refresh that finds nothing changed returns before
+  uploading and sends none.
+- An ingest run asks for a graph build only when it changed the project (#199).
+  It asks when it uploaded files, deleted paths, committed a batch or sent an
+  authoritative snapshot; otherwise `graph_ingest` reports `not_required` and
+  no build request is sent. Before, every run asked, including watch scans
+  that uploaded and deleted nothing.
+- The hosted gateway's CORS preflight answer is now pinned by a test against a
+  fixture shared with the edge (#195). The layer itself is unchanged.
+- Not in the binary: the `scripts/dev/depot-run` development helper (#197,
+  #198).
 - No tool is added or removed.
 
 ## 1.0.28

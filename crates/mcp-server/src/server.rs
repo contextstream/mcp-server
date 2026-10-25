@@ -117,6 +117,7 @@ pub fn build_registry(
     // Agent Q&A is registered unconditionally and returns a clean unavailable
     // response when its hosted backend is not configured.
     domains::qa::register_qa_tools(&mut registry, client.clone());
+    domains::agent::register_agent_tools(&mut registry, client.clone());
     // Agent Coach Kit: registered everywhere, visible only on the coach
     // surface (`/coach`, or CONTEXTSTREAM_TOOL_SURFACE_PROFILE=coach).
     domains::coach::register_coach_tools(&mut registry, client.clone());
@@ -242,6 +243,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "vcs" => "Linking VCS with ContextStream".to_string(),
         "feed" => "Updating ContextStream feed".to_string(),
         "qa" => "Asking ContextStream Q&A".to_string(),
+        "agent" => "Asking a ContextStream agent".to_string(),
         "project" => "Updating ContextStream project".to_string(),
         "workspace" => "Updating ContextStream workspace".to_string(),
         "capsule" => "Saving ContextStream capsule".to_string(),
@@ -279,6 +281,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "vcs" => "VCS linked with ContextStream".to_string(),
         "feed" => "ContextStream feed updated".to_string(),
         "qa" => "ContextStream Q&A complete".to_string(),
+        "agent" => "ContextStream agent answered".to_string(),
         "project" => "ContextStream project updated".to_string(),
         "workspace" => "ContextStream workspace updated".to_string(),
         "capsule" => "ContextStream capsule saved".to_string(),
@@ -2541,6 +2544,8 @@ mod tests {
 
     const V0_5_62_BROAD_TOOL_NAMES: &[&str] = &[
         "account",
+        // Slipstream specialist agents, added after the v0.5.62 baseline.
+        "agent",
         "answer",
         "capsule",
         "capture_plan",
@@ -2611,6 +2616,11 @@ mod tests {
         (
             "account",
             "78d98c93e037399612ec80b4843598b1a738a4f800f0d0029881c358357907b4",
+        ),
+        (
+            // Slipstream specialist agents, added after the v0.5.62 baseline.
+            "agent",
+            "c5ea913302c99630f7e488ccf85a9a21015ba4ea802ae079fd05bba1738a4e4b",
         ),
         (
             "answer",

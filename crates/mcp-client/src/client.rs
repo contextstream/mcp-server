@@ -16394,6 +16394,7 @@ impl ContextStreamClient {
             serde_json::json!({"name":"qa","category":"memory","description":"Ask grounded questions and curate the workspace knowledge base.","key_parameters":["action","question","workspace_id","project_id"],"example":"qa(action=\"ask\", question=\"How does authentication work?\")"}),
             serde_json::json!({"name":"entity","category":"memory","description":"Manage structured tickets, handoffs, incidents, releases, experiments, goals, sprints, reviews, risks, and coordination items.","key_parameters":["kind","action","id","body","query"],"example":"entity(kind=\"ticket\", action=\"list\", query={\"status\":\"open\"})"}),
             serde_json::json!({"name":"vcs","category":"integrations","description":"Read and update linked VCS repositories, pull requests, issues, commits, and notifications.","key_parameters":["action","repo_ref","number","query"],"example":"vcs(action=\"list_issues\", repo_ref=\"owner/repo\", state=\"open\")"}),
+            serde_json::json!({"name":"agent","category":"ai","description":"Find, run, read and cancel Slipstream specialist agents; a priced run needs the person's accepted quote and is charged only on success.","actions":["find","run","get_run","list_runs","cancel_run"],"key_parameters":["action","agent","input","accepted_price_credits","task_id"],"example":"agent(action=\"find\")"}),
             serde_json::json!({"name":"chart","category":"graph","description":"Render allowlisted workspace analytics charts on hosted deployments.","key_parameters":["action","chart","range","workspace_id"],"example":"chart(action=\"render\", chart=\"tool_latency_p95\", range=\"24h\")"}),
             serde_json::json!({"name":"async_job","category":"memory","description":"Run paginated exports and aggregates over durable memory on hosted deployments.","key_parameters":["action","collection","job_id","limit"],"example":"async_job(action=\"submit_export\", collection=\"decisions\")"}),
             serde_json::json!({"name":"help","category":"utility","description":"Discover tools, auth/billing state, runtime versions, workflow rules, and bundle metadata.","actions":["tools","auth","billing","version","workflow","editor_rules","enable_bundle","team_status"],"key_parameters":["action","category","format"],"example":"help(action=\"tools\", format=\"full\")"}),
@@ -26872,11 +26873,12 @@ mod tests {
             })
             .unwrap_or_default();
 
-        // Canonical catalog: 23 tools (including Context Feeds and Answer).
+        // Canonical catalog: 24 tools (including Context Feeds, Answer and the specialist agents).
         // Aliases atlas_chart / atlas_job remain accepted at call-time for
         // back-compat but are intentionally absent. The dropped `ram` alias
         // must NOT reappear.
-        assert_eq!(names.len(), 23);
+        assert_eq!(names.len(), 24);
+        assert!(names.contains(&"agent"));
         assert!(names.contains(&"answer"));
         assert!(names.contains(&"instruct"));
         assert!(names.contains(&"skill"));

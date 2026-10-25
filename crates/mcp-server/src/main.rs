@@ -3796,6 +3796,9 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
     // Load configuration
     let mut config = load_config()?;
     config.is_http_transport = true;
+    // A Slipstream auto-accept cap is a person's consent to be charged. The gateway serves
+    // everyone, so its own environment never sets one: each caller sends theirs as a header.
+    config.slipstream_auto_accept_max_credits = 0;
 
     // Caller-supplied local filesystem paths must not drive reads/writes of the
     // gateway's own disk. Publish the policy process-wide so the filesystem

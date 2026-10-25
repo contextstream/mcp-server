@@ -129,6 +129,14 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
         .map(|value| value.trim().eq_ignore_ascii_case("allow"))
         .unwrap_or(false);
 
+    // Slipstream runs priced at most this many credits start without a quote. Unset, empty
+    // or not a whole number of credits: 0, which always quotes.
+    let slipstream_auto_accept_max_credits =
+        std::env::var(mcp_tools::domains::slipstream::AUTO_ACCEPT_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+
     Ok(Config {
         api_url,
         api_key,
@@ -155,6 +163,7 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
         is_http_transport: false,
         http_local_files,
         account_mode_preference,
+        slipstream_auto_accept_max_credits,
     })
 }
 

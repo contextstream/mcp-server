@@ -117,7 +117,9 @@ pub fn build_registry(
     // Agent Q&A is registered unconditionally and returns a clean unavailable
     // response when its hosted backend is not configured.
     domains::qa::register_qa_tools(&mut registry, client.clone());
-    domains::agent::register_agent_tools(&mut registry, client.clone());
+    // Slipstream agents: registered everywhere, listed per caller (only for a
+    // workspace with agents turned on) by `with_slipstream_listing`.
+    domains::slipstream::register_slipstream_tools(&mut registry, client.clone(), session.clone());
     // Agent Coach Kit: registered everywhere, visible only on the coach
     // surface (`/coach`, or CONTEXTSTREAM_TOOL_SURFACE_PROFILE=coach).
     domains::coach::register_coach_tools(&mut registry, client.clone());
@@ -243,7 +245,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "vcs" => "Linking VCS with ContextStream".to_string(),
         "feed" => "Updating ContextStream feed".to_string(),
         "qa" => "Asking ContextStream Q&A".to_string(),
-        "agent" => "Asking a ContextStream agent".to_string(),
+        "slipstream" => "Asking a Slipstream agent".to_string(),
         "project" => "Updating ContextStream project".to_string(),
         "workspace" => "Updating ContextStream workspace".to_string(),
         "capsule" => "Saving ContextStream capsule".to_string(),
@@ -281,7 +283,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "vcs" => "VCS linked with ContextStream".to_string(),
         "feed" => "ContextStream feed updated".to_string(),
         "qa" => "ContextStream Q&A complete".to_string(),
-        "agent" => "ContextStream agent answered".to_string(),
+        "slipstream" => "Slipstream agent answered".to_string(),
         "project" => "ContextStream project updated".to_string(),
         "workspace" => "ContextStream workspace updated".to_string(),
         "capsule" => "ContextStream capsule saved".to_string(),
@@ -298,7 +300,15 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "completed": completed,
     });
 
-    if name == "session" {
+    if name == domains::slipstream::TOOL_NAME {
+        metadata["actions"] = serde_json::json!({
+            "find": "Listing Slipstream agents",
+            "run": "Running a Slipstream agent",
+            "get_run": "Reading a Slipstream run",
+            "list_runs": "Listing Slipstream runs",
+            "cancel_run": "Cancelling a Slipstream run"
+        });
+    } else if name == "session" {
         metadata["actions"] = serde_json::json!({
             "capture": "Saving session note to ContextStream",
             "capture_lesson": "Saving lesson to ContextStream",
@@ -784,6 +794,71 @@ pub(crate) fn contextstream_tools_list(
     tools
 }
 
+/// The notification after which an MCP client lists tools again.
+pub(crate) const TOOLS_LIST_CHANGED_NOTIFICATION: &str =
+    r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
+
+/// Add the `slipstream` tool to a listing when this caller's workspace has Slipstream
+/// agents turned on, with its description and input written from them. The registry's own
+/// listing leaves it out (`ToolRegistry::list`), so a workspace without Slipstream, or a
+/// caller whose workspace is not known yet, pays no prompt for it. Waits at most
+/// `slipstream::LISTING_BUDGET` for the catalog, and records what was shown so a later
+/// change can be announced (`slipstream_list_changed_notice`).
+pub(crate) async fn with_slipstream_listing(
+    registry: &ToolRegistry,
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    category: Option<&str>,
+    tools: &mut Vec<serde_json::Value>,
+) {
+    use domains::slipstream;
+    // Not on this surface (router, OpenAI agentic, coach, a light toolset): nothing to add.
+    let Some(tool) = registry.get(slipstream::TOOL_NAME) else {
+        return;
+    };
+    if !requested_category_matches(category, tool.metadata.category.as_str()) {
+        return;
+    }
+    let gate = slipstream::SlipstreamGate::global();
+    let listing = slipstream::listing(
+        &gate,
+        client,
+        session,
+        &tool.input_schema,
+        slipstream::LISTING_BUDGET,
+    )
+    .await;
+    listing.mark_advertised(&gate);
+    if !listing.is_listed() {
+        return;
+    }
+    let mut entry = contextstream_tool_list_entry(tool);
+    listing.apply(&mut entry);
+    tools.push(entry);
+    tools.sort_by(|left, right| {
+        left.get("name")
+            .and_then(serde_json::Value::as_str)
+            .cmp(&right.get("name").and_then(serde_json::Value::as_str))
+    });
+}
+
+/// After a tool call on stdio: the list-changed notification when what `tools/list` would
+/// show of `slipstream` differs from what this client was last shown (init moved the
+/// session to another workspace, an agent was turned on or off, Slipstream opened or
+/// closed for the workspace).
+pub(crate) async fn slipstream_list_changed_notice(
+    registry: &ToolRegistry,
+    client: &ContextStreamClient,
+    session: &SessionManager,
+) -> Option<&'static str> {
+    use domains::slipstream;
+    let tool = registry.get(slipstream::TOOL_NAME)?;
+    let gate = slipstream::SlipstreamGate::global();
+    slipstream::listing_changed(&gate, client, session, &tool.input_schema)
+        .await
+        .then_some(TOOLS_LIST_CHANGED_NOTIFICATION)
+}
+
 /// Run the MCP server with stdio transport.
 pub async fn run_server(
     config: Config,
@@ -925,6 +1000,8 @@ async fn run_stdio_transport(
     let registry = Arc::new(registry);
     let client = Arc::new(client);
     let mut tokenizer_warmup = TokenizerWarmup::new();
+    // Whether this client was told `tools.listChanged` at initialize.
+    let mut announces_tool_changes = false;
 
     let mut line = String::new();
     loop {
@@ -956,6 +1033,12 @@ async fn run_stdio_transport(
 
         let method = request.get("method").and_then(serde_json::Value::as_str);
         let is_initialize = method == Some("initialize");
+        let is_tool_call = method == Some("tools/call");
+        // Only an initialize-era session was told tools may change (listChanged).
+        let legacy_initialize = is_initialize
+            && !has_stateless_protocol_metadata(
+                request.get("params").unwrap_or(&serde_json::Value::Null),
+            );
         if !is_initialize && !method.is_some_and(|method| method.starts_with("notifications/")) {
             // Anything that can produce a tool result observes a warm
             // vocabulary, exactly as when it was loaded before serving.
@@ -991,6 +1074,21 @@ async fn run_stdio_transport(
             // The handshake reply is out; load the vocabulary while the
             // client processes it.
             tokenizer_warmup.start();
+        }
+        if legacy_initialize {
+            announces_tool_changes = registry.get(domains::slipstream::TOOL_NAME).is_some();
+        }
+
+        // A call may have changed what tools/list would show of Slipstream (init moved
+        // the session to another workspace, an agent was turned on): say so, and the
+        // client lists tools again.
+        if announces_tool_changes && is_tool_call {
+            if let Some(notice) = slipstream_list_changed_notice(&registry, &client, &session).await
+            {
+                stdout.write_all(notice.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
         }
 
         // After flushing the response, check if a background auto-update completed.
@@ -1553,7 +1651,19 @@ async fn handle_request_dispatch(
             registry
                 .apply_initialize_surface_profile(surface_profile_from_initialize_params(&params));
             telemetry.update_initialize_hints(&params).await;
-            let result = build_legacy_initialize_result(registry, MCP_PROTOCOL_2024_11_05, &params);
+            let mut result =
+                build_legacy_initialize_result(registry, MCP_PROTOCOL_2024_11_05, &params);
+            // Stdio can tell the client when the Slipstream listing changes (see
+            // `slipstream_list_changed_notice`); read the catalog now so the tools/list that
+            // follows finds it ready.
+            if registry.get(domains::slipstream::TOOL_NAME).is_some() {
+                result["capabilities"]["tools"]["listChanged"] = serde_json::Value::Bool(true);
+                domains::slipstream::prefetch(
+                    domains::slipstream::SlipstreamGate::global(),
+                    (**client).clone(),
+                    session.clone(),
+                );
+            }
             if crate::readiness_evidence_writes_enabled() {
                 let managed_harness = std::env::var("CONTEXTSTREAM_CLIENT")
                     .ok()
@@ -1586,7 +1696,8 @@ async fn handle_request_dispatch(
         }
 
         "tools/list" => {
-            let tools = contextstream_tools_list(registry, None);
+            let mut tools = contextstream_tools_list(registry, None);
+            with_slipstream_listing(registry, client, session, None, &mut tools).await;
             json_rpc_result(id, serde_json::json!({ "tools": tools }))
         }
 
@@ -2544,8 +2655,8 @@ mod tests {
 
     const V0_5_62_BROAD_TOOL_NAMES: &[&str] = &[
         "account",
-        // Slipstream specialist agents, added after the v0.5.62 baseline.
-        "agent",
+        // `slipstream` is listed per caller (with_slipstream_listing), so it is
+        // not in the registry's own listing.
         "answer",
         "capsule",
         "capture_plan",
@@ -2616,11 +2727,6 @@ mod tests {
         (
             "account",
             "78d98c93e037399612ec80b4843598b1a738a4f800f0d0029881c358357907b4",
-        ),
-        (
-            // Slipstream specialist agents, added after the v0.5.62 baseline.
-            "agent",
-            "c5ea913302c99630f7e488ccf85a9a21015ba4ea802ae079fd05bba1738a4e4b",
         ),
         (
             "answer",
@@ -4190,5 +4296,224 @@ mod tests {
             Some(home.to_string_lossy().as_ref()),
             true,
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // Slipstream: listed per caller, announced when it changes (stdio)
+    // ------------------------------------------------------------------
+
+    const SLIPSTREAM_WORKSPACE: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// A ContextStream API with one agent, `lens`, turned on while `enabled` holds.
+    async fn slipstream_api(enabled: Arc<std::sync::atomic::AtomicBool>) -> String {
+        let app = axum::Router::new().route(
+            "/api/v1/tasks/agents",
+            axum::routing::get(move || {
+                let on = enabled.load(std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    axum::Json(serde_json::json!({"success": true, "data": {"agents": [
+                        {"agent": {"id": "lens", "version": "0.2.0", "name": "Lens",
+                                   "description": "Reads an image you shared and ties it to your workspace.",
+                                   "price_credits": 400,
+                                   "input_schema": {"type": "object", "required": ["media_id"],
+                                                    "properties": {"media_id": {"type": "string"},
+                                                                   "question": {"type": "string"}}}},
+                         "enabled": on}]}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slipstream API");
+        let address = listener.local_addr().expect("slipstream API address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        format!("http://{address}")
+    }
+
+    fn slipstream_runtime(
+        api_url: String,
+        api_key: &str,
+        workspace: Option<Uuid>,
+    ) -> (
+        Arc<ToolRegistry>,
+        Arc<ContextStreamClient>,
+        Arc<SessionManager>,
+        AgenticTelemetry,
+    ) {
+        let config = Config {
+            api_url,
+            api_key: Some(api_key.to_string()),
+            default_workspace_id: workspace,
+            ..Config::default()
+        };
+        let client = Arc::new(ContextStreamClient::new(config.clone()));
+        let session = Arc::new(SessionManager::new(client.as_ref().clone(), config.clone()));
+        let registry = Arc::new(build_registry(
+            &config,
+            client.as_ref().clone(),
+            session.clone(),
+        ));
+        let telemetry = AgenticTelemetry::new(client.as_ref().clone(), session.clone());
+        (registry, client, session, telemetry)
+    }
+
+    async fn stdio_tools(
+        registry: &Arc<ToolRegistry>,
+        client: &Arc<ContextStreamClient>,
+        session: &Arc<SessionManager>,
+        telemetry: &AgenticTelemetry,
+    ) -> Vec<serde_json::Value> {
+        let response = handle_request(
+            registry,
+            client,
+            session,
+            telemetry,
+            serde_json::json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list", "params": {}}),
+            mcp_tools::wire_tokens::WireTokenObservation::default(),
+        )
+        .await;
+        let envelope: serde_json::Value = serde_json::from_str(&response).expect("tools/list");
+        envelope["result"]["tools"]
+            .as_array()
+            .cloned()
+            .expect("tools")
+    }
+
+    #[tokio::test]
+    async fn stdio_lists_slipstream_for_its_workspace_and_announces_a_change() {
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let api = slipstream_api(enabled.clone()).await;
+        let workspace = Uuid::parse_str(SLIPSTREAM_WORKSPACE).unwrap();
+        let (registry, client, session, telemetry) =
+            slipstream_runtime(api, "stdio-slipstream-change", Some(workspace));
+
+        // initialize tells the client the tool list can change.
+        let init = handle_request(
+            &registry,
+            &client,
+            &session,
+            &telemetry,
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": MCP_PROTOCOL_2024_11_05, "capabilities": {},
+                "clientInfo": {"name": "slipstream-test", "version": "1"}}}),
+            mcp_tools::wire_tokens::WireTokenObservation::default(),
+        )
+        .await;
+        let init: serde_json::Value = serde_json::from_str(&init).expect("initialize");
+        assert_eq!(init["result"]["capabilities"]["tools"]["listChanged"], true);
+
+        // tools/list has the tool, described from the catalog, among the rest in order.
+        let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
+        let tool = tool_by_name(&tools, "slipstream");
+        let description = tool["description"].as_str().unwrap();
+        assert!(
+            description.contains("- lens (400) [media_id]: Reads an image"),
+            "{description}"
+        );
+        assert!(description.chars().count() <= PORTABLE_DESCRIPTION_LIMIT);
+        assert!(tool["inputSchema"]["properties"]["input"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("- lens: media_id* (string), question (string)"));
+        assert!(
+            mcp_tools::portable_schema::portable_schema_violations(&tool["inputSchema"]).is_empty()
+        );
+        let names = listed_names(&tools);
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+        assert_eq!(
+            tools.len(),
+            contextstream_tools_list(&registry, None).len() + 1
+        );
+
+        // Nothing changed: nothing to announce.
+        assert_eq!(
+            slipstream_list_changed_notice(&registry, &client, &session).await,
+            None
+        );
+
+        // The agent is turned off; the next call that reads the catalog notices it.
+        enabled.store(false, std::sync::atomic::Ordering::SeqCst);
+        let found = registry
+            .execute(
+                "slipstream",
+                serde_json::json!({"action": "find", "workspace_id": SLIPSTREAM_WORKSPACE}),
+            )
+            .await
+            .expect("find");
+        assert!(!found.is_error);
+        assert_eq!(
+            slipstream_list_changed_notice(&registry, &client, &session).await,
+            Some(TOOLS_LIST_CHANGED_NOTIFICATION)
+        );
+        let notice: serde_json::Value =
+            serde_json::from_str(TOOLS_LIST_CHANGED_NOTIFICATION).unwrap();
+        assert_eq!(notice["method"], "notifications/tools/list_changed");
+        assert!(notice.get("id").is_none());
+        // Once.
+        assert_eq!(
+            slipstream_list_changed_notice(&registry, &client, &session).await,
+            None
+        );
+        let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
+        assert!(!listed_names(&tools).contains(&"slipstream"));
+    }
+
+    #[tokio::test]
+    async fn slipstream_is_not_listed_where_its_workspace_is_closed_or_unknown() {
+        // A workspace outside the rollout.
+        let app = axum::Router::new().route(
+            "/api/v1/tasks/agents",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({"success": false, "data": null,
+                        "error": {"code": "FORBIDDEN", "message": "Tasks are not available in this workspace yet"}})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let workspace = Uuid::parse_str(SLIPSTREAM_WORKSPACE).unwrap();
+        let (registry, client, session, telemetry) = slipstream_runtime(
+            format!("http://{address}"),
+            "stdio-slipstream-closed",
+            Some(workspace),
+        );
+        let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
+        assert!(!listed_names(&tools).contains(&"slipstream"));
+        // Still callable: the API answers why.
+        let refused = registry
+            .execute(
+                "slipstream",
+                serde_json::json!({"action": "find", "workspace_id": SLIPSTREAM_WORKSPACE}),
+            )
+            .await
+            .expect("find");
+        assert!(refused.is_error);
+
+        // The API cannot be reached.
+        let (registry, client, session, telemetry) = slipstream_runtime(
+            "http://127.0.0.1:9".to_string(),
+            "stdio-slipstream-down",
+            Some(workspace),
+        );
+        let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
+        assert!(!listed_names(&tools).contains(&"slipstream"));
+
+        // Surfaces without it never ask: OpenAI agentic lists only its core tools.
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let api = slipstream_api(enabled).await;
+        let (registry, client, session, telemetry) =
+            slipstream_runtime(api, "stdio-slipstream-openai", Some(workspace));
+        registry.set_tool_surface_profile(ToolSurfaceProfile::OpenaiAgentic);
+        let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
+        assert!(!listed_names(&tools).contains(&"slipstream"));
+        assert_eq!(
+            slipstream_list_changed_notice(&registry, &client, &session).await,
+            None
+        );
     }
 }

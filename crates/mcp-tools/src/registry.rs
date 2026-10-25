@@ -798,23 +798,31 @@ impl ToolRegistry {
     /// which strict MCP clients (Windsurf) treat as a fatal
     /// duplicate-tool registration error. Aliases stay callable via
     /// [`Self::get`] and [`Self::execute`].
+    ///
+    /// Tools listed per caller ([`is_listed_per_caller`]) are left out too:
+    /// the transport adds them for a caller they apply to. They stay callable.
     pub fn list(&self) -> Vec<&RegisteredTool> {
         self.tools
             .iter()
             .filter(|(name, tool)| {
-                self.is_tool_visible(name) && name.as_str() == tool.metadata.name.as_str()
+                self.is_tool_visible(name)
+                    && name.as_str() == tool.metadata.name.as_str()
+                    && !is_listed_per_caller(name)
             })
             .map(|(_, tool)| tool)
             .collect()
     }
 
-    /// List tool names. Like [`Self::list`], back-compat aliases are
-    /// filtered out so each canonical name appears exactly once.
+    /// List tool names. Like [`Self::list`], back-compat aliases and tools
+    /// listed per caller are filtered out so each canonical name appears
+    /// exactly once.
     pub fn names(&self) -> Vec<&str> {
         self.tools
             .iter()
             .filter(|(name, tool)| {
-                self.is_tool_visible(name) && name.as_str() == tool.metadata.name.as_str()
+                self.is_tool_visible(name)
+                    && name.as_str() == tool.metadata.name.as_str()
+                    && !is_listed_per_caller(name)
             })
             .map(|(name, _)| name.as_str())
             .collect()
@@ -1829,6 +1837,17 @@ impl ToolsetConfig {
     }
 }
 
+/// Tools whose `tools/list` entry depends on who asks: `slipstream` is listed
+/// only for a caller whose workspace has Slipstream agents turned on, with a
+/// description written from them. The registry's own listing leaves them out
+/// and the transports add them per caller (`slipstream::listing`).
+const LISTED_PER_CALLER: &[&str] = &[crate::domains::slipstream::TOOL_NAME];
+
+/// Whether `name` is listed per caller rather than from the registry.
+pub fn is_listed_per_caller(name: &str) -> bool {
+    LISTED_PER_CALLER.contains(&name)
+}
+
 /// Check if tool is a router direct tool (exposed in router mode).
 fn is_router_direct_tool(name: &str) -> bool {
     ROUTER_DIRECT_TOOLS.contains(&name)
@@ -2187,6 +2206,30 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
             parallel_safe: false,
             batch_safe: false,
         },
+        "slipstream" => DiscoveryHints {
+            aliases: &[
+                "agents",
+                "specialist agent",
+                "ss run",
+                "csa",
+                "run an agent",
+                "review a pull request",
+                "release notes",
+                "make a pdf",
+                "read an image",
+            ],
+            tags: &["agents", "slipstream", "tasks", "delegation", "credits"],
+            when_to_use: "Hand one well-defined job to a Slipstream specialist agent (PR review, release notes, docs drift, memory gardening, repo guide, image reading, PDF, mail digest) and read its result.",
+            avoid_when: "Do not use for work you can do directly in the session, or without showing the person the quoted price of a priced agent.",
+            examples: &[
+                "review pull request 42 in acme/api",
+                "write release notes from v1.2.0 to v1.3.0",
+                "what Slipstream agents can I use here",
+            ],
+            latency_class: "slow",
+            parallel_safe: false,
+            batch_safe: false,
+        },
         _ => DiscoveryHints {
             aliases: &[],
             tags: default_category_tags(metadata.category),
@@ -2293,8 +2336,9 @@ const STANDARD_TOOLS: &[&str] = &[
     // VCS bridge — pulls, issues, activity, notifications across
     // linked repositories (added v0.3.5).
     "vcs",
-    // Slipstream specialist agents (find, run, get_run, list_runs, cancel_run).
-    "agent",
+    // Slipstream specialist agents (find, run, get_run, list_runs, cancel_run),
+    // listed only for a workspace with Slipstream (see `domains::slipstream`).
+    "slipstream",
     // Workspace dashboard charts (premium / hosted deployments only —
     // only registered when the premium layer is connected). The
     // `atlas_chart` alias is kept for one minor cycle for back-compat.
@@ -2376,8 +2420,9 @@ const CONSOLIDATED_TOOLS: &[&str] = &[
     // VCS bridge (added v0.3.5).
     "vcs",
     // Slipstream specialist agents: find, run (priced runs need the person's
-    // accepted quote), get_run, list_runs, cancel_run.
-    "agent",
+    // accepted quote), get_run, list_runs, cancel_run. Listed only for a
+    // workspace with Slipstream (see `domains::slipstream`).
+    "slipstream",
     "help",
     "generate_rules",
     "generate_editor_rules",

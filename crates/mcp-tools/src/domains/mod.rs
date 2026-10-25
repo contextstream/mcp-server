@@ -1,6 +1,7 @@
 //! Domain-specific tool implementations.
 
 pub mod account_mode;
+pub mod agent;
 pub mod answer;
 pub mod atlas_jobs;
 pub mod atlas_warm_cache;
@@ -42,6 +43,7 @@ mod parity_eval_tests;
 mod reference_resolution_tests;
 
 // Re-export all domain tools
+pub use agent::*;
 pub use answer::*;
 pub use atlas_jobs::*;
 pub use capsule::*;

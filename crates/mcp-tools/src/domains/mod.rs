@@ -1,7 +1,6 @@
 //! Domain-specific tool implementations.
 
 pub mod account_mode;
-pub mod agent;
 pub mod answer;
 pub mod atlas_jobs;
 pub mod atlas_warm_cache;
@@ -32,6 +31,7 @@ pub(crate) mod scope_resolution;
 pub mod search;
 pub mod session;
 pub mod skill;
+pub mod slipstream;
 pub mod vcs;
 pub(crate) mod working_set;
 pub mod workspace;
@@ -43,7 +43,6 @@ mod parity_eval_tests;
 mod reference_resolution_tests;
 
 // Re-export all domain tools
-pub use agent::*;
 pub use answer::*;
 pub use atlas_jobs::*;
 pub use capsule::*;

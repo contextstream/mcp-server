@@ -1,0 +1,737 @@
+{
+ "success": true,
+ "data": {
+  "agents": [
+   {
+    "agent": {
+     "id": "docs-drift",
+     "version": "0.1.0",
+     "name": "Docs Drift",
+     "description": "Finds statements in a repository's README and docs that the code no longer matches, and proposes the edits as a diff, each backed by the code that shows it.",
+     "scopes": [
+      "context.feedback",
+      "context.read",
+      "memory.read",
+      "memory.write.note",
+      "model.invoke",
+      "search.read"
+     ],
+     "input_kinds": [],
+     "per_run_credit_cap": 800,
+     "timeout_minutes": 5,
+     "schedulable": false,
+     "price_credits": 800,
+     "input_schema": {
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "required": [
+       "project_id"
+      ],
+      "properties": {
+       "focus": {
+        "type": "string",
+        "maxLength": 300,
+        "minLength": 1,
+        "description": "A topic to check, for example \"configuration\" or \"the CLI\"."
+       },
+       "paths": {
+        "type": "array",
+        "items": {
+         "type": "string",
+         "pattern": "^(?!\\/)(?!.*(?:^|\\/)\\.\\.(?:\\/|$))[\\w./ -]{1,200}$"
+        },
+        "maxItems": 10,
+        "minItems": 1,
+        "description": "Docs to check, for example README.md or docs/setup.md. Defaults to the README and the docs the index finds."
+       },
+       "save_note": {
+        "type": "boolean",
+        "description": "Save the findings and the diff as a note in the project."
+       },
+       "project_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "description": "The indexed project whose docs to check."
+       }
+      },
+      "additionalProperties": false
+     },
+     "examples": [
+      {
+       "note": "Checks the README and the docs the index finds against the code.",
+       "input": {
+        "project_id": "11111111-1111-4111-8111-111111111111"
+       }
+      },
+      {
+       "note": "Checks one doc's settings against the code that reads them.",
+       "input": {
+        "focus": "environment variables",
+        "paths": [
+         "docs/configuration.md"
+        ],
+        "project_id": "11111111-1111-4111-8111-111111111111"
+       }
+      },
+      {
+       "note": "Declined: reviewing a pull request is PR Reviewer's job.",
+       "input": {
+        "focus": "review my pull request",
+        "project_id": "11111111-1111-4111-8111-111111111111"
+       }
+      }
+     ]
+    },
+    "enabled": true
+   },
+   {
+    "agent": {
+     "id": "gardener",
+     "version": "0.1.0",
+     "name": "Memory Gardener",
+     "description": "Finds duplicate or conflicting decisions and lessons, and stale todos, plans, tasks and reminders, and proposes merges, supersedes and closures for the person to accept.",
+     "scopes": [
+      "items.read",
+      "memory.propose",
+      "memory.read",
+      "model.invoke"
+     ],
+     "input_kinds": [],
+     "per_run_credit_cap": 400,
+     "timeout_minutes": 5,
+     "schedulable": true,
+     "price_credits": 400,
+     "input_schema": {
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+       "as_of": {
+        "type": "string",
+        "format": "date-time",
+        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$",
+        "description": "Judge staleness as of this time instead of now."
+       },
+       "focus": {
+        "type": "string",
+        "maxLength": 300,
+        "minLength": 1,
+        "description": "A topic to tend first, for example \"deployment decisions\"."
+       },
+       "kinds": {
+        "type": "array",
+        "items": {
+         "enum": [
+          "decisions",
+          "lessons",
+          "todos",
+          "plans",
+          "tasks",
+          "reminders"
+         ],
+         "type": "string"
+        },
+        "maxItems": 6,
+        "minItems": 1,
+        "description": "What to tend. Defaults to all of them."
+       },
+       "dry_run": {
+        "type": "boolean",
+        "description": "List the proposals without filing them."
+       },
+       "project_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "description": "Tend only this project's items."
+       },
+       "stale_after_days": {
+        "type": "integer",
+        "maximum": 365,
+        "minimum": 7,
+        "description": "How long past its due date an open item must be to look stale (an item with no due date: twice as long untouched). Defaults to 60."
+       }
+      },
+      "additionalProperties": false
+     },
+     "examples": [
+      {
+       "note": "The weekly pass: every kind of item, stale after 60 days.",
+       "input": {}
+      },
+      {
+       "note": "Looks for duplicate or conflicting deployment decisions and lessons first.",
+       "input": {
+        "focus": "deployment",
+        "kinds": [
+         "decisions",
+         "lessons"
+        ]
+       }
+      },
+      {
+       "note": "Lists stale todos and tasks without filing the proposals.",
+       "input": {
+        "kinds": [
+         "todos",
+         "tasks"
+        ],
+        "dry_run": true,
+        "stale_after_days": 30
+       }
+      },
+      {
+       "note": "Declined: it tidies items, it does not summarise them.",
+       "input": {
+        "focus": "summarise my decisions"
+       }
+      }
+     ]
+    },
+    "enabled": true
+   },
+   {
+    "agent": {
+     "id": "guide",
+     "version": "0.1.0",
+     "name": "Repo Guide",
+     "description": "Writes an onboarding guide for an indexed repository: architecture, where things live, how to build, run and test it, with file:line citations and a diagram.",
+     "scopes": [
+      "context.feedback",
+      "context.read",
+      "memory.read",
+      "memory.write.note",
+      "model.invoke",
+      "search.read"
+     ],
+     "input_kinds": [],
+     "per_run_credit_cap": 500,
+     "timeout_minutes": 5,
+     "schedulable": false,
+     "price_credits": 500,
+     "input_schema": {
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "required": [
+       "project_id"
+      ],
+      "properties": {
+       "focus": {
+        "type": "string",
+        "maxLength": 300,
+        "minLength": 1,
+        "description": "A part of the repository to go deeper on, for example \"the billing service\"."
+       },
+       "save_note": {
+        "type": "boolean",
+        "description": "Save the guide as a note in the project."
+       },
+       "project_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "description": "The indexed project (repository) to explain."
+       }
+      },
+      "additionalProperties": false
+     },
+     "examples": [
+      {
+       "note": "A guide to the whole repository: its parts, its commands and where to start reading.",
+       "input": {
+        "project_id": "11111111-1111-4111-8111-111111111111"
+       }
+      },
+      {
+       "note": "The same guide, going deeper on billing.",
+       "input": {
+        "focus": "the billing service",
+        "project_id": "11111111-1111-4111-8111-111111111111"
+       }
+      },
+      {
+       "note": "Declined: changing code is not Repo Guide's job.",
+       "input": {
+        "focus": "fix the failing billing tests",
+        "project_id": "11111111-1111-4111-8111-111111111111"
+       }
+      }
+     ]
+    },
+    "enabled": true
+   },
+   {
+    "agent": {
+     "id": "lens",
+     "version": "0.2.0",
+     "name": "Lens",
+     "description": "Reads an image you shared and ties it to your workspace: the text in it, related code, docs, decisions and lessons, and what to do next, with citations.",
+     "scopes": [
+      "context.feedback",
+      "context.read",
+      "media.read",
+      "memory.read",
+      "memory.write.note",
+      "model.invoke",
+      "search.read"
+     ],
+     "input_kinds": [
+      "image"
+     ],
+     "per_run_credit_cap": 400,
+     "timeout_minutes": 5,
+     "schedulable": false,
+     "price_credits": 400,
+     "input_schema": {
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "required": [
+       "media_id"
+      ],
+      "properties": {
+       "media_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "description": "The image, as a ContextStream media id. Inputs carry references, never bytes."
+       },
+       "question": {
+        "type": "string",
+        "maxLength": 1000,
+        "minLength": 1,
+        "description": "What you want to know about the image."
+       },
+       "save_note": {
+        "type": "boolean",
+        "description": "Save the analysis as a note that links to the image."
+       },
+       "project_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "description": "Search this project for related code."
+       }
+      },
+      "additionalProperties": false
+     },
+     "examples": [
+      {
+       "note": "A screenshot of a stack trace: Lens reads it, finds the failing code, and the decisions and lessons about it.",
+       "input": {
+        "media_id": "22222222-2222-4222-8222-222222222222",
+        "question": "Why is the API failing?"
+       }
+      },
+      {
+       "note": "A whiteboard photo: Lens transcribes it and links it to the docs and decisions it matches.",
+       "input": {
+        "media_id": "33333333-3333-4333-8333-333333333333"
+       }
+      },
+      {
+       "note": "Declined: making files is not Lens's job.",
+       "input": {
+        "media_id": "44444444-4444-4444-8444-444444444444",
+        "question": "Make a PDF of this"
+       }
+      }
+     ]
+    },
+    "enabled": true
+   },
+   {
+    "agent": {
+     "id": "mail",
+     "version": "0.1.0",
+     "name": "Mail",
+     "description": "Reads your recent mail and writes a digest of what needs a reply, the commitments made and the deadlines coming, and saves reply drafts for you to send. It never sends anything.",
+     "scopes": [
+      "mail.draft.write",
+      "mail.read",
+      "model.invoke"
+     ],
+     "input_kinds": [],
+     "per_run_credit_cap": 1600,
+     "timeout_minutes": 5,
+     "schedulable": true,
+     "price_credits": 500,
+     "input_schema": {
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+       "as_of": {
+        "type": "string",
+        "format": "date-time",
+        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$",
+        "description": "Read the window as of this time instead of now."
+       },
+       "focus": {
+        "type": "string",
+        "maxLength": 300,
+        "minLength": 1,
+        "description": "What to look at first, for example \"anything from Acme about the renewal\"."
+       },
+       "drafts": {
+        "type": "integer",
+        "maximum": 10,
+        "minimum": 0,
+        "description": "How many reply drafts to save in your Drafts, at most. 0 saves none. Defaults to 3."
+       },
+       "dry_run": {
+        "type": "boolean",
+        "description": "Put the drafts in the digest without saving them."
+       },
+       "mailbox": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_+-]+(?:\\.[A-Za-z0-9_+-]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$",
+        "maxLength": 254,
+        "description": "The mailbox to read. Defaults to every mailbox you have, up to three."
+       },
+       "reply_style": {
+        "type": "string",
+        "maxLength": 300,
+        "minLength": 1,
+        "description": "How the drafts should read, for example \"short and friendly, signed Ada\"."
+       },
+       "max_messages": {
+        "type": "integer",
+        "maximum": 60,
+        "minimum": 5,
+        "description": "How many of the newest inbox messages to look at in each mailbox. Defaults to 40."
+       },
+       "window_hours": {
+        "type": "integer",
+        "maximum": 336,
+        "minimum": 1,
+        "description": "How far back to read, in hours. Defaults to 24; a weekly digest uses 168."
+       }
+      },
+      "additionalProperties": false
+     },
+     "examples": [
+      {
+       "note": "The daily digest: the last 24 hours of every mailbox, with up to three reply drafts saved.",
+       "input": {}
+      },
+      {
+       "note": "A weekly digest with no drafts.",
+       "input": {
+        "drafts": 0,
+        "window_hours": 168
+       }
+      },
+      {
+       "note": "Looks at the Northwind renewal thread first and drafts short replies.",
+       "input": {
+        "focus": "anything from Northwind about the renewal",
+        "mailbox": "ada@acme.dev",
+        "reply_style": "short, signed Ada"
+       }
+      },
+      {
+       "note": "Declined: it never sends; the person sends the drafts.",
+       "input": {
+        "focus": "send the replies for me"
+       }
+      }
+     ]
+    },
+    "enabled": true
+   },
+   {
+    "agent": {
+     "id": "pdf",
+     "version": "0.1.0",
+     "name": "PDF",
+     "description": "Makes a PDF from a doc, a plan, notes or markdown in the workspace, with contents, bookmarks and links, and stores it as media.",
+     "scopes": [
+      "docs.read",
+      "items.read",
+      "media.write",
+      "model.invoke"
+     ],
+     "input_kinds": [
+      "doc",
+      "plan",
+      "markdown"
+     ],
+     "per_run_credit_cap": 600,
+     "timeout_minutes": 5,
+     "schedulable": false,
+     "price_credits": 600,
+     "input_schema": {
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+       "toc": {
+        "type": "boolean",
+        "description": "Add a table of contents, or leave it out. Left unset, long documents get one."
+       },
+       "paper": {
+        "enum": [
+         "a4",
+         "letter"
+        ],
+        "type": "string",
+        "description": "Paper size: a4 (the default) or letter."
+       },
+       "title": {
+        "type": "string",
+        "maxLength": 200,
+        "minLength": 1,
+        "description": "The PDF's title. Defaults to the source's own title."
+       },
+       "doc_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "description": "A ContextStream doc to make the PDF from."
+       },
+       "plan_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "description": "A ContextStream plan to make the PDF from, with its steps and tasks."
+       },
+       "markdown": {
+        "type": "string",
+        "maxLength": 200000,
+        "minLength": 1,
+        "description": "Markdown to make the PDF from: notes, a Lens result, anything written down."
+       },
+       "doc_title": {
+        "type": "string",
+        "maxLength": 300,
+        "minLength": 1,
+        "description": "A ContextStream doc to make the PDF from, by its title."
+       },
+       "project_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "description": "Store the PDF in this project instead of the source's."
+       },
+       "instructions": {
+        "type": "string",
+        "maxLength": 500,
+        "minLength": 1,
+        "description": "How to arrange it, for example \"one section per phase\" or \"put the open questions first\"."
+       }
+      },
+      "additionalProperties": false
+     },
+     "examples": [
+      {
+       "note": "The doc as a PDF, titled and sectioned as the doc is.",
+       "input": {
+        "doc_id": "55555555-5555-4555-8555-555555555555"
+       }
+      },
+      {
+       "note": "The plan with its steps and a table of its tasks, on US letter paper.",
+       "input": {
+        "paper": "letter",
+        "plan_id": "11111111-1111-4111-8111-111111111111"
+       }
+      },
+      {
+       "note": "Notes the person pasted, under their own title.",
+       "input": {
+        "title": "Standup, 17 October",
+        "markdown": "# Standup notes\n\n- Shipped the importer\n- Next: billing"
+       }
+      },
+      {
+       "note": "Declined: PDF prints the source as it is and does not summarise it.",
+       "input": {
+        "doc_title": "Q3 report",
+        "instructions": "summarise it in one page"
+       }
+      }
+     ]
+    },
+    "enabled": true
+   },
+   {
+    "agent": {
+     "id": "release-notes",
+     "version": "0.1.0",
+     "name": "Release Notes",
+     "description": "Turns the merged pull requests and commits between two refs into user-facing release notes, accounting for every merged pull request, and saves them as a release_notes doc.",
+     "scopes": [
+      "docs.write",
+      "model.invoke",
+      "vcs.read"
+     ],
+     "input_kinds": [],
+     "per_run_credit_cap": 900,
+     "timeout_minutes": 5,
+     "schedulable": false,
+     "price_credits": 900,
+     "input_schema": {
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "required": [
+       "repo",
+       "base",
+       "head"
+      ],
+      "properties": {
+       "base": {
+        "type": "string",
+        "pattern": "^(?!.*\\.\\.)(?!.*\\.$)[A-Za-z0-9][A-Za-z0-9._-]{0,99}$",
+        "description": "The previous release: a tag, branch or commit, for example v1.2.0."
+       },
+       "head": {
+        "type": "string",
+        "pattern": "^(?!.*\\.\\.)(?!.*\\.$)[A-Za-z0-9][A-Za-z0-9._-]{0,99}$",
+        "description": "The release: a tag, branch or commit, for example v1.3.0 or main."
+       },
+       "repo": {
+        "type": "string",
+        "pattern": "^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[A-Za-z0-9_.-]{1,100}(?:\\/[A-Za-z0-9_.-]{1,100}){1,4})$",
+        "description": "The repository to write release notes for."
+       },
+       "title": {
+        "type": "string",
+        "maxLength": 200,
+        "minLength": 1,
+        "description": "The notes' title. Defaults to the repository and the release ref."
+       },
+       "shared": {
+        "type": "boolean",
+        "description": "Save the notes for the whole workspace instead of as your own."
+       },
+       "dry_run": {
+        "type": "boolean",
+        "description": "Return the notes without saving them as a doc."
+       },
+       "audience": {
+        "enum": [
+         "users",
+         "developers"
+        ],
+        "type": "string",
+        "description": "users (the default) leaves internal changes out of the notes; developers keeps them under Internal."
+       },
+       "project_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "description": "Save the notes in this project instead of the workspace."
+       }
+      },
+      "additionalProperties": false
+     },
+     "examples": [
+      {
+       "note": "Notes for v1.3.0, saved as your own release_notes doc.",
+       "input": {
+        "base": "v1.2.0",
+        "head": "v1.3.0",
+        "repo": "acme/api"
+       }
+      },
+      {
+       "note": "What is unreleased on main, internal changes included, not saved.",
+       "input": {
+        "base": "v1.3.0",
+        "head": "main",
+        "repo": "acme/api",
+        "dry_run": true,
+        "audience": "developers"
+       }
+      },
+      {
+       "note": "Declined: reviewing changes is PR Reviewer's job.",
+       "input": {
+        "base": "v1.2.0",
+        "head": "v1.3.0",
+        "repo": "acme/api",
+        "title": "Review the changes in v1.3.0"
+       }
+      }
+     ]
+    },
+    "enabled": true
+   },
+   {
+    "agent": {
+     "id": "review",
+     "version": "0.1.0",
+     "name": "PR Reviewer",
+     "description": "Reviews a pull request's diff against the workspace's decisions, lessons and preferences, and returns findings that each cite a line of the diff and the constraint they rely on.",
+     "scopes": [
+      "context.feedback",
+      "context.read",
+      "memory.read",
+      "memory.write.note",
+      "model.invoke",
+      "vcs.read"
+     ],
+     "input_kinds": [],
+     "per_run_credit_cap": 1200,
+     "timeout_minutes": 5,
+     "schedulable": false,
+     "price_credits": 1200,
+     "input_schema": {
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "required": [
+       "repo",
+       "pull"
+      ],
+      "properties": {
+       "pull": {
+        "type": "integer",
+        "maximum": 999999999,
+        "minimum": 1,
+        "description": "The pull request (or merge request) number."
+       },
+       "repo": {
+        "type": "string",
+        "pattern": "^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[A-Za-z0-9_.-]{1,100}(?:\\/[A-Za-z0-9_.-]{1,100}){1,4})$",
+        "description": "The repository the pull request is in."
+       },
+       "focus": {
+        "type": "string",
+        "maxLength": 300,
+        "minLength": 1,
+        "description": "What to look at hardest, for example \"error handling\" or \"the migration\"."
+       },
+       "save_note": {
+        "type": "boolean",
+        "description": "Save the review as a note in the workspace."
+       },
+       "project_id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "description": "The project whose decisions, lessons and preferences apply. Defaults to the workspace's."
+       }
+      },
+      "additionalProperties": false
+     },
+     "examples": [
+      {
+       "note": "Reviews pull request 42 against the workspace's decisions, lessons and preferences.",
+       "input": {
+        "pull": 42,
+        "repo": "acme/api"
+       }
+      },
+      {
+       "note": "Looks hardest at the migration.",
+       "input": {
+        "pull": 42,
+        "repo": "acme/api",
+        "focus": "the database migration"
+       }
+      },
+      {
+       "note": "Declined: fixing failing CI is CI Fixer's job.",
+       "input": {
+        "pull": 42,
+        "repo": "acme/api",
+        "focus": "fix the failing tests"
+       }
+      }
+     ]
+    },
+    "enabled": true
+   }
+  ]
+ },
+ "error": null,
+ "metadata": {}
+}

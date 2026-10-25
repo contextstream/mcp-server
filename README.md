@@ -55,6 +55,34 @@ Then ask it to save a real decision and its reason. Start a new session and
 retrieve that decision without explaining it again. Indexing supplies code
 context; it cannot recover every undocumented decision.
 
+## Slipstream agents
+
+When your workspace has Slipstream, the server adds one tool, `slipstream`, that hands a
+whole job to a ContextStream specialist agent working with your workspace's context:
+review a pull request against your team's decisions, write release notes, check docs
+against the code, tend memory, write a repository guide, read an image, make a PDF, or
+digest your mail (it never sends). Each agent is priced in credits per run and charged
+only when the run succeeds; declined, failed, cancelled and timed-out runs are free.
+
+- **Enabling.** A workspace owner or admin turns agents on in the workspace's Slipstream
+  settings. The tool is listed only for a workspace with at least one agent turned on, so
+  everywhere else it costs no prompt. Its description names each agent turned on, its
+  price and the input it needs, so you can just ask: "Which Slipstream agents can I use
+  here?" or "Have Slipstream review PR 42 in acme/api."
+- **Workspace.** The local server lists it for the workspace of your session (or of
+  `CONTEXTSTREAM_WORKSPACE_ID`, or of the folder's mapping) and tells clients that follow
+  `notifications/tools/list_changed`, such as Claude Code, when that changes. A hosted
+  connection lists it for the workspace its `X-ContextStream-Workspace-Id` header names.
+- **Prices.** A priced agent first answers with its price; your agent shows it to you and
+  runs the job once you accept. To let runs up to a price start without that step, set an
+  auto-accept cap: `CONTEXTSTREAM_SLIPSTREAM_AUTO_ACCEPT_MAX_CREDITS=500` in the local
+  server's environment (your MCP config's `env`), or the header
+  `X-ContextStream-Slipstream-Auto-Accept-Max-Credits: 500` on a hosted connection. Unset
+  or `0` always asks; the hosted gateway never sets a cap for you.
+- **Runs.** A run waits up to 25 seconds for its result; a longer one returns its task id
+  for your agent to follow. A retried call never starts a second run.
+- **Terminal.** The same agents run from a shell with `ss run <agent>` (alias `csa`).
+
 ## Proof and data controls
 
 **95 ms median code search in our published benchmark.** This is the measured

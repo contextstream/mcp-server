@@ -2293,6 +2293,8 @@ const STANDARD_TOOLS: &[&str] = &[
     // VCS bridge — pulls, issues, activity, notifications across
     // linked repositories (added v0.3.5).
     "vcs",
+    // Slipstream specialist agents (find, run, get_run, list_runs, cancel_run).
+    "agent",
     // Workspace dashboard charts (premium / hosted deployments only —
     // only registered when the premium layer is connected). The
     // `atlas_chart` alias is kept for one minor cycle for back-compat.
@@ -2373,6 +2375,9 @@ const CONSOLIDATED_TOOLS: &[&str] = &[
     "entity",
     // VCS bridge (added v0.3.5).
     "vcs",
+    // Slipstream specialist agents: find, run (priced runs need the person's
+    // accepted quote), get_run, list_runs, cancel_run.
+    "agent",
     "help",
     "generate_rules",
     "generate_editor_rules",

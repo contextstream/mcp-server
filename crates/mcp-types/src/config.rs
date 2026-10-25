@@ -116,6 +116,14 @@ pub struct Config {
     /// Non-interactive default for team vs personal execution mode.
     #[serde(default)]
     pub account_mode_preference: AccountModePreference,
+
+    /// Slipstream runs priced at most this many credits start without asking the person
+    /// first (`CONTEXTSTREAM_SLIPSTREAM_AUTO_ACCEPT_MAX_CREDITS` on stdio, the
+    /// `X-ContextStream-Slipstream-Auto-Accept-Max-Credits` header on a hosted connection).
+    /// `0`, the default, always shows the price first. The hosted gateway never takes it from
+    /// its own environment: it would spend every caller's credits.
+    #[serde(default)]
+    pub slipstream_auto_accept_max_credits: u32,
 }
 
 fn default_true() -> bool {
@@ -167,6 +175,7 @@ impl Default for Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_default(),
+            slipstream_auto_accept_max_credits: 0,
         }
     }
 }
@@ -238,6 +247,9 @@ impl Config {
         if let Some(value) = override_config.tool_surface_profile {
             next.tool_surface_profile = value;
         }
+        if let Some(value) = override_config.slipstream_auto_accept_max_credits {
+            next.slipstream_auto_accept_max_credits = value;
+        }
 
         next
     }
@@ -282,6 +294,10 @@ pub struct ConfigOverride {
     /// `acceleration_enabled` / `X-ContextStream-Acceleration-Enabled`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub atlas_enabled: Option<bool>,
+    /// The caller's Slipstream auto-accept cap in credits
+    /// (`X-ContextStream-Slipstream-Auto-Accept-Max-Credits`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slipstream_auto_accept_max_credits: Option<u32>,
 }
 
 impl ConfigOverride {
@@ -304,6 +320,7 @@ impl ConfigOverride {
             && self.tool_surface_profile.is_none()
             && self.acceleration_enabled.is_none()
             && self.atlas_enabled.is_none()
+            && self.slipstream_auto_accept_max_credits.is_none()
     }
 
     pub fn affects_tool_registry(&self) -> bool {

@@ -10,7 +10,7 @@ use crate::agentic_telemetry::{
 };
 use crate::server::{
     build_contextstream_stateless_discover_result, build_legacy_initialize_result, build_registry,
-    contextstream_tools_list, validate_contextstream_meta_tool_arguments,
+    contextstream_tools_list, validate_contextstream_meta_tool_arguments, with_slipstream_listing,
 };
 use axum::body::Body;
 use axum::http::{Method, Request};
@@ -1365,7 +1365,15 @@ async fn handle_list_tools(
     Query(params): Query<ListParams>,
 ) -> impl IntoResponse {
     let registry = effective_registry(&state).await;
-    let tools = contextstream_tools_list(&registry, params.category.as_deref());
+    let mut tools = contextstream_tools_list(&registry, params.category.as_deref());
+    with_slipstream_listing(
+        &registry,
+        &state.client,
+        &state.session,
+        params.category.as_deref(),
+        &mut tools,
+    )
+    .await;
 
     Json(serde_json::json!({ "tools": tools }))
 }
@@ -2260,24 +2268,34 @@ async fn handle_list_tools_method(
         None => effective_registry(state).await,
     };
     let cache_key = tools_list_cache_key(state, registry.as_ref()).await;
-    if let Some(cached) = state
+    let cached = state
         .tools_list_cache
         .read()
         .unwrap_or_else(|err| err.into_inner())
         .get(&cache_key)
-        .cloned()
+        .cloned();
+    let mut response = match cached {
+        Some(cached) => cached,
+        None => {
+            let tools = contextstream_tools_list(&registry, None);
+            let response = serde_json::json!({ "tools": tools });
+            state
+                .tools_list_cache
+                .write()
+                .unwrap_or_else(|err| err.into_inner())
+                .insert(cache_key, response.clone());
+            response
+        }
+    };
+
+    // The shared cache holds what every caller sees; Slipstream depends on the caller's
+    // workspace and is added per request.
+    if let Some(tools) = response
+        .get_mut("tools")
+        .and_then(|tools| tools.as_array_mut())
     {
-        return Ok(cached);
+        with_slipstream_listing(&registry, &state.client, &state.session, None, tools).await;
     }
-
-    let tools = contextstream_tools_list(&registry, None);
-
-    let response = serde_json::json!({ "tools": tools });
-    state
-        .tools_list_cache
-        .write()
-        .unwrap_or_else(|err| err.into_inner())
-        .insert(cache_key, response.clone());
 
     Ok(response)
 }
@@ -2634,6 +2652,12 @@ fn extract_config_override(headers: &HeaderMap) -> Option<ConfigOverride> {
         // a deprecated alias during migration.
         acceleration_enabled,
         atlas_enabled,
+        // The person's own cap; the gateway's environment never sets one for callers.
+        slipstream_auto_accept_max_credits: header_str(
+            headers,
+            mcp_tools::domains::slipstream::AUTO_ACCEPT_HEADER,
+        )
+        .and_then(|value| value.trim().parse::<u32>().ok()),
     };
 
     if override_config.is_empty() {
@@ -6492,6 +6516,148 @@ mod tests {
             assert_eq!(path_surface_profile("/mcp"), None);
             assert!(is_streamable_mcp_path("/coach"));
         }
+    }
+
+    /// The hosted gateway serves everyone from one cached tool list; `slipstream`
+    /// is added per caller, for the workspace their connection names, and only
+    /// where that workspace has agents turned on.
+    #[tokio::test]
+    async fn hosted_tools_list_adds_slipstream_per_caller_workspace() {
+        let open = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let closed = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let app = axum::Router::new().route(
+            "/api/v1/tasks/agents",
+            get(move |Query(query): Query<HashMap<String, String>>| async move {
+                let asked = query.get("workspace_id").cloned().unwrap_or_default();
+                if asked == open.to_string() {
+                    (
+                        StatusCode::OK,
+                        Json(json!({"success": true, "data": {"agents": [
+                            {"agent": {"id": "review", "version": "0.1.0", "name": "PR Reviewer",
+                                       "description": "Reviews a pull request's diff against the workspace's decisions.",
+                                       "price_credits": 1200,
+                                       "input_schema": {"type": "object", "required": ["repo", "pull"],
+                                                        "properties": {"repo": {"type": "string"},
+                                                                       "pull": {"type": "integer"}}}},
+                             "enabled": true}]}})),
+                    )
+                } else {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"success": false, "data": null, "error": {
+                            "code": "FORBIDDEN", "message": "Tasks are not available in this workspace yet"}})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slipstream API");
+        let address = listener.local_addr().expect("slipstream API address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+
+        let config = Config {
+            api_url: format!("http://{address}"),
+            api_key: Some("gateway-process-key".to_string()),
+            is_http_transport: true,
+            ..Config::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config.clone()));
+        let registry = build_registry(&config, client.clone(), session.clone());
+        let state = HttpState {
+            registry: Arc::new(registry),
+            client: client.clone(),
+            session: session.clone(),
+            jwt_secret: None,
+            require_auth: false,
+            telemetry: AgenticTelemetry::new(client, session),
+            tools_list_cache: Arc::new(RwLock::new(HashMap::new())),
+            concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            metrics_handle: None,
+        };
+        let list_as = |caller: &'static str, workspace: Option<Uuid>, cap: Option<u32>| {
+            let state = state.clone();
+            async move {
+                let auth = AuthOverride {
+                    api_key: Some(format!("{caller}-key")),
+                    workspace_id: workspace,
+                    ..AuthOverride::default()
+                };
+                let config = ConfigOverride {
+                    slipstream_auto_accept_max_credits: cap,
+                    ..ConfigOverride::default()
+                };
+                run_with_caller_cache_identity(caller.to_string(), || async {
+                    run_with_auth_override(auth, || async {
+                        run_with_config_override(config, || async {
+                            handle_list_tools_method(&state, None).await
+                        })
+                        .await
+                    })
+                    .await
+                })
+                .await
+                .expect("tools/list")
+            }
+        };
+        let slipstream = |list: &Value| {
+            list["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "slipstream")
+                .cloned()
+        };
+
+        let listed = list_as("caller-open", Some(open), None).await;
+        let tool = slipstream(&listed).expect("listed for an open workspace");
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.contains("- review (1200) [pull, repo]: Reviews a pull request"));
+        assert!(description.contains("It first returns the price"));
+
+        // The caller's own auto-accept cap shapes their description only.
+        let capped = list_as("caller-open", Some(open), Some(1500)).await;
+        assert!(slipstream(&capped).unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .contains("A run priced at most 1500 credits starts at once"));
+
+        // Another caller, another workspace: not listed, and nothing leaks across.
+        let other = list_as("caller-closed", Some(closed), None).await;
+        assert!(slipstream(&other).is_none());
+        let unknown = list_as("caller-nowhere", None, None).await;
+        assert!(slipstream(&unknown).is_none());
+        assert_eq!(
+            other["tools"].as_array().unwrap().len() + 1,
+            listed["tools"].as_array().unwrap().len()
+        );
+
+        // The shared cache holds only what every caller sees.
+        for cached in state
+            .tools_list_cache
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .values()
+        {
+            assert!(slipstream(cached).is_none());
+        }
+
+        // The cap comes from the caller's header, never from the gateway.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            mcp_tools::domains::slipstream::AUTO_ACCEPT_HEADER,
+            "750".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_config_override(&headers).and_then(|c| c.slipstream_auto_accept_max_credits),
+            Some(750)
+        );
+        headers.insert(
+            mcp_tools::domains::slipstream::AUTO_ACCEPT_HEADER,
+            "lots".parse().unwrap(),
+        );
+        assert!(extract_config_override(&headers).is_none());
     }
 }
 

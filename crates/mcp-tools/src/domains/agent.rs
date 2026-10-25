@@ -423,8 +423,69 @@ fn format_catalog(catalog: &Value) -> String {
         {
             out.push_str(&format!("   {}\n", description.trim()));
         }
+        let fields = input_fields(agent.get("input_schema").unwrap_or(&Value::Null));
+        if !fields.is_empty() {
+            out.push_str(&format!("   Input: {}\n", fields.join(", ")));
+        }
+        if let Some(example) = agent
+            .get("examples")
+            .and_then(Value::as_array)
+            .and_then(|examples| examples.first())
+        {
+            let input = example.get("input").cloned().unwrap_or(Value::Null);
+            let note = example.get("note").and_then(Value::as_str).unwrap_or("");
+            out.push_str(&format!("   Example input: {input} — {note}\n"));
+        }
     }
     out.trim_end().to_string()
+}
+
+/// An input schema's top-level fields as `name (type[, required])`, required ones first.
+fn input_fields(schema: &Value) -> Vec<String> {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut fields: Vec<(bool, &String, String)> = properties
+        .iter()
+        .map(|(name, property)| {
+            let kind = if let Some(values) = property.get("enum").and_then(Value::as_array) {
+                values
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            } else {
+                match property.get("type").and_then(Value::as_str) {
+                    Some("array") => format!(
+                        "{}[]",
+                        property
+                            .pointer("/items/type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("value")
+                    ),
+                    Some(kind) => kind.to_string(),
+                    None => "value".to_string(),
+                }
+            };
+            (required.contains(&name.as_str()), name, kind)
+        })
+        .collect();
+    fields.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    fields
+        .into_iter()
+        .map(|(required, name, kind)| {
+            if required {
+                format!("{name} ({kind}, required)")
+            } else {
+                format!("{name} ({kind})")
+            }
+        })
+        .collect()
 }
 
 fn format_task(task: &Value) -> String {

@@ -206,3 +206,33 @@ fn agent_ids_are_checked_before_they_reach_a_query_string() {
         assert!(!is_agent_id(bad), "{bad:?}");
     }
 }
+
+#[test]
+fn the_catalog_text_names_each_agents_input_and_an_example() {
+    let catalog = json!({
+        "agents": [
+            {"agent": {"id": "review", "version": "0.1.0", "name": "PR Reviewer", "description": "",
+                       "price_credits": 1200,
+                       "input_schema": {"type": "object", "required": ["repo", "pull"], "properties": {
+                           "focus": {"type": "string"}, "repo": {"type": "string"}, "pull": {"type": "integer"},
+                           "paths": {"type": "array", "items": {"type": "string"}},
+                           "audience": {"enum": ["users", "developers"]}}},
+                       "examples": [{"input": {"repo": "acme/api", "pull": 42}, "note": "Reviews pull request 42."}]},
+             "enabled": true},
+            {"agent": {"id": "legacy", "version": "0.1.0", "name": "Legacy"}, "enabled": true}
+        ]
+    });
+    let text = format_catalog(&catalog);
+    assert!(text.contains(
+        "   Input: pull (integer, required), repo (string, required), audience (\"users\" | \"developers\"), focus (string), paths (string[])"
+    ));
+    let example = text
+        .lines()
+        .find(|line| line.starts_with("   Example input: "))
+        .expect("an example line");
+    assert!(example.contains(r#""pull":42"#) && example.contains(r#""repo":"acme/api""#));
+    assert!(example.ends_with(" — Reviews pull request 42."));
+    // An agent synced before inputs were has neither line.
+    let legacy = &text[text.find("**Legacy**").unwrap()..];
+    assert!(!legacy.contains("Input:") && !legacy.contains("Example input:"));
+}

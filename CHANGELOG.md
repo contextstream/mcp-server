@@ -1,5 +1,59 @@
 # Changelog
 
+## 1.0.30
+
+- Slipstream agents (#201, #202, #204): a `slipstream` tool hands one job to a
+  ContextStream specialist agent that works with the workspace's context
+  (review a pull request, write release notes, check docs against code, tend
+  memory, write a repository guide, read an image, make a PDF, digest mail
+  without sending). Actions: `find`, `run`, `get_run`, `list_runs`,
+  `cancel_run`. A run is charged its price only when it succeeds.
+  - It is listed only for a caller whose workspace's catalog answers with at
+    least one agent turned on; otherwise (no agent on, the workspace not open
+    to Slipstream, the API unreachable, no workspace known) it is not listed
+    and costs no prompt. The answer is cached per caller and workspace for 5
+    minutes (a refusal for 10; an unreachable catalog is read again after 30
+    seconds and never hides one read before), and `find` and `run` refresh it.
+  - The stdio server reads the catalog when a client initializes, advertises
+    `tools.listChanged`, and sends `notifications/tools/list_changed` after a
+    tool call that changes the listing (init into another workspace, an agent
+    turned on or off). The hosted gateway lists it per request for the
+    session's workspace or the connection's `X-ContextStream-Workspace-Id`.
+  - Its description is written from the agents turned on: each one's id,
+    price, required input and job, within 1,000 characters, then how to run
+    one. The `input` parameter lists every agent's fields with their types and
+    an example.
+  - `run` takes the workspace and project from the session (a required
+    `project_id` in an agent's input defaults to the session's project) and
+    checks the input against the agent's schema before sending it. A priced
+    agent answers with its price first and runs once the person accepts it
+    (`accepted_price_credits`). An opt-in auto-accept cap starts runs priced at
+    or below it without that step: `CONTEXTSTREAM_SLIPSTREAM_AUTO_ACCEPT_MAX_CREDITS`
+    for the stdio server, the header
+    `X-ContextStream-Slipstream-Auto-Accept-Max-Credits` on a hosted
+    connection. Unset or `0` always asks, and the hosted gateway never takes a
+    cap from its own environment.
+  - Every run carries an idempotency key, the caller's or one derived from the
+    caller, workspace, project, agent, input and session within a 10-minute
+    window, so a retried call returns the task the first one started.
+  - Answers lead with the summary, carry the task id on every line, then the
+    cost; a run still working names the `get_run` call that waits for it (up
+    to 25 seconds). A declined run suggests another agent only when the
+    workspace's catalog has it.
+- Package Bouncer (#203), an opt-in Claude Code and Cursor hook
+  (`contextstream-mcp hook package-bouncer`): before an install runs, it checks
+  every package the command names against its public registry (npm, pnpm,
+  yarn, bun, npx, pip, uv, uvx, pipx, poetry and cargo, including
+  `claude mcp add ... -- npx ...`). It denies a package the registry does not
+  have, naming the popular package it looks like; asks before a barely
+  downloaded lookalike of a popular package; and allows everything else,
+  including any lookup that fails or takes longer than 3.5 seconds. Commands
+  and projects that use a private registry are skipped.
+  `CONTEXTSTREAM_PACKAGE_BOUNCER=off` turns it off. It is not installed by
+  default; the README shows the entries.
+- One tool is added (`slipstream`, listed per caller as above). No other
+  tool, schema or description changes.
+
 ## 1.0.29
 
 - Hosted gateway: the tenant home the API names on a response

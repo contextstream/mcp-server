@@ -19,6 +19,7 @@ pub mod git_pre_push;
 pub mod instructions_loaded;
 pub mod notification;
 pub mod on_save_intent;
+pub mod package_bouncer;
 pub mod permission_request;
 pub mod post_compact;
 pub mod post_tool_use;
@@ -398,6 +399,8 @@ pub async fn dispatch_hook(name: &str) -> Result<()> {
     match name {
         "user-prompt-submit" => user_prompt_submit::handle().await,
         "pre-tool-use" => pre_tool_use::handle().await,
+        // Opt-in PreToolUse on Bash: checks the packages an install command names.
+        "package-bouncer" => package_bouncer::handle().await,
         "post-tool-use" | "post-write" => post_tool_use::handle().await,
         "post-tool-use-failure" => post_tool_use_failure::handle().await,
         // Local git capture: managed git hooks dispatch here.

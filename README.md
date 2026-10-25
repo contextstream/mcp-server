@@ -117,6 +117,34 @@ export CONTEXTSTREAM_API_KEY=...   # or: printf %s "$KEY" | contextstream-mcp co
 contextstream-mcp setup --yes --editors=claude --workspace-id=<UUID> --project-path=.
 ```
 
+### Package Bouncer (opt-in)
+
+A hook for Claude Code and Cursor that checks the packages an install command names
+against their public registry before the command runs. It covers npm, pnpm, yarn, bun,
+npx, pip, uv, uvx, pipx, poetry and cargo, including `claude mcp add ... -- npx ...`.
+
+- It **denies** a package the registry does not have, naming the popular package it
+  looks like. An agent may have invented the name, and anyone can register it.
+- It **asks** before a barely downloaded lookalike of a popular package.
+- It **allows** everything else, including whenever a lookup fails or takes too long.
+
+It skips projects and commands that use a private registry (`.npmrc`, `pip.conf`, uv or
+poetry sources, `--registry`, `--index-url`). `CONTEXTSTREAM_PACKAGE_BOUNCER=off`
+turns it off.
+
+Claude Code: add this entry to `PreToolUse` in `~/.claude/settings.json`, next to the
+hooks setup installed. `update-hooks` leaves it alone.
+
+```json
+{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "contextstream-mcp hook package-bouncer", "timeout": 8 }] }
+```
+
+Cursor (`~/.cursor/hooks.json`):
+
+```json
+{ "version": 1, "hooks": { "beforeShellExecution": [{ "command": "contextstream-mcp hook package-bouncer" }] } }
+```
+
 </details>
 
 ## Open source and contributing

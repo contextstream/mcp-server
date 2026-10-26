@@ -1856,6 +1856,7 @@ mod auto_mode_tests {
             source_commit_sha: Some("0123456789abcdef".to_string()),
             result_generation_coverage_complete: Some(true),
             result_generation_consistent: Some(true),
+            canonical: None,
         }
     }
 
@@ -8146,5 +8147,140 @@ mod scope_widening_tests {
             "other_project_scope"
         );
         assert!(structured["scope_widened"].is_string());
+    }
+}
+
+// ============================================================================
+// Remote-followed index (API migration 853)
+// ============================================================================
+
+mod remote_followed_index_tests {
+    //! A project with a remote branch is kept at the remote head by the server.
+    //! Before, search judged freshness by the age of the last write, called a
+    //! three-day-old index "stale", told the agent to re-init a path on a
+    //! machine that no longer exists, and the agent switched to grep.
+    use super::{
+        build_mcp_index_trust_diagnostics, extract_api_index_hint, format_index_trust_mismatch,
+        harmonize_project_index_state, IndexHealth,
+    };
+    use mcp_types::api::{SearchCanonicalSource, SearchIndexTrustEnvelope, SearchResponse};
+
+    const DEAD_HOST_PATH: &str = "/srv/retired-host/acme-app";
+
+    fn trust(hours_ago: i64, canonical: Option<&str>) -> SearchIndexTrustEnvelope {
+        SearchIndexTrustEnvelope {
+            project_id: uuid::Uuid::from_u128(7),
+            repository: Some("acme/app".to_string()),
+            committed_generation: 228_464,
+            indexed_at: Some(
+                (chrono::Utc::now() - chrono::Duration::hours(hours_ago)).to_rfc3339(),
+            ),
+            source_machine: Some("machine-a".to_string()),
+            source_branch: Some("main".to_string()),
+            source_commit_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            canonical: canonical.map(|state| SearchCanonicalSource {
+                provider: "github".to_string(),
+                repository: "acme/app".to_string(),
+                branch: "main".to_string(),
+                state: state.to_string(),
+                head_sha: Some("a".repeat(40)),
+                verified_at: Some(
+                    (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339(),
+                ),
+            }),
+            ..SearchIndexTrustEnvelope::default()
+        }
+    }
+
+    fn response(trust: SearchIndexTrustEnvelope) -> SearchResponse {
+        SearchResponse {
+            project_index_state: Some("ready".to_string()),
+            index_generation: Some(228_464),
+            index_trust: Some(trust),
+            ..SearchResponse::default()
+        }
+    }
+
+    #[test]
+    fn an_index_holding_its_remote_head_is_fresh_however_old_its_last_write() {
+        let hint = extract_api_index_hint(
+            &response(trust(81, Some("current"))),
+            Some(DEAD_HOST_PATH),
+            None,
+        )
+        .unwrap();
+        assert_eq!(hint.freshness, "fresh");
+        assert!(hint.recommendation.is_none());
+        assert!(
+            hint.age_hours.is_some_and(|hours| hours < 1),
+            "{:?}",
+            hint.age_hours
+        );
+
+        // A push the server is indexing right now is not a stale index either.
+        let hint = extract_api_index_hint(
+            &response(trust(81, Some("catching_up"))),
+            Some(DEAD_HOST_PATH),
+            None,
+        )
+        .unwrap();
+        assert_eq!(hint.freshness, "recent");
+        assert!(hint.recommendation.is_none());
+    }
+
+    #[test]
+    fn a_stale_recommendation_never_names_a_path_or_asks_for_init() {
+        let hint =
+            extract_api_index_hint(&response(trust(81, None)), Some(DEAD_HOST_PATH), None).unwrap();
+        assert_eq!(hint.freshness, "stale");
+        let recommendation = hint.recommendation.expect("a recommendation");
+        assert!(!recommendation.contains(DEAD_HOST_PATH), "{recommendation}");
+        assert!(
+            !recommendation.contains("init(folder_path"),
+            "{recommendation}"
+        );
+        assert!(!recommendation.to_ascii_lowercase().contains("grep"));
+    }
+
+    #[test]
+    fn an_index_state_is_never_rewritten_to_stale() {
+        let mut response = SearchResponse {
+            project_index_state: Some("partial".to_string()),
+            ..SearchResponse::default()
+        };
+        let health = IndexHealth {
+            freshness: "stale",
+            confidence: "high",
+            age_hours: Some(81),
+            scope_match: true,
+            drift_detected: false,
+            changed_file_count: 0,
+            indexed_at: None,
+            recommendation: None,
+        };
+        harmonize_project_index_state(&mut response, Some(&health));
+        assert_eq!(response.project_index_state.as_deref(), Some("partial"));
+    }
+
+    #[test]
+    fn a_checkout_on_another_branch_is_expected_when_the_index_follows_the_remote() {
+        let diagnostics = |canonical: Option<&str>| {
+            build_mcp_index_trust_diagnostics(
+                &response(trust(1, canonical)),
+                Some(uuid::Uuid::from_u128(7)),
+                Some(uuid::Uuid::from_u128(7)),
+                Some("acme/app".to_string()),
+                Some("feature/new-login".to_string()),
+                Some("fedcba9876543210fedcba9876543210fedcba98".to_string()),
+                true,
+                Some(true),
+                None,
+            )
+            .unwrap()
+        };
+        assert!(format_index_trust_mismatch(&diagnostics(Some("current"))).is_none());
+        // A checkout-fed index on another branch is still worth a warning.
+        assert!(format_index_trust_mismatch(&diagnostics(None))
+            .is_some_and(|warning| warning.contains("branch")));
     }
 }

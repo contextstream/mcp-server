@@ -1,0 +1,10 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos ]
+install-name:    '/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation'
+current-version: 5027.0.69
+compatibility-version: 150
+exports:
+  - targets:         [ x86_64-macos, arm64-macos ]
+    symbols:         [ _CFArrayAppendValue, _CFArrayCreateMutable, _CFArrayGetCount, _CFArrayGetValueAtIndex, _CFArrayInsertValueAtIndex, _CFArrayRemoveValueAtIndex, _CFDictionaryCreate, _CFDictionaryGetValueIfPresent, _CFGetTypeID, _CFNumberGetTypeID, _CFNumberGetValue, _CFRelease, _CFRetain, _CFRunLoopGetCurrent, _CFRunLoopIsWaiting, _CFRunLoopRun, _CFRunLoopStop, _CFStringCompare, _CFStringCreateWithBytes, _CFStringGetBytes, _CFStringGetCStringPtr, _CFStringGetLength, _CFStringGetTypeID, _CFTimeZoneCopySystem, _CFTimeZoneGetName, _CFTimeZoneResetSystem, _CFURLCopyAbsoluteURL, _CFURLCopyFileSystemPath, _CFURLCopyLastPathComponent, _CFURLCreateCopyAppendingPathComponent, _CFURLCreateCopyDeletingLastPathComponent, _CFURLCreateFilePathURL, _CFURLCreateFileReferenceURL, _CFURLCreateFromFileSystemRepresentation, _CFURLResourceIsReachable, _kCFAllocatorDefault, _kCFBooleanFalse, _kCFBooleanTrue, _kCFRunLoopDefaultMode, _kCFTypeArrayCallBacks, _kCFTypeDictionaryKeyCallBacks, _kCFTypeDictionaryValueCallBacks ]
+...

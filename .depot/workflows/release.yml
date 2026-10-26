@@ -1,0 +1,270 @@
+name: MCP release
+
+# Releases the MCP server with no person in the loop (docs/release.md; scripts/release/mcp_release.py holds the logic).
+#
+#   push to main  plan reads the version package.json, Cargo.toml and server.json name. When that version is not yet
+#                 out on every channel, the run gates and builds it (or reuses the bundle a previous run put on R2),
+#                 then tags it and publishes R2, a GitHub draft, npm and the MCP Registry, publishes the GitHub
+#                 release as Latest, checks every channel from the outside and waits for the hosted gateway. Once a
+#                 version is fully out, a push does nothing. A failed run is resumed by running it again: every step
+#                 skips what is already done with the same bytes.
+#   dispatch      mode=release resumes or repeats a release from main; mode=dry-run gates, builds and assembles, packs
+#                 npm and validates the registry entry, and publishes nothing. Any run that is not a clean checkout of
+#                 main is a dry run.
+#
+#     depot ci dispatch --repo contextstream/mcp-server --workflow release.yml --ref main --input mode=dry-run
+#
+# Credentials are Depot CI secrets whose only variant is limited to this repository, branch main and this workflow
+# file: MCP_RELEASE_GITHUB_TOKEN, MCP_RELEASE_NPM_TOKEN, MCP_RELEASE_R2_BUCKET_URL, MCP_RELEASE_R2_ACCESS_KEY_ID and
+# MCP_RELEASE_R2_SECRET_ACCESS_KEY. Only the publish step of a release receives them.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: release (main only), or dry-run (gate and build, publish nothing)
+        required: false
+        default: release
+        type: choice
+        options: [release, dry-run]
+
+permissions:
+  contents: read
+
+# One release at a time; a running one is never cancelled.
+concurrency:
+  group: mcp-release
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: '1'
+  SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+  SCCACHE_IDLE_TIMEOUT: '0'
+
+jobs:
+  plan:
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      ship: ${{ steps.plan.outputs.ship }}
+      build: ${{ steps.plan.outputs.build }}
+      publish: ${{ steps.plan.outputs.publish }}
+      mode: ${{ steps.plan.outputs.mode }}
+      version: ${{ steps.plan.outputs.version }}
+      commit: ${{ steps.plan.outputs.commit }}
+      epoch: ${{ steps.plan.outputs.epoch }}
+      deps_key: ${{ steps.keys.outputs.deps }}
+      deps_prefix: ${{ steps.keys.outputs.deps_prefix }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Plan
+        id: plan
+        env:
+          GITHUB_READ_TOKEN: ${{ github.token }}
+          REQUESTED_MODE: ${{ inputs.mode || 'release' }}
+        run: python3 scripts/release/mcp_release.py plan --mode "$REQUESTED_MODE" --ref "$GITHUB_REF"
+      - name: Setup cache keys
+        id: keys
+        run: scripts/dev/depot-run --cache-keys >> "$GITHUB_OUTPUT"
+
+  gate:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [rust, checks]
+    runs-on: ${{ matrix.part == 'rust' && 'depot-ubuntu-24.04-32' || 'depot-ubuntu-24.04-8' }}
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -C linker=clang -C link-arg=-fuse-ld=mold
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.plan.outputs.publish == 'true' && needs.plan.outputs.commit || '' }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Restore the cached toolchain and crates
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
+        with:
+          path: ~/.depot-run-cache/deps
+          key: ${{ needs.plan.outputs.deps_key }}
+          restore-keys: ${{ needs.plan.outputs.deps_prefix }}
+      - name: Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.23.2'
+      - name: Toolchain and compile cache
+        run: |
+          scripts/dev/depot-run --setup-script > "$RUNNER_TEMP/setup.sh"
+          bash "$RUNNER_TEMP/setup.sh" tools
+      - name: Gate (${{ matrix.part }})
+        run: bash scripts/release/gate.sh ${{ matrix.part }}
+      - name: Compile cache stats
+        if: always()
+        run: sccache --show-stats 2>/dev/null | grep -E 'Compile requests|Cache hits|Cache misses' || true
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: contextstream-mcp-linux-x64
+            runner: depot-ubuntu-24.04-16
+          - artifact: contextstream-mcp-linux-x64-remote-acceleration
+            runner: depot-ubuntu-24.04-16
+          - artifact: contextstream-mcp-linux-arm64
+            runner: depot-ubuntu-24.04-arm-16
+          - artifact: contextstream-mcp-win-x64.exe
+            runner: depot-ubuntu-24.04-16
+          - artifact: contextstream-mcp-darwin-arm64
+            runner: depot-ubuntu-24.04-16
+          - artifact: contextstream-mcp-darwin-x64
+            runner: depot-ubuntu-24.04-16
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SOURCE_DATE_EPOCH: ${{ needs.plan.outputs.epoch }}
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.plan.outputs.publish == 'true' && needs.plan.outputs.commit || '' }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Restore the cached toolchain and crates
+        if: matrix.artifact != 'contextstream-mcp-linux-arm64'
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
+        with:
+          path: ~/.depot-run-cache/deps
+          key: ${{ needs.plan.outputs.deps_key }}
+          restore-keys: ${{ needs.plan.outputs.deps_prefix }}
+      - name: Toolchain and compile cache (x86_64)
+        if: matrix.artifact != 'contextstream-mcp-linux-arm64'
+        run: |
+          scripts/dev/depot-run --setup-script > "$RUNNER_TEMP/setup.sh"
+          bash "$RUNNER_TEMP/setup.sh" tools
+      - name: Toolchain and compile cache (arm64)
+        if: matrix.artifact == 'contextstream-mcp-linux-arm64'
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 4 -o /tmp/sccache.tgz \
+            https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-aarch64-unknown-linux-musl.tar.gz
+          echo '2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a  /tmp/sccache.tgz' | sha256sum -c --quiet -
+          tar -xzf /tmp/sccache.tgz -C /tmp
+          sudo install -m 0755 /tmp/sccache-v0.18.0-aarch64-unknown-linux-musl/sccache /usr/local/bin/sccache
+          rustup toolchain install >/dev/null 2>&1 || rustup show >/dev/null
+          sccache --start-server >/dev/null
+      - name: Restore the cached MSVC CRT and SDK
+        if: matrix.artifact == 'contextstream-mcp-win-x64.exe'
+        id: xwin
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cargo-xwin
+          key: mcp-release-xwin-v0.23.1-v1
+      - name: Build ${{ matrix.artifact }}
+        run: bash scripts/release/build.sh "${{ matrix.artifact }}" "${{ needs.plan.outputs.version }}"
+      - name: Save the MSVC CRT and SDK
+        if: matrix.artifact == 'contextstream-mcp-win-x64.exe' && steps.xwin.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cargo-xwin
+          key: mcp-release-xwin-v0.23.1-v1
+      - name: Compile cache stats
+        if: always()
+        run: sccache --show-stats 2>/dev/null | grep -E 'Compile requests|Cache hits|Cache misses' || true
+      - name: Upload ${{ matrix.artifact }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  publish:
+    needs: [plan, gate, build]
+    if: >-
+      !cancelled() && needs.plan.outputs.ship == 'true' &&
+      (needs.plan.outputs.build != 'true' || (needs.gate.result == 'success' && needs.build.result == 'success'))
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 45
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.plan.outputs.publish == 'true' && needs.plan.outputs.commit || '' }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.23.2'
+      - name: Download the six binaries
+        if: needs.plan.outputs.build == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: contextstream-mcp-*
+          path: ${{ runner.temp }}/dist
+          merge-multiple: true
+      - name: Assemble the bundle
+        if: needs.plan.outputs.build == 'true'
+        run: >-
+          python3 scripts/release/mcp_release.py assemble --dist "$RUNNER_TEMP/dist"
+          --version "${{ needs.plan.outputs.version }}" --commit "${{ needs.plan.outputs.commit }}"
+      - name: Fetch the bundle a previous run put on R2
+        if: needs.plan.outputs.build != 'true'
+        run: >-
+          python3 scripts/release/mcp_release.py fetch-bundle --dist "$RUNNER_TEMP/dist"
+          --version "${{ needs.plan.outputs.version }}" --commit "${{ needs.plan.outputs.commit }}"
+      - name: Publish
+        env:
+          MCP_RELEASE_GITHUB_TOKEN: ${{ needs.plan.outputs.publish == 'true' && secrets.MCP_RELEASE_GITHUB_TOKEN || '' }}
+          MCP_RELEASE_NPM_TOKEN: ${{ needs.plan.outputs.publish == 'true' && secrets.MCP_RELEASE_NPM_TOKEN || '' }}
+          MCP_RELEASE_R2_BUCKET_URL: ${{ needs.plan.outputs.publish == 'true' && secrets.MCP_RELEASE_R2_BUCKET_URL || '' }}
+          MCP_RELEASE_R2_ACCESS_KEY_ID: ${{ needs.plan.outputs.publish == 'true' && secrets.MCP_RELEASE_R2_ACCESS_KEY_ID || '' }}
+          MCP_RELEASE_R2_SECRET_ACCESS_KEY: ${{ needs.plan.outputs.publish == 'true' && secrets.MCP_RELEASE_R2_SECRET_ACCESS_KEY || '' }}
+        run: >-
+          python3 scripts/release/mcp_release.py publish --dist "$RUNNER_TEMP/dist" --mode "${{ needs.plan.outputs.mode }}"
+          --version "${{ needs.plan.outputs.version }}" --commit "${{ needs.plan.outputs.commit }}"
+      - name: Verify every channel from the outside
+        if: needs.plan.outputs.publish == 'true'
+        env:
+          GITHUB_READ_TOKEN: ${{ github.token }}
+        run: python3 scripts/release/mcp_release.py verify --dist "$RUNNER_TEMP/dist" --version "${{ needs.plan.outputs.version }}"
+
+  hosted:
+    needs: [plan, publish]
+    if: needs.plan.outputs.publish == 'true' && needs.publish.result == 'success'
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 80
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Wait for the hosted gateway to serve the release
+        run: python3 scripts/release/mcp_release.py await-hosted --version "${{ needs.plan.outputs.version }}" --timeout 4500

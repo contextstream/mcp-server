@@ -374,13 +374,16 @@ class Bucket:
         self.key_id = secret("MCP_RELEASE_R2_ACCESS_KEY_ID")
         self.key = secret("MCP_RELEASE_R2_SECRET_ACCESS_KEY")
 
-    def _signed(self, method, key, body):
+    def _signed(self, method, key, body, query=None):
         url = self.base + "/" + urllib.parse.quote(key, safe="/")
+        # SigV4 signs the query in canonical form: names and values URI-encoded, sorted by name.
+        canonical_query = "&".join("%s=%s" % (urllib.parse.quote(name, safe="-_.~"), urllib.parse.quote(value, safe="-_.~"))
+                                   for name, value in sorted((query or {}).items()))
         parts = urllib.parse.urlparse(url)
         now = datetime.datetime.now(datetime.timezone.utc)
         stamp, day = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
         payload = sha256_bytes(body)
-        canonical = "\n".join([method, parts.path, "", "host:" + parts.netloc, "x-amz-content-sha256:" + payload,
+        canonical = "\n".join([method, parts.path, canonical_query, "host:" + parts.netloc, "x-amz-content-sha256:" + payload,
                                "x-amz-date:" + stamp, "", "host;x-amz-content-sha256;x-amz-date", payload])
         scope = day + "/auto/s3/aws4_request"
         to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, sha256_bytes(canonical.encode())])
@@ -391,7 +394,8 @@ class Bucket:
         headers = {"x-amz-date": stamp, "x-amz-content-sha256": payload,
                    "Authorization": "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
                                     "Signature=%s" % (self.key_id, scope, signature)}
-        return http(method, url, data=body if method == "PUT" else None, headers=headers, timeout=600)
+        return http(method, url + ("?" + canonical_query if canonical_query else ""), data=body if method == "PUT" else None,
+                    headers=headers, timeout=600)
 
     def get(self, key):
         status, body = self._signed("GET", key, b"")
@@ -402,6 +406,29 @@ class Bucket:
         status, _ = self._signed("PUT", key, body)
         require(status == 200, "R2 PUT %s answered HTTP %d" % (key, status))
         require(self.get(key) == body, "R2 read-back of %s differs" % key)
+
+    def list(self, prefix):
+        """The keys under `prefix` (one page of up to 1000)."""
+        status, body = self._signed("GET", "", b"", {"list-type": "2", "prefix": prefix, "max-keys": "1000"})
+        require(status == 200, "R2 LIST %s answered HTTP %d" % (prefix, status))
+        return re.findall(r"<Key>([^<]*)</Key>", body.decode())
+
+    def delete(self, key):
+        status, _ = self._signed("DELETE", key, b"")
+        require(status in (200, 204), "R2 DELETE %s answered HTTP %d" % (key, status))
+
+
+def cmd_r2_probe(args):
+    """Prove the R2 key on a probe object (list, put, get, delete) without touching a release."""
+    bucket = Bucket()
+    key = "mcp/.release-probe/%s-%d" % (os.environ.get("GITHUB_RUN_ID", "local"), int(time.time()))
+    body = os.urandom(32)
+    require(bucket.get("mcp/latest/version.json") is not None, "R2 has no mcp/latest/version.json")
+    bucket.put(key, body)
+    require(key in bucket.list("mcp/.release-probe/"), "the probe object is not listed")
+    bucket.delete(key)
+    require(bucket.get(key) is None, "the probe object is still there after DELETE")
+    say(stage="r2-probe", result="R2_PROBE_OK", key=key)
 
 
 def publish_r2(dist, version, npm_published):
@@ -727,12 +754,13 @@ def main(argv=None):
     verify = commands.add_parser("verify")
     verify.add_argument("--dist", required=True)
     verify.add_argument("--version", required=True)
+    commands.add_parser("r2-probe")
     hosted = commands.add_parser("await-hosted")
     hosted.add_argument("--version", required=True)
     hosted.add_argument("--timeout", type=int, default=4500)
     args = parser.parse_args(argv)
     handlers = {"plan": cmd_plan, "macho-check": cmd_macho_check, "assemble": cmd_assemble, "fetch-bundle": cmd_fetch_bundle,
-                "publish": cmd_publish, "verify": cmd_verify, "await-hosted": cmd_await_hosted}
+                "publish": cmd_publish, "verify": cmd_verify, "await-hosted": cmd_await_hosted, "r2-probe": cmd_r2_probe}
     try:
         handlers[args.command](args)
     except (Refused, contract.ReleaseError) as refused:

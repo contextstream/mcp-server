@@ -167,7 +167,7 @@ pub struct SearchIndexTrustEnvelope {
     pub result_generation_coverage_complete: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_generation_consistent: Option<bool>,
-    /// The remote branch the index follows (API migration 853), when the
+    /// The remote branch the index follows (API migration 854), when the
     /// project has one. `state` is the server's freshness verdict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical: Option<SearchCanonicalSource>,

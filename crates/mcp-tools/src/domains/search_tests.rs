@@ -8151,7 +8151,7 @@ mod scope_widening_tests {
 }
 
 // ============================================================================
-// Remote-followed index (API migration 853)
+// Remote-followed index (API migration 854)
 // ============================================================================
 
 mod remote_followed_index_tests {

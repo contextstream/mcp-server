@@ -1089,7 +1089,7 @@ fn requires_sync_bridge_message(path: Option<&str>) -> String {
 
 /// Never names a path: a project's registered path can belong to a machine
 /// that no longer exists, and a project with a remote is kept current by the
-/// server itself (API migration 853).
+/// server itself (API migration 854).
 fn hosted_index_refresh_instruction(_path: &str) -> String {
     "Run project(action=\"index\") to refresh it now; ContextStream also keeps it current in the background.".to_string()
 }

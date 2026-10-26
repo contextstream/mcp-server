@@ -4,7 +4,7 @@
 
 - Search never tells an agent the index is stale or to grep. The API now
   keeps each project's default branch indexed from its GitHub remote, with no
-  machine or checkout involved (contextstream API migration 853), and reports
+  machine or checkout involved (contextstream API migration 854), and reports
   `index_trust.canonical.state` (`current`, `catching_up`, `unverified`).
   - Freshness follows that state, not the age of the last write: an index that
     holds the remote head is fresh however long ago the last push was, and one

@@ -4673,7 +4673,7 @@ fn extract_project_status_index_hint(
     }
 
     // The server's verdict on the remote branch the index follows (API
-    // migration 853) beats the age of the last write.
+    // migration 854) beats the age of the last write.
     let canonical_state = body
         .get("canonical_source")
         .and_then(|source| source.get("state"))
@@ -6828,7 +6828,7 @@ fn local_mapping_mismatch_note(local_project_id: Uuid, resolved_scope: &str, pat
 /// What an index-health recommendation says about refreshing. It never names a
 /// path: the project's registered path can belong to a machine that no longer
 /// exists, and a project with a remote is kept current by the server itself
-/// (API migration 853), so there is nothing for the agent to re-run.
+/// (API migration 854), so there is nothing for the agent to re-run.
 fn hosted_index_refresh_instruction(_path: &str) -> String {
     "ContextStream refreshes this project's index in the background; keep using search.".to_string()
 }
@@ -12064,7 +12064,7 @@ impl SearchTool {
         }
 
         // The index of a project that follows its remote branch is kept at the
-        // remote head by the server (API migration 853): where other machines'
+        // remote head by the server (API migration 854): where other machines'
         // checkouts were rooted, possibly on hosts that no longer exist, is not
         // something to tell the agent.
         if result

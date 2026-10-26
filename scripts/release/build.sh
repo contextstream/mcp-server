@@ -15,8 +15,9 @@ version=${2:?version}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 
-ZIG_VERSION=0.14.1
-ZIG_SHA256=24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
+ZIG_VERSION=0.13.0
+ZIG_SHA256=d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
+ZIG_DIR=zig-linux-x86_64-$ZIG_VERSION
 ZIGBUILD_VERSION=v0.23.4
 ZIGBUILD_SHA256=9e3cf73485edbd45905c8aadbc0fdf869c7ddc3848f0c898229f2680db52e44b
 XWIN_VERSION=v0.23.1
@@ -68,14 +69,14 @@ case "$kind" in
     cargo xwin build --locked --release --package mcp-server --target "$target"
     ;;
   darwin)
-    fetch "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" "$ZIG_SHA256" "$tools/zig.tar.xz"
+    fetch "https://ziglang.org/download/$ZIG_VERSION/$ZIG_DIR.tar.xz" "$ZIG_SHA256" "$tools/zig.tar.xz"
     tar -xJf "$tools/zig.tar.xz" -C "$tools"
     fetch "https://github.com/rust-cross/cargo-zigbuild/releases/download/$ZIGBUILD_VERSION/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz" \
       "$ZIGBUILD_SHA256" "$tools/zigbuild.tar.xz"
     tar -xJf "$tools/zigbuild.tar.xz" -C "$tools"
     zigbuild=$(find "$tools" -type f -name cargo-zigbuild | head -1)
     install -m 0755 "$zigbuild" "$tools/cargo-zigbuild"
-    export PATH="$tools:$tools/zig-x86_64-linux-$ZIG_VERSION:$PATH"
+    export PATH="$tools:$tools/$ZIG_DIR:$PATH"
     stubs=$root/scripts/release/macos-link-stubs
     # RUSTFLAGS would replace the per-target flags, so the build uses only these.
     unset RUSTFLAGS
@@ -84,7 +85,7 @@ case "$kind" in
     export "CARGO_TARGET_${upper}_RUSTFLAGS=$flags"
     # Header shims for C dependencies (jemalloc), added to Zig's own macOS headers (Zig does not honour -isystem or
     # -idirafter for them). Only headers Zig lacks are added; an existing one is never replaced.
-    zig_macos=$tools/zig-x86_64-linux-$ZIG_VERSION/lib/libc/include/any-macos-any
+    zig_macos=$tools/$ZIG_DIR/lib/libc/include/any-macos-any
     [ -d "$zig_macos/sys" ] || { echo "build.sh: zig $ZIG_VERSION has no $zig_macos/sys" >&2; exit 1; }
     (cd "$stubs/include" && find . -type f -name '*.h') | while read -r header; do
       [ -e "$zig_macos/$header" ] || install -D -m 0644 "$stubs/include/$header" "$zig_macos/$header"

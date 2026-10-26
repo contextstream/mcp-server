@@ -6351,6 +6351,27 @@ fn scoped_session_folder_path<'a>(
     None
 }
 
+/// The project's recorded path as a result root, only when this session holds a checkout of
+/// the project or this process can read that folder. Searching another project from a session
+/// elsewhere returns repository-relative paths: the recorded path belongs to whichever machine
+/// first indexed the project, which may no longer exist, and an agent told a file is at a path
+/// it cannot read falls back to grep.
+fn cross_project_root<'a>(
+    scoped_session_folder_path: Option<&str>,
+    local_project_root: Option<&str>,
+    project_path: Option<&'a str>,
+) -> Option<&'a str> {
+    let project_path = project_path?;
+    if scoped_session_folder_path.is_some()
+        || local_project_root.is_some()
+        || Path::new(project_path).is_dir()
+    {
+        Some(project_path)
+    } else {
+        None
+    }
+}
+
 fn resolve_effective_folder_path(
     session_folder_path: Option<&str>,
     project_path: Option<&str>,
@@ -11926,7 +11947,11 @@ impl SearchTool {
                     resolved_project_name = Some(project.name.clone());
                     resolve_effective_folder_path(
                         scoped_session_folder_path,
-                        project.path.as_deref(),
+                        cross_project_root(
+                            scoped_session_folder_path,
+                            local_project_root.as_deref(),
+                            project.path.as_deref(),
+                        ),
                         local_project_root.as_deref(),
                         allow_current_dir_fallback,
                     )

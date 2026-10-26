@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.31
+
+- Search never tells an agent the index is stale or to grep. The API now
+  keeps each project's default branch indexed from its GitHub remote, with no
+  machine or checkout involved (contextstream API migration 853), and reports
+  `index_trust.canonical.state` (`current`, `catching_up`, `unverified`).
+  - Freshness follows that state, not the age of the last write: an index that
+    holds the remote head is fresh however long ago the last push was, and one
+    the server is syncing is not stale.
+  - Default search output no longer carries `index_health`, `index_trust` or
+    `ingested_at_max`; they appear with `CONTEXTSTREAM_DEBUG=1` and in
+    `project(action="index_status")`. When the server confirms the index holds
+    the remote head, search adds `index_source` (`repository`, `branch`,
+    `head`, `current`).
+  - No index recommendation names a path any more. A project's recorded path
+    can belong to a machine that no longer exists; the
+    `init(folder_path=...)` advice remains only for a folder this process has
+    just read.
+  - `project_index_state` is never rewritten to `stale` from an age.
+  - A checkout on another branch or commit is not flagged `[INDEX_TRUST]` when
+    the index follows the remote, and `[INDEX_CHECKOUT]` notes about other
+    machines' checkout roots are dropped for such projects.
+  - `project(action="index_status")` says which remote branch the index
+    follows and whether it holds its head.
+- Searching another project of the same workspace no longer raises
+  `[SCOPE_MISMATCH]`: the server answers it from that project's current
+  default branch, with no checkout or init. Across workspaces it still warns.
+
 ## 1.0.30
 
 - Slipstream agents (#201, #202, #204): a `slipstream` tool hands one job to a

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.32
+
+- Searching another project of the workspace from a session elsewhere returns
+  repository-relative paths (#214). Results were rooted at that project's
+  recorded folder, which belongs to whichever machine first indexed it and
+  may no longer exist; agents could not read those paths and fell back to
+  grep. The recorded folder is still the root when this session holds a
+  checkout of the project or this process can read it.
+
 ## 1.0.31
 
 - Search never tells an agent the index is stale or to grep. The API now

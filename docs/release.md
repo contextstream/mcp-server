@@ -34,7 +34,8 @@ depot ci dispatch --repo contextstream/mcp-server --workflow release.yml --ref m
 ```
 
 It gates, builds and assembles the bundle, packs npm (`npm publish --dry-run`) and validates `server.json` with
-`mcp-publisher`, and publishes nothing. Any run that is not a clean checkout of `main` (a branch, or a laptop
+`mcp-publisher`, and publishes nothing. Dispatched on `main`, it also proves the R2 key: it puts, lists, reads and
+deletes a probe object under `mcp/.release-probe/` (`mcp_release.py r2-probe`). Any run that is not a clean checkout of `main` (a branch, or a laptop
 `depot ci run` with a patch) is a dry run, whatever mode it asks for.
 
 ## Re-running after a failure
@@ -64,7 +65,7 @@ command line.
 | `MCP_RELEASE_GITHUB_TOKEN` | pushing the tag, the GitHub release and its assets, and the MCP Registry login (an org Owner's token: the registry grants `io.github.contextstream/*` only to Owners) |
 | `MCP_RELEASE_NPM_TOKEN` | `npm publish` of `@contextstream/mcp-server` |
 | `MCP_RELEASE_R2_BUCKET_URL` | the S3 endpoint and bucket of the release bucket |
-| `MCP_RELEASE_R2_ACCESS_KEY_ID`, `MCP_RELEASE_R2_SECRET_ACCESS_KEY` | a key scoped to that bucket |
+| `MCP_RELEASE_R2_ACCESS_KEY_ID`, `MCP_RELEASE_R2_SECRET_ACCESS_KEY` | the S3 pair of an account-owned API token limited to object read and write on that one bucket (access key id = token id, secret = sha256 of the token) |
 
 ## When a darwin link fails
 

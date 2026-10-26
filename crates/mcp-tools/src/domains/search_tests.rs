@@ -8284,3 +8284,36 @@ mod remote_followed_index_tests {
             .is_some_and(|warning| warning.contains("branch")));
     }
 }
+
+mod cross_project_root_tests {
+    //! An agent in one project searching another got paths rooted at the other
+    //! project's recorded folder (`/home/<user>/...` on a machine that no longer
+    //! exists), could not read them, and grepped.
+    use super::{cross_project_root, resolve_effective_folder_path};
+
+    #[test]
+    fn another_projects_results_are_not_rooted_at_a_folder_this_process_cannot_read() {
+        let gone = "/srv/retired-host/acme-app";
+        assert_eq!(cross_project_root(None, None, Some(gone)), None);
+        assert_eq!(resolve_effective_folder_path(None, None, None, false), None);
+    }
+
+    #[test]
+    fn the_sessions_own_checkout_and_readable_folders_still_root_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let readable = temp.path().to_str().unwrap();
+        assert_eq!(
+            cross_project_root(None, None, Some(readable)),
+            Some(readable)
+        );
+        let recorded = "/srv/retired-host/acme-app";
+        assert_eq!(
+            cross_project_root(Some("/srv/checkouts/acme-app"), None, Some(recorded)),
+            Some(recorded)
+        );
+        assert_eq!(
+            cross_project_root(None, Some("/srv/checkouts/acme-app"), Some(recorded)),
+            Some(recorded)
+        );
+    }
+}

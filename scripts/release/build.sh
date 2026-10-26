@@ -57,7 +57,7 @@ case "$kind" in
     cargo build --locked --release --package mcp-server --target "$target" "${features[@]}"
     ;;
   windows)
-    command -v clang-cl >/dev/null && command -v wine >/dev/null || {
+    command -v lld-link >/dev/null && { command -v wine64 >/dev/null || [ -x /usr/lib/wine/wine64 ]; } || {
       sudo apt-get update -qq
       sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends clang lld llvm nasm wine64 >/dev/null
     }
@@ -82,6 +82,13 @@ case "$kind" in
     flags="-C link-arg=-F$stubs/System/Library/Frameworks -C link-arg=-L$stubs/usr/lib"
     upper=$(echo "$target" | tr 'a-z-' 'A-Z_')
     export "CARGO_TARGET_${upper}_RUSTFLAGS=$flags"
+    # Header shims for C dependencies (jemalloc), added to Zig's own macOS headers (Zig does not honour -isystem or
+    # -idirafter for them). Only headers Zig lacks are added; an existing one is never replaced.
+    zig_macos=$tools/zig-x86_64-linux-$ZIG_VERSION/lib/libc/include/any-macos-any
+    [ -d "$zig_macos/sys" ] || { echo "build.sh: zig $ZIG_VERSION has no $zig_macos/sys" >&2; exit 1; }
+    (cd "$stubs/include" && find . -type f -name '*.h') | while read -r header; do
+      [ -e "$zig_macos/$header" ] || install -D -m 0644 "$stubs/include/$header" "$zig_macos/$header"
+    done
     log "zig $(zig version), $(cargo-zigbuild --version), deployment target $MACOSX_DEPLOYMENT_TARGET"
     cargo zigbuild --locked --release --package mcp-server --target "$target"
     ;;
@@ -101,9 +108,15 @@ case "$kind" in
     log "$artifact needs glibc $newest at most"
     ;;
   windows)
+    # Ubuntu 24.04's wine64 package leaves its 64-bit loader off PATH, and its `wine` may need the 32-bit one.
     export WINEDEBUG=-all WINEPREFIX=$tools/wine
-    wineboot -i >/dev/null 2>&1 || true
-    shown=$(wine "out/$artifact" --version 2>/dev/null | tr -d '\r' | tail -1)
+    shown=""
+    for wine in /usr/lib/wine/wine64 wine64 wine; do
+      command -v "$wine" >/dev/null || continue
+      shown=$("$wine" "out/$artifact" --version 2>&1 | tr -d '\r' | tail -1) || true
+      [ "$shown" = "contextstream-mcp $version" ] && break
+      log "$wine printed [$shown]"
+    done
     [ "$shown" = "contextstream-mcp $version" ] || { echo "build.sh: wine printed [$shown]" >&2; exit 1; }
     log "wine: $shown"
     log "DLLs: $(objdump -p "out/$artifact" | awk '/DLL Name/{print $3}' | sort | tr '\n' ' ')"

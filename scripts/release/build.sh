@@ -89,6 +89,8 @@ case "$kind" in
     (cd "$stubs/include" && find . -type f -name '*.h') | while read -r header; do
       [ -e "$zig_macos/$header" ] || install -D -m 0644 "$stubs/include/$header" "$zig_macos/$header"
     done
+    # The compile-cache server runs compilers with its own environment: restart it so it sees Zig on PATH.
+    if [ "${RUSTC_WRAPPER:-}" = sccache ]; then sccache --stop-server >/dev/null 2>&1 || true; sccache --start-server >/dev/null; fi
     log "zig $(zig version), $(cargo-zigbuild --version), deployment target $MACOSX_DEPLOYMENT_TARGET"
     cargo zigbuild --locked --release --package mcp-server --target "$target"
     ;;

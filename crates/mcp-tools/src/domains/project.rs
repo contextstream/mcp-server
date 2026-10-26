@@ -1087,11 +1087,11 @@ fn requires_sync_bridge_message(path: Option<&str>) -> String {
     )
 }
 
-fn hosted_index_refresh_instruction(path: &str) -> String {
-    let path = tool_string_literal(path);
-    format!(
-        "Re-establish the exact checkout with init(folder_path={path}), then run project(action=\"index\"). If the response says requires_sync_bridge, repair the bridge while keeping hosted MCP configured."
-    )
+/// Never names a path: a project's registered path can belong to a machine
+/// that no longer exists, and a project with a remote is kept current by the
+/// server itself (API migration 853).
+fn hosted_index_refresh_instruction(_path: &str) -> String {
+    "Run project(action=\"index\") to refresh it now; ContextStream also keeps it current in the background.".to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2529,7 +2529,20 @@ impl ToolHandler for ProjectTool {
                 let indexed_at = extract_index_timestamp(&result);
                 let age_hours = indexed_at
                     .map(|ts| chrono::Utc::now().signed_duration_since(ts).num_hours());
-                let freshness = classify_index_freshness(indexed, age_hours);
+                // A project whose index follows its remote branch (API migration
+                // 853) is as fresh as the server says: holding the remote head
+                // is current however long ago the last push was.
+                let canonical_source = result.get("canonical_source").cloned();
+                let canonical_state = canonical_source
+                    .as_ref()
+                    .and_then(|source| source.get("state"))
+                    .and_then(|state| state.as_str())
+                    .map(str::to_string);
+                let freshness = match canonical_state.as_deref() {
+                    Some("current") if indexed => "fresh",
+                    Some("catching_up") if indexed => "recent",
+                    _ => classify_index_freshness(indexed, age_hours),
+                };
                 let (confidence, confidence_reason) =
                     classify_index_confidence(indexed, api_indexed, locally_indexed, freshness);
                 let pending_paths = extract_pending_file_paths(&result);
@@ -2654,6 +2667,25 @@ impl ToolHandler for ProjectTool {
                     }
                 }
                 text.push_str(&format_index_freshness_text(freshness, age_hours, indexed));
+                if let Some(source) = canonical_source.as_ref() {
+                    let repository = source
+                        .get("repository")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("its repository");
+                    let branch = source
+                        .get("branch")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("default branch");
+                    match canonical_state.as_deref() {
+                        Some("current") => text.push_str(&format!(
+                            " Follows {repository}@{branch} and holds its current head."
+                        )),
+                        Some("catching_up") => text.push_str(&format!(
+                            " Follows {repository}@{branch}; the newest push is being indexed now."
+                        )),
+                        _ => text.push_str(&format!(" Follows {repository}@{branch}.")),
+                    }
+                }
                 if confidence != "high" {
                     text.push_str(&format!(
                         " Confidence: {}. {}",

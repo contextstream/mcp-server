@@ -666,10 +666,7 @@ impl IndexKeeper {
                 path
             )
         } else {
-            format!(
-                "Started background re-index for `{}` because the current index freshness is stale.",
-                path
-            )
+            format!("Refreshing the index of `{}` in the background.", path)
         };
         Some(message)
     }

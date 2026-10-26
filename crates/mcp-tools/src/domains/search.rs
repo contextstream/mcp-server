@@ -4302,9 +4302,10 @@ fn harmonize_project_index_state(response: &mut SearchResponse, health: Option<&
         .project_index_state
         .as_deref()
         .map(|state| state.trim().to_ascii_lowercase());
+    // Only ever upgrades: an age is not a reason to label the index stale
+    // (agents repeat "stale" to the person and reach for grep).
     let replacement = match (normalized.as_deref(), health.freshness) {
         (Some("partial" | "indexing" | "committing"), "fresh" | "recent") => Some("ready"),
-        (Some("partial" | "indexing" | "committing"), "aging" | "stale") => Some("stale"),
         _ => None,
     };
 
@@ -4481,6 +4482,23 @@ fn extract_api_index_hint(
     .flatten()
     .find_map(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
     .map(|dt| dt.with_timezone(&chrono::Utc));
+    // A project with a remote branch is kept at its head by the server: its
+    // verdict replaces the age of the newest row (a quiet repository is not
+    // stale), and while it syncs a moved head the index is still current
+    // enough to use.
+    let canonical = result
+        .index_trust
+        .as_ref()
+        .and_then(|trust| trust.canonical.as_ref());
+    let canonical_verified_at = canonical
+        .filter(|canonical| canonical.is_current())
+        .and_then(|canonical| canonical.verified_at.as_deref())
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let indexed_at = match (indexed_at, canonical_verified_at) {
+        (Some(indexed), Some(verified)) => Some(indexed.max(verified)),
+        (indexed, verified) => indexed.or(verified),
+    };
     let age_hours = indexed_at.map(|ts| chrono::Utc::now().signed_duration_since(ts).num_hours());
     let state = result
         .project_index_state
@@ -4501,7 +4519,11 @@ fn extract_api_index_hint(
         return None;
     }
 
-    let freshness = if let Some(age) = age_hours {
+    let freshness = if canonical.is_some_and(|canonical| canonical.is_current()) {
+        "fresh"
+    } else if canonical.is_some_and(|canonical| canonical.is_server_maintained()) {
+        "recent"
+    } else if let Some(age) = age_hours {
         classify_index_freshness(Some(age))
     } else {
         match state.as_deref() {
@@ -4650,7 +4672,17 @@ fn extract_project_status_index_hint(
         return None;
     }
 
-    let freshness = if let Some(age) = age_hours {
+    // The server's verdict on the remote branch the index follows (API
+    // migration 853) beats the age of the last write.
+    let canonical_state = body
+        .get("canonical_source")
+        .and_then(|source| source.get("state"))
+        .and_then(|state| state.as_str());
+    let freshness = if canonical_state == Some("current") {
+        "fresh"
+    } else if canonical_state == Some("catching_up") {
+        "recent"
+    } else if let Some(age) = age_hours {
         classify_index_freshness(Some(age))
     } else if let Some(freshness) = explicit_freshness {
         freshness
@@ -5637,10 +5669,18 @@ fn format_index_trust_mismatch(diagnostics: &McpIndexTrustDiagnostics) -> Option
     if diagnostics.checks.repository_match == Some(false) {
         mismatches.push("repository");
     }
-    if diagnostics.checks.branch_match == Some(false) {
+    // A project whose index follows its remote branch differs from a checkout
+    // on another branch or commit by design: the checkout's own changes reach
+    // search through its sync bridge, and the rest is the remote's head.
+    let follows_remote = diagnostics
+        .server
+        .canonical
+        .as_ref()
+        .is_some_and(|canonical| canonical.is_server_maintained());
+    if diagnostics.checks.branch_match == Some(false) && !follows_remote {
         mismatches.push("branch");
     }
-    if diagnostics.checks.commit_match == Some(false) {
+    if diagnostics.checks.commit_match == Some(false) && !follows_remote {
         mismatches.push("commit");
     }
     if diagnostics.checks.generation_consistent == Some(false) {
@@ -6785,7 +6825,28 @@ fn local_mapping_mismatch_note(local_project_id: Uuid, resolved_scope: &str, pat
     )
 }
 
-fn hosted_index_refresh_instruction(path: &str) -> String {
+/// What an index-health recommendation says about refreshing. It never names a
+/// path: the project's registered path can belong to a machine that no longer
+/// exists, and a project with a remote is kept current by the server itself
+/// (API migration 853), so there is nothing for the agent to re-run.
+fn hosted_index_refresh_instruction(_path: &str) -> String {
+    "ContextStream refreshes this project's index in the background; keep using search.".to_string()
+}
+
+/// The refresh to suggest when a search found nothing in an invalid scope: the
+/// exact checkout when `path` is a folder this process can read, otherwise no
+/// path at all (a project record's path may name a machine that is gone).
+fn scope_refresh_instruction(path: &str) -> String {
+    if Path::new(path).is_dir() {
+        exact_checkout_refresh_instruction(path)
+    } else {
+        hosted_index_refresh_instruction(path)
+    }
+}
+
+/// The exact-checkout refresh for a folder this process has just read (the
+/// session's own checkout), never a path taken from the project record.
+fn exact_checkout_refresh_instruction(path: &str) -> String {
     let path = serde_json::to_string(path).expect("serializing a string cannot fail");
     format!(
         "Re-establish the exact checkout with init(folder_path={path}), then run project(action=\"index\"). If the response says requires_sync_bridge, repair the bridge while keeping hosted MCP configured."
@@ -9129,7 +9190,7 @@ fn local_enrichment_unavailable_warning_for_response(
         diagnostic.folder_path,
         diagnostic.kind,
         diagnostic.detail,
-        hosted_index_refresh_instruction(refresh_hint_path)
+        exact_checkout_refresh_instruction(refresh_hint_path)
     ))
 }
 
@@ -12002,6 +12063,19 @@ impl SearchTool {
             }
         }
 
+        // The index of a project that follows its remote branch is kept at the
+        // remote head by the server (API migration 853): where other machines'
+        // checkouts were rooted, possibly on hosts that no longer exist, is not
+        // something to tell the agent.
+        if result
+            .index_trust
+            .as_ref()
+            .and_then(|trust| trust.canonical.as_ref())
+            .is_some_and(|canonical| canonical.is_server_maintained())
+        {
+            index_origin_note = None;
+        }
+
         if let Some(note) = team_scope_note.take() {
             mode_fallback_note = append_note(mode_fallback_note, &note);
         }
@@ -12945,7 +13019,7 @@ impl SearchTool {
                         reason
                     ));
                     if let Some(path) = folder_path.as_deref() {
-                        text.push_str(&format!("{}\n", hosted_index_refresh_instruction(path)));
+                        text.push_str(&format!("{}\n", scope_refresh_instruction(path)));
                     }
                     text.push('\n');
                 } else {
@@ -12975,8 +13049,8 @@ impl SearchTool {
                     }
                     if let Some(path) = folder_path.as_deref() {
                         text.push_str(&format!(
-                            "\nIf scope metadata may be stale, {}",
-                            hosted_index_refresh_instruction(path)
+                            "\nIf scope metadata may be out of date, {}",
+                            scope_refresh_instruction(path)
                         ));
                     }
                 }
@@ -13242,11 +13316,44 @@ impl SearchTool {
 
         let fallback_depth = fallback_stages.len().saturating_sub(1);
         let mut structured = search_response_structured_value(&result);
+        // Index freshness diagnostics (`index_trust`, `index_health`) are for
+        // CONTEXTSTREAM_DEBUG and `project(action="index_status")`, not the
+        // default answer: agents relayed an age as "the index is stale" and
+        // switched to grep while the server was keeping the index current.
+        let freshness_diagnostics = is_debug_enabled();
         if let Some(obj) = structured.as_object_mut() {
-            if let Some(diagnostics) = index_trust_diagnostics.as_ref() {
+            if !freshness_diagnostics {
+                obj.remove("index_trust");
+                obj.remove("ingested_at_max");
+            }
+            if let Some(diagnostics) = index_trust_diagnostics
+                .as_ref()
+                .filter(|_| freshness_diagnostics)
+            {
                 obj.insert(
                     "index_trust".to_string(),
                     serde_json::to_value(diagnostics).unwrap_or_default(),
+                );
+            }
+            // A positive, compact source line when the server confirms the
+            // index holds the remote branch head.
+            if let Some(canonical) = result
+                .index_trust
+                .as_ref()
+                .and_then(|trust| trust.canonical.as_ref())
+                .filter(|canonical| canonical.is_current())
+            {
+                obj.insert(
+                    "index_source".to_string(),
+                    serde_json::json!({
+                        "repository": canonical.repository,
+                        "branch": canonical.branch,
+                        "head": canonical
+                            .head_sha
+                            .as_deref()
+                            .map(|sha| sha.chars().take(12).collect::<String>()),
+                        "current": true,
+                    }),
                 );
             }
             if let Some(warning) = project_routing_warning.as_deref() {
@@ -13289,7 +13396,7 @@ impl SearchTool {
                 "resolution_rank".to_string(),
                 serde_json::json!(resolved_candidate_index),
             );
-            if let Some(health) = index_health.as_ref() {
+            if let Some(health) = index_health.as_ref().filter(|_| freshness_diagnostics) {
                 obj.insert(
                     "index_health".to_string(),
                     serde_json::json!({

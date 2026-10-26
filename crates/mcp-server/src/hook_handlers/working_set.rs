@@ -363,13 +363,17 @@ pub(crate) async fn observe_edits(
 }
 
 /// Calls whose project or workspace is not a scope choice: listing or
-/// creating projects, reading or changing the working set itself, and
-/// tickets, which are filed in the project that owns the code they are about
-/// (questioned only across workspaces).
+/// creating projects, reading or changing the working set itself, tickets,
+/// which are filed in the project that owns the code they are about, and code
+/// search: reading another project of the workspace is how an agent learns how
+/// that project works, and the server answers it from that project's current
+/// default branch with no checkout or init (questioned only across
+/// workspaces). A read never misfiles anything.
 fn scope_is_not_judged(tool: &str, action: &str, cross_workspace: bool) -> bool {
     match tool {
         "project" => matches!(action, "list" | "team_projects" | "working_set" | "create"),
         "entity" => matches!(action, "create" | "update") && !cross_workspace,
+        "search" => !cross_workspace,
         "workspace" => true,
         _ => false,
     }
@@ -568,8 +572,7 @@ mod tests {
         ));
         assert!(loud.contains(&format!("use project_id={PRIMARY}")));
         assert!(loud.contains(&format!("add=[\"{OTHER}\"]")));
-        // Reads with a foreign project are a wrong scope too.
-        assert!(judge("search", "", Some(OTHER), None).is_some());
+        // Grounding with a foreign project is a wrong scope too.
         assert!(judge("context", "", Some(OTHER), None).is_some());
         // The session's own project and its related projects are quiet.
         assert!(judge("memory", "create_decision", Some(RELATED), None).is_none());
@@ -585,6 +588,15 @@ mod tests {
         assert!(loud.contains(&format!("targets workspace_id={OTHER_WORKSPACE}")));
         assert!(loud.contains(&format!("is in workspace_id={WORKSPACE}")));
         assert!(judge("memory", "decisions", None, Some(WORKSPACE)).is_none());
+    }
+
+    #[test]
+    fn searching_another_project_of_the_workspace_is_not_a_scope_mistake() {
+        // From any project, an agent asking about another connected project gets
+        // that project's current default branch with no checkout or init.
+        assert!(judge("search", "", Some(OTHER), None).is_none());
+        assert!(judge("search", "", Some(OTHER), Some(WORKSPACE)).is_none());
+        assert!(judge("search", "", Some(OTHER), Some(OTHER_WORKSPACE)).is_some());
     }
 
     #[test]

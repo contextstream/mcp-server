@@ -5,9 +5,9 @@
 #
 # Writes out/<artifact> in the repository root. The workflow picks the runner: linux-arm64 builds natively on an
 # arm64 runner, everything else on x86_64. Windows builds with cargo-xwin (MSVC CRT and SDK, license accepted by
-# the owner) and is run once under Wine. The darwin binaries build with cargo-zigbuild against the link stubs in
-# scripts/release/macos-link-stubs (no macOS runner exists in Depot CI) and are checked structurally, since Linux
-# cannot run them. Every tool download is pinned by sha256. SOURCE_DATE_EPOCH comes from the workflow.
+# the owner) and is run once under Wine. The darwin binaries build with clang and ld64.lld against an SDK root made
+# from Zig's macOS libc headers and the stubs in scripts/release/macos-link-stubs (no macOS runner exists in Depot CI)
+# and are checked structurally, since Linux cannot run them. Every tool download is pinned by sha256. SOURCE_DATE_EPOCH comes from the workflow.
 set -euo pipefail
 
 artifact=${1:?artifact}
@@ -15,11 +15,9 @@ version=${2:?version}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 
-ZIG_VERSION=0.13.0
-ZIG_SHA256=d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
-ZIG_DIR=zig-linux-x86_64-$ZIG_VERSION
-ZIGBUILD_VERSION=v0.23.4
-ZIGBUILD_SHA256=9e3cf73485edbd45905c8aadbc0fdf869c7ddc3848f0c898229f2680db52e44b
+ZIG_VERSION=0.14.1
+ZIG_SHA256=24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
+ZIG_DIR=zig-x86_64-linux-$ZIG_VERSION
 XWIN_VERSION=v0.23.1
 XWIN_SHA256=c492c6dfb7e5ac0eee586b796e0fc950ba13077e7f0bbb046f445d71790d5360
 GLIBC_FLOOR=2.39
@@ -69,31 +67,51 @@ case "$kind" in
     cargo xwin build --locked --release --package mcp-server --target "$target"
     ;;
   darwin)
+    # A macOS SDK root made without Apple's SDK: the libc headers and libSystem stub that Zig ships (we use no other
+    # part of Zig), the framework and libiconv stubs of scripts/release/macos-link-stubs, and its header shims for what
+    # Zig lacks. Stock LLVM from Ubuntu compiles the C dependencies (clang) and links (ld64.lld) against it.
+    compgen -G '/usr/lib/llvm-*/bin/ld64.lld' >/dev/null && compgen -G '/usr/lib/llvm-*/bin/llvm-ar' >/dev/null || {
+      sudo apt-get update -qq
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends clang lld llvm >/dev/null
+    }
+    # Ubuntu installs ld64.lld only under its LLVM directory; clang from the same directory finds it.
+    llvm_bin=$(dirname "$(ls /usr/lib/llvm-*/bin/ld64.lld | sort -V | tail -1)")
+    export PATH="$llvm_bin:$PATH"
     fetch "https://ziglang.org/download/$ZIG_VERSION/$ZIG_DIR.tar.xz" "$ZIG_SHA256" "$tools/zig.tar.xz"
     tar -xJf "$tools/zig.tar.xz" -C "$tools"
-    fetch "https://github.com/rust-cross/cargo-zigbuild/releases/download/$ZIGBUILD_VERSION/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz" \
-      "$ZIGBUILD_SHA256" "$tools/zigbuild.tar.xz"
-    tar -xJf "$tools/zigbuild.tar.xz" -C "$tools"
-    zigbuild=$(find "$tools" -type f -name cargo-zigbuild | head -1)
-    install -m 0755 "$zigbuild" "$tools/cargo-zigbuild"
-    export PATH="$tools:$tools/$ZIG_DIR:$PATH"
+    zig_libc=$tools/$ZIG_DIR/lib/libc
     stubs=$root/scripts/release/macos-link-stubs
-    # RUSTFLAGS would replace the per-target flags, so the build uses only these.
-    unset RUSTFLAGS
-    flags="-C link-arg=-F$stubs/System/Library/Frameworks -C link-arg=-L$stubs/usr/lib"
-    upper=$(echo "$target" | tr 'a-z-' 'A-Z_')
-    export "CARGO_TARGET_${upper}_RUSTFLAGS=$flags"
-    # Header shims for C dependencies (jemalloc), added to Zig's own macOS headers (Zig does not honour -isystem or
-    # -idirafter for them). Only headers Zig lacks are added; an existing one is never replaced.
-    zig_macos=$tools/$ZIG_DIR/lib/libc/include/any-macos-any
-    [ -d "$zig_macos/sys" ] || { echo "build.sh: zig $ZIG_VERSION has no $zig_macos/sys" >&2; exit 1; }
+    sdk=$tools/MacOSX.sdk
+    mkdir -p "$sdk/usr/include" "$sdk/usr/lib" "$sdk/System/Library/Frameworks"
+    [ -d "$zig_libc/include/any-macos-any/sys" ] || { echo "build.sh: zig $ZIG_VERSION has no macOS headers" >&2; exit 1; }
+    cp -R "$zig_libc/include/any-macos-any/." "$sdk/usr/include/"
+    arch_headers=$zig_libc/include/${target%%-*}-macos-none
+    [ ! -d "$arch_headers" ] || cp -R "$arch_headers/." "$sdk/usr/include/"
+    libsystem=$(find "$zig_libc" -name libSystem.tbd | head -1)
+    [ -s "$libsystem" ] || { echo "build.sh: zig $ZIG_VERSION has no libSystem.tbd" >&2; exit 1; }
+    cp "$libsystem" "$sdk/usr/lib/libSystem.tbd"
+    ln -s libSystem.tbd "$sdk/usr/lib/libc.tbd"
+    ln -s libSystem.tbd "$sdk/usr/lib/libm.tbd"
+    cp "$stubs/usr/lib/libiconv.tbd" "$sdk/usr/lib/libiconv.tbd"
+    cp -R "$stubs/System/Library/Frameworks/." "$sdk/System/Library/Frameworks/"
     (cd "$stubs/include" && find . -type f -name '*.h') | while read -r header; do
-      [ -e "$zig_macos/$header" ] || install -D -m 0644 "$stubs/include/$header" "$zig_macos/$header"
+      [ -e "$sdk/usr/include/$header" ] || install -D -m 0644 "$stubs/include/$header" "$sdk/usr/include/$header"
     done
-    # The compile-cache server runs compilers with its own environment: restart it so it sees Zig on PATH.
-    if [ "${RUSTC_WRAPPER:-}" = sccache ]; then sccache --stop-server >/dev/null 2>&1 || true; sccache --start-server >/dev/null; fi
-    log "zig $(zig version), $(cargo-zigbuild --version), deployment target $MACOSX_DEPLOYMENT_TARGET"
-    cargo zigbuild --locked --release --package mcp-server --target "$target"
+    printf '{"CanonicalName": "macosx14.0", "DisplayName": "macOS 14.0", "Version": "14.0", "MaximumDeploymentTarget": "14.0.99"}\n' \
+      > "$sdk/SDKSettings.json"
+    triple=${target%%-*}-apple-macos$MACOSX_DEPLOYMENT_TARGET
+    triple=${triple/aarch64-/arm64-}
+    # One driver for compiling and linking (configure scripts link test programs with CC): clang, with ld64.lld.
+    printf '#!/bin/sh\nexec clang --target=%s -isysroot %s -fuse-ld=lld -Wno-unused-command-line-argument "$@"\n' \
+      "$triple" "$sdk" > "$tools/darwin-cc"
+    chmod 0755 "$tools/darwin-cc"
+    underscored=${target//-/_}
+    upper=$(echo "$underscored" | tr 'a-z' 'A-Z')
+    export SDKROOT=$sdk "CC_$underscored=$tools/darwin-cc" "AR_$underscored=llvm-ar" "RANLIB_$underscored=llvm-ranlib" \
+      "CARGO_TARGET_${upper}_LINKER=$tools/darwin-cc"
+    unset RUSTFLAGS
+    log "$(clang --version | head -1), $(ld64.lld --version | head -1), $triple"
+    cargo build --locked --release --package mcp-server --target "$target"
     ;;
 esac
 

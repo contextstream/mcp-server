@@ -36,7 +36,10 @@ case "$artifact" in
 esac
 
 log() { echo "build.sh: $*"; }
-tools=$(mktemp -d)
+# A fixed path: the darwin build's linker and SDK paths are part of every compile command, so a fresh temporary
+# directory per run would miss the compile cache for every crate.
+tools=$HOME/.cache/mcp-release-build-tools
+rm -rf "$tools" && mkdir -p "$tools"
 trap 'rm -rf "$tools"' EXIT
 
 # fetch URL SHA256 FILE: download and check the pinned digest.

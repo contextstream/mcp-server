@@ -14,7 +14,8 @@ Merge a "prepare MCP X.Y.Z" change to `main`: the same stable version in `Cargo.
 2. **gate** (two parts side by side) runs fmt, clippy, the workspace tests, the account-connection smoke, cargo
    audit, cargo deny, the release contract, the public boundary and every script and launcher test.
 3. **build** makes the six binaries in parallel: Linux x64, x64 with remote acceleration, arm64 (native arm runner),
-   Windows (cargo-xwin) and darwin arm64/x64 (cargo-zigbuild with `scripts/release/macos-link-stubs`). Linux and arm64
+   Windows (cargo-xwin) and darwin arm64/x64 (clang and ld64.lld against an SDK root made from Zig's macOS headers
+   and `scripts/release/macos-link-stubs`; no Apple SDK). Linux and arm64
    binaries run `--version` and stay under the glibc 2.39 floor, Windows runs under Wine, and the darwin binaries are
    checked structurally (`mcp_release.py macho-check`: linked libraries, minimum macOS, signature).
 4. **publish**, in order: SBOM, `version.json` and `checksums.txt`; the annotated tag `vX.Y.Z`; R2 `mcp/vX.Y.Z/` (immutable,

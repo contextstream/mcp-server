@@ -167,6 +167,45 @@ pub struct SearchIndexTrustEnvelope {
     pub result_generation_coverage_complete: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_generation_consistent: Option<bool>,
+    /// The remote branch the index follows (API migration 853), when the
+    /// project has one. `state` is the server's freshness verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical: Option<SearchCanonicalSource>,
+}
+
+/// The remote branch a project's index follows. The API keeps the branch
+/// indexed from the remote itself (push, poll and search triggered), so its
+/// state is the freshness verdict, not the age of the last write.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SearchCanonicalSource {
+    #[serde(default)]
+    pub provider: String,
+    /// `owner/repo`.
+    #[serde(default)]
+    pub repository: String,
+    #[serde(default)]
+    pub branch: String,
+    /// `current`: the index holds the remote head as of `verified_at`.
+    /// `catching_up`: the remote moved and the server is syncing it.
+    /// `unverified`: not synced yet, or the remote could not be read lately.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<String>,
+}
+
+impl SearchCanonicalSource {
+    /// The index holds the remote head.
+    pub fn is_current(&self) -> bool {
+        self.state == "current"
+    }
+
+    /// The server follows the remote and keeps the index at its head.
+    pub fn is_server_maintained(&self) -> bool {
+        matches!(self.state.as_str(), "current" | "catching_up")
+    }
 }
 
 /// Server acknowledgement of an opaque, installation-scoped checkout route.

@@ -7307,6 +7307,20 @@ async fn try_path_aware_fallbacks(
     None
 }
 
+/// Short words for why the API keeps a file for exact search only (no chunks or
+/// semantic vectors): minified or generated bundles.
+pub(crate) fn exact_search_only_label(reason: &str) -> &'static str {
+    match reason {
+        "minified_long_lines" | "minified_low_whitespace" | "minified_name" => "minified bundle",
+        "bundle_name" => "bundle",
+        "compiled_dart" => "compiled Dart bundle",
+        "bundler_chunk" => "bundler chunk",
+        "source_map" => "source map",
+        "build_output_with_source_map" => "build output",
+        _ => "generated file",
+    }
+}
+
 /// Format a single search result as a compact one-liner for display.
 fn format_result_line(
     index: usize,
@@ -7368,9 +7382,19 @@ fn format_result_line(
         .map(|s| format!(" {}%", (s * 100.0).round() as i64))
         .unwrap_or_default();
 
+    // A hit from a minified or generated bundle: found by its exact text, the file has no
+    // semantic vectors (API: metadata.exact_search_only = reason).
+    let exact_only_tag = item
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("exact_search_only"))
+        .and_then(|v| v.as_str())
+        .map(|reason| format!(" (exact-search only: {})", exact_search_only_label(reason)))
+        .unwrap_or_default();
+
     let mut line = format!(
-        "{}. {}{}{}{}\n",
-        index, kind_tag, location, lang_tag, score_str
+        "{}. {}{}{}{}{}\n",
+        index, kind_tag, location, lang_tag, score_str, exact_only_tag
     );
     if let Some(duplicates) = duplicate_locations_text_line(item, show_content) {
         line.push_str(&duplicates);

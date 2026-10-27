@@ -17,6 +17,41 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::registry::ToolHandler;
+
+/// One clause for the files the API keeps for exact search only (minified or generated
+/// bundles: searched by their exact text, no semantic vectors), with the count per reason.
+/// `None` when there are none.
+fn format_exact_search_only(result: &Value) -> Option<String> {
+    let summary = result.get("exact_search_only")?;
+    let files = summary.get("files").and_then(Value::as_i64).unwrap_or(0);
+    if files <= 0 {
+        return None;
+    }
+    // Per reason, in the words search hits use (the minified rules share one).
+    let mut by_label: std::collections::BTreeMap<&'static str, i64> =
+        std::collections::BTreeMap::new();
+    if let Some(by_reason) = summary.get("by_reason").and_then(Value::as_object) {
+        for (reason, entry) in by_reason {
+            if let Some(count) = entry.get("files").and_then(Value::as_i64) {
+                *by_label
+                    .entry(crate::domains::search::exact_search_only_label(reason))
+                    .or_default() += count;
+            }
+        }
+    }
+    let mut reasons: Vec<(&'static str, i64)> = by_label.into_iter().collect();
+    reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let detail = reasons
+        .iter()
+        .map(|(label, count)| format!("{label}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(if detail.is_empty() {
+        format!(" {files} files are exact-search only (no semantic vectors).")
+    } else {
+        format!(" {files} files are exact-search only (no semantic vectors): {detail}.")
+    })
+}
 use crate::schema::SchemaBuilder;
 
 // ============================================================================
@@ -2685,6 +2720,9 @@ impl ToolHandler for ProjectTool {
                         )),
                         _ => text.push_str(&format!(" Follows {repository}@{branch}.")),
                     }
+                }
+                if let Some(exact_only) = format_exact_search_only(&result) {
+                    text.push_str(&exact_only);
                 }
                 if confidence != "high" {
                     text.push_str(&format!(

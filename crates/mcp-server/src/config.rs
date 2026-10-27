@@ -129,10 +129,12 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
         .map(|value| value.trim().eq_ignore_ascii_case("allow"))
         .unwrap_or(false);
 
-    // Slipstream runs priced at most this many credits start without a quote. Unset, empty
-    // or not a whole number of credits: 0, which always quotes.
+    // Agent runs priced at most this many credits start without a quote. Unset, empty or not
+    // a whole number of credits: 0, which always quotes. The variable's first name is read
+    // when the current one is not set.
     let slipstream_auto_accept_max_credits =
         std::env::var(mcp_tools::domains::slipstream::AUTO_ACCEPT_ENV)
+            .or_else(|_| std::env::var(mcp_tools::domains::slipstream::LEGACY_AUTO_ACCEPT_ENV))
             .ok()
             .and_then(|value| value.trim().parse::<u32>().ok())
             .unwrap_or(0);

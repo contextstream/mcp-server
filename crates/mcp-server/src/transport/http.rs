@@ -2652,11 +2652,18 @@ fn extract_config_override(headers: &HeaderMap) -> Option<ConfigOverride> {
         // a deprecated alias during migration.
         acceleration_enabled,
         atlas_enabled,
-        // The person's own cap; the gateway's environment never sets one for callers.
+        // The person's own cap; the gateway's environment never sets one for callers. The
+        // header's first name is read when the current one is not sent.
         slipstream_auto_accept_max_credits: header_str(
             headers,
             mcp_tools::domains::slipstream::AUTO_ACCEPT_HEADER,
         )
+        .or_else(|| {
+            header_str(
+                headers,
+                mcp_tools::domains::slipstream::LEGACY_AUTO_ACCEPT_HEADER,
+            )
+        })
         .and_then(|value| value.trim().parse::<u32>().ok()),
     };
 
@@ -6518,7 +6525,7 @@ mod tests {
         }
     }
 
-    /// The hosted gateway serves everyone from one cached tool list; `slipstream`
+    /// The hosted gateway serves everyone from one cached tool list; `agents`
     /// is added per caller, for the workspace their connection names, and only
     /// where that workspace has agents turned on.
     #[tokio::test]
@@ -6606,12 +6613,18 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|tool| tool["name"] == "slipstream")
+                .find(|tool| tool["name"] == "agents")
                 .cloned()
         };
 
         let listed = list_as("caller-open", Some(open), None).await;
         let tool = slipstream(&listed).expect("listed for an open workspace");
+        // The first name is never listed.
+        assert!(!listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "slipstream"));
         let description = tool["description"].as_str().unwrap();
         assert!(description.contains("- review (1200) [pull, repo]: Reviews a pull request"));
         assert!(description.contains("It first returns the price"));
@@ -6658,6 +6671,25 @@ mod tests {
             "lots".parse().unwrap(),
         );
         assert!(extract_config_override(&headers).is_none());
+
+        // The header's first name still works, and the current one wins over it.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            mcp_tools::domains::slipstream::LEGACY_AUTO_ACCEPT_HEADER,
+            "300".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_config_override(&headers).and_then(|c| c.slipstream_auto_accept_max_credits),
+            Some(300)
+        );
+        headers.insert(
+            mcp_tools::domains::slipstream::AUTO_ACCEPT_HEADER,
+            "900".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_config_override(&headers).and_then(|c| c.slipstream_auto_accept_max_credits),
+            Some(900)
+        );
     }
 }
 

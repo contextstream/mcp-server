@@ -1,4 +1,4 @@
-//! The `slipstream` tool as a client sees it, written from the workspace's enabled catalog.
+//! The `agents` tool as a client sees it, written from the workspace's enabled catalog.
 //!
 //! - The tool description names each enabled agent: id, price, required input and its job,
 //!   then how to run one. It stays within [`DESCRIPTION_BUDGET`] characters (OpenAI-compatible
@@ -19,7 +19,7 @@ pub(crate) const DESCRIPTION_BUDGET: usize = 1000;
 pub(crate) const INPUT_REFERENCE_BUDGET: usize = 3000;
 
 /// The description when no catalog is known (router and discovery surfaces).
-pub(crate) const STATIC_DESCRIPTION: &str = "Slipstream specialist agents: hand one job (review a pull request, write release notes, read an image, make a PDF, ...) to a ContextStream agent that works with this workspace's context, and read its result. Actions: find (the agents turned on here, their price and input), run (ask an agent; a priced agent quotes first: show the person the price, then run again with accepted_price_credits), get_run (a task and its result, waiting up to 25 s), list_runs, cancel_run. Charged only when a run succeeds; declined or failed runs are free.";
+pub(crate) const STATIC_DESCRIPTION: &str = "ContextStream Agents: hand one job (review a pull request, write release notes, read an image, make a PDF, ...) to a specialist agent that works with this workspace's context, and read its result. Actions: find (the agents turned on here, their price and input), run (ask an agent; a priced agent quotes first: show the person the price, then run again with accepted_price_credits), get_run (a task and its result, waiting up to 25 s), list_runs, cancel_run. Charged only when a run succeeds; declined or failed runs are free.";
 
 const STATIC_INPUT: &str = "The agent's input object (run). find lists each agent's fields; a required project_id defaults to the session's project.";
 const STATIC_AGENT: &str =
@@ -59,7 +59,7 @@ pub(crate) fn schema_with(schema: &Value, described: &Described) -> Value {
 }
 
 fn header() -> &'static str {
-    "Slipstream agents turned on here. Each does one job with this workspace's context and returns the result. Credits per successful run, free if declined or failed:"
+    "ContextStream Agents turned on here. Each does one job with this workspace's context and returns the result. Credits per successful run, free if declined or failed:"
 }
 
 fn footer(auto_accept_max_credits: u32) -> String {
@@ -308,6 +308,6 @@ fn input_parameter(agents: &[&AgentEntry]) -> String {
 /// Where the auto-accept setting is described to a person.
 pub(crate) fn auto_accept_hint() -> String {
     format!(
-        "To let runs up to a price start without this step, the person sets {AUTO_ACCEPT_ENV} (a hosted connection sends the header X-ContextStream-Slipstream-Auto-Accept-Max-Credits)."
+        "To let runs up to a price start without this step, the person sets {AUTO_ACCEPT_ENV} (a hosted connection sends the header X-ContextStream-Agents-Auto-Accept-Max-Credits)."
     )
 }

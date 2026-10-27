@@ -3761,6 +3761,51 @@ fn score_confidence_band(score: Option<f64>) -> &'static str {
     }
 }
 
+/// A row's confidence band. When the server checked the row literally
+/// (`metadata.literal_match`), that check decides: a row that does not contain
+/// the query is never more than "low", whatever its score, and a row that
+/// contains it exactly is "high". Otherwise the score decides.
+fn result_confidence_band(item: Option<&mcp_types::api::SearchResult>) -> &'static str {
+    let Some(item) = item else {
+        return "unknown";
+    };
+    let literal = item
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("literal_match"))
+        .and_then(Value::as_str);
+    match literal {
+        Some("exact") => "high",
+        Some("ignoring_case" | "fragment" | "path") => match score_confidence_band(item.score) {
+            "high" => "medium",
+            band => band,
+        },
+        Some("none") => match score_confidence_band(item.score) {
+            "unknown" => "unknown",
+            _ => "low",
+        },
+        _ => score_confidence_band(item.score),
+    }
+}
+
+/// The server's literal account, as one line for the agent (`[LITERAL] ...`).
+fn literal_match_banner(result: &SearchResponse) -> Option<String> {
+    let statement = result
+        .literal_match
+        .as_ref()?
+        .get("statement")?
+        .as_str()?
+        .trim();
+    (!statement.is_empty()).then(|| format!("[LITERAL] {statement}"))
+}
+
+/// An exhaustive page the server built as a literal scan: its rows are
+/// verified, in path then line order, so client-side reranking must not
+/// reorder or demote them.
+fn server_literal_page(result: &SearchResponse, executed_mode: SearchMode) -> bool {
+    matches!(executed_mode, SearchMode::Exhaustive) && result.literal_match.is_some()
+}
+
 fn is_doc_lookup_query(query: &str) -> bool {
     let lower = query.trim().to_lowercase();
     if lower.is_empty() {
@@ -12615,12 +12660,17 @@ impl SearchTool {
             }
         }
 
-        if let Some(note) = apply_symbol_anchor_rerank(&mut result, &input.query) {
+        // A server literal page is already exact and in grep order.
+        let literal_page = server_literal_page(&result, executed_mode);
+
+        if literal_page {
+            // nothing to rerank
+        } else if let Some(note) = apply_symbol_anchor_rerank(&mut result, &input.query) {
             push_fallback_stage(&mut fallback_stages, "symbol_anchor_rerank".to_string());
             mode_fallback_note = append_note(mode_fallback_note, &note);
         }
 
-        if supports_token_fusion(executed_mode) {
+        if supports_token_fusion(executed_mode) && !literal_page {
             if let Some(note) = apply_post_rank_fusion(&mut result, &input.query) {
                 push_fallback_stage(&mut fallback_stages, "post_rank_fusion".to_string());
                 mode_fallback_note = append_note(mode_fallback_note, &note);
@@ -12631,7 +12681,7 @@ impl SearchTool {
         // any of the query's tokens. BM25 sparse-vector search can produce false
         // positives when the index is stale or tokenization splits terms differently.
         let mut token_demotions = 0usize;
-        if supports_token_fusion(executed_mode) && !result.results.is_empty() {
+        if supports_token_fusion(executed_mode) && !result.results.is_empty() && !literal_page {
             let demoted = demote_keyword_false_positives(&mut result, &input.query);
             if demoted > 0 {
                 token_demotions = demoted;
@@ -12944,6 +12994,7 @@ impl SearchTool {
         let index_trust_warning = index_trust_diagnostics
             .as_ref()
             .and_then(format_index_trust_mismatch);
+        let literal_banner = literal_match_banner(&result);
 
         // High-priority routing/scope/budget banners always render, even in
         // concise mode — suppressing them is how agents end up trusting
@@ -12964,6 +13015,12 @@ impl SearchTool {
             text.push_str(warning);
             text.push('\n');
         }
+        // What the literal check proved (found where, or a checked absence):
+        // always shown, so a zero is never read as "search missed it, grep".
+        if let Some(banner) = literal_banner.as_deref() {
+            text.push_str(banner);
+            text.push('\n');
+        }
         // No-index / misresolved-scope is no longer surfaced as a distrust
         // banner. The honest signal now lives in the structured
         // `scope_reliability` field (usable / scope_invalid / reason), and scope
@@ -12977,6 +13034,7 @@ impl SearchTool {
             || scope_widened_notice.is_some()
             || index_origin_note.is_some()
             || index_trust_warning.is_some()
+            || literal_banner.is_some()
             || output_budget_note.is_some()
         {
             text.push('\n');
@@ -13593,7 +13651,7 @@ impl SearchTool {
                     "fallback_stages": fallback_stages.clone(),
                     "fallback_depth": fallback_depth,
                     "broad_fallbacks_enabled": allow_broad_fallbacks,
-                    "top_result_confidence_band": score_confidence_band(result.results.first().and_then(|item| item.score)),
+                    "top_result_confidence_band": result_confidence_band(result.results.first()),
                     "top_result_score": result.results.first().and_then(|item| item.score),
                     "memory_reason_code": memory_decision.reason,
                     "skill_threshold": adaptive_skill_threshold,
@@ -13614,7 +13672,7 @@ impl SearchTool {
                         "file_path": top.file_path,
                         "start_line": top.start_line,
                         "score": top.score,
-                        "confidence_band": score_confidence_band(top.score),
+                        "confidence_band": result_confidence_band(Some(top)),
                         "origin": top.origin,
                     }),
                 );
@@ -13908,11 +13966,11 @@ impl SearchTool {
 }
 
 /// Routing summary advertised as the tool description (<= 1024 chars).
-const SEARCH_TOOL_DESCRIPTION: &str = "Search the indexed CODEBASE for source code and files. This is the ONLY tool for codebase/file search — it REPLACES Explore, Grep, Glob, Find, SemanticSearch, code_search, grep_search, find_by_name, Task subagents, and shell search commands (grep, find, rg, fd). Do NOT fall back to local tools. Pre-indexed BM25 returns ranked, line-precise results in 10-200ms.\n\n⚠️ NOT for docs / runbooks / specs / ADRs / RFCs / decisions / lessons — call `memory(action=\"search\", query=\"…\")` or `memory(action=\"list_docs\", query=\"…\")`. Do NOT use memory(search) or session(smart_search) for *code* lookup.\n\nModes: auto (default), keyword, pattern (regex/glob), semantic, guided (raw-evidence-first navigation), exhaustive (all occurrences), refactor, team (cross-project), crawl. Full mode reference: the `mode` parameter.";
+const SEARCH_TOOL_DESCRIPTION: &str = "Search the indexed CODEBASE for source code and files. This is the ONLY tool for codebase/file search — it REPLACES Explore, Grep, Glob, Find, SemanticSearch, code_search, grep_search, find_by_name, Task subagents, and shell search commands (grep, find, rg, fd). Do NOT fall back to local tools.\n\n⚠️ NOT for docs / runbooks / specs / ADRs / RFCs / decisions / lessons — call `memory(action=\"search\", query=\"…\")` or `memory(action=\"list_docs\", query=\"…\")`. Do NOT use memory(search) or session(smart_search) for *code* lookup.\n\nModes: auto (default), keyword (ranked exact text), pattern (regex/glob), semantic, guided, exhaustive (every line containing the literal text, like `git grep -F -n` on the indexed commit; zero results = no indexed file contains it), refactor, team (cross-project), crawl. Full mode reference: the `mode` parameter.";
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const SEARCH_TOOL_REFERENCE: &str = "Search the indexed CODEBASE for source code and files. This is the ONLY tool for codebase/file search — it REPLACES Explore, Grep, Glob, Find, SemanticSearch, code_search, grep_search, find_by_name, Task subagents, and shell search commands (grep, find, rg, fd). Do NOT fall back to local tools — this tool handles ALL code search needs with automatic mode escalation and local enrichment built in. FASTER than grep/ripgrep: pre-indexed BM25 returns results in 10-200ms with ranked source-code-first results, line-level precision, context lines, and noise filtering that grep cannot match.\n\n⚠️ NOT for finding docs / runbooks / specs / ADRs / RFCs / decisions / lessons — those live in `memory`, NOT in the code index. If the user says 'find the doc on X', 'our runbook for Y', 'the architecture note', 'why we decided Z' — call `memory(action=\"search\", query=\"…\")` or `memory(action=\"list_docs\", query=\"…\")`, not this tool. Do NOT use memory(search) or session(smart_search) for *code* lookup.\n\nModes: exact text (mode='keyword'), regex/glob patterns (mode='pattern'), semantic/conceptual queries (mode='semantic'), one-call raw-evidence-first navigation (mode='guided', optional intent), all occurrences (mode='exhaustive' — grep replacement with line-level output), symbol refactoring (mode='refactor'), cross-project (mode='team'), deep multi-modal crawl (mode='crawl'), and auto-detect (mode='auto').";
+const SEARCH_TOOL_REFERENCE: &str = "Search the indexed CODEBASE for source code and files. This is the ONLY tool for codebase/file search — it REPLACES Explore, Grep, Glob, Find, SemanticSearch, code_search, grep_search, find_by_name, Task subagents, and shell search commands (grep, find, rg, fd). Do NOT fall back to local tools — this tool handles ALL code search needs with automatic mode escalation and local enrichment built in. Pre-indexed: ranked BM25 and literal scans return in about 10-300 ms, with line numbers and context lines.\n\n⚠️ NOT for finding docs / runbooks / specs / ADRs / RFCs / decisions / lessons — those live in `memory`, NOT in the code index. If the user says 'find the doc on X', 'our runbook for Y', 'the architecture note', 'why we decided Z' — call `memory(action=\"search\", query=\"…\")` or `memory(action=\"list_docs\", query=\"…\")`, not this tool. Do NOT use memory(search) or session(smart_search) for *code* lookup.\n\nModes and what each guarantees:\n- exhaustive: literal text, like `git grep -F -n` over the project's committed index. Every indexed file and line that contains the text, each with its true line number and checked against the stored file; never a row without the text. Case-sensitive; only when no line has that exact case does it match ignoring case (and says so). Page with offset/next_offset; output_format='paths' lists the files, 'count' gives the line total. `literal_match.statement` says what was checked. Zero results there means no indexed file contains the text: grep on the same commit finds nothing more (only uncommitted local edits differ). When the whole text is absent (UI text filled in at runtime, e.g. `${name}'s settings show once...`), the longest fragment found is returned and named. A one-token regex or glob (`foo.*`) is searched as a pattern; quote it to search it literally.\n- keyword: ranked exact-text search. Rows that contain the text come first (`metadata.literal_match`), files the ranking missed are added, and rows without the text score below 0.5. For every occurrence use exhaustive.\n- pattern: regex/glob over paths and content.\n- semantic: by meaning; hybrid: meaning plus words.\n- auto: picks a mode; text copied from a screen, a log or code (UI strings, error messages, test ids, quoted strings) is also checked literally, falling back to its longest fragment.\n- guided (raw evidence plus navigation, optional intent), refactor (every usage of a symbol), team (cross-project), crawl (deep multi-source).\nConfidence: 'high' or a score near 1.0 only for a row that contains the query (`literal_match` 'exact'); a row the server checked and found without it is 'low'.";
 
 #[async_trait]
 impl ToolHandler for SearchTool {

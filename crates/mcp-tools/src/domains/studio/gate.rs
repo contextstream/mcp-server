@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 pub(crate) const KNOWN_TTL: Duration = Duration::from_secs(300);
 pub(crate) const UNREACHABLE_RETRY: Duration = Duration::from_secs(30);
+/// The pause before a listing reads an unreachable catalog again.
+const RETRY_PAUSE: Duration = Duration::from_millis(400);
 /// Callers remembered at once; beyond it the oldest answers go first.
 pub(crate) const MAX_ENTRIES: usize = 4096;
 
@@ -125,15 +127,33 @@ impl StudioGate {
         if let Some(offer) = self.fresh(identity) {
             return offer == Offer::Offered;
         }
-        let read = tokio::time::timeout(
-            budget,
-            client.studio_call("GET", "/create/catalog", None, None, budget),
-        )
-        .await;
-        let offer = match read {
-            Ok(Ok(answer)) => Offer::from_answer(answer.status, &answer.data),
-            _ => Offer::Unreachable,
-        };
+        // A blip (a rolling deploy's 502, a cold connection) is read again once while the
+        // budget lasts: a client that lists tools once a session would otherwise go
+        // without the tool for the whole session.
+        let started = std::time::Instant::now();
+        let mut offer = Offer::Unreachable;
+        for attempt in 0..2 {
+            let left = budget.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            if attempt > 0 {
+                tokio::time::sleep(RETRY_PAUSE.min(left)).await;
+            }
+            let left = budget.saturating_sub(started.elapsed());
+            let read = tokio::time::timeout(
+                left,
+                client.studio_call("GET", "/create/catalog", None, None, left),
+            )
+            .await;
+            offer = match read {
+                Ok(Ok(answer)) => Offer::from_answer(answer.status, &answer.data),
+                _ => Offer::Unreachable,
+            };
+            if offer != Offer::Unreachable {
+                break;
+            }
+        }
         self.record(identity, offer) == Offer::Offered
     }
 }

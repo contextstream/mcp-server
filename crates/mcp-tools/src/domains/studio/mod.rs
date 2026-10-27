@@ -753,7 +753,10 @@ impl StudioTool {
             (Some(true), _) => {}
             (Some(false), _) => {
                 return Ok(ToolResult::with_structured(
-                    "Not made: the person said no to the price. Nothing was spent.".to_string(),
+                    format!(
+                        "Not made: the person said no to {titles} for up to {} credits. Nothing was spent.",
+                        credits(price)
+                    ),
                     json!({"made": false, "plan_id": quote_id, "declined": true}),
                 ))
             }

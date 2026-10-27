@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.35
+
+- The agents tool is `agents` (ContextStream Agents), and its texts no longer
+  say Slipstream, which was the prototype's name. `slipstream`, the tool's name
+  since 1.0.30, still works for every call and is never listed, so clients and
+  saved prompts that call it keep working. A search for it with `tool_search`
+  finds `agents`.
+- The auto-accept cap is `CONTEXTSTREAM_AGENTS_AUTO_ACCEPT_MAX_CREDITS` on
+  stdio and the `X-ContextStream-Agents-Auto-Accept-Max-Credits` header on a
+  hosted connection. The `SLIPSTREAM` names still work when the new ones are
+  not set.
+- A back-compat alias is listed nowhere: `tools/list`, router operations and
+  `tool_search` each show a tool once, under its current name.
+
 ## 1.0.34
 
 - Minified and generated bundles are exact-search only (API): their stored

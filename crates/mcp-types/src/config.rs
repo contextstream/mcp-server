@@ -117,9 +117,10 @@ pub struct Config {
     #[serde(default)]
     pub account_mode_preference: AccountModePreference,
 
-    /// Slipstream runs priced at most this many credits start without asking the person
-    /// first (`CONTEXTSTREAM_SLIPSTREAM_AUTO_ACCEPT_MAX_CREDITS` on stdio, the
-    /// `X-ContextStream-Slipstream-Auto-Accept-Max-Credits` header on a hosted connection).
+    /// Agent runs priced at most this many credits start without asking the person first
+    /// (`CONTEXTSTREAM_AGENTS_AUTO_ACCEPT_MAX_CREDITS` on stdio, the
+    /// `X-ContextStream-Agents-Auto-Accept-Max-Credits` header on a hosted connection; their
+    /// first names, with `SLIPSTREAM` for `AGENTS`, still work).
     /// `0`, the default, always shows the price first. The hosted gateway never takes it from
     /// its own environment: it would spend every caller's credits.
     #[serde(default)]
@@ -294,8 +295,8 @@ pub struct ConfigOverride {
     /// `acceleration_enabled` / `X-ContextStream-Acceleration-Enabled`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub atlas_enabled: Option<bool>,
-    /// The caller's Slipstream auto-accept cap in credits
-    /// (`X-ContextStream-Slipstream-Auto-Accept-Max-Credits`).
+    /// The caller's agent auto-accept cap in credits
+    /// (`X-ContextStream-Agents-Auto-Accept-Max-Credits`, or its first name).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slipstream_auto_accept_max_credits: Option<u32>,
 }

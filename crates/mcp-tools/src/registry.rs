@@ -780,6 +780,25 @@ impl ToolRegistry {
         }
     }
 
+    /// Register `alias` as a back-compat name of the tool registered as `canonical`, on exactly
+    /// the surfaces where `canonical` is (direct tools, router operations). The alias keeps the
+    /// canonical metadata, so every listing leaves it out ([`Self::list`],
+    /// [`Self::list_operations`], [`Self::search_catalog`]) while calls by the alias still work.
+    /// Nothing is registered when `canonical` is not.
+    pub fn register_alias(&mut self, alias: &str, canonical: &str) {
+        let copy = |tool: &RegisteredTool| RegisteredTool {
+            metadata: tool.metadata.clone(),
+            handler: tool.handler.clone(),
+            input_schema: tool.input_schema.clone(),
+        };
+        if let Some(tool) = self.tools.get(canonical).map(copy) {
+            self.tools.insert(alias.to_string(), tool);
+        }
+        if let Some(tool) = self.operations.get(canonical).map(copy) {
+            self.operations.insert(alias.to_string(), tool);
+        }
+    }
+
     /// Get a tool by name.
     pub fn get(&self, name: &str) -> Option<&RegisteredTool> {
         if self.is_tool_visible(name) {
@@ -1147,14 +1166,29 @@ impl ToolRegistry {
     // Router Mode Operations
     // =========================================================================
 
-    /// List all operations (router mode).
+    /// List all operations (router mode). Back-compat aliases (keys that differ from the
+    /// operation's `metadata.name`) are left out, so each operation is listed once; they stay
+    /// callable through [`Self::get_operation`].
     pub fn list_operations(&self) -> Vec<&RegisteredTool> {
-        self.operations.values().collect()
+        self.operations
+            .iter()
+            .filter(|(name, tool)| !self.is_operation_alias(name, tool))
+            .map(|(_, tool)| tool)
+            .collect()
     }
 
-    /// Get operation names (router mode).
+    /// Get operation names (router mode), back-compat aliases left out.
     pub fn operation_names(&self) -> Vec<&str> {
-        self.operations.keys().map(|s| s.as_str()).collect()
+        self.operations
+            .iter()
+            .filter(|(name, tool)| !self.is_operation_alias(name, tool))
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// An operation registered under a back-compat name whose canonical name is registered too.
+    fn is_operation_alias(&self, name: &str, tool: &RegisteredTool) -> bool {
+        name != tool.metadata.name.as_str() && self.operations.contains_key(&tool.metadata.name)
     }
 
     /// Get an operation by name (router mode).
@@ -1234,6 +1268,18 @@ impl ToolRegistry {
                 let b_name = b.1.get("name").and_then(|v| v.as_str()).unwrap_or_default();
                 a_name.cmp(b_name)
             })
+        });
+        // A back-compat alias answers with its canonical metadata: keep the best-scoring
+        // entry of each name, so a tool is never offered twice.
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|(_, value)| {
+            seen.insert(
+                value
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            )
         });
         candidates
             .into_iter()
@@ -1837,11 +1883,14 @@ impl ToolsetConfig {
     }
 }
 
-/// Tools whose `tools/list` entry depends on who asks: `slipstream` is listed
-/// only for a caller whose workspace has Slipstream agents turned on, with a
+/// Tools whose `tools/list` entry depends on who asks: `agents` is listed
+/// only for a caller whose workspace has agents turned on, with a
 /// description written from them. The registry's own listing leaves them out
 /// and the transports add them per caller (`slipstream::listing`).
-const LISTED_PER_CALLER: &[&str] = &[crate::domains::slipstream::TOOL_NAME];
+const LISTED_PER_CALLER: &[&str] = &[
+    crate::domains::slipstream::TOOL_NAME,
+    crate::domains::slipstream::LEGACY_TOOL_NAME,
+];
 
 /// Whether `name` is listed per caller rather than from the registry.
 pub fn is_listed_per_caller(name: &str) -> bool {
@@ -2206,9 +2255,9 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
             parallel_safe: false,
             batch_safe: false,
         },
-        "slipstream" => DiscoveryHints {
+        "agents" => DiscoveryHints {
             aliases: &[
-                "agents",
+                "contextstream agents",
                 "specialist agent",
                 "ss run",
                 "csa",
@@ -2218,13 +2267,13 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
                 "make a pdf",
                 "read an image",
             ],
-            tags: &["agents", "slipstream", "tasks", "delegation", "credits"],
-            when_to_use: "Hand one well-defined job to a Slipstream specialist agent (PR review, release notes, docs drift, memory gardening, repo guide, image reading, PDF, mail digest) and read its result.",
+            tags: &["agents", "tasks", "delegation", "credits"],
+            when_to_use: "Hand one well-defined job to a ContextStream specialist agent (PR review, release notes, docs drift, memory gardening, repo guide, image reading, PDF, mail digest) and read its result.",
             avoid_when: "Do not use for work you can do directly in the session, or without showing the person the quoted price of a priced agent.",
             examples: &[
                 "review pull request 42 in acme/api",
                 "write release notes from v1.2.0 to v1.3.0",
-                "what Slipstream agents can I use here",
+                "what agents can I use here",
             ],
             latency_class: "slow",
             parallel_safe: false,
@@ -2336,9 +2385,10 @@ const STANDARD_TOOLS: &[&str] = &[
     // VCS bridge — pulls, issues, activity, notifications across
     // linked repositories (added v0.3.5).
     "vcs",
-    // Slipstream specialist agents (find, run, get_run, list_runs, cancel_run),
-    // listed only for a workspace with Slipstream (see `domains::slipstream`).
-    "slipstream",
+    // ContextStream Agents (find, run, get_run, list_runs, cancel_run), listed
+    // only for a workspace with agents turned on (see `domains::slipstream`).
+    // `slipstream` is its back-compat alias (registered with `register_alias`).
+    "agents",
     // Workspace dashboard charts (premium / hosted deployments only —
     // only registered when the premium layer is connected). The
     // `atlas_chart` alias is kept for one minor cycle for back-compat.
@@ -2419,10 +2469,11 @@ const CONSOLIDATED_TOOLS: &[&str] = &[
     "entity",
     // VCS bridge (added v0.3.5).
     "vcs",
-    // Slipstream specialist agents: find, run (priced runs need the person's
-    // accepted quote), get_run, list_runs, cancel_run. Listed only for a
-    // workspace with Slipstream (see `domains::slipstream`).
-    "slipstream",
+    // ContextStream Agents: find, run (priced runs need the person's accepted
+    // quote), get_run, list_runs, cancel_run. Listed only for a workspace with
+    // agents turned on (see `domains::slipstream`). `slipstream` is its
+    // back-compat alias (registered with `register_alias`).
+    "agents",
     "help",
     "generate_rules",
     "generate_editor_rules",

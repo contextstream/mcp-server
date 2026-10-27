@@ -1,6 +1,6 @@
 //! Whether a caller's workspace has Slipstream, cached per caller and workspace.
 //!
-//! The `slipstream` tool is listed only when the catalog answers `200` with at least one
+//! The `agents` tool is listed only when the catalog answers `200` with at least one
 //! agent an owner or admin turned on; otherwise it costs the session no prompt. The answer
 //! depends only on who asks and for which workspace, so it is cached under that pair:
 //!

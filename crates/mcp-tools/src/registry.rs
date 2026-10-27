@@ -718,7 +718,9 @@ impl ToolRegistry {
         // registered, never filtered by toolset, bundle, router or
         // consolidated mode, never an operation, and visible only when the
         // surface profile is `Coach`.
-        if crate::domains::coach::is_coach_tool(name) {
+        // `studio` is registered the same way: the ContextStudio surface (`/studio`)
+        // serves it whatever the toolset; elsewhere it is listed per caller.
+        if crate::domains::coach::is_coach_tool(name) || name == crate::domains::studio::TOOL_NAME {
             self.tools.insert(
                 name.to_string(),
                 RegisteredTool {
@@ -1152,6 +1154,11 @@ impl ToolRegistry {
         self.tool_surface_profile() == ToolSurfaceProfile::Coach
     }
 
+    /// Whether the current surface profile is the ContextStudio surface.
+    pub fn is_studio_surface(&self) -> bool {
+        self.tool_surface_profile() == ToolSurfaceProfile::Studio
+    }
+
     /// Whether the current surface profile is OpenAI agentic mode.
     pub fn is_openai_agentic_surface(&self) -> bool {
         self.tool_surface_profile() == ToolSurfaceProfile::OpenaiAgentic
@@ -1440,10 +1447,12 @@ impl ToolRegistry {
             return false;
         }
         let coach = crate::domains::coach::is_coach_tool(name);
+        let studio = name == crate::domains::studio::TOOL_NAME;
         match self.tool_surface_profile() {
             ToolSurfaceProfile::Default => !coach,
             ToolSurfaceProfile::OpenaiAgentic => !coach && is_openai_agentic_core_tool(name),
             ToolSurfaceProfile::Coach => coach,
+            ToolSurfaceProfile::Studio => studio,
         }
     }
 }
@@ -1890,6 +1899,7 @@ impl ToolsetConfig {
 const LISTED_PER_CALLER: &[&str] = &[
     crate::domains::slipstream::TOOL_NAME,
     crate::domains::slipstream::LEGACY_TOOL_NAME,
+    crate::domains::studio::TOOL_NAME,
 ];
 
 /// Whether `name` is listed per caller rather than from the registry.
@@ -2279,6 +2289,29 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
             parallel_safe: false,
             batch_safe: false,
         },
+        "studio" => DiscoveryHints {
+            aliases: &[
+                "contextstudio",
+                "make a video",
+                "make a film",
+                "product explainer",
+                "make an image",
+                "make a sound",
+                "make music",
+                "jingle",
+            ],
+            tags: &["studio", "create", "video", "image", "sound", "music", "credits"],
+            when_to_use: "Make a finished film, product explainer, image, sound or music piece from one plain request, produced from the team's brand, docs and connected products.",
+            avoid_when: "Do not use to edit local media files, or to spend credits without showing the person the plan's price.",
+            examples: &[
+                "a 30-second explainer of how decisions are recorded in our product",
+                "a short sound sting for the release announcement",
+                "a brand board for the launch post",
+            ],
+            latency_class: "slow",
+            parallel_safe: false,
+            batch_safe: false,
+        },
         _ => DiscoveryHints {
             aliases: &[],
             tags: default_category_tags(metadata.category),
@@ -2389,6 +2422,9 @@ const STANDARD_TOOLS: &[&str] = &[
     // only for a workspace with agents turned on (see `domains::slipstream`).
     // `slipstream` is its back-compat alias (registered with `register_alias`).
     "agents",
+    // ContextStudio making (plan, make, status, result, ...), listed only for a
+    // caller Create offers one-prompt making to (see `domains::studio`).
+    "studio",
     // Workspace dashboard charts (premium / hosted deployments only —
     // only registered when the premium layer is connected). The
     // `atlas_chart` alias is kept for one minor cycle for back-compat.
@@ -2474,6 +2510,10 @@ const CONSOLIDATED_TOOLS: &[&str] = &[
     // agents turned on (see `domains::slipstream`). `slipstream` is its
     // back-compat alias (registered with `register_alias`).
     "agents",
+    // ContextStudio making: plan (spends nothing), make (needs the person's
+    // go-ahead), status, result, revise, stop, library, brand, products.
+    // Listed only for a caller Create offers making to (`domains::studio`).
+    "studio",
     "help",
     "generate_rules",
     "generate_editor_rules",

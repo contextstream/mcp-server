@@ -1760,6 +1760,7 @@ version = "1.0.36"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.23.1",
  "chrono",
  "dirs",
  "fake",

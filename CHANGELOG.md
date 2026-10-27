@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.33
+
+- Exhaustive search is `git grep -F -n` on the project's indexed commit (API,
+  ticket 83bfc089): every indexed file and line that contains the text, with
+  its true line number, each row checked against the stored file, and nothing
+  that lacks the text. It used to answer from BM25, which returned rows that
+  did not contain the query with a top score of 1.0 "high" and chunk-start line
+  numbers, and agents fell back to grep (#216).
+  - The server's `literal_match` passes through, and its `statement` is shown
+    as a `[LITERAL] ...` line: a zero result is a checked absence, not a
+    ranking miss.
+  - Confidence follows the server's literal check: a row without the text is
+    never above "low", whatever its score; a row with the exact text is
+    "high"; a case-insensitive, fragment or path match is at most "medium".
+  - An exhaustive literal page keeps the server's path and line order (no
+    client rerank or demotion).
+  - The tool description, the `mode` reference, the session reminder and the
+    subagent search protocol say what each mode guarantees, including that UI
+    text filled in at runtime falls back to its longest fragment.
+
 ## 1.0.32
 
 - Searching another project of the workspace from a session elsewhere returns

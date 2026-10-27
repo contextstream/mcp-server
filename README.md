@@ -6,12 +6,21 @@
 
 <h1 align="center">ContextStream MCP Server</h1>
 
-<p align="center"><strong>Persistent memory. Millisecond code search.</strong></p>
+<p align="center"><strong>The context platform for AI agents.</strong></p>
 
 ## Your agent knows code. Give it the decisions behind yours.
 
 Connect your code, docs, and conversations so your agents can find the right
 files, recall saved decisions, and build on past work across sessions and tools.
+
+<a href="https://contextstream.io/benchmarks">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/contextstream/mcp-server/main/assets/benchmarks-dark.png">
+    <img src="https://raw.githubusercontent.com/contextstream/mcp-server/main/assets/benchmarks-light.png" width="100%" alt="ContextStream benchmarks: LongMemEval-S 96.8% (484 of 500), LoCoMo 95.7%, code search 98.77% best answer in the top 10, agent tasks 96% (23 of 24, up from 58% without it)">
+  </picture>
+</a>
+
+The numbers, their sources, and what they do not claim are under [Benchmarks](#benchmarks).
 
 <a id="install-in-30-seconds"></a>
 
@@ -83,11 +92,29 @@ only when the run succeeds; declined, failed, cancelled and timed-out runs are f
   for your agent to follow. A retried call never starts a second run.
 - **Terminal.** The same agents run from a shell with `ss run <agent>` (alias `csa`).
 
-## Proof and data controls
+## Benchmarks
 
-**95 ms median code search in our published benchmark.** This is the measured
-successful-response median for the disclosed configuration, not a latency guarantee.
-[See results, methodology, and limitations](https://contextstream.io/benchmarks).
+Each benchmark runs through the production API, is registered before its results
+are read, and is published with its method, confidence interval, and losses.
+
+| Benchmark | ContextStream | Compared with |
+|---|---|---|
+| **LongMemEval-S**, all 500 questions | **96.8%** (484/500); 96.0% on the half held out from tuning | Above Mastra (94.87%) and supermemory (85.4%) on the same official GPT-4o judge. Level with agentmemory's self-reported 96.2%, which is inside our 95% interval |
+| **LoCoMo**, all 1,540 questions | **95.7%** (1474/1540); 95.8% held out; 97.8% on the audited answer key | Above every system in the EverMemOS paper's same-judge table: EverMemOS 93.05%, Zep 85.22%, MemOS 80.76%, MemU 66.67%, Mem0 64.20% |
+| **Code search**, 177 judged developer queries | **98.77%** best answer in the top 10; **100%** a useful file in the top 10 | Embedding-only search 72.84% and ripgrep 42.59% on the same queries and judgments |
+| **Agent tasks**, 8 tasks × 3 trials | **23/24** passed (96%); 9/9 on tasks that need team knowledge | 14/24 (58%) and 0/9 with the repository alone |
+
+**61 ms median server-side search time** (127 ms p95) in the October 27 production
+run. End to end it was 223 ms, because the client ran in a different region from the
+one serving the workspace. Your latency depends on your distance from that region.
+
+Competitor figures are as each vendor or the EverMemOS paper published them; we did
+not re-run them, and readers and judges differ across rows. The code-search baselines
+come from the August 1 run on the same queries. The agent-task result uses one
+repository and one agent model, so treat it as directional.
+[Results, methodology, and limitations](https://contextstream.io/benchmarks).
+
+## Data controls
 
 **Scoped access. Traceable sources. Configurable capture.**
 Indexing sends eligible source contents to ContextStream for hosted search.

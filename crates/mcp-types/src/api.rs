@@ -300,6 +300,13 @@ pub struct SearchResponse {
     pub rewritten_queries: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_map_route: Option<ProjectAgentMapRouteHint>,
+    /// The server's literal (`git grep -F`) account of the query: whether the
+    /// text is in the committed index, in how many files and lines, whether
+    /// every file was checked, and one `statement` to act on. Exhaustive
+    /// responses always carry it; keyword and hybrid carry it when they
+    /// checked the text literally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub literal_match: Option<serde_json::Value>,
 }
 
 impl SearchResponse {

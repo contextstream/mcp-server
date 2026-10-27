@@ -20,16 +20,16 @@ const SEARCH_PROTOCOL: &str = r#"[CONTEXTSTREAM SEARCH]
 When searching code, use ContextStream search if the project is indexed. Every local search has a mode:
 - Unsure / broad: mcp__contextstream__search(mode="auto", query="...")
 - How or where something works: mode="semantic"
-- Exact text: mode="keyword"
+- Exact text, ranked: mode="keyword"
 - Grep regex: mode="pattern" (output_format="paths" lists files, "count" counts)
-- Every occurrence of a literal, like grep: mode="exhaustive"
+- Every line containing a literal, like `git grep -F -n` on the indexed commit (true line numbers; UI text filled in at runtime falls back to its longest fragment): mode="exhaustive"
 - Every usage of a symbol, e.g. before a rename: mode="refactor"
 - File names, like Glob or find: mode="pattern", query="**/*.rs", output_format="paths"
 - A whole exploration task in one call: mode="guided", query="...", intent="<the task>"
 - Deep multi-source research: mode="crawl"; across projects: mode="team"
 - Grep -C N: context_lines=N; only some file types: file_types=["rs"]
 - Callers, dependencies, impact: mcp__contextstream__graph(action="usages"|"dependencies"|"impact", target_type="function|type|module", target_id="...")
-Fall back to Glob/Grep/Read only if ContextStream search is unavailable or returns no results."#;
+An exhaustive result is complete for the indexed commit: `literal_match.statement` says what was checked, and zero results means no indexed file contains the text, so grep would find nothing more there. Fall back to Glob/Grep/Read only if ContextStream search is unavailable or errors, or to see uncommitted local edits."#;
 
 /// Fallback context when the API is unreachable.
 const FALLBACK_CONTEXT: &str = r#"[CONTEXTSTREAM] Use mcp__contextstream__search(mode="auto", query="...") for codebase search when available. Call mcp__contextstream__context(user_message="...") for task-specific context; when it returns [GROUNDING], read those prior-work hits before searching code (one-shot bundle: mcp__contextstream__session(action="ground", user_message="...")). If ContextStream surfaces [LESSONS_WARNING], treat those lessons as active instructions for the task. If this task is a continuation or references prior work, treat fresh, relevant, sufficient [GROUNDING] as the completed retrieval step and do not immediately duplicate it with mcp__contextstream__session(action="recall"). Use recall only when [GROUNDING] is absent, thin, stale, off-topic, or the user explicitly requests broader or session-specific history; if recall is thin, fall through to mcp__contextstream__memory(action="search_transcripts", query="...") for full-text across transcripts or mcp__contextstream__memory(action="list_events", event_type="session_snapshot") for turning-point bookmarks. FRESHNESS: decisions, transcript continuity, snapshots, active plans, and tasks are time-sensitive; refresh stale hits with session(action="ground"), memory(action="decisions", workspace_id="<current_workspace_id>", project_id="<current_project_id>") when ids are available, or memory(action="search_transcripts") before planning or implementation. Treat Gemini/LLM-derived [INSIGHT] items as advisory unless backed by a current captured decision/event/doc. KNOWLEDGE-FIRST (not just code): when the question is "how/why/what pattern/did we decide X?", the answer usually lives in docs/decisions/lessons/preferences/plans/tasks/skills. Pick by type: memory(action="decisions", workspace_id="<current_workspace_id>", project_id="<current_project_id>") when ids are available; memory(action="list_docs"|"get_doc"|"list_nodes"|"list_tasks"|"list_todos"|"search"); session(action="get_lessons"|"list_plans"|"get_plan"); skill(action="list"|"run"). Check the right knowledge surface BEFORE code search. If hook context is unavailable and the work is risky or unfamiliar, call mcp__contextstream__session(action="get_lessons") before improvising."#;

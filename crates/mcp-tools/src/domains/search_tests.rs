@@ -8317,3 +8317,105 @@ mod cross_project_root_tests {
         );
     }
 }
+
+// ============================================================================
+// Literal search contract (API 2026-10-27): exhaustive is `git grep -F -n`
+// ============================================================================
+
+mod literal_contract_tests {
+    use super::*;
+    use mcp_types::api::{SearchResponse, SearchResult};
+
+    fn row(path: &str, line: i64, score: f64, literal: Option<&str>) -> SearchResult {
+        SearchResult {
+            id: format!("{path}#L{line}"),
+            file_path: Some(path.to_string()),
+            location: Some(format!("{path}:{line}")),
+            start_line: Some(line),
+            score: Some(score),
+            content: Some("show once it's in a conversation".to_string()),
+            metadata: literal.map(|value| json!({ "literal_match": value })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_row_without_the_text_is_never_high_whatever_its_score() {
+        // The owner's report: a BM25 row scored 1.0 was shown as "high".
+        assert_eq!(
+            result_confidence_band(Some(&row("a.ts", 73, 1.0, Some("none")))),
+            "low"
+        );
+        assert_eq!(
+            result_confidence_band(Some(&row("a.ts", 458, 0.2, Some("exact")))),
+            "high"
+        );
+        assert_eq!(
+            result_confidence_band(Some(&row("a.ts", 458, 1.0, Some("ignoring_case")))),
+            "medium"
+        );
+        // Rows the server did not check keep the score bands.
+        assert_eq!(
+            result_confidence_band(Some(&row("a.ts", 1, 0.9, None))),
+            "high"
+        );
+        assert_eq!(result_confidence_band(None), "unknown");
+    }
+
+    #[test]
+    fn the_literal_account_passes_through_and_is_shown_as_one_line() {
+        let api = json!({
+            "results": [],
+            "total": 0,
+            "literal_match": {
+                "query": "show once it's in a conversation",
+                "text": "show once it's in a conversation",
+                "found": false,
+                "whole_query": true,
+                "case_sensitive": true,
+                "files": 0,
+                "lines": 0,
+                "complete": true,
+                "statement": "Every committed indexed file was checked, like `git grep -F -n`. No indexed file contains this text, exactly or ignoring case."
+            }
+        });
+        let response: SearchResponse = serde_json::from_value(api).unwrap();
+        assert!(response.literal_match.is_some());
+        let banner = literal_match_banner(&response).unwrap();
+        assert!(banner.starts_with("[LITERAL] Every committed indexed file was checked"));
+        // It survives into the structured output the agent reads.
+        let structured = search_response_structured_value(&response);
+        assert_eq!(structured["literal_match"]["found"], json!(false));
+    }
+
+    #[test]
+    fn a_server_literal_page_is_not_reranked_on_the_client() {
+        let response = SearchResponse {
+            results: vec![
+                row("b.ts", 1, 1.0, Some("exact")),
+                row("a.ts", 9, 1.0, Some("exact")),
+            ],
+            total: Some(2),
+            literal_match: Some(json!({"statement": "2 lines"})),
+            ..SearchResponse::default()
+        };
+        assert!(server_literal_page(&response, SearchMode::Exhaustive));
+        assert!(!server_literal_page(&response, SearchMode::Keyword));
+        let without = SearchResponse {
+            literal_match: None,
+            ..response.clone()
+        };
+        assert!(!server_literal_page(&without, SearchMode::Exhaustive));
+    }
+
+    #[test]
+    fn the_tool_text_states_what_exhaustive_guarantees() {
+        assert!(SEARCH_TOOL_DESCRIPTION.chars().count() <= 1024);
+        assert!(SEARCH_TOOL_DESCRIPTION.contains("git grep -F -n"));
+        assert!(SEARCH_TOOL_REFERENCE.contains("true line number"));
+        assert!(SEARCH_TOOL_REFERENCE
+            .contains("Zero results there means no indexed file contains the text"));
+        assert!(SEARCH_TOOL_REFERENCE.contains("longest fragment"));
+        assert!(!SEARCH_TOOL_REFERENCE.contains("FASTER than grep"));
+    }
+}

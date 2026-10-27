@@ -1419,11 +1419,11 @@ Mode selection:
 - **Exact text/symbols**: `search(mode="keyword", query="myFunction")`
 - **Regex/glob patterns**: `search(mode="pattern", query="*.tsx")` or `search(mode="pattern", query="foo\\s+bar")`
 - **Semantic/conceptual**: `search(mode="semantic", query="how does auth work")`
-- **All occurrences (grep replacement)**: `search(mode="exhaustive", query="mySymbol")`
+- **Every line containing a literal, like `git grep -F -n` on the indexed commit**: `search(mode="exhaustive", query="exact text")`
 - **Symbol refactoring (all variants)**: `search(mode="refactor", query="UserService")`
 - **Auto-detect best mode**: `search(mode="auto", query="...")`
 
-Fall back to local tools ONLY if ContextStream search returns exactly 0 results or errors.
+Fall back to local tools ONLY if ContextStream search errors. An exhaustive search with 0 results is a checked absence: no file in the indexed commit contains the text (`literal_match.statement` says so); only uncommitted local edits could differ.
 </system-reminder>"#;
 
 /// Windsurf-specific reminder injected into init/context tool responses.

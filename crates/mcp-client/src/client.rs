@@ -12018,7 +12018,9 @@ impl ContextStreamClient {
             .request(
                 "POST",
                 "/activation/events",
-                Some(payload),
+                // Keep the payload so the first-action report can be
+                // confirmed or released once the API has answered.
+                Some(payload.clone()),
                 Some(RequestOptions {
                     timeout: Some(Duration::from_secs(3)),
                     retries: Some(1),
@@ -12026,6 +12028,9 @@ impl ContextStreamClient {
                 }),
             )
             .await;
+        // Only an accepted delivery spends the session's first-action report;
+        // a refused or failed one is retried by the next real tool call.
+        crate::activation::finish_first_action_report(&payload, result.is_ok());
         if let Err(error) = result {
             debug!(%error, "activation telemetry delivery skipped");
         }

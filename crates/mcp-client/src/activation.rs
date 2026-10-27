@@ -5,6 +5,7 @@
 //! machine fingerprint.
 
 use chrono::{DateTime, Utc};
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -87,8 +88,14 @@ pub struct ActivationEventPayload {
     pub result_is_error: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstActionReportState {
+    InFlight(Uuid),
+    Accepted,
+}
+
 static RUNTIME_METADATA: OnceLock<RwLock<RuntimeMetadata>> = OnceLock::new();
-static REPORTED_ACTIONS: OnceLock<DashMap<String, Uuid>> = OnceLock::new();
+static FIRST_ACTION_REPORTS: OnceLock<DashMap<String, FirstActionReportState>> = OnceLock::new();
 static REPORTED_FAILURES: OnceLock<DashMap<String, Uuid>> = OnceLock::new();
 
 #[cfg(not(test))]
@@ -720,6 +727,38 @@ pub fn first_action_event(
     )
 }
 
+/// Session setup and bookkeeping tool names the API rejects as a first action
+/// (`is_meaningful_mcp_tool` in the API's activation service answers HTTP 400
+/// for these). Reporting one would spend the session's only report on a call
+/// that did no work, so they are filtered here as well. Keep this list in step
+/// with the API.
+const NON_ACTION_TOOL_NAMES: &[&str] = &[
+    "init",
+    "session_init",
+    "setup",
+    "doctor",
+    "help",
+    "catalog",
+    "health",
+    "config",
+    "version",
+    "auth",
+];
+
+fn is_reportable_first_action(tool_name: &str) -> bool {
+    let normalized = tool_name.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && !NON_ACTION_TOOL_NAMES.iter().any(|excluded| {
+            normalized == *excluded
+                || normalized
+                    .strip_prefix(excluded)
+                    .is_some_and(|rest| rest.starts_with('_'))
+                || normalized
+                    .strip_suffix(excluded)
+                    .is_some_and(|head| head.ends_with('_'))
+        })
+}
+
 fn first_action_event_with_metadata(
     metadata: RuntimeMetadata,
     workspace_id: Option<Uuid>,
@@ -728,18 +767,25 @@ fn first_action_event_with_metadata(
     tool_name: &str,
     operation_category: &str,
 ) -> Option<ActivationEventPayload> {
+    if !is_reportable_first_action(tool_name) {
+        return None;
+    }
     let dedupe_key = format!(
         "{}:{}",
         metadata.installation_id,
         session_id.as_deref().unwrap_or("process")
     );
     let event_id = Uuid::new_v4();
-    if REPORTED_ACTIONS
+    // Reserve the session atomically, but do not mark it reported until the
+    // API accepts delivery. Concurrent tool completions must not send duplicates.
+    match FIRST_ACTION_REPORTS
         .get_or_init(DashMap::new)
-        .insert(dedupe_key, event_id)
-        .is_some()
+        .entry(dedupe_key)
     {
-        return None;
+        Entry::Occupied(_) => return None,
+        Entry::Vacant(entry) => {
+            entry.insert(FirstActionReportState::InFlight(event_id));
+        }
     }
     Some(ActivationEventPayload {
         event_id,
@@ -766,6 +812,31 @@ fn first_action_event_with_metadata(
         http_status: None,
         result_is_error: false,
     })
+}
+
+/// Keep accepted reports deduplicated and release refused/failed attempts.
+pub(crate) fn finish_first_action_report(payload: &ActivationEventPayload, accepted: bool) {
+    if payload.event_name != "first_mcp_action_succeeded" {
+        return;
+    }
+    let dedupe_key = format!(
+        "{}:{}",
+        payload.installation_id,
+        payload.session_id.as_deref().unwrap_or("process")
+    );
+    if let Entry::Occupied(mut entry) = FIRST_ACTION_REPORTS
+        .get_or_init(DashMap::new)
+        .entry(dedupe_key)
+    {
+        if *entry.get() != FirstActionReportState::InFlight(payload.event_id) {
+            return;
+        }
+        if accepted {
+            entry.insert(FirstActionReportState::Accepted);
+        } else {
+            entry.remove();
+        }
+    }
 }
 
 pub fn failure_event(
@@ -1198,10 +1269,8 @@ mod tests {
         assert!(!snapshot.contains("token"));
     }
 
-    #[test]
-    fn first_action_is_emitted_once_per_installation_session() {
-        let session_id = format!("test-{}", Uuid::new_v4());
-        let metadata = RuntimeMetadata {
+    fn first_action_test_metadata() -> RuntimeMetadata {
+        RuntimeMetadata {
             installation_id: Uuid::new_v4(),
             client_name: Some("test".to_string()),
             client_version: "0.0.0".to_string(),
@@ -1210,25 +1279,96 @@ mod tests {
             architecture: "x86_64".to_string(),
             onboarding_version: ONBOARDING_VERSION.to_string(),
             configured_clients: Vec::new(),
-        };
-        let first = first_action_event_with_metadata(
+        }
+    }
+
+    fn test_first_action(
+        metadata: &RuntimeMetadata,
+        tool_name: &str,
+    ) -> Option<ActivationEventPayload> {
+        first_action_event_with_metadata(
             metadata.clone(),
             None,
             None,
-            Some(session_id.clone()),
-            "search",
-            "code_search",
-        );
-        let duplicate = first_action_event_with_metadata(
-            metadata,
-            None,
-            None,
-            Some(session_id),
-            "memory",
-            "memory",
-        );
-        assert!(first.is_some());
-        assert!(duplicate.is_none());
+            Some("test-session".to_string()),
+            tool_name,
+            "test",
+        )
+    }
+
+    #[test]
+    fn first_action_eligibility_matches_the_api() {
+        assert!(!is_reportable_first_action("init"));
+        assert!(!is_reportable_first_action("help"));
+        assert!(!is_reportable_first_action("session_init"));
+        assert!(!is_reportable_first_action(" Init "));
+        assert!(is_reportable_first_action("search"));
+        assert!(is_reportable_first_action("memory"));
+        assert!(is_reportable_first_action("session"));
+        assert!(is_reportable_first_action("project"));
+        assert!(!is_reportable_first_action(""));
+    }
+
+    #[test]
+    fn first_action_init_then_real_tool_reports_real_tool() {
+        let metadata = first_action_test_metadata();
+        assert!(test_first_action(&metadata, "init").is_none());
+        assert!(test_first_action(&metadata, "help").is_none());
+
+        let payload = test_first_action(&metadata, "search").expect("real tool is eligible");
+        assert_eq!(payload.properties["tool_name"], "search");
+        finish_first_action_report(&payload, true);
+    }
+
+    #[test]
+    fn first_action_refused_report_does_not_block_later_report() {
+        let metadata = first_action_test_metadata();
+        let refused = test_first_action(&metadata, "search").expect("first attempt");
+        finish_first_action_report(&refused, false);
+
+        let retry = test_first_action(&metadata, "memory").expect("retry after refusal");
+        assert_eq!(retry.properties["tool_name"], "memory");
+        assert_ne!(retry.event_id, refused.event_id);
+        // A delayed completion of the old attempt must not release this one.
+        finish_first_action_report(&refused, false);
+        assert!(test_first_action(&metadata, "search").is_none());
+        finish_first_action_report(&retry, true);
+    }
+
+    #[test]
+    fn first_action_accepted_report_is_not_repeated() {
+        let metadata = first_action_test_metadata();
+        let accepted = test_first_action(&metadata, "search").expect("first attempt");
+        finish_first_action_report(&accepted, true);
+        assert!(test_first_action(&metadata, "memory").is_none());
+
+        // A duplicate failure notification cannot undo acceptance.
+        finish_first_action_report(&accepted, false);
+        assert!(test_first_action(&metadata, "search").is_none());
+    }
+
+    #[test]
+    fn first_action_concurrent_attempts_send_only_one_report() {
+        const ATTEMPTS: usize = 8;
+        let metadata = first_action_test_metadata();
+        let barrier = Arc::new(Barrier::new(ATTEMPTS));
+        let workers: Vec<_> = (0..ATTEMPTS)
+            .map(|_| {
+                let metadata = metadata.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    test_first_action(&metadata, "search")
+                })
+            })
+            .collect();
+        let reports: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().expect("report worker"))
+            .collect();
+        assert_eq!(reports.len(), 1);
+        finish_first_action_report(&reports[0], true);
+        assert!(test_first_action(&metadata, "memory").is_none());
     }
 
     #[test]

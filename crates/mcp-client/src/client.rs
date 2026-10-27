@@ -16380,8 +16380,8 @@ impl ContextStreamClient {
     ) -> Result<serde_json::Value> {
         // Tool catalog is static - no API call needed.
         // Mirrors the canonical (non-alias) set of tools registered in the
-        // server. Aliases like `atlas_chart` (→ `chart`) and `atlas_job` (→
-        // `async_job`) are accepted at call-time for back-compat but
+        // server. Aliases like `atlas_chart` (→ `chart`), `atlas_job` (→
+        // `async_job`) and `slipstream` (→ `agents`) are accepted at call-time for back-compat but
         // intentionally omitted here so the public catalog is clean.
         let mut tools = vec![
             serde_json::json!({"name":"init","category":"session","description":"Initialize session scope and return project context.","key_parameters":["folder_path","workspace_id","project_id","session_id"],"example":"init(folder_path=\"/path/to/project\", session_id=\"session-123\")"}),
@@ -16404,7 +16404,7 @@ impl ContextStreamClient {
             serde_json::json!({"name":"qa","category":"memory","description":"Ask grounded questions and curate the workspace knowledge base.","key_parameters":["action","question","workspace_id","project_id"],"example":"qa(action=\"ask\", question=\"How does authentication work?\")"}),
             serde_json::json!({"name":"entity","category":"memory","description":"Manage structured tickets, handoffs, incidents, releases, experiments, goals, sprints, reviews, risks, and coordination items.","key_parameters":["kind","action","id","body","query"],"example":"entity(kind=\"ticket\", action=\"list\", query={\"status\":\"open\"})"}),
             serde_json::json!({"name":"vcs","category":"integrations","description":"Read and update linked VCS repositories, pull requests, issues, commits, and notifications.","key_parameters":["action","repo_ref","number","query"],"example":"vcs(action=\"list_issues\", repo_ref=\"owner/repo\", state=\"open\")"}),
-            serde_json::json!({"name":"slipstream","category":"ai","description":"Find, run, read and cancel Slipstream specialist agents; listed only for a workspace with agents turned on. A priced run needs the person's accepted quote (or their auto-accept cap) and is charged only on success.","actions":["find","run","get_run","list_runs","cancel_run"],"key_parameters":["action","agent","input","accepted_price_credits","task_id"],"example":"slipstream(action=\"find\")"}),
+            serde_json::json!({"name":"agents","category":"ai","description":"Find, run, read and cancel ContextStream Agents, specialist agents; listed only for a workspace with agents turned on. A priced run needs the person's accepted quote (or their auto-accept cap) and is charged only on success.","actions":["find","run","get_run","list_runs","cancel_run"],"key_parameters":["action","agent","input","accepted_price_credits","task_id"],"example":"agents(action=\"find\")"}),
             serde_json::json!({"name":"chart","category":"graph","description":"Render allowlisted workspace analytics charts on hosted deployments.","key_parameters":["action","chart","range","workspace_id"],"example":"chart(action=\"render\", chart=\"tool_latency_p95\", range=\"24h\")"}),
             serde_json::json!({"name":"async_job","category":"memory","description":"Run paginated exports and aggregates over durable memory on hosted deployments.","key_parameters":["action","collection","job_id","limit"],"example":"async_job(action=\"submit_export\", collection=\"decisions\")"}),
             serde_json::json!({"name":"help","category":"utility","description":"Discover tools, auth/billing state, runtime versions, workflow rules, and bundle metadata.","actions":["tools","auth","billing","version","workflow","editor_rules","enable_bundle","team_status"],"key_parameters":["action","category","format"],"example":"help(action=\"tools\", format=\"full\")"}),
@@ -26883,12 +26883,13 @@ mod tests {
             })
             .unwrap_or_default();
 
-        // Canonical catalog: 24 tools (including Context Feeds, Answer and Slipstream).
-        // Aliases atlas_chart / atlas_job remain accepted at call-time for
-        // back-compat but are intentionally absent. The dropped `ram` alias
+        // Canonical catalog: 24 tools (including Context Feeds, Answer and Agents).
+        // Aliases atlas_chart / atlas_job / slipstream remain accepted at call-time
+        // for back-compat but are intentionally absent. The dropped `ram` alias
         // must NOT reappear.
         assert_eq!(names.len(), 24);
-        assert!(names.contains(&"slipstream"));
+        assert!(names.contains(&"agents"));
+        assert!(!names.contains(&"slipstream"));
         assert!(names.contains(&"answer"));
         assert!(names.contains(&"instruct"));
         assert!(names.contains(&"skill"));

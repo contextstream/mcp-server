@@ -1325,3 +1325,97 @@ mod input_shape_tests {
         assert!(!message.contains(W), "values are not echoed: {message}");
     }
 }
+
+// ============================================================================
+// Back-compat aliases (`register_alias`)
+// ============================================================================
+
+mod alias_tests {
+    use super::*;
+
+    fn with_alias(config: &Config) -> ToolRegistry {
+        let mut registry = ToolRegistry::new(config);
+        registry.register(
+            "current_tool",
+            Arc::new(MockTool::with_details(
+                "current_tool",
+                "Current Tool",
+                "Does one thing",
+            )),
+        );
+        registry.register_alias("first_name", "current_tool");
+        registry
+    }
+
+    #[tokio::test]
+    async fn an_alias_is_callable_and_never_listed() {
+        let registry = with_alias(&create_complete_config());
+        assert!(registry.get("first_name").is_some());
+        assert_eq!(
+            registry.get("first_name").unwrap().metadata.name,
+            "current_tool"
+        );
+        let result = registry.execute("first_name", json!({})).await.unwrap();
+        assert!(!result.is_error);
+        let names = registry.names();
+        assert!(names.contains(&"current_tool"));
+        assert!(!names.contains(&"first_name"));
+        assert_eq!(
+            registry
+                .list()
+                .iter()
+                .filter(|tool| tool.metadata.name == "current_tool")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_alias_is_left_out_of_operations_and_search() {
+        let registry = with_alias(&create_complete_config());
+        assert_eq!(
+            registry
+                .list_operations()
+                .iter()
+                .filter(|tool| tool.metadata.name == "current_tool")
+                .count(),
+            1
+        );
+        assert!(!registry.operation_names().contains(&"first_name"));
+        assert!(registry.get_operation("first_name").is_some());
+        // Searching by the old name finds the tool once, under its current name.
+        let found = registry.search_catalog("first_name", None, 10);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0]["name"], "current_tool");
+        let found = registry.search_catalog("current tool", None, 10);
+        assert_eq!(
+            found
+                .iter()
+                .filter(|value| value["name"] == "current_tool")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_alias_of_a_tool_not_registered_registers_nothing() {
+        let mut registry = ToolRegistry::new(&create_complete_config());
+        registry.register_alias("first_name", "current_tool");
+        assert!(registry.get("first_name").is_none());
+        assert!(registry.get_operation("first_name").is_none());
+    }
+
+    #[test]
+    fn an_alias_follows_its_tool_into_router_operations() {
+        let registry = with_alias(&create_router_config());
+        assert!(registry.get("first_name").is_none());
+        assert!(registry.get_operation("first_name").is_some());
+        assert_eq!(registry.operation_names(), vec!["current_tool"]);
+    }
+
+    #[test]
+    fn the_agents_tool_and_its_first_name_are_listed_per_caller() {
+        assert!(is_listed_per_caller("agents"));
+        assert!(is_listed_per_caller("slipstream"));
+    }
+}

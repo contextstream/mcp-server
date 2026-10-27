@@ -1,9 +1,12 @@
-//! Slipstream: specialist agents a person hands one job, run by ContextStream's Slipstream
-//! worker and paid per successful run in credits (ContextStream `handlers/tasks_api.rs`).
+//! ContextStream Agents (internally Slipstream): specialist agents a person hands one job, run
+//! by ContextStream's Slipstream worker and paid per successful run in credits (ContextStream
+//! `handlers/tasks_api.rs`).
 //!
-//! One tool, `slipstream`, listed only for a caller whose workspace has Slipstream with at
-//! least one agent turned on (see [`gate`]); its description is written from that catalog
-//! (see [`describe`]).
+//! One tool, `agents`, listed only for a caller whose workspace has the agents with at least
+//! one turned on (see [`gate`]); its description is written from that catalog (see
+//! [`describe`]). The tool's first name, `slipstream`, stays callable as a back-compat alias
+//! ([`LEGACY_TOOL_NAME`]) and is never listed (ContextStream decision bd3949a7: the public
+//! product is ContextStream Agents).
 //!
 //! ## Actions
 //!
@@ -49,12 +52,24 @@ pub use gate::SlipstreamGate;
 use gate::{Availability, GateEntry, GateKey};
 
 /// The tool's name.
-pub const TOOL_NAME: &str = "slipstream";
+pub const TOOL_NAME: &str = "agents";
+/// The tool's name before the rename (MCP 1.0.30 to 1.0.34): still callable, never listed, so
+/// clients and saved prompts that call it keep working.
+pub const LEGACY_TOOL_NAME: &str = "slipstream";
 /// The person's auto-accept cap for stdio: runs priced at most this many credits start
 /// without a quote. `0` (the default) always quotes.
-pub const AUTO_ACCEPT_ENV: &str = "CONTEXTSTREAM_SLIPSTREAM_AUTO_ACCEPT_MAX_CREDITS";
+pub const AUTO_ACCEPT_ENV: &str = "CONTEXTSTREAM_AGENTS_AUTO_ACCEPT_MAX_CREDITS";
+/// The cap's first name, read when [`AUTO_ACCEPT_ENV`] is not set.
+pub const LEGACY_AUTO_ACCEPT_ENV: &str = "CONTEXTSTREAM_SLIPSTREAM_AUTO_ACCEPT_MAX_CREDITS";
 /// The same cap for a hosted (HTTP) connection, sent per request by the person's client.
-pub const AUTO_ACCEPT_HEADER: &str = "x-contextstream-slipstream-auto-accept-max-credits";
+pub const AUTO_ACCEPT_HEADER: &str = "x-contextstream-agents-auto-accept-max-credits";
+/// The header's first name, read when [`AUTO_ACCEPT_HEADER`] is not sent.
+pub const LEGACY_AUTO_ACCEPT_HEADER: &str = "x-contextstream-slipstream-auto-accept-max-credits";
+
+/// Whether `name` calls this tool: its name or its back-compat alias.
+pub fn is_tool_name(name: &str) -> bool {
+    name == TOOL_NAME || name == LEGACY_TOOL_NAME
+}
 
 const VALID_ACTIONS: &[&str] = &["find", "run", "get_run", "list_runs", "cancel_run"];
 
@@ -76,7 +91,7 @@ const IDEMPOTENCY_WINDOW_SECS: u64 = 600;
 /// The API's bound on a session id.
 const MAX_SESSION_ID_CHARS: usize = 200;
 
-const TOOL_REFERENCE: &str = "Slipstream agents: each does one job with the workspace's decisions, lessons, docs and code, and declines anything else (a declined run is free).\n\nActions:\n- find: the workspace's agents with job, price per run, input fields (with what each means) and an example; on = an owner or admin turned it on.\n- run: agent (id or id@version), input (the agent's input object; a required project_id defaults to the session's project). A priced agent needs accepted_price_credits at or above its price: call run without it to get the quote, show the person the price, then call again with their acceptance. Runs priced within the person's auto-accept cap start at once. wait_ms (default 20000, up to 25000) waits for the result; a run still working returns its task_id for get_run. An identical ask within 10 minutes returns the same task; pass a new idempotency_key to run the same job again.\n- get_run: task_id, wait_ms (default 20000, up to 25000): status (queued, running, succeeded, failed, declined, cancelled, timed_out), the result, and what the run cost.\n- list_runs: agent (optional filter), limit (at most 50).\n- cancel_run: task_id.\n\nBilling: a run costs its price once, only when it succeeds.";
+const TOOL_REFERENCE: &str = "ContextStream Agents: each does one job with the workspace's decisions, lessons, docs and code, and declines anything else (a declined run is free).\n\nActions:\n- find: the workspace's agents with job, price per run, input fields (with what each means) and an example; on = an owner or admin turned it on.\n- run: agent (id or id@version), input (the agent's input object; a required project_id defaults to the session's project). A priced agent needs accepted_price_credits at or above its price: call run without it to get the quote, show the person the price, then call again with their acceptance. Runs priced within the person's auto-accept cap start at once. wait_ms (default 20000, up to 25000) waits for the result; a run still working returns its task_id for get_run. An identical ask within 10 minutes returns the same task; pass a new idempotency_key to run the same job again.\n- get_run: task_id, wait_ms (default 20000, up to 25000): status (queued, running, succeeded, failed, declined, cancelled, timed_out), the result, and what the run cost.\n- list_runs: agent (optional filter), limit (at most 50).\n- cancel_run: task_id.\n\nBilling: a run costs its price once, only when it succeeds.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SlipstreamInput {
@@ -202,7 +217,7 @@ impl SlipstreamTool {
             }
             Availability::Refused(message) => Ok(not_open(workspace_id, &message)),
             Availability::Unreachable(message) => Err(Error::Network(format!(
-                "The Slipstream catalog could not be read: {message}"
+                "The agent catalog could not be read: {message}"
             ))),
         }
     }
@@ -234,7 +249,7 @@ impl SlipstreamTool {
             Availability::Refused(message) => return Ok(not_open(workspace_id, &message)),
             Availability::Unreachable(message) => {
                 return Err(Error::Network(format!(
-                    "The Slipstream catalog could not be read, so nothing was run: {message}"
+                    "The agent catalog could not be read, so nothing was run: {message}"
                 )))
             }
         };
@@ -251,7 +266,7 @@ impl SlipstreamTool {
         };
         if !entry.enabled {
             return Ok(ToolResult::error(format!(
-                "{} ({}) is not turned on in this workspace: an owner or admin turns it on in the workspace's Slipstream settings. Nothing was run.",
+                "{} ({}) is not turned on in this workspace: an owner or admin turns it on in the workspace's agent settings. Nothing was run.",
                 entry.id, entry.name
             )));
         }
@@ -544,7 +559,7 @@ impl ToolHandler for SlipstreamTool {
         static METADATA: std::sync::OnceLock<ToolMetadata> = std::sync::OnceLock::new();
         METADATA.get_or_init(|| ToolMetadata {
             name: TOOL_NAME.to_string(),
-            title: "Slipstream Agents".to_string(),
+            title: "ContextStream Agents".to_string(),
             description: describe::STATIC_DESCRIPTION.to_string(),
             category: ToolCategory::Ai,
             annotations: ToolAnnotations::destructive(),
@@ -561,7 +576,7 @@ impl ToolHandler for SlipstreamTool {
 /// The tool's input schema before a catalog is known.
 pub(crate) fn input_schema() -> Value {
     SchemaBuilder::new()
-        .description("Slipstream agent operations")
+        .description("ContextStream Agents operations")
         .string_enum(
             "action",
             &crate::schema::with_full_reference("Action to perform", TOOL_REFERENCE),
@@ -615,7 +630,7 @@ pub(crate) fn input_schema() -> Value {
 
 fn not_open(workspace_id: Uuid, message: &str) -> ToolResult {
     ToolResult::error(format!(
-        "Slipstream is not available in workspace {workspace_id}: {message}"
+        "ContextStream Agents are not available in workspace {workspace_id}: {message}"
     ))
 }
 
@@ -783,7 +798,7 @@ pub(crate) async fn listing_workspace(
         .map(|mapping| mapping.workspace_id)
 }
 
-/// What tools/list shows of `slipstream` for one caller.
+/// What tools/list shows of the agents tool for one caller.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlipstreamListing {
     identity: Option<String>,
@@ -961,7 +976,7 @@ pub async fn listing_changed(
     changed
 }
 
-/// Register the Slipstream tool.
+/// Register the agents tool, and its first name as a back-compat alias that is never listed.
 pub fn register_slipstream_tools(
     registry: &mut crate::registry::ToolRegistry,
     client: ContextStreamClient,
@@ -975,6 +990,7 @@ pub fn register_slipstream_tools(
             SlipstreamGate::global(),
         )),
     );
+    registry.register_alias(LEGACY_TOOL_NAME, TOOL_NAME);
 }
 
 #[cfg(test)]

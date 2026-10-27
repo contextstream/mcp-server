@@ -245,7 +245,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "vcs" => "Linking VCS with ContextStream".to_string(),
         "feed" => "Updating ContextStream feed".to_string(),
         "qa" => "Asking ContextStream Q&A".to_string(),
-        "slipstream" => "Asking a Slipstream agent".to_string(),
+        "agents" | "slipstream" => "Asking a ContextStream agent".to_string(),
         "project" => "Updating ContextStream project".to_string(),
         "workspace" => "Updating ContextStream workspace".to_string(),
         "capsule" => "Saving ContextStream capsule".to_string(),
@@ -283,7 +283,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "vcs" => "VCS linked with ContextStream".to_string(),
         "feed" => "ContextStream feed updated".to_string(),
         "qa" => "ContextStream Q&A complete".to_string(),
-        "slipstream" => "Slipstream agent answered".to_string(),
+        "agents" | "slipstream" => "ContextStream agent answered".to_string(),
         "project" => "ContextStream project updated".to_string(),
         "workspace" => "ContextStream workspace updated".to_string(),
         "capsule" => "ContextStream capsule saved".to_string(),
@@ -300,13 +300,13 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "completed": completed,
     });
 
-    if name == domains::slipstream::TOOL_NAME {
+    if domains::slipstream::is_tool_name(name) {
         metadata["actions"] = serde_json::json!({
-            "find": "Listing Slipstream agents",
-            "run": "Running a Slipstream agent",
-            "get_run": "Reading a Slipstream run",
-            "list_runs": "Listing Slipstream runs",
-            "cancel_run": "Cancelling a Slipstream run"
+            "find": "Listing ContextStream agents",
+            "run": "Running a ContextStream agent",
+            "get_run": "Reading an agent run",
+            "list_runs": "Listing agent runs",
+            "cancel_run": "Cancelling an agent run"
         });
     } else if name == "session" {
         metadata["actions"] = serde_json::json!({
@@ -798,10 +798,10 @@ pub(crate) fn contextstream_tools_list(
 pub(crate) const TOOLS_LIST_CHANGED_NOTIFICATION: &str =
     r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
 
-/// Add the `slipstream` tool to a listing when this caller's workspace has Slipstream
-/// agents turned on, with its description and input written from them. The registry's own
-/// listing leaves it out (`ToolRegistry::list`), so a workspace without Slipstream, or a
-/// caller whose workspace is not known yet, pays no prompt for it. Waits at most
+/// Add the `agents` tool to a listing when this caller's workspace has agents turned on,
+/// with its description and input written from them. The registry's own listing leaves it
+/// out (`ToolRegistry::list`), so a workspace without agents, or a caller whose workspace
+/// is not known yet, pays no prompt for it. Waits at most
 /// `slipstream::LISTING_BUDGET` for the catalog, and records what was shown so a later
 /// change can be announced (`slipstream_list_changed_notice`).
 pub(crate) async fn with_slipstream_listing(
@@ -4404,8 +4404,14 @@ mod tests {
 
         // tools/list has the tool, described from the catalog, among the rest in order.
         let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
-        let tool = tool_by_name(&tools, "slipstream");
+        let tool = tool_by_name(&tools, "agents");
+        // The first name stays callable but is never listed.
+        assert!(!listed_names(&tools).contains(&"slipstream"));
         let description = tool["description"].as_str().unwrap();
+        assert!(
+            !description.to_lowercase().contains("slipstream"),
+            "{description}"
+        );
         assert!(
             description.contains("- lens (400) [media_id]: Reads an image"),
             "{description}"
@@ -4433,7 +4439,8 @@ mod tests {
             None
         );
 
-        // The agent is turned off; the next call that reads the catalog notices it.
+        // The agent is turned off; the next call that reads the catalog notices it, made
+        // here through the tool's first name.
         enabled.store(false, std::sync::atomic::Ordering::SeqCst);
         let found = registry
             .execute(
@@ -4457,6 +4464,7 @@ mod tests {
             None
         );
         let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
+        assert!(!listed_names(&tools).contains(&"agents"));
         assert!(!listed_names(&tools).contains(&"slipstream"));
     }
 
@@ -4483,11 +4491,11 @@ mod tests {
             Some(workspace),
         );
         let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
-        assert!(!listed_names(&tools).contains(&"slipstream"));
+        assert!(!listed_names(&tools).contains(&"agents"));
         // Still callable: the API answers why.
         let refused = registry
             .execute(
-                "slipstream",
+                "agents",
                 serde_json::json!({"action": "find", "workspace_id": SLIPSTREAM_WORKSPACE}),
             )
             .await
@@ -4501,7 +4509,7 @@ mod tests {
             Some(workspace),
         );
         let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
-        assert!(!listed_names(&tools).contains(&"slipstream"));
+        assert!(!listed_names(&tools).contains(&"agents"));
 
         // Surfaces without it never ask: OpenAI agentic lists only its core tools.
         let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -4510,7 +4518,7 @@ mod tests {
             slipstream_runtime(api, "stdio-slipstream-openai", Some(workspace));
         registry.set_tool_surface_profile(ToolSurfaceProfile::OpenaiAgentic);
         let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
-        assert!(!listed_names(&tools).contains(&"slipstream"));
+        assert!(!listed_names(&tools).contains(&"agents"));
         assert_eq!(
             slipstream_list_changed_notice(&registry, &client, &session).await,
             None

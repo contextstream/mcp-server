@@ -231,14 +231,18 @@ fn text_of(result: &ToolResult) -> String {
 // ============================================================================
 
 #[test]
-fn the_tool_is_named_slipstream_and_lists_its_actions() {
+fn the_tool_is_named_agents_and_lists_its_actions() {
     let config = TestFixtures::test_config();
     let client = ContextStreamClient::new(config.clone());
     let session = Arc::new(SessionManager::new(client.clone(), config));
     let tool = SlipstreamTool::new(client, session, Arc::new(SlipstreamGate::new()));
     let metadata = tool.metadata();
-    assert_eq!(metadata.name, "slipstream");
-    assert_eq!(TOOL_NAME, "slipstream");
+    assert_eq!(metadata.name, "agents");
+    assert_eq!(TOOL_NAME, "agents");
+    assert_eq!(LEGACY_TOOL_NAME, "slipstream");
+    assert!(is_tool_name("agents") && is_tool_name("slipstream") && !is_tool_name("agent"));
+    assert_eq!(metadata.title, "ContextStream Agents");
+    assert!(!metadata.description.to_lowercase().contains("slipstream"));
     for action in VALID_ACTIONS {
         assert!(metadata.description.contains(action), "{action}");
     }
@@ -423,7 +427,7 @@ fn the_description_names_every_enabled_agent_its_price_and_input_within_budget()
     assert!(description.contains("- release-notes (900) [base, head, repo]"));
     assert!(!description.contains("[project_id]"));
     // How to run, with the quote step.
-    assert!(description.contains("slipstream(action=\"run\", agent, input)"));
+    assert!(description.contains("agents(action=\"run\", agent, input)"));
     assert!(description.contains("accepted_price_credits"));
     assert!(description.contains("get_run"));
     // The input parameter carries types, required marks and an example.
@@ -472,7 +476,7 @@ fn a_large_catalog_is_shortened_gracefully_and_never_over_budget() {
             assert!(
                 described
                     .description
-                    .contains("more: slipstream(action=\"find\")"),
+                    .contains("more: agents(action=\"find\")"),
                 "{count}: {}",
                 described.description
             );
@@ -626,7 +630,7 @@ async fn the_tool_is_listed_only_for_a_workspace_with_agents_turned_on() {
     let request = &stub.requests()[0];
     assert_eq!(request.path, "/tasks/agents");
     assert_eq!(request.query, format!("workspace_id={WORKSPACE}"));
-    let mut entry = json!({"name": "slipstream", "description": "static", "inputSchema": {}});
+    let mut entry = json!({"name": "agents", "description": "static", "inputSchema": {}});
     listed.apply(&mut entry);
     assert_eq!(entry["description"], description);
 
@@ -950,7 +954,7 @@ async fn a_long_run_returns_its_task_id_and_how_to_follow_it() {
     )));
     assert!(text.contains("Cost: 1200 credits if it succeeds, nothing otherwise"));
     assert!(text.contains(&format!(
-        "slipstream(action=\"get_run\", task_id=\"{TASK}\", wait_ms=25000)"
+        "agents(action=\"get_run\", task_id=\"{TASK}\", wait_ms=25000)"
     )));
     let structured = ran.structured_content.unwrap();
     assert_eq!(structured["follow_up"]["action"], "get_run");
@@ -1156,7 +1160,7 @@ fn an_api_envelope_is_unwrapped_once() {
 fn find_and_list_runs_read_for_a_model() {
     let catalog = Catalog::from_value(&live_catalog());
     let text = format::catalog_text(&catalog, 0);
-    assert!(text.starts_with("8 Slipstream agent(s), 8 turned on here."));
+    assert!(text.starts_with("8 agent(s), 8 turned on here."));
     assert!(text.contains("**PR Reviewer** (review@0.1.0) — 1200 credits; on"));
     assert!(
         text.contains("  - pull (integer, required): The pull request (or merge request) number.")
@@ -1165,7 +1169,7 @@ fn find_and_list_runs_read_for_a_model() {
     assert!(text.contains("Example input: {"));
     assert_eq!(
         format::catalog_text(&Catalog::default(), 0),
-        "No Slipstream agents are available in this workspace yet."
+        "No agents are available in this workspace yet."
     );
 
     let list = format::task_list_text(
@@ -1176,7 +1180,7 @@ fn find_and_list_runs_read_for_a_model() {
     assert!(list.contains(&format!("[task {TASK}]")));
     assert_eq!(
         format::task_list_text(&json!({"tasks": []})),
-        "No Slipstream runs in this workspace yet."
+        "No agent runs in this workspace yet."
     );
 }
 

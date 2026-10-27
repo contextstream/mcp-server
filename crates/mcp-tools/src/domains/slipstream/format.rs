@@ -199,13 +199,13 @@ pub(crate) fn render_data(data: &Value) -> String {
 /// `find`: every agent, turned-on ones first, with its job, price and input.
 pub(crate) fn catalog_text(catalog: &Catalog, auto_accept_max_credits: u32) -> String {
     if catalog.agents.is_empty() {
-        return "No Slipstream agents are available in this workspace yet.".to_string();
+        return "No agents are available in this workspace yet.".to_string();
     }
     let mut agents: Vec<&AgentEntry> = catalog.agents.iter().collect();
     agents.sort_by(|a, b| b.enabled.cmp(&a.enabled).then_with(|| a.id.cmp(&b.id)));
     let enabled = agents.iter().filter(|a| a.enabled).count();
     let mut out = format!(
-        "{} Slipstream agent(s), {enabled} turned on here. Each run is charged its price only when it succeeds.\n",
+        "{} agent(s), {enabled} turned on here. Each run is charged its price only when it succeeds.\n",
         agents.len()
     );
     if auto_accept_max_credits > 0 {
@@ -269,7 +269,7 @@ pub(crate) fn task_list_text(list: &Value) -> String {
         .cloned()
         .unwrap_or_default();
     if tasks.is_empty() {
-        return "No Slipstream runs in this workspace yet.".to_string();
+        return "No agent runs in this workspace yet.".to_string();
     }
     let mut out = format!("{} run(s), newest first:\n", tasks.len());
     for task in &tasks {

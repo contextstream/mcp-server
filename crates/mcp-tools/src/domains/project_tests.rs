@@ -2135,3 +2135,30 @@ async fn working_set_without_changes_reads_it() {
     let requests = server.await.expect("server");
     assert!(requests[0].starts_with(&format!("GET /api/v1/projects/{primary}/working-set ")));
 }
+
+#[test]
+fn index_status_counts_exact_search_only_files_per_reason() {
+    let result = json!({
+        "exact_search_only": {
+            "files": 61,
+            "by_reason": {
+                "minified_long_lines": {"files": 54, "sample": ["a.js"]},
+                "bundle_name": {"files": 4, "sample": ["b.bundle.js"]},
+                "minified_name": {"files": 2, "sample": ["c.min.js"]},
+                "compiled_dart": {"files": 1, "sample": ["main.dart.js"]}
+            }
+        }
+    });
+    assert_eq!(
+        format_exact_search_only(&result).as_deref(),
+        Some(
+            " 61 files are exact-search only (no semantic vectors): minified bundle: 56, \
+             bundle: 4, compiled Dart bundle: 1."
+        )
+    );
+    assert_eq!(
+        format_exact_search_only(&json!({"exact_search_only": {"files": 0, "by_reason": {}}})),
+        None
+    );
+    assert_eq!(format_exact_search_only(&json!({})), None);
+}

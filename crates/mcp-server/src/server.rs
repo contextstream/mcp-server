@@ -828,24 +828,27 @@ pub(crate) async fn with_slipstream_listing(
     category: Option<&str>,
     tools: &mut Vec<serde_json::Value>,
 ) {
-    add_slipstream_listing(registry, client, session, category, tools).await;
-    add_studio_listing(registry, client, category, tools).await;
+    // Both catalogs are read at once: a listing waits for the slower, not the sum.
+    let (slipstream, studio) = tokio::join!(
+        slipstream_listing_entry(registry, client, session, category),
+        studio_listing_entry(registry, client, category),
+    );
+    for entry in [slipstream, studio].into_iter().flatten() {
+        insert_sorted(tools, entry);
+    }
 }
 
-async fn add_slipstream_listing(
+async fn slipstream_listing_entry(
     registry: &ToolRegistry,
     client: &ContextStreamClient,
     session: &SessionManager,
     category: Option<&str>,
-    tools: &mut Vec<serde_json::Value>,
-) {
+) -> Option<serde_json::Value> {
     use domains::slipstream;
     // Not on this surface (router, OpenAI agentic, coach, a light toolset): nothing to add.
-    let Some(tool) = registry.get(slipstream::TOOL_NAME) else {
-        return;
-    };
+    let tool = registry.get(slipstream::TOOL_NAME)?;
     if !requested_category_matches(category, tool.metadata.category.as_str()) {
-        return;
+        return None;
     }
     let gate = slipstream::SlipstreamGate::global();
     let listing = slipstream::listing(
@@ -858,30 +861,26 @@ async fn add_slipstream_listing(
     .await;
     listing.mark_advertised(&gate);
     if !listing.is_listed() {
-        return;
+        return None;
     }
     let mut entry = contextstream_tool_list_entry(tool);
     listing.apply(&mut entry);
-    insert_sorted(tools, entry);
+    Some(entry)
 }
 
-/// Add `studio` for a caller Create offers one-prompt making to (`domains::studio::gate`),
-/// waiting at most `studio::LISTING_BUDGET` for the catalog.
-async fn add_studio_listing(
+/// `studio` for a caller Create offers one-prompt making to (`domains::studio::gate`),
+/// waiting at most `studio::LISTING_BUDGET` for the catalog; on the ContextStudio surface,
+/// always.
+async fn studio_listing_entry(
     registry: &ToolRegistry,
     client: &ContextStreamClient,
     category: Option<&str>,
-    tools: &mut Vec<serde_json::Value>,
-) {
+) -> Option<serde_json::Value> {
     use domains::studio;
-    let Some(tool) = registry.get(studio::TOOL_NAME) else {
-        return;
-    };
+    let tool = registry.get(studio::TOOL_NAME)?;
     if !requested_category_matches(category, tool.metadata.category.as_str()) {
-        return;
+        return None;
     }
-    // The ContextStudio connector always lists its one tool; elsewhere only a caller
-    // Create offers making to sees it.
     if !registry.is_studio_surface()
         && !studio::listed(
             &studio::StudioGate::global(),
@@ -890,9 +889,9 @@ async fn add_studio_listing(
         )
         .await
     {
-        return;
+        return None;
     }
-    insert_sorted(tools, contextstream_tool_list_entry(tool));
+    Some(contextstream_tool_list_entry(tool))
 }
 
 fn insert_sorted(tools: &mut Vec<serde_json::Value>, entry: serde_json::Value) {
@@ -1733,7 +1732,17 @@ async fn handle_request_dispatch(
         "server/discover" if registry.is_coach_surface() => {
             json_rpc_result(id, build_coach_stateless_discover_result())
         }
-        "server/discover" => json_rpc_result(id, build_contextstream_stateless_discover_result()),
+        "server/discover" => {
+            // A stateless client lists tools right after this, with no initialize: read
+            // the studio offer now so that listing finds it ready.
+            if registry.get(domains::studio::TOOL_NAME).is_some() {
+                domains::studio::prefetch(
+                    domains::studio::StudioGate::global(),
+                    (**client).clone(),
+                );
+            }
+            json_rpc_result(id, build_contextstream_stateless_discover_result())
+        }
 
         "resources/list" if registry.is_coach_surface() => {
             json_rpc_result(id, coach_resources_list())

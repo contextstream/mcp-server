@@ -495,6 +495,9 @@ fn stdio_content_value(item: &ContentItem) -> Value {
         ContentItem::Resource { uri, mime_type } => {
             json!({"type": "resource", "uri": uri, "mimeType": mime_type})
         }
+        ContentItem::ResourceLink { .. } => {
+            serde_json::to_value(item).unwrap_or_else(|_| json!({"type": "text", "text": ""}))
+        }
     }
 }
 

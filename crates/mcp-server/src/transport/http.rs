@@ -433,7 +433,7 @@ fn stateless_protocol_error_response(
 fn is_streamable_mcp_path(path: &str) -> bool {
     matches!(
         path,
-        "/mcp" | "/chatgpt" | "/claude" | "/client" | COACH_PATH
+        "/mcp" | "/chatgpt" | "/claude" | "/client" | COACH_PATH | STUDIO_PATH
     )
 }
 
@@ -442,12 +442,21 @@ const COACH_PATH: &str = "/coach";
 /// Its protected-resource metadata.
 const COACH_RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource/coach";
 
+/// The ContextStudio connector: only the `studio` tool.
+const STUDIO_PATH: &str = "/studio";
+/// Its protected-resource metadata.
+const STUDIO_RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource/studio";
+/// The scopes a token bound to the ContextStudio connector carries.
+const STUDIO_READ_SCOPE: &str = "read:studio";
+const STUDIO_WRITE_SCOPE: &str = "write:studio";
+
 /// The tool surface a path fixes, whatever the request asks for.
 fn path_surface_profile(path: &str) -> Option<ToolSurfaceProfile> {
     match path {
         // Integration paths have complete parity with the local MCP tool.
         "/chatgpt" | "/claude" | "/client" => Some(ToolSurfaceProfile::Default),
         COACH_PATH => Some(ToolSurfaceProfile::Coach),
+        STUDIO_PATH => Some(ToolSurfaceProfile::Studio),
         _ => None,
     }
 }
@@ -518,6 +527,10 @@ pub fn create_router(state: HttpState) -> Router {
             COACH_RESOURCE_METADATA_PATH,
             get(handle_coach_protected_resource),
         )
+        .route(
+            STUDIO_RESOURCE_METADATA_PATH,
+            get(handle_studio_protected_resource),
+        )
         // RFC 8414 + OIDC discovery. Some OAuth clients (notably
         // claude.ai's MCP custom-connector flow) probe the *resource*
         // host directly for the authorization-server metadata as a
@@ -548,6 +561,9 @@ pub fn create_router(state: HttpState) -> Router {
         // Agent Coach Kit: its own product surface (three tools, its own
         // protected-resource metadata and scopes).
         .route(COACH_PATH, post(handle_mcp_streamable))
+        // ContextStudio: its own connector (one tool, its own protected-resource
+        // metadata and scopes).
+        .route(STUDIO_PATH, post(handle_mcp_streamable))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -652,6 +668,11 @@ async fn handle_oauth_protected_resource(headers: HeaderMap) -> impl IntoRespons
 /// Protected resource metadata (RFC 9728) for the Agent Coach Kit endpoint.
 async fn handle_coach_protected_resource(headers: HeaderMap) -> impl IntoResponse {
     Json(coach_protected_resource_metadata(&headers))
+}
+
+/// Protected resource metadata (RFC 9728) for the ContextStudio connector.
+async fn handle_studio_protected_resource(headers: HeaderMap) -> impl IntoResponse {
+    Json(studio_protected_resource_metadata(&headers))
 }
 
 /// RFC 8414 / OIDC discovery served on the MCP host (mirrors what
@@ -1231,6 +1252,7 @@ fn surface_profile_code(profile: ToolSurfaceProfile) -> u8 {
         ToolSurfaceProfile::Default => 0,
         ToolSurfaceProfile::OpenaiAgentic => 1,
         ToolSurfaceProfile::Coach => 2,
+        ToolSurfaceProfile::Studio => 3,
     }
 }
 
@@ -1262,6 +1284,7 @@ fn surface_profile_from_session_id(session_id: &str) -> Option<ToolSurfaceProfil
         ToolSurfaceProfile::Default,
         ToolSurfaceProfile::OpenaiAgentic,
         ToolSurfaceProfile::Coach,
+        ToolSurfaceProfile::Studio,
     ]
     .into_iter()
     .find(|profile| surface_profile_code(*profile) == bytes[15])
@@ -2456,11 +2479,22 @@ async fn handle_call_tool_method(
         Some(call_icon.to_string()),
     )
     .with_observation(wire_observation);
-    let outcome = mcp_tools::wire_tokens::run_with_wire_response_context(
+    // A stateless call whose client can ask its person carries the person's answers in,
+    // and a question out as its own result (`input_required`; see `mcp_tools::peer`).
+    let call_peer = (strict_protocol_errors
+        && mcp_tools::peer::CallPeer::stateless_client_can_elicit(&params))
+    .then(|| {
+        mcp_tools::peer::CallPeer::new(Arc::new(mcp_tools::peer::NoLiveChannel), None, false)
+            .with_inline_input(&params)
+    });
+    let execution = mcp_tools::wire_tokens::run_with_wire_response_context(
         wire_context,
         registry.execute(name, arguments),
-    )
-    .await;
+    );
+    let outcome = match call_peer.clone() {
+        Some(peer) => mcp_tools::peer::run_with_call_peer(peer, execution).await,
+        None => execution.await,
+    };
 
     match outcome {
         Ok(result) => {
@@ -2468,11 +2502,15 @@ async fn handle_call_tool_method(
                 .telemetry
                 .emit_managed_tool_readiness(name, &result)
                 .await;
-            Ok(tool_result_response_with_title(
-                result,
-                call_title.as_deref(),
-                Some(call_icon),
-            ))
+            let mut response =
+                tool_result_response_with_title(result, call_title.as_deref(), Some(call_icon));
+            if let (Some(Value::Object(fields)), Some(target)) = (
+                call_peer.and_then(|peer| peer.take_input_required()),
+                response.as_object_mut(),
+            ) {
+                target.extend(fields);
+            }
+            Ok(response)
         }
         Err(err) => {
             if err.is_non_blocking_parser_error() {
@@ -2786,6 +2824,8 @@ fn request_origin(headers: &HeaderMap) -> String {
 fn oauth_resource_metadata_url(headers: &HeaderMap, path: &str) -> String {
     let metadata = if path == COACH_PATH {
         COACH_RESOURCE_METADATA_PATH
+    } else if path == STUDIO_PATH {
+        STUDIO_RESOURCE_METADATA_PATH
     } else {
         "/.well-known/oauth-protected-resource"
     };
@@ -2814,6 +2854,19 @@ fn coach_protected_resource_metadata(headers: &HeaderMap) -> Value {
         ],
         "bearer_methods_supported": ["header"],
         "resource_name": "Agent Coach Kit"
+    })
+}
+
+/// The ContextStudio connector's resource: `<origin>/studio`, with only the studio
+/// scopes. The API holds a token bound to it to Create's making routes and the reads the
+/// tool needs (contextstream `middleware::oauth_resource::studio_route`).
+fn studio_protected_resource_metadata(headers: &HeaderMap) -> Value {
+    json!({
+        "resource": format!("{}{STUDIO_PATH}", request_origin(headers).trim_end_matches('/')),
+        "authorization_servers": [authorization_server_origin()],
+        "scopes_supported": [STUDIO_READ_SCOPE, STUDIO_WRITE_SCOPE],
+        "bearer_methods_supported": ["header"],
+        "resource_name": "ContextStudio"
     })
 }
 
@@ -2847,6 +2900,10 @@ fn oauth_unauthorized_response(
             r#", scope="{} {}""#,
             mcp_client::coach::READ_SCOPE,
             mcp_client::coach::WRITE_SCOPE
+        ));
+    } else if path == STUDIO_PATH {
+        www_authenticate.push_str(&format!(
+            r#", scope="{STUDIO_READ_SCOPE} {STUDIO_WRITE_SCOPE}""#
         ));
     }
     if let Ok(value) = header::HeaderValue::from_str(&www_authenticate) {
@@ -2892,6 +2949,7 @@ pub async fn auth_middleware(
         || path == "/metrics"
         || path == "/.well-known/oauth-protected-resource"
         || path == COACH_RESOURCE_METADATA_PATH
+        || path == STUDIO_RESOURCE_METADATA_PATH
         || path == "/.well-known/oauth-authorization-server"
         || path == "/.well-known/openid-configuration"
     {
@@ -6506,6 +6564,110 @@ mod tests {
                     .unwrap(),
                 r#"Bearer resource_metadata="https://mcp.contextstream.io/.well-known/oauth-protected-resource""#
             );
+        }
+
+        #[tokio::test]
+        async fn studio_is_its_own_connector_with_one_tool() {
+            let app = create_router(hosted_state(false));
+            let (status, headers, init) = rpc(
+                &app,
+                "/studio",
+                &[],
+                "initialize",
+                json!({"protocolVersion": mcp_types::MCP_PROTOCOL_2024_11_05,
+                       "clientInfo": {"name": "claude-ai", "version": "1.0.0"}, "capabilities": {}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(init["result"]["serverInfo"]["name"], "contextstudio");
+            assert_eq!(init["result"]["serverInfo"]["title"], "ContextStudio");
+            assert_eq!(init["result"]["toolCount"], 1);
+            let session = headers["mcp-session-id"].to_str().unwrap().to_string();
+            assert_eq!(
+                surface_profile_from_session_id(&session),
+                Some(ToolSurfaceProfile::Studio)
+            );
+
+            // Only `studio`, listed without asking the catalog, whatever a header asks for.
+            let (_, _, list) = rpc(
+                &app,
+                "/studio",
+                &[("x-contextstream-tool-surface-profile", "default")],
+                "tools/list",
+                json!({}),
+            )
+            .await;
+            assert_eq!(names(&list), ["studio"]);
+
+            // Nothing else runs there.
+            for name in ["memory", "search", "execute_operation", "workflow"] {
+                let (_, _, response) = rpc(
+                    &app,
+                    "/studio",
+                    &[],
+                    "tools/call",
+                    json!({"name": name, "arguments": {}}),
+                )
+                .await;
+                let refused =
+                    response.get("error").is_some() || response["result"]["isError"] == json!(true);
+                assert!(refused, "{name} ran on /studio: {response}");
+            }
+
+            // The full surfaces don't list it for a caller Create doesn't offer making to.
+            for path in ["/mcp", "/claude"] {
+                let (_, _, list) = rpc(&app, path, &[], "tools/list", json!({})).await;
+                assert!(!names(&list).iter().any(|n| n == "studio"), "{path}");
+            }
+        }
+
+        #[tokio::test]
+        async fn studio_has_its_own_protected_resource_metadata_and_challenge() {
+            let app = create_router(hosted_state(true));
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/.well-known/oauth-protected-resource/studio")
+                        .header("host", "mcp.contextstream.io")
+                        .header("x-forwarded-proto", "https")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let metadata = json_response(response).await;
+            assert_eq!(metadata["resource"], "https://mcp.contextstream.io/studio");
+            assert_eq!(
+                metadata["scopes_supported"],
+                json!(["read:studio", "write:studio"])
+            );
+            assert_eq!(metadata["resource_name"], "ContextStudio");
+
+            let response = app
+                .clone()
+                .oneshot(post(
+                    "/studio",
+                    None,
+                    &[],
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers()[header::WWW_AUTHENTICATE]
+                    .to_str()
+                    .unwrap(),
+                r#"Bearer resource_metadata="https://mcp.contextstream.io/.well-known/oauth-protected-resource/studio", scope="read:studio write:studio""#
+            );
+            assert_eq!(
+                path_surface_profile("/studio"),
+                Some(ToolSurfaceProfile::Studio)
+            );
+            assert!(is_streamable_mcp_path("/studio"));
         }
 
         #[test]

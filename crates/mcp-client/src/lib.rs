@@ -23,6 +23,7 @@ pub mod ingest_guard;
 pub mod json;
 pub mod parity;
 pub mod retry;
+pub mod studio;
 pub mod ticket;
 
 pub use cache::{Cache, CacheKey};

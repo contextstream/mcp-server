@@ -19,6 +19,7 @@ pub mod atlas_flags;
 pub mod domains;
 pub mod input_shape;
 pub mod notices;
+pub mod peer;
 pub mod portable_schema;
 pub mod registry;
 pub mod schema;

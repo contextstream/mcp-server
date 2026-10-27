@@ -325,11 +325,34 @@ pub enum ContentItem {
     /// Text content
     Text { text: String },
     /// Image content
-    Image { data: String, mime_type: String },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType", alias = "mime_type")]
+        mime_type: String,
+    },
     /// Resource reference
     Resource {
         uri: String,
+        #[serde(
+            rename = "mimeType",
+            alias = "mime_type",
+            skip_serializing_if = "Option::is_none"
+        )]
+        mime_type: Option<String>,
+    },
+    /// A link to a resource the client can fetch itself (MCP 2025-06-18
+    /// `resource_link`), such as a signed download URL of a made video.
+    #[serde(rename = "resource_link")]
+    ResourceLink {
+        uri: String,
+        name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(
+            rename = "mimeType",
+            alias = "mime_type",
+            skip_serializing_if = "Option::is_none"
+        )]
         mime_type: Option<String>,
     },
 }

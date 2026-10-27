@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- ContextStudio: one tool, `studio`, listed for people ContextStream Create offers
+  one-prompt making to (plan, make, status, result, revise, stop, library, brand,
+  products). Plans spend nothing; a making spends at most its plan's price and only with
+  the person's go-ahead, asked through elicitation where the client can ask.
+- Tool calls on stdio can report `notifications/progress` and ask the person
+  (`elicitation/create` for initialize-era clients; an `input_required` result with
+  `inputRequests` and `requestState` for stateless 2026-07-28 clients such as Claude
+  Code, also over HTTP). A reader task routes the client's answers mid-call.
+- Tool results can carry `resource_link` content; image and resource content items
+  serialize `mimeType` on every transport.
+- The hosted gateway serves `/studio`, a ContextStudio connector with only the `studio`
+  tool and its own protected-resource metadata (`read:studio`, `write:studio`).
+
 ## 1.0.36
 
 - A refused first action no longer uses up the session's activation report

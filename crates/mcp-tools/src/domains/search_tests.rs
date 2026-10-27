@@ -7625,6 +7625,35 @@ mod duplicate_collapse_output_tests {
     }
 
     #[test]
+    fn hits_from_exact_search_only_files_say_so_in_a_few_words() {
+        let bundle = search_result(json!({
+            "id": "r2",
+            "file_path": "web/main.dart.js",
+            "start_line": 4,
+            "language": "javascript",
+            "score": 1.0,
+            "metadata": {"exact_search_only": "compiled_dart"},
+        }));
+        assert_eq!(
+            format_result_line(1, &bundle, false),
+            "1. web/main.dart.js:4 [javascript] 100% (exact-search only: compiled Dart bundle)\n"
+        );
+        let minified = search_result(json!({
+            "id": "r3",
+            "file_path": "static/app.js",
+            "start_line": 1,
+            "metadata": {"exact_search_only": "minified_long_lines"},
+        }));
+        let line = format_result_line(1, &minified, false);
+        assert!(
+            line.ends_with("(exact-search only: minified bundle)\n"),
+            "{line}"
+        );
+        assert!(!line.to_ascii_lowercase().contains("stale"));
+        assert_eq!(exact_search_only_label("something_new"), "generated file");
+    }
+
+    #[test]
     fn text_rendering_says_also_in_n_other_files() {
         let item = search_result(collapsed_row(5, copy_locations()));
 

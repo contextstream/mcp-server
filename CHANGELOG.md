@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.34
+
+- Minified and generated bundles are exact-search only (API): their stored
+  content is still searched by exact text, but they have no chunks or semantic
+  vectors. A search hit from such a file ends with a short note, for example
+  `(exact-search only: minified bundle)`, and `project(action="index_status")`
+  gives their count per reason, for example `61 files are exact-search only (no
+  semantic vectors): minified bundle: 56, bundle: 4, compiled Dart bundle: 1.`
+
 ## 1.0.33
 
 - Exhaustive search is `git grep -F -n` on the project's indexed commit (API,

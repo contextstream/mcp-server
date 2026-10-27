@@ -71,6 +71,8 @@ const PLAN_WAIT_MAX: u64 = 100;
 /// How long `status` waits for change by default, and at most.
 const STATUS_WAIT_DEFAULT: u64 = 50;
 const STATUS_WAIT_MAX: u64 = 100;
+/// The longest any wait lasts on the hosted gateway, whose edge ends a tool call at 60 s.
+const HOSTED_WAIT_MAX: u64 = 45;
 /// How often a running making or a planning quote is read.
 const POLL_EVERY: Duration = Duration::from_secs(5);
 /// How long the person has to answer the price question.
@@ -209,6 +211,17 @@ impl StudioTool {
         }
     }
 
+    /// A wait of `asked` seconds, at most `max`, and at most [`HOSTED_WAIT_MAX`] on the
+    /// hosted gateway.
+    async fn wait(&self, asked: u64, max: u64) -> Duration {
+        let max = if self.client.config().await.is_http_transport {
+            max.min(HOSTED_WAIT_MAX)
+        } else {
+            max
+        };
+        Duration::from_secs(asked.min(max))
+    }
+
     /// Record what an answer says of the offer, so the listing follows a pilot change.
     async fn note_offer(&self, status: u16) {
         let offer = match status {
@@ -227,12 +240,12 @@ impl StudioTool {
 
     async fn plan(&self, input: &StudioInput) -> Result<ToolResult> {
         let (workspace_id, project_id) = self.scope(input).await?;
-        let wait = Duration::from_secs(
-            input
-                .wait_seconds
-                .unwrap_or(PLAN_WAIT_DEFAULT)
-                .min(PLAN_WAIT_MAX),
-        );
+        let wait = self
+            .wait(
+                input.wait_seconds.unwrap_or(PLAN_WAIT_DEFAULT),
+                PLAN_WAIT_MAX,
+            )
+            .await;
         let prompt = input
             .prompt
             .as_deref()
@@ -896,12 +909,12 @@ impl StudioTool {
         let job_id = self.job_id(workspace_id, input).await?;
         let peer = peer::current();
         let reported = peer.as_ref().is_some_and(peer::CallPeer::reports_progress);
-        let wait = Duration::from_secs(
-            input
-                .wait_seconds
-                .unwrap_or(STATUS_WAIT_DEFAULT)
-                .min(STATUS_WAIT_MAX),
-        );
+        let wait = self
+            .wait(
+                input.wait_seconds.unwrap_or(STATUS_WAIT_DEFAULT),
+                STATUS_WAIT_MAX,
+            )
+            .await;
         let started = Instant::now();
         let mut first_made: Option<usize> = None;
         loop {
@@ -1287,12 +1300,12 @@ impl StudioTool {
             if made { "another" } else { "the unmade" },
             piece.title()
         ));
-        let wait = Duration::from_secs(
-            input
-                .wait_seconds
-                .unwrap_or(PLAN_WAIT_DEFAULT)
-                .min(PLAN_WAIT_MAX),
-        );
+        let wait = self
+            .wait(
+                input.wait_seconds.unwrap_or(PLAN_WAIT_DEFAULT),
+                PLAN_WAIT_MAX,
+            )
+            .await;
         self.ask_for_plan(workspace_id, project_id, &request, &notes, wait, &mut said)
             .await
     }

@@ -149,7 +149,7 @@ pub(crate) fn shorten(text: &str, limit: usize) -> String {
     };
     format!(
         "{}…",
-        cut.trim_end_matches(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        cut.trim_end_matches(|c: char| c == ',' || c == ';' || c == ':' || c.is_whitespace())
     )
 }
 

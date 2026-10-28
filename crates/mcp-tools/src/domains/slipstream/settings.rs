@@ -275,6 +275,15 @@ fn price_label(agent: &AgentEntry) -> String {
     }
 }
 
+/// `text` ending as a sentence: a full stop unless it already ends in one or was cut (`…`).
+fn sentence(text: &str) -> String {
+    if text.ends_with(['.', '…', '!', '?']) {
+        text.to_string()
+    } else {
+        format!("{text}.")
+    }
+}
+
 /// The agent's job in one line: the API's, else its description's first sentence.
 fn job_of(agent: &AgentEntry) -> String {
     agent
@@ -980,8 +989,8 @@ pub(crate) fn choose_form(catalog: &Catalog, multi_select: bool) -> Value {
             json!({
                 "type": "boolean",
                 "title": format!("{} ({})", agent.name, price_label(agent)),
-                "description": format!("{group}: {}. It {}.",
-                                       shorten(&job_of(agent), 100),
+                "description": format!("{group}: {} It {}.",
+                                       sentence(&shorten(&job_of(agent), 100)),
                                        access_line(agent)),
                 "default": agent.enabled,
             }),

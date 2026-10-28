@@ -1487,6 +1487,43 @@ pub struct RawJsonResponse {
     pub body: serde_json::Value,
 }
 
+/// A request body for [`ContextStreamClient::send_raw`].
+pub(crate) enum RawBody<'a> {
+    Json(&'a serde_json::Value),
+    Bytes {
+        content_type: &'a str,
+        bytes: &'a [u8],
+    },
+}
+
+/// One response, its body as bytes, whatever the status.
+#[derive(Debug, Clone)]
+pub struct RawResponse {
+    pub status: u16,
+    pub headers: reqwest::header::HeaderMap,
+    pub bytes: Vec<u8>,
+    /// The body was longer than the caller would read, so it was not read.
+    pub truncated: bool,
+}
+
+impl RawResponse {
+    /// The body as JSON: `null` when empty, a string when it is not JSON.
+    pub fn into_json(self) -> RawJsonResponse {
+        let body = if self.bytes.iter().all(u8::is_ascii_whitespace) {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&self.bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&self.bytes).into_owned())
+            })
+        };
+        RawJsonResponse {
+            status: self.status,
+            headers: self.headers,
+            body,
+        }
+    }
+}
+
 /// Paginated API response wrapper.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaginatedResponse<T> {
@@ -4271,6 +4308,32 @@ impl ContextStreamClient {
         body: Option<&serde_json::Value>,
         timeout: Duration,
     ) -> Result<RawJsonResponse> {
+        let raw = self
+            .send_raw(
+                method,
+                path,
+                body.map(RawBody::Json),
+                &[],
+                timeout,
+                usize::MAX,
+            )
+            .await?;
+        Ok(raw.into_json())
+    }
+
+    /// Send exactly one request, as [`Self::send_raw_json`] does, with
+    /// `extra_headers` and a JSON or byte body, and hand back the body's bytes
+    /// whatever the status. A body longer than `max_bytes` is not read: its
+    /// bytes come back empty and `truncated` says so.
+    pub(crate) async fn send_raw(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<RawBody<'_>>,
+        extra_headers: &[(&str, String)],
+        timeout: Duration,
+        max_bytes: usize,
+    ) -> Result<RawResponse> {
         let config = self.config().await;
         let task_auth = get_task_auth_override();
         let auth: Option<&AuthOverride> = task_auth.as_ref();
@@ -4321,8 +4384,23 @@ impl ContextStreamClient {
                 req = req.header(key, value);
             }
         }
-        if let Some(body) = body {
-            req = req.json(body);
+        for (name, value) in extra_headers {
+            if TrafficClass::is_header_name(name) {
+                continue;
+            }
+            req = req.header(*name, value.as_str());
+        }
+        match body {
+            Some(RawBody::Json(body)) => req = req.json(body),
+            Some(RawBody::Bytes {
+                content_type,
+                bytes,
+            }) => {
+                req = req
+                    .header("Content-Type", content_type)
+                    .body(bytes.to_vec());
+            }
+            None => {}
         }
 
         let response = req.timeout(timeout).send().await.map_err(|e| {
@@ -4337,21 +4415,39 @@ impl ContextStreamClient {
         observe_tenant_home_header(response.headers());
         let status = response.status().as_u16();
         let headers = response.headers().clone();
-        let bytes = response
-            .bytes()
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Ok(RawResponse {
+                status,
+                headers,
+                bytes: Vec::new(),
+                truncated: true,
+            });
+        }
+        let mut bytes = Vec::new();
+        let mut response = response;
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| Error::Network(e.to_string()))?;
-        let body = if bytes.iter().all(u8::is_ascii_whitespace) {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-                serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
-            })
-        };
-        Ok(RawJsonResponse {
+            .map_err(|e| Error::Network(e.to_string()))?
+        {
+            if bytes.len() + chunk.len() > max_bytes {
+                return Ok(RawResponse {
+                    status,
+                    headers,
+                    bytes: Vec::new(),
+                    truncated: true,
+                });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(RawResponse {
             status,
             headers,
-            body,
+            bytes,
+            truncated: false,
         })
     }
 

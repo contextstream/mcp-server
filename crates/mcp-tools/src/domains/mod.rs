@@ -32,6 +32,7 @@ pub mod search;
 pub mod session;
 pub mod skill;
 pub mod slipstream;
+pub mod studio;
 pub mod vcs;
 pub(crate) mod working_set;
 pub mod workspace;

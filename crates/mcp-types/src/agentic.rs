@@ -83,6 +83,8 @@ pub const SURFACE_BROAD_DEFAULT: &str = "broad_default_surface";
 pub const SURFACE_ADAPTIVE_OPENAI: &str = "adaptive_openai_surface";
 /// Analytics label for the Agent Coach Kit surface (`/coach`).
 pub const SURFACE_COACH: &str = "coach_surface";
+/// Analytics label for the ContextStudio surface (`/studio`).
+pub const SURFACE_STUDIO: &str = "studio_surface";
 
 /// Normalize the configured tool surface to the analytics label.
 pub fn analytics_surface_profile(profile: ToolSurfaceProfile) -> &'static str {
@@ -90,6 +92,7 @@ pub fn analytics_surface_profile(profile: ToolSurfaceProfile) -> &'static str {
         ToolSurfaceProfile::Default => SURFACE_BROAD_DEFAULT,
         ToolSurfaceProfile::OpenaiAgentic => SURFACE_ADAPTIVE_OPENAI,
         ToolSurfaceProfile::Coach => SURFACE_COACH,
+        ToolSurfaceProfile::Studio => SURFACE_STUDIO,
     }
 }
 

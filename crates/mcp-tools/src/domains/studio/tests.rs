@@ -784,6 +784,27 @@ async fn refusals_are_plain_and_nothing_is_spent() {
 }
 
 #[test]
+fn spend_past_the_hold_says_the_charge_stops_there() {
+    let stub_config = TestFixtures::test_config();
+    let client = ContextStreamClient::new(stub_config.clone());
+    let session = Arc::new(SessionManager::new(client.clone(), stub_config));
+    let tool = StudioTool::new(client, session, Arc::new(StudioGate::new()));
+    let mut running = job("generating", false);
+    running["make"]["spentCredits"] = json!(1193);
+    running["quotedCredits"] = json!(919);
+    let text = text_of(&tool.status_result(Uuid::nil(), &running, &[]));
+    assert!(
+        text.contains("The studio has spent 1,193 so far; the charge stops at the 919 held."),
+        "{text}"
+    );
+    let mut done = job("succeeded", true);
+    done["chargedCredits"] = json!(919);
+    done["make"]["spentCredits"] = json!(1926);
+    let text = text_of(&tool.status_result(Uuid::nil(), &done, &[]));
+    assert!(text.contains("Charged: 919 credits."), "{text}");
+}
+
+#[test]
 fn context_is_cut_to_fit_and_said_so() {
     let (notes, said) = notes_from(Some(&json!("one plain note"))).unwrap();
     assert_eq!(notes, vec![json!({"title": "", "text": "one plain note"})]);

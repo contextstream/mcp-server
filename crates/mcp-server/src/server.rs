@@ -323,7 +323,11 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "run": "Running a ContextStream agent",
             "get_run": "Reading an agent run",
             "list_runs": "Listing agent runs",
-            "cancel_run": "Cancelling an agent run"
+            "cancel_run": "Cancelling an agent run",
+            "settings": "Reading which ContextAgents are on",
+            "choose": "Choosing ContextAgents",
+            "enable": "Turning ContextAgents on",
+            "disable": "Turning ContextAgents off"
         });
     } else if name == "session" {
         metadata["actions"] = serde_json::json!({
@@ -1074,8 +1078,10 @@ async fn run_stdio_transport(
     let mut tokenizer_warmup = TokenizerWarmup::new();
     // Whether this client was told `tools.listChanged` at initialize.
     let mut announces_tool_changes = false;
-    // Whether this client said at initialize that it can ask its person (elicitation).
+    // Whether this client said at initialize that it can ask its person (elicitation),
+    // and the protocol revision it asked for (which form fields it can show).
     let mut client_can_elicit = false;
+    let mut client_protocol: Option<String> = None;
 
     while let Some(line) = incoming.recv().await {
         // Parse JSON-RPC request
@@ -1104,6 +1110,7 @@ async fn run_stdio_transport(
         }
         if legacy_initialize {
             client_can_elicit = mcp_tools::peer::CallPeer::client_can_elicit(&params);
+            client_protocol = mcp_tools::peer::CallPeer::initialize_protocol(&params);
         }
 
         let wire_observation = mcp_tools::wire_tokens::WireTokenObservation::default();
@@ -1125,7 +1132,8 @@ async fn run_stdio_transport(
                 peer.clone(),
                 mcp_tools::peer::CallPeer::progress_token_of(&params),
                 !stateless && client_can_elicit,
-            );
+            )
+            .with_client_protocol(client_protocol.as_deref().filter(|_| !stateless));
             if stateless && mcp_tools::peer::CallPeer::stateless_client_can_elicit(&params) {
                 call_peer = call_peer.with_inline_input(&params);
             }
@@ -4598,8 +4606,18 @@ mod tests {
             slipstream_list_changed_notice(&registry, &client, &session).await,
             None
         );
+        // With none on, the tool stays listed, saying how an owner or admin turns them on.
         let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
-        assert!(!listed_names(&tools).contains(&"agents"));
+        let tool = tool_by_name(&tools, "agents");
+        let description = tool["description"].as_str().unwrap();
+        assert!(
+            description.contains("None is on in this workspace."),
+            "{description}"
+        );
+        assert!(description.chars().count() <= PORTABLE_DESCRIPTION_LIMIT);
+        assert!(
+            mcp_tools::portable_schema::portable_schema_violations(&tool["inputSchema"]).is_empty()
+        );
         assert!(!listed_names(&tools).contains(&"slipstream"));
     }
 

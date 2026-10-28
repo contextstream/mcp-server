@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.0.38
+
+- ContextAgents settings from the `agents` tool. All agents are on by default; an owner or
+  admin chooses which stay on:
+  - `settings`: a checklist grouped by kind of work ("Code and repositories", "Files and
+    data", ...), with how many are on, what each agent does, what it may read and change in
+    plain words, which need review, who can change them, and why nothing can run when that
+    is so.
+  - `choose`: the person ticks the agents to keep on in a form their client shows
+    (elicitation): a multi-select for 2025-11-25 and later clients and stateless 2026-07-28
+    calls, one checkbox per agent for earlier ones, everything on already ticked. A client
+    without forms gets the checklist and the call to make. `agents=[ids]`, `"all"` or
+    `"none"` sets exactly that set without a form.
+  - `enable` / `disable`: an agent id or name, a list in `agents`, or `all`. Only the agents
+    named change; each answer ends with the call that undoes it.
+  - Members and viewers get a read-only answer that names the owner and admins.
+  - Changes go through the settings API in one write (`PUT /workspaces/{id}/tasks/agents/consent`);
+    against an API without it, one write per agent.
+  - New access an agent asks for is never granted by turning agents on together: only
+    `enable` naming that agent grants it, and the answer says what it may now do.
+- A workspace with agents but none on lists `agents` with how to turn them on, so an owner
+  or admin can from the session; one without agents still lists nothing.
+
 ## 1.0.37
 
 - ContextStudio: one tool, `studio`, listed for people ContextStream Create offers

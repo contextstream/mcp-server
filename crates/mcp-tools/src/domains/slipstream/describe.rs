@@ -7,6 +7,8 @@
 //! - The `input` parameter carries every agent's fields with their types and one example,
 //!   within [`INPUT_REFERENCE_BUDGET`].
 //! - The `agent` parameter lists the ids.
+//! - With no agent on, the description says what the agents are and how an owner or admin
+//!   turns them on ([`describe_none_on`]).
 
 use serde_json::Value;
 
@@ -19,7 +21,10 @@ pub(crate) const DESCRIPTION_BUDGET: usize = 1000;
 pub(crate) const INPUT_REFERENCE_BUDGET: usize = 3000;
 
 /// The description when no catalog is known (router and discovery surfaces).
-pub(crate) const STATIC_DESCRIPTION: &str = "ContextStream Agents: hand one job (review a pull request, write release notes, read an image, make a PDF, ...) to a specialist agent that works with this workspace's context, and read its result. Actions: find (the agents turned on here, their price and input), run (ask an agent; a priced agent quotes first: show the person the price, then run again with accepted_price_credits), get_run (a task and its result, waiting up to 25 s), list_runs, cancel_run. Charged only when a run succeeds; declined or failed runs are free.";
+pub(crate) const STATIC_DESCRIPTION: &str = "ContextStream Agents: hand one job (review a pull request, write release notes, read an image, make a PDF, ...) to a specialist agent that works with this workspace's context, and read its result. Actions: find (the agents turned on here, their price and input), run (ask an agent; a priced agent quotes first: show the person the price, then run again with accepted_price_credits), get_run (a task and its result, waiting up to 25 s), list_runs, cancel_run. Which agents are on: settings (each agent, what it may access, who can change it), choose (the person picks in a form), enable / disable (an id, a list or all); owners and admins change them. Charged only when a run succeeds; declined or failed runs are free.";
+
+/// The description when the workspace has agents but none is on.
+const NONE_ON_DESCRIPTION: &str = "ContextAgents: specialist agents that each do one job with this workspace's context (review a pull request, write release notes, read an image, make a PDF, ...). None is on in this workspace. settings shows each agent, what it may access and who can change it. An owner or admin turns them on with choose (the person picks in a form) or enable (an agent id, a list in agents, or all).";
 
 const STATIC_INPUT: &str = "The agent's input object (run). find lists each agent's fields; a required project_id defaults to the session's project.";
 const STATIC_AGENT: &str =
@@ -39,6 +44,27 @@ pub(crate) fn describe(catalog: &Catalog, auto_accept_max_credits: u32) -> Descr
         description: tool_description(&agents, auto_accept_max_credits),
         agent_parameter: agent_parameter(&agents),
         input_parameter: input_parameter(&agents),
+    }
+}
+
+/// The listing for a workspace whose agents are all off: what they are and how to turn them
+/// on, with every id for the `agent` parameter.
+pub(crate) fn describe_none_on(catalog: &Catalog) -> Described {
+    let ids: Vec<&str> = catalog
+        .agents
+        .iter()
+        .map(|agent| agent.id.as_str())
+        .collect();
+    Described {
+        description: NONE_ON_DESCRIPTION.to_string(),
+        agent_parameter: shorten(
+            &format!(
+                "Agent id (enable, disable), or \"all\" / \"none\". None is on here; this workspace's agents: {}.",
+                ids.join(", ")
+            ),
+            INPUT_REFERENCE_BUDGET,
+        ),
+        input_parameter: STATIC_INPUT.to_string(),
     }
 }
 
@@ -71,7 +97,7 @@ fn footer(auto_accept_max_credits: u32) -> String {
         "It first returns the price: show it to the person, then run again with accepted_price_credits.".to_string()
     };
     format!(
-        "Run: {TOOL_NAME}(action=\"run\", agent, input). {accept} An unfinished run returns a task_id for get_run (waits up to 25 s). Fields: see input. Also: find, list_runs, cancel_run."
+        "Run: {TOOL_NAME}(action=\"run\", agent, input). {accept} An unfinished run returns a task_id for get_run (waits up to 25 s). Fields: see input. Also: find, list_runs, cancel_run; settings, choose, enable, disable set which agents are on."
     )
 }
 

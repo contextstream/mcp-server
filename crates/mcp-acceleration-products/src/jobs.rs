@@ -9,6 +9,7 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::warm_cache::normalize_acceleration_api_url;
+use mcp_client::client::loopback_api_forwarder_headers;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -132,6 +133,7 @@ impl JobProvider for ContextStreamJobProvider {
             .client
             .post(self.endpoint("jobs/submit"))
             .bearer_auth(&self.job_api_token)
+            .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
             .json(&SubmitJobBody::from(spec))
             .send()
             .await
@@ -154,6 +156,7 @@ impl JobProvider for ContextStreamJobProvider {
             .client
             .post(self.endpoint("jobs/poll"))
             .bearer_auth(&self.job_api_token)
+            .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
             .json(&PollJobBody { job_id })
             .send()
             .await
@@ -188,6 +191,7 @@ impl JobProvider for ContextStreamJobProvider {
             .client
             .post(self.endpoint("jobs/result"))
             .bearer_auth(&self.job_api_token)
+            .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
             .json(&ResultJobBody {
                 job_id,
                 cursor,

@@ -977,13 +977,21 @@ impl StudioTool {
         if let Some(problem) = making_problem(job) {
             lines.push(problem);
         }
-        let spent = job
-            .get("chargedCredits")
-            .and_then(Value::as_i64)
-            .or_else(|| job.pointer("/make/spentCredits").and_then(Value::as_i64));
+        let charged = job.get("chargedCredits").and_then(Value::as_i64);
+        let spent = charged.or_else(|| job.pointer("/make/spentCredits").and_then(Value::as_i64));
         let held = job.get("quotedCredits").and_then(Value::as_i64);
         match (job_ended(job), spent, held) {
-            (true, Some(spent), _) => lines.push(format!("Charged: {} credits.", credits(spent))),
+            (true, _, _) if charged.is_some() => lines.push(format!(
+                "Charged: {} credits.",
+                credits(charged.unwrap_or_default())
+            )),
+            (true, _, _) => {}
+            // The studio's own spend can run past the hold; the charge never does.
+            (false, Some(spent), Some(held)) if spent > held => lines.push(format!(
+                "The studio has spent {} so far; the charge stops at the {} held.",
+                credits(spent),
+                credits(held)
+            )),
             (false, Some(spent), Some(held)) => lines.push(format!(
                 "Spent so far: {} of the {} held.",
                 credits(spent),

@@ -6308,7 +6308,9 @@ fn active_index_ingest_held(project_id: Uuid, folder_path: &str) -> bool {
 /// must not retry in the background either.
 fn hold_active_index_ingest(project_id: Uuid, folder_path: &str, error: &Error) -> bool {
     let wait = match IngestFailure::classify(error) {
-        IngestFailure::Denied | IngestFailure::Unauthorized => ACTIVE_INDEX_REFUSED_HOLD,
+        IngestFailure::Denied | IngestFailure::Unauthorized | IngestFailure::OutOfCredits => {
+            ACTIVE_INDEX_REFUSED_HOLD
+        }
         IngestFailure::RateLimited { retry_after } => retry_after
             .map(Duration::from_secs)
             .unwrap_or(ACTIVE_INDEX_RATE_LIMIT_FALLBACK)

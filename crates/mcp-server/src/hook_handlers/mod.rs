@@ -9,6 +9,7 @@ pub mod coaching_turn;
 pub mod common;
 pub mod compliance;
 pub(crate) mod contextagents;
+pub(crate) mod credit_notice;
 pub mod dirty_drain;
 pub(crate) mod durable_capture;
 pub(crate) mod durable_paths;
@@ -359,6 +360,22 @@ pub fn write_context_for_input(input: &Value, text: String) -> Result<()> {
     } else {
         write_stdout_json(&HookOutput::context(text))
     }
+}
+
+/// [`write_context_for_input`] plus a message for the person: Claude Code shows
+/// a hook's `systemMessage` to the user directly; other editors get only the
+/// context, which tells the assistant to relay it.
+pub fn write_context_and_notice_for_input(
+    input: &Value,
+    text: String,
+    user_message: Option<String>,
+) -> Result<()> {
+    if input_is_cursor(input) {
+        return write_context_for_input(input, text);
+    }
+    let mut output = HookOutput::context(text);
+    output.system_message = user_message;
+    write_stdout_json(&output)
 }
 
 /// Shared HTTP client for hook handlers.

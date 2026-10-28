@@ -3819,6 +3819,21 @@ fn server_literal_page(result: &SearchResponse, executed_mode: SearchMode) -> bo
     matches!(executed_mode, SearchMode::Exhaustive) && result.literal_match.is_some()
 }
 
+/// What an empty exhaustive page says after its `[LITERAL]` line, in place of
+/// the ranking-miss advice ("did not meet the relevance threshold, rephrase"):
+/// the page is a grep over the indexed commit, so an empty one is an answer,
+/// not a weak ranking.
+fn literal_empty_page_message(result: &SearchResponse) -> Option<&'static str> {
+    let summary = result.literal_match.as_ref()?;
+    if summary.get("complete").and_then(Value::as_bool) != Some(true) {
+        Some("Literal check is incomplete; absence has not been established. Check project(action=\"index_status\") and retry.\n")
+    } else if summary.get("found").and_then(Value::as_bool) == Some(true) {
+        Some("No rows on this page; the [LITERAL] line above counts the matching lines.\n")
+    } else {
+        Some("No literal matches.\n")
+    }
+}
+
 fn is_doc_lookup_query(query: &str) -> bool {
     let lower = query.trim().to_lowercase();
     if lower.is_empty() {
@@ -7538,8 +7553,43 @@ fn query_explicitly_targets_artifacts(query: &str) -> bool {
         || lower.contains("coverage")
 }
 
-fn should_filter_artifact_paths(_requested_mode: SearchMode, query: &str) -> bool {
-    !query_explicitly_targets_artifacts(query)
+fn should_filter_artifact_paths(requested_mode: SearchMode, query: &str) -> bool {
+    !matches!(requested_mode, SearchMode::Exhaustive | SearchMode::Keyword)
+        && !query_explicitly_targets_artifacts(query)
+}
+
+/// Drop rows from build output (`dist/`, `.min.js`, sourcemaps) that nothing
+/// vouches for, and return how many went. Exact modes keep every row, and in
+/// any mode a row the server verified to contain the text stays: those files
+/// are exact-search only, so an exact hit there is the answer, and hiding it
+/// would turn a found literal into a "not found".
+fn suppress_artifact_rows(
+    result: &mut SearchResponse,
+    requested_mode: SearchMode,
+    query: &str,
+) -> usize {
+    if result.results.is_empty() || !should_filter_artifact_paths(requested_mode, query) {
+        return 0;
+    }
+    let before = result.results.len();
+    result
+        .results
+        .retain(|item| result_has_literal_hit(item) || !result_has_artifact_like_path(item));
+    let removed = before - result.results.len();
+    if removed > 0 {
+        result.total = Some(result.results.len() as i64);
+    }
+    removed
+}
+
+fn result_has_literal_hit(item: &mcp_types::api::SearchResult) -> bool {
+    matches!(
+        item.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("literal_match"))
+            .and_then(Value::as_str),
+        Some("exact" | "ignoring_case" | "fragment")
+    )
 }
 
 fn is_compact_paths_response(response: &SearchResponse) -> bool {
@@ -8091,6 +8141,19 @@ fn local_match_line_index(
 ) -> Option<usize> {
     let tokens = local_snippet_query_tokens(query);
     if !tokens.is_empty() {
+        // Preserve an already matching location, including later occurrences
+        // in the same file. Only relocate a stale/non-matching chunk anchor.
+        if let Some(index) = fallback_start_line
+            .filter(|line| *line > 0)
+            .map(|line| (line - 1) as usize)
+        {
+            if content.lines().nth(index).is_some_and(|line| {
+                let lower = line.to_ascii_lowercase();
+                tokens.iter().any(|token| lower.contains(token))
+            }) {
+                return Some(index);
+            }
+        }
         for (idx, line) in content.lines().enumerate() {
             let line_lower = line.to_ascii_lowercase();
             if tokens.iter().any(|token| line_lower.contains(token)) {
@@ -8230,13 +8293,46 @@ fn refresh_indexed_result_snippets_from_local_files(
             item.content = Some(snippet);
             refreshed += 1;
         }
-        if item.start_line.is_none() {
-            item.start_line = Some((match_line_index + 1) as i64);
-        }
+        let line = (match_line_index + 1) as i64;
+        item.start_line = Some(line);
+        item.location = Some(format!("{file_path}:{line}"));
         mark_local_overlay(item);
     }
 
     refreshed
+}
+
+/// Refreshing a stale anchor or merging a local hit can make two rows refer
+/// to the same line. Compare paths under the actual checkout root so an
+/// absolute API path and a relative local path do not survive as twins.
+fn deduplicate_local_result_locations(response: &mut SearchResponse, folder_path: &Path) {
+    let mut seen = HashSet::new();
+    let before = response.results.len();
+    response.results.retain(|item| {
+        if is_memory_result(item) {
+            return true;
+        }
+        // A row without a line cannot be told from another row of the same
+        // file, so only a located row can be a twin.
+        let Some(line) = item.start_line else {
+            return true;
+        };
+        let Some(path) = item
+            .file_path
+            .as_deref()
+            .and_then(|path| local_result_path(folder_path, path))
+        else {
+            return true;
+        };
+        seen.insert((path, line))
+    });
+    let removed = before - response.results.len();
+    if removed > 0 {
+        response.total = Some(
+            (response.total.unwrap_or(before as i64) - removed as i64)
+                .max(response.results.len() as i64),
+        );
+    }
 }
 
 /// Enrich keyword/exhaustive search results by invoking ripgrep on the local tree.
@@ -12100,8 +12196,18 @@ impl SearchTool {
         // via `.contextstream/config.json` and scope fallback ended up serving
         // results from a different project, the reroute must be loud. A silent
         // reroute sends the agent chasing files that belong to another repo.
-        let mut project_routing_warning: Option<String> = None;
-        if explicit_project_id.is_none() {
+        let mut project_routing_warning = requested_explicit_project_id
+            .filter(|requested| Some(*requested) != explicit_project_id)
+            .map(|requested| {
+                let resolved = resolved_project_id
+                    .map(|id| format!("project_id={id}"))
+                    .unwrap_or_else(|| "workspace-wide scope".to_string());
+                format!(
+                    "[SCOPE_MISMATCH] Requested project_id={requested} was not used. These results are from {resolved}. {} To search the requested project deliberately, pass its workspace_id and project_id together.",
+                    shared_scope.note.as_deref().unwrap_or("The requested scope was replaced during resolution.")
+                )
+            });
+        if project_routing_warning.is_none() && explicit_project_id.is_none() {
             if let Some(pinned_project_id) = resolved_folder_project_id {
                 if resolved_project_id != Some(pinned_project_id) {
                     let resolved_label = resolved_project_id
@@ -12233,23 +12339,15 @@ impl SearchTool {
                 );
             }
         }
-        if should_filter_artifact_paths(requested_mode, &input.query) && !result.results.is_empty()
-        {
-            let before = result.results.len();
-            result
-                .results
-                .retain(|item| !result_has_artifact_like_path(item));
-            let removed = before.saturating_sub(result.results.len());
-            if removed > 0 {
-                result.total = Some(result.results.len() as i64);
-                mode_fallback_note = append_note(
-                    mode_fallback_note,
-                    &format!(
-                        "Suppressed {} build/artifact path result(s) (e.g. `.next`, sourcemaps).",
-                        removed
-                    ),
-                );
-            }
+        let removed = suppress_artifact_rows(&mut result, requested_mode, &input.query);
+        if removed > 0 {
+            mode_fallback_note = append_note(
+                mode_fallback_note,
+                &format!(
+                    "Suppressed {} build/artifact path result(s) (e.g. `.next`, sourcemaps).",
+                    removed
+                ),
+            );
         }
         // Duplicate suppression: collapse mirror-prefix duplicates (requirement #5)
         // First, canonicalize file paths so internal storage paths
@@ -12484,11 +12582,23 @@ impl SearchTool {
         );
         harmonize_project_index_state(&mut result, index_health.as_ref());
         let dirty_file_hints = activity_file_hints.clone();
+        // Exhaustive rows describe the committed index, including all matching
+        // lines and pagination. Local overlays must not rewrite that evidence
+        // or append a second representation of the same hit.
+        let literal_page = server_literal_page(&result, executed_mode);
+        let parallel_local_handle = if literal_page {
+            if let Some(handle) = parallel_local_handle {
+                handle.abort();
+            }
+            None
+        } else {
+            parallel_local_handle
+        };
 
         // Prune results for files deleted or ignored in the local working tree before
         // computing no_hits, so a drifted index never silently serves hits for
         // files that no longer exist. Guarded to local directories only.
-        if !scope_invalid && local_files_allowed {
+        if !scope_invalid && local_files_allowed && !literal_page {
             if let Some(ref fp) = folder_path {
                 let folder = Path::new(fp);
                 if folder.is_dir() {
@@ -12552,7 +12662,7 @@ impl SearchTool {
         let mut local_enrichment_diagnostic: Option<LocalEnrichDiagnostic> = None;
         // Local filesystem enrichment: supplement API results with live filesystem scanning.
         // Apply only when scope is stable and the query shape is likely to benefit.
-        if !scope_invalid && local_files_allowed {
+        if !scope_invalid && local_files_allowed && !literal_page {
             if let Some(ref fp) = folder_path {
                 let folder = PathBuf::from(fp);
                 let existing_paths: HashSet<String> = result
@@ -12725,9 +12835,6 @@ impl SearchTool {
             }
         }
 
-        // A server literal page is already exact and in grep order.
-        let literal_page = server_literal_page(&result, executed_mode);
-
         if literal_page {
             // nothing to rerank
         } else if let Some(note) = apply_symbol_anchor_rerank(&mut result, &input.query) {
@@ -12770,6 +12877,7 @@ impl SearchTool {
         if no_hits
             && !scope_invalid
             && local_files_allowed
+            && !literal_page
             && is_local_keyword_enrichment_query(&input.query)
         {
             if let Some(ref fp) = folder_path {
@@ -12981,6 +13089,12 @@ impl SearchTool {
                 &mut fallback_stages,
                 "local_enrichment_unavailable".to_string(),
             );
+        }
+
+        if local_files_allowed && !literal_page {
+            if let Some(folder) = folder_path.as_deref() {
+                deduplicate_local_result_locations(&mut result, Path::new(folder));
+            }
         }
 
         let requested_paths_output = input
@@ -13202,6 +13316,11 @@ impl SearchTool {
                         ));
                     }
                 }
+            } else if let Some(message) = literal_page
+                .then(|| literal_empty_page_message(&result))
+                .flatten()
+            {
+                text.push_str(message);
             } else if let Some((docs, fallback_project_id)) = docs_fallback.as_ref() {
                 let scope = fallback_project_id
                     .map(|id| format!(" (project_id: {})", id))

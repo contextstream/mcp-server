@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.37
 
 - ContextStudio: one tool, `studio`, listed for people ContextStream Create offers
   one-prompt making to (plan, make, status, result, revise, stop, library, brand,
@@ -14,6 +14,9 @@
   serialize `mimeType` on every transport.
 - The hosted gateway serves `/studio`, a ContextStudio connector with only the `studio`
   tool and its own protected-resource metadata (`read:studio`, `write:studio`).
+- `studio` waits stay under two minutes on stdio (Claude Code backgrounds a longer call)
+  and under 45 s on the hosted gateway; a stateless client's one `tools/list` reads the
+  ContextStudio offer once more after a failed read, and `server/discover` prefetches it.
 
 ## 1.0.36
 

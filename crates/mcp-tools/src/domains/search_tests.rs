@@ -7216,6 +7216,91 @@ mod search_quality_tests {
     }
 
     #[test]
+    fn refreshed_keyword_locations_match_the_snippet_and_collapse_twins() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("src")).unwrap();
+        let path = temp.path().join("src/nebula.js");
+        std::fs::write(
+            &path,
+            "line1\nexport const nebulaPrismCalibrate = 3;\nline3\n",
+        )
+        .unwrap();
+        let mut response = mcp_types::api::SearchResponse {
+            results: [2, 3, 11]
+                .into_iter()
+                .map(|line| mcp_types::api::SearchResult {
+                    id: format!("chunk-{line}"),
+                    file_path: Some("src/nebula.js".into()),
+                    location: Some(format!("src/nebula.js:{line}")),
+                    start_line: Some(line),
+                    language: Some("javascript".into()),
+                    content: Some("stale chunk".into()),
+                    ..Default::default()
+                })
+                .collect(),
+            total: Some(3),
+            ..Default::default()
+        };
+        // Reproduce an absolute-path / extension-language twin as well.
+        let mut twin = response.results[0].clone();
+        twin.file_path = Some(path.to_string_lossy().into_owned());
+        twin.language = Some("js".into());
+        response.results.push(twin);
+        refresh_indexed_result_snippets_from_local_files(
+            &mut response,
+            temp.path(),
+            "nebulaPrismCalibrate",
+            0,
+            500,
+        );
+        for item in &response.results {
+            assert_eq!(item.start_line, Some(2));
+            assert!(item.location.as_deref().unwrap().ends_with(":2"));
+            assert_eq!(
+                item.content.as_deref(),
+                Some("export const nebulaPrismCalibrate = 3;")
+            );
+        }
+        deduplicate_local_result_locations(&mut response, temp.path());
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.total, Some(1));
+    }
+
+    #[test]
+    fn snippet_refresh_preserves_a_later_matching_line() {
+        assert_eq!(
+            local_match_line_index("needle\nother\nneedle", "needle", Some(3)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn twin_collapse_leaves_rows_without_a_line_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.js"), "needle\n").unwrap();
+        let located = |line: Option<i64>, id: &str| mcp_types::api::SearchResult {
+            id: id.into(),
+            file_path: Some("a.js".into()),
+            start_line: line,
+            ..Default::default()
+        };
+        let mut response = mcp_types::api::SearchResponse {
+            results: vec![
+                located(None, "file-1"),
+                located(None, "file-2"),
+                located(Some(1), "chunk"),
+                located(Some(1), "twin"),
+            ],
+            total: Some(4),
+            ..Default::default()
+        };
+        deduplicate_local_result_locations(&mut response, temp.path());
+        let ids: Vec<_> = response.results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["file-1", "file-2", "chunk"]);
+        assert_eq!(response.total, Some(3));
+    }
+
+    #[test]
     fn local_result_path_rejects_parent_traversal() {
         let temp = tempfile::tempdir().unwrap();
         assert!(local_result_path(temp.path(), "../outside.rs").is_none());
@@ -8075,6 +8160,78 @@ mod scope_widening_tests {
             "scope_reason": "workspace_scope",
         })
         .to_string()
+    }
+
+    /// #224: the chunk row the index returned for the line after a match is
+    /// shown with that line's number but the matching line's text, and the one
+    /// hit used to come back as several rows. One line is one row, at its line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_keyword_hit_is_one_row_at_the_line_holding_the_text() {
+        let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/nebula.js"),
+            "line1\nexport const nebulaPrismCalibrate = 3;\nline3\n",
+        )
+        .unwrap();
+        let server = RoutedServer::spawn(Box::new(move |line, _| {
+            if line.contains("/search/") {
+                return (200, json!({
+                    "results": [
+                        {"id":"a", "file_path":"src/nebula.js", "start_line":2, "language":"javascript", "content":"export const nebulaPrismCalibrate = 3;", "score":1.0, "metadata":{"literal_match":"exact"}},
+                        {"id":"b", "file_path":"src/nebula.js", "start_line":3, "language":"javascript", "content":"line3", "score":0.5}
+                    ],
+                    "total":2, "project_index_state":"ready",
+                    "literal_match":{"complete":true,"found":true,"files":1,"lines":1,"statement":"1 line(s) in 1 file(s) contain the text exactly (case-sensitive)."}
+                }).to_string());
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            (404, json!({"error":"not found"}).to_string())
+        }));
+        let mut config = TestFixtures::test_config();
+        config.api_url = server.base_url.clone();
+        config.default_workspace_id = Some(workspace);
+        config.default_project_id = Some(project);
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        session
+            .update_scope(
+                Some(workspace),
+                Some(project),
+                Some(temp.path().to_string_lossy().into_owned()),
+            )
+            .await;
+        let keeper = create_mock_index_keeper(&client, &session);
+        let tool = SearchTool::new(
+            client,
+            session,
+            keeper,
+            mcp_types::atlas_layer::noop_layer(),
+        );
+        let result = tool
+            .execute(json!({"query":"nebulaPrismCalibrate","mode":"keyword","project_id":project,"workspace_id":workspace}))
+            .await
+            .unwrap();
+        let structured = result.structured_content.as_ref().unwrap();
+        let rows: Vec<&Value> = structured["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                row["file_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("nebula.js"))
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "{}", text_of(&result));
+        assert_eq!(rows[0]["start_line"], 2);
+        assert!(rows[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("nebulaPrismCalibrate"));
     }
 
     #[test]

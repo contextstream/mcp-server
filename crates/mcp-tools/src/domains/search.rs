@@ -8091,6 +8091,19 @@ fn local_match_line_index(
 ) -> Option<usize> {
     let tokens = local_snippet_query_tokens(query);
     if !tokens.is_empty() {
+        // Preserve an already matching location, including later occurrences
+        // in the same file. Only relocate a stale/non-matching chunk anchor.
+        if let Some(index) = fallback_start_line
+            .filter(|line| *line > 0)
+            .map(|line| (line - 1) as usize)
+        {
+            if content.lines().nth(index).is_some_and(|line| {
+                let lower = line.to_ascii_lowercase();
+                tokens.iter().any(|token| lower.contains(token))
+            }) {
+                return Some(index);
+            }
+        }
         for (idx, line) in content.lines().enumerate() {
             let line_lower = line.to_ascii_lowercase();
             if tokens.iter().any(|token| line_lower.contains(token)) {
@@ -8230,13 +8243,46 @@ fn refresh_indexed_result_snippets_from_local_files(
             item.content = Some(snippet);
             refreshed += 1;
         }
-        if item.start_line.is_none() {
-            item.start_line = Some((match_line_index + 1) as i64);
-        }
+        let line = (match_line_index + 1) as i64;
+        item.start_line = Some(line);
+        item.location = Some(format!("{file_path}:{line}"));
         mark_local_overlay(item);
     }
 
     refreshed
+}
+
+/// Refreshing a stale anchor or merging a local hit can make two rows refer
+/// to the same line. Compare paths under the actual checkout root so an
+/// absolute API path and a relative local path do not survive as twins.
+fn deduplicate_local_result_locations(response: &mut SearchResponse, folder_path: &Path) {
+    let mut seen = HashSet::new();
+    let before = response.results.len();
+    response.results.retain(|item| {
+        if is_memory_result(item) {
+            return true;
+        }
+        // A row without a line cannot be told from another row of the same
+        // file, so only a located row can be a twin.
+        let Some(line) = item.start_line else {
+            return true;
+        };
+        let Some(path) = item
+            .file_path
+            .as_deref()
+            .and_then(|path| local_result_path(folder_path, path))
+        else {
+            return true;
+        };
+        seen.insert((path, line))
+    });
+    let removed = before - response.results.len();
+    if removed > 0 {
+        response.total = Some(
+            (response.total.unwrap_or(before as i64) - removed as i64)
+                .max(response.results.len() as i64),
+        );
+    }
 }
 
 /// Enrich keyword/exhaustive search results by invoking ripgrep on the local tree.
@@ -12981,6 +13027,12 @@ impl SearchTool {
                 &mut fallback_stages,
                 "local_enrichment_unavailable".to_string(),
             );
+        }
+
+        if local_files_allowed {
+            if let Some(folder) = folder_path.as_deref() {
+                deduplicate_local_result_locations(&mut result, Path::new(folder));
+            }
         }
 
         let requested_paths_output = input

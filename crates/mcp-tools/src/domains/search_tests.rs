@@ -8248,6 +8248,55 @@ mod scope_widening_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_foreign_project_without_workspace_names_the_replacement_in_text() {
+        let (workspace, project, foreign, foreign_workspace) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let server = RoutedServer::spawn(Box::new(move |line, _| {
+            if line.contains(&format!("/projects/{foreign}")) && !line.contains("/index") {
+                return (200, project_body(foreign, foreign_workspace));
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            if line.contains("/search/") {
+                return (200, workspace_rows(project));
+            }
+            (404, json!({"error":"not found"}).to_string())
+        }));
+        let (tool, session) = gateway_tool(&server.base_url);
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        let result = mcp_client::run_with_auth_override(key_only_auth(), || {
+            tool.execute(json!({"query":"workspace router","mode":"keyword","project_id":foreign}))
+        })
+        .await
+        .unwrap();
+        let text = text_of(&result);
+        assert!(text.contains("[SCOPE_MISMATCH]"), "{text}");
+        assert!(
+            text.contains(&format!("Requested project_id={foreign} was not used")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("These results are from project_id={project}")),
+            "{text}"
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["explicit_project_autocorrected"],
+            true
+        );
+        assert!(server
+            .search_bodies()
+            .iter()
+            .all(|body| body["project_id"] == json!(project)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exhaustive_checked_absence_does_not_render_a_ranking_miss() {
         let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
         let server = RoutedServer::spawn(Box::new(move |line, _| {

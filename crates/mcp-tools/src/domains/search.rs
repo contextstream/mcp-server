@@ -12196,8 +12196,18 @@ impl SearchTool {
         // via `.contextstream/config.json` and scope fallback ended up serving
         // results from a different project, the reroute must be loud. A silent
         // reroute sends the agent chasing files that belong to another repo.
-        let mut project_routing_warning: Option<String> = None;
-        if explicit_project_id.is_none() {
+        let mut project_routing_warning = requested_explicit_project_id
+            .filter(|requested| Some(*requested) != explicit_project_id)
+            .map(|requested| {
+                let resolved = resolved_project_id
+                    .map(|id| format!("project_id={id}"))
+                    .unwrap_or_else(|| "workspace-wide scope".to_string());
+                format!(
+                    "[SCOPE_MISMATCH] Requested project_id={requested} was not used. These results are from {resolved}. {} To search the requested project deliberately, pass its workspace_id and project_id together.",
+                    shared_scope.note.as_deref().unwrap_or("The requested scope was replaced during resolution.")
+                )
+            });
+        if project_routing_warning.is_none() && explicit_project_id.is_none() {
             if let Some(pinned_project_id) = resolved_folder_project_id {
                 if resolved_project_id != Some(pinned_project_id) {
                     let resolved_label = resolved_project_id

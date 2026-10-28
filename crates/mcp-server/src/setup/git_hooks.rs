@@ -120,11 +120,33 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
+/// What an install did to one managed hook file: it wrote the hook, or it
+/// restored an execute bit that Git needs before it runs the hook.
+pub const HOOK_CREATED: &str = "create";
+pub const HOOK_UPDATED: &str = "modify";
+pub const HOOK_EXECUTE_BIT_RESTORED: &str = "restore execute bit";
+
+/// One change an install made to a managed hook (in a dry run, would make).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookChange {
+    pub path: PathBuf,
+    /// One of [`HOOK_CREATED`], [`HOOK_UPDATED`], [`HOOK_EXECUTE_BIT_RESTORED`].
+    /// A hook that needs both a rewrite and its execute bit has one entry each.
+    pub action: &'static str,
+}
+
 /// Install (or refresh) the managed git hooks for `repo_root`.
 ///
 /// Idempotent: re-running replaces only the managed block (re-pointing the
 /// binary path), preserves any user hook content, and chains after it.
 pub fn install_git_hooks(repo_root: &Path) -> Result<()> {
+    install_git_hooks_reporting(repo_root).map(|_| ())
+}
+
+/// [`install_git_hooks`], returning what it changed so that a caller such as
+/// `doctor --repair` can say so. A hook that was already current and
+/// executable is not listed.
+pub fn install_git_hooks_reporting(repo_root: &Path) -> Result<Vec<HookChange>> {
     let hooks_dir = resolve_hooks_dir(repo_root).ok_or_else(|| {
         anyhow!(
             "could not resolve git hooks dir for {}",
@@ -132,10 +154,11 @@ pub fn install_git_hooks(repo_root: &Path) -> Result<()> {
         )
     })?;
     let binary = hook_binary_path();
+    let mut changes = Vec::new();
     for name in HOOK_NAMES {
-        install_one(&hooks_dir.join(name), name, &binary)?;
+        changes.extend(install_one(&hooks_dir.join(name), name, &binary)?);
     }
-    Ok(())
+    Ok(changes)
 }
 
 /// Remove the managed block from each hook. Cleanly modified user hooks are
@@ -256,12 +279,15 @@ fn managed_block(name: &str, binary: &str) -> String {
     format!("{SENTINEL_START}\n{inner}{SENTINEL_END}\n")
 }
 
-fn install_one(path: &Path, name: &str, binary: &str) -> Result<()> {
+/// Install or refresh one managed hook, returning what changed.
+fn install_one(path: &Path, name: &str, binary: &str) -> Result<Vec<HookChange>> {
     let existing = match std::fs::read_to_string(path) {
         Ok(existing) => Some(existing),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    // A hook that does not exist yet is created executable.
+    let was_executable = existing.is_none() || is_executable(path);
     let new_content = desired_hook_content(existing.as_deref(), name, binary)?;
     safe_edit::write_executable_if_unchanged(path, &new_content, existing.as_deref())?;
     // An unchanged hook is not rewritten, so repair the mode separately:
@@ -270,7 +296,24 @@ fn install_one(path: &Path, name: &str, binary: &str) -> Result<()> {
     if !safe_edit::is_dry_run() {
         ensure_executable(path)?;
     }
-    Ok(())
+    let mut changes = Vec::new();
+    if existing.as_deref() != Some(new_content.as_str()) {
+        changes.push(HookChange {
+            path: path.to_path_buf(),
+            action: if existing.is_none() {
+                HOOK_CREATED
+            } else {
+                HOOK_UPDATED
+            },
+        });
+    }
+    if !was_executable {
+        changes.push(HookChange {
+            path: path.to_path_buf(),
+            action: HOOK_EXECUTE_BIT_RESTORED,
+        });
+    }
+    Ok(changes)
 }
 
 /// Add the execute bits (to at least 0755) to a managed hook that has none.
@@ -663,6 +706,107 @@ mod tests {
             .unwrap()
             .not_executable
             .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_reports_each_hook_it_creates_updates_or_makes_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let _env = init_repo(temp.path());
+        let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        let created = install_git_hooks_reporting(temp.path()).expect("install");
+        assert_eq!(created.len(), HOOK_NAMES.len());
+        for name in HOOK_NAMES {
+            assert!(
+                created.contains(&HookChange {
+                    path: hooks_dir.join(name),
+                    action: HOOK_CREATED,
+                }),
+                "{name} is reported as created: {created:?}"
+            );
+        }
+
+        // Nothing to do, nothing to report.
+        assert_eq!(install_git_hooks_reporting(temp.path()).unwrap(), vec![]);
+
+        // The state every repo set up by 1.0.0-1.0.26 was left in: a current
+        // hook whose only fault is its mode. That is the repair to report, and
+        // it rewrites nothing, so it leaves no recovery backup.
+        let post_commit = hooks_dir.join("post-commit");
+        let before = read(&post_commit);
+        std::fs::set_permissions(&post_commit, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let repaired = install_git_hooks_reporting(temp.path()).expect("repair");
+        assert_eq!(
+            repaired,
+            vec![HookChange {
+                path: post_commit.clone(),
+                action: HOOK_EXECUTE_BIT_RESTORED,
+            }]
+        );
+        assert_eq!(mode(&post_commit), 0o755);
+        assert_eq!(read(&post_commit), before);
+        assert!(!safe_edit::backup_path(&post_commit).unwrap().exists());
+        assert_eq!(install_git_hooks_reporting(temp.path()).unwrap(), vec![]);
+
+        // A user's own hook that is not executable is rewritten with the managed
+        // block, made executable, and backed up: both changes are reported.
+        let pre_push = hooks_dir.join("pre-push");
+        std::fs::write(&pre_push, "#!/bin/sh\necho user hook\n").unwrap();
+        std::fs::set_permissions(&pre_push, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let both = install_git_hooks_reporting(temp.path()).expect("install over user hook");
+        assert_eq!(
+            both,
+            vec![
+                HookChange {
+                    path: pre_push.clone(),
+                    action: HOOK_UPDATED,
+                },
+                HookChange {
+                    path: pre_push.clone(),
+                    action: HOOK_EXECUTE_BIT_RESTORED,
+                },
+            ]
+        );
+        assert_eq!(mode(&pre_push), 0o755);
+        assert!(safe_edit::backup_path(&pre_push).unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dry_run_previews_the_execute_bit_without_restoring_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let _env = init_repo(temp.path());
+        install_git_hooks(temp.path()).expect("install");
+        let hooks_dir = resolve_hooks_dir(temp.path()).unwrap();
+        let post_commit = hooks_dir.join("post-commit");
+        std::fs::set_permissions(&post_commit, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        safe_edit::set_dry_run(true);
+        let planned = install_git_hooks_reporting(temp.path());
+        safe_edit::set_dry_run(false);
+        let _ = safe_edit::take_planned_changes();
+
+        // A dry run always bakes in the managed binary path, so it may also plan
+        // content rewrites; the execute bit is the one change that is exact.
+        let restores: Vec<_> = planned
+            .expect("dry run")
+            .into_iter()
+            .filter(|change| change.action == HOOK_EXECUTE_BIT_RESTORED)
+            .collect();
+        assert_eq!(
+            restores,
+            vec![HookChange {
+                path: post_commit.clone(),
+                action: HOOK_EXECUTE_BIT_RESTORED,
+            }]
+        );
+        assert_eq!(mode(&post_commit), 0o600, "a dry run changes nothing");
     }
 
     #[test]

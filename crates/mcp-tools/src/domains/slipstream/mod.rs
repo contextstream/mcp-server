@@ -2,11 +2,11 @@
 //! by ContextStream's Slipstream worker and paid per successful run in credits (ContextStream
 //! `handlers/tasks_api.rs`).
 //!
-//! One tool, `agents`, listed only for a caller whose workspace has the agents with at least
-//! one turned on (see [`gate`]); its description is written from that catalog (see
-//! [`describe`]). The tool's first name, `slipstream`, stays callable as a back-compat alias
-//! ([`LEGACY_TOOL_NAME`]) and is never listed (ContextStream decision bd3949a7: the public
-//! product is ContextStream Agents).
+//! One tool, `agents`, listed for a caller whose workspace has the agents (see [`gate`]); its
+//! description is written from that catalog (see [`describe`]): the agents turned on, or,
+//! with none on, how to turn them on. The tool's first name, `slipstream`, stays callable as
+//! a back-compat alias ([`LEGACY_TOOL_NAME`]) and is never listed (ContextStream decision
+//! bd3949a7: the public product is ContextStream Agents).
 //!
 //! ## Actions
 //!
@@ -20,6 +20,8 @@
 //! - `get_run`: one task with its result, waiting up to 25 s for it to end.
 //! - `list_runs`: the workspace's tasks, newest first.
 //! - `cancel_run`: stop a task.
+//! - `settings`, `enable`, `disable`, `choose`: which agents are on in the workspace, and
+//!   choosing them (see [`settings`]); only an owner or admin changes it.
 //!
 //! A run is charged its price once, only when it succeeds; a declined, failed, cancelled or
 //! timed-out run costs nothing.
@@ -28,6 +30,7 @@ pub(crate) mod catalog;
 pub(crate) mod describe;
 pub(crate) mod format;
 pub(crate) mod gate;
+pub(crate) mod settings;
 
 use async_trait::async_trait;
 use mcp_client::{ContextStreamClient, RequestOptions};
@@ -71,7 +74,17 @@ pub fn is_tool_name(name: &str) -> bool {
     name == TOOL_NAME || name == LEGACY_TOOL_NAME
 }
 
-const VALID_ACTIONS: &[&str] = &["find", "run", "get_run", "list_runs", "cancel_run"];
+const VALID_ACTIONS: &[&str] = &[
+    "find",
+    "run",
+    "get_run",
+    "list_runs",
+    "cancel_run",
+    "settings",
+    "choose",
+    "enable",
+    "disable",
+];
 
 /// The longest ContextStream holds a request open for a task to end.
 pub(crate) const MAX_WAIT_MS: u64 = 25_000;
@@ -91,7 +104,7 @@ const IDEMPOTENCY_WINDOW_SECS: u64 = 600;
 /// The API's bound on a session id.
 const MAX_SESSION_ID_CHARS: usize = 200;
 
-const TOOL_REFERENCE: &str = "ContextStream Agents: each does one job with the workspace's decisions, lessons, docs and code, and declines anything else (a declined run is free).\n\nActions:\n- find: the workspace's agents with job, price per run, input fields (with what each means) and an example; on = an owner or admin turned it on.\n- run: agent (id or id@version), input (the agent's input object; a required project_id defaults to the session's project). A priced agent needs accepted_price_credits at or above its price: call run without it to get the quote, show the person the price, then call again with their acceptance. Runs priced within the person's auto-accept cap start at once. wait_ms (default 20000, up to 25000) waits for the result; a run still working returns its task_id for get_run. An identical ask within 10 minutes returns the same task; pass a new idempotency_key to run the same job again.\n- get_run: task_id, wait_ms (default 20000, up to 25000): status (queued, running, succeeded, failed, declined, cancelled, timed_out), the result, and what the run cost.\n- list_runs: agent (optional filter), limit (at most 50).\n- cancel_run: task_id.\n\nBilling: a run costs its price once, only when it succeeds.";
+const TOOL_REFERENCE: &str = "ContextStream Agents: each does one job with the workspace's decisions, lessons, docs and code, and declines anything else (a declined run is free).\n\nActions:\n- find: the workspace's agents with job, price per run, input fields (with what each means) and an example; on = an owner or admin turned it on.\n- run: agent (id or id@version), input (the agent's input object; a required project_id defaults to the session's project). A priced agent needs accepted_price_credits at or above its price: call run without it to get the quote, show the person the price, then call again with their acceptance. Runs priced within the person's auto-accept cap start at once. wait_ms (default 20000, up to 25000) waits for the result; a run still working returns its task_id for get_run. An identical ask within 10 minutes returns the same task; pass a new idempotency_key to run the same job again.\n- get_run: task_id, wait_ms (default 20000, up to 25000): status (queued, running, succeeded, failed, declined, cancelled, timed_out), the result, and what the run cost.\n- list_runs: agent (optional filter), limit (at most 50).\n- cancel_run: task_id.\n- settings: which ContextAgents are on in the workspace, grouped by kind of work: what each does, what it may access, which need review, and who can change them.\n- choose: the person picks which agents are on in a form their client shows (every agent, those on checked); a client without forms gets the checklist. agents=[ids] (or \"all\" / \"none\") sets exactly that set without a form.\n- enable / disable: agent (an id, \"all\" or \"none\") or agents (a list). Only an owner or admin changes them; anyone else is told who can. Naming an agent that needs review in enable grants its new access.\n\nBilling: a run costs its price once, only when it succeeds.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SlipstreamInput {
@@ -106,6 +119,8 @@ pub struct SlipstreamInput {
     pub limit: Option<i64>,
     pub idempotency_key: Option<String>,
     pub session_id: Option<String>,
+    /// Agents for enable, disable and choose: a list of ids, or `all` / `none`.
+    pub agents: Option<Value>,
 }
 
 pub struct SlipstreamTool {
@@ -547,6 +562,10 @@ impl ToolHandler for SlipstreamTool {
             "get_run" => self.get_run(&input).await,
             "list_runs" => self.list_runs(&input).await,
             "cancel_run" => self.cancel_run(&input).await,
+            "settings" => self.settings(&input).await,
+            "choose" => self.choose(&input).await,
+            "enable" => self.switch(&input, settings::Verb::Enable).await,
+            "disable" => self.switch(&input, settings::Verb::Disable).await,
             _ => Err(Error::Validation(format!(
                 "Unknown action: {}. Available actions: {}",
                 action,
@@ -585,7 +604,13 @@ pub(crate) fn input_schema() -> Value {
         )
         .string(
             "agent",
-            "Agent id, or id@version (run; a filter for list_runs). find lists them.",
+            "Agent id, or id@version (run; a filter for list_runs). find lists them. enable and disable also take \"all\" or \"none\".",
+            false,
+        )
+        .array(
+            "agents",
+            "Agent ids (enable, disable, choose), or [\"all\"] / [\"none\"]. choose sets exactly these on.",
+            "string",
             false,
         )
         .object(
@@ -820,19 +845,23 @@ impl SlipstreamListing {
         base_schema: &Value,
         auto_accept_max_credits: u32,
     ) -> Self {
-        let availability = &entry.availability;
-        match availability.catalog().filter(|_| availability.is_listed()) {
-            Some(catalog) => {
-                let described = describe::describe(catalog, auto_accept_max_credits);
-                Self {
-                    identity,
-                    listed: Some((
-                        described.description.clone(),
-                        describe::schema_with(base_schema, &described),
-                    )),
-                }
+        let described = match &entry.availability {
+            Availability::Available(catalog) => {
+                describe::describe(catalog, auto_accept_max_credits)
             }
-            None => Self::hidden(identity),
+            // Agents the workspace has, none on: listed with how to turn them on, so an owner
+            // or admin can from here.
+            Availability::NoneEnabled(catalog) if !catalog.agents.is_empty() => {
+                describe::describe_none_on(catalog)
+            }
+            _ => return Self::hidden(identity),
+        };
+        Self {
+            identity,
+            listed: Some((
+                described.description.clone(),
+                describe::schema_with(base_schema, &described),
+            )),
         }
     }
 
@@ -929,7 +958,7 @@ pub fn prefetch(
 }
 
 /// After a tool call: whether this caller's listing now differs from the one it was last
-/// shown (another workspace, an agent turned on or off, Slipstream opened or closed). A
+/// shown (another workspace, an agent turned on or off, the agents opened or closed). A
 /// workspace never read is read now (briefly); a stale answer is refreshed in the
 /// background and noticed on a later call. `false` until a listing was shown.
 pub async fn listing_changed(

@@ -1,16 +1,18 @@
 //! Whether a caller's workspace has Slipstream, cached per caller and workspace.
 //!
-//! The `agents` tool is listed only when the catalog answers `200` with at least one
-//! agent an owner or admin turned on; otherwise it costs the session no prompt. The answer
-//! depends only on who asks and for which workspace, so it is cached under that pair:
+//! The `agents` tool is listed only when the catalog answers `200` with agents: with at least
+//! one turned on, described from those; with none on, as how to turn them on (an owner or
+//! admin chooses them from the tool). A workspace without agents, or not open to them, costs
+//! the session no prompt. The answer depends only on who asks and for which workspace, so it
+//! is cached under that pair:
 //!
 //! - available or none on: 5 minutes; refused (`401`/`403`, or an API without the route):
 //!   10 minutes;
 //! - unreachable (network, timeout, `5xx`): retried after 30 s, and a catalog known before the
 //!   failure keeps being served meanwhile, so a blip never takes the tool away mid-session.
 //!
-//! `find` and `run` always read the catalog fresh and record it here, which is how an agent
-//! turned on or off reaches the listing between refreshes.
+//! `find`, `run` and the settings actions always read the catalog fresh and record it here,
+//! which is how an agent turned on or off reaches the listing between refreshes.
 
 use mcp_client::ContextStreamClient;
 use mcp_types::Error;
@@ -43,6 +45,8 @@ pub(crate) enum Availability {
 }
 
 impl Availability {
+    /// The catalog answered with at least one agent on.
+    #[cfg(test)]
     pub fn is_listed(&self) -> bool {
         matches!(self, Self::Available(_))
     }

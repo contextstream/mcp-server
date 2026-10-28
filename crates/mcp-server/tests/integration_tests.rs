@@ -232,7 +232,11 @@ mod notice_conformance_tests {
             client.clone(),
             session.clone(),
         );
-        mcp_tools::domains::capsule::register_capsule_tools(&mut registry, client.clone());
+        mcp_tools::domains::capsule::register_capsule_tools(
+            &mut registry,
+            client.clone(),
+            session.clone(),
+        );
         mcp_tools::domains::coordination::register_coordination_tools(
             &mut registry,
             client.clone(),

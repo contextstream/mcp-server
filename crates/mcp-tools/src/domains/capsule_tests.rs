@@ -2,6 +2,7 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use super::*;
+use crate::domains::request_probe::RequestProbe;
 use crate::registry::ToolHandler;
 use crate::testing::TestFixtures;
 use mcp_client::CapsuleShareParams;
@@ -1153,4 +1154,228 @@ fn test_format_share_result_text_team_marks_auth_required() {
     assert!(s.contains("authenticated team link"));
     assert!(s.contains("Share policy: authenticated multi-use"));
     assert!(!s.contains("Agent URL (paste into LLMs)"));
+}
+
+// Hosted sessions keep the scope `init` resolved in session state, or carry it
+// in the connection's headers, never in the process config the API client
+// falls back to (#189). These tests run inside the per-request auth scope the
+// hosted gateway sets, which also stops `update_scope` from writing process
+// defaults.
+
+fn hosted_capsule_tool(base_url: &str) -> (CapsuleTool, Arc<mcp_session::SessionManager>) {
+    let mut config = TestFixtures::test_config();
+    config.api_url = base_url.to_string();
+    config.default_workspace_id = None;
+    config.default_project_id = None;
+    config.is_http_transport = true;
+    let client = ContextStreamClient::new(config.clone());
+    let session = Arc::new(mcp_session::SessionManager::new(client.clone(), config));
+    (
+        CapsuleTool::new(client).with_session(session.clone()),
+        session,
+    )
+}
+
+fn hosted_auth(workspace: Option<Uuid>) -> mcp_types::config::AuthOverride {
+    mcp_types::config::AuthOverride {
+        api_key: Some("test-key".to_string()),
+        workspace_id: workspace,
+        ..Default::default()
+    }
+}
+
+fn requested(probe: &RequestProbe, path: &str) -> bool {
+    let expected = format!("GET /api/v1{path}");
+    probe
+        .request_lines()
+        .iter()
+        .any(|line| line.starts_with(&expected))
+}
+
+#[tokio::test]
+async fn list_uses_the_project_that_init_resolved_in_the_session() {
+    let probe = RequestProbe::answering("[]").await;
+    let (tool, session) = hosted_capsule_tool(&probe.base_url);
+    let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+    mcp_client::run_with_auth_override(hosted_auth(None), || async {
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        tool.execute(json!({"action": "list"})).await
+    })
+    .await
+    .expect("capsule list with the session's scope");
+    assert!(
+        requested(&probe, &format!("/projects/{project}/capsules")),
+        "{:?}",
+        probe.request_lines()
+    );
+}
+
+#[tokio::test]
+async fn list_uses_the_workspace_header_when_the_session_has_no_scope() {
+    let probe = RequestProbe::answering("[]").await;
+    let (tool, _session) = hosted_capsule_tool(&probe.base_url);
+    let workspace = Uuid::new_v4();
+    mcp_client::run_with_auth_override(hosted_auth(Some(workspace)), || {
+        tool.execute(json!({"action": "list"}))
+    })
+    .await
+    .expect("capsule list with the header's workspace");
+    assert!(
+        requested(&probe, &format!("/workspaces/{workspace}/capsules")),
+        "{:?}",
+        probe.request_lines()
+    );
+}
+
+#[tokio::test]
+async fn list_in_another_workspace_does_not_borrow_the_sessions_project() {
+    let probe = RequestProbe::answering("[]").await;
+    let (tool, session) = hosted_capsule_tool(&probe.base_url);
+    let (workspace, project, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    mcp_client::run_with_auth_override(hosted_auth(None), || async {
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        tool.execute(json!({"action": "list", "workspace_id": other}))
+            .await
+    })
+    .await
+    .expect("capsule list for another workspace");
+    assert!(
+        requested(&probe, &format!("/workspaces/{other}/capsules")),
+        "{:?}",
+        probe.request_lines()
+    );
+    assert!(!requested(&probe, &format!("/projects/{project}/capsules")));
+}
+
+#[tokio::test]
+async fn list_without_any_scope_still_asks_for_one() {
+    let probe = RequestProbe::start().await;
+    let (tool, _session) = hosted_capsule_tool(&probe.base_url);
+    let error = mcp_client::run_with_auth_override(hosted_auth(None), || {
+        tool.execute(json!({"action": "list"}))
+    })
+    .await
+    .expect_err("no scope anywhere")
+    .to_string();
+    assert!(error.contains("workspace_id or project_id"), "{error}");
+    assert!(probe.request_lines().is_empty());
+}
+
+#[tokio::test]
+async fn create_fills_the_session_scope_the_call_omits() {
+    let probe = RequestProbe::start().await;
+    let (tool, session) = hosted_capsule_tool(&probe.base_url);
+    let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+    // The stub's answer is not a capsule, so the call itself fails; the request
+    // it sent is what matters.
+    let _ = mcp_client::run_with_auth_override(hosted_auth(None), || async {
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        tool.execute(json!({"action": "create", "purpose": "handoff"}))
+            .await
+    })
+    .await;
+    let body = probe
+        .body_of("POST /api/v1/capsules")
+        .expect("create request");
+    assert_eq!(body["workspace_id"], json!(workspace));
+    assert_eq!(body["project_id"], json!(project));
+    assert_eq!(body["scope"], "project");
+}
+
+#[tokio::test]
+async fn create_by_project_name_keeps_the_name_instead_of_the_sessions_project() {
+    let probe = RequestProbe::start().await;
+    let (tool, session) = hosted_capsule_tool(&probe.base_url);
+    let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+    let _ = mcp_client::run_with_auth_override(hosted_auth(None), || async {
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        tool.execute(json!({"action": "create", "project_name": "other-project"}))
+            .await
+    })
+    .await;
+    let body = probe
+        .body_of("POST /api/v1/capsules")
+        .expect("create request");
+    assert_eq!(body["workspace_id"], json!(workspace));
+    assert_eq!(body["project_name"], "other-project");
+    assert!(body.get("project_id").is_none(), "{body}");
+}
+
+fn input_with(fields: serde_json::Value) -> CapsuleInput {
+    let mut value = json!({"action": "list"});
+    for (key, field) in fields.as_object().unwrap() {
+        value[key] = field.clone();
+    }
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn fill_scope_defaults_only_fills_what_the_call_omits() {
+    let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+    let (named_workspace, named_project) = (Uuid::new_v4(), Uuid::new_v4());
+
+    let mut input = input_with(json!({}));
+    fill_scope_defaults(&mut input, (Some(workspace), Some(project)));
+    assert_eq!(input.workspace_id, Some(workspace.to_string()));
+    assert_eq!(input.project_id, Some(project.to_string()));
+
+    // Ids the call names are kept, and naming the session's own workspace
+    // still takes its project.
+    let mut input = input_with(json!({
+        "workspace_id": workspace.to_string(),
+        "project_id": named_project.to_string(),
+    }));
+    fill_scope_defaults(&mut input, (Some(workspace), Some(project)));
+    assert_eq!(input.project_id, Some(named_project.to_string()));
+    let mut input = input_with(json!({"workspace_id": workspace.to_string()}));
+    fill_scope_defaults(&mut input, (Some(workspace), Some(project)));
+    assert_eq!(input.project_id, Some(project.to_string()));
+
+    // Another workspace never inherits the session's project.
+    let mut input = input_with(json!({"workspace_id": named_workspace.to_string()}));
+    fill_scope_defaults(&mut input, (Some(workspace), Some(project)));
+    assert_eq!(input.workspace_id, Some(named_workspace.to_string()));
+    assert_eq!(input.project_id, None);
+
+    // A malformed workspace_id is left for the call to reject.
+    let mut input = input_with(json!({"workspace_id": "not-a-uuid"}));
+    fill_scope_defaults(&mut input, (Some(workspace), Some(project)));
+    assert_eq!(input.workspace_id.as_deref(), Some("not-a-uuid"));
+    assert_eq!(input.project_id, None);
+
+    // A folder or a project name picks its own project.
+    for hint in [
+        json!({"folder_path": "/work/app"}),
+        json!({"project_name": "app"}),
+    ] {
+        let mut input = input_with(hint);
+        fill_scope_defaults(&mut input, (Some(workspace), Some(project)));
+        assert_eq!(input.workspace_id, Some(workspace.to_string()));
+        assert_eq!(input.project_id, None);
+    }
+
+    // No session scope: nothing to fill.
+    let mut input = input_with(json!({}));
+    fill_scope_defaults(&mut input, (None, None));
+    assert_eq!((input.workspace_id, input.project_id), (None, None));
+}
+
+#[test]
+fn only_actions_that_read_a_scope_get_the_session_defaults() {
+    for action in ["create", "list", "list_shares", "audit", "primer"] {
+        assert!(SCOPE_DEFAULTED_ACTIONS.contains(&action), "{action}");
+    }
+    // `open` keys its cache on the workspace a call names; the session's must
+    // not switch that cache on.
+    for action in ["open", "get", "delete", "share", "revoke_share"] {
+        assert!(!SCOPE_DEFAULTED_ACTIONS.contains(&action), "{action}");
+    }
 }

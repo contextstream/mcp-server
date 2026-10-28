@@ -7538,8 +7538,43 @@ fn query_explicitly_targets_artifacts(query: &str) -> bool {
         || lower.contains("coverage")
 }
 
-fn should_filter_artifact_paths(_requested_mode: SearchMode, query: &str) -> bool {
-    !query_explicitly_targets_artifacts(query)
+fn should_filter_artifact_paths(requested_mode: SearchMode, query: &str) -> bool {
+    !matches!(requested_mode, SearchMode::Exhaustive | SearchMode::Keyword)
+        && !query_explicitly_targets_artifacts(query)
+}
+
+/// Drop rows from build output (`dist/`, `.min.js`, sourcemaps) that nothing
+/// vouches for, and return how many went. Exact modes keep every row, and in
+/// any mode a row the server verified to contain the text stays: those files
+/// are exact-search only, so an exact hit there is the answer, and hiding it
+/// would turn a found literal into a "not found".
+fn suppress_artifact_rows(
+    result: &mut SearchResponse,
+    requested_mode: SearchMode,
+    query: &str,
+) -> usize {
+    if result.results.is_empty() || !should_filter_artifact_paths(requested_mode, query) {
+        return 0;
+    }
+    let before = result.results.len();
+    result
+        .results
+        .retain(|item| result_has_literal_hit(item) || !result_has_artifact_like_path(item));
+    let removed = before - result.results.len();
+    if removed > 0 {
+        result.total = Some(result.results.len() as i64);
+    }
+    removed
+}
+
+fn result_has_literal_hit(item: &mcp_types::api::SearchResult) -> bool {
+    matches!(
+        item.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("literal_match"))
+            .and_then(Value::as_str),
+        Some("exact" | "ignoring_case" | "fragment")
+    )
 }
 
 fn is_compact_paths_response(response: &SearchResponse) -> bool {
@@ -12279,23 +12314,15 @@ impl SearchTool {
                 );
             }
         }
-        if should_filter_artifact_paths(requested_mode, &input.query) && !result.results.is_empty()
-        {
-            let before = result.results.len();
-            result
-                .results
-                .retain(|item| !result_has_artifact_like_path(item));
-            let removed = before.saturating_sub(result.results.len());
-            if removed > 0 {
-                result.total = Some(result.results.len() as i64);
-                mode_fallback_note = append_note(
-                    mode_fallback_note,
-                    &format!(
-                        "Suppressed {} build/artifact path result(s) (e.g. `.next`, sourcemaps).",
-                        removed
-                    ),
-                );
-            }
+        let removed = suppress_artifact_rows(&mut result, requested_mode, &input.query);
+        if removed > 0 {
+            mode_fallback_note = append_note(
+                mode_fallback_note,
+                &format!(
+                    "Suppressed {} build/artifact path result(s) (e.g. `.next`, sourcemaps).",
+                    removed
+                ),
+            );
         }
         // Duplicate suppression: collapse mirror-prefix duplicates (requirement #5)
         // First, canonicalize file paths so internal storage paths

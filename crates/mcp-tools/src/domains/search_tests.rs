@@ -4691,9 +4691,13 @@ mod auto_mode_tests {
             SearchMode::Pattern,
             "dashboard-settings-dialog*"
         ));
-        assert!(should_filter_artifact_paths(
+        assert!(!should_filter_artifact_paths(
             SearchMode::Exhaustive,
             "NotificationBell"
+        ));
+        assert!(!should_filter_artifact_paths(
+            SearchMode::Keyword,
+            "nebulaPrismMinified"
         ));
         assert!(!should_filter_artifact_paths(
             SearchMode::Pattern,
@@ -8670,6 +8674,60 @@ mod literal_contract_tests {
             content: Some("show once it's in a conversation".to_string()),
             metadata: literal.map(|value| json!({ "literal_match": value })),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exact_modes_keep_bundle_hits_and_other_modes_keep_verified_literal_hits() {
+        let bundles = [
+            "public/js/vendor.min.js",
+            "web/dist/app.js",
+            "web/build/app.js",
+        ];
+        let page = |literal: &str| SearchResponse {
+            results: bundles
+                .iter()
+                .map(|path| row(path, 1, 1.0, Some(literal)))
+                .chain([row("src/app.js", 1, 1.0, Some(literal))])
+                .collect(),
+            total: Some(4),
+            ..Default::default()
+        };
+        for mode in [SearchMode::Keyword, SearchMode::Exhaustive] {
+            for literal in ["exact", "ignoring_case", "fragment", "none"] {
+                let mut response = page(literal);
+                assert_eq!(
+                    suppress_artifact_rows(&mut response, mode, "nebulaPrismMinified"),
+                    0,
+                    "{mode:?} {literal}"
+                );
+                assert_eq!(response.results.len(), 4);
+            }
+        }
+        for mode in [
+            SearchMode::Hybrid,
+            SearchMode::Semantic,
+            SearchMode::Pattern,
+        ] {
+            // Rows the server verified keep their place in every mode...
+            for literal in ["exact", "ignoring_case", "fragment"] {
+                let mut response = page(literal);
+                assert_eq!(
+                    suppress_artifact_rows(&mut response, mode, "nebulaPrismMinified"),
+                    0,
+                    "{mode:?} {literal}"
+                );
+            }
+            // ...and unverified build output is still dropped.
+            let mut response = page("none");
+            assert_eq!(
+                suppress_artifact_rows(&mut response, mode, "nebulaPrismMinified"),
+                3,
+                "{mode:?}"
+            );
+            assert_eq!(response.results.len(), 1);
+            assert_eq!(response.results[0].file_path.as_deref(), Some("src/app.js"));
+            assert_eq!(response.total, Some(1));
         }
     }
 

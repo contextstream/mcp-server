@@ -86,6 +86,29 @@ come from the August 1 run on the same queries. The agent-task result uses one
 repository and one agent model, so treat it as directional.
 [Results, methodology, and limitations](https://contextstream.io/benchmarks).
 
+## ContextStudio
+
+For people ContextStream Create offers one-prompt making to, the server adds one tool,
+`studio`: ask for a film, a product explainer filmed from your connected product, an
+image, sound or music in plain words, and ContextStudio's producer plans the pieces from
+what your team knows (brand kit, docs, decisions, connected products). There are no models
+to pick.
+
+- **Plan, then price.** `plan` returns the pieces and one price ("up to N credits, likely
+  about M") and spends nothing. Pass what your agent knows that the workspace may not (the
+  diff it just made, release notes, the doc it has open) as `context`; the producer reads
+  it next to the team's own context.
+- **Your go-ahead.** `make` spends at most the plan's price, and only after you agree: a
+  client that can ask you (MCP elicitation, or a stateless `input_required` result) asks
+  you itself; otherwise the agent passes the price you accepted.
+- **Following it.** `status` reports each piece while it waits (with
+  `notifications/progress` where the call asks for them); a product film takes 13 to 21
+  minutes. `result` shows images inline and links video and sound (signed links valid
+  about 15 minutes), with each piece's placard. Also `revise`, `stop`, `library`, `brand`
+  and `products`.
+- **Connector.** The hosted path `/studio` serves only this tool, for Claude.ai or ChatGPT
+  connectors, with OAuth tokens bound to that resource (`read:studio`, `write:studio`).
+
 ## Data controls
 
 **Scoped access. Traceable sources. Configurable capture.**

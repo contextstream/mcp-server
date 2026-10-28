@@ -346,6 +346,9 @@ pub enum ToolSurfaceProfile {
     /// `workflow_save`, `workflow_delete`). Served at `/coach`; a server
     /// configured with it stays coach-only whatever a client asks for.
     Coach,
+    /// ContextStudio: only the `studio` tool, always listed. Served at
+    /// `/studio`, the ContextStudio connector.
+    Studio,
 }
 
 impl FromStr for ToolSurfaceProfile {
@@ -356,6 +359,7 @@ impl FromStr for ToolSurfaceProfile {
             "default" | "standard" | "full" => Ok(Self::Default),
             "openai" | "openai_agentic" | "agentic" | "agentic_openai" => Ok(Self::OpenaiAgentic),
             "coach" | "agent_coach_kit" => Ok(Self::Coach),
+            "studio" | "contextstudio" => Ok(Self::Studio),
             _ => Err(()),
         }
     }
@@ -367,6 +371,7 @@ impl ToolSurfaceProfile {
             Self::Default => "default",
             Self::OpenaiAgentic => "openai_agentic",
             Self::Coach => "coach",
+            Self::Studio => "studio",
         }
     }
 }

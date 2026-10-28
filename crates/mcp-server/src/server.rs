@@ -15,7 +15,7 @@ use mcp_types::{
 };
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -120,6 +120,9 @@ pub fn build_registry(
     // Slipstream agents: registered everywhere, listed per caller (only for a
     // workspace with agents turned on) by `with_slipstream_listing`.
     domains::slipstream::register_slipstream_tools(&mut registry, client.clone(), session.clone());
+    // ContextStudio making: registered everywhere, listed per caller (only for a
+    // person Create offers one-prompt making to) by `with_slipstream_listing`.
+    domains::studio::register_studio_tools(&mut registry, client.clone(), session.clone());
     // Agent Coach Kit: registered everywhere, visible only on the coach
     // surface (`/coach`, or CONTEXTSTREAM_TOOL_SURFACE_PROFILE=coach).
     domains::coach::register_coach_tools(&mut registry, client.clone());
@@ -246,6 +249,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "feed" => "Updating ContextStream feed".to_string(),
         "qa" => "Asking ContextStream Q&A".to_string(),
         "agents" | "slipstream" => "Asking a ContextStream agent".to_string(),
+        "studio" => "Working in ContextStudio".to_string(),
         "project" => "Updating ContextStream project".to_string(),
         "workspace" => "Updating ContextStream workspace".to_string(),
         "capsule" => "Saving ContextStream capsule".to_string(),
@@ -284,6 +288,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "feed" => "ContextStream feed updated".to_string(),
         "qa" => "ContextStream Q&A complete".to_string(),
         "agents" | "slipstream" => "ContextStream agent answered".to_string(),
+        "studio" => "ContextStudio answered".to_string(),
         "project" => "ContextStream project updated".to_string(),
         "workspace" => "ContextStream workspace updated".to_string(),
         "capsule" => "ContextStream capsule saved".to_string(),
@@ -300,7 +305,19 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "completed": completed,
     });
 
-    if domains::slipstream::is_tool_name(name) {
+    if name == domains::studio::TOOL_NAME {
+        metadata["actions"] = serde_json::json!({
+            "plan": "Planning in ContextStudio",
+            "make": "Making in ContextStudio",
+            "status": "Checking a ContextStudio making",
+            "result": "Reading what ContextStudio made",
+            "revise": "Planning a revision in ContextStudio",
+            "stop": "Stopping a ContextStudio making",
+            "library": "Listing ContextStudio makings",
+            "brand": "Reading the brand kit",
+            "products": "Listing connected products"
+        });
+    } else if domains::slipstream::is_tool_name(name) {
         metadata["actions"] = serde_json::json!({
             "find": "Listing ContextStream agents",
             "run": "Running a ContextStream agent",
@@ -811,13 +828,27 @@ pub(crate) async fn with_slipstream_listing(
     category: Option<&str>,
     tools: &mut Vec<serde_json::Value>,
 ) {
+    // Both catalogs are read at once: a listing waits for the slower, not the sum.
+    let (slipstream, studio) = tokio::join!(
+        slipstream_listing_entry(registry, client, session, category),
+        studio_listing_entry(registry, client, category),
+    );
+    for entry in [slipstream, studio].into_iter().flatten() {
+        insert_sorted(tools, entry);
+    }
+}
+
+async fn slipstream_listing_entry(
+    registry: &ToolRegistry,
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    category: Option<&str>,
+) -> Option<serde_json::Value> {
     use domains::slipstream;
     // Not on this surface (router, OpenAI agentic, coach, a light toolset): nothing to add.
-    let Some(tool) = registry.get(slipstream::TOOL_NAME) else {
-        return;
-    };
+    let tool = registry.get(slipstream::TOOL_NAME)?;
     if !requested_category_matches(category, tool.metadata.category.as_str()) {
-        return;
+        return None;
     }
     let gate = slipstream::SlipstreamGate::global();
     let listing = slipstream::listing(
@@ -830,10 +861,40 @@ pub(crate) async fn with_slipstream_listing(
     .await;
     listing.mark_advertised(&gate);
     if !listing.is_listed() {
-        return;
+        return None;
     }
     let mut entry = contextstream_tool_list_entry(tool);
     listing.apply(&mut entry);
+    Some(entry)
+}
+
+/// `studio` for a caller Create offers one-prompt making to (`domains::studio::gate`),
+/// waiting at most `studio::LISTING_BUDGET` for the catalog; on the ContextStudio surface,
+/// always.
+async fn studio_listing_entry(
+    registry: &ToolRegistry,
+    client: &ContextStreamClient,
+    category: Option<&str>,
+) -> Option<serde_json::Value> {
+    use domains::studio;
+    let tool = registry.get(studio::TOOL_NAME)?;
+    if !requested_category_matches(category, tool.metadata.category.as_str()) {
+        return None;
+    }
+    if !registry.is_studio_surface()
+        && !studio::listed(
+            &studio::StudioGate::global(),
+            client,
+            studio::LISTING_BUDGET,
+        )
+        .await
+    {
+        return None;
+    }
+    Some(contextstream_tool_list_entry(tool))
+}
+
+fn insert_sorted(tools: &mut Vec<serde_json::Value>, entry: serde_json::Value) {
     tools.push(entry);
     tools.sort_by(|left, right| {
         left.get("name")
@@ -985,48 +1046,44 @@ impl TokenizerWarmup {
 }
 
 /// Run the stdio transport for JSON-RPC.
+///
+/// A reader task reads the client's lines (see `transport::stdio_peer`): answers to this
+/// server's own requests reach the tool call waiting on them, and everything else is
+/// handled here, one message at a time, in arrival order. A tool call runs with the client
+/// as its peer (`mcp_tools::peer`), so it can report progress when the call carried a
+/// progress token and ask the person a question when the client can elicit.
 async fn run_stdio_transport(
     registry: ToolRegistry,
     client: ContextStreamClient,
     session: Arc<SessionManager>,
     telemetry: AgenticTelemetry,
 ) -> Result<()> {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
+    use crate::transport::stdio_peer::{read_client, LineWriter, StdioPeer};
 
-    let mut reader = BufReader::new(stdin);
-    let mut stdout = stdout;
+    let writer = Arc::new(LineWriter::new(tokio::io::stdout()));
+    let peer = Arc::new(StdioPeer::new(writer.clone()));
+    let (queue, mut incoming) = tokio::sync::mpsc::channel::<String>(64);
+    tokio::spawn(read_client(
+        BufReader::new(tokio::io::stdin()),
+        peer.pending(),
+        queue,
+    ));
 
     let registry = Arc::new(registry);
     let client = Arc::new(client);
     let mut tokenizer_warmup = TokenizerWarmup::new();
     // Whether this client was told `tools.listChanged` at initialize.
     let mut announces_tool_changes = false;
+    // Whether this client said at initialize that it can ask its person (elicitation).
+    let mut client_can_elicit = false;
 
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line).await?;
-
-        if bytes_read == 0 {
-            // EOF - client disconnected
-            debug!("Client disconnected");
-            break;
-        }
-
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
+    while let Some(line) = incoming.recv().await {
         // Parse JSON-RPC request
-        let request: serde_json::Value = match serde_json::from_str(line) {
+        let request: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
                 let error_response = json_rpc_error(None, -32700, &format!("Parse error: {}", e));
-                stdout.write_all(error_response.as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await?;
+                writer.write_line(&error_response).await?;
                 continue;
             }
         };
@@ -1034,27 +1091,48 @@ async fn run_stdio_transport(
         let method = request.get("method").and_then(serde_json::Value::as_str);
         let is_initialize = method == Some("initialize");
         let is_tool_call = method == Some("tools/call");
+        let params = request
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         // Only an initialize-era session was told tools may change (listChanged).
-        let legacy_initialize = is_initialize
-            && !has_stateless_protocol_metadata(
-                request.get("params").unwrap_or(&serde_json::Value::Null),
-            );
+        let legacy_initialize = is_initialize && !has_stateless_protocol_metadata(&params);
         if !is_initialize && !method.is_some_and(|method| method.starts_with("notifications/")) {
             // Anything that can produce a tool result observes a warm
             // vocabulary, exactly as when it was loaded before serving.
             tokenizer_warmup.wait().await;
         }
+        if legacy_initialize {
+            client_can_elicit = mcp_tools::peer::CallPeer::client_can_elicit(&params);
+        }
 
         let wire_observation = mcp_tools::wire_tokens::WireTokenObservation::default();
-        let response = handle_request(
+        let handled = handle_request(
             &registry,
             &client,
             &session,
             &telemetry,
             request,
             wire_observation.clone(),
-        )
-        .await;
+        );
+        // A tool call can report progress to its client mid-call. An initialize-era
+        // session's client is asked questions live (it declared elicitation at initialize);
+        // a stateless (2026-07-28) call carries its own capabilities, and a question goes
+        // back as its result (`input_required`), answered in the call that follows.
+        let response = if is_tool_call {
+            let stateless = has_stateless_protocol_metadata(&params);
+            let mut call_peer = mcp_tools::peer::CallPeer::new(
+                peer.clone(),
+                mcp_tools::peer::CallPeer::progress_token_of(&params),
+                !stateless && client_can_elicit,
+            );
+            if stateless && mcp_tools::peer::CallPeer::stateless_client_can_elicit(&params) {
+                call_peer = call_peer.with_inline_input(&params);
+            }
+            mcp_tools::peer::run_with_call_peer(call_peer, handled).await
+        } else {
+            handled.await
+        };
 
         // Don't write empty responses (e.g. for notifications)
         if !response.is_empty() {
@@ -1065,9 +1143,7 @@ async fn run_stdio_transport(
                 &wire_observation,
                 "mcp_stdio_final_response",
             );
-            stdout.write_all(response.as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+            writer.write_line(&response).await?;
         }
 
         if is_initialize {
@@ -1085,9 +1161,7 @@ async fn run_stdio_transport(
         if announces_tool_changes && is_tool_call {
             if let Some(notice) = slipstream_list_changed_notice(&registry, &client, &session).await
             {
-                stdout.write_all(notice.as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await?;
+                writer.write_line(notice).await?;
             }
         }
 
@@ -1099,6 +1173,7 @@ async fn run_stdio_transport(
             exec_updated_binary();
         }
     }
+    debug!("Client disconnected");
 
     Ok(())
 }
@@ -1302,6 +1377,9 @@ fn build_legacy_initialize_result_with_teaching(
     if registry.is_coach_surface() {
         return build_coach_initialize_result(registry, protocol_version);
     }
+    if registry.is_studio_surface() {
+        return build_studio_initialize_result(protocol_version);
+    }
     let mut result = serde_json::json!({
         "protocolVersion": protocol_version,
         "capabilities": {
@@ -1332,6 +1410,29 @@ fn build_legacy_initialize_result_with_teaching(
     }
 
     result
+}
+
+// ============================================================================
+// ContextStudio surface
+// ============================================================================
+
+/// The name the ContextStudio connector introduces itself with.
+pub(crate) const STUDIO_SERVER_NAME: &str = "contextstudio";
+
+/// `initialize` on the ContextStudio surface: its own identity and a short note on
+/// how its one tool is used.
+pub(crate) fn build_studio_initialize_result(protocol_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": protocol_version,
+        "capabilities": {"tools": {"listChanged": false}},
+        "serverInfo": {
+            "name": STUDIO_SERVER_NAME,
+            "title": "ContextStudio",
+            "version": mcp_types::config::VERSION
+        },
+        "instructions": "ContextStudio makes films, product explainers, images, sound and music from one plain request, produced from what the team knows. Use the studio tool: plan first (it spends nothing), show the person the plan and its one price, make it only with their go-ahead, then follow status until it ends and show the result.",
+        "toolCount": 1
+    })
 }
 
 // ============================================================================
@@ -1631,7 +1732,17 @@ async fn handle_request_dispatch(
         "server/discover" if registry.is_coach_surface() => {
             json_rpc_result(id, build_coach_stateless_discover_result())
         }
-        "server/discover" => json_rpc_result(id, build_contextstream_stateless_discover_result()),
+        "server/discover" => {
+            // A stateless client lists tools right after this, with no initialize: read
+            // the studio offer now so that listing finds it ready.
+            if registry.get(domains::studio::TOOL_NAME).is_some() {
+                domains::studio::prefetch(
+                    domains::studio::StudioGate::global(),
+                    (**client).clone(),
+                );
+            }
+            json_rpc_result(id, build_contextstream_stateless_discover_result())
+        }
 
         "resources/list" if registry.is_coach_surface() => {
             json_rpc_result(id, coach_resources_list())
@@ -1662,6 +1773,12 @@ async fn handle_request_dispatch(
                     domains::slipstream::SlipstreamGate::global(),
                     (**client).clone(),
                     session.clone(),
+                );
+            }
+            if registry.get(domains::studio::TOOL_NAME).is_some() {
+                domains::studio::prefetch(
+                    domains::studio::StudioGate::global(),
+                    (**client).clone(),
                 );
             }
             if crate::readiness_evidence_writes_enabled() {
@@ -1722,6 +1839,7 @@ async fn handle_request_dispatch(
             if tool_name != "init"
                 && tool_name != "context"
                 && !domains::coach::is_coach_tool(tool_name)
+                && !registry.is_studio_surface()
                 && !session.is_initialized().await
             {
                 debug!(
@@ -1930,7 +2048,9 @@ async fn handle_request_dispatch(
                         Some(contextstream_call_icon(tool_name).to_string()),
                     )
                     .with_structured_content(include_workflow_contract);
-                    let payload = mcp_tools::wire_tokens::tool_result_payload(&result, &context);
+                    let mut payload =
+                        mcp_tools::wire_tokens::tool_result_payload(&result, &context);
+                    with_input_required(&mut payload);
                     json_rpc_result(id, payload)
                 }
                 Err(e) => {
@@ -1960,6 +2080,9 @@ async fn handle_request_dispatch(
                                     let mut r = serde_json::json!({"type": "resource", "uri": uri});
                                     if let Some(mt) = mime_type { r["mimeType"] = serde_json::json!(mt); }
                                     r
+                                }
+                                link @ mcp_types::tool::ContentItem::ResourceLink { .. } => {
+                                    serde_json::to_value(link).unwrap_or_default()
                                 }
                             }).collect();
                             serde_json::json!({
@@ -2008,6 +2131,18 @@ async fn handle_request_dispatch(
                 json_rpc_error(id, -32601, &format!("Method not found: {}", method))
             }
         }
+    }
+}
+
+/// A stateless call that ended with a question for the person carries it as its result
+/// (`resultType: "input_required"`, `inputRequests`, `requestState`; see `mcp_tools::peer`).
+pub(crate) fn with_input_required(payload: &mut serde_json::Value) {
+    let Some(question) = mcp_tools::peer::current().and_then(|peer| peer.take_input_required())
+    else {
+        return;
+    };
+    if let (Some(target), serde_json::Value::Object(fields)) = (payload.as_object_mut(), question) {
+        target.extend(fields);
     }
 }
 

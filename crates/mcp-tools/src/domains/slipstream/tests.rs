@@ -485,6 +485,10 @@ fn a_large_catalog_is_shortened_gracefully_and_never_over_budget() {
     }
     assert_eq!(shorten("short", 10), "short");
     assert_eq!(shorten("one two three four five", 12), "one two…");
+    assert_eq!(
+        shorten("where things live: how to build", 21),
+        "where things live…"
+    );
 }
 
 #[test]
@@ -1648,6 +1652,10 @@ fn the_form_lists_every_agent_with_those_on_checked() {
         .as_str()
         .unwrap()
         .starts_with("Mail and research: Reads your recent mail"));
+    // A cut job ends in "…", never "….".
+    assert!(properties
+        .values()
+        .all(|p| !p["description"].as_str().unwrap().contains("….")));
 
     // Either answer reads back as the agents to have on.
     let picked = |content: Value| chosen(&catalog, content.as_object().unwrap());

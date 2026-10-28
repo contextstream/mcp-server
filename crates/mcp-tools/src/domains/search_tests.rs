@@ -8133,6 +8133,151 @@ mod scope_widening_tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exhaustive_literal_page_keeps_indexed_lines_without_local_twins() {
+        let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("quasar.js"),
+            "local quasarTune\nother\nlocal quasarTune\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("uncommitted.js"), "quasarTune").unwrap();
+        let server = RoutedServer::spawn(Box::new(move |line, _| {
+            if line.contains("/search/") {
+                return (200, json!({
+                    "results": [
+                        {"id":"a", "file_path":"quasar.js", "start_line":1, "content":"indexed quasarTune", "score":1.0, "metadata":{"literal_match":"exact"}},
+                        {"id":"b", "file_path":"quasar.js", "start_line":3, "content":"indexed quasarTune again", "score":1.0, "metadata":{"literal_match":"exact"}},
+                        {"id":"c", "file_path":"deleted.js", "start_line":2, "content":"quasarTune", "score":1.0, "metadata":{"literal_match":"exact"}}
+                    ],
+                    "total":3, "project_index_state":"ready",
+                    "literal_match":{"complete":true,"found":true,"statement":"3 indexed matching lines."}
+                }).to_string());
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            (404, json!({"error":"not found"}).to_string())
+        }));
+        let mut config = TestFixtures::test_config();
+        config.api_url = server.base_url.clone();
+        config.default_workspace_id = Some(workspace);
+        config.default_project_id = Some(project);
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        session
+            .update_scope(
+                Some(workspace),
+                Some(project),
+                Some(temp.path().to_string_lossy().into_owned()),
+            )
+            .await;
+        let keeper = create_mock_index_keeper(&client, &session);
+        let tool = SearchTool::new(
+            client,
+            session,
+            keeper,
+            mcp_types::atlas_layer::noop_layer(),
+        );
+        let result = tool.execute(json!({"query":"quasarTune","mode":"exhaustive","project_id":project,"workspace_id":workspace})).await.unwrap();
+        let structured = result.structured_content.as_ref().unwrap();
+        let rows = structured["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{}", text_of(&result));
+        assert_eq!(rows[0]["content"], "indexed quasarTune");
+        assert_eq!(rows[1]["start_line"], 3);
+        assert!(rows[2]["file_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/deleted.js"));
+        assert_eq!(structured["total"], 3);
+    }
+
+    /// #222: a literal that lives only in a minified bundle or `dist/` file is
+    /// found by the exact modes, and no mode lets "[LITERAL] found" be followed
+    /// by an empty result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_literal_hit_in_a_bundle_is_returned_not_suppressed() {
+        let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+        let server = RoutedServer::spawn(Box::new(move |line, _| {
+            if line.contains("/search/") {
+                return (200, json!({
+                    "results": [
+                        {"id":"a", "file_path":"public/js/vendor.min.js", "start_line":1, "content":"nebulaPrismMinified", "score":0.8, "metadata":{"literal_match":"exact"}},
+                        {"id":"b", "file_path":"web/dist/noise.js", "start_line":1, "content":"unrelated", "score":0.6, "metadata":{"literal_match":"none"}}
+                    ],
+                    "total":2, "project_index_state":"ready",
+                    "literal_match":{"complete":true,"found":true,"files":1,"lines":1,"statement":"1 line(s) in 1 file(s) contain the text exactly (case-sensitive)."}
+                }).to_string());
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            (404, json!({"error":"not found"}).to_string())
+        }));
+        let (tool, session) = gateway_tool(&server.base_url);
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        for mode in ["exhaustive", "keyword", "hybrid"] {
+            let result = tool
+                .execute(json!({"query":"nebulaPrismMinified","mode":mode}))
+                .await
+                .unwrap();
+            let text = text_of(&result);
+            let paths: Vec<&str> = result.structured_content.as_ref().unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|row| row["file_path"].as_str())
+                .collect();
+            assert!(paths.contains(&"public/js/vendor.min.js"), "{mode}: {text}");
+            assert!(
+                text.contains("[LITERAL] 1 line(s) in 1 file(s)"),
+                "{mode}: {text}"
+            );
+            assert!(!text.contains("relevance threshold"), "{mode}: {text}");
+            // Exact modes list the whole page; the others still drop build
+            // output the server did not verify.
+            assert_eq!(
+                paths.contains(&"web/dist/noise.js"),
+                mode != "hybrid",
+                "{mode}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exhaustive_checked_absence_does_not_render_a_ranking_miss() {
+        let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+        let server = RoutedServer::spawn(Box::new(move |line, _| {
+            if line.contains("/search/") {
+                return (200, json!({"results":[],"total":0,"project_index_state":"ready",
+                    "literal_match":{"complete":true,"found":false,"statement":"No indexed file contains this text."}
+                }).to_string());
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            (404, json!({"error":"not found"}).to_string())
+        }));
+        let (tool, session) = gateway_tool(&server.base_url);
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        let result = tool
+            .execute(json!({"query":"zzqxAbsentLiteral9931","mode":"exhaustive"}))
+            .await
+            .unwrap();
+        let text = text_of(&result);
+        assert!(
+            text.contains("[LITERAL] No indexed file contains"),
+            "{text}"
+        );
+        assert!(!text.contains("relevance threshold"), "{text}");
+        assert!(!text.contains("Rephrase"), "{text}");
+    }
+
     /// Routes for a workspace where project P exists but its project-scoped
     /// search fails transiently (404), while a workspace-wide search would
     /// return project Q's file `f`.
@@ -8798,6 +8943,30 @@ mod literal_contract_tests {
             ..response.clone()
         };
         assert!(!server_literal_page(&without, SearchMode::Exhaustive));
+    }
+
+    #[test]
+    fn literal_empty_pages_never_describe_a_ranking_miss() {
+        for (complete, found) in [(true, false), (true, true), (false, false)] {
+            let response = SearchResponse {
+                literal_match: Some(json!({"complete": complete, "found": found})),
+                ..Default::default()
+            };
+            let message = literal_empty_page_message(&response).unwrap();
+            assert!(!message.contains("relevance"));
+            assert!(!message.contains("Rephrase"));
+            if !complete {
+                assert!(message.contains("absence has not been established"));
+                assert!(message.contains("index_status"));
+            } else if found {
+                // Matches exist, only not on this page: never say none.
+                assert!(message.contains("[LITERAL]"), "{message}");
+                assert!(!message.contains("No literal matches"), "{message}");
+            } else {
+                assert!(message.starts_with("No literal matches"), "{message}");
+            }
+        }
+        assert!(literal_empty_page_message(&SearchResponse::default()).is_none());
     }
 
     #[test]

@@ -3819,6 +3819,21 @@ fn server_literal_page(result: &SearchResponse, executed_mode: SearchMode) -> bo
     matches!(executed_mode, SearchMode::Exhaustive) && result.literal_match.is_some()
 }
 
+/// What an empty exhaustive page says after its `[LITERAL]` line, in place of
+/// the ranking-miss advice ("did not meet the relevance threshold, rephrase"):
+/// the page is a grep over the indexed commit, so an empty one is an answer,
+/// not a weak ranking.
+fn literal_empty_page_message(result: &SearchResponse) -> Option<&'static str> {
+    let summary = result.literal_match.as_ref()?;
+    if summary.get("complete").and_then(Value::as_bool) != Some(true) {
+        Some("Literal check is incomplete; absence has not been established. Check project(action=\"index_status\") and retry.\n")
+    } else if summary.get("found").and_then(Value::as_bool) == Some(true) {
+        Some("No rows on this page; the [LITERAL] line above counts the matching lines.\n")
+    } else {
+        Some("No literal matches.\n")
+    }
+}
+
 fn is_doc_lookup_query(query: &str) -> bool {
     let lower = query.trim().to_lowercase();
     if lower.is_empty() {
@@ -12557,11 +12572,23 @@ impl SearchTool {
         );
         harmonize_project_index_state(&mut result, index_health.as_ref());
         let dirty_file_hints = activity_file_hints.clone();
+        // Exhaustive rows describe the committed index, including all matching
+        // lines and pagination. Local overlays must not rewrite that evidence
+        // or append a second representation of the same hit.
+        let literal_page = server_literal_page(&result, executed_mode);
+        let parallel_local_handle = if literal_page {
+            if let Some(handle) = parallel_local_handle {
+                handle.abort();
+            }
+            None
+        } else {
+            parallel_local_handle
+        };
 
         // Prune results for files deleted or ignored in the local working tree before
         // computing no_hits, so a drifted index never silently serves hits for
         // files that no longer exist. Guarded to local directories only.
-        if !scope_invalid && local_files_allowed {
+        if !scope_invalid && local_files_allowed && !literal_page {
             if let Some(ref fp) = folder_path {
                 let folder = Path::new(fp);
                 if folder.is_dir() {
@@ -12625,7 +12652,7 @@ impl SearchTool {
         let mut local_enrichment_diagnostic: Option<LocalEnrichDiagnostic> = None;
         // Local filesystem enrichment: supplement API results with live filesystem scanning.
         // Apply only when scope is stable and the query shape is likely to benefit.
-        if !scope_invalid && local_files_allowed {
+        if !scope_invalid && local_files_allowed && !literal_page {
             if let Some(ref fp) = folder_path {
                 let folder = PathBuf::from(fp);
                 let existing_paths: HashSet<String> = result
@@ -12798,9 +12825,6 @@ impl SearchTool {
             }
         }
 
-        // A server literal page is already exact and in grep order.
-        let literal_page = server_literal_page(&result, executed_mode);
-
         if literal_page {
             // nothing to rerank
         } else if let Some(note) = apply_symbol_anchor_rerank(&mut result, &input.query) {
@@ -12843,6 +12867,7 @@ impl SearchTool {
         if no_hits
             && !scope_invalid
             && local_files_allowed
+            && !literal_page
             && is_local_keyword_enrichment_query(&input.query)
         {
             if let Some(ref fp) = folder_path {
@@ -13056,7 +13081,7 @@ impl SearchTool {
             );
         }
 
-        if local_files_allowed {
+        if local_files_allowed && !literal_page {
             if let Some(folder) = folder_path.as_deref() {
                 deduplicate_local_result_locations(&mut result, Path::new(folder));
             }
@@ -13281,6 +13306,11 @@ impl SearchTool {
                         ));
                     }
                 }
+            } else if let Some(message) = literal_page
+                .then(|| literal_empty_page_message(&result))
+                .flatten()
+            {
+                text.push_str(message);
             } else if let Some((docs, fallback_project_id)) = docs_fallback.as_ref() {
                 let scope = fallback_project_id
                     .map(|id| format!(" (project_id: {})", id))

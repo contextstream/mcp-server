@@ -240,9 +240,11 @@
   are now created 0755, and `setup`, `init`, `update`,
   `contextstream-mcp git-hooks` and `doctor --repair --scope project` restore
   the execute bit on a managed hook that lacks it (`doctor --repair` still
-  needs a configured editor or `--editors`, and leaves a `.contextstream.bak`
-  copy of each hook it repairs). `doctor` has a new `git_hooks` check that
-  fails when a managed hook is not executable (#179).
+  needs a configured editor or `--editors`. It leaves a `.contextstream.bak`
+  copy of a hook only when it rewrites the hook's content; a hook that lacked
+  just its execute bit is not rewritten, so it gets no backup). `doctor` has a
+  new `git_hooks` check that fails when a managed hook is not executable
+  (#179).
 - Search no longer returns every file twice after `project(action="ingest_local")`
   or the background refresh that `init` starts. The index also holds a
   file-level summary row for each file at line 0. When the same file (in the

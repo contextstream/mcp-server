@@ -2309,6 +2309,40 @@ fn validate_repair_scope(options: &DoctorOptions) -> Result<()> {
     Ok(())
 }
 
+/// Refresh the managed git hooks that are already installed in the project's
+/// repository, which also restores the execute bit on hooks that earlier
+/// releases created as 0600. Never installs hooks into a repository that has
+/// none: `None` means there was nothing managed to refresh.
+///
+/// Returns what changed, to be reported. A dry run's `safe_edit` plan already
+/// lists each hook it would rewrite, so it adds only the execute bit it would
+/// restore, which the plan cannot show because it is not a content change.
+fn repair_managed_git_hooks(
+    project_path: Option<&Path>,
+    dry_run: bool,
+) -> Option<Result<Vec<RepairChange>>> {
+    let repo_root = project_path.and_then(super::git_hooks::resolve_repo_root)?;
+    let has_managed = super::git_hooks::managed_hooks_status(&repo_root)
+        .is_some_and(|status| !status.installed.is_empty());
+    if !has_managed {
+        return None;
+    }
+    Some(
+        super::git_hooks::install_git_hooks_reporting(&repo_root).map(|changes| {
+            changes
+                .into_iter()
+                .filter(|change| {
+                    !dry_run || change.action == super::git_hooks::HOOK_EXECUTE_BIT_RESTORED
+                })
+                .map(|change| RepairChange {
+                    path: change.path.display().to_string(),
+                    action: change.action,
+                })
+                .collect()
+        }),
+    )
+}
+
 async fn run_repairs(options: &DoctorOptions, targets: &[Editor]) -> DoctorRepairReport {
     let scope = options.scope.as_cli_value();
     let mut operations = vec!["configs", "rules"];
@@ -2348,22 +2382,15 @@ async fn run_repairs(options: &DoctorOptions, targets: &[Editor]) -> DoctorRepai
             }
         }
     }
+    let mut hook_changes = Vec::new();
     if options.scope.include_project() {
-        // Refresh managed git hooks that are already installed, which also
-        // restores the execute bit on hooks earlier releases created as 0600.
-        // Never installs hooks into a repository that has none.
-        if let Some(repo_root) = options
-            .project_path
-            .as_deref()
-            .and_then(super::git_hooks::resolve_repo_root)
+        if let Some(outcome) =
+            repair_managed_git_hooks(options.project_path.as_deref(), options.dry_run)
         {
-            let has_managed = super::git_hooks::managed_hooks_status(&repo_root)
-                .is_some_and(|status| !status.installed.is_empty());
-            if has_managed {
-                operations.push("git_hooks");
-                if let Err(error) = super::git_hooks::install_git_hooks(&repo_root) {
-                    failures.push(format!("git_hooks: {error}"));
-                }
+            operations.push("git_hooks");
+            match outcome {
+                Ok(changes) => hook_changes = changes,
+                Err(error) => failures.push(format!("git_hooks: {error}")),
             }
         }
     }
@@ -2381,7 +2408,7 @@ async fn run_repairs(options: &DoctorOptions, targets: &[Editor]) -> DoctorRepai
             }
         }
     }
-    let changes = if options.dry_run {
+    let mut changes: Vec<RepairChange> = if options.dry_run {
         super::safe_edit::take_planned_changes()
             .into_iter()
             .map(|change| RepairChange {
@@ -2392,6 +2419,7 @@ async fn run_repairs(options: &DoctorOptions, targets: &[Editor]) -> DoctorRepai
     } else {
         Vec::new()
     };
+    changes.extend(hook_changes);
     DoctorRepairReport {
         mode: if options.dry_run {
             "dry_run"
@@ -2718,6 +2746,45 @@ fn print_check(check: &SurfaceCheck, indent: &str) {
     }
 }
 
+/// The human report of a repair run, one line per entry.
+fn repair_report_lines(repair: &DoctorRepairReport) -> Vec<String> {
+    let ui = super::ui::ui();
+    let mut lines = vec![format!(
+        "{}{}",
+        super::ui::GUTTER,
+        ui.kicker(if repair.mode == "dry_run" {
+            "Repair · preview only"
+        } else {
+            "Repair · applied"
+        })
+    )];
+    if repair.changes.is_empty() && repair.failures.is_empty() {
+        lines.push(format!(
+            "{}{} No managed changes were needed.",
+            super::ui::GUTTER,
+            status_glyph(CheckStatus::Pass)
+        ));
+    }
+    for change in &repair.changes {
+        lines.push(format!(
+            "{}{} {} {}",
+            super::ui::GUTTER,
+            ui.accent("→"),
+            change.action,
+            ui.faint(&change.path)
+        ));
+    }
+    for failure in &repair.failures {
+        lines.push(format!(
+            "{}{} {}",
+            super::ui::GUTTER,
+            status_glyph(CheckStatus::Fail),
+            failure
+        ));
+    }
+    lines
+}
+
 struct DoctorDryRunReset;
 
 impl Drop for DoctorDryRunReset {
@@ -2849,38 +2916,8 @@ pub async fn run_doctor(options: DoctorOptions, json: bool, support: bool) -> Re
         println!();
     }
     if let Some(repair) = &report.repair {
-        println!(
-            "{}{}",
-            super::ui::GUTTER,
-            ui.kicker(if repair.mode == "dry_run" {
-                "Repair · preview only"
-            } else {
-                "Repair · applied"
-            })
-        );
-        if repair.changes.is_empty() && repair.failures.is_empty() {
-            println!(
-                "{}{} No managed changes were needed.",
-                super::ui::GUTTER,
-                status_glyph(CheckStatus::Pass)
-            );
-        }
-        for change in &repair.changes {
-            println!(
-                "{}{} {} {}",
-                super::ui::GUTTER,
-                ui.accent("→"),
-                change.action,
-                ui.faint(&change.path)
-            );
-        }
-        for failure in &repair.failures {
-            println!(
-                "{}{} {}",
-                super::ui::GUTTER,
-                status_glyph(CheckStatus::Fail),
-                failure
-            );
+        for line in repair_report_lines(repair) {
+            println!("{line}");
         }
         println!();
     }
@@ -3229,6 +3266,133 @@ mod tests {
         assert!(broken.detail.contains("post-commit"), "{}", broken.detail);
         assert!(!broken.detail.contains("pre-push"), "{}", broken.detail);
         assert!(broken.fix.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_reports_the_execute_bit_it_restores_on_a_managed_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git_init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(temp.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("git runs");
+        assert!(git_init.success());
+
+        // No managed hooks: nothing to refresh, and none are installed.
+        assert!(repair_managed_git_hooks(Some(temp.path()), false).is_none());
+        assert!(repair_managed_git_hooks(None, false).is_none());
+
+        crate::setup::git_hooks::install_git_hooks(temp.path()).expect("install");
+        let repo_root = crate::setup::git_hooks::resolve_repo_root(temp.path()).unwrap();
+        let hooks_dir = crate::setup::git_hooks::resolve_hooks_dir(&repo_root).unwrap();
+        let post_commit = hooks_dir.join("post-commit");
+        assert!(repair_managed_git_hooks(Some(temp.path()), false)
+            .expect("managed hooks")
+            .expect("repair")
+            .is_empty());
+
+        // The repro of #191: `chmod 600` on a hook, then `doctor --repair`.
+        std::fs::set_permissions(&post_commit, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let changes = repair_managed_git_hooks(Some(temp.path()), false)
+            .expect("managed hooks")
+            .expect("repair");
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].action, "restore execute bit");
+        assert_eq!(changes[0].path, post_commit.display().to_string());
+        let mode = std::fs::metadata(&post_commit)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+
+        let repair = DoctorRepairReport {
+            mode: "applied",
+            operations: vec!["git_hooks"],
+            changes,
+            failures: Vec::new(),
+        };
+        let report = repair_report_lines(&repair).join("\n");
+        assert!(report.contains("restore execute bit"), "{report}");
+        assert!(report.contains("post-commit"), "{report}");
+        assert!(!report.contains("No managed changes"), "{report}");
+
+        // Once repaired, there is truly nothing left to do.
+        assert!(repair_managed_git_hooks(Some(temp.path()), false)
+            .expect("managed hooks")
+            .expect("repair")
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_dry_run_lists_the_execute_bit_it_would_restore() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git_init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(temp.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("git runs");
+        assert!(git_init.success());
+        crate::setup::git_hooks::install_git_hooks(temp.path()).expect("install");
+        let repo_root = crate::setup::git_hooks::resolve_repo_root(temp.path()).unwrap();
+        let hooks_dir = crate::setup::git_hooks::resolve_hooks_dir(&repo_root).unwrap();
+        let post_commit = hooks_dir.join("post-commit");
+        std::fs::set_permissions(&post_commit, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        super::super::safe_edit::set_dry_run(true);
+        let outcome = repair_managed_git_hooks(Some(temp.path()), true);
+        super::super::safe_edit::set_dry_run(false);
+        let _ = super::super::safe_edit::take_planned_changes();
+
+        let changes = outcome.expect("managed hooks").expect("dry run");
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].action, "restore execute bit");
+        let mode = std::fs::metadata(&post_commit)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "a dry run changes nothing");
+    }
+
+    #[test]
+    fn repair_report_says_nothing_was_needed_only_when_nothing_happened() {
+        let report = |changes: Vec<RepairChange>, failures: Vec<String>| {
+            repair_report_lines(&DoctorRepairReport {
+                mode: "applied",
+                operations: vec!["git_hooks"],
+                changes,
+                failures,
+            })
+            .join("\n")
+        };
+        assert!(report(Vec::new(), Vec::new()).contains("No managed changes were needed"));
+        let repaired = report(
+            vec![RepairChange {
+                path: "/repo/.git/hooks/post-commit".to_string(),
+                action: "restore execute bit",
+            }],
+            Vec::new(),
+        );
+        assert!(!repaired.contains("No managed changes were needed"));
+        assert!(repaired.contains("restore execute bit"));
+        let failed = report(Vec::new(), vec!["git_hooks: boom".to_string()]);
+        assert!(!failed.contains("No managed changes were needed"));
+        assert!(failed.contains("git_hooks: boom"));
     }
 
     #[test]

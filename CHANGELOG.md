@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.0.36
+
+- A refused first action no longer uses up the session's activation report
+  (#227). Setup calls such as `init` do not count as a first action, but the
+  session used to be marked as reported by one, so the first real action was
+  never reported. The report is now sent after the first real tool call, and
+  it is sent again if it was not accepted.
+- Search through a second checkout of a project no longer returns text from
+  files that checkout's ignore rules exclude (#190). A file that another
+  checkout had indexed before `.contextstream/ignore` listed it could still
+  show its current text in `semantic` and `hybrid` results. Those hits are now
+  dropped, `pattern` mode skips excluded paths too, and a result saved before
+  you add a rule is not shown again afterwards. If an ignore file cannot be
+  read, that checkout's hits are dropped rather than shown.
+- Search output is more accurate:
+  - A keyword row names the line it shows and keeps an anchor that already
+    matches. Rows for the same file and line appear once, not once per
+    language label or path form (#224).
+  - A hit in a minified or build file (`.min.js`, `dist/`, `build/`) is no
+    longer reported as not found. `exhaustive` and `keyword` never drop a row
+    because of its path, and other modes keep a row the server confirmed
+    contains the text (#222).
+  - An exact-text page from the server is shown as the server gave it, with no
+    extra local rows. An empty page now says what was established
+    (incomplete, matches on another page, or none) instead of "did not meet
+    the relevance threshold" (#218).
+  - When a `project_id` is replaced while the scope is resolved, the text
+    opens with a `[SCOPE_MISMATCH]` line, not only the structured result
+    (#213).
+- On a hosted connection, `vcs` and `capsule` use the workspace and project
+  the session already has, from `init` or from the request headers (#189).
+  `vcs list_repos` and `capsule list` used to fail with "workspace_id is
+  required" straight after a successful `init`. The `vcs` error now says to
+  run `init` or pass `workspace_id`.
+- `doctor --repair` lists the git hook repairs it makes, including restoring a
+  hook's execute bit, and says "No managed changes were needed" only when it
+  did nothing (#191). A dry run shows the execute bit it would restore.
+- The local sync no longer walks into a folder that has its own `.git` below
+  the project root: another clone, a linked worktree or a submodule. Git skips
+  those folders, but the sync used to upload their files as extra files of the
+  project (#229).
+- Updated two dependencies, `uuid` (1.29.0) and `open` (5.4.5).
+
 ## 1.0.35
 
 - The agents tool is `agents` (ContextStream Agents), and its texts no longer

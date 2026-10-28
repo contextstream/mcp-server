@@ -1,0 +1,700 @@
+{
+  "success": true,
+  "data": {
+    "available": true,
+    "agents": [
+      {
+        "agent": {
+          "id": "analyst",
+          "version": "1.1.0",
+          "name": "Data Analyst",
+          "description": "Answers a question about a CSV or XLSX table, in plain English or structured, with charts; every number is computed twice by the engine, never by the model.",
+          "scopes": [
+            "context.read",
+            "model.invoke"
+          ],
+          "price_credits": 800,
+          "timeout_minutes": 5,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "context.read",
+          "model.invoke"
+        ],
+        "effective_scopes": [
+          "context.read",
+          "model.invoke"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "context.read",
+            "description": "Read context about the task from this workspace, without saving anything."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "audit",
+          "version": "0.1.0",
+          "name": "Security Audit",
+          "description": "Scans a public GitHub repo's lockfiles with osv-scanner, judges from the code whether each vulnerable package is actually used, and proposes an upgrade path for each.",
+          "scopes": [
+            "context.read",
+            "model.invoke"
+          ],
+          "price_credits": 2500,
+          "timeout_minutes": 15,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "context.read",
+          "model.invoke"
+        ],
+        "effective_scopes": [
+          "context.read",
+          "model.invoke"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "context.read",
+            "description": "Read context about the task from this workspace, without saving anything."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "ci-fix",
+          "version": "0.1.0",
+          "name": "CI Fixer",
+          "description": "Reproduces a failing test run of a public GitHub repo in a sandbox and returns a minimal fix as a diff, with the passing test output. Never changes a test to make it pass.",
+          "scopes": [
+            "context.read",
+            "model.invoke"
+          ],
+          "price_credits": 5000,
+          "timeout_minutes": 20,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "context.read",
+          "model.invoke"
+        ],
+        "effective_scopes": [
+          "context.read",
+          "model.invoke"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "context.read",
+            "description": "Read context about the task from this workspace, without saving anything."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "dependency-upgrader",
+          "version": "1.0.0",
+          "name": "Dependency Upgrader",
+          "description": "Upgrades a public GitHub repo within its semver ranges and runs its tests; when the upgrade breaks them, fixes the project's code. Returns the diff and the results.",
+          "scopes": [
+            "context.read",
+            "model.invoke"
+          ],
+          "price_credits": 8000,
+          "timeout_minutes": 30,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "context.read",
+          "model.invoke"
+        ],
+        "effective_scopes": [
+          "context.read",
+          "model.invoke"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "context.read",
+            "description": "Read context about the task from this workspace, without saving anything."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "docs-drift",
+          "version": "0.1.0",
+          "name": "Docs Drift",
+          "description": "Finds statements in a repository's README and docs that the code no longer matches, and proposes the edits as a diff, each backed by the code that shows it.",
+          "scopes": [
+            "context.feedback",
+            "context.read",
+            "memory.read",
+            "memory.write.note",
+            "model.invoke",
+            "search.read"
+          ],
+          "price_credits": 800,
+          "timeout_minutes": 5,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "context.feedback",
+          "context.read",
+          "memory.read",
+          "memory.write.note",
+          "model.invoke",
+          "search.read"
+        ],
+        "effective_scopes": [
+          "context.feedback",
+          "context.read",
+          "memory.read",
+          "memory.write.note",
+          "model.invoke",
+          "search.read"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "context.feedback",
+            "description": "Mark the context items it used as helpful, for its own run only."
+          },
+          {
+            "scope": "context.read",
+            "description": "Read context about the task from this workspace, without saving anything."
+          },
+          {
+            "scope": "memory.read",
+            "description": "Search this workspace's memory, decisions and lessons."
+          },
+          {
+            "scope": "memory.write.note",
+            "description": "Save one private note for you with what it found."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          },
+          {
+            "scope": "search.read",
+            "description": "Search this workspace's indexed code."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "gardener",
+          "version": "0.1.0",
+          "name": "Memory Gardener",
+          "description": "Finds duplicate or conflicting decisions and lessons, and stale todos, plans, tasks and reminders, and proposes merges, supersedes and closures for the person to accept.",
+          "scopes": [
+            "items.read",
+            "memory.propose",
+            "memory.read",
+            "model.invoke"
+          ],
+          "price_credits": 400,
+          "timeout_minutes": 5,
+          "schedulable": true
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "items.read",
+          "memory.propose",
+          "memory.read",
+          "model.invoke"
+        ],
+        "effective_scopes": [
+          "items.read",
+          "memory.propose",
+          "memory.read",
+          "model.invoke"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "items.read",
+            "description": "Read this workspace's todos, plans, tasks and reminders."
+          },
+          {
+            "scope": "memory.propose",
+            "description": "Propose changes to memory, such as merging or closing items. Nothing changes until you accept."
+          },
+          {
+            "scope": "memory.read",
+            "description": "Search this workspace's memory, decisions and lessons."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "guide",
+          "version": "0.1.0",
+          "name": "Repo Guide",
+          "description": "Writes an onboarding guide for an indexed repository: architecture, where things live, how to build, run and test it, with file:line citations and a diagram.",
+          "scopes": [
+            "context.feedback",
+            "context.read",
+            "memory.read",
+            "memory.write.note",
+            "model.invoke",
+            "search.read"
+          ],
+          "price_credits": 500,
+          "timeout_minutes": 5,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "context.feedback",
+          "context.read",
+          "memory.read",
+          "memory.write.note",
+          "model.invoke",
+          "search.read"
+        ],
+        "effective_scopes": [
+          "context.feedback",
+          "context.read",
+          "memory.read",
+          "memory.write.note",
+          "model.invoke",
+          "search.read"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "context.feedback",
+            "description": "Mark the context items it used as helpful, for its own run only."
+          },
+          {
+            "scope": "context.read",
+            "description": "Read context about the task from this workspace, without saving anything."
+          },
+          {
+            "scope": "memory.read",
+            "description": "Search this workspace's memory, decisions and lessons."
+          },
+          {
+            "scope": "memory.write.note",
+            "description": "Save one private note for you with what it found."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          },
+          {
+            "scope": "search.read",
+            "description": "Search this workspace's indexed code."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "keeper",
+          "version": "0.1.0",
+          "name": "Plans & Tasks Keeper",
+          "description": "Answers status, what is next, what is blocked, who is on what and what changed, from the workspace's plans and tasks, in about 300 tokens citing their ids.",
+          "scopes": [
+            "items.read",
+            "model.invoke"
+          ],
+          "price_credits": 0,
+          "timeout_minutes": 5,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "items.read",
+          "model.invoke"
+        ],
+        "effective_scopes": [
+          "items.read",
+          "model.invoke"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "items.read",
+            "description": "Read this workspace's todos, plans, tasks and reminders."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "lens",
+          "version": "0.2.0",
+          "name": "Lens",
+          "description": "Reads an image you shared and ties it to your workspace: the text in it, related code, docs, decisions and lessons, and what to do next, with citations.",
+          "scopes": [
+            "context.feedback",
+            "context.read",
+            "media.read",
+            "memory.read",
+            "memory.write.note",
+            "model.invoke",
+            "search.read"
+          ],
+          "price_credits": 400,
+          "timeout_minutes": 5,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "context.feedback",
+          "context.read",
+          "media.read",
+          "memory.read",
+          "memory.write.note",
+          "model.invoke",
+          "search.read"
+        ],
+        "effective_scopes": [
+          "context.feedback",
+          "context.read",
+          "media.read",
+          "memory.read",
+          "memory.write.note",
+          "model.invoke",
+          "search.read"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "context.feedback",
+            "description": "Mark the context items it used as helpful, for its own run only."
+          },
+          {
+            "scope": "context.read",
+            "description": "Read context about the task from this workspace, without saving anything."
+          },
+          {
+            "scope": "media.read",
+            "description": "Read a media file you name, its download link and its previews."
+          },
+          {
+            "scope": "memory.read",
+            "description": "Search this workspace's memory, decisions and lessons."
+          },
+          {
+            "scope": "memory.write.note",
+            "description": "Save one private note for you with what it found."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          },
+          {
+            "scope": "search.read",
+            "description": "Search this workspace's indexed code."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "mail",
+          "version": "0.1.0",
+          "name": "Mail",
+          "description": "Reads your recent mail and writes a digest of what needs a reply, the commitments made and the deadlines coming, and saves reply drafts for you to send. It never sends anything.",
+          "scopes": [
+            "mail.draft.write",
+            "mail.read",
+            "model.invoke"
+          ],
+          "price_credits": 500,
+          "timeout_minutes": 5,
+          "schedulable": true
+        },
+        "enabled": false,
+        "needs_review": false,
+        "consented_scopes": [],
+        "effective_scopes": [],
+        "scope_descriptions": [
+          {
+            "scope": "mail.draft.write",
+            "description": "Save reply drafts in your own mailbox for you to review and send. It never sends."
+          },
+          {
+            "scope": "mail.read",
+            "description": "Read your own mailbox when you run it: your messages and conversations, without marking them read. It cannot send, move or delete mail."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "oracle",
+          "version": "0.2.0",
+          "name": "Code Oracle",
+          "description": "Answers where-is, what-calls, how-does-it-flow and where-to-change questions about indexed code: a cited answer of at most 600 tokens and a read list.",
+          "scopes": [
+            "context.read",
+            "memory.read",
+            "model.invoke",
+            "search.read"
+          ],
+          "price_credits": 0,
+          "timeout_minutes": 5,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "context.read",
+          "memory.read",
+          "model.invoke",
+          "search.read"
+        ],
+        "effective_scopes": [
+          "context.read",
+          "memory.read",
+          "model.invoke",
+          "search.read"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "context.read",
+            "description": "Read context about the task from this workspace, without saving anything."
+          },
+          {
+            "scope": "memory.read",
+            "description": "Search this workspace's memory, decisions and lessons."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          },
+          {
+            "scope": "search.read",
+            "description": "Search this workspace's indexed code."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "pdf",
+          "version": "0.1.0",
+          "name": "PDF",
+          "description": "Makes a PDF from a doc, a plan, notes or markdown in the workspace, with contents, bookmarks and links, and stores it as media.",
+          "scopes": [
+            "docs.read",
+            "items.read",
+            "media.write",
+            "model.invoke"
+          ],
+          "price_credits": 600,
+          "timeout_minutes": 5,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "docs.read",
+          "items.read",
+          "media.write",
+          "model.invoke"
+        ],
+        "effective_scopes": [
+          "docs.read",
+          "items.read",
+          "media.write",
+          "model.invoke"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "docs.read",
+            "description": "Read a doc you name in this workspace."
+          },
+          {
+            "scope": "items.read",
+            "description": "Read this workspace's todos, plans, tasks and reminders."
+          },
+          {
+            "scope": "media.write",
+            "description": "Save one file it made (such as a PDF) to this workspace."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "release-notes",
+          "version": "0.1.0",
+          "name": "Release Notes",
+          "description": "Turns the merged pull requests and commits between two refs into user-facing release notes, accounting for every merged pull request, and saves them as a release_notes doc.",
+          "scopes": [
+            "docs.write",
+            "model.invoke",
+            "vcs.read"
+          ],
+          "price_credits": 900,
+          "timeout_minutes": 5,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "docs.write",
+          "model.invoke",
+          "vcs.read"
+        ],
+        "effective_scopes": [
+          "docs.write",
+          "model.invoke",
+          "vcs.read"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "docs.write",
+            "description": "Save one doc it wrote (such as release notes) to this workspace, private to you unless you ask to share it."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          },
+          {
+            "scope": "vcs.read",
+            "description": "Read repositories, pull requests, commits and tags through this workspace's connection. It cannot write."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "research-brief",
+          "version": "1.0.0",
+          "name": "Research Brief",
+          "description": "Reads RSS and Atom feeds and their articles, then writes a short brief of the main stories in which every point carries a quote checked against the article.",
+          "scopes": [
+            "context.read",
+            "model.invoke"
+          ],
+          "price_credits": 1500,
+          "timeout_minutes": 6,
+          "schedulable": true
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "context.read",
+          "model.invoke"
+        ],
+        "effective_scopes": [
+          "context.read",
+          "model.invoke"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "context.read",
+            "description": "Read context about the task from this workspace, without saving anything."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          }
+        ]
+      },
+      {
+        "agent": {
+          "id": "review",
+          "version": "0.1.0",
+          "name": "PR Reviewer",
+          "description": "Reviews a pull request's diff against the workspace's decisions, lessons and preferences, and returns findings that each cite a line of the diff and the constraint they rely on.",
+          "scopes": [
+            "context.feedback",
+            "context.read",
+            "memory.read",
+            "memory.write.note",
+            "model.invoke",
+            "vcs.read"
+          ],
+          "price_credits": 1200,
+          "timeout_minutes": 5,
+          "schedulable": false
+        },
+        "enabled": true,
+        "needs_review": false,
+        "consented_scopes": [
+          "context.feedback",
+          "context.read",
+          "memory.read",
+          "memory.write.note",
+          "model.invoke",
+          "vcs.read"
+        ],
+        "effective_scopes": [
+          "context.feedback",
+          "context.read",
+          "memory.read",
+          "memory.write.note",
+          "model.invoke",
+          "vcs.read"
+        ],
+        "scope_descriptions": [
+          {
+            "scope": "context.feedback",
+            "description": "Mark the context items it used as helpful, for its own run only."
+          },
+          {
+            "scope": "context.read",
+            "description": "Read context about the task from this workspace, without saving anything."
+          },
+          {
+            "scope": "memory.read",
+            "description": "Search this workspace's memory, decisions and lessons."
+          },
+          {
+            "scope": "memory.write.note",
+            "description": "Save one private note for you with what it found."
+          },
+          {
+            "scope": "model.invoke",
+            "description": "Call ContextStream's models, billed to you within the task's credit cap."
+          },
+          {
+            "scope": "vcs.read",
+            "description": "Read repositories, pull requests, commits and tags through this workspace's connection. It cannot write."
+          }
+        ]
+      }
+    ]
+  }
+}

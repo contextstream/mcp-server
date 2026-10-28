@@ -261,6 +261,7 @@ fn the_tool_is_named_agents_and_lists_its_actions() {
         "limit",
         "idempotency_key",
         "session_id",
+        "agents",
     ] {
         assert!(props.contains_key(field), "{field}");
     }
@@ -634,13 +635,23 @@ async fn the_tool_is_listed_only_for_a_workspace_with_agents_turned_on() {
     listed.apply(&mut entry);
     assert_eq!(entry["description"], description);
 
-    // 200 with none on: hidden.
+    // 200 with none on: listed, saying how to turn them on.
     let none_on = Stub::api(
         json!({"agents": [{"agent": {"id": "lens", "price_credits": 400}, "enabled": false}]}),
         |_| Answer::error(404, "no"),
     )
     .await;
-    assert!(!listing_for(&none_on.url, "key-none", Some(workspace()))
+    let none_listed = listing_for(&none_on.url, "key-none", Some(workspace())).await;
+    assert!(none_listed.is_listed());
+    assert!(none_listed
+        .description()
+        .unwrap()
+        .contains("None is on in this workspace."));
+    assert_ne!(none_listed.fingerprint(), listed.fingerprint());
+
+    // 200 with no agents at all: hidden.
+    let empty = Stub::api(json!({"agents": []}), |_| Answer::error(404, "no")).await;
+    assert!(!listing_for(&empty.url, "key-empty", Some(workspace()))
         .await
         .is_listed());
 
@@ -1190,4 +1201,1127 @@ fn a_large_result_is_cut_for_text_but_kept_whole_in_structured_content() {
     let rendered = format::render_data(&json!({"report": big}));
     assert!(rendered.chars().count() < format::MAX_RESULT_CHARS + 200);
     assert!(rendered.contains("the structured result has all of it"));
+}
+
+// ============================================================================
+// Settings: which agents are on, and choosing them
+// ============================================================================
+
+use super::settings::{
+    access_line, category_of, choose_form, chosen, form_state, outcome_text, plan, resolve,
+    settings_text, target_of, Manage, Plan, Target, Verb, WorkspaceInfo,
+};
+use crate::peer::{run_with_call_peer, CallPeer, NoLiveChannel, PeerChannel};
+
+const ME: &str = "44444444-4444-4444-8444-444444444444";
+const ADMIN: &str = "55555555-5555-4555-8555-555555555555";
+
+/// The fifteen agents of a production workspace from the catalog: fourteen on, `mail` never
+/// chosen (from before agents were on by default).
+fn settings_catalog() -> Value {
+    serde_json::from_str(include_str!("testdata/settings_catalog.json")).expect("settings fixture")
+}
+
+/// The same workspace as the settings view answers it: every agent on, with its access in
+/// words, its group, the caller's role and the owners and admins.
+fn settings_view() -> Value {
+    serde_json::from_str(include_str!("testdata/settings_view.json")).expect("view fixture")
+}
+
+/// The catalog with `lens` on but asking for a scope nobody consented to yet.
+fn catalog_with_review() -> Value {
+    let mut value = settings_catalog();
+    for entry in value["data"]["agents"].as_array_mut().unwrap() {
+        if entry["agent"]["id"] == "lens" {
+            let effective: Vec<Value> = entry["effective_scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|scope| *scope != "media.read")
+                .cloned()
+                .collect();
+            entry["effective_scopes"] = json!(effective);
+            entry["consented_scopes"] = json!(effective);
+            entry["needs_review"] = json!(true);
+        }
+    }
+    value
+}
+
+/// The view with `lens` needing review the same way.
+fn view_with_review() -> Value {
+    let mut value = settings_view();
+    for entry in value["data"]["agents"].as_array_mut().unwrap() {
+        if entry["id"] == "lens" {
+            entry["needs_review"] = json!(true);
+            entry["new_access"] = json!(["media.read"]);
+            for item in entry["access"].as_array_mut().unwrap() {
+                if item["scope"] == "media.read" {
+                    item["granted"] = json!(false);
+                    item["new"] = json!(true);
+                }
+            }
+        }
+    }
+    value["data"]["summary"]["needs_review"] = json!(1);
+    value
+}
+
+fn owner_info() -> WorkspaceInfo {
+    WorkspaceInfo {
+        name: Some("Demos".to_string()),
+        manage: Manage {
+            can_change: Some(true),
+            role: Some("owner".to_string()),
+            managers: vec!["sam (owner)".to_string()],
+        },
+        ..WorkspaceInfo::default()
+    }
+}
+
+fn agent<'a>(catalog: &'a Catalog, id: &str) -> &'a super::catalog::AgentEntry {
+    catalog.find(id).expect(id)
+}
+
+#[test]
+fn the_catalog_and_the_settings_view_carry_access_and_review_state() {
+    let catalog = Catalog::from_value(&catalog_with_review());
+    assert_eq!(catalog.agents.len(), 15);
+    let lens = agent(&catalog, "lens");
+    assert!(lens.enabled && lens.needs_review);
+    assert!(lens.scopes.contains(&"media.read".to_string()));
+    assert_eq!(lens.new_scopes(), vec!["media.read"]);
+    assert!(lens.access.is_empty() && lens.job_line.is_none());
+
+    // The view: flat agents with words, groups and the one-line job.
+    let view = Catalog::from_value(&view_with_review());
+    assert_eq!(view.agents.len(), 15);
+    assert_eq!(
+        view.categories.first(),
+        Some(&("code".to_string(), "Code and repositories".to_string()))
+    );
+    let lens = agent(&view, "lens");
+    assert_eq!(lens.category.as_deref(), Some("files"));
+    assert!(lens
+        .job_line
+        .as_deref()
+        .unwrap()
+        .starts_with("Reads an image you shared"));
+    assert_eq!(lens.scopes.len(), lens.access.len());
+    assert!(lens
+        .access
+        .iter()
+        .any(|a| a.scope == "media.read" && a.new && !a.granted));
+    assert!(lens.needs_review);
+    assert!(view.find("mail").unwrap().enabled, "on by default");
+
+    // Groups: the API's, else the same mapping here.
+    let fallback = Catalog::from_value(&settings_catalog());
+    for (id, group) in [
+        ("review", "code"),
+        ("audit", "code"),
+        ("lens", "files"),
+        ("keeper", "work"),
+        ("mail", "research"),
+        ("research-brief", "research"),
+    ] {
+        assert_eq!(category_of(agent(&fallback, id)), group, "{id}");
+    }
+    let unknown = Catalog::from_value(&json!({"agents": [
+        {"agent": {"id": "triage", "scopes": ["vcs.read", "model.invoke"]}, "enabled": true},
+        {"agent": {"id": "inbox", "scopes": ["mail.read"]}, "enabled": true},
+        {"agent": {"id": "misc", "scopes": ["model.invoke"]}, "enabled": true}]}));
+    let groups: Vec<String> = unknown.agents.iter().map(category_of).collect();
+    assert_eq!(groups, vec!["code", "research", "other"]);
+}
+
+#[test]
+fn access_is_said_in_the_apis_plain_words() {
+    // Worded here from the catalog, and as the view words it: the same line.
+    for value in [settings_catalog(), settings_view()] {
+        let catalog = Catalog::from_value(&value);
+        let line = |id: &str| access_line(agent(&catalog, id));
+        assert_eq!(line("keeper"), "reads plans and tasks; changes nothing");
+        assert_eq!(
+            line("lens"),
+            "reads task context, reads images you share, reads decisions and lessons, searches code; marks context it used, saves one note"
+        );
+        assert_eq!(line("mail"), "reads your mail; drafts replies, never sends");
+        assert_eq!(
+            line("gardener"),
+            "reads plans and tasks, reads decisions and lessons; proposes memory changes"
+        );
+        assert_eq!(line("release-notes"), "reads repositories; saves one doc");
+        assert_eq!(
+            line("pdf"),
+            "reads a doc you name, reads plans and tasks; saves one file"
+        );
+    }
+    // A scope with no words is shown by its name, as something it changes.
+    let odd = Catalog::from_value(&json!({"agents": [{"agent": {"id": "x",
+        "scopes": ["calendar.write", "model.invoke"]}, "enabled": true}]}));
+    assert_eq!(access_line(&odd.agents[0]), "calendar.write");
+    // Needing review: what its runs hold now, and the new access apart.
+    let review = Catalog::from_value(&view_with_review());
+    assert_eq!(
+        access_line(agent(&review, "lens")),
+        "reads task context, reads decisions and lessons, searches code; marks context it used, saves one note"
+    );
+}
+
+#[test]
+fn settings_is_a_checklist_grouped_by_kind_of_work() {
+    let catalog = Catalog::from_value(&settings_catalog());
+    let text = settings_text(&catalog, &owner_info());
+    eprintln!(
+        "--- settings ({} chars) ---\n{text}\n---",
+        text.chars().count()
+    );
+    assert!(text.starts_with(
+        "ContextAgents in Demos: 14 of 15 on.\nYou can change them: you own this workspace.\n"
+    ));
+    for group in [
+        "Code and repositories · 8 of 8 on",
+        "Files and data · 3 of 3 on",
+        "Plans and memory · 2 of 2 on",
+        "Mail and research · 1 of 2 on",
+    ] {
+        assert!(text.contains(&format!("\n{group}\n")), "{group}");
+    }
+    let at = |needle: &str| text.find(needle).unwrap();
+    assert!(at("\nCode and repositories ·") < at("\nFiles and data ·"));
+    assert!(at("\nPlans and memory ·") < at("\nMail and research ·"));
+    assert!(text.contains("  [ ] mail  Mail (500 credits): Reads your recent mail"));
+    assert!(text.contains("\n      reads your mail; drafts replies, never sends\n"));
+    assert!(text.contains("  [x] keeper  Plans & Tasks Keeper (free): "));
+    assert!(text.contains("  [x] review  PR Reviewer (1200 credits): "));
+    assert!(text.ends_with(
+        "Change: agents(action=\"choose\") asks the person in a form; or enable / disable with agent=\"<id>\" or \"all\", or agents=[\"<id>\", ...]."
+    ));
+    assert!(!text.to_lowercase().contains("slipstream"));
+    // Two lines an agent, inside a small budget.
+    assert!(
+        text.lines().count() <= 15 * 2 + 4 * 2 + 4,
+        "{}",
+        text.lines().count()
+    );
+    assert!(text.chars().count() < 4000, "{}", text.chars().count());
+
+    // The view: every agent on by default, its own groups and jobs, and why runs are blocked.
+    let view = settings_view();
+    let mut info = WorkspaceInfo::from_view(&view["data"], Some(&json!({"name": "Demos"})));
+    info.runs_blocked = Some(
+        "ContextAgents can't run in this workspace yet. Your choices here are saved and apply as soon as they can."
+            .to_string(),
+    );
+    let text = settings_text(&Catalog::from_value(&view), &info);
+    assert!(text.starts_with(
+        "ContextAgents in Demos: 15 of 15 on.\nYou can change them: you own this workspace.\nContextAgents can't run in this workspace yet."
+    ));
+    assert!(text.contains("\nMail and research · 2 of 2 on\n"));
+
+    // An agent that needs review says what it asks for and how to grant it.
+    let review = Catalog::from_value(&catalog_with_review());
+    let text = settings_text(&review, &owner_info());
+    assert!(text.starts_with("ContextAgents in Demos: 14 of 15 on, 1 needs review."));
+    assert!(text.contains(
+        "      needs review: it also asks to read a media file you name, its download link and its previews; enable lens to grant that\n"
+    ));
+
+    assert_eq!(
+        settings_text(&Catalog::default(), &WorkspaceInfo::default()),
+        "No ContextAgents are available in this workspace yet."
+    );
+}
+
+#[test]
+fn who_can_change_it_is_read_from_the_view_or_the_members() {
+    // The view says it.
+    let mut view = settings_view()["data"].clone();
+    let info = WorkspaceInfo::from_view(&view, None);
+    assert_eq!(info.manage.can_change, Some(true));
+    assert_eq!(
+        info.manage.managers,
+        vec!["Sam Rivera (owner)", "Ana Lee (admin)"]
+    );
+    assert_eq!(info.runs_open, Some(true));
+    assert_eq!(info.runs_blocked, None);
+    view["role"] = json!("member");
+    view["can_manage"] = json!(false);
+    let info = WorkspaceInfo::from_view(&view, Some(&json!({"name": "Demos"})));
+    assert_eq!(
+        info.manage.summary_line(),
+        "Read-only for you (you're a member here): Sam Rivera (owner) or Ana Lee (admin) can change them."
+    );
+    let text = settings_text(&Catalog::from_value(&view), &info);
+    assert!(text.ends_with("To change them, ask Sam Rivera (owner) or Ana Lee (admin)."));
+    assert!(!text.contains("Change: agents("));
+
+    // An API without the view: the workspace and its members.
+    let workspace = json!({"id": WORKSPACE, "name": "Demos", "owner_username": "sam"});
+    let me = json!({"id": ME, "email": "me@example.com"});
+    let members = json!({"items": [
+        {"user": {"id": ME, "username": "me", "full_name": "Mia"}, "role": "member", "status": "active"},
+        {"user": {"id": ADMIN, "username": "ana", "full_name": "Ana Lee"}, "role": "admin", "status": "active"},
+        {"user": {"id": "66666666-6666-4666-8666-666666666666", "full_name": "Old Admin"}, "role": "admin", "status": "inactive"}
+    ], "total": 3});
+    let info = WorkspaceInfo::from_reads(Some(&workspace), Some(&me), Some(&members));
+    assert_eq!(info.name.as_deref(), Some("Demos"));
+    assert_eq!(info.manage.can_change, Some(false));
+    assert_eq!(info.manage.role.as_deref(), Some("member"));
+    assert_eq!(info.manage.managers, vec!["sam (owner)", "Ana Lee (admin)"]);
+    let admin = WorkspaceInfo::from_reads(
+        Some(&workspace),
+        Some(&json!({"id": ADMIN})),
+        Some(&members),
+    );
+    assert_eq!(
+        admin.manage.summary_line(),
+        "You can change them: you're an admin here."
+    );
+    // Someone who reads the catalog but is not a member row owns the workspace...
+    let stranger = json!({"id": "77777777-7777-4777-8777-777777777777"});
+    let owner = WorkspaceInfo::from_reads(Some(&workspace), Some(&stranger), Some(&members));
+    assert_eq!(owner.manage.role.as_deref(), Some("owner"));
+    // ... unless the member list was only a page of a longer one.
+    let partial = json!({"items": members["items"], "total": 250});
+    let unknown = WorkspaceInfo::from_reads(Some(&workspace), Some(&stranger), Some(&partial));
+    assert_eq!(unknown.manage.can_change, None);
+    assert_eq!(
+        unknown.manage.summary_line(),
+        "The workspace owner or an admin can change them."
+    );
+    let nothing = WorkspaceInfo::from_reads(None, None, None);
+    assert_eq!(nothing.manage, Manage::default());
+    assert_eq!(nothing.where_label(), "in this workspace");
+    assert_eq!(nothing.manage.who(), "the workspace owner or an admin");
+}
+
+#[test]
+fn a_call_names_agents_by_id_name_list_all_or_none() {
+    let catalog = Catalog::from_value(&settings_catalog());
+    let ids = |target: Target| match target {
+        Target::Some(names) => resolve(&catalog, &names)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(ids(target_of(Some("lens"), None).unwrap()), vec!["lens"]);
+    assert_eq!(
+        ids(target_of(Some("lens, pdf@0.1.0"), None).unwrap()),
+        vec!["lens", "pdf"]
+    );
+    assert_eq!(
+        ids(target_of(None, Some(&json!(["Code Oracle", "LENS", "lens"]))).unwrap()),
+        vec!["oracle", "lens"]
+    );
+    assert_eq!(target_of(Some("all"), None).unwrap(), Target::All);
+    assert_eq!(target_of(None, Some(&json!(["ALL"]))).unwrap(), Target::All);
+    assert_eq!(target_of(None, Some(&json!("none"))).unwrap(), Target::None);
+    assert!(target_of(None, Some(&json!(["all", "lens"]))).is_err());
+    assert!(target_of(None, None).is_err());
+    assert!(target_of(Some("  "), Some(&json!([]))).is_err());
+    assert!(target_of(None, Some(&json!([1]))).is_err());
+    let unknown = resolve(&catalog, &["nope".to_string()]).unwrap_err();
+    assert!(unknown.starts_with("No agent nope here. The agents: analyst, audit,"));
+}
+
+#[test]
+fn only_what_changes_is_planned_and_new_access_is_never_granted_silently() {
+    let catalog = Catalog::from_value(&catalog_with_review());
+    let ids = |plan: &Plan, on: bool| -> Vec<String> {
+        plan.changes
+            .iter()
+            .filter(|c| c.on == on)
+            .map(|c| c.id.clone())
+            .collect()
+    };
+    let on_now: Vec<&str> = catalog.enabled().iter().map(|a| a.id.as_str()).collect();
+
+    // enable all: only what is off; lens keeps its consent; the bulk write says "all".
+    let all = plan(&catalog, Verb::Enable, &Target::All).unwrap();
+    assert_eq!(ids(&all, true), vec!["mail"]);
+    assert_eq!(all.still_review, vec!["lens"]);
+    assert_eq!(all.bulk_enable(&catalog), json!("all"));
+    // disable all: the fourteen on, "none".
+    let off = plan(&catalog, Verb::Disable, &Target::All).unwrap();
+    assert_eq!(off.changes.len(), 14);
+    assert_eq!(off.bulk_enable(&catalog), json!("none"));
+    // enable none is everything off; disable none changes nothing.
+    let none = plan(&catalog, Verb::Enable, &Target::None).unwrap();
+    assert_eq!(none.changes.len(), 14);
+    assert_eq!(none.bulk_enable(&catalog), json!("none"));
+    // disable none: none off, so every agent on (as `csa disable none`).
+    let none_off = plan(&catalog, Verb::Disable, &Target::None).unwrap();
+    assert_eq!(ids(&none_off, true), vec!["mail"]);
+    assert_eq!(none_off.bulk_enable(&catalog), json!("all"));
+    assert!(none_off.note.as_deref().unwrap().contains("every agent on"));
+
+    // Naming agents changes only those: the bulk set is what is on now plus or minus them.
+    let named = plan(
+        &catalog,
+        Verb::Enable,
+        &Target::Some(vec!["mail".into(), "oracle".into()]),
+    )
+    .unwrap();
+    assert_eq!(ids(&named, true), vec!["mail"]);
+    assert_eq!(named.already_on, vec!["oracle"]);
+    let mut expected: Vec<&str> = on_now.clone();
+    expected.push("mail");
+    expected.sort();
+    assert_eq!(named.bulk_enable(&catalog), json!(expected));
+    let disable = plan(
+        &catalog,
+        Verb::Disable,
+        &Target::Some(vec!["mail".into(), "keeper".into()]),
+    )
+    .unwrap();
+    assert_eq!(ids(&disable, false), vec!["keeper"]);
+    assert_eq!(disable.already_off, vec!["mail"]);
+    let expected: Vec<&str> = on_now
+        .iter()
+        .copied()
+        .filter(|id| *id != "keeper")
+        .collect();
+    assert_eq!(disable.bulk_enable(&catalog), json!(expected));
+
+    // Naming lens in enable grants its new access, and says so; it is already in the set.
+    let review = plan(&catalog, Verb::Enable, &Target::Some(vec!["lens".into()])).unwrap();
+    assert_eq!(review.changes.len(), 1);
+    assert_eq!(
+        review.changes[0].grants,
+        vec!["read a media file you name, its download link and its previews"]
+    );
+
+    // choose sets exactly the set.
+    let chosen_set = plan(
+        &catalog,
+        Verb::Choose,
+        &Target::Some(vec!["oracle".into(), "mail".into(), "lens".into()]),
+    )
+    .unwrap();
+    assert_eq!(ids(&chosen_set, true), vec!["mail"]);
+    assert_eq!(ids(&chosen_set, false).len(), 12);
+    assert_eq!(chosen_set.still_review, vec!["lens"]);
+    assert_eq!(
+        chosen_set.bulk_enable(&catalog),
+        json!(["lens", "mail", "oracle"])
+    );
+    assert!(plan(&catalog, Verb::Choose, &Target::Some(vec!["nope".into()])).is_err());
+}
+
+#[test]
+fn the_form_lists_every_agent_with_those_on_checked() {
+    let catalog = Catalog::from_value(&settings_catalog());
+    let multi = choose_form(&catalog, true);
+    eprintln!(
+        "--- form ---\n{}",
+        serde_json::to_string_pretty(&multi).unwrap()
+    );
+    let field = &multi["properties"]["enabled"];
+    assert_eq!(field["type"], "array");
+    let options = field["items"]["anyOf"].as_array().unwrap();
+    assert_eq!(options.len(), 15);
+    assert!(options
+        .iter()
+        .all(|o| o["const"].is_string() && o["title"].as_str().unwrap().chars().count() <= 100));
+    assert_eq!(
+        options[0]["const"], "ci-fix",
+        "Code and repositories first, by name"
+    );
+    let default = field["default"].as_array().unwrap();
+    assert_eq!(default.len(), 14);
+    assert!(!default.contains(&json!("mail")));
+    assert_eq!(multi["required"], json!(["enabled"]));
+
+    // Before 2025-11-25: one checkbox per agent, flat and primitive.
+    let boxes = choose_form(&catalog, false);
+    let properties = boxes["properties"].as_object().unwrap();
+    assert_eq!(properties.len(), 15);
+    assert!(properties.values().all(|p| p["type"] == "boolean"));
+    assert_eq!(properties["mail"]["default"], json!(false));
+    assert_eq!(properties["oracle"]["default"], json!(true));
+    assert_eq!(properties["mail"]["title"], "Mail (500 credits)");
+    assert!(properties["mail"]["description"]
+        .as_str()
+        .unwrap()
+        .starts_with("Mail and research: Reads your recent mail"));
+
+    // Either answer reads back as the agents to have on.
+    let picked = |content: Value| chosen(&catalog, content.as_object().unwrap());
+    let answer = picked(json!({"enabled": ["mail", "oracle", "nope"]})).unwrap();
+    assert_eq!(answer, vec!["mail", "oracle"]);
+    assert_eq!(
+        picked(json!({"enabled": []})).unwrap(),
+        Vec::<String>::new()
+    );
+    let answer = picked(json!({"keeper": false, "mail": true})).unwrap();
+    assert_eq!(answer.len(), 14);
+    assert!(answer.contains(&"mail".to_string()) && !answer.contains(&"keeper".to_string()));
+    assert!(picked(json!({})).is_none());
+
+    // The question is about this state: another state asks again.
+    let state = form_state(workspace(), &catalog);
+    assert!(state.starts_with(&format!("agents-choose:{WORKSPACE}:")));
+    let mut changed = settings_catalog();
+    changed["data"]["agents"][9]["enabled"] = json!(true);
+    assert_ne!(
+        state,
+        form_state(workspace(), &Catalog::from_value(&changed))
+    );
+}
+
+#[test]
+fn a_change_says_what_it_did_and_how_to_undo_it() {
+    let before = Catalog::from_value(&settings_catalog());
+    let plan_off = plan(&before, Verb::Disable, &Target::Some(vec!["keeper".into()])).unwrap();
+    let mut after_value = settings_catalog();
+    for entry in after_value["data"]["agents"].as_array_mut().unwrap() {
+        if entry["agent"]["id"] == "keeper" {
+            entry["enabled"] = json!(false);
+        }
+    }
+    let after = Catalog::from_value(&after_value);
+    let text = outcome_text(&owner_info(), &before, Some(&after), &plan_off, &[]);
+    assert_eq!(
+        text,
+        "ContextAgents in Demos: 13 of 15 on (was 14).\nTurned off: keeper (Plans & Tasks Keeper).\nUndo: agents(action=\"enable\", agent=\"keeper\")"
+    );
+    let none = plan(&before, Verb::Enable, &Target::Some(vec!["oracle".into()])).unwrap();
+    assert_eq!(
+        outcome_text(&owner_info(), &before, Some(&before), &none, &[]),
+        "Nothing changed: 14 of 15 ContextAgents are on in Demos.\nAlready on: oracle."
+    );
+    let two = plan(
+        &before,
+        Verb::Disable,
+        &Target::Some(vec!["keeper".into(), "pdf".into()]),
+    )
+    .unwrap();
+    let failed = vec![(two.changes[1].clone(), "boom".to_string())];
+    let text = outcome_text(&owner_info(), &before, None, &two, &failed);
+    assert!(text.starts_with("ContextAgents in Demos: 13 of 15 on (was 14)."));
+    assert!(text.contains("Not changed: pdf stays on: boom"));
+    let mixed = plan(
+        &before,
+        Verb::Choose,
+        &Target::Some(vec!["oracle".into(), "mail".into()]),
+    )
+    .unwrap();
+    let text = outcome_text(&owner_info(), &before, None, &mixed, &[]);
+    assert!(text.contains("Undo: agents(action=\"choose\", agents=[\"analyst\", "));
+}
+
+// --- Through the tool, against a stub API -------------------------------------
+
+/// What a stub API holds and how it answers.
+#[derive(Clone, Copy)]
+struct StubShape {
+    /// The settings view and the bulk write answer (an API with them).
+    view: bool,
+    /// The caller may change the settings.
+    admin: bool,
+    /// The catalog's status (`403`: outside the rollout).
+    catalog_status: u16,
+    /// The members can be read (an API without the view).
+    members: bool,
+}
+
+const OWNER_WITH_VIEW: StubShape = StubShape {
+    view: true,
+    admin: true,
+    catalog_status: 200,
+    members: true,
+};
+const OWNER_WITHOUT_VIEW: StubShape = StubShape {
+    view: false,
+    ..OWNER_WITH_VIEW
+};
+
+fn set_enabled(view: &mut Value, id: &str, on: bool) {
+    for entry in view["agents"].as_array_mut().unwrap() {
+        if entry["id"] == id {
+            entry["enabled"] = json!(on);
+            for item in entry["access"].as_array_mut().unwrap() {
+                item["granted"] = json!(on && item["new"] != json!(true));
+            }
+        }
+    }
+}
+
+/// A stub that keeps what the tool sets. With the view, it answers the view and the bulk
+/// write; without, the catalog (from `catalog`), the caller and the members. Both take the
+/// per-agent write.
+async fn settings_stub(catalog: Value, view: Value, shape: StubShape) -> Stub {
+    let catalog = Arc::new(Mutex::new(catalog));
+    let view = Arc::new(Mutex::new(view["data"].clone()));
+    Stub::start(Arc::new(move |request: &Recorded| {
+        let path = request.path.as_str();
+        let settings = format!("/workspaces/{WORKSPACE}/tasks/agents/consent");
+        let refused = || Answer::error(403, "Only an owner or admin sets which agents may run");
+        if path == settings {
+            if !shape.view {
+                return Answer::error(404, "Not found");
+            }
+            if request.method == "PUT" {
+                if !shape.admin {
+                    return refused();
+                }
+                let mut view = view.lock().unwrap();
+                let ids: Vec<String> = view["agents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|a| a["id"].as_str().unwrap().to_string())
+                    .collect();
+                for id in ids {
+                    let on = match &request.body["enable"] {
+                        Value::String(word) => word == "all",
+                        Value::Array(set) => set.contains(&json!(id)),
+                        _ => return Answer::error(400, "enable is all, none or a list"),
+                    };
+                    set_enabled(&mut view, &id, on);
+                }
+                return Answer::ok(view.clone());
+            }
+            return Answer::ok(view.lock().unwrap().clone());
+        }
+        if path == "/tasks/agents" {
+            if shape.catalog_status != 200 {
+                return Answer::error(
+                    shape.catalog_status,
+                    "Tasks are not available in this workspace yet",
+                );
+            }
+            return Answer::ok(catalog.lock().unwrap()["data"].clone());
+        }
+        if path == format!("/workspaces/{WORKSPACE}") {
+            return Answer::ok(json!({"id": WORKSPACE, "name": "Demos", "owner_username": "sam"}));
+        }
+        if path == "/auth/me" {
+            return Answer::ok(json!({"id": ME, "email": "me@example.com"}));
+        }
+        if path == format!("/workspaces/{WORKSPACE}/members") {
+            if !shape.members {
+                return Answer::error(404, "no");
+            }
+            let role = if shape.admin { "admin" } else { "member" };
+            return Answer::ok(json!({"items": [
+                {"user": {"id": ME, "username": "me"}, "role": role, "status": "active"},
+                {"user": {"id": ADMIN, "username": "ana", "full_name": "Ana Lee"}, "role": "admin", "status": "active"}
+            ], "total": 2}));
+        }
+        if path.starts_with("/projects/") {
+            return Answer::ok(json!({"id": PROJECT, "name": "api", "workspace_id": WORKSPACE}));
+        }
+        if request.method == "PUT" && path.ends_with("/consent") {
+            if !shape.admin {
+                return refused();
+            }
+            let agent = path.split('/').nth_back(1).unwrap().to_string();
+            let on = request.body["enabled"].as_bool().unwrap();
+            for entry in catalog.lock().unwrap()["data"]["agents"].as_array_mut().unwrap() {
+                if entry["agent"]["id"] == agent.as_str() {
+                    entry["enabled"] = json!(on);
+                    if on {
+                        entry["needs_review"] = json!(false);
+                    }
+                }
+            }
+            let mut view = view.lock().unwrap();
+            set_enabled(&mut view, &agent, on);
+            for entry in view["agents"].as_array_mut().unwrap() {
+                if entry["id"] == agent.as_str() && on {
+                    entry["needs_review"] = json!(false);
+                    for item in entry["access"].as_array_mut().unwrap() {
+                        item["new"] = json!(false);
+                        item["granted"] = json!(true);
+                    }
+                }
+            }
+            return Answer::ok(json!({"enabled": on}));
+        }
+        Answer::error(404, "no")
+    }))
+    .await
+}
+
+fn writes(stub: &Stub) -> Vec<(String, Value)> {
+    stub.requests()
+        .into_iter()
+        .filter(|r| r.method == "PUT")
+        .map(|r| (r.path, r.body))
+        .collect()
+}
+
+fn settings_path_of() -> String {
+    format!("/workspaces/{WORKSPACE}/tasks/agents/consent")
+}
+
+#[tokio::test]
+async fn with_the_settings_routes_one_bulk_write_sets_exactly_what_is_meant() {
+    let stub = settings_stub(settings_catalog(), view_with_review(), OWNER_WITH_VIEW).await;
+    let (tool, _) = stub.tool(stub.config("key-view"));
+
+    let settings = tool.execute(json!({"action": "settings"})).await.unwrap();
+    let text = text_of(&settings);
+    assert!(text.starts_with(
+        "ContextAgents in Demos: 15 of 15 on, 1 needs review.\nYou can change them: you own this workspace.\n\nCode and repositories · 8 of 8 on\n"
+    ));
+    let data = settings.structured_content.clone().unwrap();
+    assert_eq!(data["runs"]["open"], true);
+    assert_eq!(data["agents"][0]["id"], "ci-fix");
+    // Only the view and the workspace were read: no members, no catalog.
+    assert!(stub
+        .requests()
+        .iter()
+        .all(|r| r.path != "/auth/me" && r.path != "/tasks/agents"));
+
+    // disable names one: the set is everything on but keeper.
+    let off = tool
+        .execute(json!({"action": "disable", "agent": "keeper"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        text_of(&off),
+        "ContextAgents in Demos: 14 of 15 on (was 15).\nTurned off: keeper (Plans & Tasks Keeper).\nUndo: agents(action=\"enable\", agent=\"keeper\")"
+    );
+    let sent = writes(&stub);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, settings_path_of());
+    let set = sent[0].1["enable"].as_array().unwrap();
+    assert_eq!(set.len(), 14);
+    assert!(!set.contains(&json!("keeper")) && set.contains(&json!("lens")));
+    assert_eq!(sent[0].1["accept_new_access"], false);
+
+    // enable names one: everything on plus it.
+    let on = tool
+        .execute(json!({"action": "enable", "agents": ["keeper"]}))
+        .await
+        .unwrap();
+    assert!(text_of(&on).starts_with("ContextAgents in Demos: 15 of 15 on (was 14)."));
+    assert_eq!(writes(&stub)[1].1["enable"].as_array().unwrap().len(), 15);
+
+    // none, then all: the words themselves.
+    let none = tool
+        .execute(json!({"action": "choose", "agents": "none"}))
+        .await
+        .unwrap();
+    assert!(text_of(&none).starts_with("ContextAgents in Demos: 0 of 15 on (was 15)."));
+    assert_eq!(writes(&stub)[2].1["enable"], "none");
+    let all = tool
+        .execute(json!({"action": "enable", "agent": "all"}))
+        .await
+        .unwrap();
+    assert!(text_of(&all).starts_with("ContextAgents in Demos: 15 of 15 on (was 0)."));
+    assert_eq!(writes(&stub)[3].1["enable"], "all");
+
+    // Naming the agent that needs review grants its new access, one agent at a time.
+    let reviewed = tool
+        .execute(json!({"action": "enable", "agent": "lens"}))
+        .await
+        .unwrap();
+    assert!(text_of(&reviewed).contains(
+        "Reviewed: lens may now also read a media file you name, its download link and its previews."
+    ));
+    let last = writes(&stub).pop().unwrap();
+    assert_eq!(
+        last,
+        (
+            format!("/workspaces/{WORKSPACE}/tasks/agents/lens/consent"),
+            json!({"enabled": true})
+        )
+    );
+    assert_eq!(writes(&stub).len(), 5);
+}
+
+#[tokio::test]
+async fn without_the_settings_routes_each_agent_is_written_alone() {
+    let stub = settings_stub(settings_catalog(), settings_view(), OWNER_WITHOUT_VIEW).await;
+    let (tool, gate) = stub.tool(stub.config("key-settings"));
+
+    let settings = tool.execute(json!({"action": "settings"})).await.unwrap();
+    assert!(!settings.is_error);
+    let text = text_of(&settings);
+    assert!(text.starts_with(
+        "ContextAgents in Demos: 14 of 15 on.\nYou can change them: you're an admin here."
+    ));
+    let data = settings.structured_content.clone().unwrap();
+    assert_eq!(
+        (data["on"].clone(), data["total"].clone()),
+        (json!(14), json!(15))
+    );
+
+    let off = tool
+        .execute(json!({"action": "disable", "agent": "keeper"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        text_of(&off),
+        "ContextAgents in Demos: 13 of 15 on (was 14).\nTurned off: keeper (Plans & Tasks Keeper).\nUndo: agents(action=\"enable\", agent=\"keeper\")"
+    );
+    let per_agent: Vec<(String, Value)> = writes(&stub)
+        .into_iter()
+        .filter(|(path, _)| *path != settings_path_of())
+        .collect();
+    assert_eq!(
+        per_agent,
+        vec![(
+            format!("/workspaces/{WORKSPACE}/tasks/agents/keeper/consent"),
+            json!({"enabled": false})
+        )]
+    );
+    // The listing learned it from the read after the change.
+    let key = GateKey {
+        identity: caller_identity(&tool.client).await.unwrap(),
+        workspace_id: workspace(),
+    };
+    let cached = gate.entry(&key).unwrap();
+    assert!(
+        !cached
+            .availability
+            .catalog()
+            .unwrap()
+            .find("keeper")
+            .unwrap()
+            .enabled
+    );
+
+    // enable all turns on only what is off.
+    let all = tool
+        .execute(json!({"action": "enable", "agents": ["all"]}))
+        .await
+        .unwrap();
+    assert!(text_of(&all).starts_with("ContextAgents in Demos: 15 of 15 on (was 13)."));
+    assert_eq!(writes(&stub).len(), 3);
+
+    // Already so: nothing is sent.
+    let again = tool
+        .execute(json!({"action": "enable", "agent": "mail"}))
+        .await
+        .unwrap();
+    assert!(text_of(&again).starts_with("Nothing changed: 15 of 15 ContextAgents are on in Demos."));
+    assert_eq!(writes(&stub).len(), 3);
+
+    // A name the catalog lacks is refused before anything is sent.
+    let unknown = tool
+        .execute(json!({"action": "disable", "agent": "nope"}))
+        .await
+        .unwrap_err();
+    assert!(unknown.to_string().contains("No agent nope here."));
+    let empty = tool.execute(json!({"action": "enable"})).await.unwrap_err();
+    assert!(empty.to_string().contains("Name the agents"));
+    assert_eq!(writes(&stub).len(), 3);
+}
+
+#[tokio::test]
+async fn a_member_is_told_who_can_change_it_and_nothing_is_sent() {
+    let mut member_view = settings_view();
+    member_view["data"]["role"] = json!("member");
+    member_view["data"]["can_manage"] = json!(false);
+    let member = StubShape {
+        admin: false,
+        ..OWNER_WITH_VIEW
+    };
+    let stub = settings_stub(settings_catalog(), member_view, member).await;
+    let (tool, _) = stub.tool(stub.config("key-member"));
+    let settings = tool.execute(json!({"action": "settings"})).await.unwrap();
+    assert!(text_of(&settings).contains(
+        "Read-only for you (you're a member here): Sam Rivera (owner) or Ana Lee (admin) can change them."
+    ));
+    let refused = tool
+        .execute(json!({"action": "disable", "agent": "mail"}))
+        .await
+        .unwrap();
+    assert!(!refused.is_error);
+    assert_eq!(
+        text_of(&refused),
+        "Nothing changed: only Sam Rivera (owner) or Ana Lee (admin) can choose which ContextAgents are on in Demos (you're a member here). Ask them to turn mail off. agents(action=\"settings\") shows what is on now."
+    );
+    let choose = tool.execute(json!({"action": "choose"})).await.unwrap();
+    assert!(
+        text_of(&choose).starts_with("Nothing changed: only Sam Rivera (owner) or Ana Lee (admin)")
+    );
+    assert!(writes(&stub).is_empty());
+
+    // Without the view, and the members unreadable: the first write finds out, then stops.
+    let unknown = StubShape {
+        view: false,
+        admin: false,
+        members: false,
+        catalog_status: 200,
+    };
+    let stub = settings_stub(settings_catalog(), settings_view(), unknown).await;
+    let (tool, _) = stub.tool(stub.config("key-unknown"));
+    let refused = tool
+        .execute(json!({"action": "disable", "agents": ["keeper", "pdf", "lens"]}))
+        .await
+        .unwrap();
+    assert!(text_of(&refused).starts_with(
+        "Nothing changed: only sam (owner) can choose which ContextAgents are on in Demos."
+    ));
+    assert_eq!(writes(&stub).len(), 1, "one try, then stop");
+}
+
+#[tokio::test]
+async fn runs_not_open_yet_are_said_plainly() {
+    // With the view: the settings still read and change; why runs can't start is said.
+    let mut closed_view = settings_view();
+    closed_view["data"]["runs"] = json!({"open": false, "blocked": {"code": "not_open",
+        "message": "ContextAgents can't run in this workspace yet. Your choices here are saved and apply as soon as they can."},
+        "daily": {"used": 0, "limit": 200, "reached": false, "resets_at": "2026-10-29T00:00:00Z"}});
+    let closed = StubShape {
+        catalog_status: 403,
+        ..OWNER_WITH_VIEW
+    };
+    let stub = settings_stub(settings_catalog(), closed_view, closed).await;
+    let (tool, gate) = stub.tool(stub.config("key-not-open"));
+    let settings = tool.execute(json!({"action": "settings"})).await.unwrap();
+    assert!(text_of(&settings).contains(
+        "\nContextAgents can't run in this workspace yet. Your choices here are saved and apply as soon as they can.\n"
+    ));
+    assert_eq!(
+        settings.structured_content.as_ref().unwrap()["runs"]["open"],
+        false
+    );
+    let off = tool
+        .execute(json!({"action": "disable", "agent": "mail"}))
+        .await
+        .unwrap();
+    assert!(text_of(&off).starts_with("ContextAgents in Demos: 14 of 15 on (was 15)."));
+    // The tool stays unlisted there: the catalog is still closed.
+    let key = GateKey {
+        identity: caller_identity(&tool.client).await.unwrap(),
+        workspace_id: workspace(),
+    };
+    assert!(!gate.entry(&key).unwrap().availability.is_listed());
+
+    // Without the view: a closed catalog means nothing to choose.
+    let old_closed = StubShape {
+        view: false,
+        catalog_status: 403,
+        ..OWNER_WITH_VIEW
+    };
+    let stub = settings_stub(settings_catalog(), settings_view(), old_closed).await;
+    let (tool, _) = stub.tool(stub.config("key-closed-settings"));
+    for call in [
+        json!({"action": "settings"}),
+        json!({"action": "enable", "agent": "all"}),
+        json!({"action": "choose"}),
+    ] {
+        let answer = tool.execute(call).await.unwrap();
+        assert!(!answer.is_error);
+        assert!(text_of(&answer).starts_with(
+            "ContextAgents aren't open in Demos yet, so there is nothing to choose and nothing was changed."
+        ));
+        assert_eq!(answer.structured_content.as_ref().unwrap()["open"], false);
+    }
+    assert!(writes(&stub).is_empty());
+}
+
+/// A client that answers elicitations with `answers` in turn, recording what it was asked.
+#[derive(Default)]
+struct FormClient {
+    asked: Mutex<Vec<Value>>,
+    answers: Mutex<Vec<std::result::Result<Value, String>>>,
+}
+
+#[async_trait]
+impl PeerChannel for FormClient {
+    async fn notify(&self, _method: &str, _params: Value) {}
+
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        _timeout: Duration,
+    ) -> std::result::Result<Value, String> {
+        assert_eq!(method, "elicitation/create");
+        self.asked.lock().unwrap().push(params);
+        let mut answers = self.answers.lock().unwrap();
+        if answers.is_empty() {
+            Err("no answer".to_string())
+        } else {
+            answers.remove(0)
+        }
+    }
+}
+
+fn form_client(answers: Vec<std::result::Result<Value, String>>) -> Arc<FormClient> {
+    Arc::new(FormClient {
+        asked: Mutex::new(Vec::new()),
+        answers: Mutex::new(answers),
+    })
+}
+
+#[tokio::test]
+async fn choose_asks_the_person_in_a_form_and_sets_what_they_ticked() {
+    let stub = settings_stub(settings_catalog(), settings_view(), OWNER_WITH_VIEW).await;
+    let (tool, _) = stub.tool(stub.config("key-form"));
+
+    // A 2025-11-25 client: one multi-select, everything on checked; keeper unticked.
+    let keep: Vec<String> = Catalog::from_value(&settings_view())
+        .agents
+        .iter()
+        .map(|a| a.id.clone())
+        .filter(|id| id != "keeper")
+        .collect();
+    let client = form_client(vec![Ok(
+        json!({"action": "accept", "content": {"enabled": keep}}),
+    )]);
+    let peer = CallPeer::new(client.clone(), None, true).with_client_protocol(Some("2025-11-25"));
+    let answer = run_with_call_peer(peer, tool.execute(json!({"action": "choose"})))
+        .await
+        .unwrap();
+    assert!(text_of(&answer)
+        .starts_with("ContextAgents in Demos: 14 of 15 on (was 15).\nTurned off: keeper"));
+    let asked = client.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("Choose the ContextAgents on in Demos. 15 of 15 are on now."));
+    let field = &asked[0]["requestedSchema"]["properties"]["enabled"];
+    assert_eq!(field["type"], "array");
+    assert_eq!(field["default"].as_array().unwrap().len(), 15);
+    // The form's answer is the exact set.
+    assert_eq!(writes(&stub)[0].1["enable"], json!(keep));
+
+    // A 2025-06-18 client: one checkbox per agent; keeper ticked again.
+    let client = form_client(vec![Ok(
+        json!({"action": "accept", "content": {"keeper": true}}),
+    )]);
+    let peer = CallPeer::new(client.clone(), None, true).with_client_protocol(Some("2025-06-18"));
+    let answer = run_with_call_peer(peer, tool.execute(json!({"action": "choose"})))
+        .await
+        .unwrap();
+    assert!(text_of(&answer).contains("Turned on: keeper (Plans & Tasks Keeper)."));
+    let asked = client.asked.lock().unwrap().clone();
+    let boxes = &asked[0]["requestedSchema"]["properties"];
+    assert_eq!(boxes["mail"]["type"], "boolean");
+    assert_eq!(boxes["keeper"]["default"], false);
+    assert_eq!(writes(&stub).len(), 2);
+
+    // A client that refuses the multi-select at once is asked again with checkboxes.
+    let client = form_client(vec![
+        Err("the client answered with an error: unsupported schema".to_string()),
+        Ok(json!({"action": "decline"})),
+    ]);
+    let peer = CallPeer::new(client.clone(), None, true).with_client_protocol(Some("2025-11-25"));
+    let answer = run_with_call_peer(peer, tool.execute(json!({"action": "choose"})))
+        .await
+        .unwrap();
+    assert_eq!(
+        text_of(&answer),
+        "Nothing changed: the person closed the form. 15 of 15 ContextAgents stay on in Demos."
+    );
+    let asked = client.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2);
+    assert_eq!(
+        asked[1]["requestedSchema"]["properties"]["mail"]["type"],
+        "boolean"
+    );
+
+    // No answer at all: the checklist and the call to make.
+    let peer =
+        CallPeer::new(form_client(vec![]), None, true).with_client_protocol(Some("2025-11-25"));
+    let answer = run_with_call_peer(peer, tool.execute(json!({"action": "choose"})))
+        .await
+        .unwrap();
+    assert!(text_of(&answer)
+        .contains("The form could not be shown here: show the person this checklist"));
+    assert_eq!(writes(&stub).len(), 2);
+}
+
+#[tokio::test]
+async fn choose_without_a_form_gives_the_checklist_and_with_agents_sets_exactly_them() {
+    let stub = settings_stub(settings_catalog(), settings_view(), OWNER_WITHOUT_VIEW).await;
+    let (tool, _) = stub.tool(stub.config("key-text"));
+    // No peer (the hosted gateway), or a client without elicitation.
+    for peer in [None, Some(CallPeer::new(form_client(vec![]), None, false))] {
+        let call = tool.execute(json!({"action": "choose"}));
+        let answer = match peer {
+            Some(peer) => run_with_call_peer(peer, call).await,
+            None => call.await,
+        }
+        .unwrap();
+        let text = text_of(&answer);
+        assert!(text.starts_with("ContextAgents in Demos: 14 of 15 on."));
+        assert!(text.ends_with("This client can't show a form: show the person this checklist and ask which to keep on, then call agents(action=\"choose\", agents=[\"<id>\", ...]) with exactly those (or agents=\"all\" / \"none\"). Only what changes is sent."));
+        assert_eq!(answer.structured_content.as_ref().unwrap()["form"], false);
+    }
+    assert!(writes(&stub).is_empty());
+
+    let exact = tool
+        .execute(json!({"action": "choose", "agents": ["oracle", "review", "mail"]}))
+        .await
+        .unwrap();
+    let text = text_of(&exact);
+    assert!(text.starts_with("ContextAgents in Demos: 3 of 15 on (was 14)."));
+    assert!(text.contains("Turned on: mail (Mail)."));
+    assert_eq!(writes(&stub).len(), 1 + 12);
+}
+
+#[tokio::test]
+async fn a_stateless_client_answers_the_form_in_the_next_call() {
+    let stub = settings_stub(settings_catalog(), settings_view(), OWNER_WITH_VIEW).await;
+    let (tool, _) = stub.tool(stub.config("key-stateless"));
+    let first = CallPeer::new(Arc::new(NoLiveChannel), None, false).with_inline_input(&json!({}));
+    let asking = run_with_call_peer(first.clone(), tool.execute(json!({"action": "choose"})))
+        .await
+        .unwrap();
+    assert_eq!(
+        text_of(&asking),
+        "Asking the person which ContextAgents to keep on in Demos."
+    );
+    let question = first.take_input_required().expect("the question");
+    assert_eq!(question["resultType"], "input_required");
+    let request = &question["inputRequests"]["agents"];
+    assert_eq!(request["method"], "elicitation/create");
+    assert_eq!(
+        request["params"]["requestedSchema"]["properties"]["enabled"]["type"], "array",
+        "a stateless (2026-07-28) client has multi-select"
+    );
+    let state = question["requestState"].as_str().unwrap().to_string();
+    assert!(writes(&stub).is_empty());
+
+    let answered = CallPeer::new(Arc::new(NoLiveChannel), None, false).with_inline_input(&json!({
+        "inputResponses": {"agents": {"action": "accept", "content": {"enabled": ["oracle"]}}},
+        "requestState": state,
+    }));
+    let done = run_with_call_peer(answered, tool.execute(json!({"action": "choose"})))
+        .await
+        .unwrap();
+    assert!(text_of(&done).starts_with("ContextAgents in Demos: 1 of 15 on (was 15)."));
+    assert_eq!(
+        writes(&stub),
+        vec![(
+            settings_path_of(),
+            json!({"enable": ["oracle"], "accept_new_access": false})
+        )]
+    );
+}
+
+#[tokio::test]
+async fn with_no_agent_on_the_tool_is_listed_with_how_to_turn_them_on() {
+    let mut value = settings_catalog();
+    for entry in value["data"]["agents"].as_array_mut().unwrap() {
+        entry["enabled"] = json!(false);
+    }
+    let stub = Stub::api(value["data"].clone(), |_| Answer::error(404, "no")).await;
+    let listed = listing_for(&stub.url, "key-none-on", Some(workspace())).await;
+    assert!(listed.is_listed());
+    let description = listed.description().unwrap();
+    assert!(description.starts_with("ContextAgents: specialist agents"));
+    assert!(description.contains("None is on in this workspace."));
+    assert!(description.contains("choose") && description.contains("enable"));
+    assert!(description.chars().count() <= DESCRIPTION_BUDGET);
+    let schema = listed.input_schema().unwrap();
+    let agent_param = schema["properties"]["agent"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(agent_param.contains("oracle") && agent_param.contains("mail"));
+    assert_eq!(schema["properties"]["agents"]["items"]["type"], "string");
 }

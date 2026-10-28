@@ -69,7 +69,14 @@ pub struct CallPeer {
     last_progress: Arc<Mutex<Option<f64>>>,
     /// A stateless call's answers, and the question it ends with when it needs one.
     inline: Option<Arc<InlineInput>>,
+    /// The protocol revision the client asked for at `initialize` (its newest), which says
+    /// which form fields it can show.
+    client_protocol: Option<String>,
 }
+
+/// The first revision whose elicitation forms have multi-select fields (an array of
+/// enumerated strings), MCP 2025-11-25.
+pub const MULTI_SELECT_PROTOCOL: &str = "2025-11-25";
 
 /// What a stateless (2026-07-28) call carries back from the person, and what it asks.
 #[derive(Debug, Default)]
@@ -121,7 +128,35 @@ impl CallPeer {
             elicitation,
             last_progress: Arc::new(Mutex::new(None)),
             inline: None,
+            client_protocol: None,
         }
+    }
+
+    /// The protocol revision the client asked for at `initialize`.
+    pub fn with_client_protocol(mut self, protocol: Option<&str>) -> Self {
+        self.client_protocol = protocol
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        self
+    }
+
+    /// The protocol revision an `initialize`'s params ask for.
+    pub fn initialize_protocol(initialize_params: &Value) -> Option<String> {
+        initialize_params
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Whether a form may hold a multi-select field: a stateless (2026-07-28) call, or a
+    /// client that asked for 2025-11-25 or later. Revisions are dates, so they order as text.
+    pub fn can_multi_select(&self) -> bool {
+        self.inline.is_some()
+            || self
+                .client_protocol
+                .as_deref()
+                .is_some_and(|protocol| protocol >= MULTI_SELECT_PROTOCOL)
     }
 
     /// A stateless call whose client can ask its person: its `inputResponses` and
@@ -484,6 +519,27 @@ mod tests {
             &json!({"capabilities": {"elicitation": {}}})
         ));
         assert!(!CallPeer::client_can_elicit(&json!({"capabilities": {}})));
+    }
+
+    #[test]
+    fn multi_select_forms_need_2025_11_25_or_a_stateless_call() {
+        let recorder: Arc<dyn PeerChannel> = Arc::new(Recorder::default());
+        let live = |protocol: Option<&str>| {
+            CallPeer::new(recorder.clone(), None, true).with_client_protocol(protocol)
+        };
+        assert!(!live(None).can_multi_select());
+        assert!(!live(Some("2024-11-05")).can_multi_select());
+        assert!(!live(Some("2025-06-18")).can_multi_select());
+        assert!(live(Some("2025-11-25")).can_multi_select());
+        assert!(live(Some("2026-07-28")).can_multi_select());
+        assert!(!live(Some("  ")).can_multi_select());
+        let stateless = CallPeer::new(recorder.clone(), None, false).with_inline_input(&json!({}));
+        assert!(stateless.can_multi_select());
+        assert_eq!(
+            CallPeer::initialize_protocol(&json!({"protocolVersion": "2025-11-25"})).as_deref(),
+            Some("2025-11-25")
+        );
+        assert_eq!(CallPeer::initialize_protocol(&json!({})), None);
     }
 
     #[tokio::test]

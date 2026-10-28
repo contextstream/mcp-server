@@ -1,5 +1,7 @@
 //! The Slipstream catalog as ContextStream answers it (`GET /tasks/agents?workspace_id=`):
-//! every agent with the workspace's decision about it, its price per run and its input.
+//! every agent with the workspace's decision about it, its price per run and its input. The
+//! settings view (`GET /workspaces/{id}/tasks/agents/consent`) parses into the same shape,
+//! with each agent's access in words, its one-line job and the groups to show agents in.
 //!
 //! Parsing is tolerant: a field a worker from before prices or inputs synced leaves out is
 //! simply absent, and an entry without an id is skipped.
@@ -11,6 +13,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct Catalog {
     pub agents: Vec<AgentEntry>,
+    /// The groups to show agents in, `(id, label)` in display order (the settings view).
+    pub categories: Vec<(String, String)>,
 }
 
 /// One agent and whether an owner or admin turned it on in the workspace.
@@ -26,6 +30,53 @@ pub(crate) struct AgentEntry {
     pub input_schema: Option<Value>,
     pub examples: Vec<Example>,
     pub enabled: bool,
+    /// The scopes the agent asks for, in its order.
+    pub scopes: Vec<String>,
+    /// What each scope lets it do, as the consent screen words it: `(scope, description)`.
+    pub scope_descriptions: Vec<(String, String)>,
+    /// The scopes a run holds now: the agent's, within what the workspace consented to.
+    pub effective_scopes: Vec<String>,
+    /// On, but the agent now asks for scopes nobody consented to yet.
+    pub needs_review: bool,
+    /// The catalog's own grouping (a category id), when it gives one.
+    pub category: Option<String>,
+    /// What it does in one line, when the API words it (the settings view).
+    pub job_line: Option<String>,
+    /// Each scope in words, when the API gives them (the settings view).
+    pub access: Vec<AccessItem>,
+}
+
+/// What one scope lets an agent do, in words, and where the workspace stands on it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AccessItem {
+    pub scope: String,
+    /// A chip's words: "Reads repositories".
+    pub label: String,
+    /// The sentence a person consents to.
+    pub description: String,
+    pub kind: AccessKind,
+    /// Its runs hold it now.
+    pub granted: bool,
+    /// What a review would add.
+    pub new: bool,
+}
+
+/// Whether a scope reads the workspace, changes something in it, or calls models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccessKind {
+    Read,
+    Write,
+    Models,
+}
+
+impl AccessKind {
+    fn parse(kind: &str) -> Self {
+        match kind {
+            "read" => Self::Read,
+            "models" => Self::Models,
+            _ => Self::Write,
+        }
+    }
 }
 
 /// One worked example of an agent's input.
@@ -57,7 +108,22 @@ impl Catalog {
             .and_then(Value::as_array)
             .map(|entries| entries.iter().filter_map(AgentEntry::from_value).collect())
             .unwrap_or_default();
-        Self { agents }
+        let categories = value
+            .get("categories")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let id = item.get("id")?.as_str()?.trim();
+                        let label = item.get("label")?.as_str()?.trim();
+                        (!id.is_empty() && !label.is_empty())
+                            .then(|| (id.to_string(), label.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { agents, categories }
     }
 
     /// The agents an owner or admin turned on, by id.
@@ -125,7 +191,94 @@ impl AgentEntry {
                     .collect()
             })
             .unwrap_or_default();
+        let strings = |value: Option<&Value>| -> Vec<String> {
+            value
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let scope_descriptions = entry
+            .get("scope_descriptions")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let scope = item.get("scope")?.as_str()?.trim();
+                        let description = item.get("description")?.as_str()?.trim();
+                        (!scope.is_empty() && !description.is_empty())
+                            .then(|| (scope.to_string(), description.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let category = [agent.get("category"), entry.get("category")]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|c| !c.is_empty())
+            .map(str::to_string);
+        let access: Vec<AccessItem> = entry
+            .get("access")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let scope = item.get("scope")?.as_str()?.trim().to_string();
+                        let words = |key: &str| {
+                            item.get(key)
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .unwrap_or_default()
+                                .to_string()
+                        };
+                        let label = Some(words("label"))
+                            .filter(|label| !label.is_empty())
+                            .unwrap_or_else(|| scope.clone());
+                        Some(AccessItem {
+                            label,
+                            description: words("description"),
+                            kind: AccessKind::parse(&words("kind")),
+                            granted: item.get("granted").and_then(Value::as_bool) == Some(true),
+                            new: item.get("new").and_then(Value::as_bool) == Some(true),
+                            scope,
+                        })
+                    })
+                    .filter(|item| !item.scope.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The settings view says each scope through `access`; the catalog lists them.
+        let mut scopes = strings(agent.get("scopes"));
+        if scopes.is_empty() {
+            scopes = access.iter().map(|item| item.scope.clone()).collect();
+        }
+        let mut scope_descriptions: Vec<(String, String)> = scope_descriptions;
+        if scope_descriptions.is_empty() {
+            scope_descriptions = access
+                .iter()
+                .filter(|item| !item.description.is_empty())
+                .map(|item| (item.scope.clone(), item.description.clone()))
+                .collect();
+        }
         Some(Self {
+            job_line: Some(text("job")).filter(|job| !job.is_empty()),
+            access,
+            scopes,
+            scope_descriptions,
+            effective_scopes: strings(entry.get("effective_scopes")),
+            needs_review: entry.get("needs_review").and_then(Value::as_bool) == Some(true),
+            category,
             version: text("version"),
             name,
             description: text("description"),
@@ -148,6 +301,19 @@ impl AgentEntry {
         } else {
             format!("{}@{}", self.id, self.version)
         }
+    }
+
+    /// The scopes it asks for that its runs do not hold yet: what an owner or admin grants
+    /// by turning it on again. Empty unless it needs review.
+    pub fn new_scopes(&self) -> Vec<&str> {
+        if !self.needs_review {
+            return Vec::new();
+        }
+        self.scopes
+            .iter()
+            .filter(|scope| !self.effective_scopes.contains(scope))
+            .map(String::as_str)
+            .collect()
     }
 
     /// A price above zero: the run needs the person's accepted quote.

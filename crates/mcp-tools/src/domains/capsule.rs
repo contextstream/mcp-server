@@ -186,6 +186,7 @@ pub struct CapsuleInput {
 pub struct CapsuleTool {
     client: ContextStreamClient,
     atlas_layer: mcp_types::atlas_layer::AtlasLayer,
+    session: Option<Arc<mcp_session::SessionManager>>,
 }
 
 impl CapsuleTool {
@@ -200,7 +201,13 @@ impl CapsuleTool {
         Self {
             client,
             atlas_layer,
+            session: None,
         }
+    }
+
+    pub fn with_session(mut self, session: Arc<mcp_session::SessionManager>) -> Self {
+        self.session = Some(session);
+        self
     }
 
     fn parse_uuid(value: &Option<String>, field_name: &str) -> Result<Option<Uuid>> {
@@ -263,12 +270,52 @@ const CAPSULE_TOOL_DESCRIPTION: &str = "ContextCapsule: portable, shareable, hyd
 /// [`crate::schema::with_full_reference`].
 const CAPSULE_TOOL_REFERENCE: &str = "ContextCapsule: portable, shareable, hydrate-on-demand snapshots of project or session context.\n\nUse capsule when:\n- User pastes a /c/<token> link or capsule_<uuid> token → action=open, url=<paste>\n- User explicitly asks for a capsule, portable bundle, share link, team link, or external-agent link → action=create; session creates automatically mint a safe share by default, so call action=share only for a different/additional policy\n- User asks for an end-of-session capsule or shareable summary → action=create, scope=session, session_id=<current session id> (or transcript_id=<uuid>). Return the capsule id plus Agent URL + Dashboard URL links; pass audience=\"self\" only when the user explicitly requests no share link\n- User wants to bootstrap a fresh agent with project state → action=open after action=create\n- User asks for a paste-ready capsule prompt (\"bootstrap prompt\", \"prompt for ChatGPT/Claude\", \"summarize this capsule for a fresh agent\") → action=bootstrap_prompt — returns Markdown the agent can paste verbatim into another LLM\n- User wants files / knowledge / code graphs from a share token → action=graph (share_token or url)\n- User wants to list or audit capsules → action=list, list_shares, audit\n\nHandoff routing:\n- A generic request to create/prepare a handoff, hand work over, or continue in another agent/session MUST create `entity(kind=\"handoff\", action=\"create\", ...)` as the durable handoff.\n- If that handoff also needs a portable bundle, capsule, or share link, create the entity AND this capsule; return both results. Capsule is the artifact, not a replacement for the handoff entity.\n- Never replace either tool call with HANDOFF.md, a scratch prompt, a generic document/event, or prose alone.\n\nDo NOT use capsule for normal turn-by-turn retrieval — use `context` instead.\nDo NOT satisfy a session-capsule request with a prose summary only; default shared results must include the created capsule id plus Agent URL / Dashboard URL links. If audience=\"self\" is passed or auto-share fails, still return the capsule id and explain the missing share link.\n\nSession capsules default to a snapshot handoff with the full transcript available as lazy chunks and owner-only transcript access enforced by the API. Session create results include share links by default; audience=\"self\" opts out. Team share links are authenticated and reusable by default; external_agent/public_link/support shares are token-gated and single-use by default. After action=open with hydrate=false (default), follow up with action=chunk for lazy sections (chunk_ids present, no inline data). For share tokens, action=graph returns JSON (explorer|knowledge|code).";
 
+/// Actions whose workspace and project the API client takes from the process
+/// defaults when the call names none. A hosted session keeps the scope `init`
+/// resolved in its session state (or in the connection's headers), never in
+/// those process defaults, so these actions fill it in themselves. Actions
+/// that read no scope are left alone.
+const SCOPE_DEFAULTED_ACTIONS: &[&str] = &["create", "list", "list_shares", "audit", "primer"];
+
+/// Complete a call's scope from the session's `(workspace, project)`.
+///
+/// The session's project is not borrowed when the call already chooses a
+/// project another way: it names a workspace other than the session's, or a
+/// `folder_path` or `project_name` to resolve.
+fn fill_scope_defaults(
+    input: &mut CapsuleInput,
+    (workspace, project): (Option<Uuid>, Option<Uuid>),
+) {
+    let names_another_workspace = input.workspace_id.as_deref().is_some_and(|raw| {
+        match Uuid::parse_str(raw.trim()) {
+            Ok(named) => Some(named) != workspace,
+            // Not a UUID: the call fails on it later; don't guess a project.
+            Err(_) => true,
+        }
+    });
+    let names_a_project_hint = [input.folder_path.as_deref(), input.project_name.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|hint| !hint.trim().is_empty());
+    if input.workspace_id.is_none() {
+        input.workspace_id = workspace.map(|id| id.to_string());
+    }
+    if input.project_id.is_none() && !names_another_workspace && !names_a_project_hint {
+        input.project_id = project.map(|id| id.to_string());
+    }
+}
+
 #[async_trait]
 impl ToolHandler for CapsuleTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
-        let input: CapsuleInput =
+        let mut input: CapsuleInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
         let action = input.action.to_lowercase();
+        if SCOPE_DEFAULTED_ACTIONS.contains(&action.as_str()) {
+            let defaults =
+                super::scope::read_scope_defaults(&self.client, self.session.as_deref()).await;
+            fill_scope_defaults(&mut input, defaults);
+        }
 
         match action.as_str() {
             "open" => {
@@ -2536,11 +2583,12 @@ fn format_list_shares_summary(
 pub fn register_capsule_tools(
     registry: &mut crate::registry::ToolRegistry,
     client: ContextStreamClient,
+    session: Arc<mcp_session::SessionManager>,
 ) {
     let atlas_layer = registry.atlas_layer().clone();
     registry.register(
         "capsule",
-        Arc::new(CapsuleTool::with_atlas(client, atlas_layer)),
+        Arc::new(CapsuleTool::with_atlas(client, atlas_layer).with_session(session)),
     );
 }
 

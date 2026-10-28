@@ -88,7 +88,7 @@ pub fn build_registry(
         client.clone(),
         session.clone(),
     );
-    domains::vcs::register_vcs_tools(&mut registry, client.clone());
+    domains::vcs::register_vcs_tools(&mut registry, client.clone(), session.clone());
     // Account connection tool (browser device login, credential status). In
     // full mode it lets a revoked or expired key be repaired from chat.
     // Stdio only: the hosted HTTP gateway keeps bearer auth and never
@@ -112,7 +112,7 @@ pub fn build_registry(
     domains::media::register_media_tools(&mut registry, client.clone(), session.clone());
     domains::help::register_help_tools(&mut registry, client.clone());
     if config.capsule_enabled {
-        domains::capsule::register_capsule_tools(&mut registry, client.clone());
+        domains::capsule::register_capsule_tools(&mut registry, client.clone(), session.clone());
     }
     // Agent Q&A is registered unconditionally and returns a clean unavailable
     // response when its hosted backend is not configured.

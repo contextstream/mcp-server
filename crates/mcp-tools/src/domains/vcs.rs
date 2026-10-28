@@ -124,11 +124,20 @@ pub struct VcsInput {
 
 pub struct VcsTool {
     client: ContextStreamClient,
+    session: Option<Arc<mcp_session::SessionManager>>,
 }
 
 impl VcsTool {
     pub fn new(client: ContextStreamClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            session: None,
+        }
+    }
+
+    pub fn with_session(mut self, session: Arc<mcp_session::SessionManager>) -> Self {
+        self.session = Some(session);
+        self
     }
 
     async fn resolve_workspace_id(&self, input: &Option<String>) -> Result<Uuid> {
@@ -137,10 +146,11 @@ impl VcsTool {
                 .map_err(|_| Error::Validation("Invalid workspace_id".to_string()));
         }
 
-        let config = self.client.config().await;
-        config.default_workspace_id.ok_or_else(|| {
+        let (workspace_id, _) =
+            super::scope::read_scope_defaults(&self.client, self.session.as_deref()).await;
+        workspace_id.ok_or_else(|| {
             Error::Validation(
-                "workspace_id is required when no default workspace is configured".to_string(),
+                "workspace_id is required: this session has no workspace yet. Run init(folder_path=\"...\") or pass workspace_id".to_string(),
             )
         })
     }
@@ -1175,8 +1185,9 @@ impl ToolHandler for VcsTool {
 pub fn register_vcs_tools(
     registry: &mut crate::registry::ToolRegistry,
     client: ContextStreamClient,
+    session: Arc<mcp_session::SessionManager>,
 ) {
-    registry.register("vcs", Arc::new(VcsTool::new(client)));
+    registry.register("vcs", Arc::new(VcsTool::new(client).with_session(session)));
 }
 
 #[cfg(test)]

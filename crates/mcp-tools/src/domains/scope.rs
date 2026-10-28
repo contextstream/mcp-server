@@ -624,6 +624,33 @@ pub fn attach_scope_recovery_metadata(value: &mut Value, scope: &ResolvedWriteSc
     }
 }
 
+/// Defaults for tools that only need the already resolved scope. Hosted init
+/// updates caller-partitioned session state rather than the process config;
+/// stateless calls may instead carry that scope in request headers.
+pub(crate) async fn read_scope_defaults(
+    client: &ContextStreamClient,
+    session: Option<&SessionManager>,
+) -> (Option<Uuid>, Option<Uuid>) {
+    let state = match session {
+        Some(session) => Some(session.state().await),
+        None => None,
+    };
+    let auth = get_task_auth_override();
+    let config = client.config().await;
+    (
+        state
+            .as_ref()
+            .and_then(|state| state.workspace_id)
+            .or_else(|| auth.as_ref().and_then(|auth| auth.workspace_id))
+            .or(config.default_workspace_id),
+        state
+            .as_ref()
+            .and_then(|state| state.project_id)
+            .or_else(|| auth.as_ref().and_then(|auth| auth.project_id))
+            .or(config.default_project_id),
+    )
+}
+
 pub async fn resolve_read_scope(
     client: &ContextStreamClient,
     session: &SessionManager,
@@ -1681,6 +1708,75 @@ mod tests {
         assert_eq!(
             value["scope_recovery_note"],
             serde_json::json!("Recovered project scope")
+        );
+    }
+    fn scope_test_client(
+        workspace: Option<Uuid>,
+        project: Option<Uuid>,
+    ) -> (ContextStreamClient, SessionManager) {
+        let config = mcp_types::Config {
+            default_workspace_id: workspace,
+            default_project_id: project,
+            ..mcp_types::Config::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = SessionManager::new(client.clone(), config);
+        (client, session)
+    }
+
+    #[tokio::test]
+    async fn scope_defaults_come_from_the_process_config_when_nothing_else_has_them() {
+        let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+        let (client, session) = scope_test_client(Some(workspace), Some(project));
+        assert_eq!(
+            read_scope_defaults(&client, Some(&session)).await,
+            (Some(workspace), Some(project))
+        );
+        assert_eq!(
+            read_scope_defaults(&client, None).await,
+            (Some(workspace), Some(project))
+        );
+        let (client, session) = scope_test_client(None, None);
+        assert_eq!(
+            read_scope_defaults(&client, Some(&session)).await,
+            (None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_scope_defaults_read_the_session_then_the_request_headers() {
+        let (header_workspace, header_project) = (Uuid::new_v4(), Uuid::new_v4());
+        let (session_workspace, session_project) = (Uuid::new_v4(), Uuid::new_v4());
+        let (client, session) = scope_test_client(None, None);
+        let auth = mcp_types::config::AuthOverride {
+            api_key: Some("test-key".to_string()),
+            workspace_id: Some(header_workspace),
+            project_id: Some(header_project),
+            ..Default::default()
+        };
+
+        mcp_client::run_with_auth_override(auth, || async {
+            // A stateless call: only the headers carry the scope.
+            assert_eq!(
+                read_scope_defaults(&client, Some(&session)).await,
+                (Some(header_workspace), Some(header_project))
+            );
+            // After init: the session's scope wins, as for every read tool.
+            session
+                .update_scope(Some(session_workspace), Some(session_project), None)
+                .await;
+            assert_eq!(
+                read_scope_defaults(&client, Some(&session)).await,
+                (Some(session_workspace), Some(session_project))
+            );
+        })
+        .await;
+
+        // The hosted request never wrote the process config.
+        assert_eq!(
+            read_scope_defaults(&client, None).await,
+            (None, None),
+            "a hosted session's scope must not reach the process defaults"
         );
     }
 }

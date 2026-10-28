@@ -1158,7 +1158,7 @@ impl IngestHold {
     fn refused(&self) -> bool {
         matches!(
             self.failure,
-            IngestFailure::Denied | IngestFailure::Unauthorized
+            IngestFailure::Denied | IngestFailure::Unauthorized | IngestFailure::OutOfCredits
         )
     }
 }
@@ -1745,6 +1745,9 @@ fn record_watch_flush_outcome(
                     "watch: ingest accepted again; sync resumed for this checkout"
                 );
             }
+            // An accepted ingest is the proof credits are back (the client also
+            // clears the shared record when its request is accepted).
+            mcp_client::credit_hold::clear(target.project_id);
             retry
         }
         WatchFlushOutcome::Failed(retry, failure) => {
@@ -1789,6 +1792,8 @@ fn ingest_hold_delay(failure: IngestFailure, streak: u32, jitter: f64) -> Durati
                 INGEST_DENIED_RECHECK_MAX
             }
         }
+        // Credits can be added at any time: recheck soon, then back off to 30 min.
+        IngestFailure::OutOfCredits => mcp_client::credit_hold::recheck_delay(streak),
         // The server's instruction wins, bounded by the slowest recheck.
         IngestFailure::RateLimited { retry_after } => retry_after
             .map(Duration::from_secs)
@@ -1825,6 +1830,13 @@ fn log_ingest_hold(target: &WatchTarget, failure: IngestFailure, streak: u32, de
             project_id = %target.project_id,
             path = %target.folder_path,
             "watch: the API rejected the saved credentials, so sync is paused. Run `contextstream-mcp setup` to sign in again; rechecking in {minutes} min"
+        ),
+        // The person is told once by the hooks (`mcp_client::credit_hold`); the
+        // log line is the first refusal of a hold only, not every recheck.
+        IngestFailure::OutOfCredits if streak == 1 => tracing::warn!(
+            project_id = %target.project_id,
+            path = %target.folder_path,
+            "watch: the account is out of credits, so sync for this checkout is paused. Local changes stay queued and nothing is lost; add credits or upgrade at https://contextstream.io/pricing. Rechecking in {minutes} min, then less often"
         ),
         IngestFailure::RateLimited { .. } => tracing::info!(
             project_id = %target.project_id,
@@ -3232,6 +3244,122 @@ mod tests {
         }
     }
 
+    fn out_of_credits() -> mcp_types::Error {
+        mcp_types::Error::InsufficientCredits {
+            message: "You've run out of credits.".to_string(),
+            required: Some(20),
+            available: Some(3),
+        }
+    }
+
+    #[test]
+    fn a_credit_refusal_is_sent_once_then_held_and_rechecked_less_often() {
+        let mut sim = WatchSim::new();
+        sim.edit(
+            "/repo/held-checkout/src/lib.rs",
+            PendingSubmissionMode::Targeted,
+        );
+        // The same edit is re-queued every 5 s (the job reconcile), as it is
+        // while a refused batch's files stay dirty. None of it may be sent.
+        sim.reseed = Some(WatchSubmissionRetry {
+            paths: vec!["/repo/held-checkout/src/lib.rs".to_string()],
+            mode: PendingSubmissionMode::Targeted,
+        });
+        let mut refuse = |_| Err(out_of_credits());
+
+        sim.run_until(secs(5 * 60 - 1), &mut refuse);
+        assert_eq!(sim.submissions.len(), 1, "one attempt, then held");
+        let first = sim.submission_times()[0];
+        assert!(first <= secs(2), "first attempt after the debounce");
+
+        // First recheck after 5 minutes; still refused, the next is after 10.
+        sim.run_until(first + secs(5 * 60) + secs(1), &mut refuse);
+        assert_eq!(sim.submissions.len(), 2, "the 5 minute recheck");
+        let second = sim.submission_times()[1];
+        sim.run_until(second + secs(10 * 60) - secs(1), &mut refuse);
+        assert_eq!(sim.submissions.len(), 2, "held for 10 minutes now");
+        sim.run_until(second + secs(10 * 60) + secs(1), &mut refuse);
+        assert_eq!(sim.submissions.len(), 3);
+
+        // The wait stops growing at 30 minutes.
+        let third = sim.submission_times()[2];
+        sim.run_until(third + secs(20 * 60) + secs(1), &mut refuse);
+        assert_eq!(sim.submissions.len(), 4);
+        let fourth = sim.submission_times()[3];
+        sim.run_until(fourth + secs(30 * 60) + secs(1), &mut refuse);
+        assert_eq!(sim.submissions.len(), 5);
+        let fifth = sim.submission_times()[4];
+        sim.run_until(fifth + secs(30 * 60) + secs(1), &mut refuse);
+        assert_eq!(sim.submissions.len(), 6, "30 minutes is the ceiling");
+    }
+
+    #[test]
+    fn indexing_resumes_by_itself_once_credits_are_added() {
+        let mut sim = WatchSim::new();
+        sim.edit(
+            "/repo/held-checkout/src/lib.rs",
+            PendingSubmissionMode::Targeted,
+        );
+        sim.reseed = Some(WatchSubmissionRetry {
+            paths: vec!["/repo/held-checkout/src/lib.rs".to_string()],
+            mode: PendingSubmissionMode::Targeted,
+        });
+        // Out of credits for the first attempt and its recheck, then credits
+        // are added and the third attempt is accepted.
+        let mut api = |attempt: usize| match attempt {
+            1 | 2 => Err(out_of_credits()),
+            _ => Ok(()),
+        };
+        sim.run_until(secs(60 * 60), &mut api);
+
+        assert_eq!(sim.submissions.len(), 3, "refused twice, then accepted");
+        let times = sim.submission_times();
+        assert!(times[2] - times[1] >= secs(10 * 60), "{times:?}");
+        assert!(
+            sim.holds.lock().unwrap().is_empty(),
+            "an accepted ingest ends the hold"
+        );
+        assert!(
+            sim.pending.lock().unwrap().is_empty(),
+            "the queued edit was sent, not dropped"
+        );
+    }
+
+    #[test]
+    fn a_managed_reload_rechecks_a_credit_hold_at_once() {
+        let mut sim = WatchSim::new();
+        sim.edit(
+            "/repo/held-checkout/src/lib.rs",
+            PendingSubmissionMode::Targeted,
+        );
+        let mut refuse = |_: usize| Err(out_of_credits());
+        sim.run_until(secs(30), &mut refuse);
+        assert_eq!(sim.submissions.len(), 1);
+        assert!(sim.holds.lock().unwrap().values().all(IngestHold::refused));
+
+        refresh_ingest_holds(&sim.holds, std::slice::from_ref(&sim.target), true);
+        assert!(sim.holds.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn credits_reserved_for_queued_work_stay_a_short_transient_backoff() {
+        // 503 CREDITS_TEMPORARILY_RESERVED: the balance covers the request and
+        // the holds settle by themselves, so it is not a credit refusal.
+        let mut sim = WatchSim::new();
+        sim.edit(
+            "/repo/held-checkout/src/lib.rs",
+            PendingSubmissionMode::Targeted,
+        );
+        let mut reserved =
+            |_: usize| Err(mcp_types::Error::http(503, "Credits temporarily reserved"));
+        sim.run_until(secs(30), &mut reserved);
+        assert!(
+            sim.submissions.len() >= 3,
+            "it keeps the 2 s..5 min transient backoff, not a 5 minute hold: {:?}",
+            sim.submission_times()
+        );
+    }
+
     #[test]
     fn rate_limit_after_denials_holds_for_the_full_retry_after() {
         let mut sim = WatchSim::new();
@@ -3359,6 +3487,11 @@ mod tests {
         assert_eq!(
             ingest_hold_delay(limited(Some(86_400)), 1, 0.0),
             INGEST_DENIED_RECHECK_MAX
+        );
+        let credits = |streak| ingest_hold_delay(IngestFailure::OutOfCredits, streak, 0.0);
+        assert_eq!(
+            [1, 2, 3, 4, 20].map(credits),
+            [secs(300), secs(600), secs(1200), secs(1800), secs(1800)]
         );
         let transient = (1..=12)
             .map(|streak| ingest_hold_delay(IngestFailure::Transient, streak, 0.0))

@@ -134,6 +134,14 @@ pub async fn handle() -> Result<()> {
         }
     }
 
+    // Indexing paused because the account is out of credits: told once.
+    let credit_notice = super::credit_notice::take(&cwd);
+    if let Some(hold) = credit_notice.as_ref() {
+        output_text.push_str("\n\n");
+        output_text.push_str(&super::credit_notice::assistant_context(hold));
+        output_text.push('\n');
+    }
+
     if let Some(restored) = restored_context {
         output_text.push('\n');
         output_text.push_str(&restored);
@@ -182,7 +190,13 @@ pub async fn handle() -> Result<()> {
     } else {
         output_text
     };
-    super::write_context_for_input(&input, output_text)?;
+    super::write_context_and_notice_for_input(
+        &input,
+        output_text,
+        credit_notice
+            .as_ref()
+            .map(super::credit_notice::user_message),
+    )?;
 
     Ok(())
 }

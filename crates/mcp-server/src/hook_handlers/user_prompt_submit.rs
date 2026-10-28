@@ -182,11 +182,17 @@ fn extract_session_id(input: &Value) -> Option<String> {
         .map(String::from)
 }
 
-fn write_editor_output(editor: EditorFormat, context: Option<String>) -> Result<()> {
+fn write_editor_output(
+    editor: EditorFormat,
+    context: Option<String>,
+    user_message: Option<String>,
+) -> Result<()> {
     match editor {
         EditorFormat::Claude => {
             if let Some(text) = context {
-                write_stdout_json(&HookOutput::context(text))?;
+                let mut output = HookOutput::context(text);
+                output.system_message = user_message;
+                write_stdout_json(&output)?;
             } else {
                 write_stdout_json(&HookOutput::empty())?;
             }
@@ -402,7 +408,7 @@ pub async fn handle() -> Result<()> {
         .map(|v| v == "false")
         .unwrap_or(false)
     {
-        write_editor_output(editor, None)?;
+        write_editor_output(editor, None, None)?;
         return Ok(());
     }
 
@@ -529,15 +535,26 @@ pub async fn handle() -> Result<()> {
         contextagents_fut,
     );
 
+    let mut combined = build_context_message(editor, context, &input);
+    // Indexing paused because the account is out of credits: told once.
+    let credit_notice = super::credit_notice::take(&cwd);
+    if let Some(hold) = credit_notice.as_ref() {
+        combined = format!(
+            "{}\n\n{combined}",
+            super::credit_notice::assistant_context(hold)
+        );
+    }
     // The ContextAgents call goes first: it is the one thing to do before the work starts.
-    let combined = match contextagents {
-        Some(hint) => format!(
-            "{hint}\n\n{}",
-            build_context_message(editor, context, &input)
-        ),
-        None => build_context_message(editor, context, &input),
-    };
-    write_editor_output(editor, Some(combined))?;
+    if let Some(hint) = contextagents {
+        combined = format!("{hint}\n\n{combined}");
+    }
+    write_editor_output(
+        editor,
+        Some(combined),
+        credit_notice
+            .as_ref()
+            .map(super::credit_notice::user_message),
+    )?;
     Ok(())
 }
 

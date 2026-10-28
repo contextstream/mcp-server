@@ -4617,25 +4617,34 @@ impl ContextStreamClient {
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32);
 
-            let rich_message = format!(
-                "{}\n\nTo continue using ContextStream:\n  \
-                 - Purchase credits or upgrade: https://contextstream.io/pricing\n  \
-                 - Manage billing: https://contextstream.io/account/billing\n\n\
-                 Recommended upgrade paths:\n  \
-                 - Starter/Free -> Pro: 25,000 operations/month\n  \
-                 - Starter/Free -> Elite: 100,000 operations/month plus full graph\n  \
-                 - Pro -> Elite: 4x Pro operations plus full graph",
-                message
-            );
-
-            return Error::InsufficientCredits {
-                message: rich_message,
-                required,
-                available,
-            };
+            return Self::credits_refused_error(message, required, available);
         }
 
         Error::http_with_code(status, message, ErrorCode::from_status(status))
+    }
+
+    /// The error for a credit refusal (HTTP 402, or a queued ingest job that
+    /// failed because the payer could not pay), with how to continue.
+    fn credits_refused_error(
+        message: String,
+        required: Option<i32>,
+        available: Option<i32>,
+    ) -> Error {
+        let rich_message = format!(
+            "{}\n\nTo continue using ContextStream:\n  \
+             - Purchase credits or upgrade: https://contextstream.io/pricing\n  \
+             - Manage billing: https://contextstream.io/account/billing\n\n\
+             Recommended upgrade paths:\n  \
+             - Starter/Free -> Pro: 25,000 operations/month\n  \
+             - Starter/Free -> Elite: 100,000 operations/month plus full graph\n  \
+             - Pro -> Elite: 4x Pro operations plus full graph",
+            message
+        );
+        Error::InsufficientCredits {
+            message: rich_message,
+            required,
+            available,
+        }
     }
 
     /// Initialize session as best-effort startup work. Known non-blocking
@@ -6779,6 +6788,21 @@ impl ContextStreamClient {
         let api_url = config.api_url.clone();
         drop(config);
 
+        // Automatic callers (the sync bridge, the keep-warm daemon, hooks) are
+        // answered locally while the project's payer is out of credits, before
+        // any scan or request: the files stay queued on this machine and the
+        // hold's recheck decides when to ask again. A person's own run asks.
+        if params.background.unwrap_or(false) {
+            if let Some(hold) = crate::credit_hold::active_hold(project_id) {
+                return Err(Self::credits_refused_error(
+                    "Automatic indexing for this project is paused because the account is out of credits; it is rechecked every few minutes."
+                        .to_string(),
+                    hold.required,
+                    hold.available,
+                ));
+            }
+        }
+
         if !local_files_allowed {
             return Err(Error::Validation(format!(
                 "Direct local ingest of '{}' is disabled on the hosted MCP gateway because it would read the gateway host's own disk. Keep the editor on hosted MCP and let the managed sync bridge (or editor hooks / ContextStream Desktop) upload this checkout; verify with project(action=\"index_status\"). (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)",
@@ -7701,6 +7725,16 @@ impl ContextStreamClient {
                 Self::invalidate_hash_manifest_data_three_way(&manifest_scope, &manifest_base_data);
             if let Some(error) = halted {
                 return Err(error);
+            }
+            if let Some((required, available)) = wait_summary.credit_refusal {
+                return Err(Self::credits_refused_error(
+                    format!(
+                        "You've run out of credits, so indexing stopped: {total_failed} file(s) were not indexed after {total_uploaded} uploaded and {} fully indexed. Your files are safe and are indexed when you add credits",
+                        wait_summary.files_indexed
+                    ),
+                    required,
+                    available,
+                ));
             }
             return Err(Error::http(
                 500,
@@ -8634,6 +8668,19 @@ impl ContextStreamClient {
         // both the legacy sync path (Phase 2/3 server-side R2 uploads + DB
         // upsert) and the new fast path (R2 staging write + 202) comfortably
         // fit under. Long-running follow-up is handled by `wait_for_ingest_jobs`.
+        // A payer that was just refused for credits is not asked again by anything
+        // automatic until its recheck time: the answer is the same and every ask
+        // queues a job. A person's own index run (not background) always asks.
+        if background {
+            if let Some(hold) = crate::credit_hold::active_hold(project_id) {
+                return Err(Self::credits_refused_error(
+                    "Automatic indexing for this project is paused because the account is out of credits; it is rechecked every few minutes."
+                        .to_string(),
+                    hold.required,
+                    hold.available,
+                ));
+            }
+        }
         let result = self
             .post_with_options::<serde_json::Value, _>(
                 &ingest_path,
@@ -8648,7 +8695,27 @@ impl ContextStreamClient {
                     ..Default::default()
                 },
             )
-            .await?;
+            .await;
+        match &result {
+            Ok(_) => {
+                // Accepted: the payer can pay again, so any hold ends.
+                crate::credit_hold::clear(project_id);
+            }
+            Err(Error::InsufficientCredits {
+                required,
+                available,
+                ..
+            }) => {
+                crate::credit_hold::record_refusal(
+                    project_id,
+                    Some(expected_workspace_id),
+                    *required,
+                    *available,
+                );
+            }
+            Err(_) => {}
+        }
+        let result = result?;
 
         Self::parse_ingest_batch_result(result, project_id, file_paths)
     }
@@ -9232,6 +9299,15 @@ impl ContextStreamClient {
                         completed_jobs.push(*job_id);
                     }
                     PendingScanJobState::Failed => {
+                        if crate::credit_hold::job_failed_for_credits(&progress_value) {
+                            let message = job_progress.error_message.clone().unwrap_or_default();
+                            let (required, available) =
+                                crate::credit_hold::parse_credit_amounts(&message);
+                            crate::credit_hold::record_refusal(
+                                project_id, None, required, available,
+                            );
+                            summary.credit_refusal.get_or_insert((required, available));
+                        }
                         summary.files_failed +=
                             job_progress.files_total.max(batch.file_paths.len() as i64);
                         summary.failed_jobs.push(format!(
@@ -20584,6 +20660,9 @@ struct IngestJobWaitSummary {
     files_indexed: i64,
     files_failed: i64,
     failed_jobs: Vec<String>,
+    /// A queued job failed because the payer could not pay: `(required,
+    /// available)` as the worker reported them.
+    credit_refusal: Option<(Option<i32>, Option<i32>)>,
     /// Jobs still running on the server when the soft-wait window
     /// elapsed. The client returns success to the caller and leaves
     /// the server-side jobs to finish in the background; surfaced to
@@ -22742,6 +22821,256 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(server.await.expect("server"), 1, "no in-request retry");
+    }
+
+    fn out_of_credits_body() -> &'static str {
+        r#"{"success":false,"error":{"code":"INSUFFICIENT_CREDITS","message":"You've run out of credits. This operation requires 20 credits but you have 3 available.","details":{"required":20,"available":3}}}"#
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_credit_refusal_holds_automatic_ingest_and_a_persons_own_run_still_asks() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-credit-hold-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let (client, server) = client_with_raw_responses(
+            vec![
+                raw_response("402 Payment Required", "", out_of_credits_body()),
+                raw_response("200 OK", "", r#"{"files_indexed":1,"committed":true}"#),
+            ],
+            Duration::from_millis(2_500),
+        )
+        .await;
+        let file = serde_json::json!({"path": "src/lib.rs", "content": "fn main() {}"});
+        let send = |background: bool| {
+            let client = client.clone();
+            let file = file.clone();
+            async move {
+                client
+                    .send_ingest_batch(
+                        project_id,
+                        workspace_id,
+                        &[&file],
+                        background,
+                        None,
+                        Some("watch"),
+                        None,
+                        false,
+                        false,
+                        None,
+                    )
+                    .await
+            }
+        };
+
+        // The first automatic send asks and is refused: a credit refusal that
+        // halts the project, with the amounts the API reported.
+        let refused = send(true).await.expect_err("402 must surface");
+        assert!(
+            matches!(
+                refused,
+                Error::InsufficientCredits {
+                    required: Some(20),
+                    available: Some(3),
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            crate::IngestFailure::classify(&refused),
+            crate::IngestFailure::OutOfCredits
+        );
+        let hold = crate::credit_hold::active_hold(project_id).expect("the project is held");
+        assert_eq!((hold.required, hold.available), (Some(20), Some(3)));
+
+        // The next automatic sends are answered locally with the same refusal
+        // and never reach the server.
+        for _ in 0..3 {
+            let again = send(true).await.expect_err("held");
+            assert!(
+                matches!(
+                    again,
+                    Error::InsufficientCredits {
+                        required: Some(20),
+                        ..
+                    }
+                ),
+                "{again:?}"
+            );
+        }
+
+        // A person's own run is not background: it asks, is accepted, and the
+        // hold ends.
+        send(false).await.expect("a person's own run asks again");
+        assert!(crate::credit_hold::active_hold(project_id).is_none());
+        assert_eq!(
+            server.await.expect("server"),
+            2,
+            "one refused request and one accepted; the held sends made none"
+        );
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_queued_job_that_failed_for_credits_holds_the_project_and_stops_the_run() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-credit-job-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let (client, server) = client_with_raw_responses(
+            vec![raw_response(
+                "200 OK",
+                "",
+                r#"{"status":"failed","phase":"failed","error_code":"INSUFFICIENT_CREDITS","error_message":"batch 6b0e (+3 jobs): job 1f2a: insufficient credits for raw ingest: required=20, available=3","files_total":20,"files_processed":0}"#,
+            )],
+            Duration::from_millis(1_500),
+        )
+        .await;
+        let batch = BatchUploadResult {
+            files_indexed: 0,
+            committed: false,
+            job_id: Some(job_id),
+            progress_url: None,
+            file_paths: (0..20).map(|n| format!("src/f{n}.rs")).collect(),
+        };
+
+        let summary = client
+            .wait_for_ingest_jobs(project_id, &[batch], &mut |_| {})
+            .await
+            .expect("the wait itself succeeds");
+        assert_eq!(summary.credit_refusal, Some((Some(20), Some(3))));
+        assert_eq!(summary.files_failed, 20);
+        let hold = crate::credit_hold::active_hold(project_id)
+            .expect("automatic senders stop for this project");
+        assert_eq!((hold.required, hold.available), (Some(20), Some(3)));
+        assert_eq!(server.await.expect("server"), 1);
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_failed_job_that_is_not_about_credits_does_not_hold_the_project() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-credit-other-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let (client, server) = client_with_raw_responses(
+            vec![raw_response(
+                "200 OK",
+                "",
+                r#"{"status":"failed","phase":"failed","error_message":"R2 fetch failed: service error","files_total":20,"files_processed":0}"#,
+            )],
+            Duration::from_millis(1_500),
+        )
+        .await;
+        let batch = BatchUploadResult {
+            files_indexed: 0,
+            committed: false,
+            job_id: Some(Uuid::new_v4()),
+            progress_url: None,
+            file_paths: vec!["src/a.rs".to_string()],
+        };
+        let summary = client
+            .wait_for_ingest_jobs(project_id, &[batch], &mut |_| {})
+            .await
+            .expect("summary");
+        assert_eq!(summary.credit_refusal, None);
+        assert_eq!(summary.files_failed, 20);
+        assert!(crate::credit_hold::active_hold(project_id).is_none());
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ingest_local_answers_a_held_background_project_before_scanning_anything() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-credit-local-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        crate::credit_hold::record_refusal(project_id, Some(workspace_id), Some(20), Some(3))
+            .expect("hold recorded");
+        let (client, server) =
+            client_with_raw_responses(Vec::new(), Duration::from_millis(500)).await;
+
+        let error = client
+            .ingest_local(IngestLocalParams {
+                // Not a directory: a scan would fail validation instead.
+                path: temp_home
+                    .join("does-not-exist")
+                    .to_string_lossy()
+                    .to_string(),
+                workspace_id: Some(workspace_id),
+                project_id: Some(project_id),
+                force: None,
+                generate_editor_rules: None,
+                include_media: None,
+                max_files: None,
+                background: Some(true),
+                origin: Some("active_hot_tick".to_string()),
+                reroot: None,
+            })
+            .await
+            .expect_err("held");
+        assert!(
+            matches!(error, Error::InsufficientCredits { .. }),
+            "{error:?}"
+        );
+        assert_eq!(server.await.expect("server"), 0, "no request was made");
+
+        // Not background: a person's run is not short-circuited (it fails on
+        // the missing folder, which proves it got past the hold).
+        let (client, _server) =
+            client_with_raw_responses(Vec::new(), Duration::from_millis(200)).await;
+        let error = client
+            .ingest_local(IngestLocalParams {
+                path: temp_home
+                    .join("does-not-exist")
+                    .to_string_lossy()
+                    .to_string(),
+                workspace_id: Some(workspace_id),
+                project_id: Some(project_id),
+                force: None,
+                generate_editor_rules: None,
+                include_media: None,
+                max_files: None,
+                background: None,
+                origin: None,
+                reroot: None,
+            })
+            .await
+            .expect_err("missing folder");
+        assert!(
+            !matches!(error, Error::InsufficientCredits { .. }),
+            "{error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&temp_home);
     }
 
     #[tokio::test]

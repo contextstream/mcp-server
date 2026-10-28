@@ -529,6 +529,19 @@ fn caller_scoped_search_cache_key(base_key: &str, caller_identity: &str) -> Stri
     format!("search-caller:v2:{}", sha256_hex_bytes(&canonical))
 }
 
+// This policy file is normally gitignored, so git dirtiness cannot invalidate
+// a rendered response when its rules change. Never replay one under new rules.
+fn project_ignore_cache_fingerprint(folder_path: Option<&str>) -> Option<String> {
+    let Some(folder_path) = folder_path else {
+        return Some("no-local-checkout".to_string());
+    };
+    match std::fs::read(Path::new(folder_path).join(".contextstream/ignore")) {
+        Ok(bytes) => Some(sha256_hex_bytes(&bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some("absent".to_string()),
+        Err(_) => None,
+    }
+}
+
 fn local_checkout_cache_identity(
     folder_path: Option<&str>,
     repository: Option<&str>,
@@ -7873,7 +7886,9 @@ fn local_glob_enrich(
             .to_string_lossy()
             .to_string();
 
-        if is_artifact_like_path(&relative) {
+        if is_artifact_like_path(&relative)
+            || ContextStreamClient::ingest_ignores_relative_path(folder_path, &relative)
+        {
             continue;
         }
         if !glob.is_match(&relative) && !glob.is_match(path) {
@@ -7940,7 +7955,9 @@ fn local_path_enrich(
             .to_string_lossy()
             .to_string();
 
-        if is_artifact_like_path(&relative) {
+        if is_artifact_like_path(&relative)
+            || ContextStreamClient::ingest_ignores_relative_path(folder_path, &relative)
+        {
             continue;
         }
         if existing_paths.contains(&relative) {
@@ -8107,8 +8124,9 @@ fn mark_local_overlay(item: &mut mcp_types::api::SearchResult) {
 }
 
 /// Drop indexed results whose backing file no longer exists in the local
-/// working tree. Only files that resolve under `folder_path` are considered:
-/// memory results, build artifacts, and paths outside the local tree (or that
+/// working tree or are excluded by its current ingest rules. Only files that
+/// resolve under `folder_path` are considered:
+/// memory results and paths outside the local tree (or that
 /// can't be resolved locally, e.g. remote/hosted searches) are always kept so
 /// this never prunes legitimately-remote hits. Returns the number removed and
 /// refreshes `response.total`/`paths` to match.
@@ -8123,15 +8141,17 @@ fn prune_deleted_file_results(response: &mut SearchResponse, folder_path: &Path)
         let Some(file_path) = item.file_path.as_deref() else {
             return true;
         };
-        if is_artifact_like_path(file_path) {
-            return true;
-        }
         // Only prune when the path resolves under the local folder; otherwise
         // we can't make a trustworthy existence judgement (keep it).
         let Some(local_path) = local_result_path(folder_path, file_path) else {
             return true;
         };
-        if local_path.exists() {
+        let relative = local_path.strip_prefix(folder_path).unwrap_or(&local_path);
+        if !ContextStreamClient::ingest_ignores_relative_path(
+            folder_path,
+            &relative.to_string_lossy(),
+        ) && (local_path.exists() || is_artifact_like_path(file_path))
+        {
             return true;
         }
         removed_paths.insert(file_path.to_string());
@@ -8141,6 +8161,7 @@ fn prune_deleted_file_results(response: &mut SearchResponse, folder_path: &Path)
     let removed = before.saturating_sub(response.results.len());
     if removed > 0 {
         response.total = Some(response.results.len() as i64);
+        response.count = response.total;
         if !response.paths.is_empty() {
             response
                 .paths
@@ -8157,6 +8178,12 @@ fn refresh_indexed_result_snippets_from_local_files(
     context_lines: usize,
     content_max_chars: usize,
 ) -> usize {
+    if !folder_path.is_dir() {
+        return 0;
+    }
+    // Remove old indexed content too, rather than merely skipping the disk
+    // read and leaving a previously uploaded excluded snippet in the response.
+    prune_deleted_file_results(response, folder_path);
     let mut refreshed = 0usize;
 
     for item in response.results.iter_mut() {
@@ -11518,7 +11545,13 @@ impl SearchTool {
         );
         let caller_cache_scope = super::atlas_warm_cache::current_caller_cache_scope();
         let caller_cache_identity = caller_cache_scope.cache_identity();
+        let project_ignore_fingerprint = project_ignore_cache_fingerprint(
+            session_folder_path
+                .as_deref()
+                .filter(|_| local_files_allowed),
+        );
         let use_search_cache = caller_cache_identity.is_some()
+            && project_ignore_fingerprint.is_some()
             && !checkout_scope_unroutable
             && should_use_search_cache(session_folder_path.as_deref(), folder_has_drift);
         // Resolve once immediately before cache identity construction. The
@@ -11552,7 +11585,15 @@ impl SearchTool {
             &tokenizer_cache_namespace,
         );
         let cache_key = caller_cache_identity
-            .map(|identity| caller_scoped_search_cache_key(&base_cache_key, identity))
+            .map(|identity| {
+                caller_scoped_search_cache_key(
+                    &format!(
+                        "{base_cache_key}:ignore:{}",
+                        project_ignore_fingerprint.as_deref().unwrap_or_default()
+                    ),
+                    identity,
+                )
+            })
             .unwrap_or_default();
         if use_search_cache {
             if let Some((cached_text, cached_structured)) = search_cache().get(&cache_key) {
@@ -12444,7 +12485,7 @@ impl SearchTool {
         harmonize_project_index_state(&mut result, index_health.as_ref());
         let dirty_file_hints = activity_file_hints.clone();
 
-        // Prune results for files deleted from the local working tree before
+        // Prune results for files deleted or ignored in the local working tree before
         // computing no_hits, so a drifted index never silently serves hits for
         // files that no longer exist. Guarded to local directories only.
         if !scope_invalid && local_files_allowed {
@@ -12456,7 +12497,7 @@ impl SearchTool {
                         mode_fallback_note = append_note(
                             mode_fallback_note,
                             &format!(
-                                "Removed {} result(s) for files no longer on disk; re-index to fully refresh the index.",
+                                "Removed {} result(s) for files deleted or excluded by local ingest rules; re-index to fully refresh the index.",
                                 pruned_deleted
                             ),
                         );

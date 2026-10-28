@@ -7019,6 +7019,154 @@ mod search_quality_tests {
     }
 
     #[test]
+    fn snippet_refresh_preserves_results_when_local_checkout_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut response = mcp_types::api::SearchResponse {
+            results: vec![mcp_types::api::SearchResult {
+                id: "remote".into(),
+                file_path: Some("src/ok.py".into()),
+                content: Some("remote indexed content".into()),
+                ..Default::default()
+            }],
+            total: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            refresh_indexed_result_snippets_from_local_files(
+                &mut response,
+                &temp.path().join("missing-checkout"),
+                "indexed",
+                0,
+                500,
+            ),
+            0
+        );
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(
+            response.results[0].content.as_deref(),
+            Some("remote indexed content")
+        );
+    }
+
+    #[test]
+    fn rendered_cache_identity_tracks_project_ignore_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().to_str().unwrap();
+        let absent = project_ignore_cache_fingerprint(Some(folder)).unwrap();
+        std::fs::create_dir(temp.path().join(".contextstream")).unwrap();
+        let policy = temp.path().join(".contextstream/ignore");
+        std::fs::write(&policy, "secret/\n").unwrap();
+        let first = project_ignore_cache_fingerprint(Some(folder)).unwrap();
+        assert_ne!(absent, first);
+        assert_eq!(
+            first,
+            project_ignore_cache_fingerprint(Some(folder)).unwrap()
+        );
+        std::fs::write(&policy, "secret/\n*.env.txt\n").unwrap();
+        assert_ne!(
+            first,
+            project_ignore_cache_fingerprint(Some(folder)).unwrap()
+        );
+        std::fs::remove_file(&policy).unwrap();
+        std::fs::create_dir(&policy).unwrap();
+        assert!(project_ignore_cache_fingerprint(Some(folder)).is_none());
+    }
+
+    #[test]
+    fn secondary_checkout_overlay_honours_ingest_ignores() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join("canonical/project");
+        let secondary = temp.path().join("secondary/project");
+        for root in [&canonical, &secondary] {
+            std::fs::create_dir_all(root.join("secret")).unwrap();
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            for (path, marker) in [
+                ("secret/creds.txt", "excluded_directory_marker"),
+                ("prod.env.txt", "excluded_glob_marker"),
+                ("src/ok.py", "allowed_overlay_marker"),
+            ] {
+                std::fs::write(root.join(path), format!("overlay_query {marker}\n")).unwrap();
+            }
+        }
+        std::fs::create_dir_all(secondary.join(".contextstream")).unwrap();
+        std::fs::write(
+            secondary.join(".contextstream/ignore"),
+            "secret/\n*.env.txt\n",
+        )
+        .unwrap();
+
+        // The canonical index predates the active secondary checkout's rules.
+        // Both relative and locally rooted API paths must obey that checkout.
+        for absolute_paths in [false, true] {
+            let mut response = mcp_types::api::SearchResponse {
+                results: ["secret/creds.txt", "prod.env.txt", "src/ok.py"]
+                    .into_iter()
+                    .map(|path| mcp_types::api::SearchResult {
+                        id: path.into(),
+                        file_path: Some(if absolute_paths {
+                            secondary.join(path).to_string_lossy().into_owned()
+                        } else {
+                            path.into()
+                        }),
+                        content: Some("old indexed content".into()),
+                        start_line: Some(1),
+                        ..Default::default()
+                    })
+                    .collect(),
+                total: Some(3),
+                ..Default::default()
+            };
+            response.paths = response
+                .results
+                .iter()
+                .filter_map(|item| item.file_path.clone())
+                .collect();
+
+            prune_deleted_file_results(&mut response, &secondary);
+            refresh_indexed_result_snippets_from_local_files(
+                &mut response,
+                &secondary,
+                "overlay_query",
+                0,
+                500,
+            );
+
+            let wire = serde_json::to_string(&response).unwrap();
+            assert!(!wire.contains("excluded_directory_marker"));
+            assert!(!wire.contains("excluded_glob_marker"));
+            assert!(!wire.contains("secret/creds.txt"));
+            assert!(!wire.contains("prod.env.txt"));
+            assert!(wire.contains("allowed_overlay_marker"));
+            assert_eq!(response.results.len(), 1);
+            assert_eq!(response.paths.len(), 1);
+            assert_eq!(response.total, Some(1));
+        }
+    }
+
+    #[test]
+    fn local_pattern_enrichment_honours_ingest_ignores() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join(".contextstream")).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".contextstream/ignore"), "secret/\n*.env.txt\n").unwrap();
+        for path in ["secret/creds.txt", "prod.env.txt", "src/ok.txt"] {
+            std::fs::write(root.join(path), "pattern fixture\n").unwrap();
+        }
+        for results in [
+            local_glob_enrich(root, "*.txt", &HashSet::new()),
+            local_path_enrich(root, ".txt", &HashSet::new()),
+        ] {
+            let paths: Vec<_> = results
+                .into_iter()
+                .filter_map(|item| item.file_path)
+                .collect();
+            assert_eq!(paths, ["src/ok.txt"]);
+        }
+    }
+
+    #[test]
     fn refresh_indexed_snippets_uses_local_working_tree_content() {
         let temp = tempfile::tempdir().unwrap();
         let file_path = temp.path().join("rust-toolchain.toml");

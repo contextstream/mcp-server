@@ -41,6 +41,8 @@ pub mod workspace_drift;
 mod parity_eval_tests;
 #[cfg(test)]
 mod reference_resolution_tests;
+#[cfg(test)]
+mod request_probe;
 
 // Re-export all domain tools
 pub use answer::*;

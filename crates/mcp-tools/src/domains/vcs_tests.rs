@@ -1,6 +1,7 @@
 //! Tests for the VCS domain tool.
 
 use super::*;
+use crate::domains::request_probe::RequestProbe;
 use crate::registry::ToolHandler;
 use crate::testing::TestFixtures;
 use serde_json::json;
@@ -164,4 +165,109 @@ async fn create_link_names_the_field_that_is_missing_or_wrong() {
             "{field}: {error}"
         );
     }
+}
+
+// A hosted session's `init` resolves the workspace into session state, never
+// into the process config, and a stateless call may carry it only in the
+// connection's headers (#189). Each test runs inside the per-request auth
+// scope the hosted gateway sets, which also stops `update_scope` from writing
+// process defaults.
+
+fn hosted_vcs_tool(base_url: &str) -> (VcsTool, Arc<mcp_session::SessionManager>) {
+    let mut config = TestFixtures::test_config();
+    config.api_url = base_url.to_string();
+    config.default_workspace_id = None;
+    config.default_project_id = None;
+    config.is_http_transport = true;
+    let client = ContextStreamClient::new(config.clone());
+    let session = Arc::new(mcp_session::SessionManager::new(client.clone(), config));
+    (VcsTool::new(client).with_session(session.clone()), session)
+}
+
+fn hosted_auth(workspace: Option<Uuid>) -> mcp_types::config::AuthOverride {
+    mcp_types::config::AuthOverride {
+        api_key: Some("test-key".to_string()),
+        workspace_id: workspace,
+        ..Default::default()
+    }
+}
+
+fn repos_requested_for(probe: &RequestProbe, workspace: Uuid) -> bool {
+    let expected = format!("GET /api/v1/integrations/workspaces/{workspace}/vcs/repos");
+    probe
+        .request_lines()
+        .iter()
+        .any(|line| line.starts_with(&expected))
+}
+
+#[tokio::test]
+async fn list_repos_uses_the_workspace_that_init_resolved_in_the_session() {
+    let probe = RequestProbe::start().await;
+    let (tool, session) = hosted_vcs_tool(&probe.base_url);
+    let workspace = Uuid::new_v4();
+    let result = mcp_client::run_with_auth_override(hosted_auth(None), || async {
+        session
+            .update_scope(Some(workspace), Some(Uuid::new_v4()), None)
+            .await;
+        tool.execute(json!({"action": "list_repos"})).await
+    })
+    .await;
+    result.expect("list_repos with the session's workspace");
+    assert!(
+        repos_requested_for(&probe, workspace),
+        "{:?}",
+        probe.request_lines()
+    );
+}
+
+#[tokio::test]
+async fn list_repos_uses_the_workspace_header_when_the_session_has_none() {
+    let probe = RequestProbe::start().await;
+    let (tool, _session) = hosted_vcs_tool(&probe.base_url);
+    let workspace = Uuid::new_v4();
+    mcp_client::run_with_auth_override(hosted_auth(Some(workspace)), || {
+        tool.execute(json!({"action": "list_repos"}))
+    })
+    .await
+    .expect("list_repos with the header's workspace");
+    assert!(
+        repos_requested_for(&probe, workspace),
+        "{:?}",
+        probe.request_lines()
+    );
+}
+
+#[tokio::test]
+async fn list_repos_prefers_an_explicit_workspace_to_the_sessions() {
+    let probe = RequestProbe::start().await;
+    let (tool, session) = hosted_vcs_tool(&probe.base_url);
+    let (session_workspace, explicit) = (Uuid::new_v4(), Uuid::new_v4());
+    mcp_client::run_with_auth_override(hosted_auth(Some(Uuid::new_v4())), || async {
+        session
+            .update_scope(Some(session_workspace), None, None)
+            .await;
+        tool.execute(json!({"action": "list_repos", "workspace_id": explicit}))
+            .await
+    })
+    .await
+    .expect("list_repos with an explicit workspace");
+    assert!(repos_requested_for(&probe, explicit));
+    assert!(!repos_requested_for(&probe, session_workspace));
+}
+
+#[tokio::test]
+async fn list_repos_without_any_workspace_says_how_to_get_one() {
+    let probe = RequestProbe::start().await;
+    let (tool, _session) = hosted_vcs_tool(&probe.base_url);
+    let error = mcp_client::run_with_auth_override(hosted_auth(None), || {
+        tool.execute(json!({"action": "list_repos"}))
+    })
+    .await
+    .expect_err("no workspace anywhere")
+    .to_string();
+    assert!(
+        error.contains("workspace_id") && error.contains("init("),
+        "{error}"
+    );
+    assert!(probe.request_lines().is_empty());
 }

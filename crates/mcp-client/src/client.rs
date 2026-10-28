@@ -10739,12 +10739,25 @@ impl ContextStreamClient {
             if name.is_some_and(Self::should_skip_ingest_directory) {
                 return false;
             }
-            if entry.depth() == 1 && name.is_some_and(|name| layout.skips_root_entry(name)) {
-                return false;
-            }
             let is_dir = entry
                 .file_type()
                 .is_some_and(|file_type| file_type.is_dir());
+            // A subdirectory carrying its own `.git` entry is the root of a
+            // separate repository, and Git never descends into one. Neither
+            // may ingest: two untracked full clones inside a project folder
+            // uploaded 24,909 extra rows (2026-10-27). The project root is
+            // exempt above, so its own `.git` never stops the walk.
+            if is_dir && Self::is_nested_repository_root(entry.path()) {
+                debug!(
+                    "Skipping nested Git repository {} while indexing {}",
+                    entry.path().display(),
+                    root_for_filter.display()
+                );
+                return false;
+            }
+            if entry.depth() == 1 && name.is_some_and(|name| layout.skips_root_entry(name)) {
+                return false;
+            }
             !root_filters
                 .iter()
                 .any(|matcher| matcher.matched(entry.path(), is_dir).is_ignore())
@@ -11063,6 +11076,17 @@ impl ContextStreamClient {
             observed_paths,
             cursor_update,
         })
+    }
+
+    /// Return whether `path` is the root of a separate repository nested in
+    /// the project: it holds its own `.git` entry, a directory for a normal
+    /// clone or a file for a linked worktree or submodule. Git treats such a
+    /// directory as an independent repository and never descends into it, so
+    /// the ingest walk must not either — untracked clones inside a project
+    /// folder were uploaded as 24,909 extra rows (2026-10-27). A broken
+    /// symlink still marks the boundary, hence `symlink_metadata`.
+    fn is_nested_repository_root(path: &Path) -> bool {
+        std::fs::symlink_metadata(path.join(".git")).is_ok()
     }
 
     /// Return whether an automatic ingest must prune a directory subtree.
@@ -28956,6 +28980,78 @@ mod tests {
             ContextStreamClient::normalize_git_remote_identity("git@example.com:Org/Team/Repo.git")
         );
         assert!(ContextStreamClient::normalize_git_remote_identity("../local/repo.git").is_none());
+    }
+
+    #[test]
+    fn read_local_files_skips_nested_git_repository_directories(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        write_layout_files(
+            root,
+            &[
+                "src/lib.rs",
+                // An untracked full clone: its own `.git` directory.
+                "clone/.git/HEAD",
+                "clone/.git/objects/pack.hdr",
+                "clone/Cargo.toml",
+                "clone/src/main.rs",
+                // A plain subfolder next to the clone is still source.
+                "docs/notes.md",
+            ],
+        )?;
+
+        let indexed = full_scan_paths(root)?;
+
+        assert!(indexed.contains(&"src/lib.rs".to_string()), "{indexed:?}");
+        assert!(
+            indexed.contains(&"docs/notes.md".to_string()),
+            "a normal subfolder must still be ingested: {indexed:?}"
+        );
+        assert!(
+            !indexed.iter().any(|path| path.starts_with("clone/")),
+            "a nested clone must not be ingested: {indexed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_local_files_skips_nested_git_worktrees_and_keeps_the_project_root(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        write_layout_files(
+            root,
+            &[
+                // The project root is itself a checkout; its own `.git` entry
+                // must not stop the walk.
+                ".git/HEAD",
+                ".git/objects/pack.hdr",
+                "src/lib.rs",
+                // A linked worktree or submodule: `.git` is a file.
+                "worktree/main.rs",
+            ],
+        )?;
+        std::fs::write(
+            root.join("worktree").join(".git"),
+            "gitdir: /tmp/worktrees/clone\n",
+        )?;
+
+        let indexed = full_scan_paths(root)?;
+
+        assert!(
+            indexed.contains(&"src/lib.rs".to_string()),
+            "the root's own .git must not stop the walk: {indexed:?}"
+        );
+        assert!(
+            !indexed.iter().any(|path| path.starts_with(".git/")),
+            "the checkout's own .git contents are not source: {indexed:?}"
+        );
+        assert!(
+            !indexed.iter().any(|path| path.starts_with("worktree/")),
+            "a nested worktree must not be ingested: {indexed:?}"
+        );
+        Ok(())
     }
 
     #[test]

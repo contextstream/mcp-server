@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.42
+
+- Antigravity uses ContextStream. Setup and `update` install a ContextStream plugin in
+  `~/.gemini/config/plugins/contextstream/`: compact rules, an on-demand skill, and hooks that ground each
+  session and nudge local searches toward ContextStream search. `doctor` checks the plugin and
+  `doctor --repair` installs it (#321).
+- Gemini: tool schemas no longer advertise boolean `additionalProperties`, which Gemini rejects, and a
+  Gemini `init` matches folders but never creates a project.
+- Coordination: a share that names an agent says who got it, MCP agents carry their handle, notice
+  actions name their workspace, and a harness task notification is not the session's task (#301, #309, #310).
+- Setup, update, uninstall and doctor: a re-run with the same flags is quiet (#298); update refreshes
+  hooks once (#302); a missing helper binary is flagged and update installs atomically (#296); uninstall
+  removes what setup created (#307, #308, #322); rules keep the person's text first (#323) and one
+  Windsurf front matter block (#297); setup-written rules files stay out of the index (#285, #312);
+  usage metadata and notices are disclosed with an opt-out (#290).
+- Gateway and client: OAuth discovery is public and consistent (#299, #300); a refused credential fails
+  `initialize` like a missing one (#252, #303); failed tool calls are `isError` results (#280); with the
+  network down a call fails in about half a second (#320).
+- Search and tools: no 0% rows (#289), clear paging (#313), a checked absence is one short answer (#283),
+  and many clearer error messages (#284, #286, #287, #292-#295, #304, #305, #311).
+
 ## 1.0.41
 
 - Coordination notices reach long-running and headless sessions mid-run. Claude Code, Antigravity and

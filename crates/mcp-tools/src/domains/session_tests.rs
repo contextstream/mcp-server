@@ -3360,6 +3360,24 @@ mod metadata_tests {
     }
 
     #[test]
+    fn capture_plan_schema_requires_at_least_one_step() {
+        // The handler rejects a plan without steps, so the schema says so (#281).
+        let tool = CapturePlanTool::new(create_mock_client(), create_mock_session());
+        let schema = tool.input_schema();
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required list")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert!(
+            required.contains(&"title") && required.contains(&"steps"),
+            "{required:?}"
+        );
+        assert_eq!(schema["properties"]["steps"]["minItems"], 1);
+    }
+
+    #[test]
     fn test_capture_plan_tool_metadata() {
         let client = create_mock_client();
         let session = create_mock_session();

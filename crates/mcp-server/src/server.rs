@@ -2892,7 +2892,7 @@ mod tests {
         ),
         (
             "capture_plan",
-            "a6180b7827aeb9adb1163a7cf9eb4f4a2a530b35e2d138f52d56d16d4fa392b9",
+            "cf9587bd213efc36da69376cd37efaa8ce6aecca63d2d402aa5bc56bad0cef6d",
         ),
         (
             "context",

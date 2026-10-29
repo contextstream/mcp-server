@@ -8,6 +8,7 @@ pub mod capsule;
 pub mod charts;
 pub mod coach;
 pub mod coordination;
+pub mod destructive;
 pub mod display_title;
 pub mod doc_ops;
 pub mod entity;

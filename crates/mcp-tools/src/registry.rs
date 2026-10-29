@@ -728,11 +728,13 @@ impl ToolRegistry {
         // surface profile is `Coach`.
         // `studio` is registered the same way: the ContextStudio surface (`/studio`)
         // serves it whatever the toolset; elsewhere it is listed per caller.
-        // So are the read-only twins (`domains::read_only`): direct tools only,
-        // listed per caller, and never in an operations catalog.
+        // So are the read-only twins (`domains::read_only`) and the tool of
+        // irreversible actions (`domains::destructive`): direct tools only,
+        // never in an operations catalog.
         if crate::domains::coach::is_coach_tool(name)
             || name == crate::domains::studio::TOOL_NAME
             || crate::domains::read_only::is_read_only_twin(name)
+            || name == crate::domains::destructive::DELETE_TOOL
         {
             self.tools.insert(
                 name.to_string(),
@@ -773,6 +775,17 @@ impl ToolRegistry {
         if self.consolidated_mode && !is_consolidated_tool(name) {
             return;
         }
+
+        // A listed tool whose irreversible actions moved to `delete` lists
+        // only its other actions and is not destructive (#330). Operation
+        // catalogs keep every action: `execute_operation` is destructive.
+        let mut metadata = metadata;
+        let mut input_schema = input_schema;
+        crate::domains::destructive::split_listing(
+            name,
+            &mut input_schema,
+            &mut metadata.annotations,
+        );
 
         self.tools.insert(
             name.to_string(),
@@ -893,6 +906,7 @@ impl ToolRegistry {
             acceleration_observation_request(name, &input).map(|request| (request, Instant::now()));
         let write_timing = write_timing_start(name, &input, observation.is_some());
 
+        let moved_note = crate::domains::destructive::moved_note(name, &input);
         let outcome = match model_id {
             Some(model_id) => {
                 mcp_client::run_with_model_id(model_id, || tool.handler.execute(input)).await
@@ -900,6 +914,15 @@ impl ToolRegistry {
             None => tool.handler.execute(input).await,
         };
         let outcome = explain_input_error(name, &mismatches, outcome);
+        // An irreversible action called by its old name still runs; say where
+        // it is listed now (#330).
+        let outcome = match (outcome, moved_note) {
+            (Ok(mut result), Some(note)) => {
+                crate::domains::destructive::add_moved_note(&mut result, note);
+                Ok(result)
+            }
+            (outcome, _) => outcome,
+        };
 
         if let Some((request, started)) = observation {
             self.report_acceleration_observation(request, started.elapsed(), outcome.as_ref());
@@ -2512,6 +2535,8 @@ const OPENAI_AGENTIC_CORE_TOOLS: &[&str] = &[
     "project_read",
     "session_read",
     "workspace_read",
+    // The irreversible actions of the tools above (#330).
+    "delete",
 ];
 
 /// Tools exposed in router mode

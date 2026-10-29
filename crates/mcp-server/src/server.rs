@@ -137,6 +137,9 @@ pub fn build_registry(
     // Read-only twins of memory, workspace, project and session: registered
     // and listed wherever their tool is (#330).
     domains::read_only::register_read_only_twins(&mut registry);
+    // Irreversible actions of memory, project and the other multi-action tools,
+    // listed in one destructive tool so the others are not (#330).
+    domains::destructive::register_delete_tool(&mut registry);
 
     registry
 }
@@ -2931,6 +2934,8 @@ mod tests {
         "capture_plan",
         "context",
         "coordination",
+        // #330: the irreversible actions of the multi-action tools.
+        "delete",
         "entity",
         "feed",
         "graph",
@@ -2978,6 +2983,7 @@ mod tests {
         "batch_operations",
         "capsule",
         "context",
+        "delete",
         "execute_operation",
         "help",
         "init",
@@ -3014,8 +3020,11 @@ mod tests {
             "31a1e0b733ffe17a9514444bdffd2c6603ae733d4cee48d09d90de16b5c69bb6",
         ),
         (
+            // #330: the irreversible actions of capsule, entity, feed, instruct,
+            // media, memory, project, qa, session, skill, vcs and workspace left
+            // their action enums for `delete`; the old names still run.
             "capsule",
-            "515471604f860d05a7cd8c2225f91ddd44ea71be8982d7242b47df3bde22f423",
+            "da346db49adfb1eb1aa0ade07fbeb7b651928836554590c08edf96e058bbfc88",
         ),
         (
             "capture_plan",
@@ -3035,15 +3044,19 @@ mod tests {
             "e2d3e012ea534f68d5064054920b3f0f1ce6383745002a2d164ab63e55c0fda8",
         ),
         (
+            "delete",
+            "6e7f684969e5b6601e6a814d4c7046670f670e8bc4b0dbcfc0403f6ef2efbf87",
+        ),
+        (
             // Advanced for tickets 2c0e695e and 9e5c9232: `target_project`
             // (a project name) was added, and `kind` lost `discussion`, which
             // mapped to an API route that never existed, so every call failed.
             "entity",
-            "e1ae3da8928ff62e4d69240d034132479d4a567e116a338a54a6ca30be22559c",
+            "449b3b7ebe2741b31aff87f5feccc765a1b18e56e475b1c833a1bdd592d45d94",
         ),
         (
             "feed",
-            "9f10868167ea4cdaceb968050674a934cbd7c74d75c29ae1def64e6e63c28298",
+            "9043a0e9e1957f3a7702472917044745de5caf98514e3c540c8c6a715191589c",
         ),
         (
             "graph",
@@ -3061,7 +3074,7 @@ mod tests {
         ),
         (
             "instruct",
-            "ac3e393499454ba89a60e56dbe8ab6480629f0593d7adc26d30ea53779f90e68",
+            "93763d33e3d0c95fd84ee13bfd8a61b5ebbc1fc330d09f6f25fbd4a78dcdcb95",
         ),
         (
             // Additive: connected-app actions (apps, find, read,
@@ -3073,7 +3086,7 @@ mod tests {
         ),
         (
             "media",
-            "959dc2221efaf74946a3477f316646c0ccacf22099e29c90b3f447f3f16b21c2",
+            "7c0beba3b19f29d9c51bf6657420a62dcdd2804c2dbf5cd80ca52f2f11eb6ccc",
         ),
         (
             // Advanced in Wave 3b: additive typed-decision inputs (sort,
@@ -3082,7 +3095,7 @@ mod tests {
             // successor_id) plus the `create_decision` / `decision_action`
             // enum values. Every earlier field and action still accepted.
             "memory",
-            "845f1df8c09b2eb710d625909c4594781b59770fdb1a233c7e2b714079ded3c7",
+            "343942c8c1aa6555d4f12c9a871a2c3aa140fb6aa106cf1b7569c82df41a0925",
         ),
         (
             "memory_complete_todo",
@@ -3132,7 +3145,7 @@ mod tests {
             // (related projects for cross-project work). Every earlier field
             // and action still accepted.
             "project",
-            "2b9d0e81e9bd9c9eb1f49aef43daa57b7b59b76c5a3039a9b38aafd586905a65",
+            "be40b7d0238da7e6d3681e983b10a8e504f882489ac43675916380ac60c7d86c",
         ),
         (
             // #325: without `recent_changes`, which the hosted gateway refuses.
@@ -3141,7 +3154,7 @@ mod tests {
         ),
         (
             "qa",
-            "bbebec6eca65166262d2d9b0ec92e7143ab3bc82e88b79cdbd801f4049a97d38",
+            "e4716ffb4e7f26147df700a3d38cd799139bfccc36958a7825e115c60bf18098",
         ),
         (
             "reminder",
@@ -3156,7 +3169,7 @@ mod tests {
             // alternatives, scope, confidence, supersedes) plus the
             // `supersede_lesson` action value. Additive only.
             "session",
-            "33dfd983203082155af85e995945cc1ef8ce9b5848ea4f29f409944c2c98f9d2",
+            "c6c66bfe07ddce961b1d0e5fe5245dcf492eb7c3cf50ddd051593e188e9ad9ca",
         ),
         (
             "session_capture",
@@ -3176,15 +3189,15 @@ mod tests {
         ),
         (
             "skill",
-            "77a796790a62943bb0034f6cddd5fb1ae7f575ee0137e1f2f3decf00859cd5e8",
+            "692ed0723cb1765b05a3c32fb3d09e98b979623df17fec8ab33595f735c83d47",
         ),
         (
             "vcs",
-            "b55f1fdce285368d22bd978f710a780350443c1fdbe7c1959eaa1857deecc126",
+            "cada27f46baa6ec184d1af1133f09ea8931ef66f4e85ac6de1d87e3175f6da70",
         ),
         (
             "workspace",
-            "82b580b422c95161db9b0732d6a184f7f77fa511d28670c035939884bbc5ffba",
+            "3c45fbf907d5c264202d6cb43264385d33a05dff579306f59ca752a63d29d814",
         ),
         (
             "workspace_read",
@@ -3679,10 +3692,14 @@ mod tests {
         assert_eq!(help["annotations"]["readOnlyHint"], true);
         assert_eq!(help["annotations"]["destructiveHint"], false);
 
+        // #330: their irreversible actions are listed in `delete`, so these
+        // write but do not destroy, and list none of the moved actions.
         for name in [
             "capsule",
+            "coordination",
             "entity",
             "feed",
+            "instruct",
             "integration",
             "memory",
             "media",
@@ -3700,13 +3717,46 @@ mod tests {
                 "{name} exposes mutating actions"
             );
             assert_eq!(
-                tool["annotations"]["destructiveHint"], true,
-                "{name} exposes delete/purge/revoke/overwrite actions"
+                tool["annotations"]["destructiveHint"], false,
+                "{name} lists only actions that leave things in place"
             );
             assert_eq!(
                 tool["_meta"]["contextstream"]["safety"]["requiresConfirmation"], true,
                 "{name} must request confirmation"
             );
+            for action in tool["inputSchema"]["properties"]["action"]["enum"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let action = action.as_str().unwrap_or_default();
+                assert!(
+                    domains::destructive::separated(name, action).is_none(),
+                    "{name} still lists {action}"
+                );
+            }
+        }
+
+        let delete = tool_by_name(&tools, domains::destructive::DELETE_TOOL);
+        assert_eq!(delete["annotations"]["destructiveHint"], true);
+        assert_eq!(delete["annotations"]["readOnlyHint"], false);
+        let listed = delete["inputSchema"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("delete actions")
+            .clone();
+        for moved in domains::destructive::SEPARATED_ACTIONS {
+            let qualified = serde_json::json!(format!("{}.{}", moved.tool, moved.action));
+            assert_eq!(
+                listed.contains(&qualified),
+                moved.listed_in.is_none(),
+                "{qualified}"
+            );
+            for param in moved.params {
+                assert!(
+                    delete["inputSchema"]["properties"][param].is_object(),
+                    "delete has no {param} for {qualified}"
+                );
+            }
         }
     }
 
@@ -3796,17 +3846,22 @@ mod tests {
                     );
                 }
 
-                // Single-action aliases advertise their own safety rather than
-                // inheriting the parent domain's, so a delete or an overwrite
-                // has to claim it here. Name matching is only a backstop
-                // against a new alias forgetting; the values are still explicit
-                // at each registration site.
-                if name.contains("delete") || name.contains("update") {
-                    assert_eq!(
-                        annotations["destructiveHint"], true,
-                        "{profile_name}/{name} removes or overwrites data, which is not an additive update"
-                    );
-                }
+                // #330: only the dedicated tools are destructive. `delete` holds
+                // the irreversible actions, the two memory aliases delete or
+                // replace a doc, `execute_operation` runs any operation and
+                // the coach surface has its own delete.
+                const DEDICATED_DESTRUCTIVE: &[&str] = &[
+                    "delete",
+                    "memory_delete_doc",
+                    "memory_update_doc",
+                    "execute_operation",
+                    "workflow_delete",
+                ];
+                assert_eq!(
+                    annotations["destructiveHint"] == true,
+                    DEDICATED_DESTRUCTIVE.contains(&name),
+                    "{profile_name}/{name}: destructiveHint must be true exactly on the dedicated destructive tools"
+                );
 
                 println!(
                     "{:<24} {:>8} {:>11} {:>11}",

@@ -219,7 +219,7 @@ fn twin_schema(twin: &ReadOnlyTwin, tool_schema: &Value) -> Value {
 /// Remove the `description` of a parameter's schema and of the schemas
 /// nested in it. A nested parameter that is itself called `description`
 /// stays: only schema keywords are walked, never values or property names.
-fn strip_descriptions(schema: &mut Value) {
+pub(crate) fn strip_descriptions(schema: &mut Value) {
     let Value::Object(map) = schema else {
         return;
     };

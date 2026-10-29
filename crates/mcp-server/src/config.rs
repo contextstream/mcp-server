@@ -27,17 +27,21 @@ pub fn load_limited_config() -> Result<Config> {
 }
 
 fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
-    let saved_credentials = if std::env::var("CONTEXTSTREAM_API_KEY").is_err()
-        && std::env::var("CONTEXTSTREAM_JWT").is_err()
-    {
+    let has_env_auth = std::env::var("CONTEXTSTREAM_API_KEY").is_ok()
+        || std::env::var("CONTEXTSTREAM_JWT").is_ok();
+    let saved_credentials = if !has_env_auth || std::env::var("CONTEXTSTREAM_API_URL").is_err() {
         load_saved_credentials()
     } else {
         None
     };
 
     // Try to load saved credentials if env vars not set.
-    if let Some(saved) = saved_credentials.as_ref() {
-        std::env::set_var("CONTEXTSTREAM_API_KEY", &saved.api_key);
+    if !has_env_auth {
+        if let Some(saved) = saved_credentials.as_ref() {
+            if !saved.api_key.trim().is_empty() {
+                std::env::set_var("CONTEXTSTREAM_API_KEY", &saved.api_key);
+            }
+        }
     }
 
     // Prefer an explicit env override, then a source-built local dev binary,

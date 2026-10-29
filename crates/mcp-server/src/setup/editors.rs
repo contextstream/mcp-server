@@ -1008,6 +1008,11 @@ mod tests {
 
     #[test]
     fn test_copilot_uses_vscode_user_mcp_json_path() {
+        // Both sides read HOME; a test that points HOME at a temp folder
+        // between them failed this one (gate v59q7dhc3z).
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             Editor::Copilot.mcp_config_path(),
             vscode_user_dir().map(|dir| dir.join("mcp.json"))

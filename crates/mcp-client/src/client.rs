@@ -2793,7 +2793,23 @@ impl ContextStreamClient {
             }
             None => Self::legacy_checkout_id(&root, configured_fingerprint),
         };
-        let git_branch = Self::git_branch(root.to_string_lossy().as_ref());
+        let root_str = root.to_string_lossy();
+        let git_commit_sha = Self::git_head_sha(root_str.as_ref());
+        // A freshly `git init`ed repository has a symbolic `HEAD` ref before
+        // its first commit (`git_commit_sha` is `None`). Advertising a dirty
+        // named branch with no base commit routes initial uploads into an
+        // uncommitted branch overlay instead of a searchable base index; treat
+        // commitless checkouts identically to non-Git folders until the first
+        // commit exists.
+        let (git_branch, git_commit_timestamp, dirty) = if git_commit_sha.is_some() {
+            (
+                Self::git_branch(root_str.as_ref()),
+                Self::git_commit_timestamp(root_str.as_ref()),
+                Self::git_dirty(root_str.as_ref()),
+            )
+        } else {
+            (None, None, None)
+        };
         let git_ref_kind = if git_branch.is_some() {
             "branch"
         } else {
@@ -2808,13 +2824,13 @@ impl ContextStreamClient {
             repository_identity,
             git_ref_kind,
             is_default_branch: Self::git_is_default_branch(
-                root.to_string_lossy().as_ref(),
+                root_str.as_ref(),
                 git_branch.as_deref(),
             ),
             git_branch,
-            git_commit_sha: Self::git_head_sha(root.to_string_lossy().as_ref()),
-            git_commit_timestamp: Self::git_commit_timestamp(root.to_string_lossy().as_ref()),
-            dirty: Self::git_dirty(root.to_string_lossy().as_ref()),
+            git_commit_sha,
+            git_commit_timestamp,
+            dirty,
             captured_at: Utc::now().to_rfc3339(),
         };
         let guard = Self::sha256_hex(&format!(
@@ -6429,14 +6445,22 @@ impl ContextStreamClient {
         let status = self
             .scoped_primary_index_attestation_status(project_id, workspace_id)
             .await?;
-        let Some(attestation) = Self::committed_index_attestation(&status) else {
-            // Terminal jobs can become visible just before the primary
-            // generation proof. Keep the receipt and retry rather than
-            // advancing local state without an attestation.
+        let attestation = Self::committed_index_attestation(&status);
+        if attestation.is_none()
+            && status
+                .get("project_index_state")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|state| state.eq_ignore_ascii_case("committing"))
+        {
+            // Terminal jobs can become visible just before an in-flight primary
+            // manifest commit finishes. Keep the receipt while the primary
+            // state is actively `"committing"`; otherwise (e.g. deletion-only,
+            // post-drain, or overlay-only jobs where `committed_manifest_digest`
+            // remains null) finalize cleanly without wedging future scans.
             return Ok(PendingScanReceiptReconcile::Pending {
                 job_ids: receipt.job_ids,
             });
-        };
+        }
         let final_guard = Self::local_checkout_guard(folder_path, project_id, workspace_id)?;
         if final_guard.as_deref() != checkout_guard {
             return Err(Error::Validation(
@@ -6447,9 +6471,9 @@ impl ContextStreamClient {
         if receipt.fingerprint_semantics.as_deref() != Some(FINGERPRINT_SEMANTICS_RACY_CLEAN_V1) {
             // Legacy receipts may contain fingerprints admitted while their
             // timestamp tick was still open. Their remote jobs must reach a
-            // terminal, primary-attested state before we discard local state;
-            // otherwise a replacement ingest could race an older live job and
-            // be overwritten afterward. Once quiescent, force a fresh
+            // terminal state before we discard local state; otherwise a
+            // replacement ingest could race an older live job and be
+            // overwritten afterward. Once quiescent, force a fresh
             // checkout-scoped content scan.
             tracing::warn!(
                 receipt_id = %receipt.receipt_id,
@@ -6463,7 +6487,14 @@ impl ContextStreamClient {
             return Ok(PendingScanReceiptReconcile::Reset);
         }
         Self::finalize_pending_scan_receipt(&receipt_path, &receipt)?;
-        Self::write_server_index_attestation_only(folder_path, project_id, &attestation);
+        match attestation.as_deref() {
+            Some(attestation) => {
+                Self::write_server_index_attestation_only(folder_path, project_id, attestation);
+            }
+            None => {
+                Self::clear_server_index_attestation(folder_path, project_id);
+            }
+        }
         Ok(PendingScanReceiptReconcile::Applied {
             scan_complete: receipt.scan_complete,
         })
@@ -7623,15 +7654,22 @@ impl ContextStreamClient {
         // claiming a committed index is ready yet.
         let receipt_finalized = if wait_summary.pending_jobs == 0 {
             if let Some((receipt_path, receipt)) = pending_scan_receipt.as_ref() {
-                let status = self
+                let mut status = self
                     .scoped_primary_index_attestation_status(project_id, expected_workspace_id)
                     .await?;
-                let attestation = Self::committed_index_attestation(&status).ok_or_else(|| {
-                    Error::Validation(
-                        "Async scan jobs completed without a committed primary index attestation"
-                            .to_string(),
-                    )
-                })?;
+                let mut attestation = Self::committed_index_attestation(&status);
+                if attestation.is_none()
+                    && status
+                        .get("project_index_state")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|state| state.eq_ignore_ascii_case("committing"))
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    status = self
+                        .scoped_primary_index_attestation_status(project_id, expected_workspace_id)
+                        .await?;
+                    attestation = Self::committed_index_attestation(&status);
+                }
                 let final_guard =
                     Self::local_checkout_guard(&params.path, project_id, expected_workspace_id)?;
                 if final_guard != initial_checkout_guard {
@@ -7641,7 +7679,24 @@ impl ContextStreamClient {
                     ));
                 }
                 Self::finalize_pending_scan_receipt(receipt_path, receipt)?;
-                Self::write_server_index_attestation_only(&params.path, project_id, &attestation);
+                match attestation.as_deref() {
+                    Some(attestation) if effective_scan_complete => {
+                        Self::write_verified_index_status(&params.path, project_id, attestation);
+                    }
+                    Some(attestation) => {
+                        Self::write_server_index_attestation_only(
+                            &params.path,
+                            project_id,
+                            attestation,
+                        );
+                    }
+                    None if effective_scan_complete => {
+                        Self::write_unverified_index_status(&params.path, project_id);
+                    }
+                    None => {
+                        Self::clear_server_index_attestation(&params.path, project_id);
+                    }
+                }
                 true
             } else {
                 false
@@ -9533,6 +9588,33 @@ impl ContextStreamClient {
                 "server_index_attestation".to_string(),
                 serde_json::json!(server_index_attestation),
             );
+        });
+    }
+
+    fn write_unverified_index_status(folder_path: &str, project_id: Uuid) {
+        let indexed_commit = Self::git_head_sha(folder_path);
+        let now = Utc::now();
+        Self::mutate_index_status_entry(folder_path, project_id, |entry| {
+            entry.insert(
+                "indexed_at".to_string(),
+                serde_json::json!(now.to_rfc3339()),
+            );
+            entry.remove("server_index_attestation");
+            match &indexed_commit {
+                Some(sha) => {
+                    entry.insert("indexed_commit".to_string(), serde_json::json!(sha));
+                }
+                None => {
+                    entry.remove("indexed_commit");
+                }
+            }
+            entry.remove("indexing_started_at");
+        });
+    }
+
+    fn clear_server_index_attestation(folder_path: &str, project_id: Uuid) {
+        Self::mutate_index_status_entry(folder_path, project_id, |entry| {
+            entry.remove("server_index_attestation");
         });
     }
 
@@ -30104,6 +30186,319 @@ mod tests {
         let body = params.with_defaults(&Config::default());
 
         assert_eq!(body.get("status"), Some(&serde_json::json!("active")));
+    }
+
+    #[test]
+    fn unborn_head_git_checkout_uses_commitless_provenance_until_first_commit(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("mcp-client-unborn-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".contextstream"))?;
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&root)
+            .status()?
+            .success());
+        let marker_dir = root.join(".git").join("contextstream");
+        std::fs::create_dir_all(&marker_dir)?;
+        let workspace_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let fingerprint = format!("git-common-dir-v1:{}", Uuid::new_v4());
+        std::fs::write(marker_dir.join("repository-id"), &fingerprint)?;
+        std::fs::write(
+            root.join("main.rs"),
+            "fn main() {}
+",
+        )?;
+        std::fs::write(
+            root.join(".contextstream").join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "workspace_id": workspace_id,
+                "project_id": project_id,
+                "checkout_root": std::fs::canonicalize(&root)?,
+                "repository_fingerprint": fingerprint,
+            }))?,
+        )?;
+
+        let root_str = root.to_string_lossy().to_string();
+        let unborn =
+            ContextStreamClient::local_checkout_snapshot(&root_str, project_id, workspace_id)?
+                .expect("unborn checkout snapshot");
+        assert!(unborn.provenance.git_commit_sha.is_none());
+        assert!(unborn.provenance.git_branch.is_none());
+        assert_eq!(unborn.provenance.git_ref_kind, "detached");
+        assert!(unborn.provenance.dirty.is_none());
+
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&root)
+            .args(["add", "main.rs"])
+            .status()?
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&root)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "init",
+            ])
+            .status()?
+            .success());
+        std::fs::write(
+            root.join("extra.rs"),
+            "pub fn extra() {}
+",
+        )?;
+
+        let committed =
+            ContextStreamClient::local_checkout_snapshot(&root_str, project_id, workspace_id)?
+                .expect("committed checkout snapshot");
+        assert_eq!(committed.guard, unborn.guard);
+        assert!(committed.provenance.git_commit_sha.is_some());
+        assert!(committed.provenance.git_branch.is_some());
+        assert_eq!(committed.provenance.git_ref_kind, "branch");
+        assert_eq!(committed.provenance.dirty, Some(true));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_ingest_succeeds_when_completed_job_leaves_manifest_uncertified() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-async-uncert-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("temp home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let root = initialize_bound_ingest_fixture(&temp_home, project_id, workspace_id)
+            .expect("initialize checkout");
+        let root_text = std::fs::canonicalize(&root)
+            .expect("canonical checkout")
+            .to_string_lossy()
+            .to_string();
+
+        // Seed an extra file in the local manifest and exclude it via `.contextignore`
+        // so `ingest_local` sends a deletion-only async job (`deleted_paths` contains
+        // `remove_me.rs`), reproducing issue #269 Scenario 2 as well as uncertified
+        // async completions.
+        std::fs::write(root.join("remove_me.rs"), "// REMOVE_ME\n").expect("write excluded file");
+        std::fs::write(
+            root.join(".contextignore"),
+            "remove_me.rs\n.contextignore\n",
+        )
+        .expect("write .contextignore");
+        let scope = bound_manifest_scope(&root, project_id, workspace_id);
+        ContextStreamClient::write_hash_manifest(
+            &scope,
+            &std::collections::HashMap::from([
+                (
+                    "lib.rs".to_string(),
+                    ContextStreamClient::sha256_hex("pub fn ready() -> bool { true }\n"),
+                ),
+                (
+                    "remove_me.rs".to_string(),
+                    ContextStreamClient::sha256_hex("// REMOVE_ME\n"),
+                ),
+            ]),
+        );
+        let pre_delete_status = primary_attestation_fixture(project_id, workspace_id, 42, 'a');
+        let pre_delete_attestation =
+            ContextStreamClient::committed_index_attestation(&pre_delete_status)
+                .expect("pre-delete attestation");
+        ContextStreamClient::write_verified_index_status(
+            &root_text,
+            project_id,
+            &pre_delete_attestation,
+        );
+
+        let job_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("job uuid");
+        let mut uncertified = primary_attestation_fixture(project_id, workspace_id, 43, 'b');
+        uncertified["project_index_state"] = serde_json::json!("ready");
+        uncertified["committed"] = serde_json::json!(false);
+        uncertified["committed_manifest_digest"] = serde_json::Value::Null;
+        uncertified["committed_manifest_file_count"] = serde_json::json!(0);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = seen.clone();
+        let saw_ingest = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_ingest_server = saw_ingest.clone();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut expected_total: Option<usize> = None;
+                loop {
+                    let read = socket.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..read]);
+                    if expected_total.is_none() {
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let header_end = pos + 4;
+                            let headers = String::from_utf8_lossy(&raw[..header_end]);
+                            let content_len = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (k, v) = line.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            expected_total = Some(header_end + content_len);
+                        }
+                    }
+                    if let Some(total) = expected_total {
+                        if raw.len() >= total {
+                            break;
+                        }
+                    }
+                }
+                let req_str = String::from_utf8_lossy(&raw).to_string();
+                let request_line = req_str.lines().next().unwrap_or("");
+                recorder.lock().unwrap().push(req_str.clone());
+
+                let (status_line, body) = if request_line
+                    .starts_with(&format!("POST /api/v1/projects/{project_id}/files/ingest "))
+                {
+                    saw_ingest_server.store(true, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        "202 Accepted",
+                        serde_json::json!({
+                            "files_indexed": 0,
+                            "committed": false,
+                            "job_id": job_id,
+                        })
+                        .to_string(),
+                    )
+                } else if request_line.starts_with(&format!(
+                    "GET /api/v1/projects/{project_id}/ingest/jobs/{job_id}"
+                )) {
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "status": "completed",
+                            "files_total": 0,
+                            "files_processed": 0,
+                        })
+                        .to_string(),
+                    )
+                } else if request_line
+                    .starts_with(&format!("GET /api/v1/projects/{project_id}/index/status"))
+                {
+                    if saw_ingest_server.load(std::sync::atomic::Ordering::SeqCst) {
+                        ("200 OK", uncertified.to_string())
+                    } else {
+                        ("200 OK", pre_delete_status.to_string())
+                    }
+                } else if request_line.starts_with(&format!("GET /api/v1/projects/{project_id} ")) {
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "id": project_id,
+                            "name": "repo",
+                            "workspace_id": workspace_id,
+                        })
+                        .to_string(),
+                    )
+                } else if request_line.starts_with("POST /api/v1/graph/ingest ") {
+                    (
+                        "200 OK",
+                        serde_json::json!({ "status": "queued" }).to_string(),
+                    )
+                } else {
+                    (
+                        "404 Not Found",
+                        serde_json::json!({ "error": request_line }).to_string(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let mut config = Config::default();
+        config.api_url = format!("http://{addr}");
+        config.api_key = Some("test-key".to_string());
+        let client = ContextStreamClient::new(config);
+
+        let result = client
+            .ingest_local(IngestLocalParams {
+                path: root_text.clone(),
+                workspace_id: Some(workspace_id),
+                project_id: Some(project_id),
+                force: Some(false),
+                include_media: Some(false),
+                ..Default::default()
+            })
+            .await
+            .expect("completed async job with uncertified manifest must succeed");
+        server.abort();
+        assert_eq!(result["status"], "success", "{result}");
+        assert_eq!(result["committed"], true, "{result}");
+
+        let receipt_path =
+            ContextStreamClient::pending_scan_receipt_path(&root_text, project_id, workspace_id)
+                .expect("receipt path");
+        assert!(
+            !receipt_path.exists(),
+            "pending receipt must be finalized and removed"
+        );
+
+        let updated_manifest = ContextStreamClient::read_hash_manifest(&scope);
+        assert!(updated_manifest.contains_key("lib.rs"));
+        assert!(
+            !updated_manifest.contains_key("remove_me.rs"),
+            "excluded path must be removed from local hash manifest"
+        );
+        assert!(
+            ContextStreamClient::local_server_index_attestation(&root_text).is_none(),
+            "stale pre-deletion server attestation must be cleared when manifest is uncertified"
+        );
+        assert!(ContextStreamClient::local_indexed_at(&root_text).is_some());
+
+        let requests = seen.lock().unwrap().clone();
+        let ingest_req = requests
+            .iter()
+            .find(|req| {
+                req.starts_with(&format!("POST /api/v1/projects/{project_id}/files/ingest "))
+            })
+            .expect("deletion ingest request");
+        let ingest_body = request_body(ingest_req);
+        let deleted_paths = ingest_body["deleted_paths"]
+            .as_array()
+            .expect("deleted_paths array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            deleted_paths.contains(&"remove_me.rs"),
+            "expected remove_me.rs in deleted_paths, got {deleted_paths:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_home);
     }
 }
 

@@ -2720,11 +2720,22 @@ pub async fn run_setup_with_project_overrides(
 /// editors, hosted remote transport, background indexing, no media. Fails
 /// fast with guidance when credentials are missing/invalid or the workspace
 /// is ambiguous — it never guesses across workspaces.
-/// When plain `setup --yes` (with no override flags) is re-run inside a
+/// When `setup --yes`, plain or with flags that already match, is re-run inside a
 /// checkout that is already configured, linked, indexed, and passing all
 /// setup-managed doctor checks, emit a concise confirmation and return `true`
 /// without mutating files or spawning background indexing.
-async fn try_short_circuit_healthy_noninteractive_setup() -> Result<bool> {
+///
+/// Bootstrap scripts pass the same `--editors`, `--workspace-id`,
+/// `--project-path`, `--project-id` and `--project-name` every time, so those
+/// count as unchanged when each one names what is already saved; any that
+/// differs falls through to the full setup, which applies it.
+async fn try_short_circuit_healthy_noninteractive_setup(
+    requested_editors: Option<&[editors::Editor]>,
+    explicit_project_path: Option<&Path>,
+    explicit_workspace_id: Option<&str>,
+    explicit_project_id: Option<uuid::Uuid>,
+    explicit_project_name: Option<&str>,
+) -> Result<bool> {
     struct RestorePersistence(bool);
     impl Drop for RestorePersistence {
         fn drop(&mut self) {
@@ -2785,6 +2796,13 @@ async fn try_short_circuit_healthy_noninteractive_setup() -> Result<bool> {
     if saved_editors.is_empty() || saved_editors.len() != selection.clients.len() {
         return Ok(false);
     }
+    if let Some(requested) = requested_editors {
+        let requested: HashSet<editors::Editor> = requested.iter().copied().collect();
+        let saved: HashSet<editors::Editor> = saved_editors.iter().copied().collect();
+        if requested != saved {
+            return Ok(false);
+        }
+    }
     if !matches!(
         read_setup_transport_marker_result(),
         Ok(Some(SetupTransportPreference::HostedRemote))
@@ -2793,7 +2811,7 @@ async fn try_short_circuit_healthy_noninteractive_setup() -> Result<bool> {
     }
 
     let cwd = std::env::current_dir()?;
-    let Some(project_path) = resolve_setup_project_path(&cwd, None, false)? else {
+    let Some(project_path) = resolve_setup_project_path(&cwd, explicit_project_path, false)? else {
         return Ok(false);
     };
     let Ok(Some(local_cfg)) = read_project_config(&project_path) else {
@@ -2811,6 +2829,12 @@ async fn try_short_circuit_healthy_noninteractive_setup() -> Result<bool> {
     ) else {
         return Ok(false);
     };
+    if explicit_workspace_id
+        .is_some_and(|requested| uuid::Uuid::parse_str(requested.trim()).ok() != Some(ws_uuid))
+        || explicit_project_id.is_some_and(|requested| requested != proj_uuid)
+    {
+        return Ok(false);
+    }
 
     if setup_path_has_project_content_files(&project_path, false)
         && !ContextStreamClient::local_project_index_is_current(
@@ -2833,6 +2857,9 @@ async fn try_short_circuit_healthy_noninteractive_setup() -> Result<bool> {
         .await
         .is_err()
     {
+        return Ok(false);
+    }
+    if explicit_project_name.is_some_and(|requested| requested.trim() != project.name.trim()) {
         return Ok(false);
     }
     if !linked_project_name_matches_checkout(
@@ -2924,13 +2951,15 @@ async fn run_setup_noninteractive(
     };
 
     if !account_only
-        && only.is_none()
-        && explicit_project_path.is_none()
-        && explicit_workspace_id.is_none()
-        && parsed_project_id.is_none()
-        && normalized_project_name.is_none()
         && explicit_learning_choice.is_none()
-        && try_short_circuit_healthy_noninteractive_setup().await?
+        && try_short_circuit_healthy_noninteractive_setup(
+            only,
+            explicit_project_path,
+            explicit_workspace_id,
+            parsed_project_id,
+            normalized_project_name,
+        )
+        .await?
     {
         return Ok(false);
     }

@@ -3655,6 +3655,76 @@ mod tests {
         }
     }
 
+    /// Ingest leaves a rules file with nothing but the managed block out of the
+    /// index (so the agent's own instructions never outrank project code in
+    /// search). This ties that to what `setup` really writes: every file it
+    /// creates with a managed block, in a directory ingest does not prune, has
+    /// to be one the detector recognizes.
+    #[test]
+    fn every_managed_rules_file_setup_creates_is_left_out_of_the_index() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        for editor in Editor::selectable() {
+            if editor.rules_path(Some(project)).is_some() {
+                write_project_rules(
+                    &editor,
+                    project,
+                    Some("ws-1"),
+                    Some("Personal"),
+                    Some("streamingmusic"),
+                )
+                .unwrap_or_else(|e| panic!("write_project_rules failed for {editor:?}: {e:#}"));
+            }
+        }
+
+        let mut checked = Vec::new();
+        let mut unrecognized = Vec::new();
+        let mut pending = vec![project.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read dir").flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if path.is_dir() {
+                    // Ingest never descends into these, so nothing in them is indexed.
+                    if !mcp_client::ContextStreamClient::should_skip_ingest_directory(&name) {
+                        pending.push(path);
+                    }
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                if !content.contains(CONTEXTSTREAM_START) {
+                    continue;
+                }
+                if !mcp_types::rules_hash::is_managed_rules_file_name(&name)
+                    || !mcp_types::rules_hash::is_managed_rules_only(&content)
+                {
+                    unrecognized.push(
+                        path.strip_prefix(project)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string(),
+                    );
+                }
+                checked.push(name);
+            }
+        }
+        unrecognized.sort();
+        assert!(
+            unrecognized.is_empty(),
+            "setup writes a managed rules block into these files, but ingest would index \
+             them as project code (add the file name to MANAGED_RULES_FILE_NAMES in \
+             mcp-types rules_hash.rs): {unrecognized:?}"
+        );
+        checked.sort();
+        assert!(
+            checked.iter().any(|name| name == "CLAUDE.md")
+                && checked.iter().any(|name| name == "AGENTS.md"),
+            "the walk must reach the root rules files, saw {checked:?}"
+        );
+    }
+
     #[test]
     fn test_mode_for_editor_uses_tier_mapping() {
         assert_eq!(mode_for_editor(&Editor::ClaudeCode), RulesMode::Bootstrap);

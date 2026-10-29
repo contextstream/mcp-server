@@ -37,19 +37,17 @@ use mcp_types::{Error, ErrorCode};
 use serde_json::Value;
 use uuid::Uuid;
 
-/// Match the two HTTP codes that mean "the session is bound to a
-/// workspace the current credentials can't access":
-///
-/// - **403 Forbidden** — the canonical case. Token is valid, user has
-///   an account, but the workspace_id on the request isn't one of
-///   their own and they aren't a member.
-/// - **401 Unauthorized** — token expired / missing entirely. Same
-///   user-visible symptom (the agent gets a forbidden-style response
-///   on a quiet read), so we bucket it together for read actions and
-///   surface the same re-init hint.
+/// Match the HTTP code that means "the session is bound to a workspace the
+/// current credentials can't access": **403 Forbidden**. The credential is
+/// valid, but the workspace_id on the request isn't one of the account's own
+/// and it isn't a member.
 ///
 /// Other HTTP codes are intentionally NOT considered drift:
 ///
+/// - 401 means the credential itself was refused (invalid, expired or
+///   revoked). It bubbles with its own message, which says how to fix the
+///   key; calling it drift told the agent "Loaded 0" and "Re-run init",
+///   neither true nor helpful (mcp-server#304).
 /// - 404 / 422 are already handled per-action as "missing" / "empty"
 ///   results (`is_recoverable_read_error` covers those).
 /// - 5xx / 429 / etc. are real errors and should bubble.
@@ -58,9 +56,6 @@ pub fn is_workspace_access_error(err: &Error) -> bool {
         err,
         Error::Http {
             code: ErrorCode::Forbidden,
-            ..
-        } | Error::Http {
-            code: ErrorCode::Unauthorized,
             ..
         }
     )
@@ -115,7 +110,8 @@ pub fn drift_collection_result(
     extras: Option<Value>,
 ) -> ToolResult {
     let hint = drift_text_hint(workspace_id);
-    let text = format!("Loaded 0 {} (workspace access drift). {}", kind, hint);
+    // Not "Loaded 0": nothing was read, so an empty list would mislead (#304).
+    let text = format!("Could not load {} (workspace access drift). {}", kind, hint);
     let mut payload = serde_json::Map::new();
     if let Some(Value::Object(extra_map)) = extras {
         for (k, v) in extra_map {
@@ -175,12 +171,16 @@ mod tests {
     use mcp_types::tool::ContentItem;
 
     #[test]
-    fn workspace_access_error_matches_403_and_401() {
+    fn workspace_access_error_is_403_and_a_refused_credential_is_not_drift() {
         assert!(is_workspace_access_error(&Error::http(
             403,
             "Forbidden: No access to workspace"
         )));
-        assert!(is_workspace_access_error(&Error::http(401, "Unauthorized")));
+        // #304: a refused key keeps its own 401 message.
+        assert!(!is_workspace_access_error(&Error::http(
+            401,
+            "Unauthorized"
+        )));
     }
 
     #[test]

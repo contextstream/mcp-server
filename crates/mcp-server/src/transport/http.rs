@@ -1021,6 +1021,13 @@ async fn serve_mcp_streamable(
                 ),
                 data: None,
             }),
+            "initialize" if api_key_refused_at_initialize(&state, &headers).await => {
+                Err(JsonRpcError {
+                    code: INITIALIZE_KEY_REFUSED_CODE,
+                    message: INITIALIZE_KEY_REFUSED_MESSAGE.to_string(),
+                    data: None,
+                })
+            }
             "initialize" => {
                 state
                     .telemetry
@@ -2267,6 +2274,90 @@ fn log_failed_tool_call(headers: &HeaderMap, tool: &str, error: &JsonRpcError) {
         client_version = %client_version,
         "tool call failed"
     );
+}
+
+/// How long the hosted gateway keeps the API's answer about one API key at
+/// `initialize`, so reconnects do not each cost an API call.
+const INITIALIZE_KEY_ACCEPTED_TTL: Duration = Duration::from_secs(600);
+const INITIALIZE_KEY_REFUSED_TTL: Duration = Duration::from_secs(60);
+const INITIALIZE_KEY_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+const INITIALIZE_KEY_CACHE_LIMIT: usize = 10_000;
+/// JSON-RPC error code for an `initialize` whose API key the API refused.
+const INITIALIZE_KEY_REFUSED_CODE: i32 = -32001;
+const INITIALIZE_KEY_REFUSED_MESSAGE: &str =
+    "ContextStream did not accept the API key sent with this \
+    connection (invalid, expired or revoked). Save a valid key with `contextstream-mcp setup` and \
+    restart the editor, or update the X-ContextStream-API-Key header in the editor's MCP config.";
+
+/// Hashed caller identity -> (accepted, when the API answered).
+fn initialize_key_verdicts() -> &'static std::sync::Mutex<HashMap<String, (bool, Instant)>> {
+    static VERDICTS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (bool, Instant)>>> =
+        std::sync::OnceLock::new();
+    VERDICTS.get_or_init(Default::default)
+}
+
+/// On the hosted gateway (`require_auth`), an `initialize` carrying an API key
+/// the API refuses with a definite 401 fails, so an editor does not report a
+/// connection whose every tool call would fail (#252). An unreachable, slow or
+/// failing API lets the initialize through as before; bearer JWTs were
+/// verified by the auth middleware already. The API is asked with this
+/// request's own credentials (the middleware's task-local auth override).
+async fn api_key_refused_at_initialize(state: &HttpState, headers: &HeaderMap) -> bool {
+    if !state.require_auth {
+        return false;
+    }
+    let Some(auth) = extract_auth_override(headers) else {
+        return false;
+    };
+    if auth.jwt.is_some() {
+        return false;
+    }
+    let Some(api_key) = auth
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return false;
+    };
+    let identity = SessionKey::ApiKey(api_key.to_string()).atlas_user_scope_token();
+    let now = Instant::now();
+    if let Some(identity) = identity.as_deref() {
+        let cached = initialize_key_verdicts()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(identity)
+            .copied();
+        if let Some((accepted, at)) = cached {
+            let ttl = if accepted {
+                INITIALIZE_KEY_ACCEPTED_TTL
+            } else {
+                INITIALIZE_KEY_REFUSED_TTL
+            };
+            if now.duration_since(at) < ttl {
+                return !accepted;
+            }
+        }
+    }
+    let accepted = match tokio::time::timeout(INITIALIZE_KEY_CHECK_TIMEOUT, state.client.me()).await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(mcp_types::Error::Http { status: 401, .. })) => false,
+        _ => return false,
+    };
+    if let Some(identity) = identity {
+        let mut verdicts = initialize_key_verdicts()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if verdicts.len() >= INITIALIZE_KEY_CACHE_LIMIT {
+            verdicts.retain(|_, (_, at)| now.duration_since(*at) < INITIALIZE_KEY_ACCEPTED_TTL);
+            if verdicts.len() >= INITIALIZE_KEY_CACHE_LIMIT {
+                verdicts.clear();
+            }
+        }
+        verdicts.insert(identity, (accepted, now));
+    }
+    !accepted
 }
 
 async fn handle_initialize_method(
@@ -6949,5 +7040,135 @@ mod cors_preflight_contract {
         let got = answer(&case).await;
         assert_eq!(got["status"], 404);
         assert_eq!(got["body"], "routed past the CORS layer");
+    }
+}
+
+#[cfg(test)]
+mod initialize_key_tests {
+    use super::*;
+    use crate::server::build_registry;
+    use http_body_util::BodyExt;
+    use mcp_types::config::Config;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower::ServiceExt as _;
+
+    /// An API that answers every request with `status_line`, counting them.
+    async fn api_answering(status_line: &'static str) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind api");
+        let address = listener.local_addr().expect("api address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = vec![0u8; 16 * 1024];
+                let _ = socket.read(&mut buffer).await;
+                let body = r#"{"success":false,"error":"no"}"#;
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}"), hits)
+    }
+
+    /// The hosted gateway: credentials come with each request.
+    fn hosted_gateway(api_url: String) -> axum::Router {
+        let config = Config {
+            api_url,
+            api_key: None,
+            is_http_transport: true,
+            ..Config::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config.clone()));
+        let registry = build_registry(&config, client.clone(), session.clone());
+        create_router(HttpState {
+            registry: Arc::new(registry),
+            client: client.clone(),
+            session: session.clone(),
+            jwt_secret: None,
+            require_auth: true,
+            telemetry: AgenticTelemetry::new(client, session),
+            tools_list_cache: Arc::new(RwLock::new(HashMap::new())),
+            concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            metrics_handle: None,
+        })
+    }
+
+    async fn initialize(router: axum::Router, api_key: &str) -> Value {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("x-contextstream-api-key", api_key)
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2024-11-05",
+                                "clientInfo": {"name": "qa", "version": "1.0"},
+                                "capabilities": {}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("initialize request"),
+            )
+            .await
+            .expect("initialize response");
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        // Plain JSON, or one server-sent event carrying it.
+        let json_text = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
+            .unwrap_or(&text)
+            .trim()
+            .to_string();
+        serde_json::from_str(&json_text).unwrap_or_else(|_| panic!("JSON body: {text}"))
+    }
+
+    #[tokio::test]
+    async fn hosted_initialize_refuses_a_key_the_api_rejects_and_remembers_it() {
+        let (api_url, hits) = api_answering("HTTP/1.1 401 Unauthorized").await;
+        let body = initialize(hosted_gateway(api_url.clone()), "refused-key-252").await;
+        assert_eq!(body["error"]["code"], INITIALIZE_KEY_REFUSED_CODE, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("did not accept the API key")),
+            "{body}"
+        );
+        let asked = hits.load(Ordering::SeqCst);
+        assert!(asked >= 1);
+
+        // A reconnect within the cache window is refused without asking again.
+        let body = initialize(hosted_gateway(api_url), "refused-key-252").await;
+        assert_eq!(body["error"]["code"], INITIALIZE_KEY_REFUSED_CODE, "{body}");
+        assert_eq!(hits.load(Ordering::SeqCst), asked);
+    }
+
+    #[tokio::test]
+    async fn hosted_initialize_goes_through_when_the_api_cannot_answer() {
+        let (api_url, _) = api_answering("HTTP/1.1 503 Service Unavailable").await;
+        let body = initialize(hosted_gateway(api_url), "transient-key-252").await;
+        assert!(body.get("result").is_some(), "{body}");
+        assert!(body.get("error").is_none(), "{body}");
     }
 }

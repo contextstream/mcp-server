@@ -387,6 +387,55 @@ impl AgenticTelemetry {
             .map(|known| known.canonical_id.to_string());
     }
 
+    /// The stateless (2026-07-28) contract has no initialize: the client's
+    /// name rides in each request's `_meta`, and its requests share no MCP
+    /// session, so the caller's credential is the partition. A request that
+    /// carries the managed identity sets the hints initialize would have set,
+    /// keeping what was already observed for the same identity, so its
+    /// handshake and tool calls count as readiness evidence (#328: Claude
+    /// Code, which speaks only this contract, never did).
+    pub async fn ensure_managed_stateless_hints(
+        &self,
+        params: &Value,
+        managed_identity: Option<ManagedHarnessRuntimeIdentity>,
+    ) {
+        let Some(identity) = managed_identity else {
+            return;
+        };
+        let Some(partition) = telemetry_partition(None) else {
+            return;
+        };
+        let client_info = params
+            .get("_meta")
+            .and_then(|meta| meta.get(mcp_types::MCP_META_CLIENT_INFO))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let claims = serde_json::json!({ "clientInfo": client_info });
+        let harness_id = exact_initialize_harness(&claims, Some(identity.harness_id));
+        if harness_id != Some(identity.harness_id) {
+            return;
+        }
+        let now = Instant::now();
+        let mut runtime = self.runtime.lock().await;
+        clean_runtime_state(&mut runtime, now);
+        let hints = runtime
+            .hints
+            .entry(partition)
+            .or_insert_with(|| RuntimeHints {
+                harness_id,
+                managed_identity: None,
+                model_id: None,
+                last_activity: now,
+                readiness_observed_at: HashMap::new(),
+            });
+        if hints.managed_identity.as_ref() != Some(&identity) {
+            hints.harness_id = harness_id;
+            hints.managed_identity = Some(identity);
+            hints.readiness_observed_at.clear();
+        }
+        hints.last_activity = now;
+    }
+
     pub async fn emit_managed_connected_readiness(
         &self,
         mcp_session_id: Option<&str>,
@@ -1208,6 +1257,82 @@ mod tests {
         )
         .await;
         assert_eq!(anonymous_initialize, anonymous_follow_up);
+    }
+
+    #[tokio::test]
+    async fn a_stateless_request_with_the_managed_identity_sets_the_hints() {
+        // #328: Claude Code's stateless server/discover, tools/list and
+        // tools/call never counted as readiness evidence.
+        let config = mcp_types::Config {
+            api_key: Some("process-key".to_string()),
+            ..Default::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        let telemetry = AgenticTelemetry::new(client, session);
+        let identity = ManagedHarnessRuntimeIdentity {
+            installation_id: Uuid::new_v4(),
+            harness_id: HarnessId::ClaudeCode,
+            managed_config_version: "2".to_string(),
+            teaching_version: "harness_teaching_v4".to_string(),
+        };
+        let stateless = |name: &str| {
+            serde_json::json!({"_meta": {
+                mcp_types::MCP_META_CLIENT_INFO: {"name": name, "version": "2.1.312"}
+            }})
+        };
+        let caller = || mcp_types::AuthOverride {
+            api_key: Some("caller-key".to_string()),
+            ..Default::default()
+        };
+
+        // Another client's name, or no name, is not this harness.
+        for params in [stateless("cursor"), serde_json::json!({})] {
+            run_with_auth_override(caller(), || async {
+                telemetry
+                    .ensure_managed_stateless_hints(&params, Some(identity.clone()))
+                    .await;
+            })
+            .await;
+        }
+        assert!(telemetry.runtime.lock().await.hints.is_empty());
+
+        // Claude Code's own: the hints initialize would have set, kept from
+        // one request to the next with what was observed.
+        run_with_auth_override(caller(), || async {
+            telemetry
+                .ensure_managed_stateless_hints(&stateless("claude-code"), Some(identity.clone()))
+                .await;
+        })
+        .await;
+        {
+            let mut runtime = telemetry.runtime.lock().await;
+            assert_eq!(runtime.hints.len(), 1);
+            let hints = runtime.hints.values_mut().next().unwrap();
+            assert_eq!(hints.harness_id, Some(HarnessId::ClaudeCode));
+            assert_eq!(hints.managed_identity.as_ref(), Some(&identity));
+            hints
+                .readiness_observed_at
+                .insert(RuntimeReadinessKind::Connected, Utc::now());
+        }
+        run_with_auth_override(caller(), || async {
+            telemetry
+                .ensure_managed_stateless_hints(&stateless("claude-code"), Some(identity.clone()))
+                .await;
+        })
+        .await;
+        let runtime = telemetry.runtime.lock().await;
+        assert_eq!(runtime.hints.len(), 1);
+        assert_eq!(
+            runtime
+                .hints
+                .values()
+                .next()
+                .unwrap()
+                .readiness_observed_at
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

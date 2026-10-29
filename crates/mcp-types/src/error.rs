@@ -143,6 +143,18 @@ impl Error {
         }
     }
 
+    /// Whether ContextStream could not be reached or would not serve the
+    /// caller at all: the network, a timeout, missing or refused credentials,
+    /// a server or gateway failure. A refusal of the request's own content (a
+    /// 400 validation error, a 404, a plan limit) is not one.
+    pub fn is_connection_failure(&self) -> bool {
+        match self {
+            Self::Http { status, .. } => matches!(status, 401 | 407 | 408) || *status >= 500,
+            Self::Network(_) | Self::Timeout(_) | Self::MissingCredentials => true,
+            _ => false,
+        }
+    }
+
     /// Check if this error is retryable.
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -274,6 +286,38 @@ impl fmt::Display for ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_reach_auth_and_server_failures_are_connection_failures() {
+        // #291: a 400 for the caller's own input is not a failed connection.
+        let http = |status| Error::Http {
+            status,
+            message: String::new(),
+            code: ErrorCode::BadRequest,
+            source: None,
+        };
+        for error in [
+            http(401),
+            http(500),
+            http(503),
+            Error::Network("refused".into()),
+            Error::Timeout(30),
+            Error::MissingCredentials,
+        ] {
+            assert!(error.is_connection_failure(), "{error}");
+        }
+        for error in [
+            http(400),
+            http(403),
+            http(404),
+            http(422),
+            http(429),
+            Error::Validation("query too long".into()),
+            Error::Tool("unknown tool".into()),
+        ] {
+            assert!(!error.is_connection_failure(), "{error}");
+        }
+    }
 
     #[test]
     fn test_error_code_from_status() {

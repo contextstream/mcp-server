@@ -189,3 +189,22 @@ fn uninstall_gives_a_persons_own_aider_configs_back_byte_for_byte() {
         "setup's copies of their files remain: {left:?}"
     );
 }
+
+#[test]
+fn uninstall_mentions_credentials_only_when_there_are_some_to_leave() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = home.join("app");
+    std::fs::create_dir_all(&project).unwrap();
+    let said = |output: Output| {
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).contains("Credentials in ~/.contextstream")
+    };
+
+    assert!(
+        !said(run(&home, &project, &["uninstall", "--scope", "all"])),
+        "nothing was ever signed in, so there is nothing left to name"
+    );
+    std::fs::create_dir_all(home.join(".contextstream")).unwrap();
+    assert!(said(run(&home, &project, &["uninstall", "--scope", "all"])));
+}

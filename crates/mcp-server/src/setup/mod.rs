@@ -1089,15 +1089,19 @@ pub async fn uninstall(
             println!();
             println!("  {}", style(git_hooks_remain_message(&remaining)).yellow());
         }
-        println!();
-        println!(
-            "  {}",
-            style(
-                "Credentials in ~/.contextstream were left in place. \
-                 Delete that directory to remove them too."
-            )
-            .dim()
-        );
+        // Only when there is something left: on a machine that never signed in
+        // the note names a directory that does not exist.
+        if dirs::home_dir().is_some_and(|home| home.join(".contextstream").is_dir()) {
+            println!();
+            println!(
+                "  {}",
+                style(
+                    "Credentials in ~/.contextstream were left in place. \
+                     Delete that directory to remove them too."
+                )
+                .dim()
+            );
+        }
     }
 
     if failures.is_empty() {

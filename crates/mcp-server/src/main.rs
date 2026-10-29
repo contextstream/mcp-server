@@ -3488,10 +3488,7 @@ async fn run_index_or_ingest(
                 style("ℹ  ").blue()
             );
             let api_key = setup::ensure_authenticated_api_key().await?;
-            mcp_types::config::Config {
-                api_key: Some(api_key),
-                ..Default::default()
-            }
+            setup::setup_client_config(&api_key)
         }
         Ok(c) => c,
         Err(_) => {
@@ -3500,10 +3497,7 @@ async fn run_index_or_ingest(
                 style("ℹ  ").blue()
             );
             let api_key = setup::ensure_authenticated_api_key().await?;
-            mcp_types::config::Config {
-                api_key: Some(api_key),
-                ..Default::default()
-            }
+            setup::setup_client_config(&api_key)
         }
     };
 

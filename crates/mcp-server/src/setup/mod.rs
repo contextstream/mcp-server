@@ -1358,10 +1358,7 @@ pub async fn update_hooks_scoped(
 
 pub async fn ensure_authenticated_api_key() -> Result<String> {
     if let Some(existing_api_key) = get_api_key_result()? {
-        let client = ContextStreamClient::new(Config {
-            api_key: Some(existing_api_key.clone()),
-            ..Default::default()
-        });
+        let client = ContextStreamClient::new(setup_client_config(&existing_api_key));
 
         if client.me().await.is_ok() {
             return Ok(existing_api_key);
@@ -1483,10 +1480,7 @@ async fn update_configs_scoped_with_interactivity(
         .and_then(|cfg| cfg.workspace_name.clone());
     let mut project_id = local_config.as_ref().and_then(|cfg| cfg.project_id.clone());
 
-    let client = ContextStreamClient::new(Config {
-        api_key: Some(api_key.clone()),
-        ..Default::default()
-    });
+    let client = ContextStreamClient::new(setup_client_config(&api_key));
 
     if (scope == "project" || scope == "all") && cwd.is_some() {
         if let Some(project_path) = cwd.as_ref() {
@@ -2120,10 +2114,7 @@ pub async fn update_rules_scoped(
         // Try API-driven resolution first, then fall back to header-sniffing.
         let api_resolved = match get_api_key_result()? {
             Some(key) => {
-                let client = ContextStreamClient::new(Config {
-                    api_key: Some(key),
-                    ..Default::default()
-                });
+                let client = ContextStreamClient::new(setup_client_config(&key));
                 resolve_workspace_from_api(&client, &cwd).await
             }
             None => None,
@@ -3682,10 +3673,7 @@ pub async fn authenticate() -> Result<(String, String)> {
                 Some(&mask_api_key(&api_key)),
             );
             if prompts::confirm("Keep using it?", true)? {
-                let client = ContextStreamClient::new(Config {
-                    api_key: Some(api_key.clone()),
-                    ..Default::default()
-                });
+                let client = ContextStreamClient::new(setup_client_config(&api_key));
                 let check = ui::spin(
                     "Checking your saved sign-in",
                     tokio::time::timeout(std::time::Duration::from_secs(10), client.me()),
@@ -3990,6 +3978,7 @@ async fn authenticate_browser() -> Result<(String, String)> {
 
     // Exchange the browser session for a persistent API key.
     let client = ContextStreamClient::new(Config {
+        api_url: setup_client_config("").api_url,
         jwt: Some(token.access_token.clone()),
         ..Default::default()
     });

@@ -13646,6 +13646,23 @@ impl SearchTool {
                         "… +{} more result(s) omitted to stay within the output budget. Paginate with offset={}, or use output_format=\"paths\"/\"minimal\".\n",
                         omitted_rows, next_offset
                     ));
+                } else {
+                    // The header counts every match: say when fewer are listed,
+                    // and how to get the next page (#313).
+                    let offset = resolved_offset.unwrap_or(0).max(0);
+                    let shown = idx as i64;
+                    if shown < total - offset {
+                        text.push_str(&format!("Showing {shown} of {total}."));
+                        if let Some(limit) = resolved_limit.filter(|limit| *limit > 0) {
+                            if offset + limit < total {
+                                text.push_str(&format!(
+                                    " Pass offset={} for the next page.",
+                                    offset + limit
+                                ));
+                            }
+                        }
+                        text.push('\n');
+                    }
                 }
 
                 // Format memory results in a separate section

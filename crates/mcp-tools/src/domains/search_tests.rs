@@ -8328,6 +8328,42 @@ mod scope_widening_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_of_a_longer_result_says_how_many_are_listed() {
+        // #313: the header said "24 results" over 10 rows, with no way on.
+        let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+        let server = RoutedServer::spawn(Box::new(move |line, _| {
+            if line.contains("/search/") {
+                let rows: Vec<Value> = (0..10)
+                    .map(|i| json!({"id": format!("r{i}"), "file_path": format!("src/loyalty_{i}.rs"), "start_line": 1, "content": format!("loyalty discount {i}"), "score": 0.9 - (i as f64) * 0.01}))
+                    .collect();
+                return (
+                    200,
+                    json!({"results": rows, "total": 24, "project_index_state": "ready"})
+                        .to_string(),
+                );
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            (404, json!({"error":"not found"}).to_string())
+        }));
+        let (tool, session) = gateway_tool(&server.base_url);
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        let result = tool
+            .execute(json!({"query":"loyalty discount","mode":"semantic","limit":10}))
+            .await
+            .unwrap();
+        let text = text_of(&result);
+        assert!(text.contains("24 results for"), "{text}");
+        assert!(
+            text.contains("Showing 10 of 24. Pass offset=10 for the next page."),
+            "{text}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_checked_keyword_absence_is_one_short_answer() {
         // #283: no caveat that contradicts the [LITERAL] line, no advice to
         // run the full scan that was just run, no internal notes.

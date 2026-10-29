@@ -314,13 +314,21 @@ fn write_agy_steps(steps: Vec<Value>) -> Result<()> {
     Ok(())
 }
 
+/// Whether this machine has a ContextStream key. The plugin's hooks also run
+/// where it was installed from its repository and `setup` never ran: with no
+/// key they would tell the model ContextStream is connected, and its first
+/// call would fail, so they stay silent.
+fn has_key() -> bool {
+    crate::setup::get_api_key().is_some()
+}
+
 pub async fn handle_session_start() -> Result<()> {
     let input = read_stdin_json()?;
     let cwd = common::extract_cwd(&input);
     mid_run_notices::observe_session_context(&input, &cwd);
     remove_stale_state();
     let mut steps = Vec::new();
-    if session_init_enabled() && !cwd.trim().is_empty() {
+    if session_init_enabled() && has_key() && !cwd.trim().is_empty() {
         steps.push(json!({"systemMessage": {"systemMessage": session_guidance(&cwd)}}));
     }
     write_agy_steps(steps)
@@ -328,6 +336,9 @@ pub async fn handle_session_start() -> Result<()> {
 
 pub async fn handle_pre_invocation() -> Result<()> {
     let input = read_stdin_json()?;
+    if !has_key() {
+        return write_agy_steps(Vec::new());
+    }
     let cwd = common::extract_cwd(&input);
     let mut steps = Vec::new();
     if let Some(notice) = mid_run_notices::notice_for_hook(&input, &cwd, "antigravity") {

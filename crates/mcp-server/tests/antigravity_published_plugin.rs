@@ -159,3 +159,54 @@ fn setups_own_commands_work_on_the_installed_public_plugin() {
         left.iter().map(|(path, _)| path).collect::<Vec<_>>()
     );
 }
+
+fn hook_output(home: &Path, hook: &str, key: Option<&str>) -> String {
+    use std::io::Write;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"));
+    command
+        .args(["hook", hook, "--contextstream-managed-hook=v1"])
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("CONTEXTSTREAM_WATCH", "0")
+        .env("CONTEXTSTREAM_API_URL", "http://127.0.0.1:9")
+        .env_remove("CONTEXTSTREAM_API_KEY")
+        .current_dir(home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    if let Some(key) = key {
+        command.env("CONTEXTSTREAM_API_KEY", key);
+    }
+    let mut child = command.spawn().unwrap();
+    let input = serde_json::json!({
+        "conversationId": "550e8400-e29b-41d4-a716-446655440000",
+        "workspacePaths": [home.join("app")],
+        "invocationNum": 0,
+    });
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn the_hooks_claim_a_connection_only_where_there_is_a_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    std::fs::create_dir_all(home.join("app")).unwrap();
+
+    // The plugin installed from GitHub on a machine where setup never ran.
+    for hook in ["agy-session-start", "agy-pre-invocation"] {
+        assert_eq!(hook_output(home, hook, None), "{}", "{hook} without a key");
+    }
+    // With a key, as after setup, the same hooks speak.
+    let started = hook_output(home, "agy-session-start", Some("cs_test_not_a_real_key"));
+    assert!(started.contains("ContextStream is connected"), "{started}");
+    let invoked = hook_output(home, "agy-pre-invocation", Some("cs_test_not_a_real_key"));
+    assert!(invoked.contains("Ground this request"), "{invoked}");
+}

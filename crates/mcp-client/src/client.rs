@@ -14948,16 +14948,22 @@ impl ContextStreamClient {
     }
 
     /// Search integration content.
+    ///
+    /// The API searches with GET and a `q` query string: per workspace for
+    /// Slack and GitHub (`/integrations/workspaces/{id}/{provider}/search`), the
+    /// provider's own route without a workspace, and every connected source for
+    /// `all` (`/integrations/search`). The old `POST /integrations/{provider}/search`
+    /// never existed and answered 404 (#275).
     pub async fn integration_search(
         &self,
         params: IntegrationSearchParams,
     ) -> Result<serde_json::Value> {
-        let provider = params.provider.clone();
         let config = self.config.read().await;
-        let body = params.with_defaults(&config);
+        let workspace_id = params.workspace_id.or(config.default_workspace_id);
         drop(config);
-        self.post(&format!("/integrations/{}/search", provider), &body)
-            .await
+        let path =
+            integration_search_path(&params.provider, workspace_id, &params.query, params.limit);
+        self.get(&path).await
     }
 
     /// Get integration stats.
@@ -17302,6 +17308,30 @@ impl IntegrationSearchParams {
             "limit": self.limit,
         }))
     }
+}
+
+/// The API path `integration_search` asks (see there).
+pub fn integration_search_path(
+    provider: &str,
+    workspace_id: Option<Uuid>,
+    query: &str,
+    limit: Option<i64>,
+) -> String {
+    let mut params = vec![format!("q={}", urlencoding::encode(query))];
+    if let Some(limit) = limit {
+        params.push(format!("limit={limit}"));
+    }
+    let base = match (provider, workspace_id) {
+        ("all", workspace_id) => {
+            if let Some(id) = workspace_id {
+                params.push(format!("workspace_id={id}"));
+            }
+            "/integrations/search".to_string()
+        }
+        (provider, Some(id)) => format!("/integrations/workspaces/{id}/{provider}/search"),
+        (provider, None) => format!("/{provider}/search"),
+    };
+    format!("{base}?{}", params.join("&"))
 }
 
 /// Parameters for integration activity.
@@ -31399,6 +31429,24 @@ mod caller_bound_response_cache_tests {
 
 #[cfg(test)]
 mod pushed_commits_body_tests {
+
+    #[test]
+    fn integration_search_uses_the_routes_the_api_serves() {
+        let ws = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            crate::client::integration_search_path("slack", Some(ws), "deploy fix", Some(5)),
+            "/integrations/workspaces/550e8400-e29b-41d4-a716-446655440000/slack/search?q=deploy%20fix&limit=5"
+        );
+        assert_eq!(
+            crate::client::integration_search_path("github", None, "deploy", None),
+            "/github/search?q=deploy"
+        );
+        assert_eq!(
+            crate::client::integration_search_path("all", Some(ws), "deploy", None),
+            "/integrations/search?q=deploy&workspace_id=550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
     use super::*;
 
     fn push_body(commits: Option<Vec<String>>) -> serde_json::Value {

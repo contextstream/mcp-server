@@ -4588,6 +4588,7 @@ fn context_wire_text_priority(line: &str) -> Option<u8> {
     let upper = line.to_ascii_uppercase();
     if upper.contains("[LESSONS_WARNING]")
         || upper.contains("[COORDINATION]")
+        || upper.contains("[CONTEXTAGENTS]")
         || upper.contains("[PARTIAL]")
         || upper.contains("[PREFERENCE]")
         || upper.contains("[PREFS]")
@@ -10044,14 +10045,11 @@ impl ToolHandler for ContextTool {
             }
             text.push_str(&coordination_block);
         }
+        // First, like the hook's: it is the one thing to do before the work starts.
         if let Some(handle) = contextagents_future {
             let bound = proactive_bound.max(crate::domains::slipstream::auto::CONTEXT_BUDGET);
             if let Ok(Ok(Some(block))) = tokio::time::timeout(bound, handle).await {
-                if !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                text.push_str(&block);
-                text.push('\n');
+                text = format!("{block}\n{text}");
             }
         }
 

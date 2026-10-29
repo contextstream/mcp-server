@@ -21,6 +21,9 @@ pub struct MomentTable {
     pub change_verbs: Vec<String>,
     /// Words a question starts with.
     pub question_words: Vec<String>,
+    /// Words that negate the cue right after them ("don't upgrade the deps").
+    #[serde(default)]
+    pub negators: Vec<String>,
 }
 
 /// One moment.
@@ -182,12 +185,46 @@ pub fn prompt_moments(prompt: &str) -> Vec<&'static Moment> {
                     !groups.is_empty() && groups.iter().all(|g| group_hit(g, &words))
                 }) || cues.phrases.iter().any(|phrase| has_phrase(&text, phrase));
             fits && !cues.not.iter().any(|phrase| has_phrase(&text, phrase))
+                && !negated(cues, &words, &table.negators)
                 && cues
                     .requires
                     .iter()
                     .all(|need| requirement_met(need, prompt, &words, table))
         })
         .collect()
+}
+
+/// Whether every hit of the moment's lead cues (the first word group of each `any_of`
+/// entry, and each phrase's start) has a negator within the 3 words before it: the request
+/// says not to do it ("don't upgrade the deps", "no need to update the packages").
+fn negated(cues: &PromptCues, words: &[String], negators: &[String]) -> bool {
+    let mut hits = Vec::new();
+    for groups in &cues.any_of {
+        if let Some(lead) = groups.first() {
+            for (index, word) in words.iter().enumerate() {
+                if lead.iter().any(|cue| cue_matches(cue, word)) {
+                    hits.push(index);
+                }
+            }
+        }
+    }
+    for phrase in &cues.phrases {
+        let phrase = prompt_words(phrase);
+        if phrase.is_empty() {
+            continue;
+        }
+        for index in 0..words.len() {
+            if words[index..].starts_with(&phrase) {
+                hits.push(index);
+            }
+        }
+    }
+    !hits.is_empty()
+        && hits.iter().all(|&index| {
+            words[index.saturating_sub(3)..index]
+                .iter()
+                .any(|word| negators.iter().any(|negator| negator == word))
+        })
 }
 
 fn requirement_met(need: &str, prompt: &str, words: &[String], table: &MomentTable) -> bool {

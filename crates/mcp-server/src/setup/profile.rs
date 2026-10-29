@@ -107,7 +107,7 @@ pub async fn run_setup_with_profile(
     // ------------------------------------------------------------------
     // Credentials: keep a valid same-user key, never clobber another user's.
     // ------------------------------------------------------------------
-    let api_url = normalize_api_url(&payload.api_url);
+    let api_url = normalize_profile_api_url(&payload.api_url);
     let (active_key, kept_existing) = resolve_credentials(&payload, &api_url).await?;
 
     // A redeemed link identifies the requested account; only credential
@@ -118,11 +118,7 @@ pub async fn run_setup_with_profile(
         style(&payload.email).cyan().bold()
     );
 
-    let config = Config {
-        api_key: Some(active_key.clone()),
-        ..Default::default()
-    };
-    let client = ContextStreamClient::new(config);
+    let client = ContextStreamClient::new(profile_client_config(&active_key, &api_url));
 
     // ------------------------------------------------------------------
     // Editors: exactly what the profile chose, present on this machine.
@@ -360,6 +356,25 @@ fn load_profile_file(path: &Path) -> Result<SetupProfilePayload> {
         .with_context(|| format!("parsing profile file {}", path.display()))
 }
 
+fn normalize_profile_api_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return redeem_api_url();
+    }
+    let normalized = normalize_api_url(trimmed);
+    normalized
+        .strip_suffix("/api/v1")
+        .unwrap_or(&normalized)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn profile_client_config(api_key: &str, api_url: &str) -> Config {
+    let mut config = super::setup_client_config(api_key);
+    config.api_url = api_url.to_string();
+    config
+}
+
 fn redeem_api_url() -> String {
     if let Ok(url) = std::env::var("CONTEXTSTREAM_API_URL") {
         if !url.trim().is_empty() {
@@ -490,11 +505,7 @@ async fn redeem_token(token: &str) -> Result<SetupProfilePayload> {
 async fn fallback_authenticated_payload(api_url: &str) -> Result<SetupProfilePayload> {
     let api_key = super::ensure_authenticated_api_key().await?;
 
-    let config = Config {
-        api_key: Some(api_key.clone()),
-        ..Default::default()
-    };
-    let client = ContextStreamClient::new(config);
+    let client = ContextStreamClient::new(profile_client_config(&api_key, api_url));
     let user = client.me().await.context("validating browser sign-in")?;
 
     #[derive(Deserialize, Default)]
@@ -578,11 +589,7 @@ async fn resolve_credentials(
     };
 
     // Validate the existing key and compare account identity.
-    let config = Config {
-        api_key: Some(existing_key.clone()),
-        ..Default::default()
-    };
-    let client = ContextStreamClient::new(config);
+    let client = ContextStreamClient::new(profile_client_config(&existing_key, api_url));
     let existing_user = tokio::time::timeout(Duration::from_secs(10), client.me()).await;
 
     match existing_user {

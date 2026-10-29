@@ -2577,7 +2577,18 @@ async fn run_configure_api_key_from_stdin() -> Result<()> {
     let user = tokio::time::timeout(std::time::Duration::from_secs(10), client.me())
         .await
         .map_err(|_| anyhow::anyhow!("Key verification timed out; check connectivity and re-run."))?
-        .map_err(|e| anyhow::anyhow!("The API key was not accepted ({}); nothing was saved.", e))?;
+        .map_err(|e| {
+            // Offline, a timeout, a 5xx or a rate limit says nothing about the
+            // key; only a refusal does (#248).
+            if e.is_retryable() {
+                anyhow::anyhow!(
+                    "Could not verify the API key: {api_url} did not answer ({e}). Check the \
+                     connection and re-run; nothing was saved."
+                )
+            } else {
+                anyhow::anyhow!("The API key was not accepted ({e}); nothing was saved.")
+            }
+        })?;
 
     setup::persist_setup_credentials(api_key, &api_url)?;
     eprintln!(

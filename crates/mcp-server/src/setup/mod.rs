@@ -2899,10 +2899,18 @@ async fn run_setup_noninteractive(
             anyhow::anyhow!("Credential validation timed out; check connectivity and re-run.")
         })?
         .map_err(|e| {
-            anyhow::anyhow!(
-                "Saved credentials are invalid ({}); run `contextstream-mcp setup` interactively.",
-                e
-            )
+            // Offline, a timeout, a 5xx or a rate limit says nothing about the
+            // credentials; only a refusal does (#248).
+            if e.is_retryable() {
+                anyhow::anyhow!(
+                    "Could not verify the saved credentials: {api_url} did not answer ({e}). \
+                     Check the connection and re-run; nothing was changed."
+                )
+            } else {
+                anyhow::anyhow!(
+                    "Saved credentials are invalid ({e}); run `contextstream-mcp setup` interactively."
+                )
+            }
         })?;
     let credentials_saved = persist_setup_credentials(&api_key, &api_url)?;
     if credentials_saved && !safe_edit::is_dry_run() {

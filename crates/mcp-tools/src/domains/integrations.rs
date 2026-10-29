@@ -39,6 +39,18 @@ const VALID_PROVIDERS: &[&str] = &[
     "all",
 ];
 
+/// Providers whose content `search` can reach.
+const SEARCHABLE_PROVIDERS: &[&str] = &["slack", "github", "all"];
+
+/// Results in a search answer: a bare list, or `{results: [...]}` (cross-source).
+fn search_result_count(result: &Value) -> usize {
+    let payload = result.get("data").unwrap_or(result);
+    payload
+        .as_array()
+        .or_else(|| payload.get("results").and_then(Value::as_array))
+        .map_or(0, Vec::len)
+}
+
 /// Valid actions.
 const VALID_ACTIONS: &[&str] = &[
     "status",
@@ -221,6 +233,14 @@ impl ToolHandler for IntegrationTool {
                 let query = input
                     .query
                     .ok_or_else(|| Error::Validation("query is required for search".to_string()))?;
+                // The API searches Slack and GitHub content (#275).
+                if !SEARCHABLE_PROVIDERS.contains(&provider.as_str()) {
+                    return Err(Error::Validation(format!(
+                        "search covers slack, github, or all connected sources (provider=\"all\"); \
+                         {provider} content is not searchable here. Use action=\"activity\" or \
+                         action=\"status\" for {provider}."
+                    )));
+                }
                 let params = IntegrationSearchParams {
                     provider: provider.clone(),
                     query,
@@ -228,7 +248,7 @@ impl ToolHandler for IntegrationTool {
                     limit: input.limit,
                 };
                 let result = self.client.integration_search(params).await?;
-                let count = result.as_array().map(|a| a.len()).unwrap_or(0);
+                let count = search_result_count(&result);
                 Ok(ToolResult::with_structured(
                     format!("Found {} results from {}.", count, provider),
                     result,
@@ -698,7 +718,7 @@ impl ToolHandler for IntegrationTool {
                     limit: input.limit,
                 };
                 let result = self.client.integration_search(params).await?;
-                let count = result.as_array().map(|a| a.len()).unwrap_or(0);
+                let count = search_result_count(&result);
                 Ok(ToolResult::with_structured(
                     format!(
                         "Cross-provider team search: {} results from all connected integrations.",

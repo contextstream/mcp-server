@@ -905,3 +905,29 @@ mod app_action_tests {
         assert!(!error.contains("Validation"), "{error}");
     }
 }
+
+// ============================================================================
+// Search (#275)
+// ============================================================================
+
+#[test]
+fn search_counts_bare_and_cross_source_answers() {
+    assert_eq!(search_result_count(&json!([1, 2])), 2);
+    assert_eq!(
+        search_result_count(&json!({"results": [1, 2, 3], "total_results": 3})),
+        3
+    );
+    assert_eq!(search_result_count(&json!({"data": {"results": [1]}})), 1);
+    assert_eq!(search_result_count(&json!({})), 0);
+}
+
+#[tokio::test]
+async fn search_refuses_providers_the_api_cannot_search() {
+    let client = create_mock_client();
+    let tool = IntegrationTool::new(client.clone(), create_test_session(&client));
+    let error = tool
+        .execute(json!({"action": "search", "provider": "notion", "query": "deploy"}))
+        .await
+        .expect_err("notion search is not served");
+    assert!(error.to_string().contains("not searchable"), "{error}");
+}

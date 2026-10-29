@@ -9349,6 +9349,40 @@ impl ContextStreamClient {
         Some(indexed_time.with_timezone(&chrono::Utc))
     }
 
+    /// Whether `indexed-projects.json` already records a fresh, completed local
+    /// index for this exact folder and project UUID (and matching Git HEAD when
+    /// inside a Git repository). Read-only: never creates or modifies files.
+    pub fn local_project_index_is_current(folder_path: &str, project_id: Uuid) -> bool {
+        let Some((scope_path, info)) = Self::best_local_index_entry(folder_path) else {
+            return false;
+        };
+        if Self::normalize_match_path(Path::new(&scope_path))
+            != Self::normalize_match_path(Path::new(folder_path))
+        {
+            return false;
+        }
+        if info.get("project_id").and_then(serde_json::Value::as_str)
+            != Some(project_id.to_string().as_str())
+        {
+            return false;
+        }
+        if info.get("indexing_started_at").is_some() || !Self::index_entry_is_ready(&info) {
+            return false;
+        }
+        if let Some(current_head) = Self::git_head_sha(folder_path) {
+            if let Some(indexed_commit) = info
+                .get("indexed_commit")
+                .and_then(serde_json::Value::as_str)
+                .filter(|sha| !sha.trim().is_empty())
+            {
+                if indexed_commit != current_head {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Origins of automatic background refreshes. They never repair a whole
     /// checkout on an unverified server generation alone.
     fn is_background_ingest_origin(origin: Option<&str>) -> bool {

@@ -923,17 +923,35 @@ fn restore_default_sigpipe(command: &Option<Commands>) {
 #[cfg(not(unix))]
 fn restore_default_sigpipe(_command: &Option<Commands>) {}
 
-/// `-q` / `--quiet` ("errors only"): a one-shot command's stdout goes to the
-/// null device, while its errors (stderr) and exit status are unchanged, so
-/// scripts and CI can run `-q setup --yes`, `-q doctor`, `-q configure` (#255).
-/// The stdio server, the HTTP gateway, the sync bridge and editor hooks own
-/// their stdout and are left alone. Must run before any output.
+/// `-q` / `--quiet` ("errors only", #255) for one-shot commands: progress and
+/// confirmation lines on stderr are silenced (`setup::ui::is_quiet`), and
+/// stdout goes to the null device unless it carries the data the command was
+/// asked for (`--json`, `--support`, `clients`, `detect-editors`,
+/// `generate-configs`). Errors and the exit status are unchanged. The stdio
+/// server, the HTTP gateway, the sync bridge and editor hooks own their
+/// output and are left alone. Must run before any output.
 fn silence_stdout_when_quiet(quiet: bool, command: &Option<Commands>) {
-    let owns_stdout = matches!(
+    let owns_output = matches!(
         command,
         None | Some(Commands::Http { .. } | Commands::Hook { .. } | Commands::Watch)
     );
-    if quiet && !owns_stdout {
+    if !quiet || owns_output {
+        return;
+    }
+    setup::ui::set_quiet(true);
+    let stdout_is_data = matches!(
+        command,
+        Some(
+            Commands::Doctor { json: true, .. }
+                | Commands::Doctor { support: true, .. }
+                | Commands::VerifyKey { json: true, .. }
+                | Commands::Link { json: true, .. }
+                | Commands::Clients { .. }
+                | Commands::DetectEditors { .. }
+                | Commands::GenerateConfigs { .. }
+        )
+    );
+    if !stdout_is_data {
         redirect_stdout_to_null();
     }
 }
@@ -1296,7 +1314,9 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             let target = std::path::PathBuf::from(&install_dir);
             match setup::install_binary(&target) {
                 Ok(()) => {
-                    eprintln!("Installed to {}/{}", install_dir, binary_name());
+                    if !setup::ui::is_quiet() {
+                        eprintln!("Installed to {}/{}", install_dir, binary_name());
+                    }
                 }
                 Err(e) => {
                     eprintln!("Install failed: {}", e);
@@ -2172,6 +2192,7 @@ fn run_git_hooks(path: Option<String>, uninstall: bool) {
 
     if uninstall {
         match setup::git_hooks::uninstall_git_hooks(&root) {
+            Ok(()) if setup::ui::is_quiet() => {}
             Ok(()) => eprintln!("Removed ContextStream git hooks from {}", root.display()),
             Err(e) => {
                 eprintln!("Failed to remove git hooks: {}", e);
@@ -2190,6 +2211,7 @@ fn run_git_hooks(path: Option<String>, uninstall: bool) {
     }
 
     match setup::git_hooks::install_git_hooks(&root) {
+        Ok(()) if setup::ui::is_quiet() => {}
         Ok(()) => eprintln!(
             "Git capture: hooks installed (post-commit, pre-push, post-checkout, post-merge) in {}",
             root.display()
@@ -2391,6 +2413,9 @@ async fn run_configure(
         )
         .await?;
 
+        if setup::ui::is_quiet() {
+            return Ok(ConfigureOutcome::Changed);
+        }
         if mcp_server::setup::safe_edit::is_dry_run() {
             eprintln!(
                 "Transcript defaults would be updated (scope: {}).",
@@ -2607,11 +2632,13 @@ async fn run_configure_api_key_from_stdin() -> Result<()> {
         })?;
 
     setup::persist_setup_credentials(api_key, &api_url)?;
-    eprintln!(
-        "Credentials saved to {}. Authenticated as {}.",
-        setup::credentials_file_path().display(),
-        user.email
-    );
+    if !setup::ui::is_quiet() {
+        eprintln!(
+            "Credentials saved to {}. Authenticated as {}.",
+            setup::credentials_file_path().display(),
+            user.email
+        );
+    }
     if std::env::var("CONTEXTSTREAM_API_KEY").is_ok_and(|env| env.trim() != api_key) {
         eprintln!(
             "Note: CONTEXTSTREAM_API_KEY is set in this environment and takes precedence \
@@ -3305,7 +3332,9 @@ async fn download_and_install_binary(client: &reqwest::Client, version: &str) ->
     // the mutable `latest` path here could cross a release promotion boundary
     // between the manifest fetch and the binary download.
     let download_url = release_binary_url(version, file_name);
-    eprintln!("Downloading {} binary from CDN...", arch_key);
+    if !setup::ui::is_quiet() {
+        eprintln!("Downloading {} binary from CDN...", arch_key);
+    }
 
     let response = client
         .get(&download_url)
@@ -3378,11 +3407,13 @@ async fn download_and_install_binary(client: &reqwest::Client, version: &str) ->
     // Clean up old binary
     let _ = std::fs::remove_file(&old_path);
 
-    eprintln!(
-        "Installed to {} ({} bytes)",
-        install_path.display(),
-        bytes.len()
-    );
+    if !setup::ui::is_quiet() {
+        eprintln!(
+            "Installed to {} ({} bytes)",
+            install_path.display(),
+            bytes.len()
+        );
+    }
 
     // Verify the new binary runs
     let output = std::process::Command::new(&install_path)
@@ -3390,6 +3421,7 @@ async fn download_and_install_binary(client: &reqwest::Client, version: &str) ->
         .output();
 
     match output {
+        Ok(o) if o.status.success() && setup::ui::is_quiet() => {}
         Ok(o) if o.status.success() => {
             let version = String::from_utf8_lossy(&o.stdout);
             eprintln!(

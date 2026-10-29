@@ -66,6 +66,40 @@ fn quiet_silences_stdout_and_keeps_the_exit_status() {
 }
 
 #[test]
+fn quiet_silences_progress_on_stderr_and_keeps_requested_data_on_stdout() {
+    // update-rules reports each editor on stderr; -q drops it.
+    let loud = run(
+        &["update-rules", "--scope", "global", "--editors", "claude"],
+        "",
+    );
+    let quiet = run(
+        &[
+            "-q",
+            "update-rules",
+            "--scope",
+            "global",
+            "--editors",
+            "claude",
+        ],
+        "",
+    );
+    assert_eq!(quiet.status.code(), loud.status.code());
+    assert!(!loud.stderr.is_empty(), "update-rules reports progress");
+    assert!(
+        quiet.stderr.is_empty(),
+        "-q update-rules printed: {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+
+    // Output the command was asked for is not discarded.
+    let clients = run(&["-q", "clients"], "");
+    assert!(clients.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&clients.stdout).expect("clients JSON on stdout under -q");
+    assert!(parsed.is_object() || parsed.is_array());
+}
+
+#[test]
 fn quiet_keeps_errors_on_stderr() {
     let quiet = run(&["-q", "configure", "--api-key-stdin"], "\n");
     assert!(!quiet.status.success(), "an empty key must fail");

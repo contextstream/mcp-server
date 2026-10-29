@@ -285,7 +285,7 @@ fn install_binary_impl(target_dir: &std::path::Path, report_success: bool) -> Re
     let target_canonical = std::fs::canonicalize(&target).ok();
     if target_canonical.as_ref() == Some(&current_canonical) {
         let version = verify_binary_runs(&target)?;
-        if report_success {
+        if report_success && !super::ui::is_quiet() {
             eprintln!(
                 "{}{} Verified: {}",
                 super::ui::GUTTER,
@@ -297,7 +297,7 @@ fn install_binary_impl(target_dir: &std::path::Path, report_success: bool) -> Re
     }
     if target.exists() && files_have_identical_contents(&current, &target).unwrap_or(false) {
         if let Ok(version) = verify_binary_runs(&target) {
-            if report_success {
+            if report_success && !super::ui::is_quiet() {
                 eprintln!(
                     "{}{} Verified: {}",
                     super::ui::GUTTER,
@@ -406,7 +406,7 @@ fn install_binary_impl(target_dir: &std::path::Path, report_success: bool) -> Re
     }
     sync_binary_parent(&target);
 
-    if report_success {
+    if report_success && !super::ui::is_quiet() {
         eprintln!(
             "{}{} Verified: {}",
             super::ui::GUTTER,

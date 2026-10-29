@@ -17,9 +17,10 @@ pub(super) fn metadata() -> ToolMetadata {
             Read what changed and why it matters, post agent findings, follow feeds, mark them \
             read, share them across workspaces, tune sources, and trigger curation. Actions: \
             list, ensure (get-or-create the canonical workspace/project feed, or create a topic \
-            feed), get, update, archive, items (view=latest|unread|posts|top), post, follow, \
-            unfollow, read, share, unshare, feedback, curate, runs, sources, ground (top items \
-            for a task). Feeds are curated summaries with citations — distinct from memory \
+            feed), get, update, items (view=latest|unread|posts|top), post, follow, \
+            unfollow, read, share, feedback, curate, runs, sources, ground (top items \
+            for a task). To archive a feed or revoke a share, use the `delete` tool \
+            (action=\"feed.archive\" or \"feed.unshare\"). Feeds are curated summaries with citations — distinct from memory \
             (durable notes), coordination (live agent notices), and entity handoffs. When \
             [FEED] lines appear in grounding, open the feed with feed(action=\"items\", \
             feed_id=\"...\") before re-deriving the same context."
@@ -137,7 +138,7 @@ pub(super) fn input_schema() -> Value {
         .string("query", "Natural-language task anchor for ground.", false)
         .integer(
             "expected_revision",
-            "Current feed revision, required for update and archive.",
+            "Current feed revision, required for update.",
             false,
         )
         .string(

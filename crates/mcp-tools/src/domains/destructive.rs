@@ -8,12 +8,12 @@
 //! (`destructiveHint: true`, id-only parameters), as `<tool>.<action>`. The
 //! tools they came from list only their other actions and claim
 //! `destructiveHint: false`: what they do is read, create or edit something
-//! that still exists afterwards. An edit of a record's fields is not counted
-//! as irreversible; replacing a document's text is (`memory.update_doc`, listed
-//! as the existing `memory_update_doc`).
+//! that still exists afterwards. An edit replaces text the person can write
+//! again; a removal is what cannot be undone.
 //!
-//! Nothing stops working: a call that still names a moved action runs as
-//! before, with a note naming where it is listed now. Router-mode and
+//! A call that names a moved action on its old tool is refused with the call
+//! to make instead (#334: it used to run, so a tool that claimed it could not
+//! destroy anything still deleted, with no confirmation). Router-mode and
 //! `execute_operation` catalogs keep every action, since `execute_operation`
 //! is itself destructive.
 
@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mcp_types::{
-    tool::{ContentItem, ToolAnnotations, ToolCategory, ToolMetadata, ToolResult},
+    tool::{ToolAnnotations, ToolCategory, ToolMetadata, ToolResult},
     Error, Result,
 };
 use serde_json::{json, Map, Value};
@@ -37,9 +37,6 @@ pub struct SeparatedAction {
     pub tool: &'static str,
     pub action: &'static str,
     pub params: &'static [&'static str],
-    /// Listed in [`DELETE_TOOL`] when `None`; otherwise the dedicated tool that
-    /// already existed for it.
-    pub listed_in: Option<&'static str>,
 }
 
 const fn removal(
@@ -51,24 +48,23 @@ const fn removal(
         tool,
         action,
         params,
-        listed_in: None,
     }
 }
 
-/// Every irreversible action: it removes something (delete, purge, merge a
-/// project away, remove indexed paths), withdraws something others rely on
-/// (revoke or unshare a share, archive a feed, unregister a webhook, clear
-/// pushed instructions) or replaces a document's text.
+/// Every irreversible action: it removes something (delete, purge, merge or
+/// combine a project away, remove indexed paths) or withdraws something others
+/// rely on (revoke or unshare a share, archive a feed, unregister a webhook,
+/// clear pushed instructions).
 pub const SEPARATED_ACTIONS: &[SeparatedAction] = &[
     removal(
         "memory",
         "delete_node",
-        &["node_id", "workspace_id", "project_id"],
+        &["node_id", "delete_all", "workspace_id", "project_id"],
     ),
     removal(
         "memory",
         "delete_event",
-        &["event_id", "workspace_id", "project_id"],
+        &["event_id", "delete_all", "workspace_id", "project_id"],
     ),
     removal(
         "memory",
@@ -95,12 +91,6 @@ pub const SEPARATED_ACTIONS: &[SeparatedAction] = &[
         "delete_transcript",
         &["transcript_id", "workspace_id"],
     ),
-    SeparatedAction {
-        tool: "memory",
-        action: "update_doc",
-        params: &[],
-        listed_in: Some("memory_update_doc"),
-    },
     removal(
         "session",
         "delete_lesson",
@@ -153,6 +143,11 @@ pub const SEPARATED_ACTIONS: &[SeparatedAction] = &[
         &["project_id", "source_project_id", "workspace_id"],
     ),
     removal(
+        "project",
+        "combine",
+        &["project_id", "source_project_id", "workspace_id"],
+    ),
+    removal(
         "vcs",
         "delete_repo",
         &["provider", "owner", "repo", "repo_ref", "workspace_id"],
@@ -172,14 +167,24 @@ pub const SEPARATED_ACTIONS: &[SeparatedAction] = &[
 ];
 
 /// Tools that claimed `destructiveHint` without an irreversible action: their
-/// writes (dismiss a notice or reminder, change a setting, edit a task's
-/// fields, edit a page in a connected app that keeps its history) leave the
-/// thing in place.
+/// writes (dismiss a notice or reminder, change a setting, edit a doc, a task
+/// or a page in a connected app) leave the thing in place.
 pub const NO_LONGER_DESTRUCTIVE: &[&str] = &[
     "coordination",
     "integration",
     "reminder",
+    "memory_update_doc",
     "memory_update_task",
+];
+
+/// Parameters only the moved actions took: the tools they came from no longer
+/// list them ([`DELETE_TOOL`] does).
+const PARAMS_OF_MOVED_ACTIONS: &[(&str, &[&str])] = &[
+    ("memory", &["delete_all"]),
+    ("project", &["paths", "source_project_id"]),
+    ("capsule", &["schedule_id"]),
+    ("feed", &["share_id"]),
+    ("vcs", &["link_id"]),
 ];
 
 /// The irreversible action `action` of `tool`, when it is one.
@@ -189,7 +194,7 @@ pub fn separated(tool: &str, action: &str) -> Option<&'static SeparatedAction> {
         .find(|moved| moved.tool == tool && moved.action == action)
 }
 
-/// Whether `tool` lost its irreversible actions to [`DELETE_TOOL`] (or kept
+/// Whether `tool` lost its irreversible actions to [`DELETE_TOOL`] (or had
 /// none), and so is listed as not destructive.
 pub fn is_split_tool(tool: &str) -> bool {
     NO_LONGER_DESTRUCTIVE.contains(&tool)
@@ -197,7 +202,8 @@ pub fn is_split_tool(tool: &str) -> bool {
 }
 
 /// The listed schema and annotations of `tool` after the split: its action
-/// enum without the irreversible actions, and `destructiveHint: false`.
+/// enum and parameters without the irreversible actions', and
+/// `destructiveHint: false`.
 pub fn split_listing(tool: &str, schema: &mut Value, annotations: &mut ToolAnnotations) {
     if !is_split_tool(tool) {
         return;
@@ -211,20 +217,39 @@ pub fn split_listing(tool: &str, schema: &mut Value, annotations: &mut ToolAnnot
                 .is_none_or(|action| separated(tool, action).is_none())
         });
     }
+    let unused = PARAMS_OF_MOVED_ACTIONS
+        .iter()
+        .find(|(name, _)| *name == tool)
+        .map_or(&[][..], |(_, params)| *params);
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        for param in unused {
+            properties.remove(*param);
+        }
+    }
+    if let Some(Value::Array(required)) = schema.get_mut("required") {
+        required.retain(|name| name.as_str().is_none_or(|name| !unused.contains(&name)));
+    }
 }
 
-/// The note for a call that still names a moved action.
-pub fn moved_note(tool: &str, input: &Value) -> Option<String> {
+/// The refusal for a call that names a moved action on its old tool: it
+/// cannot be undone, so it runs only through [`DELETE_TOOL`] (#334).
+pub fn moved_refusal(tool: &str, input: &Value) -> Option<String> {
     let action = input.get("action").and_then(Value::as_str)?;
-    let moved = separated(tool, action)?;
-    Some(match moved.listed_in {
-        Some(listed_in) => format!(
-            "Note: {tool}(action=\"{action}\") is listed as `{listed_in}` now; this call still works."
-        ),
-        None => format!(
-            "Note: {tool}(action=\"{action}\") is listed in `{DELETE_TOOL}` now (action=\"{tool}.{action}\"); this call still works."
-        ),
-    })
+    separated(tool, action)?;
+    Some(format!(
+        "{tool}(action=\"{action}\") cannot be undone, so it runs only through the `{DELETE_TOOL}` tool: \
+         call {DELETE_TOOL} with action=\"{tool}.{action}\" and the same ids, after confirming with the person."
+    ))
+}
+
+/// The call to retry `action` of `tool` with: through [`DELETE_TOOL`] when the
+/// action was moved there, else on the tool itself. `args` follows the action.
+pub fn retry_call(tool: &str, action: &str, args: &str) -> String {
+    if separated(tool, action).is_some() {
+        format!("{DELETE_TOOL}(action=\"{tool}.{action}\", {args})")
+    } else {
+        format!("{tool}(action=\"{action}\", {args})")
+    }
 }
 
 /// Register [`DELETE_TOOL`] with the handlers of the tools it acts through,
@@ -232,14 +257,15 @@ pub fn moved_note(tool: &str, input: &Value) -> Option<String> {
 pub fn register_delete_tool(registry: &mut ToolRegistry) {
     let mut actions = Vec::new();
     let mut properties = Map::new();
-    for moved in SEPARATED_ACTIONS
-        .iter()
-        .filter(|moved| moved.listed_in.is_none())
-    {
+    for moved in SEPARATED_ACTIONS {
         let Some(tool) = registry.get(moved.tool) else {
             continue;
         };
-        let tool_properties = tool.input_schema.get("properties").cloned();
+        // The tool's own schema: its listed one no longer has the parameters
+        // only these actions take.
+        let own_schema =
+            crate::portable_schema::portable_input_schema(&tool.handler.input_schema());
+        let tool_properties = own_schema.get("properties").cloned();
         for param in moved.params {
             if properties.contains_key(*param) {
                 continue;
@@ -300,13 +326,15 @@ const DESCRIPTION: &str = "Delete, purge or revoke ContextStream data. Cannot be
     name the item's tool and action here, e.g. action=\"memory.delete_doc\" with doc_id.";
 
 const ACTION_GUIDE: &str = "<tool>.<action> to run. Ids by action: memory.delete_* take the \
-    item's id (node_id, event_id, task_id, todo_id, diagram_id, doc_id, transcript_id); \
-    session.delete_lesson lesson_id; qa.delete_kb id; entity.delete kind and id; skill.delete \
-    skill_id or name; media.delete content_id; capsule.delete capsule_id; capsule.schedule_delete \
-    schedule_id; capsule.revoke_share and feed.unshare share_id; feed.archive feed_id; \
-    instruct.clear session_id; project.* project_id (remove_paths also paths, merge also \
-    source_project_id); vcs.delete_repo and vcs.unregister_webhook owner and repo; \
-    vcs.delete_link link_id; vcs.delete_automation automation_id; workspace.delete workspace_id.";
+    item's id (node_id, event_id, task_id, todo_id, diagram_id, doc_id, transcript_id; \
+    delete_all for every exact-title match of a node or event); session.delete_lesson lesson_id; \
+    qa.delete_kb id; entity.delete kind and id; skill.delete skill_id or name; media.delete \
+    content_id; capsule.delete capsule_id; capsule.schedule_delete schedule_id; \
+    capsule.revoke_share and feed.unshare share_id; feed.archive feed_id; instruct.clear \
+    session_id; project.* project_id (remove_paths also paths; merge and combine also \
+    source_project_id, the project merged away); vcs.delete_repo and vcs.unregister_webhook \
+    owner and repo; vcs.delete_link link_id; vcs.delete_automation automation_id; \
+    workspace.delete workspace_id.";
 
 struct DeleteTool {
     actions: Vec<(&'static SeparatedAction, Arc<dyn ToolHandler>)>,
@@ -352,17 +380,12 @@ impl ToolHandler for DeleteTool {
     }
 }
 
-/// Add [`moved_note`] to a result.
-pub fn add_moved_note(result: &mut ToolResult, note: String) {
-    result.content.push(ContentItem::text(note));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn every_separated_action_is_named_once() {
+    fn every_separated_action_is_named_once_and_takes_an_id() {
         let mut seen = std::collections::HashSet::new();
         for moved in SEPARATED_ACTIONS {
             assert!(
@@ -371,29 +394,36 @@ mod tests {
                 moved.tool,
                 moved.action
             );
-            if moved.listed_in.is_none() {
-                assert!(
-                    !moved.params.is_empty(),
-                    "{}.{} takes no id",
-                    moved.tool,
-                    moved.action
-                );
-            }
+            assert!(
+                !moved.params.is_empty(),
+                "{}.{} takes no id",
+                moved.tool,
+                moved.action
+            );
         }
     }
 
     #[test]
-    fn a_split_tool_lists_only_its_other_actions_and_is_not_destructive() {
-        let mut schema = json!({"type": "object", "properties": {"action": {
-            "type": "string",
-            "enum": ["list", "get", "create", "delete", "purge", "remove_paths", "forget_local"]
-        }}});
+    fn a_split_tool_lists_only_its_other_actions_and_parameters() {
+        let mut schema = json!({"type": "object", "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "get", "create", "delete", "purge", "remove_paths", "combine", "forget_local"]
+            },
+            "project_id": {"type": "string"},
+            "paths": {"type": "array", "items": {"type": "string"}},
+            "source_project_id": {"type": "string"}
+        }, "required": ["action", "paths"]});
         let mut annotations = ToolAnnotations::destructive();
         split_listing("project", &mut schema, &mut annotations);
         assert_eq!(
             schema["properties"]["action"]["enum"],
             json!(["list", "get", "create", "forget_local"])
         );
+        assert!(schema["properties"].get("paths").is_none());
+        assert!(schema["properties"].get("source_project_id").is_none());
+        assert!(schema["properties"]["project_id"].is_object());
+        assert_eq!(schema["required"], json!(["action"]));
         assert!(!annotations.destructive);
         assert!(!annotations.read_only);
 
@@ -470,14 +500,20 @@ mod tests {
     }
 
     #[test]
-    fn an_old_action_name_gets_a_note_naming_its_new_place() {
+    fn an_old_action_name_is_refused_with_the_call_to_make() {
         assert_eq!(
-            moved_note("memory", &json!({"action": "delete_doc"})).as_deref(),
-            Some("Note: memory(action=\"delete_doc\") is listed in `delete` now (action=\"memory.delete_doc\"); this call still works.")
+            moved_refusal("project", &json!({"action": "delete", "project_id": "p"})).as_deref(),
+            Some("project(action=\"delete\") cannot be undone, so it runs only through the `delete` tool: call delete with action=\"project.delete\" and the same ids, after confirming with the person.")
         );
-        assert!(moved_note("memory", &json!({"action": "update_doc"}))
-            .is_some_and(|note| note.contains("`memory_update_doc`")));
-        assert_eq!(moved_note("memory", &json!({"action": "search"})), None);
-        assert_eq!(moved_note("search", &json!({"query": "x"})), None);
+        // Edits and everything else run as before.
+        assert_eq!(
+            moved_refusal("memory", &json!({"action": "update_doc"})),
+            None
+        );
+        assert_eq!(
+            moved_refusal("project", &json!({"action": "forget_local"})),
+            None
+        );
+        assert_eq!(moved_refusal("search", &json!({"query": "x"})), None);
     }
 }

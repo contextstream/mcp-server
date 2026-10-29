@@ -424,7 +424,8 @@ impl SkillTool {
             candidates.extend(skill_lookup_candidates(&account));
         }
 
-        let retry = format!("skill(action=\"{action_name}\", skill_id=\"<id>\")");
+        let retry =
+            crate::domains::destructive::retry_call("skill", action_name, "skill_id=\"<id>\"");
         lookup::resolve_reference(
             &LookupContext {
                 kind: RecordKind::new("skill", "skills"),

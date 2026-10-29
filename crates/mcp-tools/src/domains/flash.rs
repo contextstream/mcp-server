@@ -596,7 +596,7 @@ impl ToolHandler for FlashTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "flash".to_string(),
             title: "Session Instructions (flash alias)".to_string(),
-            description: "Alias of instruct. Session-scoped instruction cache operations. Actions: bootstrap, get, push, ack, clear, stats, checkpoint, verify.".to_string(),
+            description: "Alias of instruct. Session-scoped instruction cache operations. Actions: bootstrap, get, push, ack, stats, checkpoint, verify (to clear the cache: the `delete` tool, action=\"instruct.clear\").".to_string(),
             category: ToolCategory::Session,
             annotations: ToolAnnotations::destructive(),
             is_pro: false,
@@ -693,7 +693,7 @@ impl ToolHandler for InstructTool {
             name: "instruct".to_string(),
             title: "Session Instructions".to_string(),
             description:
-                "Session-scoped instruction cache operations. Actions: bootstrap, get, push, ack, clear, stats, checkpoint, verify."
+                "Session-scoped instruction cache operations. Actions: bootstrap, get, push, ack, stats, checkpoint, verify (to clear the cache: the `delete` tool, action=\"instruct.clear\")."
                     .to_string(),
             category: ToolCategory::Session,
             annotations: ToolAnnotations::destructive(),

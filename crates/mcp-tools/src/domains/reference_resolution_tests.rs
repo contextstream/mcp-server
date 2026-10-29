@@ -171,7 +171,7 @@ async fn delete_doc_by_a_partial_title_deletes_nothing_and_returns_the_candidate
         "[CANDIDATES] \"deploy notes\" is not the id or the exact title of any doc; nothing was deleted."
     ));
     assert!(text.contains(&format!("1. **Deploy runbook** (id: {runbook})")));
-    assert!(text.ends_with("Retry: memory(action=\"delete_doc\", doc_id=\"<id>\")"));
+    assert!(text.ends_with("Retry: delete(action=\"memory.delete_doc\", doc_id=\"<id>\")"));
     assert_eq!(api.writes(), no_writes());
 }
 
@@ -1128,7 +1128,7 @@ async fn deleting_an_entity_or_changing_its_status_needs_an_exact_title() {
         .expect("a candidate answer");
     assert_refused(&result, "not_exact", &[ticket]);
     assert!(text_of(&result)
-        .ends_with("Retry: entity(kind=\"ticket\", action=\"delete\", id=\"<id>\")"));
+        .ends_with("Retry: delete(action=\"entity.delete\", kind=\"ticket\", id=\"<id>\")"));
 
     let result = api
         .entity()

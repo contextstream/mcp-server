@@ -438,7 +438,11 @@ impl EntityTool {
             .unwrap_or_default();
         let singular = kind.replace('_', " ");
         let plural = plural_kind(kind);
-        let retry = format!("entity(kind=\"{kind}\", action=\"{action_name}\", id=\"<id>\")");
+        let retry = if crate::domains::destructive::separated("entity", action_name).is_some() {
+            format!("delete(action=\"entity.{action_name}\", kind=\"{kind}\", id=\"<id>\")")
+        } else {
+            format!("entity(kind=\"{kind}\", action=\"{action_name}\", id=\"<id>\")")
+        };
         lookup::resolve_reference(
             &LookupContext {
                 kind: RecordKind::new(&singular, &plural),
@@ -700,7 +704,7 @@ fn format_entity_list(kind: &str, result: &Value) -> String {
 }
 
 /// Routing summary advertised as the tool description (<= 1024 chars).
-const ENTITY_TOOL_DESCRIPTION: &str = "Tickets, handoffs, incidents, releases, experiments, goals, key_results, sprints, reviews, risks, backlog_views. USE THIS TOOL for: 'create a handoff' / 'prepare a handoff' / 'hand this over' / 'continue with another agent' (kind=handoff, body={title, summary, scope, next_steps}; add to_user_id only when known and never invent it) · 'create a ticket' / 'file a bug' (kind=ticket; file in the project that owns the code: target_project) · 'log an incident' · 'track this release' · 'start an experiment' · 'create an OKR' (kind=goal/key_result) · 'plan a sprint' · 'design review' · 'log a risk'.\n\nNot this tool: memory(action=create_task) (todo), memory(action=create_doc, ...) (a runbook is a doc, not a handoff), session(action=capture, ...) (events). A generic handoff always creates entity(kind=handoff); additionally call capsule for a portable bundle or share link. HANDOFF.md or prose: local text is NOT the canonical handoff.\n\nActions: list | get | create | update | delete; per-kind fields: see `action`.";
+const ENTITY_TOOL_DESCRIPTION: &str = "Tickets, handoffs, incidents, releases, experiments, goals, key_results, sprints, reviews, risks, backlog_views. USE THIS TOOL for: 'create a handoff' / 'prepare a handoff' / 'hand this over' / 'continue with another agent' (kind=handoff, body={title, summary, scope, next_steps}; add to_user_id only when known and never invent it) · 'create a ticket' / 'file a bug' (kind=ticket; file in the project that owns the code: target_project) · 'log an incident' · 'track this release' · 'start an experiment' · 'create an OKR' (kind=goal/key_result) · 'plan a sprint' · 'design review' · 'log a risk'.\n\nNot this tool: memory(action=create_task) (todo), memory(action=create_doc, ...) (a runbook is a doc, not a handoff), session(action=capture, ...) (events). A generic handoff always creates entity(kind=handoff); additionally call capsule for a portable bundle or share link. HANDOFF.md or prose: local text is NOT the canonical handoff.\n\nActions: list | get | create | update; per-kind fields: see `action`.";
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
@@ -738,7 +742,7 @@ const ENTITY_TOOL_REFERENCE: &str = "Structured taxonomy entities — tickets, h
                   the canonical handoff and must not replace entity(kind=handoff). If the user \
                   explicitly requests a local file, create the entity first and treat the file \
                   only as an additional artifact.\n\n\
-                Actions: list | get | create | update | delete. Body is free-form JSON \
+                Actions: list | get | create | update (to delete one: the `delete` tool, action=\"entity.delete\"). Body is free-form JSON \
                 forwarded to the API; see the API schema for per-kind fields. \
                 \n\nWHERE TO FILE: file a ticket in the project that owns the code it is \
                 about (the repository of the files it cites), not the session's current \
@@ -1121,7 +1125,7 @@ impl ToolHandler for EntityTool {
             )
             .string(
                 "id",
-                "Entity ID or lookup text (title/name/objective/version) for get / update / delete. delete and an update that sets status need an ID or the exact title.",
+                "Entity ID or lookup text (title/name/objective/version) for get / update. An update that sets status needs an ID or the exact title.",
                 false,
             )
             .uuid(

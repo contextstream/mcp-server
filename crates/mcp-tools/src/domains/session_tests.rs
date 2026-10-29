@@ -4949,7 +4949,9 @@ mod validation_tests {
             "[CANDIDATES] \"dashboard recap card sorting\" is not the id or the exact title of any lesson; nothing was deleted."
         ));
         assert!(text.contains(lesson_id));
-        assert!(text.contains("Retry: session(action=\"delete_lesson\", lesson_id=\"<id>\")"));
+        assert!(
+            text.contains("Retry: delete(action=\"session.delete_lesson\", lesson_id=\"<id>\")")
+        );
         server_thread.join().expect("mock server should complete");
     }
 

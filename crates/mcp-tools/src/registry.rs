@@ -884,6 +884,11 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| Error::Tool(format!("Unknown tool: {}", name)))?;
+        // An irreversible action runs only through `delete`, whose listing
+        // says it destroys; its old tool says it does not (#330, #334).
+        if let Some(refusal) = crate::domains::destructive::moved_refusal(name, &input) {
+            return Err(Error::Validation(refusal));
+        }
 
         if let Some(result) = self.plan_restriction_for_tool(&tool.metadata).await {
             return Ok(result);
@@ -906,7 +911,6 @@ impl ToolRegistry {
             acceleration_observation_request(name, &input).map(|request| (request, Instant::now()));
         let write_timing = write_timing_start(name, &input, observation.is_some());
 
-        let moved_note = crate::domains::destructive::moved_note(name, &input);
         let outcome = match model_id {
             Some(model_id) => {
                 mcp_client::run_with_model_id(model_id, || tool.handler.execute(input)).await
@@ -914,15 +918,6 @@ impl ToolRegistry {
             None => tool.handler.execute(input).await,
         };
         let outcome = explain_input_error(name, &mismatches, outcome);
-        // An irreversible action called by its old name still runs; say where
-        // it is listed now (#330).
-        let outcome = match (outcome, moved_note) {
-            (Ok(mut result), Some(note)) => {
-                crate::domains::destructive::add_moved_note(&mut result, note);
-                Ok(result)
-            }
-            (outcome, _) => outcome,
-        };
 
         if let Some((request, started)) = observation {
             self.report_acceleration_observation(request, started.elapsed(), outcome.as_ref());

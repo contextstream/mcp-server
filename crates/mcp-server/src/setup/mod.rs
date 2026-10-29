@@ -3188,6 +3188,7 @@ async fn run_setup_noninteractive(
     };
 
     if binding_established {
+        ask_sync_bridge_to_reload();
         if let Some(repo_root) = configured_project_path.and_then(git_hooks::resolve_repo_root) {
             let root_str = repo_root.to_string_lossy().to_string();
             if !crate::hook_handlers::git_common::capture_disabled(&root_str) {
@@ -3427,6 +3428,17 @@ fn disclosure_env_bool(name: &str, default: bool) -> bool {
             _ => None,
         })
         .unwrap_or(default)
+}
+
+/// Tell a running sync bridge about the checkout setup just mapped. A bridge
+/// started while the hooks were installed does not know the checkout yet and
+/// would only find it on its next re-enumeration, two minutes later, so edits
+/// made in the meantime went unsynced (#306). A no-op when no bridge is running.
+pub(super) fn ask_sync_bridge_to_reload() {
+    if safe_edit::is_dry_run() {
+        return;
+    }
+    let _ = crate::watch::request_sync_bridge_reload();
 }
 
 fn data_collection_points(non_interactive: bool) -> [String; 8] {

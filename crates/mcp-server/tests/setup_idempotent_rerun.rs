@@ -367,6 +367,40 @@ async fn setup_yes_rerun_on_healthy_indexed_project_is_quiet_and_mutates_nothing
     .await
     .unwrap();
 
+    // Play a healthy running sync bridge: it holds the singleton lock and
+    // publishes a fresh heartbeat. That keeps setup from launching a real
+    // watcher, and lets us see that setup asks the bridge to reload once the
+    // checkout is mapped (#306): otherwise the bridge only finds a new checkout
+    // on its next two-minute pass.
+    std::fs::create_dir_all(home.join(".contextstream")).unwrap();
+    let bridge_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(home.join(".contextstream/watch.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&bridge_lock).unwrap();
+    // The cleanup at the end signals the pid in the heartbeat, so it names a
+    // harmless stand-in process, never this one.
+    let mut stand_in_bridge = Command::new("sleep").arg("300").spawn().unwrap();
+    std::fs::write(
+        home.join(".contextstream/watch.heartbeat.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "role": "hosted_sync_bridge",
+            "version": env!("CARGO_PKG_VERSION"),
+            "pid": stand_in_bridge.id(),
+            "owner_id": "44444444-4444-4444-8444-444444444444",
+            "target_count": 1,
+            "refreshed_at": chrono::Utc::now().to_rfc3339(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let reload_request = home.join(".contextstream/watch.reload");
+    assert!(!reload_request.exists());
+
     // 1. Initial `setup --yes --editors=claude --workspace-id=...`.
     let first_home = home.clone();
     let first_proj = project.clone();
@@ -397,6 +431,11 @@ async fn setup_yes_rerun_on_healthy_indexed_project_is_quiet_and_mutates_nothing
         "initial setup failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&first_out.stdout),
         String::from_utf8_lossy(&first_out.stderr)
+    );
+
+    assert!(
+        reload_request.is_file(),
+        "setup must ask a running sync bridge to reload once the checkout is mapped"
     );
 
     // Add a tracked content file (`README.md`) and record a completed local index
@@ -683,6 +722,9 @@ async fn setup_yes_rerun_on_healthy_indexed_project_is_quiet_and_mutates_nothing
     .unwrap();
     stop_spawned_watch_helper_if_any(&home);
     server.abort();
+    drop(bridge_lock);
+    let _ = stand_in_bridge.kill();
+    let _ = stand_in_bridge.wait();
 
     assert!(
         heal_out.status.success(),

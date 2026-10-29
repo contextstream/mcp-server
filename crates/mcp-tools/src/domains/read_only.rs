@@ -88,9 +88,9 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
         tool: "project",
         title: "Read Projects",
         description: "List and inspect ContextStream projects without changing anything: \
-                      list, get, overview, statistics, files, index status and history, team \
-                      projects and recent changes. Same arguments as project(action=...) for \
-                      these actions. Use `project` to create, index, update or delete.",
+                      list, get, overview, statistics, files, index status and history, and \
+                      team projects. Same arguments as project(action=...) for these actions. \
+                      Use `project` to create, index, update or delete.",
         actions: &[
             "list",
             "get",
@@ -100,7 +100,9 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
             "index_status",
             "index_history",
             "team_projects",
-            "recent_changes",
+            // Not `recent_changes`: it reads the server host's own git
+            // repository, so the hosted gateway always refuses it (#325).
+            // `project(action="recent_changes")` still runs on stdio.
         ],
     },
     ReadOnlyTwin {

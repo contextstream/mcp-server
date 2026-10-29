@@ -3135,8 +3135,9 @@ mod tests {
             "2b9d0e81e9bd9c9eb1f49aef43daa57b7b59b76c5a3039a9b38aafd586905a65",
         ),
         (
+            // #325: without `recent_changes`, which the hosted gateway refuses.
             "project_read",
-            "79ca59f71749e968bd97f74518fc4b0e1aa7938e505bcc66c1fa5abc9388f980",
+            "df87f1730d34ae918ff23c2b293d57bb14ef7824f0291a5729bdc291211afaf8",
         ),
         (
             "qa",

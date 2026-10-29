@@ -871,6 +871,7 @@ fn main() -> Result<()> {
 
     setup_logging(cli.verbose, cli.quiet);
     restore_default_sigpipe(&cli.command);
+    silence_stdout_when_quiet(cli.quiet, &cli.command);
 
     // Register the process-global teaching-bundle fingerprint so request
     // bodies, readiness, doctor, runtime staleness checks, and every editor
@@ -921,6 +922,45 @@ fn restore_default_sigpipe(command: &Option<Commands>) {
 
 #[cfg(not(unix))]
 fn restore_default_sigpipe(_command: &Option<Commands>) {}
+
+/// `-q` / `--quiet` ("errors only"): a one-shot command's stdout goes to the
+/// null device, while its errors (stderr) and exit status are unchanged, so
+/// scripts and CI can run `-q setup --yes`, `-q doctor`, `-q configure` (#255).
+/// The stdio server, the HTTP gateway, the sync bridge and editor hooks own
+/// their stdout and are left alone. Must run before any output.
+fn silence_stdout_when_quiet(quiet: bool, command: &Option<Commands>) {
+    let owns_stdout = matches!(
+        command,
+        None | Some(Commands::Http { .. } | Commands::Hook { .. } | Commands::Watch)
+    );
+    if quiet && !owns_stdout {
+        redirect_stdout_to_null();
+    }
+}
+
+#[cfg(unix)]
+fn redirect_stdout_to_null() {
+    use std::os::fd::AsRawFd;
+    if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+        // SAFETY: called from `main` before any output or other thread; dup2
+        // replaces fd 1 atomically and the duplicate outlives `null`.
+        unsafe { libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO) };
+    }
+}
+
+#[cfg(windows)]
+fn redirect_stdout_to_null() {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{SetStdHandle, STD_OUTPUT_HANDLE};
+    if let Ok(null) = std::fs::OpenOptions::new().write(true).open("NUL") {
+        // Rust looks the standard handle up on every write; the handle stays
+        // open for the rest of the process.
+        unsafe { SetStdHandle(STD_OUTPUT_HANDLE, null.into_raw_handle() as _) };
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn redirect_stdout_to_null() {}
 
 /// Export the hook's event name and host arguments for the handlers.
 ///

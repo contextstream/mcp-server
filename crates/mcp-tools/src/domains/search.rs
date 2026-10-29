@@ -3516,10 +3516,13 @@ fn widened_scope_row_label(
 ) -> Option<String> {
     match result_row_project_id(item) {
         Some(row_project) => {
-            let same_project = expected_project_id
-                .is_some_and(|expected| row_project.eq_ignore_ascii_case(&expected.to_string()));
-            (!same_project)
-                .then(|| format!("[other project {}]", truncate_json_string(row_project, 64)))
+            let label = truncate_json_string(row_project, 64);
+            match expected_project_id {
+                // No current project: every row just names its own.
+                None => Some(format!("[project {label}]")),
+                Some(expected) if row_project.eq_ignore_ascii_case(&expected.to_string()) => None,
+                Some(_) => Some(format!("[other project {label}]")),
+            }
         }
         None => Some("[project not reported]".to_string()),
     }
@@ -3539,6 +3542,18 @@ fn label_widened_scope_row(line: String, label: Option<&str>) -> String {
 /// Always-rendered notice for a search that ran outside the project the
 /// session resolved. `None` when the search stayed in that project, or when no
 /// project was resolved (a plain workspace search).
+/// A local search from a folder linked to no project ran across the whole
+/// workspace: say so, and how to link the folder (#284).
+fn unlinked_folder_notice(
+    local_files_allowed: bool,
+    expected_project_id: Option<Uuid>,
+    resolved_project_id: Option<Uuid>,
+) -> Option<&'static str> {
+    (local_files_allowed && expected_project_id.is_none() && resolved_project_id.is_none()).then_some(
+        "[NO_PROJECT] This folder is not linked to a ContextStream project, so this search covered every project in the workspace; each row names its project. Run `contextstream-mcp setup` in this folder to link it, or pass project_id.",
+    )
+}
+
 fn widened_scope_notice(
     expected_project_id: Option<Uuid>,
     resolved_project_id: Option<Uuid>,
@@ -12617,8 +12632,10 @@ impl SearchTool {
 
         // Prune results for files deleted or ignored in the local working tree before
         // computing no_hits, so a drifted index never silently serves hits for
-        // files that no longer exist. Guarded to local directories only.
-        if !scope_invalid && local_files_allowed && !literal_page {
+        // files that no longer exist. Guarded to local directories only, and
+        // to a project search: a workspace-wide search's rows are other
+        // projects' files, not this folder's (#284).
+        if !scope_invalid && local_files_allowed && !literal_page && target_project_id.is_some() {
             if let Some(ref fp) = folder_path {
                 let folder = Path::new(fp);
                 if folder.is_dir() {
@@ -13168,7 +13185,10 @@ impl SearchTool {
         // in the text, even in concise mode, and labels every row that is not
         // from that project.
         let scope_widened_notice =
-            widened_scope_notice(project_id, resolved_project_id, requested_mode);
+            widened_scope_notice(project_id, resolved_project_id, requested_mode).or_else(|| {
+                unlinked_folder_notice(local_files_allowed, project_id, resolved_project_id)
+                    .map(str::to_string)
+            });
         let widened_row_label = |item: &mcp_types::api::SearchResult| {
             scope_widened_notice
                 .as_ref()

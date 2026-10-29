@@ -8558,6 +8558,16 @@ mod scope_widening_tests {
             Some(format!("[other project {other}]").as_str())
         );
         assert_eq!(widened_scope_row_label(&own, Some(expected)), None);
+        // #284: with no current project every row names its own project.
+        assert_eq!(
+            widened_scope_row_label(&own, None).as_deref(),
+            Some(format!("[project {expected}]").as_str())
+        );
+        let notice = crate::domains::search::unlinked_folder_notice;
+        assert!(notice(true, None, None).is_some_and(|text| text.starts_with("[NO_PROJECT]")));
+        assert_eq!(notice(false, None, None), None, "hosted: no folder to link");
+        assert_eq!(notice(true, None, Some(expected)), None);
+        assert_eq!(notice(true, Some(expected), None), None);
         assert_eq!(
             widened_scope_row_label(&unattributed, Some(expected)).as_deref(),
             Some("[project not reported]")

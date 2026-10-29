@@ -325,6 +325,19 @@ impl Editor {
         self.profile().hooks.any()
     }
 
+    /// Whether setup writes hooks for this editor: its full ContextStream hook
+    /// set, or for Codex and Antigravity only the hooks that show coordination
+    /// notices to a long-running session between prompts. Those two keep no
+    /// enforcement hooks, so [`Self::has_hooks`] stays false for them.
+    pub fn installs_hooks(&self) -> bool {
+        self.has_hooks() || self.installs_notice_hooks_only()
+    }
+
+    /// Codex and Antigravity: only the mid-run notice hooks are installed.
+    pub fn installs_notice_hooks_only(&self) -> bool {
+        matches!(self, Editor::Codex | Editor::Antigravity)
+    }
+
     /// Whether this harness has an MCP transport that can produce a runtime
     /// handshake. Aider is intentionally rules-only and must never be
     /// presented as merely waiting for an MCP connection.
@@ -835,6 +848,18 @@ mod tests {
         assert!(!Editor::Antigravity.has_hooks());
         assert!(!Editor::Copilot.has_hooks());
         assert!(!Editor::Codex.has_hooks());
+    }
+
+    #[test]
+    fn codex_and_antigravity_install_only_notice_hooks() {
+        for editor in [Editor::Codex, Editor::Antigravity] {
+            assert!(editor.installs_hooks());
+            assert!(editor.installs_notice_hooks_only());
+            assert!(!editor.has_hooks());
+        }
+        assert!(Editor::ClaudeCode.installs_hooks());
+        assert!(!Editor::ClaudeCode.installs_notice_hooks_only());
+        assert!(!Editor::KiloCode.installs_hooks());
     }
 
     #[test]

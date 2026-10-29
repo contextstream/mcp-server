@@ -2076,7 +2076,7 @@ fn hook_event_name(hook_name: &str) -> &str {
         "instructions-loaded" => "InstructionsLoaded",
         "session-end" => "SessionEnd",
         "user-prompt-submit" | "on-save-intent" => "UserPromptSubmit",
-        "pre-tool-use" | "package-bouncer" => "PreToolUse",
+        "pre-tool-use" | "package-bouncer" | "mid-run-notices" => "PreToolUse",
         "post-tool-use" => "PostToolUse",
         "post-tool-use-failure" => "PostToolUseFailure",
         // The Bash observer is a PostToolUse hook; git-* hooks are git-native

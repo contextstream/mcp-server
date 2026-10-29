@@ -3,6 +3,7 @@
 //! Each handler reads JSON from stdin, processes it, and writes JSON to stdout.
 //! These replace the previous bash/curl scripts with fast, native Rust handlers.
 
+pub mod antigravity;
 pub mod client_model_extractor;
 pub mod coaching_turn;
 pub mod common;
@@ -17,6 +18,7 @@ pub mod git_post_commit;
 pub mod git_post_merge;
 pub mod git_pre_push;
 pub mod instructions_loaded;
+pub mod mid_run_notices;
 pub mod notification;
 pub mod on_save_intent;
 pub mod package_bouncer;
@@ -423,6 +425,14 @@ pub async fn dispatch_hook(name: &str) -> Result<()> {
         "notification" => notification::handle().await,
         // Codex `notify` program: hands finished turns to the coaching loop.
         "codex-notify" => coaching_turn::handle_codex_notify().await,
+        // Antigravity (`agy`) lifecycle hooks (~/.gemini/config/hooks.json).
+        "agy-session-start" => antigravity::handle_session_start().await,
+        "agy-pre-invocation" => antigravity::handle_pre_invocation().await,
+        "agy-post-tool-use" => antigravity::handle_post_tool_use().await,
+        // Codex `PreToolUse`: mid-run coordination notices only.
+        "mid-run-notices" => mid_run_notices::handle_notice_hook().await,
+        // Detached mid-run notice poll started by a tool-call hook.
+        mid_run_notices::BACKGROUND_POLL_HOOK => mid_run_notices::run_background_poll().await,
         "permission-request" => permission_request::handle().await,
         "pre-compact" => pre_compact::handle().await,
         "post-compact" => post_compact::handle().await,

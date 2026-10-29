@@ -930,7 +930,7 @@ fn check_hooks(editor: &Editor) -> SurfaceCheck {
         editor.id()
     );
 
-    if !editor.has_hooks() {
+    if !editor.installs_hooks() {
         return SurfaceCheck::skipped(
             SURFACE,
             match editor {
@@ -962,6 +962,12 @@ fn check_hooks(editor: &Editor) -> SurfaceCheck {
             let path = home.join(".cursor").join("hooks.json");
             check_hook_file_has_owned_contextstream(editor, &path, &fix)
         }
+        // Mid-run coordination notices only; these editors keep no
+        // enforcement hooks.
+        Editor::Codex | Editor::Antigravity => match super::hooks::hook_config_path(editor) {
+            Some(path) => check_hook_file_has_owned_contextstream(editor, &path, &fix),
+            None => SurfaceCheck::skipped(SURFACE, "no hook config path for this editor"),
+        },
         Editor::Windsurf => {
             let path = home.join(".codeium").join("windsurf").join("hooks.json");
             let base = check_hook_file_has_owned_contextstream(editor, &path, &fix);

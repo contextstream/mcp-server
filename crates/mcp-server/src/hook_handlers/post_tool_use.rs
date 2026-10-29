@@ -885,6 +885,8 @@ pub async fn handle() -> Result<()> {
     let cwd = extract_cwd(&input);
 
     if is_contextstream_server_call(&mcp_server_name, &tool_name) {
+        // Notices a `context`/`init` result showed are not shown again mid-run.
+        super::mid_run_notices::record_tool_result_delivery(&input, &cwd, &tool_response);
         // Record successful initialization before optional indexing/routing
         // work, whose early returns must not lose this session's receipt.
         if completes_session_init(&normalized_tool_name, &tool_response) {

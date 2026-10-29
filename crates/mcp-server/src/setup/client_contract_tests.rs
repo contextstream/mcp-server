@@ -198,6 +198,7 @@ fn editor_contract(editor: &Editor) -> Value {
             "legacy_rules_project": sandbox.displays(editor.legacy_rules_paths(Some(project))),
             "cleanup_rules_global": sandbox.displays(editor.legacy_cleanup_only_rules_paths(None)),
             "cleanup_rules_project": sandbox.displays(editor.legacy_cleanup_only_rules_paths(Some(project))),
+            "hooks_config": sandbox.display(crate::setup::hooks::hook_config_path(editor)),
         })
     };
 
@@ -208,6 +209,7 @@ fn editor_contract(editor: &Editor) -> Value {
         "uses_json_config": editor.uses_json_config(),
         "uses_vscode_settings": editor.uses_vscode_settings(),
         "has_hooks": editor.has_hooks(),
+        "installs_hooks": editor.installs_hooks(),
         "has_mcp_transport": editor.has_mcp_transport(),
         "supports_remote": editor_supports_remote_mcp(editor),
         "enforcement_tier": format!("{:?}", editor.enforcement_tier()),

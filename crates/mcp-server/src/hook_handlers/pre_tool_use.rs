@@ -2237,6 +2237,18 @@ fn clears_context_gate(is_contextstream_call: bool, normalized_tool: &str) -> bo
     is_contextstream_call && normalized_tool == "context"
 }
 
+/// The automatic ContextAgent run a `[CONTEXTAGENTS]` hint named: the agents tool resolves
+/// its own workspace and project, so it never waits on init or context (and clears neither).
+fn is_automatic_agents_run(
+    is_contextstream_call: bool,
+    normalized_tool: &str,
+    tool_input: &Value,
+) -> bool {
+    is_contextstream_call
+        && normalized_tool == "agents"
+        && tool_input.get("automatic").and_then(Value::as_bool) == Some(true)
+}
+
 fn allowed_before_context_without_clearing(
     is_contextstream_call: bool,
     normalized_tool: &str,
@@ -2488,6 +2500,26 @@ pub async fn handle() -> Result<()> {
         _ => None,
     };
 
+    // ContextAgents: a step that fits one (a dependency, audit, release or CI command; an
+    // edit to a lockfile, the docs or the changelog) gets the call that starts it, when the
+    // workspace's automatic runs are on. Nothing is read unless the step fits a moment.
+    let contextagents_notice = if matches!(editor, EditorFormat::Claude) && !is_contextstream_call {
+        let fitting = super::contextagents::step_moments(&tool, &tool_input);
+        super::contextagents::step_hint(
+            &input,
+            &cwd,
+            &fitting,
+            super::contextagents::CLAUDE_AGENTS_TOOL,
+        )
+        .await
+    } else {
+        None
+    };
+    let mid_run_notice = match (mid_run_notice, contextagents_notice) {
+        (Some(notice), Some(agents)) => Some(format!("{notice}\n\n{agents}")),
+        (notice, agents) => notice.or(agents),
+    };
+
     let emit = |decision: HookDecision| -> Result<()> {
         if !matches!(decision, HookDecision::BlockWithMessage(_)) && record_state_change {
             prompt_state::mark_state_changed(&cwd);
@@ -2537,6 +2569,12 @@ pub async fn handle() -> Result<()> {
                     })),
                     ..Default::default()
                 });
+            } else if is_automatic_agents_run(
+                is_contextstream_call,
+                &normalized_contextstream_tool,
+                &tool_input,
+            ) {
+                // Allowed; the init requirement stays for the next call.
             } else if is_mcp_tool || is_contextstream_call {
                 let required = format!("{}(...)", init_tool_name(&editor));
                 let quick = format!(
@@ -2583,6 +2621,10 @@ pub async fn handle() -> Result<()> {
             } else if allowed_before_context_without_clearing(
                 is_contextstream_call,
                 &normalized_contextstream_tool,
+            ) || is_automatic_agents_run(
+                is_contextstream_call,
+                &normalized_contextstream_tool,
+                &tool_input,
             ) {
                 // init(...) is allowed before context(...) so the required order
                 // can be init -> context on the first message in a session.
@@ -3867,6 +3909,23 @@ mod tests {
 
         let targeted = search_call(&EditorFormat::Windsurf, SearchMode::Hybrid, "auth");
         assert!(targeted.contains("mode=\"hybrid\""));
+    }
+
+    #[test]
+    fn an_automatic_agents_run_passes_the_first_call_gates() {
+        let automatic = serde_json::json!({"action": "run", "agent": "audit", "automatic": true});
+        assert!(is_automatic_agents_run(true, "agents", &automatic));
+        assert!(!is_automatic_agents_run(
+            true,
+            "agents",
+            &serde_json::json!({"action": "run", "agent": "audit"})
+        ));
+        assert!(!is_automatic_agents_run(true, "search", &automatic));
+        assert!(!is_automatic_agents_run(false, "agents", &automatic));
+        assert_eq!(
+            normalize_contextstream_tool_name("mcp__contextstream__agents"),
+            "agents"
+        );
     }
 
     #[test]

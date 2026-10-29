@@ -495,13 +495,48 @@ pub async fn handle() -> Result<()> {
         )
         .await;
     };
-    let (context, _, ()) = tokio::join!(
+    // ContextAgents: when the request fits one and the workspace's automatic runs are on,
+    // the call that starts it. Nothing is read unless the request fits a moment.
+    let contextagents_fut = async {
+        let prompt = input
+            .get("prompt")
+            .and_then(Value::as_str)
+            .filter(|prompt| !is_harness_notification(prompt))?;
+        let fitting = mcp_tools::domains::slipstream::moments::prompt_moments(prompt);
+        let tool = match editor {
+            EditorFormat::Claude => super::contextagents::CLAUDE_AGENTS_TOOL,
+            _ => "agents",
+        };
+        super::contextagents::hint(
+            &super::contextagents::HookScope {
+                api_url: &config.api_url,
+                api_key: &config.api_key,
+                workspace_id: config.workspace_id.as_deref(),
+                project_id: config.project_id.as_deref(),
+                folder: &effective_folder,
+            },
+            &fitting,
+            Some(prompt),
+            mcp_tools::domains::slipstream::auto::Trigger::Request,
+            tool,
+        )
+        .await
+    };
+    let (context, _, (), contextagents) = tokio::join!(
         context_fut,
         super::dirty_drain::drain_best_effort(std::time::Duration::from_secs(2)),
         coaching_fut,
+        contextagents_fut,
     );
 
-    let combined = build_context_message(editor, context, &input);
+    // The ContextAgents call goes first: it is the one thing to do before the work starts.
+    let combined = match contextagents {
+        Some(hint) => format!(
+            "{hint}\n\n{}",
+            build_context_message(editor, context, &input)
+        ),
+        None => build_context_message(editor, context, &input),
+    };
     write_editor_output(editor, Some(combined))?;
     Ok(())
 }

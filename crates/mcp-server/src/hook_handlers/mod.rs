@@ -8,6 +8,7 @@ pub mod client_model_extractor;
 pub mod coaching_turn;
 pub mod common;
 pub mod compliance;
+pub(crate) mod contextagents;
 pub mod dirty_drain;
 pub(crate) mod durable_capture;
 pub(crate) mod durable_paths;

@@ -74,14 +74,30 @@ pub async fn handle() -> Result<()> {
         // from deliberate post-mortem synthesis, not a counter hitting 3.
     }
 
-    if count >= 2 {
-        let guidance = format!(
-            "The `{}` tool has failed {} times with a similar error in this workspace. Read the error details carefully, avoid repeating the same call unchanged, and switch to a narrower or fallback path if needed.",
-            tool_name, count
-        );
-        write_stdout_json(&HookOutput::context(guidance))?;
-    } else {
-        write_stdout_json(&HookOutput::empty())?;
+    // ContextAgents: a failed install or CI check fits one; with the workspace's automatic
+    // runs on, the call that starts it.
+    let fitting = super::contextagents::failed_step_moments(
+        tool_name,
+        input.get("tool_input").unwrap_or(&Value::Null),
+    );
+    let contextagents = super::contextagents::step_hint(
+        &input,
+        &cwd,
+        &fitting,
+        super::contextagents::CLAUDE_AGENTS_TOOL,
+    )
+    .await;
+
+    let guidance = (count >= 2).then(|| format!(
+        "The `{}` tool has failed {} times with a similar error in this workspace. Read the error details carefully, avoid repeating the same call unchanged, and switch to a narrower or fallback path if needed.",
+        tool_name, count
+    ));
+    match (guidance, contextagents) {
+        (None, None) => write_stdout_json(&HookOutput::empty())?,
+        (Some(guidance), Some(agents)) => {
+            write_stdout_json(&HookOutput::context(format!("{guidance}\n\n{agents}")))?
+        }
+        (Some(one), None) | (None, Some(one)) => write_stdout_json(&HookOutput::context(one))?,
     }
     Ok(())
 }

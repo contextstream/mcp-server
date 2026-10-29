@@ -38,10 +38,20 @@ pub(crate) struct Described {
     pub input_parameter: String,
 }
 
+#[cfg(test)]
 pub(crate) fn describe(catalog: &Catalog, auto_accept_max_credits: u32) -> Described {
+    describe_auto(catalog, auto_accept_max_credits, false)
+}
+
+/// [`describe`], saying so when the workspace's automatic runs are on (`auto_run.mcp`).
+pub(crate) fn describe_auto(
+    catalog: &Catalog,
+    auto_accept_max_credits: u32,
+    automatic_runs: bool,
+) -> Described {
     let agents = catalog.enabled();
     Described {
-        description: tool_description(&agents, auto_accept_max_credits),
+        description: tool_description(&agents, auto_accept_max_credits, automatic_runs),
         agent_parameter: agent_parameter(&agents),
         input_parameter: input_parameter(&agents),
     }
@@ -88,7 +98,10 @@ fn header() -> &'static str {
     "ContextStream Agents turned on here. Each does one job with this workspace's context and returns the result. Credits per successful run, free if declined or failed:"
 }
 
-fn footer(auto_accept_max_credits: u32) -> String {
+/// What the description adds when the workspace's automatic runs are on.
+pub(crate) const AUTOMATIC_RUNS_NOTE: &str = "Automatic runs are on here: when a task fits an agent, start it yourself with automatic=true (no quote; it runs in the background) and read it later with get_run.";
+
+fn footer(auto_accept_max_credits: u32, automatic_runs: bool) -> String {
     let accept = if auto_accept_max_credits > 0 {
         format!(
             "A run priced at most {auto_accept_max_credits} credits starts at once (the person's auto-accept cap); a pricier one first returns its price: show it, then run again with accepted_price_credits."
@@ -96,8 +109,13 @@ fn footer(auto_accept_max_credits: u32) -> String {
     } else {
         "It first returns the price: show it to the person, then run again with accepted_price_credits.".to_string()
     };
+    let automatic = if automatic_runs {
+        format!(" {AUTOMATIC_RUNS_NOTE}")
+    } else {
+        String::new()
+    };
     format!(
-        "Run: {TOOL_NAME}(action=\"run\", agent, input). {accept} An unfinished run returns a task_id for get_run (waits up to 25 s). Fields: see input. Also: find, list_runs, cancel_run; settings, choose, enable, disable set which agents are on."
+        "Run: {TOOL_NAME}(action=\"run\", agent, input). {accept} An unfinished run returns a task_id for get_run (waits up to 25 s).{automatic} Fields: see input. Also: find, list_runs, cancel_run; settings, choose, enable, disable set which agents are on."
     )
 }
 
@@ -157,9 +175,13 @@ fn joined(lines: &[String]) -> usize {
     lines.iter().map(|line| line.chars().count() + 1).sum()
 }
 
-fn tool_description(agents: &[&AgentEntry], auto_accept_max_credits: u32) -> String {
+fn tool_description(
+    agents: &[&AgentEntry],
+    auto_accept_max_credits: u32,
+    automatic_runs: bool,
+) -> String {
     let header = header();
-    let footer = footer(auto_accept_max_credits);
+    let footer = footer(auto_accept_max_credits, automatic_runs);
     let fixed = header.chars().count() + footer.chars().count() + 2;
     let room = DESCRIPTION_BUDGET.saturating_sub(fixed);
 

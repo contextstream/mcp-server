@@ -8821,6 +8821,38 @@ impl ToolHandler for ContextTool {
         } else {
             None
         };
+        // ContextAgents (`auto_run.mcp`): the call to start an agent when this request fits
+        // one, and the automatic runs that finished. Reads nothing when no moment fits and
+        // no run is waiting; rendered after the warm-cache write, like coordination.
+        let contextagents_future = workspace_id.map(|ws_a| {
+            let client_a = self.client.clone();
+            let session_key_a = mcp_client::get_task_session_key();
+            let caller_cache_identity_a = mcp_client::get_task_caller_cache_identity();
+            let auth_override_a = mcp_client::get_task_auth_override();
+            let config_override_a = mcp_client::get_task_config_override();
+            let pid_a = project_id;
+            let folder_a = folder_path_for_grounding.clone();
+            let prompt_a = user_message_for_relevance.clone();
+            tokio::spawn(async move {
+                with_caller_auth(
+                    session_key_a,
+                    caller_cache_identity_a,
+                    auth_override_a,
+                    config_override_a,
+                    || async move {
+                        crate::domains::slipstream::auto::context_block(
+                            &client_a,
+                            ws_a,
+                            pid_a,
+                            folder_a.as_deref(),
+                            &prompt_a,
+                        )
+                        .await
+                    },
+                )
+                .await
+            })
+        });
         if let (Some(session_id), true) = (context_session_id.clone(), workspace_id.is_some()) {
             spawn_coordination_check_in(
                 &self.client,
@@ -10011,6 +10043,16 @@ impl ToolHandler for ContextTool {
                 text.push('\n');
             }
             text.push_str(&coordination_block);
+        }
+        if let Some(handle) = contextagents_future {
+            let bound = proactive_bound.max(crate::domains::slipstream::auto::CONTEXT_BUDGET);
+            if let Ok(Ok(Some(block))) = tokio::time::timeout(bound, handle).await {
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&block);
+                text.push('\n');
+            }
         }
 
         let session_snap = self.session.state().await;

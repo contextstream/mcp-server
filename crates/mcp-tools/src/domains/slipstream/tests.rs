@@ -2333,3 +2333,182 @@ async fn with_no_agent_on_the_tool_is_listed_with_how_to_turn_them_on() {
     assert!(agent_param.contains("oracle") && agent_param.contains("mail"));
     assert_eq!(schema["properties"]["agents"]["items"]["type"], "string");
 }
+
+// ============================================================================
+// Automatic runs (auto_run.mcp)
+// ============================================================================
+
+/// `GET .../tasks/agents/auto` as the API answers it: `review` may run, `audit` needs review.
+fn auto_setting(mcp: bool) -> Value {
+    json!({
+        "auto_run": {"mcp": mcp, "contextcode": "off", "per_run_credit_limit": 2000},
+        "blocked": null,
+        "agents": [
+            {"id": "review", "name": "PR Reviewer", "job": "Reviews a pull request's diff.",
+             "enabled": true, "scopes_ok": true, "inputs_required": ["pull", "repo"]},
+            {"id": "audit", "name": "Security Audit", "job": "Finds known vulnerabilities.",
+             "enabled": true, "scopes_ok": false, "inputs_required": ["repo_url"]}
+        ]
+    })
+}
+
+/// The usual API plus the automatic-run setting (`None`: an API without the route) and
+/// `task` for the task routes.
+async fn auto_stub(
+    setting: Option<Value>,
+    task: impl Fn(&Recorded) -> Answer + Send + Sync + 'static,
+) -> Stub {
+    let catalog = live_catalog();
+    Stub::start(Arc::new(move |request: &Recorded| {
+        if request.path.ends_with("/tasks/agents/auto") {
+            match &setting {
+                Some(setting) => Answer::ok(setting.clone()),
+                None => Answer::error(404, "Not Found"),
+            }
+        } else if request.path == "/tasks/agents" {
+            Answer::ok(catalog.clone())
+        } else if request.path.starts_with("/projects/") {
+            Answer::ok(json!({"id": PROJECT, "name": "api", "workspace_id": WORKSPACE}))
+        } else {
+            task(request)
+        }
+    }))
+    .await
+}
+
+fn auto_run_input() -> Value {
+    run_input(json!({"automatic": true}))
+}
+
+#[tokio::test]
+async fn an_automatic_run_starts_without_a_quote_in_the_background_marked_auto_mcp() {
+    let stub = auto_stub(Some(auto_setting(true)), |request| {
+        if request.method == "POST" {
+            Answer::ok(task_view("queued", false))
+        } else {
+            let mut listed = task_view("running", false);
+            listed["source"] = json!("auto_mcp");
+            Answer::ok(json!({"tasks": [listed]}))
+        }
+    })
+    .await;
+    let (tool, _) = stub.tool(stub.config("key-auto-run"));
+    let started = tool.execute(auto_run_input()).await.unwrap();
+    let posts = stub.task_posts();
+    assert_eq!(posts.len(), 1, "no quote first");
+    let body = &posts[0].body;
+    assert_eq!(body["source"], "auto_mcp");
+    assert_eq!(body["wait_ms"], 0);
+    assert!(body.get("accepted_price_credits").is_none());
+    assert_eq!(body["input"], json!({"repo": "acme/api", "pull": 42}));
+    assert!(body["idempotency_key"]
+        .as_str()
+        .unwrap()
+        .starts_with("auto-mcp-"));
+    let text = text_of(&started);
+    assert!(
+        text.contains("Started automatically, in the background"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("get_run\", task_id=\"{TASK}\"")));
+    let structured = started.structured_content.as_ref().unwrap();
+    assert_eq!(structured["automatic"], true);
+    assert_eq!(structured["task_id"], TASK);
+
+    // The runs list says it ran on its own.
+    let listed = tool
+        .execute(json!({"action": "list_runs", "workspace_id": WORKSPACE}))
+        .await
+        .unwrap();
+    assert!(text_of(&listed).contains("started automatically (auto_mcp)"));
+}
+
+#[tokio::test]
+async fn with_automatic_runs_off_or_unknown_nothing_runs() {
+    for (key, setting) in [
+        ("key-auto-off", Some(auto_setting(false))),
+        ("key-auto-old-api", None),
+    ] {
+        let stub = auto_stub(setting, |_| Answer::ok(task_view("queued", false))).await;
+        let (tool, _) = stub.tool(stub.config(key));
+        let refused = tool.execute(auto_run_input()).await.unwrap();
+        let text = text_of(&refused);
+        assert!(
+            text.starts_with("Not run: automatic ContextAgent runs are off in this workspace"),
+            "{key}: {text}"
+        );
+        assert!(text.contains("Nothing was charged"));
+        assert_eq!(refused.structured_content.as_ref().unwrap()["ran"], false);
+        assert!(stub.task_posts().is_empty(), "{key}");
+    }
+}
+
+#[tokio::test]
+async fn an_agent_automatic_runs_may_not_use_never_runs() {
+    let stub = auto_stub(Some(auto_setting(true)), |_| {
+        Answer::ok(task_view("queued", false))
+    })
+    .await;
+    let (tool, _) = stub.tool(stub.config("key-auto-review-needed"));
+    let refused = tool
+        .execute(json!({"action": "run", "agent": "audit", "automatic": true,
+                        "workspace_id": WORKSPACE, "project_id": PROJECT,
+                        "input": {"repo_url": "https://github.com/acme/api"}}))
+        .await
+        .unwrap();
+    assert!(text_of(&refused).contains("audit is not an agent automatic runs may use here"));
+    assert!(stub.task_posts().is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_automatic_run_says_why_and_quiets_suggestions() {
+    let stub = auto_stub(Some(auto_setting(true)), |request| {
+        if request.method == "POST" {
+            Answer::error(
+                409,
+                "auto_run_over_limit: the run's price is above the workspace's per-run limit",
+            )
+        } else {
+            Answer::error(404, "no")
+        }
+    })
+    .await;
+    let config = stub.config("key-auto-refused");
+    let (tool, _) = stub.tool(config.clone());
+    let refused = tool.execute(auto_run_input()).await.unwrap();
+    let text = text_of(&refused);
+    assert!(text.starts_with("Not run: auto_run_over_limit"), "{text}");
+    assert!(text.contains("no more ContextAgents will be suggested"));
+    assert_eq!(refused.structured_content.as_ref().unwrap()["ran"], false);
+    let caller = caller_identity(&ContextStreamClient::new(config))
+        .await
+        .unwrap();
+    assert!(auto::Ledger::for_process(true).is_paused(&caller, workspace()));
+}
+
+#[tokio::test]
+async fn the_listing_says_so_when_automatic_runs_are_on() {
+    let stub = Stub::api(live_catalog(), |_| Answer::error(404, "no")).await;
+    let off = listing_for(&stub.url, "key-auto-listing", Some(workspace())).await;
+    assert!(!off
+        .description()
+        .unwrap()
+        .contains(describe::AUTOMATIC_RUNS_NOTE));
+    let mut config = stub.config("key-auto-listing");
+    config.default_workspace_id = Some(workspace());
+    let identity = caller_identity(&ContextStreamClient::new(config))
+        .await
+        .unwrap();
+    auto::SettingCache::global().set_for_test(
+        &identity,
+        workspace(),
+        auto::SettingRead::Read {
+            setting: auto::AutoSetting::from_value(&auto_setting(true)).unwrap(),
+        },
+    );
+    let on = listing_for(&stub.url, "key-auto-listing", Some(workspace())).await;
+    let description = on.description().unwrap();
+    assert!(description.contains(describe::AUTOMATIC_RUNS_NOTE));
+    assert!(description.chars().count() <= DESCRIPTION_BUDGET);
+    assert!(on.input_schema().unwrap()["properties"]["automatic"].is_object());
+}

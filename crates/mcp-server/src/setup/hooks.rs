@@ -1267,10 +1267,39 @@ fn uninstall_notice_hooks(
     };
     let loaded = safe_edit::read_for_edit(&path, safe_edit::JsonDialect::Strict)?;
     let updated = remove(&loaded, &path)?;
+
+    // Setup created this file when it was nothing but our entry: take it away
+    // with the backup a later refresh left, as for Claude Code's settings.json
+    // (#274), instead of leaving `{"hooks": {}}` and a copy of the managed hook.
+    // A file with anything of the person's own in it, or a backup that was
+    // theirs, is only edited.
+    let backup_path = safe_edit::backup_path(&path)?;
+    let backup = safe_edit::read_recovery_for_edit(&backup_path, safe_edit::JsonDialect::Strict)?;
+    let only_ours = |config: &safe_edit::LoadedConfig| {
+        remove(config, &path)
+            .map(|left| left != config.value && is_empty_hooks_document(&left))
+            .unwrap_or(false)
+    };
+    if only_ours(&loaded) && backup.as_ref().is_none_or(only_ours) {
+        safe_edit::remove_owned_file_if_unchanged(&path, &loaded.raw)?;
+        if let Some(backup) = backup {
+            safe_edit::remove_owned_file_if_unchanged(&backup_path, &backup.raw)?;
+        }
+        return Ok(());
+    }
+
     if updated != loaded.value {
         safe_edit::commit_with_removals(&path, &loaded, &updated, removed_keys)?;
     }
     Ok(())
+}
+
+/// A hooks document with nothing left in it: no keys, or only an empty `hooks`.
+fn is_empty_hooks_document(value: &Value) -> bool {
+    value.as_object().is_some_and(|root| {
+        root.iter()
+            .all(|(key, value)| key == "hooks" && value.as_object().is_some_and(JsonMap::is_empty))
+    })
 }
 
 fn remove_antigravity_hooks(loaded: &safe_edit::LoadedConfig, path: &Path) -> Result<Value> {
@@ -4562,6 +4591,63 @@ mod tests {
         } else {
             std::env::remove_var("HOME");
         }
+    }
+
+    #[test]
+    fn notice_hook_files_setup_created_are_removed_with_their_backup_on_uninstall() {
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+
+        for (editor, path) in [
+            (Editor::Codex, codex_hooks_path().expect("Codex path")),
+            (
+                Editor::Antigravity,
+                antigravity_hooks_path().expect("Antigravity path"),
+            ),
+        ] {
+            // Setup, then a refresh from an older binary, which leaves a backup
+            // that still holds the managed hook (#307).
+            install_hooks(&editor, None).expect("initial install");
+            let installed = std::fs::read_to_string(&path).expect("read hooks");
+            let older = installed.replace(&find_binary_path(), "/old/contextstream-mcp");
+            assert_ne!(older, installed, "test must alter a managed command");
+            std::fs::write(&path, older).expect("simulate an older managed config");
+            install_hooks(&editor, None).expect("refresh");
+            assert!(safe_edit::backup_path(&path).unwrap().exists());
+
+            uninstall_hooks(&editor).expect("uninstall");
+            assert!(
+                !path.exists(),
+                "{} hooks file remained",
+                editor.display_name()
+            );
+            assert!(
+                !safe_edit::backup_path(&path).unwrap().exists(),
+                "{} backup remained",
+                editor.display_name()
+            );
+        }
+
+        if let Some(value) = previous_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn an_empty_hooks_document_is_recognized() {
+        assert!(is_empty_hooks_document(&json!({})));
+        assert!(is_empty_hooks_document(&json!({"hooks": {}})));
+        assert!(!is_empty_hooks_document(
+            &json!({"hooks": {"PreToolUse": []}})
+        ));
+        assert!(!is_empty_hooks_document(&json!({"other": 1})));
+        assert!(!is_empty_hooks_document(&json!([])));
     }
 
     #[test]

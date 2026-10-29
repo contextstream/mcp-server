@@ -618,13 +618,102 @@ fn create_unique_temp_with_mode(path: &Path, initial_mode: u32) -> Result<(PathB
     )
 }
 
+fn resolve_git_dir_from_marker(worktree_root: &Path, dot_git: &Path) -> Option<PathBuf> {
+    if dot_git.is_dir() {
+        return Some(dot_git.to_path_buf());
+    }
+    if dot_git.is_file() {
+        let raw = std::fs::read_to_string(dot_git).ok()?;
+        let target = raw
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("gitdir:"))?
+            .trim();
+        let git_dir = if Path::new(target).is_absolute() {
+            PathBuf::from(target)
+        } else {
+            worktree_root.join(target)
+        };
+        if git_dir.is_dir() {
+            return Some(git_dir);
+        }
+    }
+    None
+}
+
+fn relocated_backup_path(resolved: &Path, file_name: &str) -> Option<PathBuf> {
+    let parent = resolved.parent()?;
+    if parent
+        .components()
+        .any(|component| component.as_os_str() == ".git")
+    {
+        return None;
+    }
+
+    // Inside a Git worktree, store recovery sidecars under `<git-dir>/contextstream-backups/`
+    // so `git status` stays clean and rule-directory scanners (`.windsurf/rules/`,
+    // `.cursor/rules/`, `.clinerules/`) never ingest `.bak` files.
+    for ancestor in parent.ancestors() {
+        let dot_git = ancestor.join(".git");
+        if std::fs::symlink_metadata(&dot_git).is_ok() {
+            if let Some(git_dir) = resolve_git_dir_from_marker(ancestor, &dot_git) {
+                let rel = resolved.strip_prefix(ancestor).ok()?;
+                if !rel.as_os_str().is_empty() {
+                    let target = git_dir.join("contextstream-backups").join(rel);
+                    return Some(target.with_file_name(format!("{}{}", file_name, BACKUP_SUFFIX)));
+                }
+            }
+            break;
+        }
+    }
+
+    // Outside Git, still keep backups out of active rule-scanner directories
+    // (`.windsurf/rules/`, `.cursor/rules/`, `.clinerules/`).
+    if parent.file_name().is_some_and(|name| name == "rules") {
+        if let Some(holder) = parent.parent() {
+            if holder
+                .file_name()
+                .is_some_and(|name| name == ".windsurf" || name == ".cursor")
+            {
+                if let Some(project_root) = holder.parent() {
+                    let rel = resolved.strip_prefix(project_root).ok()?;
+                    let target = project_root
+                        .join(".contextstream")
+                        .join("backups")
+                        .join(rel);
+                    return Some(target.with_file_name(format!("{}{}", file_name, BACKUP_SUFFIX)));
+                }
+            }
+        }
+    } else if parent.file_name().is_some_and(|name| name == ".clinerules") {
+        if let Some(project_root) = parent.parent() {
+            let rel = resolved.strip_prefix(project_root).ok()?;
+            let target = project_root
+                .join(".contextstream")
+                .join("backups")
+                .join(rel);
+            return Some(target.with_file_name(format!("{}{}", file_name, BACKUP_SUFFIX)));
+        }
+    }
+
+    None
+}
+
 pub(crate) fn backup_path(path: &Path) -> Result<PathBuf> {
     let resolved = resolve_edit_path(path)?;
     let file_name = resolved
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("Invalid config path: {}", path.display()))?
         .to_string_lossy();
-    Ok(resolved.with_file_name(format!("{}{}", file_name, BACKUP_SUFFIX)))
+    let sibling = resolved.with_file_name(format!("{}{}", file_name, BACKUP_SUFFIX));
+    // Honor any pre-existing legacy sibling backup first so upgrades and explicit
+    // sidecar fixtures continue to find and clean up in-place `.bak` files.
+    if std::fs::symlink_metadata(&sibling).is_ok() {
+        return Ok(sibling);
+    }
+    if let Some(relocated) = relocated_backup_path(&resolved, &file_name) {
+        return Ok(relocated);
+    }
+    Ok(sibling)
 }
 
 fn validate_recovery_file(path: &Path) -> Result<Option<std::fs::Metadata>> {
@@ -780,6 +869,15 @@ fn create_backup_if_absent(path: &Path, content: &[u8]) -> Result<bool> {
         return Ok(false);
     }
 
+    if let Some(parent) = backup.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Could not create recovery backup directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
     // Prepare the complete backup under a private, unique name, then publish
     // it with an atomic no-replace hard link. Writing directly to the final
     // `.bak` path could leave a truncated-but-trusted recovery file if the
@@ -932,6 +1030,26 @@ pub(crate) fn write_public_if_unchanged(
         content,
         Some(expected_existing),
         true,
+        false,
+        None,
+        true,
+    )
+}
+
+/// Variant of [`write_public_if_unchanged`] for files already proven to be
+/// wholly ContextStream-owned (with no pre-ContextStream recovery backup to
+/// preserve), avoiding redundant backups when multiple editors update the same
+/// generated rules file during `setup`.
+pub(crate) fn write_public_owned_file_if_unchanged(
+    path: &Path,
+    content: &str,
+    expected_existing: Option<&str>,
+) -> Result<bool> {
+    write_if_changed_impl_full(
+        path,
+        content,
+        Some(expected_existing),
+        false,
         false,
         None,
         true,
@@ -2332,6 +2450,64 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn backup_path_relocates_git_worktree_and_rule_scanner_backups() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let agents = repo.path().join("AGENTS.md");
+        std::fs::write(&agents, "# Team header\n").unwrap();
+
+        write_public_if_unchanged(
+            &agents,
+            "# Team header\n\n# Managed\n",
+            Some("# Team header\n"),
+        )
+        .unwrap();
+        assert!(
+            !repo
+                .path()
+                .join(format!("AGENTS.md{BACKUP_SUFFIX}"))
+                .exists(),
+            "working tree must not get an untracked AGENTS.md.contextstream.bak"
+        );
+        let relocated = backup_path(&agents).unwrap();
+        assert!(
+            relocated.starts_with(repo.path().join(".git/contextstream-backups")),
+            "expected backup under .git/contextstream-backups, got {}",
+            relocated.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&relocated).unwrap(),
+            "# Team header\n"
+        );
+
+        // Git hooks inside `.git/hooks/` stay in place inside `.git/`.
+        let hook = repo.path().join(".git/hooks/post-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            backup_path(&hook).unwrap(),
+            repo.path()
+                .join(format!(".git/hooks/post-commit{BACKUP_SUFFIX}"))
+        );
+
+        // Non-git `.windsurf/rules/` also keeps `.bak` outside the active rules directory.
+        let non_git = tempfile::tempdir().unwrap();
+        let windsurf_rule = non_git.path().join(".windsurf/rules/contextstream.md");
+        std::fs::create_dir_all(windsurf_rule.parent().unwrap()).unwrap();
+        std::fs::write(&windsurf_rule, "# Old rule\n").unwrap();
+        write_public_if_unchanged(&windsurf_rule, "# Updated rule\n", Some("# Old rule\n"))
+            .unwrap();
+        assert!(
+            !non_git
+                .path()
+                .join(format!(".windsurf/rules/contextstream.md{BACKUP_SUFFIX}"))
+                .exists(),
+            "rule scanner directory must not hold .bak sidecars"
+        );
+        assert!(backup_path(&windsurf_rule).unwrap().exists());
     }
 
     #[cfg(unix)]

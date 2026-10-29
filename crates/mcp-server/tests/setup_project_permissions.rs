@@ -422,3 +422,111 @@ async fn setup_in_non_git_directory_gitignores_secret_project_mcp_config_and_war
         "git status after git init must not show secret .mcp.json as untracked:\n{status_out}"
     );
 }
+
+#[tokio::test]
+async fn setup_keeps_git_working_tree_and_windsurf_rules_free_of_bak_files() {
+    const SECRET: &str = "no-bak-pollution-secret";
+    let (api_url, server) = spawn_mock_setup_server(SECRET).await;
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    init_git_repo(project.path());
+
+    // Case 1: Pre-existing tracked user AGENTS.md, CLAUDE.md, and .windsurf/rules/contextstream.md
+    std::fs::create_dir_all(project.path().join(".windsurf/rules")).unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), "# Team AGENTS header\n").unwrap();
+    std::fs::write(project.path().join("CLAUDE.md"), "# Team CLAUDE header\n").unwrap();
+    std::fs::write(
+        project.path().join(".windsurf/rules/contextstream.md"),
+        "# Old windsurf note\n",
+    )
+    .unwrap();
+    assert!(Command::new("git")
+        .args(["add", "."])
+        .current_dir(project.path())
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args([
+            "-c",
+            "user.name=qa",
+            "-c",
+            "user.email=qa@example.test",
+            "commit",
+            "-qm",
+            "seed user rules",
+        ])
+        .current_dir(project.path())
+        .status()
+        .unwrap()
+        .success());
+
+    let home_path = home.path().to_path_buf();
+    let project_path = project.path().to_path_buf();
+    let api_url_case1 = api_url.clone();
+
+    let out1 = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+            .args([
+                "setup",
+                "--yes",
+                "--editors=claude,cursor,windsurf,codex,cline,roo",
+                &format!("--workspace-id={WORKSPACE_ID}"),
+            ])
+            .env_clear()
+            .env("HOME", &home_path)
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("CONTEXTSTREAM_API_KEY", SECRET)
+            .env("CONTEXTSTREAM_API_URL", &api_url_case1)
+            .env("CONTEXTSTREAM_NO_BROWSER", "1")
+            .env("NO_COLOR", "1")
+            .current_dir(&project_path)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    stop_spawned_watch_helper_if_any(home.path());
+    server.abort();
+
+    assert!(
+        out1.status.success(),
+        "setup failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out1.stdout),
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    let git_status = Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let status_text = String::from_utf8_lossy(&git_status.stdout);
+    assert!(
+        !status_text.contains(".contextstream.bak"),
+        "git status must not show any *.contextstream.bak files:\n{status_text}"
+    );
+    assert!(
+        !project
+            .path()
+            .join(".windsurf/rules/contextstream.md.contextstream.bak")
+            .exists(),
+        ".windsurf/rules/ must not contain .contextstream.bak files"
+    );
+    assert!(
+        !project
+            .path()
+            .join(".git/contextstream-backups/.clinerules.contextstream.bak")
+            .exists(),
+        "cline + roo on a fresh .clinerules must not create a backup of ContextStream's own generated rules"
+    );
+    assert!(
+        project
+            .path()
+            .join(".git/contextstream-backups/AGENTS.md.contextstream.bak")
+            .exists(),
+        "pre-existing user AGENTS.md recovery backup should live under .git/contextstream-backups/"
+    );
+}

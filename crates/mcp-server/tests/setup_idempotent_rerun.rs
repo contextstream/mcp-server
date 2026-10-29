@@ -294,6 +294,23 @@ fn stop_spawned_watch_helper_if_any(home: &Path) {
     }
 }
 
+fn run_setup_yes(home: &Path, cwd: &Path, extra_args: Vec<String>) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+        .args(["setup", "--yes"])
+        .args(extra_args)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("CONTEXTSTREAM_NO_BROWSER", "1")
+        .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("CONTEXTSTREAM_API_KEY")
+        .env_remove("CONTEXTSTREAM_API_URL")
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
 fn snapshot_files(paths: &[PathBuf]) -> Vec<(PathBuf, SystemTime, Vec<u8>)> {
     paths
         .iter()
@@ -493,6 +510,86 @@ async fn setup_yes_rerun_on_healthy_indexed_project_is_quiet_and_mutates_nothing
             after_mtime,
             "healthy re-run touched mtime of {}",
             path.display()
+        );
+    }
+
+    // 2b. A bootstrap script passes the same flags every time. When each one names
+    // what is already saved, the re-run is just as quiet and changes nothing (#298).
+    let flags_home = home.clone();
+    let flags_proj = project.clone();
+    let same_flags = vec![
+        "--editors=claude".to_string(),
+        format!("--workspace-id={WORKSPACE_ID}"),
+        format!("--project-path={}", project.display()),
+        format!("--project-id={PROJECT_ID}"),
+    ];
+    let flags_out =
+        tokio::task::spawn_blocking(move || run_setup_yes(&flags_home, &flags_proj, same_flags))
+            .await
+            .unwrap();
+    let flags_stdout = String::from_utf8_lossy(&flags_out.stdout);
+    assert!(
+        flags_out.status.success(),
+        "same-flags re-run failed:\nstdout:\n{flags_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&flags_out.stderr)
+    );
+    assert!(
+        flags_stdout.contains("already set up and healthy"),
+        "expected the concise confirmation for matching flags, got:\n{flags_stdout}"
+    );
+    for noisy in [
+        "CONTEXTSTREAM SETUP",
+        "DATA AND PRIVACY",
+        "Indexing in the background",
+        "Restart Claude Code",
+    ] {
+        assert!(
+            !flags_stdout.contains(noisy),
+            "a re-run with matching flags should omit {noisy:?}, got:\n{flags_stdout}"
+        );
+    }
+    let after_flags = snapshot_files(&watched_paths);
+    for ((path, before_mtime, before_bytes), (_, after_mtime, after_bytes)) in
+        before.iter().zip(after_flags.iter())
+    {
+        assert_eq!(
+            before_bytes,
+            after_bytes,
+            "a re-run with matching flags mutated {}",
+            path.display()
+        );
+        assert_eq!(
+            before_mtime,
+            after_mtime,
+            "a re-run with matching flags touched mtime of {}",
+            path.display()
+        );
+    }
+
+    // 2c. A flag that differs from what is saved is a request for a change, so the
+    // quick confirmation must not swallow it.
+    let other_workspace = "99999999-9999-4999-8999-999999999999";
+    for different in [
+        format!("--workspace-id={other_workspace}"),
+        "--project-name=a-different-name".to_string(),
+        // Last: the full setup it triggers adds a second editor.
+        "--editors=claude,codex".to_string(),
+    ] {
+        let diff_home = home.clone();
+        let diff_proj = project.clone();
+        let flag = different.clone();
+        let diff_out =
+            tokio::task::spawn_blocking(move || run_setup_yes(&diff_home, &diff_proj, vec![flag]))
+                .await
+                .unwrap();
+        let diff_stdout = String::from_utf8_lossy(&diff_out.stdout);
+        assert!(
+            !diff_stdout.contains("already set up and healthy"),
+            "{different} differs from the saved state and must not be reported as healthy:\n{diff_stdout}"
+        );
+        assert!(
+            diff_stdout.contains("CONTEXTSTREAM SETUP"),
+            "{different} should run the full setup, got:\n{diff_stdout}"
         );
     }
 

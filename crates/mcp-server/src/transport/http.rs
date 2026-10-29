@@ -1017,6 +1017,16 @@ async fn handle_mcp_streamable(
         session_profile,
         state.registry.default_tool_surface_profile(),
     );
+    // A refused credential fails initialize the way a missing one does:
+    // HTTP 401 with WWW-Authenticate, which an editor reports as a failed
+    // connection, where a JSON-RPC error in a 200 still read "Connected"
+    // (#252, #303).
+    if request.method == "initialize" && !uses_stateless_http_contract(&headers, &request) {
+        if let Some(refusal) = credential_refused_at_initialize(&state, &headers).await {
+            let path = matched_path.as_ref().map_or("/mcp", |path| path.as_str());
+            return oauth_unauthorized_response(&headers, path, refusal, refusal);
+        }
+    }
     run_with_tool_surface_profile(surface_profile, || {
         serve_mcp_streamable(
             state,
@@ -1204,13 +1214,6 @@ async fn serve_mcp_streamable(
                 ),
                 data: None,
             }),
-            "initialize" if api_key_refused_at_initialize(&state, &headers).await => {
-                Err(JsonRpcError {
-                    code: INITIALIZE_KEY_REFUSED_CODE,
-                    message: INITIALIZE_KEY_REFUSED_MESSAGE.to_string(),
-                    data: None,
-                })
-            }
             "initialize" => {
                 state
                     .telemetry
@@ -2498,12 +2501,14 @@ const INITIALIZE_KEY_ACCEPTED_TTL: Duration = Duration::from_secs(600);
 const INITIALIZE_KEY_REFUSED_TTL: Duration = Duration::from_secs(60);
 const INITIALIZE_KEY_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const INITIALIZE_KEY_CACHE_LIMIT: usize = 10_000;
-/// JSON-RPC error code for an `initialize` whose API key the API refused.
-const INITIALIZE_KEY_REFUSED_CODE: i32 = -32001;
 const INITIALIZE_KEY_REFUSED_MESSAGE: &str =
     "ContextStream did not accept the API key sent with this \
     connection (invalid, expired or revoked). Save a valid key with `contextstream-mcp setup` and \
     restart the editor, or update the X-ContextStream-API-Key header in the editor's MCP config.";
+const INITIALIZE_TOKEN_REFUSED_MESSAGE: &str =
+    "ContextStream did not accept the access token sent with this \
+    connection (invalid or expired). Reconnect to sign in again, or use an API key from \
+    `contextstream-mcp setup`.";
 
 /// Hashed caller identity -> (accepted, when the API answered).
 fn initialize_key_verdicts() -> &'static std::sync::Mutex<HashMap<String, (bool, Instant)>> {
@@ -2512,31 +2517,33 @@ fn initialize_key_verdicts() -> &'static std::sync::Mutex<HashMap<String, (bool,
     VERDICTS.get_or_init(Default::default)
 }
 
-/// On the hosted gateway (`require_auth`), an `initialize` carrying an API key
-/// the API refuses with a definite 401 fails, so an editor does not report a
-/// connection whose every tool call would fail (#252). An unreachable, slow or
-/// failing API lets the initialize through as before; bearer JWTs were
-/// verified by the auth middleware already. The API is asked with this
-/// request's own credentials (the middleware's task-local auth override).
-async fn api_key_refused_at_initialize(state: &HttpState, headers: &HeaderMap) -> bool {
+/// On the hosted gateway (`require_auth`), an `initialize` whose credential the
+/// API refuses with a definite 401 fails, so an editor does not report a
+/// connection whose every tool call would fail (#252, #303). A bearer token is
+/// checked the same way unless the gateway verified it itself (it has the JWT
+/// secret). An unreachable, slow or failing API lets the initialize through.
+/// The API is asked with this request's own credentials (the middleware's
+/// task-local auth override). Returns what to tell the client.
+async fn credential_refused_at_initialize(
+    state: &HttpState,
+    headers: &HeaderMap,
+) -> Option<&'static str> {
     if !state.require_auth {
-        return false;
+        return None;
     }
-    let Some(auth) = extract_auth_override(headers) else {
-        return false;
+    let auth = extract_auth_override(headers)?;
+    let (identity, refusal) = match (auth.jwt.as_deref(), auth.api_key.as_deref()) {
+        (Some(_), _) if state.jwt_secret.is_some() => return None,
+        (Some(token), _) => (
+            SessionKey::Jwt(token.to_string()).atlas_user_scope_token(),
+            INITIALIZE_TOKEN_REFUSED_MESSAGE,
+        ),
+        (None, Some(api_key)) => (
+            SessionKey::ApiKey(api_key.to_string()).atlas_user_scope_token(),
+            INITIALIZE_KEY_REFUSED_MESSAGE,
+        ),
+        (None, None) => return None,
     };
-    if auth.jwt.is_some() {
-        return false;
-    }
-    let Some(api_key) = auth
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-    else {
-        return false;
-    };
-    let identity = SessionKey::ApiKey(api_key.to_string()).atlas_user_scope_token();
     let now = Instant::now();
     if let Some(identity) = identity.as_deref() {
         let cached = initialize_key_verdicts()
@@ -2551,7 +2558,7 @@ async fn api_key_refused_at_initialize(state: &HttpState, headers: &HeaderMap) -
                 INITIALIZE_KEY_REFUSED_TTL
             };
             if now.duration_since(at) < ttl {
-                return !accepted;
+                return (!accepted).then_some(refusal);
             }
         }
     }
@@ -2559,7 +2566,7 @@ async fn api_key_refused_at_initialize(state: &HttpState, headers: &HeaderMap) -
     {
         Ok(Ok(_)) => true,
         Ok(Err(mcp_types::Error::Http { status: 401, .. })) => false,
-        _ => return false,
+        _ => return None,
     };
     if let Some(identity) = identity {
         let mut verdicts = initialize_key_verdicts()
@@ -2573,7 +2580,7 @@ async fn api_key_refused_at_initialize(state: &HttpState, headers: &HeaderMap) -
         }
         verdicts.insert(identity, (accepted, now));
     }
-    !accepted
+    (!accepted).then_some(refusal)
 }
 
 async fn handle_initialize_method(
@@ -2900,21 +2907,25 @@ fn extract_auth_override(headers: &HeaderMap) -> Option<AuthOverride> {
     let mut api_key: Option<String> = None;
     let mut jwt: Option<String> = None;
 
+    // An empty or blank credential header (what an editor config sends when
+    // the variable it names is unset) is no credential (#303).
+    let credential = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|h| h.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+
     // Explicit API-key headers
-    if let Some(v) = headers
-        .get("x-api-key")
-        .or_else(|| headers.get("x-contextstream-api-key"))
-        .and_then(|h| h.to_str().ok())
-    {
-        api_key = Some(v.to_string());
+    if let Some(v) = credential("x-api-key").or_else(|| credential("x-contextstream-api-key")) {
+        api_key = Some(v);
     }
 
     // Explicit JWT header
-    if let Some(v) = headers
-        .get("x-contextstream-jwt")
-        .and_then(|h| h.to_str().ok())
-    {
-        jwt = Some(v.to_string());
+    if let Some(v) = credential("x-contextstream-jwt") {
+        jwt = Some(v);
     }
 
     // Authorization: Bearer – could be an API key or a JWT
@@ -2923,8 +2934,10 @@ fn extract_auth_override(headers: &HeaderMap) -> Option<AuthOverride> {
             .get(header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
             .and_then(|h| h.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
         {
-            let token = bearer.trim().to_string();
+            let token = bearer.to_string();
             // Heuristic: JWTs have three dot-separated base64 segments
             let parts: Vec<&str> = token.split('.').collect();
             if parts.len() == 3 && parts.iter().all(|p| !p.is_empty()) {
@@ -7692,14 +7705,19 @@ mod initialize_key_tests {
     }
 
     async fn initialize(router: axum::Router, api_key: &str) -> Value {
-        let response = router
+        let response = initialize_with(router, "x-contextstream-api-key", api_key).await;
+        json_body(response).await
+    }
+
+    async fn initialize_with(router: axum::Router, header: &str, value: &str) -> Response {
+        router
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("accept", "application/json, text/event-stream")
-                    .header("x-contextstream-api-key", api_key)
+                    .header(header, value)
                     .body(Body::from(
                         json!({
                             "jsonrpc": "2.0",
@@ -7716,7 +7734,10 @@ mod initialize_key_tests {
                     .expect("initialize request"),
             )
             .await
-            .expect("initialize response");
+            .expect("initialize response")
+    }
+
+    async fn json_body(response: Response) -> Value {
         let bytes = response
             .into_body()
             .collect()
@@ -7734,24 +7755,68 @@ mod initialize_key_tests {
         serde_json::from_str(&json_text).unwrap_or_else(|_| panic!("JSON body: {text}"))
     }
 
+    /// A refused credential fails initialize like a missing one: HTTP 401 with
+    /// WWW-Authenticate (#252: a JSON-RPC error in a 200 still read "Connected").
+    async fn assert_refused(response: Response, says: &str) {
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+        let body = json_body(response).await;
+        assert!(
+            body["error_description"]
+                .as_str()
+                .is_some_and(|message| message.contains(says)),
+            "{body}"
+        );
+    }
+
     #[tokio::test]
     async fn hosted_initialize_refuses_a_key_the_api_rejects_and_remembers_it() {
         let (api_url, hits) = api_answering("HTTP/1.1 401 Unauthorized").await;
-        let body = initialize(hosted_gateway(api_url.clone()), "refused-key-252").await;
-        assert_eq!(body["error"]["code"], INITIALIZE_KEY_REFUSED_CODE, "{body}");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("did not accept the API key")),
-            "{body}"
-        );
+        let gateway = hosted_gateway(api_url.clone());
+        let response = initialize_with(gateway, "x-contextstream-api-key", "refused-key-252").await;
+        assert_refused(response, "did not accept the API key").await;
         let asked = hits.load(Ordering::SeqCst);
         assert!(asked >= 1);
 
         // A reconnect within the cache window is refused without asking again.
-        let body = initialize(hosted_gateway(api_url), "refused-key-252").await;
-        assert_eq!(body["error"]["code"], INITIALIZE_KEY_REFUSED_CODE, "{body}");
+        let gateway = hosted_gateway(api_url);
+        let response = initialize_with(gateway, "x-contextstream-api-key", "refused-key-252").await;
+        assert_refused(response, "did not accept the API key").await;
         assert_eq!(hits.load(Ordering::SeqCst), asked);
+    }
+
+    #[tokio::test]
+    async fn hosted_initialize_checks_a_bearer_token_it_cannot_verify_itself() {
+        // #303: a garbage JWT passed initialize on the hosted gateway.
+        let (api_url, hits) = api_answering("HTTP/1.1 401 Unauthorized").await;
+        let response = initialize_with(
+            hosted_gateway(api_url),
+            "authorization",
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjF9.x303",
+        )
+        .await;
+        assert_refused(response, "did not accept the access token").await;
+        assert!(hits.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_credential_header_is_no_credential() {
+        // #303: an editor config naming an unset variable sends an empty key.
+        let (api_url, hits) = api_answering("HTTP/1.1 200 OK").await;
+        for (header, value) in [("x-api-key", ""), ("x-contextstream-api-key", "   ")] {
+            let response = initialize_with(hosted_gateway(api_url.clone()), header, value).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{header}");
+            let body = json_body(response).await;
+            assert_eq!(
+                body["error_description"], "Bearer token required",
+                "{header}"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "nothing was asked of the API"
+        );
     }
 
     #[tokio::test]

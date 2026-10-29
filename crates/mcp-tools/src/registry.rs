@@ -1017,7 +1017,9 @@ impl ToolRegistry {
                     category,
                 );
             }
-            Err(error) => client.spawn_activation_failure(
+            // The event is `mcp_connection_failed`: a tool refusing the
+            // caller's input is not one (#291).
+            Err(error) if error.is_connection_failure() => client.spawn_activation_failure(
                 state.workspace_id,
                 state.project_id,
                 state.session_id.clone(),

@@ -55,6 +55,65 @@ const KNOWN_RULES_FILENAMES: &[&str] = &[
     "contextstream.md",
 ];
 
+/// Base names of the project files `setup` writes a managed rules block into.
+/// Matched on the file name at any depth, because ingest meets these files
+/// wherever a monorepo package keeps one. Whether a file with one of these
+/// names is excluded is decided by [`is_managed_rules_only`], never by the
+/// name alone: `AGENTS.md` and `CLAUDE.md` are also where people write their
+/// own project guidance.
+const MANAGED_RULES_FILE_NAMES: &[&str] = &[
+    "CLAUDE.md",
+    "AGENTS.md",
+    "GEMINI.md",
+    "QWEN.md",
+    "CONVENTIONS.md",
+    "copilot-instructions.md",
+    ".cursorrules",
+    ".windsurfrules",
+    ".clinerules",
+    ".kilocoderules",
+    ".aider.conf.yml",
+    "contextstream.md",
+    "contextstream.mdc",
+];
+
+const MANAGED_BLOCK_OPENERS: [&str; 2] = ["<contextstream>", "<!-- BEGIN ContextStream -->"];
+const MANAGED_BLOCK_CLOSERS: [&str; 2] = ["</contextstream>", "<!-- END ContextStream -->"];
+
+/// Whether `name` (a bare file name) is one `setup` writes a managed rules
+/// block into.
+pub fn is_managed_rules_file_name(name: &str) -> bool {
+    MANAGED_RULES_FILE_NAMES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(name))
+}
+
+/// Whether `text` is nothing but ContextStream-managed rules blocks and blank
+/// lines, which is what `setup` writes into a rules file that did not exist.
+///
+/// The text of those blocks is instructions for the agent, which its editor
+/// already loads from the file. Indexed with the project's code, it outranked
+/// that code for unrelated questions. A file with any other content, such as
+/// the person's own guidance next to the block, or a block that is not closed
+/// (an edit in progress), is not managed-only and is indexed as before.
+pub fn is_managed_rules_only(text: &str) -> bool {
+    let mut inside = false;
+    let mut blocks = 0usize;
+    for line in text.strip_prefix('\u{feff}').unwrap_or(text).lines() {
+        // YAML surfaces such as `.aider.conf.yml` comment the tags out.
+        let tag = line.trim().trim_start_matches('#').trim();
+        if inside {
+            inside = !MANAGED_BLOCK_CLOSERS.contains(&tag);
+        } else if MANAGED_BLOCK_OPENERS.contains(&tag) {
+            inside = true;
+            blocks += 1;
+        } else if !line.trim().is_empty() {
+            return false;
+        }
+    }
+    blocks > 0 && !inside
+}
+
 /// Comment marker used inside the `<contextstream>` block of locally-
 /// generated rules files to record the canonical teaching-bundle
 /// fingerprint that wrote them. Reading this back lets the MCP binary
@@ -286,6 +345,67 @@ mod tests {
         // Embed in a realistic surrounding block.
         let file = format!("<contextstream>\n{}# rest of the file\n", line);
         assert_eq!(extract_hash_marker(&file).as_deref(), Some(h));
+    }
+
+    #[test]
+    fn a_file_of_only_managed_blocks_is_managed_only() {
+        let block = format!(
+            "<contextstream>\n{}# ContextStream Rules\n\nUse `context()` first.\n</contextstream>\n",
+            format_hash_marker("deadbeefcafebabe")
+        );
+        assert!(is_managed_rules_only(&block));
+        // Blank lines around and between blocks, CRLF endings and a BOM.
+        assert!(is_managed_rules_only(&format!("\n\n{block}\n\n{block}\n")));
+        assert!(is_managed_rules_only(&block.replace('\n', "\r\n")));
+        assert!(is_managed_rules_only(&format!("\u{feff}{block}")));
+        // The legacy markers and the commented-out YAML form.
+        assert!(is_managed_rules_only(
+            "<!-- BEGIN ContextStream -->\nrules\n<!-- END ContextStream -->\n"
+        ));
+        assert!(is_managed_rules_only(
+            "# <contextstream>\n# ContextStream managed rules reference\n# </contextstream>\n"
+        ));
+    }
+
+    #[test]
+    fn a_file_with_anything_else_is_not_managed_only() {
+        let block = "<contextstream>\nrules\n</contextstream>\n";
+        // The person's own guidance, before or after the block.
+        assert!(!is_managed_rules_only(&format!(
+            "# Project notes\n\n{block}"
+        )));
+        assert!(!is_managed_rules_only(&format!(
+            "{block}\n## Our conventions\n"
+        )));
+        // Nothing to exclude: empty, blank, or no block at all.
+        assert!(!is_managed_rules_only(""));
+        assert!(!is_managed_rules_only("\n  \n"));
+        assert!(!is_managed_rules_only("# Just a readme\n"));
+        // A block that never closes is an edit in progress, not a managed file.
+        assert!(!is_managed_rules_only("<contextstream>\nrules\n"));
+        // A tag inside a sentence is text, not a block.
+        assert!(!is_managed_rules_only(
+            "Wrap it in <contextstream> and </contextstream> tags.\n"
+        ));
+    }
+
+    #[test]
+    fn managed_rules_file_names_match_without_regard_to_case() {
+        for name in [
+            "CLAUDE.md",
+            "AGENTS.md",
+            "GEMINI.md",
+            "QWEN.md",
+            "claude.md",
+            "copilot-instructions.md",
+            ".cursorrules",
+            ".aider.conf.yml",
+        ] {
+            assert!(is_managed_rules_file_name(name), "{name}");
+        }
+        for name in ["README.md", "main.rs", "rules.md", "CLAUDE.md.bak", ""] {
+            assert!(!is_managed_rules_file_name(name), "{name}");
+        }
     }
 
     #[test]

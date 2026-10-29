@@ -3127,6 +3127,9 @@ impl ContextStreamClient {
             }
             Err(BoundedTextReadError::Transient) => return TargetedFileDecision::Reject,
         };
+        if Self::is_managed_rules_content(name, &content) {
+            return TargetedFileDecision::Delete(relative);
+        }
         if std::fs::canonicalize(&candidate).ok().as_ref() != Some(&canonical_before) {
             return TargetedFileDecision::Reject;
         }
@@ -11130,8 +11133,31 @@ impl ContextStreamClient {
                 })
                 .flatten();
 
+            // The managed rules `setup` writes are instructions for the agent,
+            // not project code. Checked even when the fingerprint says the
+            // file is unchanged, so a copy an older release indexed goes too.
+            let managed_rules_bytes = mcp_types::rules_hash::is_managed_rules_file_name(name)
+                .then(|| {
+                    Self::read_bounded_text_beneath(
+                        &canonical_root,
+                        Path::new(&relative_path),
+                        5 * 1024 * 1024,
+                    )
+                    .ok()
+                    .filter(|content| Self::is_managed_rules_content(name, content))
+                    .map(|content| content.len())
+                })
+                .flatten();
             let reused = cached_hash.is_some();
-            if reused {
+            if let Some(bytes) = managed_rules_bytes {
+                content_files_read += 1;
+                content_bytes_read = content_bytes_read.saturating_add(bytes as u64);
+                // Like invalid UTF-8, a stable policy exclusion: one tombstone,
+                // and capped scans move past it.
+                policy_deleted_paths.push(relative_path.clone());
+                page_observed_paths.push(relative_path.clone());
+                policy_excluded_after_read = true;
+            } else if reused {
                 reused_files += 1;
             } else if Self::is_media_file(name) {
                 match Self::read_bounded_bytes_beneath(
@@ -11426,6 +11452,34 @@ impl ContextStreamClient {
     pub fn ingest_ignores_relative_path(root: &Path, relative: &str) -> bool {
         let candidate = root.join(relative);
         Self::targeted_path_is_ignored(root, &candidate, relative) != Ok(false)
+            || Self::is_managed_rules_only_file(&candidate)
+    }
+
+    /// Whether a text file is a rules file holding nothing but the managed
+    /// block `setup` wrote (see [`mcp_types::rules_hash::is_managed_rules_only`]).
+    /// Those blocks are instructions for the agent, which its editor already
+    /// loads, so indexing them only buried project code under them in search.
+    fn is_managed_rules_content(name: &str, content: &str) -> bool {
+        mcp_types::rules_hash::is_managed_rules_file_name(name)
+            && mcp_types::rules_hash::is_managed_rules_only(content)
+    }
+
+    /// [`Self::is_managed_rules_content`] for a file on disk. Anything that
+    /// cannot be read, or is too large to be what `setup` wrote (its block is
+    /// tens of KB), is not managed-only.
+    fn is_managed_rules_only_file(candidate: &Path) -> bool {
+        const MANAGED_RULES_MAX_BYTES: u64 = 1024 * 1024;
+        let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if !mcp_types::rules_hash::is_managed_rules_file_name(name)
+            || std::fs::metadata(candidate)
+                .map_or(true, |meta| meta.len() > MANAGED_RULES_MAX_BYTES)
+        {
+            return false;
+        }
+        std::fs::read_to_string(candidate)
+            .is_ok_and(|content| Self::is_managed_rules_content(name, &content))
     }
 
     /// Check if a file is a media file (image, audio, video, document).
@@ -28201,6 +28255,155 @@ mod tests {
             .iter()
             .any(|path| path == "invalid.rs"));
         assert!(scan.files.iter().all(|file| file["path"] != "invalid.rs"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    const MANAGED_RULES_FILE: &str = "<contextstream>\n\
+        <!-- contextstream-rules-hash: deadbeefcafebabe -->\n\
+        # ContextStream Rules\nCall context() first.\n</contextstream>\n";
+
+    #[test]
+    fn managed_rules_files_are_not_indexed_but_a_persons_own_guidance_is(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("mcp-client-managed-rules-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("packages/api"))?;
+        // Git metadata is never source; a plain directory keeps targeted policy valid.
+        std::fs::create_dir_all(root.join(".git"))?;
+        // What `setup` writes into a rules file that did not exist, at the
+        // root and in a package, next to the person's own guidance with the
+        // block added, a file that is not a rules file, and code.
+        std::fs::write(root.join("CLAUDE.md"), MANAGED_RULES_FILE)?;
+        std::fs::write(root.join("packages/api/AGENTS.md"), MANAGED_RULES_FILE)?;
+        std::fs::write(
+            root.join("AGENTS.md"),
+            format!("# Our conventions\n\nPrefer small functions.\n\n{MANAGED_RULES_FILE}"),
+        )?;
+        std::fs::write(root.join("README.md"), MANAGED_RULES_FILE)?;
+        std::fs::write(root.join("main.rs"), "fn main() {}\n")?;
+        let root_path = root.to_string_lossy().to_string();
+
+        for managed in ["CLAUDE.md", "packages/api/AGENTS.md"] {
+            assert!(
+                matches!(
+                    ContextStreamClient::targeted_text_file_decision(
+                        &root_path,
+                        root.join(managed).to_string_lossy().as_ref(),
+                    ),
+                    TargetedFileDecision::Delete(path) if path == managed
+                ),
+                "{managed} is tombstoned"
+            );
+            assert!(ContextStreamClient::ingest_ignores_relative_path(
+                &root, managed
+            ));
+        }
+        for indexed in ["AGENTS.md", "README.md", "main.rs"] {
+            assert!(
+                matches!(
+                    ContextStreamClient::targeted_text_file_decision(
+                        &root_path,
+                        root.join(indexed).to_string_lossy().as_ref(),
+                    ),
+                    TargetedFileDecision::Upload(_)
+                ),
+                "{indexed} is uploaded"
+            );
+            assert!(!ContextStreamClient::ingest_ignores_relative_path(
+                &root, indexed
+            ));
+        }
+
+        let client = ContextStreamClient::new(Config::default());
+        let scan = client.read_local_files(&root_path, usize::MAX, false)?;
+        assert!(
+            scan.complete,
+            "a managed rules file is a terminal policy exclusion"
+        );
+        let mut tombstoned = scan.policy_deleted_paths.clone();
+        tombstoned.sort();
+        assert_eq!(tombstoned, ["CLAUDE.md", "packages/api/AGENTS.md"]);
+        let mut uploaded: Vec<&str> = scan
+            .files
+            .iter()
+            .filter_map(|file| file["path"].as_str())
+            .collect();
+        uploaded.sort();
+        assert_eq!(uploaded, ["AGENTS.md", "README.md", "main.rs"]);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_rules_file_an_older_release_indexed_is_removed_though_its_fingerprint_is_unchanged(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("mcp-client-managed-rules-warm-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(root.join("CLAUDE.md"), MANAGED_RULES_FILE)?;
+        std::fs::write(root.join("src/lib.rs"), "pub fn a() {}\n")?;
+
+        // The manifest an earlier release left: both files indexed, with the
+        // stat tuples a warm scan trusts.
+        let mut manifest = HashManifestData {
+            hashes: Default::default(),
+            fingerprints: Default::default(),
+        };
+        let mut cutoff = (0, 0);
+        for (relative, content) in [
+            ("CLAUDE.md", MANAGED_RULES_FILE),
+            ("src/lib.rs", "pub fn a() {}\n"),
+        ] {
+            let fingerprint = ContextStreamClient::local_file_fingerprint(&std::fs::metadata(
+                root.join(relative),
+            )?)
+            .expect("regular file fingerprint");
+            cutoff = std::cmp::max(
+                cutoff,
+                std::cmp::max(
+                    (
+                        fingerprint.modified_seconds,
+                        fingerprint.modified_nanoseconds,
+                    ),
+                    (fingerprint.changed_seconds, fingerprint.changed_nanoseconds),
+                ),
+            );
+            manifest.hashes.insert(
+                relative.to_string(),
+                ContextStreamClient::sha256_hex(content),
+            );
+            manifest
+                .fingerprints
+                .insert(relative.to_string(), fingerprint);
+        }
+        let policy = FingerprintReusePolicy {
+            closed_tick_cutoff: Some(FilesystemTimestamp {
+                seconds: cutoff.0,
+                nanoseconds: cutoff.1,
+            }),
+            refresh_cutoff_per_file: false,
+            filesystem_supported_override: Some(true),
+        };
+
+        let client = ContextStreamClient::new(Config::default());
+        let scan = client.read_local_files_scoped_with_policy(
+            root.to_string_lossy().as_ref(),
+            usize::MAX,
+            false,
+            "managed-rules-warm",
+            Some(&manifest),
+            false,
+            policy,
+        )?;
+        assert!(scan.complete);
+        assert!(scan.files.is_empty());
+        assert_eq!(scan.reused_files, 1, "only src/lib.rs is still reused");
+        assert_eq!(scan.policy_deleted_paths, ["CLAUDE.md"]);
+        assert!(!scan.fingerprints.contains_key("CLAUDE.md"));
 
         std::fs::remove_dir_all(root)?;
         Ok(())

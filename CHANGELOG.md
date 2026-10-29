@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.40
+
+- Setup keeps what you set before:
+  - re-running `setup` without `--editors` keeps the editors configured earlier (#239, #240);
+  - `setup --account-only` works on accounts with several workspaces and defers installation
+    state until the account is chosen (#254);
+  - `setup` saves the validated `CONTEXTSTREAM_API_KEY`.
+- Project linking:
+  - `link` on a healthy linked project shows the project's details, with no contradictory
+    fallback text (#258);
+  - a linked monorepo subpackage resolves before the enclosing git root (#244).
+- `doctor` infers the linked project scope when run read-only, and its deep project learning
+  status matches setup's (#242).
+- The `coordination` tool's `share` resolves the session's scope and validates `project_id`
+  (#259).
+
 ## 1.0.39
 
 - Setup wizard and `configure` deep project learning improvements:

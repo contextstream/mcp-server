@@ -2423,6 +2423,22 @@ async fn an_automatic_run_starts_without_a_quote_in_the_background_marked_auto_m
     assert!(text_of(&listed).contains("started automatically (auto_mcp)"));
 }
 
+#[test]
+fn an_automatic_run_names_no_price() {
+    let mut task = task_view("succeeded", true);
+    task["source"] = json!("auto_mcp");
+    let text = format::task_text(&task, None, &[]);
+    assert!(!text.contains("Cost:"), "{text}");
+    assert!(!text.contains("credits"), "{text}");
+    assert!(text.contains("Summary: Two findings in the retry loop."));
+    let listed = format::task_list_text(&json!({"tasks": [task]}));
+    assert!(!listed.contains("credits"), "{listed}");
+    assert!(listed.contains("started automatically (auto_mcp)"));
+    // A run the person asked for still says what it cost.
+    let manual = format::task_text(&task_view("succeeded", true), None, &[]);
+    assert!(manual.contains("Cost: charged 1200 credits"));
+}
+
 #[tokio::test]
 async fn with_automatic_runs_off_or_unknown_nothing_runs() {
     for (key, setting) in [

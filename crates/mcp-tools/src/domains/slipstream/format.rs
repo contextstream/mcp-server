@@ -128,7 +128,11 @@ pub(crate) fn task_text(task: &Value, catalog: Option<&Catalog>, notes: &[String
         (_, None) if done && !succeeded => "Cost: not charged".to_string(),
         (_, None) => "Cost: metered per model call".to_string(),
     };
-    lines.push(format!("{cost} {tag}"));
+    // A run a client started on its own names no price: the workspace's limits hold it,
+    // and the person never sees a per-run price (owner preference; csc's cards do the same).
+    if !is_automatic(task) {
+        lines.push(format!("{cost} {tag}"));
+    }
 
     for note in notes {
         lines.push(format!("Note: {note} {tag}"));
@@ -262,6 +266,13 @@ pub(crate) fn catalog_text(catalog: &Catalog, auto_accept_max_credits: u32) -> S
 }
 
 /// `list_runs`: one line per task, newest first, each with its task id.
+/// A run a client started on its own (`auto_mcp`, `auto_contextcode`, `auto_web`).
+fn is_automatic(task: &Value) -> bool {
+    task.get("source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source.starts_with("auto_"))
+}
+
 pub(crate) fn task_list_text(list: &Value) -> String {
     let tasks = list
         .get("tasks")
@@ -278,7 +289,9 @@ pub(crate) fn task_list_text(list: &Value) -> String {
         let status = task.get("status").and_then(Value::as_str).unwrap_or("?");
         let created = task.get("created_at").and_then(Value::as_str).unwrap_or("");
         let cost = match task.get("charged_credits").and_then(Value::as_i64) {
-            Some(charged) if charged > 0 => format!(", charged {charged} credits"),
+            Some(charged) if charged > 0 && !is_automatic(task) => {
+                format!(", charged {charged} credits")
+            }
             _ => String::new(),
         };
         // A run a client started on its own (`auto_mcp`, `auto_contextcode`, `auto_web`).

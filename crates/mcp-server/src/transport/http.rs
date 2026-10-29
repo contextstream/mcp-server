@@ -1240,7 +1240,15 @@ async fn serve_mcp_streamable(
                 }
                 result
             }
-            "tools/list" => handle_list_tools_method(&state, request_registry.clone()).await,
+            "tools/list" => {
+                let mut listing = handle_list_tools_method(&state, request_registry.clone()).await;
+                if client_confirms_writes(&headers) {
+                    if let Ok(listing) = listing.as_mut() {
+                        add_read_only_twins(&state, request_registry.clone(), listing).await;
+                    }
+                }
+                listing
+            }
             "tools/call" => {
                 handle_call_tool_method(
                     &state,
@@ -1570,7 +1578,29 @@ fn apply_default_context_mode(request: &mut JsonRpcRequest, default_context_mode
 /// sessions initialized as clientInfo `Gemini`.
 fn client_without_local_checkout(headers: &HeaderMap) -> bool {
     header_str(headers, "user-agent").is_some_and(|agent| agent.trim() == "Google")
-        || session_client_identity(headers).0 == "Gemini"
+        || session_client_identity(headers).0 == mcp_types::harness::GEMINI_APP_CLIENT_NAME
+}
+
+/// Whether the request comes from a client that asks its person to confirm
+/// every tool call not annotated read-only: the Gemini app, the same requests
+/// as [`client_without_local_checkout`]. Its `tools/list` also carries the
+/// read-only twins (`mcp_tools::domains::read_only`).
+fn client_confirms_writes(headers: &HeaderMap) -> bool {
+    client_without_local_checkout(headers)
+}
+
+async fn add_read_only_twins(
+    state: &HttpState,
+    registry_override: Option<Arc<ToolRegistry>>,
+    listing: &mut Value,
+) {
+    let registry = match registry_override {
+        Some(registry) => registry,
+        None => effective_registry(state).await,
+    };
+    if let Some(tools) = listing.get_mut("tools").and_then(Value::as_array_mut) {
+        crate::server::with_read_only_twins(&registry, None, tools);
+    }
 }
 
 /// A `folder_path` such a client passes to `init` names a folder on the
@@ -5023,6 +5053,24 @@ mod tests {
             assert!(other_tool.params["arguments"]
                 .get("skip_project_creation")
                 .is_none());
+        }
+
+        #[test]
+        fn only_the_gemini_app_gets_the_read_only_twins() {
+            assert!(client_confirms_writes(&headers_with(&[(
+                "user-agent",
+                "Google"
+            )])));
+            for agent in [
+                "claude-code/2.1.312 (cli)",
+                "codex-mcp-client/0.165.0",
+                "Google-Extended",
+            ] {
+                assert!(
+                    !client_confirms_writes(&headers_with(&[("user-agent", agent)])),
+                    "{agent}"
+                );
+            }
         }
 
         #[test]

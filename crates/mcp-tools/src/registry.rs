@@ -728,7 +728,12 @@ impl ToolRegistry {
         // surface profile is `Coach`.
         // `studio` is registered the same way: the ContextStudio surface (`/studio`)
         // serves it whatever the toolset; elsewhere it is listed per caller.
-        if crate::domains::coach::is_coach_tool(name) || name == crate::domains::studio::TOOL_NAME {
+        // So are the read-only twins (`domains::read_only`): direct tools only,
+        // listed per caller, and never in an operations catalog.
+        if crate::domains::coach::is_coach_tool(name)
+            || name == crate::domains::studio::TOOL_NAME
+            || crate::domains::read_only::is_read_only_twin(name)
+        {
             self.tools.insert(
                 name.to_string(),
                 RegisteredTool {
@@ -1914,9 +1919,11 @@ const LISTED_PER_CALLER: &[&str] = &[
     crate::domains::studio::TOOL_NAME,
 ];
 
-/// Whether `name` is listed per caller rather than from the registry.
+/// Whether `name` is listed per caller rather than from the registry. The
+/// read-only twins (`domains::read_only`) are too: the hosted gateway lists
+/// them for a client that confirms every call that may write.
 pub fn is_listed_per_caller(name: &str) -> bool {
-    LISTED_PER_CALLER.contains(&name)
+    LISTED_PER_CALLER.contains(&name) || crate::domains::read_only::is_read_only_twin(name)
 }
 
 /// Check if tool is a router direct tool (exposed in router mode).

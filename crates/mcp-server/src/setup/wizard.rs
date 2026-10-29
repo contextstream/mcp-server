@@ -1057,6 +1057,7 @@ async fn finish(
             } else {
                 ui::say(Mark::Ok, "Project linked", Some(&display_path(path)));
             }
+            super::ask_sync_bridge_to_reload();
             install_git_capture(path);
         }
     }

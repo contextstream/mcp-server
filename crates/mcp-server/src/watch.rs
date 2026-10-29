@@ -2101,6 +2101,7 @@ pub async fn run_watch() -> Result<()> {
     let mut job_reconcile_tick = tokio::time::interval(JOB_RECONCILE_INTERVAL);
     job_reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     job_reconcile_tick.reset();
+    let mut catch_up = CatchUpQueue::default();
     let mut reenumerate_tick = tokio::time::interval(REENUMERATE_INTERVAL);
     reenumerate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut link_audit_tick = tokio::time::interval_at(
@@ -2180,7 +2181,9 @@ pub async fn run_watch() -> Result<()> {
                         *notify_roots
                             .lock()
                             .unwrap_or_else(|error| error.into_inner()) = watch_roots(&targets);
-                        apply_watches(&mut watcher, &mut watched, &targets);
+                        let started = apply_watches(&mut watcher, &mut watched, &targets);
+                        catch_up.add(&started, Instant::now());
+                        run_catch_up(&mut catch_up, &targets);
                         lock.write_heartbeat(targets.len());
                         tracing::info!(
                             targets = targets.len(),
@@ -2245,7 +2248,9 @@ pub async fn run_watch() -> Result<()> {
                 *notify_roots
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = watch_roots(&targets);
-                apply_watches(&mut watcher, &mut watched, &targets);
+                let started = apply_watches(&mut watcher, &mut watched, &targets);
+                catch_up.add(&started, Instant::now());
+                run_catch_up(&mut catch_up, &targets);
                 lock.write_heartbeat(targets.len());
             }
             _ = lock_tick.tick() => {
@@ -2308,14 +2313,16 @@ pub async fn run_watch() -> Result<()> {
 }
 
 /// Reconcile the set of actively-watched folders with the current targets.
+/// Returns the folders it started watching on this call.
 fn apply_watches<W: notify::Watcher>(
     watcher: &mut W,
     watched: &mut HashSet<String>,
     targets: &[WatchTarget],
-) {
+) -> Vec<String> {
     use notify::RecursiveMode;
 
     let desired: HashSet<String> = targets.iter().map(|t| t.folder_path.clone()).collect();
+    let mut started = Vec::new();
 
     // Add new folders.
     for folder in &desired {
@@ -2325,6 +2332,7 @@ fn apply_watches<W: notify::Watcher>(
         match watcher.watch(Path::new(folder), RecursiveMode::Recursive) {
             Ok(()) => {
                 watched.insert(folder.clone());
+                started.push(folder.clone());
                 tracing::debug!("watch: now watching {}", folder);
             }
             Err(e) => {
@@ -2340,6 +2348,99 @@ fn apply_watches<W: notify::Watcher>(
         let _ = watcher.unwatch(Path::new(&folder));
         watched.remove(&folder);
         tracing::debug!("watch: stopped watching {}", folder);
+    }
+    started
+}
+
+/// How long a newly monitored checkout may wait to be indexed before the
+/// bridge gives up on catching it up.
+const CATCH_UP_MAX_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// Checkouts that started being monitored while the bridge was running and
+/// still need one catch-up scan (#306).
+///
+/// Setup starts the bridge, then maps the checkout, then indexes it in the
+/// background, so a file written after the index walked the tree but before
+/// the bridge noticed the checkout is in neither: the filesystem watch only
+/// sees later changes. One durable full rescan, which the periodic reconcile
+/// submits through the normal ingest path against the stored file hashes,
+/// closes that gap. It waits until the checkout is indexed, because a
+/// checkout nobody indexed stays that way: indexing is the person's choice.
+#[derive(Default)]
+struct CatchUpQueue {
+    waiting: HashMap<String, Instant>,
+}
+
+impl CatchUpQueue {
+    fn add(&mut self, folders: &[String], now: Instant) {
+        for folder in folders {
+            self.waiting.entry(folder.clone()).or_insert(now);
+        }
+    }
+
+    /// The folders to scan now. An entry leaves the queue when it is ready,
+    /// when its target is no longer monitored, or after `CATCH_UP_MAX_WAIT`.
+    fn take_ready(
+        &mut self,
+        targets: &[WatchTarget],
+        now: Instant,
+        is_indexed: impl Fn(&WatchTarget) -> bool,
+    ) -> Vec<String> {
+        let mut ready = Vec::new();
+        self.waiting.retain(|folder, since| {
+            if now.saturating_duration_since(*since) > CATCH_UP_MAX_WAIT {
+                return false;
+            }
+            let Some(target) = targets.iter().find(|target| &target.folder_path == folder) else {
+                return false;
+            };
+            if is_indexed(target) {
+                ready.push(folder.clone());
+                return false;
+            }
+            true
+        });
+        ready
+    }
+}
+
+/// Whether `indexed-projects.json` records a completed local index of this
+/// checkout for this project.
+fn root_is_indexed(indexed: Option<&Value>, folder: &str, project_id: Uuid) -> bool {
+    let canonical =
+        |path: &str| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let wanted = canonical(folder);
+    indexed
+        .and_then(|document| document.get("projects"))
+        .and_then(Value::as_object)
+        .is_some_and(|projects| {
+            projects.iter().any(|(path, info)| {
+                info.get("project_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    == Some(project_id)
+                    && canonical(path) == wanted
+            })
+        })
+}
+
+/// Schedule the catch-up scan for every waiting checkout that is now indexed.
+fn run_catch_up(queue: &mut CatchUpQueue, targets: &[WatchTarget]) {
+    if queue.waiting.is_empty() {
+        return;
+    }
+    let indexed =
+        contextstream_dir().and_then(|dir| read_json_file(&dir.join("indexed-projects.json")));
+    let ready = queue.take_ready(targets, Instant::now(), |target| {
+        root_is_indexed(indexed.as_ref(), &target.folder_path, target.project_id)
+    });
+    for folder in ready {
+        let marked = dirty_drain::mark_watch_force_full(&folder);
+        tracing::info!(
+            folder = %folder,
+            marked,
+            "watch: scheduled one catch-up scan for a newly monitored, already indexed checkout"
+        );
     }
 }
 
@@ -2395,6 +2496,115 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::tempdir;
+
+    fn target_for(folder: &str) -> WatchTarget {
+        WatchTarget {
+            folder_path: folder.to_string(),
+            project_id: Uuid::from_u128(7),
+            workspace_id: None,
+        }
+    }
+
+    #[test]
+    fn apply_watches_reports_only_the_roots_it_starts_watching() {
+        let temp = tempdir().expect("tempdir");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first = first.to_string_lossy().to_string();
+        let second = second.to_string_lossy().to_string();
+
+        let mut watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {})
+            .expect("a filesystem watcher");
+        let mut watched = HashSet::new();
+
+        let mut started = apply_watches(&mut watcher, &mut watched, &[target_for(&first)]);
+        started.sort();
+        assert_eq!(started, std::slice::from_ref(&first));
+
+        // Nothing is new on the next pass, then one more root appears.
+        assert!(apply_watches(&mut watcher, &mut watched, &[target_for(&first)]).is_empty());
+        let started = apply_watches(
+            &mut watcher,
+            &mut watched,
+            &[target_for(&first), target_for(&second)],
+        );
+        assert_eq!(started, [second]);
+    }
+
+    #[test]
+    fn a_new_root_is_caught_up_once_and_only_after_it_is_indexed() {
+        let now = Instant::now();
+        let folder = "/work/app".to_string();
+        let targets = vec![target_for(&folder)];
+        let mut queue = CatchUpQueue::default();
+        queue.add(std::slice::from_ref(&folder), now);
+
+        // Not indexed yet: it keeps waiting and nothing is scanned.
+        assert!(queue.take_ready(&targets, now, |_| false).is_empty());
+        assert!(queue.take_ready(&targets, now, |_| false).is_empty());
+        assert_eq!(queue.waiting.len(), 1);
+
+        // Indexed: scanned once, then it is gone.
+        assert_eq!(
+            queue.take_ready(&targets, now, |_| true),
+            std::slice::from_ref(&folder)
+        );
+        assert!(queue.take_ready(&targets, now, |_| true).is_empty());
+        assert!(queue.waiting.is_empty());
+
+        // Adding a root again does not move its original deadline.
+        queue.add(std::slice::from_ref(&folder), now);
+        queue.add(std::slice::from_ref(&folder), now + Duration::from_secs(60));
+        assert_eq!(queue.waiting[&folder], now);
+    }
+
+    #[test]
+    fn a_root_that_never_gets_indexed_or_disappears_stops_waiting() {
+        let now = Instant::now();
+        let folder = "/work/app".to_string();
+        let targets = vec![target_for(&folder)];
+
+        let mut waited_too_long = CatchUpQueue::default();
+        waited_too_long.add(std::slice::from_ref(&folder), now);
+        let later = now + CATCH_UP_MAX_WAIT + Duration::from_secs(1);
+        assert!(waited_too_long
+            .take_ready(&targets, later, |_| true)
+            .is_empty());
+        assert!(waited_too_long.waiting.is_empty());
+
+        let mut vanished = CatchUpQueue::default();
+        vanished.add(std::slice::from_ref(&folder), now);
+        assert!(vanished.take_ready(&[], now, |_| true).is_empty());
+        assert!(vanished.waiting.is_empty());
+    }
+
+    #[test]
+    fn a_checkout_counts_as_indexed_only_for_its_own_project() {
+        let temp = tempdir().expect("tempdir");
+        let folder = temp.path().join("app");
+        std::fs::create_dir_all(&folder).unwrap();
+        let folder = folder.to_string_lossy().to_string();
+        let project = Uuid::from_u128(7);
+        let registry = json!({
+            "projects": { folder.clone(): { "project_id": project.to_string() } }
+        });
+
+        assert!(root_is_indexed(Some(&registry), &folder, project));
+        assert!(!root_is_indexed(
+            Some(&registry),
+            &folder,
+            Uuid::from_u128(8)
+        ));
+        assert!(!root_is_indexed(
+            Some(&registry),
+            temp.path().join("other").to_str().unwrap(),
+            project
+        ));
+        assert!(!root_is_indexed(None, &folder, project));
+        assert!(!root_is_indexed(Some(&json!({})), &folder, project));
+    }
 
     fn ws() -> Uuid {
         Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap()

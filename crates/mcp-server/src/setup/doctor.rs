@@ -2285,6 +2285,31 @@ fn sync_bridge_check(
     }
 }
 
+/// A bridge that is running but monitors no checkout at all, while this
+/// checkout is bound to a project, has not picked it up yet: a new checkout is
+/// found within about two minutes. A green check would say otherwise (#306).
+/// No fix is offered, because there is nothing to repair and a warning with
+/// one would stop a quick `setup --yes` re-run from reporting a healthy setup.
+fn with_checkout_monitoring_note(
+    check: Option<SurfaceCheck>,
+    health: Option<&crate::watch::SyncBridgeHealth>,
+    checkout_is_bound: bool,
+) -> Option<SurfaceCheck> {
+    let check = check?;
+    let not_monitoring_anything = health.is_some_and(|health| {
+        health.state == crate::watch::SyncBridgeHealthState::Running && health.target_count == 0
+    });
+    if check.status == CheckStatus::Pass && checkout_is_bound && not_monitoring_anything {
+        return Some(SurfaceCheck::warning(
+            "sync_bridge",
+            "hosted sync bridge is running but not monitoring this checkout yet; a new checkout is picked up within about two minutes (run doctor again, or doctor --repair to ask it now)",
+            None,
+            None,
+        ));
+    }
+    Some(check)
+}
+
 pub(super) fn doctor_client_config() -> Result<Config> {
     let saved = super::read_saved_credentials()?;
     let nonempty_env = |name: &str| {
@@ -2671,6 +2696,11 @@ async fn run_repairs(options: &DoctorOptions, targets: &[Editor]) -> DoctorRepai
             }
         }
     }
+    if !options.dry_run && options.scope.include_project() {
+        // A bridge that has not found this checkout yet would only do so on its
+        // next two-minute pass; ask it now (a no-op when none is running).
+        let _ = crate::watch::request_sync_bridge_reload();
+    }
     let recorded = if options.dry_run {
         super::safe_edit::take_planned_changes()
     } else {
@@ -2708,6 +2738,13 @@ async fn build_report_for_targets(
         && targets.iter().any(Editor::has_mcp_transport);
     let bridge_registration = needs_bridge_check.then(super::sync_bridge_registration_status);
     let bridge_health = needs_bridge_check.then(crate::watch::sync_bridge_health);
+    let checkout_is_bound = options.scope.include_project()
+        && options.project_path.as_deref().is_some_and(|path| {
+            super::read_project_config(path)
+                .ok()
+                .flatten()
+                .is_some_and(|config| config.project_id.is_some())
+        });
 
     let installation_result = mcp_client::activation::existing_installation_id();
     let installation_id = installation_result.as_ref().ok().copied().flatten();
@@ -2801,11 +2838,15 @@ async fn build_report_for_targets(
                 Some(&repair_fix),
             ));
             checks.push(readiness_check("readiness_remote", &remote, None));
-            if let Some(check) = sync_bridge_check(
-                editor,
-                bridge_transport,
-                bridge_registration.as_ref(),
+            if let Some(check) = with_checkout_monitoring_note(
+                sync_bridge_check(
+                    editor,
+                    bridge_transport,
+                    bridge_registration.as_ref(),
+                    bridge_health.as_ref(),
+                ),
                 bridge_health.as_ref(),
+                checkout_is_bound,
             ) {
                 checks.push(check);
             }
@@ -3444,6 +3485,64 @@ mod tests {
         .expect("check");
         assert_eq!(stale.status, CheckStatus::Fail);
         assert!(stale.detail.contains("0.0.0-stale"));
+    }
+
+    #[test]
+    fn a_running_bridge_that_monitors_nothing_is_a_warning_for_a_bound_checkout() {
+        let registered = Ok(super::super::SyncBridgeServiceRegistration {
+            state: super::super::SyncBridgeRegistrationState::Registered,
+            activation: super::super::SyncBridgeActivationState::Active,
+            platform: "test",
+            changed: false,
+        });
+        let mut idle = bridge_health(crate::watch::SyncBridgeHealthState::Running);
+        idle.target_count = 0;
+        let mut busy = idle.clone();
+        busy.target_count = 3;
+        let check = |health: &crate::watch::SyncBridgeHealth, bound: bool| {
+            with_checkout_monitoring_note(
+                sync_bridge_check(
+                    &Editor::Codex,
+                    DoctorTransportState::Hosted,
+                    Some(&registered),
+                    Some(health),
+                ),
+                Some(health),
+                bound,
+            )
+            .expect("check")
+        };
+
+        // Bound to a project, bridge up, nothing monitored yet: a warning that
+        // offers no fix, so it never blocks a quiet healthy re-run.
+        let warned = check(&idle, true);
+        assert_eq!(warned.status, CheckStatus::Warn);
+        assert!(
+            warned.detail.contains("not monitoring this checkout yet"),
+            "{}",
+            warned.detail
+        );
+        assert!(warned.fix.is_none());
+
+        // Monitoring something, or no checkout bound here: unchanged.
+        assert_eq!(check(&busy, true).status, CheckStatus::Pass);
+        assert_eq!(check(&idle, false).status, CheckStatus::Pass);
+
+        // A failing bridge check keeps its own failure.
+        let stopped = bridge_health(crate::watch::SyncBridgeHealthState::Stopped);
+        let failing = with_checkout_monitoring_note(
+            sync_bridge_check(
+                &Editor::Codex,
+                DoctorTransportState::Hosted,
+                Some(&registered),
+                Some(&stopped),
+            ),
+            Some(&stopped),
+            true,
+        )
+        .expect("check");
+        assert_eq!(failing.status, CheckStatus::Fail);
+        assert!(with_checkout_monitoring_note(None, Some(&idle), true).is_none());
     }
 
     #[test]

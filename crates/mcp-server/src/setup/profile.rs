@@ -825,6 +825,7 @@ fn print_engine_outcome(
         workspace,
         project_path,
         outcome,
+        super::account_learning::SummaryLearningHint::None,
     );
     let ui = super::ui::ui();
     let mut notes = Vec::new();

@@ -147,7 +147,8 @@ sync your local checkout.
 
 ```bash
 contextstream-mcp setup --dry-run
-contextstream-mcp doctor --scope=all --only-configured
+contextstream-mcp doctor
+contextstream-mcp doctor --repair
 ```
 
 ### Scripted and CI setup
@@ -225,9 +226,18 @@ Use the pinned Rust toolchain. For contribution checks and commit sign-off, read
 
 ### Optional deep project learning
 
-Deep project learning starts off for new accounts. Plain `contextstream-mcp setup --yes`
-preserves your current choice. To review consent, run
-`contextstream-mcp configure --account-learning on` and confirm on the signed-in
-privacy page. To withdraw, run `contextstream-mcp configure --account-learning off`.
-Agents cannot consent for you. Doctor and init show status only. See
+Deep project learning starts off for new accounts. Interactive `setup` offers it
+once per account (or once when terms change) and remembers if you decline; plain
+`contextstream-mcp setup --yes` preserves your current choice.
+
+```bash
+contextstream-mcp configure --account-learning status   # show current consent state
+contextstream-mcp configure --account-learning on       # open privacy page in browser (or print URL)
+contextstream-mcp configure --account-learning off      # withdraw consent and queue deletion
+```
+
+`--deep-learning` is accepted as an alias for `--account-learning`. Only a person
+can grant consent by ticking the unchecked box on the signed-in privacy page
+(`https://contextstream.io/dashboard/account/privacy`); agents and API keys cannot
+consent for you. Doctor and init show status only. See
 [data handling and controls](docs/data-handling.md).

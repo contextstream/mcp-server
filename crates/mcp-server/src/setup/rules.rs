@@ -7,7 +7,7 @@
 //! - No-hook editors (Codex, OpenCode, Aider, Antigravity): Extra guidance for manual enforcement
 
 use super::safe_edit;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use mcp_types::{build_harness_teaching, HarnessTeachingDelivery, HARNESS_TEACHING_VERSION};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -417,7 +417,7 @@ fn ensure_windsurf_always_on_frontmatter(content: &str) -> String {
 /// Some editors may use directory-style rule locations (for example, `.clinerules/`).
 /// When a directory is provided, write/read the managed block in
 /// `<dir>/contextstream.md`.
-fn resolve_rules_file_path(path: &Path) -> PathBuf {
+pub(super) fn resolve_rules_file_path(path: &Path) -> PathBuf {
     if path.exists() && path.is_dir() {
         path.join("contextstream.md")
     } else {
@@ -1269,14 +1269,13 @@ pub fn write_editor_rules(editor: &Editor) -> Result<()> {
 
 /// Write project-level rules file.
 ///
-/// `AGENTS.md` (used by Codex/OpenCode) is also loaded by Windsurf as additional
-/// context, so when Windsurf already has ContextStream rules under
-/// `.windsurf/rules/` we skip writing AGENTS.md to avoid the cross-editor
-/// duplication that makes Windsurf ignore the rules entirely. Other editors
-/// (Cursor, ClaudeCode, Cline, KiloCode, RooCode) read their own specific
-/// rule files (Cursor reads `.cursor/rules/*.mdc`) and do NOT load AGENTS.md —
-/// their presence must not trigger a skip, otherwise Codex/OpenCode end up with
-/// no project rule context at all.
+/// Every editor that declares a project rules target receives that file,
+/// including `AGENTS.md` clients (`codex`, `opencode`, `muse`, `copilot-cli`,
+/// and peers) when Windsurf or other editors are also configured in the same
+/// repository. Skipping `AGENTS.md` left those clients without project-scoped
+/// workspace/project guidance (and left editors without global rules, like Muse
+/// Code and Crush, with no ContextStream rules at all) while causing setup
+/// verification to report missing project rules files.
 pub fn write_project_rules(
     editor: &Editor,
     project_path: &Path,
@@ -1284,50 +1283,6 @@ pub fn write_project_rules(
     workspace_name: Option<&str>,
     project_name: Option<&str>,
 ) -> Result<()> {
-    fn path_has_contextstream_markers(path: &Path) -> Result<bool> {
-        let resolved = resolve_rules_file_path(path);
-        if !resolved.try_exists().with_context(|| {
-            format!(
-                "Could not inspect Windsurf rules path {}",
-                resolved.display()
-            )
-        })? {
-            return Ok(false);
-        }
-        let content = std::fs::read_to_string(&resolved).with_context(|| {
-            format!(
-                "Could not read Windsurf rules file {} before deciding whether to update AGENTS.md",
-                resolved.display()
-            )
-        })?;
-        Ok(content_has_owned_contextstream_rules(&content))
-    }
-
-    // Skip AGENTS.md only when Windsurf has its own project
-    // rules already. Windsurf is the one editor that loads BOTH its
-    // `.windsurf/rules/` files and AGENTS.md, so duplicate ContextStream content
-    // across the two makes Windsurf ignore them entirely. The other editors
-    // (Cursor reads `.cursor/rules/*.mdc`, ClaudeCode reads `CLAUDE.md`,
-    // Cline/KiloCode/RooCode read their own conventions) do not also consume
-    // AGENTS.md and must not block its generation.
-    if uses_project_agents_md(editor) {
-        for windsurf_path in Editor::Windsurf.all_rules_paths(Some(project_path)) {
-            if path_has_contextstream_markers(&windsurf_path)? {
-                // If we're skipping AGENTS.md to avoid Windsurf duplication,
-                // also clean any existing ContextStream block from AGENTS.md so
-                // users don't have to manually remove stale legacy/mixed markers.
-                if remove_contextstream_from_rules(editor, Some(project_path))? {
-                    tracing::debug!("Removed stale ContextStream block from AGENTS.md before skip");
-                }
-                tracing::debug!(
-                    "Skipping AGENTS.md rules — Windsurf already has ContextStream rules at {}",
-                    windsurf_path.display()
-                );
-                return Ok(());
-            }
-        }
-    }
-
     let paths = editor.all_rules_paths(Some(project_path));
     if paths.is_empty() {
         return Err(anyhow::anyhow!(
@@ -3500,26 +3455,19 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_skip_removes_existing_agents_contextstream_block() {
+    fn test_agents_md_editors_write_project_rules_when_windsurf_is_configured() {
         let temp = tempdir().expect("tempdir");
         let project = temp.path();
 
-        // Simulate another editor already having project-level ContextStream rules.
-        let windsurf_path = project
-            .join(".windsurf")
-            .join("rules")
-            .join("contextstream.md");
-        std::fs::create_dir_all(windsurf_path.parent().expect("windsurf parent")).expect("mkdirs");
-        std::fs::write(
-            &windsurf_path,
-            format!(
-                "{}\nWindsurf content\n{}",
-                CONTEXTSTREAM_START, CONTEXTSTREAM_END
-            ),
+        write_project_rules(
+            &Editor::Windsurf,
+            project,
+            Some("ws-1"),
+            Some("Personal"),
+            Some("streamingmusic"),
         )
-        .expect("write windsurf rules");
+        .expect("write windsurf project rules");
 
-        // Existing AGENTS.md with legacy markers should be auto-cleaned on skip.
         let agents_path = project.join("AGENTS.md");
         std::fs::write(
             &agents_path,
@@ -3528,71 +3476,36 @@ mod tests {
                 LEGACY_START, LEGACY_END
             ),
         )
-        .expect("write agents");
+        .expect("seed legacy agents");
 
-        write_project_rules(&Editor::Codex, project, None, None, Some("project")).expect("write");
-
-        let updated = std::fs::read_to_string(&agents_path).expect("read agents");
-        assert!(
-            !updated.contains(LEGACY_START),
-            "legacy start marker should be removed"
-        );
-        assert!(
-            !updated.contains(LEGACY_END),
-            "legacy end marker should be removed"
-        );
-        assert!(
-            updated.contains("User notes"),
-            "non-ContextStream content stays"
-        );
-    }
-
-    #[test]
-    fn test_opencode_skip_removes_existing_agents_contextstream_block() {
-        let temp = tempdir().expect("tempdir");
-        let project = temp.path();
-
-        // Simulate another editor already having project-level ContextStream rules.
-        let windsurf_path = project
-            .join(".windsurf")
-            .join("rules")
-            .join("contextstream.md");
-        std::fs::create_dir_all(windsurf_path.parent().expect("windsurf parent")).expect("mkdirs");
-        std::fs::write(
-            &windsurf_path,
-            format!(
-                "{}\nWindsurf content\n{}",
-                CONTEXTSTREAM_START, CONTEXTSTREAM_END
-            ),
-        )
-        .expect("write windsurf rules");
-
-        // Existing AGENTS.md with legacy markers should be auto-cleaned on skip.
-        let agents_path = project.join("AGENTS.md");
-        std::fs::write(
-            &agents_path,
-            format!(
-                "{}\nStale opencode rules\n{}\nUser notes",
-                LEGACY_START, LEGACY_END
-            ),
-        )
-        .expect("write agents");
-
-        write_project_rules(&Editor::OpenCode, project, None, None, Some("project"))
-            .expect("write");
+        for editor in [
+            Editor::Codex,
+            Editor::OpenCode,
+            Editor::MuseCode,
+            Editor::CopilotCli,
+        ] {
+            write_project_rules(
+                &editor,
+                project,
+                Some("ws-1"),
+                Some("Personal"),
+                Some("streamingmusic"),
+            )
+            .expect("write AGENTS.md rules alongside Windsurf");
+        }
 
         let updated = std::fs::read_to_string(&agents_path).expect("read agents");
+        assert!(content_has_owned_contextstream_rules(&updated));
+        assert!(!updated.contains(LEGACY_START));
+        assert!(!updated.contains(LEGACY_END));
+        assert!(updated.contains("User notes"));
         assert!(
-            !updated.contains(LEGACY_START),
-            "legacy start marker should be removed"
-        );
-        assert!(
-            !updated.contains(LEGACY_END),
-            "legacy end marker should be removed"
-        );
-        assert!(
-            updated.contains("User notes"),
-            "non-ContextStream content stays"
+            project
+                .join(".windsurf")
+                .join("rules")
+                .join("contextstream.md")
+                .exists(),
+            "Windsurf project rules remain intact"
         );
     }
 
@@ -3667,33 +3580,39 @@ mod tests {
     }
 
     #[test]
-    fn codex_rule_write_fails_closed_when_windsurf_rules_cannot_be_read() {
+    fn all_selectable_editors_have_matching_project_rules_after_write() {
         let temp = tempdir().expect("tempdir");
         let project = temp.path();
-        let windsurf_primary = project
-            .join(".windsurf")
-            .join("rules")
-            .join("contextstream.md");
 
-        // Directory-style rule targets resolve one level deeper. Making that
-        // resolved target a directory reliably produces a read error on every
-        // platform without relying on permission semantics.
-        std::fs::create_dir_all(windsurf_primary.join("contextstream.md"))
-            .expect("create unreadable rule shape");
+        for editor in Editor::selectable() {
+            if editor.rules_path(Some(project)).is_some() {
+                write_project_rules(
+                    &editor,
+                    project,
+                    Some("ws-1"),
+                    Some("Personal"),
+                    Some("streamingmusic"),
+                )
+                .unwrap_or_else(|e| panic!("write_project_rules failed for {editor:?}: {e:#}"));
+            }
+        }
 
-        let error = write_project_rules(&Editor::Codex, project, None, None, None)
-            .expect_err("an unreadable duplicate-prevention input must abort");
-
-        assert!(
-            error
-                .to_string()
-                .contains("Could not read Windsurf rules file"),
-            "unexpected error: {error:#}"
-        );
-        assert!(
-            !project.join("AGENTS.md").exists(),
-            "Codex rules were written after the Windsurf safety check failed"
-        );
+        for editor in Editor::selectable() {
+            if let Some(expected) = editor.rules_path(Some(project)) {
+                let resolved = resolve_rules_file_path(&expected);
+                let content = std::fs::read_to_string(&resolved).unwrap_or_else(|e| {
+                    panic!(
+                        "missing project rules for {editor:?} at {}: {e}",
+                        resolved.display()
+                    )
+                });
+                assert!(
+                    content_has_owned_contextstream_rules(&content),
+                    "expected owned ContextStream rules for {editor:?} at {}",
+                    resolved.display()
+                );
+            }
+        }
     }
 
     #[test]

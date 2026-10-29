@@ -127,6 +127,7 @@ pub(super) fn default_index_plan(project_path: Option<&Path>, plan: &ProjectPlan
 /// Everything the review screen shows and Save applies.
 struct Choices {
     api_key: String,
+    user_id: Option<String>,
     email: String,
     client: ContextStreamClient,
     team_capable: bool,
@@ -137,6 +138,8 @@ struct Choices {
     workspace: Option<WorkspaceInfo>,
     project: ProjectPlan,
     index: IndexPlan,
+    learning_state: super::account_learning::ConsentState,
+    explicit_learning: bool,
     learning_choice: Option<bool>,
     /// `Some(true)` turns Claude Code auto memory off after saving; `None`
     /// when Claude Code is not being set up or auto memory is already off.
@@ -155,8 +158,17 @@ enum ReviewAction {
     Exit,
 }
 
+fn learning_prompt_text(state: &super::account_learning::ConsentState) -> &'static str {
+    if state.is_reconsent() {
+        "Deep project learning terms were updated — open consent review after setup?"
+    } else {
+        "Open optional deep project learning consent after setup?"
+    }
+}
+
 fn review_actions(
     index: IndexPlan,
+    offer_learning_toggle: bool,
     claude_auto_memory_off: Option<bool>,
 ) -> Vec<(ReviewAction, &'static str)> {
     let mut actions = vec![
@@ -170,10 +182,12 @@ fn review_actions(
     ) {
         actions.push((ReviewAction::Indexing, "Change when indexing runs"));
     }
-    actions.push((
-        ReviewAction::AccountLearning,
-        "Change consent-page reminder",
-    ));
+    if offer_learning_toggle {
+        actions.push((
+            ReviewAction::AccountLearning,
+            "Change consent-page reminder",
+        ));
+    }
     match claude_auto_memory_off {
         Some(true) => actions.push((ReviewAction::ClaudeAutoMemory, "Keep Claude auto memory on")),
         Some(false) => actions.push((
@@ -206,9 +220,12 @@ pub(super) async fn run(
         "Sign in to ContextStream",
         "Your agents' memory lives in your ContextStream account.",
     );
-    let (api_key, email) = sign_in(Some(signup_probe)).await?;
+    let (api_key, user_id, email) = sign_in(Some(signup_probe)).await?;
     let client = client_for(&api_key);
     let team_capable = load_team_capability(&client).await;
+    let learning_state =
+        super::account_learning::fetch_consent_state(&client, user_id.as_deref(), Some(&email))
+            .await;
 
     print_step(
         2,
@@ -238,8 +255,18 @@ pub(super) async fn run(
     let project = plan_project(&client, project_path.as_deref(), workspace.as_ref()).await?;
     let index = default_index_plan(project_path.as_deref(), &project);
 
+    let learning_choice = match explicit_learning_choice {
+        Some(choice) => Some(choice),
+        None if learning_state.should_prompt_in_wizard() => Some(super::confirm(
+            learning_prompt_text(&learning_state),
+            false,
+        )?),
+        None => None,
+    };
+
     let mut choices = Choices {
         api_key,
+        user_id,
         email,
         client,
         team_capable,
@@ -250,14 +277,9 @@ pub(super) async fn run(
         workspace,
         project,
         index,
-        learning_choice: match explicit_learning_choice {
-            Some(choice) => Some(choice),
-            None => super::confirm(
-                "Open optional deep project learning consent after setup?",
-                false,
-            )?
-            .then_some(true),
-        },
+        learning_state,
+        explicit_learning: explicit_learning_choice.is_some(),
+        learning_choice,
         claude_auto_memory_off: None,
     };
     choices.claude_auto_memory_off = claude_auto_memory_default(&choices.editors);
@@ -269,12 +291,13 @@ pub(super) async fn run(
             "Nothing is saved until you choose Save. Change anything first.",
         );
         print_review(&choices);
-        let actions: Vec<_> = review_actions(choices.index, choices.claude_auto_memory_off)
-            .into_iter()
-            .filter(|(action, _)| {
-                explicit_learning_choice.is_none() || *action != ReviewAction::AccountLearning
-            })
-            .collect();
+        let offer_learning_toggle =
+            !choices.explicit_learning && choices.learning_state.should_prompt_in_wizard();
+        let actions = review_actions(
+            choices.index,
+            offer_learning_toggle,
+            choices.claude_auto_memory_off,
+        );
         let labels: Vec<&str> = actions.iter().map(|(_, label)| *label).collect();
         let choice = prompts::select("Ready to set up ContextStream?", &labels)?;
         match actions[choice].0 {
@@ -304,21 +327,37 @@ pub(super) async fn run(
                 }
             }
             ReviewAction::AccountLearning => {
-                choices.learning_choice = super::confirm(
-                    "Open optional deep project learning consent after setup?",
+                choices.learning_choice = Some(super::confirm(
+                    learning_prompt_text(&choices.learning_state),
                     false,
-                )?
-                .then_some(true);
+                )?);
             }
             ReviewAction::ClaudeAutoMemory => {
                 choices.claude_auto_memory_off = choices.claude_auto_memory_off.map(|off| !off);
             }
             ReviewAction::Account => {
-                let (api_key, email) = sign_in(None).await?;
+                let (api_key, user_id, email) = sign_in(None).await?;
                 choices.client = client_for(&api_key);
                 choices.api_key = api_key;
+                choices.user_id = user_id;
                 choices.email = email;
                 choices.team_capable = load_team_capability(&choices.client).await;
+                choices.learning_state = super::account_learning::fetch_consent_state(
+                    &choices.client,
+                    choices.user_id.as_deref(),
+                    Some(&choices.email),
+                )
+                .await;
+                if !choices.explicit_learning {
+                    choices.learning_choice = if choices.learning_state.should_prompt_in_wizard() {
+                        Some(super::confirm(
+                            learning_prompt_text(&choices.learning_state),
+                            false,
+                        )?)
+                    } else {
+                        None
+                    };
+                }
                 choices.workspace =
                     choose_workspace(&choices.client, choices.project_path.as_deref(), true)
                         .await?;
@@ -340,20 +379,49 @@ pub(super) async fn run(
     }
 
     print_step(5, "Finishing setup", "");
-    let review_learning =
-        choices.learning_choice == Some(true) && explicit_learning_choice.is_none();
-    finish(choices).await?;
-    if review_learning {
-        super::account_learning::configure(true).await?;
+    let open_browser_after_finish = !choices.explicit_learning
+        && choices.learning_state.should_prompt_in_wizard()
+        && choices.learning_choice == Some(true);
+    if !choices.explicit_learning
+        && choices.learning_state.should_prompt_in_wizard()
+        && choices.learning_choice == Some(false)
+    {
+        if let Err(error) = super::account_learning::record_declined(
+            choices.user_id.as_deref(),
+            Some(&choices.email),
+            choices.learning_state.current_version(),
+            choices.learning_state.is_reconsent(),
+        ) {
+            tracing::debug!(%error, "could not record local account-learning decline");
+        }
+    }
+    let summary_hint = if choices.explicit_learning || open_browser_after_finish {
+        super::account_learning::SummaryLearningHint::None
+    } else {
+        choices.learning_state.summary_hint()
+    };
+    finish(choices, summary_hint).await?;
+    if open_browser_after_finish {
+        super::account_learning::open_browser_consent_prompt();
     }
     Ok(true)
 }
 
 fn client_for(api_key: &str) -> ContextStreamClient {
-    ContextStreamClient::new(Config {
+    let mut config = Config {
         api_key: Some(api_key.to_string()),
         ..Default::default()
-    })
+    };
+    if std::env::var_os("CONTEXTSTREAM_API_URL").is_none_or(|value| value.is_empty()) {
+        if let Some(saved_url) = super::read_saved_credentials()
+            .ok()
+            .and_then(|creds| creds.api_url)
+            .filter(|url| !url.trim().is_empty())
+        {
+            config.api_url = saved_url;
+        }
+    }
+    ContextStreamClient::new(config)
 }
 
 async fn load_team_capability(client: &ContextStreamClient) -> bool {
@@ -375,7 +443,9 @@ async fn load_team_capability(client: &ContextStreamClient) -> bool {
 }
 
 /// Reuse a working saved sign-in without asking; otherwise sign in fresh.
-async fn sign_in(signup_probe: Option<tokio::task::JoinHandle<bool>>) -> Result<(String, String)> {
+async fn sign_in(
+    signup_probe: Option<tokio::task::JoinHandle<bool>>,
+) -> Result<(String, Option<String>, String)> {
     if safe_edit::is_dry_run() {
         let api_key = super::get_api_key_result()?.ok_or_else(|| {
             anyhow::anyhow!(
@@ -389,7 +459,7 @@ async fn sign_in(signup_probe: Option<tokio::task::JoinHandle<bool>>) -> Result<
                 anyhow::anyhow!("Dry-run could not validate the existing credentials: {error}")
             })?;
         ui::say(Mark::Ok, "Signed in", Some(&user.email));
-        return Ok((api_key, user.email));
+        return Ok((api_key, Some(user.id.to_string()), user.email));
     }
 
     // Only the first sign-in reuses saved credentials; switching accounts
@@ -411,7 +481,7 @@ async fn sign_in(signup_probe: Option<tokio::task::JoinHandle<bool>>) -> Result<
             match check {
                 Ok(Ok(user)) => {
                     ui::say(Mark::Ok, "Signed in", Some(&user.email));
-                    return Ok((api_key, user.email));
+                    return Ok((api_key, Some(user.id.to_string()), user.email));
                 }
                 Ok(Err(error)) => ui::say(
                     Mark::Warn,
@@ -437,6 +507,12 @@ async fn sign_in(signup_probe: Option<tokio::task::JoinHandle<bool>>) -> Result<
     };
     let (api_key, email) = super::authenticate_fresh(signup_available).await?;
     super::write_saved_credentials(&api_key, None)?;
+    let user_id =
+        tokio::time::timeout(std::time::Duration::from_secs(5), client_for(&api_key).me())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|user| user.id.to_string());
     ui::say(
         Mark::Ok,
         "Signed in",
@@ -445,7 +521,7 @@ async fn sign_in(signup_probe: Option<tokio::task::JoinHandle<bool>>) -> Result<
             display_path(&super::credentials_file_path())
         )),
     );
-    Ok((api_key, email))
+    Ok((api_key, user_id, email))
 }
 
 fn initial_editors(
@@ -714,14 +790,16 @@ fn print_review(choices: &Choices) {
         rows.push(ui.row("Folder", &ui.path(&display_path(path))));
     }
     rows.push(ui.row("Indexing", choices.index.summary()));
-    rows.push(ui.row(
-        "Deep project learning",
-        match choices.learning_choice {
-            Some(true) => "Review consent in browser",
-            Some(false) => "Withdraw consent after saving",
-            None => "No change (default)",
-        },
-    ));
+    if choices.explicit_learning || choices.learning_state.should_prompt_in_wizard() {
+        rows.push(ui.row(
+            "Deep project learning",
+            match choices.learning_choice {
+                Some(true) => "Review consent in browser",
+                Some(false) if choices.explicit_learning => "Withdraw consent after saving",
+                Some(false) | None => "Not now (default) · turn on anytime later",
+            },
+        ));
+    }
     if let Some(off) = choices.claude_auto_memory_off {
         rows.push(ui.row(
             "Claude auto memory",
@@ -739,9 +817,13 @@ fn print_review(choices: &Choices) {
     println!();
 }
 
-async fn finish(choices: Choices) -> Result<()> {
+async fn finish(
+    choices: Choices,
+    learning_hint: super::account_learning::SummaryLearningHint,
+) -> Result<()> {
     let Choices {
         api_key,
+        user_id: _,
         email,
         client,
         team_capable,
@@ -752,6 +834,8 @@ async fn finish(choices: Choices) -> Result<()> {
         workspace,
         project,
         index,
+        learning_state: _,
+        explicit_learning: _,
         learning_choice: _,
         claude_auto_memory_off,
     } = choices;
@@ -902,6 +986,7 @@ async fn finish(choices: Choices) -> Result<()> {
         workspace.as_ref(),
         project_path.as_deref(),
         &outcome,
+        learning_hint,
     );
     Ok(())
 }
@@ -1075,7 +1160,7 @@ mod tests {
     #[test]
     fn review_offers_the_claude_auto_memory_toggle_only_when_it_applies() {
         let label = |off| {
-            review_actions(IndexPlan::Background, off)
+            review_actions(IndexPlan::Background, false, off)
                 .into_iter()
                 .find(|(action, _)| *action == ReviewAction::ClaudeAutoMemory)
                 .map(|(_, label)| label)
@@ -1088,19 +1173,62 @@ mod tests {
 
     #[test]
     fn review_offers_indexing_changes_only_when_there_is_something_to_index() {
-        let with_index: Vec<_> = review_actions(IndexPlan::Background, None)
+        let with_index: Vec<_> = review_actions(IndexPlan::Background, false, None)
             .into_iter()
             .map(|(action, _)| action)
             .collect();
         assert_eq!(with_index.first(), Some(&ReviewAction::Save));
         assert!(with_index.contains(&ReviewAction::Indexing));
+        assert!(!with_index.contains(&ReviewAction::AccountLearning));
         assert_eq!(with_index.last(), Some(&ReviewAction::Exit));
 
-        let empty: Vec<_> = review_actions(IndexPlan::NothingYet, None)
+        let empty: Vec<_> = review_actions(IndexPlan::NothingYet, true, None)
             .into_iter()
             .map(|(action, _)| action)
             .collect();
         assert!(!empty.contains(&ReviewAction::Indexing));
+        assert!(empty.contains(&ReviewAction::AccountLearning));
+    }
+
+    #[test]
+    fn wizard_prompts_deep_learning_only_for_never_asked_or_reconsent() {
+        use super::super::account_learning::ConsentState;
+
+        for quiet_state in [
+            ConsentState::On {
+                version: Some("v1".into()),
+            },
+            ConsentState::Declined {
+                version: Some("v1".into()),
+            },
+            ConsentState::Unreadable,
+        ] {
+            assert!(!quiet_state.should_prompt_in_wizard());
+            let actions = review_actions(
+                IndexPlan::Background,
+                quiet_state.should_prompt_in_wizard(),
+                None,
+            );
+            assert!(!actions
+                .iter()
+                .any(|(action, _)| *action == ReviewAction::AccountLearning));
+        }
+
+        let first_time = ConsentState::NeverAsked {
+            version: Some("v1".into()),
+        };
+        assert!(first_time.should_prompt_in_wizard());
+        assert_eq!(
+            learning_prompt_text(&first_time),
+            "Open optional deep project learning consent after setup?"
+        );
+
+        let reconsent = ConsentState::ReconsentNeeded {
+            accepted_version: Some("v1".into()),
+            current_version: Some("v2".into()),
+        };
+        assert!(reconsent.should_prompt_in_wizard());
+        assert!(learning_prompt_text(&reconsent).contains("terms were updated"));
     }
 
     /// Prints every setup screen in truecolor for visual review:
@@ -1158,6 +1286,7 @@ mod tests {
 
         let choices = Choices {
             api_key: String::new(),
+            user_id: None,
             email: "you@example.com".into(),
             client: client_for("test"),
             team_capable: true,
@@ -1175,6 +1304,10 @@ mod tests {
                 repository_url: None,
             },
             index: IndexPlan::Background,
+            learning_state: super::super::account_learning::ConsentState::On {
+                version: Some("account-learning-v1".into()),
+            },
+            explicit_learning: false,
             learning_choice: None,
             claude_auto_memory_off: None,
         };
@@ -1186,7 +1319,7 @@ mod tests {
             .format_select_prompt(&mut prompt, "Ready to set up ContextStream?")
             .unwrap();
         println!("{prompt}");
-        for (index, (_, label)) in review_actions(IndexPlan::Background, None)
+        for (index, (_, label)) in review_actions(IndexPlan::Background, false, None)
             .iter()
             .enumerate()
         {
@@ -1246,6 +1379,7 @@ mod tests {
             choices.workspace.as_ref(),
             choices.project_path.as_deref(),
             &outcome,
+            super::super::account_learning::SummaryLearningHint::On,
         );
         println!(
             "{}",

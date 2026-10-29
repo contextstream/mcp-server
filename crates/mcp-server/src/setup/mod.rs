@@ -2470,9 +2470,15 @@ pub async fn run_setup_with_learning_choice(
     learning_choice: Option<bool>,
 ) -> Result<bool> {
     if non_interactive {
-        run_setup_noninteractive(only, project_path, account_only, workspace_id)
-            .await
-            .map(|_| true)
+        run_setup_noninteractive(
+            only,
+            project_path,
+            account_only,
+            workspace_id,
+            learning_choice,
+        )
+        .await
+        .map(|_| true)
     } else {
         wizard::run(only, project_path, account_only, learning_choice).await
     }
@@ -2487,6 +2493,7 @@ async fn run_setup_noninteractive(
     explicit_project_path: Option<&Path>,
     account_only: bool,
     explicit_workspace_id: Option<&str>,
+    explicit_learning_choice: Option<bool>,
 ) -> Result<()> {
     print_welcome_banner();
     print_data_collection_disclosure(true);
@@ -2521,6 +2528,17 @@ async fn run_setup_noninteractive(
             )
         })?;
     ui::say(ui::Mark::Ok, "Signed in", Some(&user.email));
+    let learning_hint = if explicit_learning_choice.is_some() {
+        account_learning::SummaryLearningHint::None
+    } else {
+        account_learning::fetch_consent_state(
+            &client,
+            Some(&user.id.to_string()),
+            Some(&user.email),
+        )
+        .await
+        .summary_hint()
+    };
 
     // An explicit --editors list wins; otherwise fall back to detection, which
     // is the documented behaviour of `setup --yes`.
@@ -2562,6 +2580,7 @@ async fn run_setup_noninteractive(
             None,
             project_path.as_deref(),
             &outcome,
+            learning_hint,
         );
         return Ok(());
     }
@@ -2705,6 +2724,7 @@ async fn run_setup_noninteractive(
         workspace.as_ref(),
         project_path.as_deref(),
         &outcome,
+        learning_hint,
     );
     Ok(())
 }
@@ -2918,6 +2938,45 @@ fn setup_teaching_contracts(editors: &[editors::Editor]) -> Vec<HarnessTeachingC
         .collect()
 }
 
+fn editors_match_managed_selection(editors: &[editors::Editor]) -> bool {
+    let Ok(selection) = mcp_client::activation::configured_client_selection() else {
+        return false;
+    };
+    if !selection.recorded {
+        return true;
+    }
+    let mut current: Vec<String> = editors
+        .iter()
+        .map(|editor| editor.id().to_string())
+        .collect();
+    current.sort();
+    current.dedup();
+    selection.clients == current
+}
+
+pub(super) fn format_setup_repair_command(
+    editors: &[editors::Editor],
+    binding_established: bool,
+    project_path: Option<&Path>,
+    managed_selection: bool,
+) -> String {
+    let mut cmd = String::from("contextstream-mcp doctor --repair");
+    let unconfirmed_existing_project_config = !binding_established
+        && project_path.is_some_and(|path| wizard_config::project_config_path(path).exists());
+    if unconfirmed_existing_project_config {
+        cmd.push_str(" --scope global");
+    }
+    if !managed_selection && !editors.is_empty() {
+        let ids = editors
+            .iter()
+            .map(editors::Editor::id)
+            .collect::<Vec<_>>()
+            .join(",");
+        cmd.push_str(&format!(" --editors {ids}"));
+    }
+    cmd
+}
+
 fn print_setup_outcome(
     email: &str,
     team_capable: bool,
@@ -2925,6 +2984,7 @@ fn print_setup_outcome(
     workspace: Option<&WorkspaceInfo>,
     project_path: Option<&Path>,
     outcome: &SetupCompletionEvidence,
+    learning_hint: account_learning::SummaryLearningHint,
 ) {
     let ui = ui::ui();
     let teaching_contracts = setup_teaching_contracts(editors);
@@ -3056,19 +3116,14 @@ fn print_setup_outcome(
             ));
         }
         SetupCompletionState::RepairRequired => {
-            let scope = if outcome.binding_established {
-                "all"
-            } else {
-                "global"
-            };
+            let repair_cmd = format_setup_repair_command(
+                editors,
+                outcome.binding_established,
+                project_path,
+                editors_match_managed_selection(editors),
+            );
             step(1, "Repair the editor settings setup manages:");
-            detail(&ui.path(&format!(
-                "contextstream-mcp doctor --repair --scope {scope} --editors {editor_ids}"
-            )));
-            step(2, "Then confirm everything passes:");
-            detail(&ui.path(&format!(
-                "contextstream-mcp doctor --scope {scope} --editors {editor_ids}"
-            )));
+            detail(&ui.path(&repair_cmd));
         }
         SetupCompletionState::AccountOnly => {
             step(1, "When you're ready, link a project:");
@@ -3133,19 +3188,38 @@ fn print_setup_outcome(
             wrapped(&format!("\"{}\"", first_value_prompt()), &|line| {
                 ui.accent(line)
             });
+            let doctor_cmd = if editors_match_managed_selection(editors) {
+                "contextstream-mcp doctor".to_string()
+            } else {
+                format!("contextstream-mcp doctor --scope all --editors {editor_ids}")
+            };
             println!();
             println!(
                 "{}{}",
                 ui::GUTTER,
-                ui.faint(&format!(
-                    "Check the connection anytime · contextstream-mcp doctor --scope all --editors {editor_ids}"
-                ))
+                ui.faint(&format!("Check the connection anytime · {doctor_cmd}"))
             );
             if team_capable {
                 println!();
                 team_guidance::print_team_success_next_steps();
             }
         }
+    }
+    match learning_hint {
+        account_learning::SummaryLearningHint::On => {
+            println!("{}{}", ui::GUTTER, ui.faint("Deep project learning: on"));
+        }
+        account_learning::SummaryLearningHint::Available => {
+            println!(
+                "{}{}",
+                ui::GUTTER,
+                ui.faint(&format!(
+                    "Deep project learning is optional · turn on anytime: {}",
+                    account_learning::ENABLE_COMMAND
+                ))
+            );
+        }
+        account_learning::SummaryLearningHint::None => {}
     }
     println!();
 }
@@ -5042,7 +5116,7 @@ mod tests {
     use super::{
         ambiguous_workspace_message, canonical_checkout_root, classify_project_workspace,
         data_collection_disclosure, editor_needs_managed_helper, format_index_completion_message,
-        linked_project_name_matches_checkout, local_mcp_allowed,
+        format_setup_repair_command, linked_project_name_matches_checkout, local_mcp_allowed,
         local_mcp_override_allowed_from_env_value, no_target_editors_message,
         parse_setup_ingest_job_progress, parse_setup_transport_preference,
         project_workspace_is_verified, read_setup_transport_marker,
@@ -5060,6 +5134,29 @@ mod tests {
 
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn format_setup_repair_command_omits_managed_editor_list_and_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let twelve = Editor::selectable();
+        assert_eq!(
+            format_setup_repair_command(&twelve, true, Some(dir.path()), true),
+            "contextstream-mcp doctor --repair"
+        );
+        assert_eq!(
+            format_setup_repair_command(&twelve, false, Some(dir.path()), true),
+            "contextstream-mcp doctor --repair"
+        );
+        assert_eq!(
+            format_setup_repair_command(
+                &[Editor::ClaudeCode, Editor::Codex],
+                true,
+                Some(dir.path()),
+                false
+            ),
+            "contextstream-mcp doctor --repair --editors claude,codex"
+        );
     }
 
     /// `setup --yes` on a multi-workspace account must say how to choose one

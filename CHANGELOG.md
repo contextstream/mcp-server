@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.0.39
+
+- Setup wizard and `configure` deep project learning improvements:
+  - Interactive `setup` checks `/users/me/learning-consent` after sign-in: when consent is
+    already active (`enabled && !requires_reconsent`), setup skips the prompt, never opens the
+    browser, and shows a single quiet status line (`Deep project learning: on`).
+  - First-time accounts are asked once; declining is remembered per account locally in
+    `~/.contextstream/account-learning.json` so later `setup` and `update` runs stay quiet and
+    show one subtle hint line instead. When consent terms change (`requires_reconsent`), setup
+    asks once per updated version and follows the same rule.
+  - `contextstream-mcp configure` is now documented in `--help` and accepts
+    `--account-learning [status|on|off]` (alias `--deep-learning`) to inspect state, open the
+    signed-in privacy page (or print the URL when headless), or withdraw consent. Human consent
+    remains strictly browser-only.
+- Setup project rules and repair guidance:
+  - Fixed `write_project_rules` skipping `AGENTS.md` when Windsurf project rules were present,
+    which left `codex`, `opencode`, `muse`, `copilot-cli`, and peer `AGENTS.md` clients missing
+    project rules at the end of setup; raised the saved client-selection cap so all selectable
+    editors persist.
+  - Shortened setup repair guidance to `contextstream-mcp doctor --repair`, with `doctor --repair`
+    defaulting safely to `all` in linked project folders and `global` elsewhere when `--scope`
+    is omitted.
+
 ## 1.0.38
 
 - ContextAgents settings from the `agents` tool. All agents are on by default; an owner or

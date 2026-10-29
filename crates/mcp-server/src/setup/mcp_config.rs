@@ -4047,6 +4047,101 @@ fn write_project_mcp_config_with_transport_mode(
     Ok(())
 }
 
+/// When CLI setup/update writes a secret-bearing project MCP config in a
+/// folder that is not yet a Git repository, `.git/info/exclude` does not exist.
+/// Add the project-relative config path to `<project_path>/.gitignore` so a
+/// subsequent `git init && git add .` never stages the plaintext API key.
+pub(super) fn protect_non_git_secret_project_config(
+    editor: &Editor,
+    project_path: &Path,
+    use_local_transport: bool,
+    api_key: &str,
+    remote_auth_api_key: Option<&str>,
+) -> Result<Option<String>> {
+    let inside_git_worktree = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_path)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+        || project_path
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").exists());
+    if inside_git_worktree {
+        return Ok(None);
+    }
+
+    let Some(mcp_path) = editor.project_mcp_config_path(project_path) else {
+        return Ok(None);
+    };
+
+    let carries_key = if safe_edit::is_dry_run() {
+        let transport_mode = if use_local_transport {
+            TransportMode::ForceLocal
+        } else {
+            TransportMode::ForceRemote
+        };
+        let remote = should_use_remote_http(editor, None, transport_mode);
+        if editor.descriptor().dialect == ConfigDialect::OpenCode {
+            !remote && !api_key.trim().is_empty()
+        } else {
+            remote && remote_auth_api_key.is_some_and(|key| !key.trim().is_empty())
+        }
+    } else {
+        let raw = match std::fs::read_to_string(&mcp_path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        [Some(api_key), remote_auth_api_key]
+            .into_iter()
+            .flatten()
+            .filter(|key| !key.trim().is_empty())
+            .any(|key| raw.contains(key))
+    };
+    if !carries_key {
+        return Ok(None);
+    }
+
+    let Ok(relative) = mcp_path.strip_prefix(project_path) else {
+        return Ok(None);
+    };
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    if relative.is_empty() {
+        return Ok(None);
+    }
+    let entry = format!("/{relative}");
+
+    let gitignore_path = project_path.join(".gitignore");
+    let existing = match std::fs::read_to_string(&gitignore_path) {
+        Ok(content) => Some(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+
+    if existing.as_deref().is_some_and(|content| {
+        content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed == entry || trimmed == relative
+        })
+    }) {
+        return Ok(None);
+    }
+
+    let mut updated = existing.clone().unwrap_or_default();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    if !updated.contains("# ContextStream: project MCP config") {
+        updated.push_str("# ContextStream: project MCP config contains an API key\n");
+    }
+    updated.push_str(&entry);
+    updated.push('\n');
+
+    safe_edit::write_public_if_unchanged(&gitignore_path, &updated, existing.as_deref())?;
+    Ok(Some(entry))
+}
+
 /// A project MCP file that carries the API key must not be committed by a
 /// routine `git add -A`. Exclude it locally (`.git/info/exclude`, never the
 /// shared `.gitignore`) unless the repository already tracks or ignores it.

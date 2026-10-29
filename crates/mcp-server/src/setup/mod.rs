@@ -1624,6 +1624,23 @@ async fn update_configs_scoped_with_interactivity(
                             transport_label.to_lowercase(),
                             editor.display_name()
                         );
+                        if let Ok(Some(ignored_entry)) =
+                            mcp_config::protect_non_git_secret_project_config(
+                                editor,
+                                project_path,
+                                use_local_transport,
+                                &api_key,
+                                (!use_local_transport).then_some(api_key.as_str()),
+                            )
+                        {
+                            if !safe_edit::is_dry_run() {
+                                eprintln!(
+                                    "  {} Non-git folder: added {} to .gitignore so a future `git init` will not stage your API key",
+                                    style("⚠").yellow(),
+                                    ignored_entry
+                                );
+                            }
+                        }
                         if matches!(editor, editors::Editor::Codex) {
                             if let Err(error) = mcp_config::ensure_codex_project_trust(project_path)
                             {
@@ -3818,6 +3835,21 @@ pub async fn configure_editor_with_workspace(
             Ok(()) => {
                 mcp_targets.push("project");
                 wrote_project_mcp = true;
+                if let Ok(Some(ignored_entry)) = mcp_config::protect_non_git_secret_project_config(
+                    editor,
+                    project_path,
+                    matches!(transport_preference, SetupTransportPreference::LocalBinary),
+                    api_key,
+                    remote_auth_api_key,
+                ) {
+                    if !safe_edit::is_dry_run() {
+                        eprintln!(
+                            "    {} Non-git folder: added {} to .gitignore so a future `git init` will not stage your API key",
+                            style("⚠").yellow(),
+                            ignored_entry
+                        );
+                    }
+                }
             }
             Err(e) => {
                 warn!(

@@ -477,6 +477,68 @@ fn get_index_status(folder_path: &str) -> IndexStatus {
     index_status_from_data(folder_path, data)
 }
 
+/// Whether ContextStream has an index (fresh or stale) covering `folder_path`.
+pub(crate) fn folder_is_indexed(folder_path: &str) -> bool {
+    get_index_status(folder_path).is_indexed
+}
+
+/// The local code search a shell command runs, if any: the tool (`grep`,
+/// `rg`, `find`, ...) and a best-effort query. Agents chain searches
+/// (`cd repo && grep -rn x src | head`), so each `&&`, `||` or `;` part counts
+/// by the command at the head of its pipeline; a search fed by a pipe
+/// (`ps aux | grep x`) is filtering.
+pub(crate) fn shell_code_search(command: &str) -> Option<(&'static str, String)> {
+    pipeline_heads(command)
+        .into_iter()
+        .find_map(detect_bash_code_search)
+}
+
+/// The first command of each pipeline in `command`, splitting on `&&`, `||`,
+/// `;` and `|` outside quotes.
+fn pipeline_heads(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut heads = Vec::new();
+    let (mut start, mut in_tail) = (0, false);
+    let (mut quote, mut escaped) = (None::<u8>, false);
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' && quote != Some(b'\'') {
+            escaped = true;
+        } else if let Some(open) = quote {
+            if byte == open {
+                quote = None;
+            }
+        } else if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+        } else if matches!(byte, b';' | b'&' | b'|') {
+            let pair = bytes.get(i + 1) == Some(&byte);
+            let ends_list = byte == b';' || pair;
+            if byte != b'&' || pair {
+                if !in_tail {
+                    heads.push(&command[start..i]);
+                }
+                in_tail = !ends_list;
+                i += if pair { 2 } else { 1 };
+                start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if !in_tail {
+        heads.push(&command[start..]);
+    }
+    heads
+}
+
+/// The ContextStream search mode that suits `query`.
+pub(crate) fn search_mode_for(query: &str) -> &'static str {
+    recommend_search_mode(query).0.as_str()
+}
+
 fn should_wait_for_initial_index(status: IndexStatus) -> bool {
     !status.is_indexed
 }
@@ -4843,5 +4905,34 @@ mod tests {
         );
         assert_eq!(file_types_from_glob("**/*.{ts,tsx}"), vec!["ts", "tsx"]);
         assert!(file_types_from_glob("src/**").is_empty());
+    }
+
+    #[test]
+    fn pipeline_heads_split_lists_and_skip_pipe_tails_outside_quotes() {
+        assert_eq!(
+            pipeline_heads("cd /r && git ls-files | head -100 && grep -rn \"a|b;c\" src | head"),
+            vec!["cd /r ", " git ls-files ", " grep -rn \"a|b;c\" src "]
+        );
+        assert_eq!(pipeline_heads("a; b || c & d"), vec!["a", " b ", " c & d"]);
+        assert_eq!(pipeline_heads("ps aux | grep x"), vec!["ps aux "]);
+        assert_eq!(pipeline_heads("echo 'x && y'"), vec!["echo 'x && y'"]);
+    }
+
+    #[test]
+    fn shell_code_search_finds_chained_searches_but_not_filters() {
+        // The commands Antigravity's agent ran in the live baseline (#321).
+        assert_eq!(
+            shell_code_search(
+                "cd /repo && git ls-files | grep -i -E \"setup|install\" ; grep -rln \"mcpServers\" --include=*.rs crates | head -30"
+            ),
+            Some(("grep", "mcpServers".to_string()))
+        );
+        assert_eq!(
+            shell_code_search("cd /repo && find . -name '*.rs' -path '*setup*'"),
+            Some(("find", "*.rs".to_string()))
+        );
+        assert_eq!(shell_code_search("ps aux | grep agy"), None);
+        assert_eq!(shell_code_search("grep -n fn src/main.rs"), None);
+        assert_eq!(shell_code_search("cargo test && ls"), None);
     }
 }

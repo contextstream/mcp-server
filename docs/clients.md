@@ -36,6 +36,13 @@ contextstream-mcp setup --editors=kimi,qwen,zed
 | Crush | `crush` | `~/.config/crush/crush.json` | — | `AGENTS.md` | — |
 <!-- END GENERATED -->
 
+For Antigravity (the desktop app and `agy`), setup also installs a ContextStream
+plugin in `~/.gemini/config/plugins/contextstream`. It holds compact always-on
+rules (`rules/AGENTS.md`), the full reference as the `contextstream` skill, and
+hooks that remind the agent to call `init`/`context` and to search ContextStream
+before its own grep and find. Antigravity shows it under its plugins
+(`agy plugin list`); `doctor` reports whether it is installed and on.
+
 `<VS Code user dir>` is `~/.config/Code/User` on Linux,
 `~/Library/Application Support/Code/User` on macOS, and `%APPDATA%\Code\User` on
 Windows. `<Claude config dir>` is `~/.config/Claude`,

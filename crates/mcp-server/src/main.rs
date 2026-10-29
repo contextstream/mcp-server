@@ -838,9 +838,11 @@ Notes:
       - Verify ContextStream hook entries exist for PreToolUse + UserPromptSubmit
       - Ensure CONTEXTSTREAM_HOOK_ENABLED is not set to false
   - Antigravity troubleshooting:
-      - Antigravity currently uses rules-only guidance (no lifecycle hooks)
+      - Rules, skill and hooks come from the ContextStream plugin in
+        ~/.gemini/config/plugins/contextstream (`agy plugin list` shows it)
       - Verify ~/.gemini/config/mcp_config.json contains contextstream (serverUrl)
-      - Follow strict init() -> context() -> search(mode="auto") workflow
+      - `contextstream-mcp doctor --repair --editors antigravity` restores the plugin;
+        `agy plugin enable contextstream` turns it back on
 
 Team workflows:
   Team accounts unlock shared workspace memory, skill discovery/sharing, ticket

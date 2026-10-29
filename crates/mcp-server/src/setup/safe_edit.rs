@@ -412,6 +412,30 @@ fn record_planned_in(
     });
 }
 
+/// Whether this dry run already plans to delete `path`. The file stays on
+/// disk until the run is applied, so a later step that depends on it being
+/// gone asks here.
+pub(crate) fn is_planned_deletion(path: &Path) -> bool {
+    if !is_dry_run() {
+        return false;
+    }
+    let deletes = |changes: &[PlannedChange]| {
+        changes
+            .iter()
+            .any(|change| change.path == path && matches!(change.action, ChangeAction::Delete))
+    };
+    #[cfg(not(test))]
+    {
+        let guard = planned_changes().lock().unwrap_or_else(|e| e.into_inner());
+        deletes(&guard)
+    }
+
+    #[cfg(test)]
+    {
+        TEST_PLANNED.with(|planned| deletes(&planned.borrow()))
+    }
+}
+
 /// Drain and return everything a dry run planned to do.
 pub fn take_planned_changes() -> Vec<PlannedChange> {
     #[cfg(not(test))]

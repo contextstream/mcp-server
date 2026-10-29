@@ -1306,9 +1306,85 @@ fn check_editor_surfaces(
         if matches!(editor, Editor::ClaudeCode) {
             checks.push(check_claude_auto_memory());
         }
+        if matches!(editor, Editor::Antigravity) {
+            checks.push(check_antigravity_plugin());
+        }
     }
 
     checks
+}
+
+/// Antigravity loads ContextStream's rules, skill and hooks from one plugin
+/// folder, and only while the folder has a manifest and the plugin is on.
+/// The rules and hooks have their own checks; this one covers the rest.
+fn check_antigravity_plugin() -> SurfaceCheck {
+    use super::antigravity_plugin::{self as plugin, ManifestState};
+    const SURFACE: &str = "plugin";
+    const FIX: &str = "contextstream-mcp doctor --repair --scope global --editors antigravity";
+
+    let manifest = plugin::manifest_path();
+    match plugin::manifest_state() {
+        ManifestState::Missing => {
+            return SurfaceCheck::problem(
+                SURFACE,
+                CheckStatus::Fail,
+                "plugin manifest missing, so Antigravity loads none of the ContextStream rules, skill or hooks",
+                manifest.as_deref(),
+                FIX,
+            )
+        }
+        ManifestState::Unreadable(detail) => {
+            return SurfaceCheck::problem(
+                SURFACE,
+                CheckStatus::Fail,
+                format!("plugin manifest is unreadable ({detail}), so Antigravity skips the plugin"),
+                manifest.as_deref(),
+                FIX,
+            )
+        }
+        ManifestState::Present => {}
+    }
+    if plugin::disabled_in_antigravity() {
+        return SurfaceCheck::problem(
+            SURFACE,
+            CheckStatus::Warn,
+            "the ContextStream plugin is turned off in Antigravity",
+            plugin::plugin_dir().as_deref(),
+            "agy plugin enable contextstream (or turn it on in Antigravity's plugin settings)",
+        );
+    }
+    if let Some(path) = super::hooks::legacy_antigravity_hook_entry_path() {
+        return SurfaceCheck::problem(
+            SURFACE,
+            CheckStatus::Warn,
+            "an older ContextStream hook entry is still here, so each hook runs twice",
+            Some(&path),
+            FIX,
+        );
+    }
+    if let Some(path) = super::rules::retired_antigravity_gemini_md_rules() {
+        return SurfaceCheck::problem(
+            SURFACE,
+            CheckStatus::Warn,
+            "older ContextStream rules here also load into Antigravity, from the same rules budget",
+            Some(&path),
+            FIX,
+        );
+    }
+    if !plugin::skill_installed() {
+        return SurfaceCheck::problem(
+            SURFACE,
+            CheckStatus::Warn,
+            "the contextstream skill (the full reference) is missing",
+            plugin::skill_path().as_deref(),
+            FIX,
+        );
+    }
+    SurfaceCheck::pass(
+        SURFACE,
+        "ContextStream plugin installed and on",
+        plugin::plugin_dir().as_deref(),
+    )
 }
 
 /// Claude Code auto memory competes with ContextStream: while it is on, the
@@ -5093,5 +5169,58 @@ mod tests {
             FIX,
         );
         assert_eq!(codex_matching.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn antigravity_plugin_check_reports_manifest_switch_and_leftovers() {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+        let config = temp.path().join(".gemini").join("config");
+
+        let missing = check_antigravity_plugin();
+        assert_eq!(missing.status, CheckStatus::Fail);
+        assert!(
+            missing.detail.contains("manifest missing"),
+            "{}",
+            missing.detail
+        );
+
+        super::super::rules::write_editor_rules(&Editor::Antigravity).expect("rules");
+        super::super::hooks::install_hooks(&Editor::Antigravity, None).expect("hooks");
+        let healthy = check_antigravity_plugin();
+        assert_eq!(healthy.status, CheckStatus::Pass, "{}", healthy.detail);
+
+        std::fs::write(
+            config.join("config.json"),
+            r#"{"plugins": {"contextstream": {"enabled": false}}}"#,
+        )
+        .unwrap();
+        let disabled = check_antigravity_plugin();
+        assert_eq!(disabled.status, CheckStatus::Warn);
+        assert!(disabled
+            .fix
+            .as_deref()
+            .unwrap()
+            .contains("agy plugin enable contextstream"));
+        std::fs::remove_file(config.join("config.json")).unwrap();
+
+        std::fs::write(
+            config.join("hooks.json"),
+            r#"{"contextstream": {"SessionStart": []}}"#,
+        )
+        .unwrap();
+        let twice = check_antigravity_plugin();
+        assert_eq!(twice.status, CheckStatus::Warn);
+        assert!(twice.detail.contains("runs twice"), "{}", twice.detail);
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 }

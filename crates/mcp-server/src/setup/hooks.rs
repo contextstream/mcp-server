@@ -727,9 +727,7 @@ pub fn install_hooks(editor: &Editor, api_key: Option<&str>) -> Result<()> {
         Editor::Windsurf => install_windsurf_hooks(api_key),
         Editor::Cline | Editor::RooCode => install_vscode_extension_hooks(editor, api_key),
         Editor::Codex => install_notice_hooks(codex_hooks_path(), build_codex_hooks_update),
-        Editor::Antigravity => {
-            install_notice_hooks(antigravity_hooks_path(), build_antigravity_hooks_update)
-        }
+        Editor::Antigravity => install_antigravity_hooks(),
         Editor::KiloCode => {
             // Kilo CLI doesn't support filesystem hooks — enforcement is
             // handled via rules + skills + MCP tools.
@@ -1093,16 +1091,19 @@ fn install_vscode_extension_hooks(editor: &Editor, _api_key: Option<&str>) -> Re
 }
 
 // ============================================================================
-// Mid-run notice hooks (Codex, Antigravity)
+// Codex and Antigravity hooks
 // ============================================================================
 //
-// Codex and Antigravity keep no ContextStream enforcement hooks. These hooks
-// only show coordination notices to a long-running session between prompts.
+// Codex keeps no ContextStream enforcement hooks; its hook only shows
+// coordination notices to a long-running session between prompts.
+// Antigravity's hooks, in the ContextStream plugin, show those notices too and
+// remind the agent to ground each request and to search ContextStream before
+// its own grep and find (see `hook_handlers::antigravity`).
 
 /// Codex `PreToolUse` hook that shows mid-run notices. Codex reads
 /// Claude-format `hooks.json` and accepts `additionalContext` on `PreToolUse`.
 pub(crate) const CODEX_NOTICE_HOOK: &str = "mid-run-notices";
-/// ContextStream's named entry in Antigravity's `hooks.json`.
+/// ContextStream's named entry in the plugin's `hooks.json`.
 const ANTIGRAVITY_HOOK_ENTRY: &str = "contextstream";
 /// `(event, hook name, timeout)`. `SessionStart` and `PreInvocation` list
 /// handlers flat; `PostToolUse` groups them under a matcher.
@@ -1117,7 +1118,34 @@ fn codex_hooks_path() -> Option<PathBuf> {
 }
 
 fn antigravity_hooks_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".gemini").join("config").join("hooks.json"))
+    super::antigravity_plugin::hooks_path()
+}
+
+/// Write the hook entry into the ContextStream plugin, and take the one
+/// earlier releases put in the global `~/.gemini/config/hooks.json` out, so
+/// each hook runs once.
+fn install_antigravity_hooks() -> Result<()> {
+    // Antigravity runs a plugin's hooks only when the plugin has a manifest.
+    super::antigravity_plugin::ensure_manifest()?;
+    install_notice_hooks(antigravity_hooks_path(), build_antigravity_hooks_update)?;
+    remove_legacy_antigravity_hooks()
+}
+
+fn remove_legacy_antigravity_hooks() -> Result<()> {
+    uninstall_notice_hooks(
+        super::antigravity_plugin::legacy_hooks_path(),
+        remove_antigravity_hooks,
+        &[ANTIGRAVITY_HOOK_ENTRY],
+    )
+}
+
+/// Whether the global `~/.gemini/config/hooks.json` still has ContextStream's
+/// entry from a release before the plugin.
+pub(crate) fn legacy_antigravity_hook_entry_path() -> Option<PathBuf> {
+    let path = super::antigravity_plugin::legacy_hooks_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    value.get(ANTIGRAVITY_HOOK_ENTRY).is_some().then_some(path)
 }
 
 /// The JSON hook file setup writes for `editor`, when it writes one.
@@ -2698,11 +2726,15 @@ pub fn uninstall_hooks(editor: &Editor) -> Result<()> {
         Editor::Windsurf => uninstall_windsurf_hooks(),
         Editor::Cline | Editor::RooCode => uninstall_vscode_extension_hooks(editor),
         Editor::Codex => uninstall_notice_hooks(codex_hooks_path(), remove_codex_notice_hooks, &[]),
-        Editor::Antigravity => uninstall_notice_hooks(
-            antigravity_hooks_path(),
-            remove_antigravity_hooks,
-            &[ANTIGRAVITY_HOOK_ENTRY],
-        ),
+        Editor::Antigravity => {
+            uninstall_notice_hooks(
+                antigravity_hooks_path(),
+                remove_antigravity_hooks,
+                &[ANTIGRAVITY_HOOK_ENTRY],
+            )?;
+            remove_legacy_antigravity_hooks()?;
+            super::antigravity_plugin::remove_if_unused().map(|_| ())
+        }
         _ => Ok(()),
     }
 }
@@ -4585,6 +4617,71 @@ mod tests {
         uninstall_hooks(&Editor::Antigravity).expect("uninstall Antigravity hooks");
         let written: Value = serde_json::from_str(&std::fs::read_to_string(&agy).unwrap()).unwrap();
         assert_eq!(written, json!({"lint-checker": lint}));
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn antigravity_hooks_move_from_the_global_hooks_file_into_the_plugin() {
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+
+        // An earlier release's entry in the global file, beside the person's own.
+        let global = temp.path().join(".gemini/config/hooks.json");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        let lint = json!({"PostToolUse": [{"matcher": "run_command", "hooks": [{"command": "./lint.sh"}]}]});
+        std::fs::write(
+            &global,
+            serde_json::to_string_pretty(&json!({
+                "lint-checker": lint,
+                "contextstream": antigravity_hook_entry("/old/contextstream-mcp"),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy_antigravity_hook_entry_path(), Some(global.clone()));
+
+        install_hooks(&Editor::Antigravity, None).expect("install Antigravity hooks");
+        let plugin = temp.path().join(".gemini/config/plugins/contextstream");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(plugin.join("hooks.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            validate_managed_hook_config(&Editor::Antigravity, &written),
+            Ok(3)
+        );
+        assert!(
+            plugin.join("plugin.json").exists(),
+            "hooks need the manifest"
+        );
+        let left: Value = serde_json::from_str(&std::fs::read_to_string(&global).unwrap()).unwrap();
+        assert_eq!(left, json!({"lint-checker": lint}));
+        assert_eq!(legacy_antigravity_hook_entry_path(), None);
+
+        // A global file that held only our entry goes (a fresh one: the
+        // backup of the file above holds the person's entry).
+        let _ = std::fs::remove_file(safe_edit::backup_path(&global).unwrap());
+        std::fs::write(
+            &global,
+            serde_json::to_string(
+                &json!({"contextstream": antigravity_hook_entry("/old/contextstream-mcp")}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        install_hooks(&Editor::Antigravity, None).expect("refresh");
+        assert!(!global.exists());
+
+        uninstall_hooks(&Editor::Antigravity).expect("uninstall");
+        assert!(!plugin.exists(), "an unused plugin is removed");
 
         if let Some(home) = previous_home {
             std::env::set_var("HOME", home);

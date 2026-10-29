@@ -683,7 +683,7 @@
           "config_path": "~/.gemini/config/mcp_config.json",
           "editor": "antigravity",
           "editor_name": "Antigravity",
-          "rules_path": "~/.gemini/GEMINI.md",
+          "rules_path": "~/.gemini/config/plugins/contextstream/rules/AGENTS.md",
           "server_config": {
             "args": [],
             "command": "~/.contextstream/bin/contextstream-mcp",
@@ -724,7 +724,7 @@
           "config_path": "~/.gemini/config/mcp_config.json",
           "editor": "antigravity",
           "editor_name": "Antigravity",
-          "rules_path": "~/.gemini/GEMINI.md",
+          "rules_path": "~/.gemini/config/plugins/contextstream/rules/AGENTS.md",
           "server_config": {
             "headers": {
               "X-ContextStream-API-Key": "test-key",
@@ -756,7 +756,7 @@
       "paths": {
         "cleanup_rules_global": [],
         "cleanup_rules_project": [],
-        "hooks_config": "~/.gemini/config/hooks.json",
+        "hooks_config": "~/.gemini/config/plugins/contextstream/hooks.json",
         "legacy_mcp_config": [
           "~/.gemini/antigravity/mcp_config.json"
         ],
@@ -766,7 +766,7 @@
         ],
         "mcp_config": "~/.gemini/config/mcp_config.json",
         "project_mcp_config": "<project>/.agents/mcp_config.json",
-        "rules_global": "~/.gemini/GEMINI.md",
+        "rules_global": "~/.gemini/config/plugins/contextstream/rules/AGENTS.md",
         "rules_project": "<project>/GEMINI.md"
       },
       "writes": {

@@ -228,35 +228,7 @@ pub fn is_scratch_or_temp_path(path: &str) -> bool {
 }
 
 /// Normalize an agent handle such as `agent-cc-qa.Cz5v` -> `cc-qa`.
-pub fn normalize_agent_handle(raw: &str) -> Option<String> {
-    let mut token = raw
-        .trim()
-        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | ':' | ',' | ';'))
-        .trim();
-    if token.is_empty() {
-        return None;
-    }
-    if let Some((stem, suffix)) = token.rsplit_once('.') {
-        if stem.to_ascii_lowercase().starts_with("agent-")
-            && (3..=10).contains(&suffix.len())
-            && suffix.chars().all(|c| c.is_ascii_alphanumeric())
-        {
-            token = stem;
-        }
-    }
-    let lowered = token.to_ascii_lowercase();
-    let stripped = lowered.strip_prefix("agent-").unwrap_or(&lowered);
-    let candidate = if !stripped.is_empty() {
-        stripped
-    } else {
-        lowered.as_str()
-    };
-    (candidate.len() <= 64
-        && candidate
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
-    .then(|| candidate.to_string())
-}
+pub use mcp_client::agent_handle::normalize_agent_handle;
 
 fn extract_heading_agent_name(text: &str) -> Option<String> {
     for line in text.lines().take(12) {

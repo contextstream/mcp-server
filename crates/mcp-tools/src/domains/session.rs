@@ -3659,6 +3659,7 @@ impl ToolHandler for InitTool {
                         .context_hint
                         .as_deref()
                         .and_then(coordination_task_summary),
+                    folder_path_owned.as_deref(),
                 );
             }
         }
@@ -7223,7 +7224,12 @@ fn spawn_coordination_check_in(
     project_id: Option<Uuid>,
     session_id: String,
     task_summary: Option<String>,
+    folder: Option<&str>,
 ) {
+    // The agent's handle (from its environment or agent-<name> folder) lets a
+    // share that names it reach this session (mcp-server#310).
+    let metadata = mcp_client::agent_handle::agent_handle(folder)
+        .map(|handle| serde_json::json!({ "agent_name": handle }));
     let client = client.clone();
     let session_key = mcp_client::get_task_session_key();
     let caller_cache_identity = mcp_client::get_task_caller_cache_identity();
@@ -7242,7 +7248,7 @@ fn spawn_coordination_check_in(
                         project_id,
                         &session_id,
                         task_summary.as_deref(),
-                        None,
+                        metadata.as_ref(),
                     )
                     .await
             },
@@ -8822,6 +8828,7 @@ impl ToolHandler for ContextTool {
                 project_id,
                 session_id,
                 coordination_task_summary(&user_message_for_relevance),
+                self.session.state().await.folder_path.as_deref(),
             );
         }
 

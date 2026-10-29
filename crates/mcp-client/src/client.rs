@@ -4115,16 +4115,31 @@ impl ContextStreamClient {
                     } else {
                         Error::Network(e.to_string())
                     };
+                    // A connection refused, unroutable or unresolved fails at
+                    // once; backing off 1 s, 2 s and 4 s only made every call
+                    // wait 6.5 s or more with the network down (#320). One quick
+                    // retry covers a blip; timeouts keep the full schedule.
+                    let refused = e.is_connect() && !e.is_timeout();
+                    let retries_allowed = if refused {
+                        max_retries.min(CONNECT_FAILURE_RETRIES)
+                    } else {
+                        max_retries
+                    };
 
                     if error.is_retryable()
-                        && attempt < max_retries
+                        && attempt < retries_allowed
                         && retry_permitted(
                             is_write,
                             failure,
                             api_supports_idempotency(&config.api_url),
                         )
                     {
-                        if let Some(delay) = self.retry_config.delay_before_retry(&error, attempt) {
+                        let delay = if refused {
+                            Some(CONNECT_FAILURE_RETRY_DELAY)
+                        } else {
+                            self.retry_config.delay_before_retry(&error, attempt)
+                        };
+                        if let Some(delay) = delay {
                             retry_delay = Some(delay);
                             attempt += 1;
                             continue;
@@ -20970,6 +20985,11 @@ pub fn coordination_notice_path(
     path
 }
 
+/// Retries of a request whose connection was refused, unroutable or
+/// unresolved, and the wait before each (#320).
+const CONNECT_FAILURE_RETRIES: u32 = 1;
+const CONNECT_FAILURE_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 fn extract_error_message(body: &serde_json::Value, status: u16) -> String {
     if let Some(validation_message) = extract_validation_error_message(body) {
         return validation_message;
@@ -27234,6 +27254,29 @@ mod tests {
         );
 
         assert_eq!(message, "content_max_chars: must be between 50 and 10000");
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_fails_quickly_instead_of_backing_off() {
+        // #320: four attempts with 1 s, 2 s and 4 s waits made every call take
+        // 6.5 s or more with the network down.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let config = mcp_types::Config {
+            api_url: format!("http://{address}"),
+            api_key: Some("cs_test_refused".to_string()),
+            ..Default::default()
+        };
+        let client = ContextStreamClient::new(config);
+        let started = std::time::Instant::now();
+        let error = client.me().await.expect_err("nothing listens there");
+        assert!(matches!(error, Error::Network(_)), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

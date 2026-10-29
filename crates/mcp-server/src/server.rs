@@ -1932,6 +1932,7 @@ async fn handle_request_dispatch(
                 && !domains::coach::is_coach_tool(tool_name)
                 && !registry.is_studio_surface()
                 && !session.is_initialized().await
+                && !auto_init_recently_unreachable()
             {
                 debug!(
                     "Auto-init: session not initialized, triggering init before '{}'",
@@ -1967,8 +1968,19 @@ async fn handle_request_dispatch(
                     });
 
                     match init_tool.handler.execute(init_args).await {
-                        Ok(_) => debug!("Auto-init completed successfully"),
-                        Err(e) => debug!("Auto-init failed (non-fatal): {}", e),
+                        Ok(_) => {
+                            debug!("Auto-init completed successfully");
+                            note_auto_init_reachability(true);
+                        }
+                        Err(e) => {
+                            debug!("Auto-init failed (non-fatal): {}", e);
+                            if matches!(
+                                e,
+                                mcp_types::Error::Network(_) | mcp_types::Error::Timeout(_)
+                            ) {
+                                note_auto_init_reachability(false);
+                            }
+                        }
                     }
                 }
             }
@@ -2318,6 +2330,27 @@ fn json_rpc_result(id: Option<serde_json::Value>, result: serde_json::Value) -> 
         "result": result
     })
     .to_string()
+}
+
+/// How long after an auto-init that could not reach the API the next tool
+/// calls skip auto-init, instead of each paying its retries again (#320).
+const AUTO_INIT_UNREACHABLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+static AUTO_INIT_UNREACHABLE_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+fn note_auto_init_reachability(reached: bool) {
+    let mut last = AUTO_INIT_UNREACHABLE_AT
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    *last = (!reached).then(std::time::Instant::now);
+}
+
+fn auto_init_recently_unreachable() -> bool {
+    AUTO_INIT_UNREACHABLE_AT
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .is_some_and(|at| at.elapsed() < AUTO_INIT_UNREACHABLE_BACKOFF)
 }
 
 fn json_rpc_error(id: Option<serde_json::Value>, code: i32, message: &str) -> String {

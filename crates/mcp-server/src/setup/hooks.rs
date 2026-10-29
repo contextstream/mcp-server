@@ -592,6 +592,10 @@ pub fn install_hooks(editor: &Editor, api_key: Option<&str>) -> Result<()> {
         Editor::Cursor => install_cursor_hooks(api_key),
         Editor::Windsurf => install_windsurf_hooks(api_key),
         Editor::Cline | Editor::RooCode => install_vscode_extension_hooks(editor, api_key),
+        Editor::Codex => install_notice_hooks(codex_hooks_path(), build_codex_hooks_update),
+        Editor::Antigravity => {
+            install_notice_hooks(antigravity_hooks_path(), build_antigravity_hooks_update)
+        }
         Editor::KiloCode => {
             // Kilo CLI doesn't support filesystem hooks — enforcement is
             // handled via rules + skills + MCP tools.
@@ -924,6 +928,227 @@ fn install_vscode_extension_hooks(editor: &Editor, _api_key: Option<&str>) -> Re
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Mid-run notice hooks (Codex, Antigravity)
+// ============================================================================
+//
+// Codex and Antigravity keep no ContextStream enforcement hooks. These hooks
+// only show coordination notices to a long-running session between prompts.
+
+/// Codex `PreToolUse` hook that shows mid-run notices. Codex reads
+/// Claude-format `hooks.json` and accepts `additionalContext` on `PreToolUse`.
+pub(crate) const CODEX_NOTICE_HOOK: &str = "mid-run-notices";
+/// ContextStream's named entry in Antigravity's `hooks.json`.
+const ANTIGRAVITY_HOOK_ENTRY: &str = "contextstream";
+/// `(event, hook name, timeout)`. `SessionStart` and `PreInvocation` list
+/// handlers flat; `PostToolUse` groups them under a matcher.
+const ANTIGRAVITY_HOOK_SPECS: &[(&str, &str, u64)] = &[
+    ("SessionStart", "agy-session-start", 10),
+    ("PreInvocation", "agy-pre-invocation", 5),
+    ("PostToolUse", "agy-post-tool-use", 5),
+];
+
+fn codex_hooks_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".codex").join("hooks.json"))
+}
+
+fn antigravity_hooks_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".gemini").join("config").join("hooks.json"))
+}
+
+/// The JSON hook file setup writes for `editor`, when it writes one.
+pub(crate) fn hook_config_path(editor: &Editor) -> Option<PathBuf> {
+    match editor {
+        Editor::ClaudeCode => claude_code_settings_path(),
+        Editor::Cursor => cursor_hooks_path(),
+        Editor::Windsurf => windsurf_hooks_path(),
+        Editor::Codex => codex_hooks_path(),
+        Editor::Antigravity => antigravity_hooks_path(),
+        _ => None,
+    }
+}
+
+/// Managed hook names of every `command` anywhere under `value`.
+fn managed_hook_names_in(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items.iter().flat_map(managed_hook_names_in).collect(),
+        Value::Object(object) => {
+            let mut names: Vec<String> = object
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(current_managed_hook_name)
+                .map(|name| vec![name.to_string()])
+                .unwrap_or_default();
+            names.extend(object.values().flat_map(managed_hook_names_in));
+            names
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn is_codex_notice_hook_group(group: &Value) -> bool {
+    group.get("hooks").is_some_and(|hooks| {
+        managed_hook_names_in(hooks)
+            .iter()
+            .any(|name| name == CODEX_NOTICE_HOOK)
+    })
+}
+
+fn codex_notice_hook_group(binary: &str) -> Value {
+    json!({
+        "hooks": [{
+            "type": "command",
+            "command": hook_command(binary, CODEX_NOTICE_HOOK),
+            "timeout": 5,
+        }]
+    })
+}
+
+fn root_object_for_edit(loaded: &safe_edit::LoadedConfig, path: &Path) -> Result<JsonMap> {
+    match &loaded.value {
+        Value::Object(root) => Ok(root.clone()),
+        Value::Null => Ok(JsonMap::new()),
+        _ => anyhow::bail!(
+            "Refusing to modify {}: it is not a JSON object.",
+            path.display()
+        ),
+    }
+}
+
+/// Add (or refresh) the notice hook in Codex's `hooks.json`, leaving every
+/// other entry, ContextStream-owned or not, as it is.
+fn build_codex_hooks_update(loaded: &safe_edit::LoadedConfig, path: &Path) -> Result<Value> {
+    let mut root = root_object_for_edit(loaded, path)?;
+    let mut hooks = hooks_object_of(loaded, path)?;
+    let group = codex_notice_hook_group(&find_binary_path());
+    match hooks.get_mut("PreToolUse") {
+        Some(Value::Array(groups)) => {
+            groups.retain(|existing| !is_codex_notice_hook_group(existing));
+            groups.push(group);
+        }
+        Some(_) => anyhow::bail!(
+            "Refusing to modify {}: \"PreToolUse\" is not an array.",
+            path.display()
+        ),
+        None => {
+            hooks.insert("PreToolUse".to_string(), Value::Array(vec![group]));
+        }
+    }
+    root.insert("hooks".to_string(), Value::Object(hooks));
+    Ok(Value::Object(root))
+}
+
+fn remove_codex_notice_hooks(loaded: &safe_edit::LoadedConfig, path: &Path) -> Result<Value> {
+    let mut root = root_object_for_edit(loaded, path)?;
+    let mut hooks = hooks_object_of(loaded, path)?;
+    if let Some(Value::Array(groups)) = hooks.get_mut("PreToolUse") {
+        groups.retain(|existing| !is_codex_notice_hook_group(existing));
+        if groups.is_empty() {
+            hooks.remove("PreToolUse");
+        }
+    }
+    root.insert("hooks".to_string(), Value::Object(hooks));
+    Ok(Value::Object(root))
+}
+
+fn antigravity_hook_entry(binary: &str) -> Value {
+    let mut entry = JsonMap::new();
+    for (event, hook_name, timeout) in ANTIGRAVITY_HOOK_SPECS {
+        let handler = json!({
+            "type": "command",
+            "command": hook_command(binary, hook_name),
+            "timeout": timeout,
+        });
+        let handlers = if *event == "PostToolUse" {
+            json!([{ "matcher": "*", "hooks": [handler] }])
+        } else {
+            json!([handler])
+        };
+        entry.insert((*event).to_string(), handlers);
+    }
+    Value::Object(entry)
+}
+
+/// Set ContextStream's named entry in Antigravity's `hooks.json`; other named
+/// hooks are left as they are.
+fn build_antigravity_hooks_update(loaded: &safe_edit::LoadedConfig, path: &Path) -> Result<Value> {
+    let mut root = root_object_for_edit(loaded, path)?;
+    root.insert(
+        ANTIGRAVITY_HOOK_ENTRY.to_string(),
+        antigravity_hook_entry(&find_binary_path()),
+    );
+    Ok(Value::Object(root))
+}
+
+fn install_notice_hooks(
+    path: Option<PathBuf>,
+    build: fn(&safe_edit::LoadedConfig, &Path) -> Result<Value>,
+) -> Result<()> {
+    let path = path.ok_or_else(|| anyhow::anyhow!("Could not determine the hooks path"))?;
+    let loaded = safe_edit::read_for_edit(&path, safe_edit::JsonDialect::Strict)?;
+    warn_on_nonstandard_syntax(&loaded, &path);
+    let updated = build(&loaded, &path)?;
+    safe_edit::commit(&path, &loaded, &updated)?;
+    Ok(())
+}
+
+/// `removed_keys`: the top-level keys `remove` may delete.
+fn uninstall_notice_hooks(
+    path: Option<PathBuf>,
+    remove: fn(&safe_edit::LoadedConfig, &Path) -> Result<Value>,
+    removed_keys: &[&str],
+) -> Result<()> {
+    let Some(path) = path.filter(|path| path.exists()) else {
+        return Ok(());
+    };
+    let loaded = safe_edit::read_for_edit(&path, safe_edit::JsonDialect::Strict)?;
+    let updated = remove(&loaded, &path)?;
+    if updated != loaded.value {
+        safe_edit::commit_with_removals(&path, &loaded, &updated, removed_keys)?;
+    }
+    Ok(())
+}
+
+fn remove_antigravity_hooks(loaded: &safe_edit::LoadedConfig, path: &Path) -> Result<Value> {
+    let mut root = root_object_for_edit(loaded, path)?;
+    root.remove(ANTIGRAVITY_HOOK_ENTRY);
+    Ok(Value::Object(root))
+}
+
+fn validate_codex_notice_hooks(value: &Value) -> std::result::Result<usize, String> {
+    let groups = value
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "no PreToolUse hooks".to_string())?;
+    if groups.iter().any(is_codex_notice_hook_group) {
+        Ok(1)
+    } else {
+        Err("the mid-run notice hook is not installed".to_string())
+    }
+}
+
+fn validate_antigravity_hooks(value: &Value) -> std::result::Result<usize, String> {
+    let entry = value
+        .get(ANTIGRAVITY_HOOK_ENTRY)
+        .and_then(Value::as_object)
+        .ok_or_else(|| "the \"contextstream\" hook entry is missing".to_string())?;
+    if entry.get("enabled") == Some(&Value::Bool(false)) {
+        return Err("the \"contextstream\" hook entry is disabled".to_string());
+    }
+    for (event, hook_name, _) in ANTIGRAVITY_HOOK_SPECS {
+        let installed = entry.get(*event).is_some_and(|handlers| {
+            managed_hook_names_in(handlers)
+                .iter()
+                .any(|name| name == hook_name)
+        });
+        if !installed {
+            return Err(format!("{event} does not run {hook_name}"));
+        }
+    }
+    Ok(ANTIGRAVITY_HOOK_SPECS.len())
 }
 
 /// Get Claude Code settings.json path.
@@ -2133,6 +2358,11 @@ pub(super) fn validate_managed_hook_config(
     editor: &Editor,
     value: &Value,
 ) -> std::result::Result<usize, String> {
+    match editor {
+        Editor::Codex => return validate_codex_notice_hooks(value),
+        Editor::Antigravity => return validate_antigravity_hooks(value),
+        _ => {}
+    }
     let hooks = value
         .get("hooks")
         .and_then(Value::as_object)
@@ -2272,6 +2502,12 @@ pub fn uninstall_hooks(editor: &Editor) -> Result<()> {
         Editor::Cursor => uninstall_cursor_hooks(),
         Editor::Windsurf => uninstall_windsurf_hooks(),
         Editor::Cline | Editor::RooCode => uninstall_vscode_extension_hooks(editor),
+        Editor::Codex => uninstall_notice_hooks(codex_hooks_path(), remove_codex_notice_hooks, &[]),
+        Editor::Antigravity => uninstall_notice_hooks(
+            antigravity_hooks_path(),
+            remove_antigravity_hooks,
+            &[ANTIGRAVITY_HOOK_ENTRY],
+        ),
         _ => Ok(()),
     }
 }
@@ -3864,6 +4100,101 @@ mod tests {
         assert!(written.contains("\"model\": \"opus\""), "{written}");
         assert_eq!(claude_auto_memory_setting(), Some(ClaudeAutoMemory::Off));
         assert!(!disable_claude_auto_memory().expect("idempotent"));
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn codex_and_antigravity_get_only_notice_hooks_and_keep_other_entries() {
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+
+        // A user's own Codex hook and an older ContextStream pre-tool-use entry.
+        let codex = codex_hooks_path().expect("Codex path");
+        std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        let user_hook = json!({"hooks": [{"type": "command", "command": "./audit.sh"}]});
+        let other_managed = json!({"hooks": [{"type": "command", "command": hook_command("/x/contextstream-mcp", "pre-tool-use"), "timeout": 5}]});
+        std::fs::write(
+            &codex,
+            serde_json::to_string_pretty(
+                &json!({"hooks": {"PreToolUse": [user_hook, other_managed]}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            install_hooks(&Editor::Codex, None).expect("install Codex notice hooks");
+        }
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&codex).unwrap()).unwrap();
+        let groups = written["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 3, "{written}");
+        assert_eq!(groups[0], user_hook);
+        assert_eq!(groups[1], other_managed);
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|group| is_codex_notice_hook_group(group))
+                .count(),
+            1
+        );
+        assert_eq!(
+            validate_managed_hook_config(&Editor::Codex, &written),
+            Ok(1)
+        );
+
+        uninstall_hooks(&Editor::Codex).expect("uninstall Codex notice hooks");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&codex).unwrap()).unwrap();
+        assert_eq!(
+            written["hooks"]["PreToolUse"],
+            json!([user_hook, other_managed])
+        );
+        assert!(validate_managed_hook_config(&Editor::Codex, &written).is_err());
+
+        // Antigravity: a named entry beside the user's own.
+        let agy = antigravity_hooks_path().expect("Antigravity path");
+        std::fs::create_dir_all(agy.parent().unwrap()).unwrap();
+        let lint = json!({"PostToolUse": [{"matcher": "run_command", "hooks": [{"command": "./lint.sh"}]}]});
+        std::fs::write(
+            &agy,
+            serde_json::to_string(&json!({"lint-checker": lint})).unwrap(),
+        )
+        .unwrap();
+        install_hooks(&Editor::Antigravity, None).expect("install Antigravity hooks");
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&agy).unwrap()).unwrap();
+        assert_eq!(written["lint-checker"], lint);
+        let entry = &written["contextstream"];
+        assert!(entry["SessionStart"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("hook agy-session-start --contextstream-managed-hook=v1"));
+        assert!(entry["PreInvocation"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("hook agy-pre-invocation"));
+        assert_eq!(entry["PostToolUse"][0]["matcher"], "*");
+        assert!(entry["PostToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("hook agy-post-tool-use"));
+        assert_eq!(
+            validate_managed_hook_config(&Editor::Antigravity, &written),
+            Ok(3)
+        );
+
+        uninstall_hooks(&Editor::Antigravity).expect("uninstall Antigravity hooks");
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&agy).unwrap()).unwrap();
+        assert_eq!(written, json!({"lint-checker": lint}));
 
         if let Some(home) = previous_home {
             std::env::set_var("HOME", home);

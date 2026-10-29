@@ -385,6 +385,8 @@ struct ApiConfig {
     /// The ContextStream session `init` named for this host session, so the
     /// hook and the agent's own `context()` calls share one coordination identity.
     coordination_session_id: Option<String>,
+    /// Agent handle (e.g. `cc-qa`, `mcp-eng2`) for direct recipient targeting.
+    agent_name: Option<String>,
 }
 
 /// Handle the UserPromptSubmit hook.
@@ -413,7 +415,23 @@ pub async fn handle() -> Result<()> {
         prompt_state::mark_context_required(&cwd);
     }
 
+    super::mid_run_notices::observe_session_context(&input, &cwd);
+    let resolved_scope = super::mid_run_notices::resolve_hook_scope(&input, &cwd);
     let mut config = load_config(&cwd);
+    if config.workspace_id.is_none() {
+        config.workspace_id = resolved_scope.config.workspace_id.clone();
+    }
+    // A scratch-folder session takes the repository scope its prompt, brief,
+    // or tool calls point at.
+    if (config.project_id.is_none() || super::mid_run_notices::is_scratch_or_temp_path(&cwd))
+        && resolved_scope.config.project_id.is_some()
+    {
+        config.project_id = resolved_scope.config.project_id.clone();
+        if resolved_scope.config.workspace_id.is_some() {
+            config.workspace_id = resolved_scope.config.workspace_id.clone();
+        }
+    }
+    let effective_folder = resolved_scope.effective_folder_path;
     config.session_id = extract_session_id(&input);
     if coordination_checkin_enabled() {
         config.task_summary = prompt_task_summary(&input);
@@ -421,6 +439,7 @@ pub async fn handle() -> Result<()> {
             .session_id
             .as_deref()
             .and_then(super::durable_capture::session_api_session_id);
+        config.agent_name = resolved_scope.agent_name;
     }
 
     // Try fast API call if we have credentials. Reconcile unflushed local
@@ -429,8 +448,11 @@ pub async fn handle() -> Result<()> {
     // cooldown makes the vast majority of prompts a cheap no-op.
     let context_fut = async {
         if !config.api_key.is_empty() {
-            match fetch_hook_context(&config, editor, &cwd).await {
-                Some(ctx) => ctx,
+            match fetch_hook_context(&config, editor, &effective_folder).await {
+                Some(ctx) => {
+                    super::mid_run_notices::record_prompt_delivery(&input, &cwd, &ctx);
+                    ctx
+                }
                 None => fallback_reminder(),
             }
         } else {
@@ -521,6 +543,9 @@ fn hook_context_body(
             "coordination_session_id".to_string(),
             Value::String(session.clone()),
         );
+    }
+    if let Some(ref agent_name) = config.agent_name {
+        body.insert("agent_name".to_string(), Value::String(agent_name.clone()));
     }
 
     body
@@ -668,6 +693,7 @@ fn load_config(cwd: &str) -> ApiConfig {
         session_id: None,
         task_summary: None,
         coordination_session_id: None,
+        agent_name: None,
     }
 }
 
@@ -722,6 +748,7 @@ mod tests {
             session_id: Some("claude-session".to_string()),
             task_summary: None,
             coordination_session_id: None,
+            agent_name: None,
         };
         let body = hook_context_body(&config, EditorFormat::Claude, "/repo");
         assert!(!body.contains_key("task_summary"));

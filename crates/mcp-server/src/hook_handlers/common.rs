@@ -71,16 +71,21 @@ impl ApiConfig {
 /// `session_id` (or `sessionId`), Cursor `conversation_id`. This is not the id
 /// `init` returns, which is what a transcript and a resume card use.
 pub fn host_session_key(input: &Value) -> Option<String> {
-    ["session_id", "sessionId", "conversation_id"]
-        .iter()
-        .find_map(|key| {
-            input
-                .get(*key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
+    [
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "conversationId",
+    ]
+    .iter()
+    .find_map(|key| {
+        input
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// The label a git event carries for the harness that ran the hook: `cursor`,
@@ -112,6 +117,14 @@ pub fn extract_cwd(input: &Value) -> String {
         .or_else(|| {
             input
                 .get("workspaceRoots")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .or_else(|| {
+            input
+                .get("workspacePaths")
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())

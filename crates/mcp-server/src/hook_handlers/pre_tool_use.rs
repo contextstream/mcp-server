@@ -2403,10 +2403,42 @@ pub async fn handle() -> Result<()> {
         compliance::emit_for_hook(&compliance_config, Some(&input), Some("PreToolUse"), event);
     };
 
+    // Coordination notices that reached this session since its last prompt
+    // (headless sessions have no later prompt). `context`, `init`, and
+    // `coordination` calls return notices themselves.
+    super::mid_run_notices::observe_tool_args(&input, &cwd, &tool_input);
+    let mid_run_notice = match editor {
+        EditorFormat::Claude | EditorFormat::Cline
+            if !(is_contextstream_call
+                && matches!(
+                    normalized_contextstream_tool.as_str(),
+                    "context" | "init" | "coordination"
+                )) =>
+        {
+            let api_editor = if matches!(editor, EditorFormat::Claude) {
+                "claude"
+            } else {
+                "cline"
+            };
+            super::mid_run_notices::notice_for_hook(&input, &cwd, api_editor)
+        }
+        _ => None,
+    };
+
     let emit = |decision: HookDecision| -> Result<()> {
         if !matches!(decision, HookDecision::BlockWithMessage(_)) && record_state_change {
             prompt_state::mark_state_changed(&cwd);
         }
+        let decision = match (&mid_run_notice, decision) {
+            (Some(notice), HookDecision::Allow) => HookDecision::AllowWithContext(notice.clone()),
+            (Some(notice), HookDecision::AllowWithContext(msg)) => {
+                HookDecision::AllowWithContext(format!("{msg}\n\n{notice}"))
+            }
+            (Some(notice), HookDecision::BlockWithMessage(msg)) => {
+                HookDecision::BlockWithMessage(format!("{msg}\n\n{notice}"))
+            }
+            (None, decision) => decision,
+        };
         write_output(&editor, decision)
     };
 

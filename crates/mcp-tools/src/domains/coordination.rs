@@ -61,6 +61,9 @@ pub struct CoordinationInput {
     pub message: Option<String>,
     /// Presence metadata for check_in, e.g. {"git": {"branch", "commit"}}.
     pub metadata: Option<Value>,
+    /// For action=share: the one agent (e.g. "cc-qa") or session id of the
+    /// sender's own the share is for. Only that agent's sessions receive it.
+    pub to: Option<String>,
 }
 
 const SCOPE_DEFAULTED_ACTIONS: &[&str] = &["check_in", "inbox", "list", "share", "settings"];
@@ -237,6 +240,20 @@ impl ToolHandler for CoordinationTool {
                 if !target_projects.is_empty() {
                     body["target_project_ids"] = serde_json::json!(target_projects);
                 }
+                if let Some(to) = input
+                    .to
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|to| !to.is_empty())
+                {
+                    body["to"] = serde_json::json!(to);
+                }
+                // The sending session never receives its own share back.
+                if let Some(session) = self.session.as_deref() {
+                    if let Some(session_id) = session.state().await.api_session_id.clone() {
+                        body["session_id"] = serde_json::json!(session_id);
+                    }
+                }
                 let result = self.client.coordination_share(body).await?;
                 Ok(ToolResult::with_structured(
                     format_share(&result, &title),
@@ -358,6 +375,11 @@ impl ToolHandler for CoordinationTool {
                 false,
             )
             .string("title", "Title when sharing an item.", false)
+            .string(
+                "to",
+                "For share: one agent of yours (e.g. \"cc-qa\") or a session id. Only that agent receives the share, mid-run included.",
+                false,
+            )
             .string("summary", "Short summary of the shared knowledge.", false)
             .string(
                 "why_it_matters",
@@ -840,5 +862,64 @@ mod tests {
         let body = captured.lock().await.clone().expect("captured body");
         assert_eq!(body["workspace_id"], ws.to_string());
         assert_eq!(body["project_id"], proj.to_string());
+        assert!(body.get("to").is_none());
+    }
+
+    #[tokio::test]
+    async fn share_to_names_the_recipient_and_the_sending_session() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
+        let captured_srv = captured.clone();
+        let srv = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if let Some((_, body)) = req.split_once("\r\n\r\n") {
+                if let Ok(parsed) = serde_json::from_str::<Value>(body) {
+                    *captured_srv.lock().await = Some(parsed);
+                }
+            }
+            let resp_body = r#"{"data":{"id":"11111111-1111-4111-8111-111111111111"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let config = mcp_types::Config {
+            api_url: format!("http://{addr}/api/v1"),
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(mcp_session::SessionManager::new(client.clone(), config));
+        session
+            .update_scope(Some(Uuid::new_v4()), Some(Uuid::new_v4()), None)
+            .await;
+        session
+            .set_api_session_id(Some("sender-session".into()))
+            .await;
+
+        let tool = CoordinationTool::new(client).with_session(session);
+        let res = tool
+            .execute(json!({
+                "action": "share",
+                "kind": "status",
+                "title": "Kimi key funded",
+                "to": " cc-qa ",
+            }))
+            .await
+            .expect("share with to");
+        assert!(!res.is_error);
+        srv.await.unwrap();
+
+        let body = captured.lock().await.clone().expect("captured body");
+        assert_eq!(body["to"], "cc-qa");
+        assert_eq!(body["session_id"], "sender-session");
     }
 }

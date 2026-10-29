@@ -839,11 +839,12 @@ async fn handle_studio_protected_resource(headers: HeaderMap) -> impl IntoRespon
     Json(studio_protected_resource_metadata(&headers))
 }
 
-/// RFC 8414 / OIDC discovery served on the MCP host (mirrors what
-/// the actual authorization server publishes). Lets clients that
+/// RFC 8414 / OIDC discovery served on the MCP host. Lets clients that
 /// probe the resource host directly find the right endpoints without
 /// the auth-middleware 401 that broke claude.ai's custom connector
-/// flow.
+/// flow. It must say what the authorization server itself publishes, field
+/// for field: contextstream `oauth_provider::oauth_authorization_server_metadata`
+/// (its `ADVERTISED_SCOPES` and `SIGNING_ALGORITHMS`).
 async fn handle_oauth_authorization_server() -> impl IntoResponse {
     let auth_server = authorization_server_origin();
     let public_url = std::env::var("CONTEXTSTREAM_PUBLIC_WEB_ORIGIN")
@@ -861,18 +862,29 @@ async fn handle_oauth_authorization_server() -> impl IntoResponse {
         "token_endpoint_auth_methods_supported": [
             "client_secret_basic",
             "client_secret_post",
-            "none"
+            "none",
+            "private_key_jwt"
         ],
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
-        "code_challenge_methods_supported": ["S256", "plain"],
+        // OAuth 2.1 and the MCP authorization spec allow S256 only.
+        "code_challenge_methods_supported": ["S256"],
         "scopes_supported": [
             "read:workspaces",
             "read:projects",
             "read:search",
             "read:memory",
-            "write:memory"
-        ]
+            "write:memory",
+            mcp_client::coach::READ_SCOPE,
+            mcp_client::coach::WRITE_SCOPE,
+            "read:agents",
+            "write:agents",
+            STUDIO_READ_SCOPE,
+            STUDIO_WRITE_SCOPE
+        ],
+        "authorization_response_iss_parameter_supported": true,
+        "token_endpoint_auth_signing_alg_values_supported": ["RS256", "ES256"],
+        "client_id_metadata_document_supported": true
     }))
 }
 
@@ -3241,15 +3253,13 @@ pub async fn auth_middleware(
     // unauthenticated — challenging it for a Bearer token (which is
     // what an OAuth client is trying to *obtain*) is the bug that
     // surfaced as `mcp_client_invalid` in claude.ai's custom
-    // connector flow.
+    // connector flow. That holds for every `/.well-known/` path: one the
+    // gateway does not publish, such as the RFC 9728 URL a client builds
+    // from `/mcp`, is a 404, so the client falls back to the root document.
     if path == "/health"
         || path == "/api/v1/health"
         || path == "/metrics"
-        || path == "/.well-known/oauth-protected-resource"
-        || path == COACH_RESOURCE_METADATA_PATH
-        || path == STUDIO_RESOURCE_METADATA_PATH
-        || path == "/.well-known/oauth-authorization-server"
-        || path == "/.well-known/openid-configuration"
+        || path.starts_with("/.well-known/")
     {
         return Ok(next.run(request).await);
     }
@@ -7103,6 +7113,115 @@ mod tests {
                 Some(ToolSurfaceProfile::Studio)
             );
             assert!(is_streamable_mcp_path("/studio"));
+        }
+
+        // #299: a discovery URL is never challenged for a token. One the
+        // gateway does not publish is a 404, so the client uses the root one.
+        #[tokio::test]
+        async fn every_well_known_path_is_public() {
+            let app = create_router(hosted_state(true));
+            for (path, status) in [
+                ("/.well-known/oauth-protected-resource", StatusCode::OK),
+                (
+                    "/.well-known/oauth-protected-resource/coach",
+                    StatusCode::OK,
+                ),
+                (
+                    "/.well-known/oauth-protected-resource/studio",
+                    StatusCode::OK,
+                ),
+                (
+                    "/.well-known/oauth-protected-resource/mcp",
+                    StatusCode::NOT_FOUND,
+                ),
+                (
+                    "/.well-known/oauth-protected-resource/claude",
+                    StatusCode::NOT_FOUND,
+                ),
+                ("/.well-known/oauth-authorization-server", StatusCode::OK),
+                ("/.well-known/openid-configuration", StatusCode::OK),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(path)
+                            .header("host", "mcp.contextstream.io")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status, "{path}");
+                assert!(
+                    !response.headers().contains_key(header::WWW_AUTHENTICATE),
+                    "{path}"
+                );
+            }
+        }
+
+        // #300: the gateway's authorization-server document says what
+        // api.contextstream.io's says: S256 only, every scope it grants.
+        #[tokio::test]
+        async fn authorization_server_metadata_matches_the_authorization_server() {
+            let app = create_router(hosted_state(true));
+            for path in [
+                "/.well-known/oauth-authorization-server",
+                "/.well-known/openid-configuration",
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(path)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let metadata = json_response(response).await;
+                assert_eq!(
+                    metadata["code_challenge_methods_supported"],
+                    json!(["S256"])
+                );
+                assert_eq!(
+                    metadata["scopes_supported"],
+                    json!([
+                        "read:workspaces",
+                        "read:projects",
+                        "read:search",
+                        "read:memory",
+                        "write:memory",
+                        "read:coach",
+                        "write:coach",
+                        "read:agents",
+                        "write:agents",
+                        "read:studio",
+                        "write:studio"
+                    ])
+                );
+                assert_eq!(
+                    metadata["token_endpoint_auth_methods_supported"],
+                    json!([
+                        "client_secret_basic",
+                        "client_secret_post",
+                        "none",
+                        "private_key_jwt"
+                    ])
+                );
+                assert_eq!(
+                    metadata["token_endpoint_auth_signing_alg_values_supported"],
+                    json!(["RS256", "ES256"])
+                );
+                assert_eq!(
+                    metadata["authorization_response_iss_parameter_supported"],
+                    true
+                );
+                assert_eq!(metadata["client_id_metadata_document_supported"], true);
+            }
         }
 
         #[test]

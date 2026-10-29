@@ -2479,6 +2479,10 @@ async fn run_repairs(options: &DoctorOptions, targets: &[Editor]) -> DoctorRepai
     let scope = options.scope.as_cli_value();
     let mut operations = vec!["configs", "rules"];
     let mut failures = Vec::new();
+    // A dry run lists what it would write; a real repair lists what it wrote (#264).
+    if !options.dry_run {
+        super::safe_edit::begin_applied_journal();
+    }
     if let Err(error) =
         super::update_configs_scoped_noninteractive(scope, Some(targets), true).await
     {
@@ -2543,17 +2547,18 @@ async fn run_repairs(options: &DoctorOptions, targets: &[Editor]) -> DoctorRepai
             }
         }
     }
-    let mut changes: Vec<RepairChange> = if options.dry_run {
+    let recorded = if options.dry_run {
         super::safe_edit::take_planned_changes()
-            .into_iter()
-            .map(|change| RepairChange {
-                path: change.path.display().to_string(),
-                action: change.action.label(),
-            })
-            .collect()
     } else {
-        Vec::new()
+        super::safe_edit::take_applied_changes()
     };
+    let mut changes: Vec<RepairChange> = recorded
+        .into_iter()
+        .map(|change| RepairChange {
+            path: change.path.display().to_string(),
+            action: change.action.label(),
+        })
+        .collect();
     changes.extend(hook_changes);
     DoctorRepairReport {
         mode: if options.dry_run {

@@ -4036,9 +4036,11 @@ fn write_project_mcp_config_with_transport_mode(
 
     insert_contextstream_server(&mut config, server_path, server)?;
 
-    safe_edit::commit(&mcp_path, &loaded, &config)?;
     if carries_key {
+        safe_edit::commit(&mcp_path, &loaded, &config)?;
         keep_secret_config_out_of_git(project_path, &mcp_path);
+    } else {
+        safe_edit::commit_public(&mcp_path, &loaded, &config)?;
     }
     record_configured_evidence(editor);
 
@@ -4152,7 +4154,7 @@ pub fn write_workspace_config(
     }
     config["version"] = json!(mcp_types::config::VERSION);
 
-    safe_edit::commit_with_removals(
+    safe_edit::commit_public_with_removals(
         &config_path,
         &loaded,
         &config,

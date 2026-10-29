@@ -156,7 +156,7 @@ pub fn write_project_config(project_path: &Path, config: &ProjectConfig) -> Resu
             updated_object.insert(key.clone(), value.clone());
         }
     }
-    safe_edit::commit_with_removals(&path, &loaded, &updated, &removed_keys)?;
+    safe_edit::commit_public_with_removals(&path, &loaded, &updated, &removed_keys)?;
 
     // Add to .gitignore if it exists
     add_to_gitignore(project_path)?;
@@ -196,7 +196,7 @@ fn add_to_gitignore(project_path: &Path) -> Result<()> {
 
     let separator = if content.ends_with('\n') { "" } else { "\n" };
     let updated = format!("{content}{separator}\n# ContextStream config\n.contextstream/\n");
-    safe_edit::write_if_unchanged(&gitignore_path, &updated, Some(&content))?;
+    safe_edit::write_public_if_unchanged(&gitignore_path, &updated, Some(&content))?;
 
     Ok(())
 }

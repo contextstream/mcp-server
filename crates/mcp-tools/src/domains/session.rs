@@ -1005,6 +1005,44 @@ fn upsert_relation(
     }
 }
 
+/// Find a resolved folder's related projects after init has answered, and
+/// store them for routing if the session is still on that project.
+fn spawn_project_relation_enrichment(
+    client: ContextStreamClient,
+    session: Arc<SessionManager>,
+    workspace_id: Uuid,
+    folder_path: String,
+    project_id: Option<Uuid>,
+    project_name: Option<String>,
+) {
+    let session_key = mcp_client::get_task_session_key();
+    let caller_cache_identity = mcp_client::get_task_caller_cache_identity();
+    let auth_override = mcp_client::get_task_auth_override();
+    let config_override = mcp_client::get_task_config_override();
+    tokio::spawn(async move {
+        with_caller_auth(
+            session_key,
+            caller_cache_identity,
+            auth_override,
+            config_override,
+            || async move {
+                let relations = resolve_project_relations_for_folder(
+                    &client,
+                    workspace_id,
+                    &folder_path,
+                    project_id,
+                    project_name.as_deref(),
+                )
+                .await;
+                if !relations.is_empty() && session.state().await.project_id == project_id {
+                    session.set_project_relations(relations).await;
+                }
+            },
+        )
+        .await
+    });
+}
+
 async fn resolve_project_relations_for_folder(
     client: &ContextStreamClient,
     workspace_id: Uuid,
@@ -3009,14 +3047,29 @@ impl ToolHandler for InitTool {
             if let (Some(folder_path), Some(workspace_id)) =
                 (folder_path_owned.as_deref(), resolved_workspace_id)
             {
-                project_relations = resolve_project_relations_for_folder(
-                    &self.client,
-                    workspace_id,
-                    folder_path,
-                    resolved_project_id,
-                    relation_project_name.as_deref(),
-                )
-                .await;
+                if resolved_project_id.is_some() {
+                    // The API already resolved this folder's project, so its
+                    // relations are enrichment. Finding them walks the whole
+                    // workspace catalog (18 sequential pages for 1,790
+                    // projects), which must not hold up this call (#282).
+                    spawn_project_relation_enrichment(
+                        self.client.clone(),
+                        self.session.clone(),
+                        workspace_id,
+                        folder_path.to_string(),
+                        resolved_project_id,
+                        relation_project_name.clone(),
+                    );
+                } else {
+                    project_relations = resolve_project_relations_for_folder(
+                        &self.client,
+                        workspace_id,
+                        folder_path,
+                        resolved_project_id,
+                        relation_project_name.as_deref(),
+                    )
+                    .await;
+                }
             }
         }
         if !project_relations.is_empty() {

@@ -1075,6 +1075,7 @@ async fn serve_mcp_streamable(
     }
 
     apply_default_context_mode(&mut request, query.default_context_mode.as_deref());
+    apply_cloud_client_init_defaults(&mut request, &headers);
     let stateless_request = uses_stateless_http_contract(&headers, &request);
     if stateless_request {
         if let Err(error) = validate_stateless_jsonrpc_envelope(
@@ -1558,6 +1559,39 @@ fn apply_default_context_mode(request: &mut JsonRpcRequest, default_context_mode
     arguments
         .entry("mode".to_string())
         .or_insert_with(|| json!(mode));
+}
+
+/// Whether the request comes from a client that runs in its vendor's cloud
+/// and has no checkout of the user's folders: Google's Gemini app, whose
+/// requests all carry `User-Agent: Google` and whose tool calls come from
+/// sessions initialized as clientInfo `Gemini`.
+fn client_without_local_checkout(headers: &HeaderMap) -> bool {
+    header_str(headers, "user-agent").is_some_and(|agent| agent.trim() == "Google")
+        || session_client_identity(headers).0 == "Gemini"
+}
+
+/// A `folder_path` such a client passes to `init` names a folder on the
+/// user's computer that nothing will ever index, so `init` may match it to an
+/// existing project but must not create one (with "the index builds in the
+/// background"). An explicit `skip_project_creation` still wins.
+fn apply_cloud_client_init_defaults(request: &mut JsonRpcRequest, headers: &HeaderMap) {
+    if request.method != "tools/call" || !client_without_local_checkout(headers) {
+        return;
+    }
+    let Some(params) = request.params.as_object_mut() else {
+        return;
+    };
+    if params.get("name").and_then(Value::as_str) != Some("init") {
+        return;
+    }
+    if !params.get("arguments").is_some_and(Value::is_object) {
+        params.insert("arguments".to_string(), json!({}));
+    }
+    if let Some(arguments) = params.get_mut("arguments").and_then(Value::as_object_mut) {
+        arguments
+            .entry("skip_project_creation".to_string())
+            .or_insert(json!(true));
+    }
 }
 
 /// Handle initialize request.
@@ -4920,6 +4954,99 @@ mod tests {
             apply_default_context_mode(&mut request, Some("fast"));
 
             assert_eq!(request.params["arguments"]["mode"], json!("deep"));
+        }
+
+        fn tool_call(name: &str, arguments: Value) -> JsonRpcRequest {
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(1)),
+                method: "tools/call".to_string(),
+                params: json!({ "name": name, "arguments": arguments }),
+            }
+        }
+
+        fn headers_with(pairs: &[(&'static str, &str)]) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(*name, value.parse().unwrap());
+            }
+            headers
+        }
+
+        #[test]
+        fn gemini_init_does_not_create_a_project_unless_asked() {
+            let google = headers_with(&[("user-agent", "Google")]);
+            let mut request = tool_call("init", json!({ "folder_path": "/Users/me/dev/app" }));
+            apply_cloud_client_init_defaults(&mut request, &google);
+            assert_eq!(
+                request.params["arguments"]["skip_project_creation"],
+                json!(true)
+            );
+
+            let mut explicit = tool_call(
+                "init",
+                json!({ "folder_path": "/Users/me/dev/app", "skip_project_creation": false }),
+            );
+            apply_cloud_client_init_defaults(&mut explicit, &google);
+            assert_eq!(
+                explicit.params["arguments"]["skip_project_creation"],
+                json!(false)
+            );
+
+            let mut no_arguments = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(1)),
+                method: "tools/call".to_string(),
+                params: json!({ "name": "init" }),
+            };
+            apply_cloud_client_init_defaults(&mut no_arguments, &google);
+            assert_eq!(
+                no_arguments.params["arguments"]["skip_project_creation"],
+                json!(true)
+            );
+
+            let mut other_tool = tool_call("search", json!({ "query": "auth" }));
+            apply_cloud_client_init_defaults(&mut other_tool, &google);
+            assert!(other_tool.params["arguments"]
+                .get("skip_project_creation")
+                .is_none());
+        }
+
+        #[test]
+        fn gemini_session_init_does_not_create_a_project() {
+            let session_id = "6f0c1e8a-0000-4000-8000-00000000gem1";
+            remember_session_client(
+                session_id,
+                &json!({ "clientInfo": { "name": "Gemini", "version": "1" } }),
+            );
+            let headers = headers_with(&[("mcp-session-id", session_id), ("user-agent", "x")]);
+            let mut request = tool_call("init", json!({}));
+            apply_cloud_client_init_defaults(&mut request, &headers);
+            assert_eq!(
+                request.params["arguments"]["skip_project_creation"],
+                json!(true)
+            );
+        }
+
+        #[test]
+        fn local_clients_keep_project_creation_on_init() {
+            for agent in [
+                "claude-code/2.1.312 (cli)",
+                "codex-mcp-client/0.165.0",
+                "Google-Extended",
+            ] {
+                let mut request = tool_call("init", json!({ "folder_path": "/Users/me/dev/app" }));
+                apply_cloud_client_init_defaults(
+                    &mut request,
+                    &headers_with(&[("user-agent", agent)]),
+                );
+                assert!(
+                    request.params["arguments"]
+                        .get("skip_project_creation")
+                        .is_none(),
+                    "{agent}"
+                );
+            }
         }
 
         #[test]

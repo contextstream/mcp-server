@@ -2063,6 +2063,13 @@ async fn handle_request_dispatch(
                     let mut payload =
                         mcp_tools::wire_tokens::tool_result_payload(&result, &context);
                     with_input_required(&mut payload);
+                    crate::hook_handlers::mid_run_notices::attach_to_tool_result(
+                        &mut payload,
+                        tool_name,
+                        client,
+                        session,
+                    )
+                    .await;
                     json_rpc_result(id, payload)
                 }
                 Err(e) => {
@@ -2898,7 +2905,7 @@ mod tests {
             // Coordination v2: action=reply with `message`, and `metadata`
             // (git branch/commit) on check_in as judge evidence.
             "coordination",
-            "28a3c5485106a5720aa8c3774f0139a37eea775d316cbd994604bb721642a4cc",
+            "8c566231ed75c196070bc0c632887509acb6474638b7696e5e31b30787c97be1",
         ),
         (
             // Advanced for tickets 2c0e695e and 9e5c9232: `target_project`

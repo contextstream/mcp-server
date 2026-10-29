@@ -816,7 +816,7 @@ pub async fn uninstall(
         if include_global {
             match hooks::uninstall_hooks(editor) {
                 Ok(()) => {
-                    if editor.has_hooks() {
+                    if editor.installs_hooks() {
                         processed.push("hooks");
                     }
                 }
@@ -1141,7 +1141,7 @@ fn no_target_editors_message(only_configured: bool) -> String {
 }
 
 fn editor_needs_managed_helper(editor: &editors::Editor) -> bool {
-    editor.has_mcp_transport() || editor.has_hooks()
+    editor.has_mcp_transport() || editor.installs_hooks()
 }
 
 fn targets_need_managed_helper(targets: &[editors::Editor]) -> bool {
@@ -1189,7 +1189,10 @@ pub async fn update_hooks_scoped(
         return Ok(());
     }
     let mut failures = Vec::new();
-    let hook_target_count = targets.iter().filter(|editor| editor.has_hooks()).count();
+    let hook_target_count = targets
+        .iter()
+        .filter(|editor| editor.installs_hooks())
+        .count();
 
     let hosted_transport = !matches!(
         read_setup_transport_marker_result()?,
@@ -1219,7 +1222,7 @@ pub async fn update_hooks_scoped(
     );
     let mut updated_count = 0;
     for editor in &targets {
-        if !editor.has_hooks() {
+        if !editor.installs_hooks() {
             if matches!(editor, editors::Editor::KiloCode) {
                 refresh_note!(
                     "{} {} does not support filesystem hooks; skipping.",
@@ -4009,7 +4012,7 @@ pub async fn configure_editor_with_workspace(
     }
 
     // Install hooks only after the executable they reference is known-good.
-    if editor.has_hooks() && helper_ready {
+    if editor.installs_hooks() && helper_ready {
         match hooks::install_hooks(editor, Some(api_key)) {
             Ok(()) => {
                 saved_items.push("hooks");

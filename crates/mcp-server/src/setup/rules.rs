@@ -2308,6 +2308,29 @@ fn find_contextstream_block_bounds(content: &str) -> Option<(usize, usize)> {
 
 /// Replace or insert ContextStream block in content.
 /// Recognizes both current `<contextstream>` and legacy `<!-- BEGIN ContextStream -->` markers.
+/// A block in a YAML file is commented out line by line, so its opening tag sits
+/// after a `# ` that the block's own text carries as well. The bounds of an
+/// existing block start at the tag, which leaves that `# ` in front of it, and
+/// putting the new block there stacked another one on every rewrite (`# # #
+/// <contextstream>`). When what precedes the tag on its line is the new block's
+/// own prefix, once or stacked, drop it: the new block brings its own.
+fn without_repeated_block_prefix<'a>(before: &'a str, new_block: &str) -> &'a str {
+    let Some((start, _)) = find_contextstream_block_bounds(new_block) else {
+        return before;
+    };
+    let new_prefix = &new_block[new_block[..start].rfind('\n').map_or(0, |at| at + 1)..start];
+    let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+    let existing_prefix = &before[line_start..];
+    if new_prefix.is_empty()
+        || existing_prefix.is_empty()
+        || !existing_prefix.len().is_multiple_of(new_prefix.len())
+        || existing_prefix != new_prefix.repeat(existing_prefix.len() / new_prefix.len())
+    {
+        return before;
+    }
+    &before[..line_start]
+}
+
 pub fn replace_contextstream_block(existing: &str, new_block: &str) -> Result<String> {
     if existing.is_empty() {
         return Ok(new_block.to_string());
@@ -2330,6 +2353,7 @@ pub fn replace_contextstream_block(existing: &str, new_block: &str) -> Result<St
         // Preserve every byte outside the owned block. In particular, trimming
         // here would silently rewrite user-authored spacing around the block.
         let before = &existing[..start_pos];
+        let before = without_repeated_block_prefix(before, new_block);
         let after = &existing[end_pos..];
         // The block bounds intentionally begin/end at the XML markers so
         // adjacent line endings remain user-owned exterior content. Generated
@@ -2574,7 +2598,11 @@ fn remove_contextstream_from_path(path: &Path) -> Result<bool> {
         }
         let cleaned = format!("{}{}", before, after);
         if is_effectively_empty(&cleaned) {
-            if backup.is_none() && adjusted_start == 0 {
+            // Nothing before the block but comment markers (Aider's `# `) is as
+            // much ours as an empty prefix: delete it without keeping a
+            // recovery copy of a file we created, which would be the leftover
+            // `.contextstream.bak` of #322.
+            if backup.is_none() && is_effectively_empty(before) {
                 safe_edit::remove_owned_file_if_unchanged(&resolved_path, &content)?;
             } else {
                 safe_edit::remove_file_if_unchanged(&resolved_path, &content)?;
@@ -4314,6 +4342,88 @@ mod tests {
         );
         assert!(!safe_edit::backup_path(&conf).unwrap().exists());
         assert!(!shared.exists(), "the shared rules file remained");
+    }
+
+    #[test]
+    fn the_global_aider_config_and_its_backup_are_removed_on_uninstall() {
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+
+        let conf = Editor::Aider
+            .rules_path(None)
+            .expect("global aider rules path");
+        assert!(conf.starts_with(temp.path()), "{}", conf.display());
+        write_editor_rules(&Editor::Aider).expect("write global rules");
+        let older = std::fs::read_to_string(&conf).unwrap().replace(
+            "contextstream-rules-hash: ",
+            "contextstream-rules-hash: 0000",
+        );
+        std::fs::write(&conf, older).unwrap();
+        write_editor_rules(&Editor::Aider).expect("refresh global rules");
+        let backup = safe_edit::backup_path(&conf).unwrap();
+        assert!(backup.exists(), "a refresh leaves a backup");
+
+        remove_contextstream_from_rules(&Editor::Aider, None).expect("remove");
+        let left = (
+            conf.exists().then(|| std::fs::read_to_string(&conf).ok()),
+            backup
+                .exists()
+                .then(|| std::fs::read_to_string(&backup).ok()),
+        );
+        if let Some(value) = previous_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        assert_eq!(left, (None, None), "global aider files remained");
+    }
+
+    #[test]
+    fn uninstalling_a_config_setup_wrote_once_leaves_no_recovery_copy() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        let conf = project.join(".aider.conf.yml");
+        write_project_rules(&Editor::Aider, project, Some("ws"), Some("W"), Some("p"))
+            .expect("write aider rules");
+        assert!(!safe_edit::backup_path(&conf).unwrap().exists());
+
+        remove_contextstream_from_rules(&Editor::Aider, Some(project)).expect("remove");
+        assert!(!conf.exists());
+        assert!(
+            !safe_edit::backup_path(&conf).unwrap().exists(),
+            "deleting a file ContextStream created must not leave a copy of it"
+        );
+    }
+
+    #[test]
+    fn rewriting_the_aider_config_does_not_stack_comment_prefixes() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        let conf = project.join(".aider.conf.yml");
+        let write = || {
+            write_project_rules(&Editor::Aider, project, Some("ws"), Some("W"), Some("p"))
+                .expect("write aider rules");
+        };
+        write();
+        let first = std::fs::read_to_string(&conf).unwrap();
+        for _ in 0..3 {
+            write();
+        }
+        let after = std::fs::read_to_string(&conf).unwrap();
+        assert_eq!(after, first, "a plain rewrite changes nothing");
+        assert_eq!(after.matches("# <contextstream>").count(), 1, "{after}");
+        assert!(!after.contains("# # "), "{after}");
+
+        // A file the old behaviour already stacked is put right by a rewrite.
+        let stacked = first.replacen("# <contextstream>", "# # # # <contextstream>", 1);
+        assert_ne!(stacked, first);
+        std::fs::write(&conf, stacked).unwrap();
+        write();
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), first);
     }
 
     #[test]

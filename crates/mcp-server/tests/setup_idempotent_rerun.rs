@@ -294,6 +294,18 @@ fn stop_spawned_watch_helper_if_any(home: &Path) {
     }
 }
 
+/// Aider files in the home directory and the project, backups included.
+fn aider_files(home: &Path, project: &Path) -> Vec<String> {
+    let mut found: Vec<String> = [home, project]
+        .iter()
+        .flat_map(|root| std::fs::read_dir(root).unwrap().flatten())
+        .filter(|entry| entry.file_name().to_string_lossy().contains("aider"))
+        .map(|entry| entry.path().display().to_string())
+        .collect();
+    found.sort();
+    found
+}
+
 fn run_setup_yes(home: &Path, cwd: &Path, extra_args: Vec<String>) -> std::process::Output {
     let mut args = vec!["setup".to_string(), "--yes".to_string()];
     args.extend(extra_args);
@@ -720,6 +732,54 @@ async fn setup_yes_rerun_on_healthy_indexed_project_is_quiet_and_mutates_nothing
     })
     .await
     .unwrap();
+    // A real `setup --yes` for Aider, then `uninstall`: nothing of the Aider
+    // setup may remain, backups included (#322).
+    let aider_before: Vec<String> = aider_files(&home, &project);
+    let aider_home = home.clone();
+    let aider_proj = project.clone();
+    let aider_setup = tokio::task::spawn_blocking(move || {
+        run_setup_yes(
+            &aider_home,
+            &aider_proj,
+            vec![
+                "--editors=aider".to_string(),
+                format!("--workspace-id={WORKSPACE_ID}"),
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        aider_setup.status.success(),
+        "aider setup failed:\n{}{}",
+        String::from_utf8_lossy(&aider_setup.stdout),
+        String::from_utf8_lossy(&aider_setup.stderr)
+    );
+    let with_aider = aider_files(&home, &project);
+    assert!(
+        with_aider
+            .iter()
+            .any(|path| path.ends_with(".aider.conf.yml")),
+        "setup should write the aider configs: {with_aider:?}"
+    );
+    let aider_home = home.clone();
+    let aider_proj = project.clone();
+    let aider_uninstall = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &aider_home,
+            &aider_proj,
+            vec!["uninstall".to_string(), "--editors=aider".to_string()],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        aider_files(&home, &project),
+        aider_before,
+        "uninstall left aider files behind:\n{}{}",
+        String::from_utf8_lossy(&aider_uninstall.stdout),
+        String::from_utf8_lossy(&aider_uninstall.stderr)
+    );
     stop_spawned_watch_helper_if_any(&home);
     server.abort();
     drop(bridge_lock);

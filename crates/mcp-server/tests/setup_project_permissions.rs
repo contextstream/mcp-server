@@ -137,6 +137,27 @@ async fn spawn_mock_setup_server(
             }),
         )
         .route(
+            "/api/v1/projects/{id}",
+            get(move |headers: HeaderMap, AxumPath(id): AxumPath<String>| async move {
+                if !check_auth(&headers) {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({"error": "invalid api key"})),
+                    );
+                }
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "data": {
+                            "id": id,
+                            "name": "demo",
+                            "workspace_id": WORKSPACE_ID
+                        }
+                    })),
+                )
+            }),
+        )
+        .route(
             "/api/v1/harness-readiness/status",
             get(
                 move |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| async move {
@@ -186,7 +207,7 @@ fn init_git_repo(dir: &Path) {
         .status()
         .unwrap()
         .success());
-    std::fs::write(dir.join("README.md"), "# demo\n").unwrap();
+    std::fs::write(dir.join(".gitkeep"), "").unwrap();
     assert!(Command::new("git")
         .args(["add", "."])
         .current_dir(dir)
@@ -245,7 +266,7 @@ async fn setup_respects_umask_for_project_rules_and_keeps_secret_configs_private
         Command::new("sh")
             .args([
                 "-c",
-                "umask 0022 && exec \"$1\" setup --yes --no-index --editors=claude,cursor,windsurf,codex,gemini,qwen,cline,aider,opencode --workspace-id=\"$2\"",
+                "umask 0022 && exec \"$1\" setup --yes --editors=claude,cursor,windsurf,codex,gemini,qwen,cline,aider,opencode --workspace-id=\"$2\"",
                 "sh",
                 &bin,
                 WORKSPACE_ID,
@@ -319,4 +340,85 @@ async fn setup_respects_umask_for_project_rules_and_keeps_secret_configs_private
         .mode()
         & 0o777;
     assert_eq!(creds_mode, 0o600);
+}
+
+#[tokio::test]
+async fn setup_in_non_git_directory_gitignores_secret_project_mcp_config_and_warns() {
+    const SECRET: &str = "non-git-mcp-secret-key";
+    let (api_url, server) = spawn_mock_setup_server(SECRET).await;
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let home_path = home.path().to_path_buf();
+    let project_path = project.path().to_path_buf();
+    let bin = env!("CARGO_BIN_EXE_contextstream-mcp").to_string();
+
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new("sh")
+            .args([
+                "-c",
+                "umask 0022 && exec \"$1\" setup --yes --editors=claude,codex --workspace-id=\"$2\"",
+                "sh",
+                &bin,
+                WORKSPACE_ID,
+            ])
+            .env_clear()
+            .env("HOME", &home_path)
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("CONTEXTSTREAM_API_KEY", SECRET)
+            .env("CONTEXTSTREAM_API_URL", &api_url)
+            .env("CONTEXTSTREAM_NO_BROWSER", "1")
+            .env("NO_COLOR", "1")
+            .current_dir(&project_path)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    stop_spawned_watch_helper_if_any(home.path());
+    server.abort();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "setup in non-git dir failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("/.mcp.json") && stderr.contains(".gitignore"),
+        "expected non-git .gitignore warning on stderr:\n{stderr}"
+    );
+
+    let gitignore_path = project.path().join(".gitignore");
+    let gitignore = std::fs::read_to_string(&gitignore_path).expect(".gitignore must exist");
+    assert!(
+        gitignore.lines().any(|line| line.trim() == "/.mcp.json"),
+        "expected /.mcp.json in .gitignore:\n{gitignore}"
+    );
+    let gitignore_mode = std::fs::metadata(&gitignore_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(gitignore_mode, 0o644);
+
+    // Initialize git afterward and confirm `.mcp.json` is ignored by git status.
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(project.path())
+        .status()
+        .unwrap()
+        .success());
+    let status = Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let status_out = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        !status_out.lines().any(|line| line.ends_with(".mcp.json")),
+        "git status after git init must not show secret .mcp.json as untracked:\n{status_out}"
+    );
 }

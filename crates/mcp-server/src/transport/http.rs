@@ -16,7 +16,8 @@ use axum::body::Body;
 use axum::http::{Method, Request};
 use axum::middleware::Next;
 use axum::{
-    extract::{Json, MatchedPath, Path, Query, State},
+    body::Bytes,
+    extract::{rejection::BytesRejection, DefaultBodyLimit, Json, MatchedPath, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response, Sse},
     routing::{get, post},
@@ -430,6 +431,168 @@ fn stateless_protocol_error_response(
         .into_response()
 }
 
+/// The largest request body the HTTP transport reads (axum's default, set
+/// here so the 413 answer can name it).
+const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+const JSONRPC_PARSE_ERROR: i32 = -32700;
+const JSONRPC_INVALID_REQUEST: i32 = -32600;
+
+/// One JSON-RPC message POSTed to a Streamable HTTP path.
+#[derive(Debug)]
+enum IncomingMcpMessage {
+    /// A request or notification for the server to handle.
+    Request(JsonRpcRequest),
+    /// The client's answer to a server request. Nothing waits for one, so it
+    /// is accepted with no body.
+    Response,
+}
+
+/// Why a POST body is not one usable JSON-RPC message, answered as a
+/// JSON-RPC error.
+#[derive(Debug)]
+struct MalformedMessage {
+    status: StatusCode,
+    id: Value,
+    code: i32,
+    message: String,
+}
+
+impl MalformedMessage {
+    fn new(status: StatusCode, id: Value, code: i32, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            id,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn into_response(self) -> Response {
+        stateless_protocol_error_response(
+            self.status,
+            Some(self.id),
+            JsonRpcError {
+                code: self.code,
+                message: self.message,
+                data: None,
+            },
+        )
+    }
+}
+
+/// `application/json` or an `application/*+json` type, as axum's `Json` accepts.
+fn has_json_content_type(headers: &HeaderMap) -> bool {
+    let Some(mime) = header_value(headers, header::CONTENT_TYPE.as_str())
+        .and_then(|value| value.split(';').next())
+        .map(|mime| mime.trim().to_ascii_lowercase())
+    else {
+        return false;
+    };
+    mime.split_once('/').is_some_and(|(kind, subtype)| {
+        kind == "application" && (subtype == "json" || subtype.ends_with("+json"))
+    })
+}
+
+/// Reads the body of a Streamable HTTP POST as one JSON-RPC message. Every
+/// failure is a JSON-RPC error with a short reason, never framework text.
+fn incoming_mcp_message(
+    headers: &HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<IncomingMcpMessage, MalformedMessage> {
+    if !has_json_content_type(headers) {
+        return Err(MalformedMessage::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Value::Null,
+            JSONRPC_INVALID_REQUEST,
+            "Unsupported Media Type: send the JSON-RPC message with Content-Type: application/json",
+        ));
+    }
+    let body = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            MalformedMessage::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Value::Null,
+                JSONRPC_INVALID_REQUEST,
+                format!(
+                    "Request body too large: the limit is {} MB ({MAX_REQUEST_BODY_BYTES} bytes)",
+                    MAX_REQUEST_BODY_BYTES / (1024 * 1024)
+                ),
+            )
+        } else {
+            MalformedMessage::new(
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+                JSONRPC_PARSE_ERROR,
+                "Parse error: the request body could not be read",
+            )
+        }
+    })?;
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Err(MalformedMessage::new(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            JSONRPC_PARSE_ERROR,
+            "Parse error: the request body is empty; send one JSON-RPC message",
+        ));
+    }
+    let value: Value = serde_json::from_slice(&body).map_err(|err| {
+        MalformedMessage::new(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            JSONRPC_PARSE_ERROR,
+            format!("Parse error: {err}"),
+        )
+    })?;
+    jsonrpc_message_from_value(value).map_err(|(id, reason)| {
+        MalformedMessage::new(
+            StatusCode::BAD_REQUEST,
+            id,
+            JSONRPC_INVALID_REQUEST,
+            format!("Invalid Request: {reason}"),
+        )
+    })
+}
+
+/// One parsed JSON value as a JSON-RPC message, or why it is not one (with the
+/// message's `id` when it carries a usable one).
+fn jsonrpc_message_from_value(value: Value) -> Result<IncomingMcpMessage, (Value, &'static str)> {
+    let mut message = match value {
+        Value::Object(message) => message,
+        Value::Array(_) => {
+            return Err((
+                Value::Null,
+                "batches are not supported; send one JSON-RPC message per request",
+            ))
+        }
+        _ => return Err((Value::Null, "the body must be one JSON-RPC message object")),
+    };
+    let id = match message.remove("id") {
+        None | Some(Value::Null) => None,
+        Some(id @ (Value::String(_) | Value::Number(_))) => Some(id),
+        Some(_) => return Err((Value::Null, "\"id\" must be a string or a number")),
+    };
+    let error_id = id.clone().unwrap_or(Value::Null);
+    let jsonrpc = match message.remove("jsonrpc") {
+        Some(Value::String(jsonrpc)) => jsonrpc,
+        _ => return Err((error_id, "\"jsonrpc\" must be \"2.0\"")),
+    };
+    let method = match message.remove("method") {
+        Some(Value::String(method)) => method,
+        Some(_) => return Err((error_id, "\"method\" must be a string")),
+        None if message.contains_key("result") || message.contains_key("error") => {
+            return Ok(IncomingMcpMessage::Response)
+        }
+        None => return Err((error_id, "missing \"method\"")),
+    };
+    Ok(IncomingMcpMessage::Request(JsonRpcRequest {
+        jsonrpc,
+        id,
+        method,
+        params: message.remove("params").unwrap_or(Value::Null),
+    }))
+}
+
 fn is_streamable_mcp_path(path: &str) -> bool {
     matches!(
         path,
@@ -564,6 +727,7 @@ pub fn create_router(state: HttpState) -> Router {
         // ContextStudio: its own connector (one tool, its own protected-resource
         // metadata and scopes).
         .route(STUDIO_PATH, post(handle_mcp_streamable))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -801,14 +965,20 @@ async fn handle_jsonrpc(
 /// - Requires `Accept: application/json, text/event-stream`
 /// - Supports both initialize-era clients and the stateless 2026-07-28 contract
 /// - Returns `Mcp-Session-Id` only for legacy initialize
-/// - Notifications (no `id`) get 202 Accepted
+/// - Notifications (no `id`) and client responses get 202 Accepted
+/// - A body that is not one JSON-RPC message gets a JSON-RPC error
 async fn handle_mcp_streamable(
     State(state): State<HttpState>,
     Query(query): Query<McpQueryParams>,
     matched_path: Option<MatchedPath>,
     headers: HeaderMap,
-    Json(request): Json<JsonRpcRequest>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    let request = match incoming_mcp_message(&headers, body) {
+        Ok(IncomingMcpMessage::Request(request)) => request,
+        Ok(IncomingMcpMessage::Response) => return StatusCode::ACCEPTED.into_response(),
+        Err(malformed) => return malformed.into_response(),
+    };
     // Integration-specific endpoints (/chatgpt, /claude, /client) must expose
     // the full ContextStream tool surface regardless of client auto-detection,
     // so the app/plugin has complete parity with the local MCP tool; /coach
@@ -4084,6 +4254,143 @@ mod tests {
             mcp_types::MCP_PROTOCOL_2024_11_05
         );
         assert!(response["result"].get("resultType").is_none());
+    }
+
+    // #287: a body that is not one JSON-RPC request gets a JSON-RPC error with
+    // a short reason, never framework text, and a client's response gets 202.
+    #[tokio::test]
+    async fn streamable_http_answers_malformed_bodies_in_json_rpc() {
+        async fn post(content_type: &str, body: impl Into<Body>) -> Response {
+            create_router(create_protocol_test_state())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header("content-type", content_type)
+                        .header("accept", "application/json, text/event-stream")
+                        .body(body.into())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+        async fn error_of(response: Response, status: StatusCode) -> (Value, i64, String) {
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            let body = json_response(response).await;
+            assert_eq!(body["jsonrpc"], "2.0");
+            let message = body["error"]["message"].as_str().unwrap().to_string();
+            assert!(
+                !message.contains("target type") && !message.contains("invalid type"),
+                "{message}"
+            );
+            (
+                body["id"].clone(),
+                body["error"]["code"].as_i64().unwrap(),
+                message,
+            )
+        }
+        async fn accepted(response: Response) {
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(body.is_empty());
+        }
+
+        accepted(
+            post(
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":9,"result":{}}"#,
+            )
+            .await,
+        )
+        .await;
+        accepted(
+            post(
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":9,"error":{"code":-1,"message":"no"}}"#,
+            )
+            .await,
+        )
+        .await;
+        accepted(
+            post(
+                "application/json; charset=utf-8",
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            )
+            .await,
+        )
+        .await;
+
+        let (id, code, message) = error_of(
+            post(
+                "application/json",
+                r#"[{"jsonrpc":"2.0","id":5,"method":"ping"},{"jsonrpc":"2.0","id":6,"method":"ping"}]"#,
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!((id, code), (Value::Null, -32600));
+        assert!(message.contains("batches are not supported"), "{message}");
+
+        let (id, code, message) = error_of(
+            post("application/json", "{nope").await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!((id, code), (Value::Null, -32700));
+        assert!(message.starts_with("Parse error: "), "{message}");
+
+        let (id, code, message) =
+            error_of(post("application/json", "").await, StatusCode::BAD_REQUEST).await;
+        assert_eq!((id, code), (Value::Null, -32700));
+        assert!(message.contains("empty"), "{message}");
+
+        let (_, code, message) = error_of(
+            post("text/plain", "{}").await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        )
+        .await;
+        assert_eq!(code, -32600);
+        assert!(
+            message.contains("Content-Type: application/json"),
+            "{message}"
+        );
+
+        let (id, code, message) = error_of(
+            post("application/json", r#"{"jsonrpc":"2.0","id":3}"#).await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!((id, code), (json!(3), -32600));
+        assert_eq!(message, "Invalid Request: missing \"method\"");
+
+        let (id, _, message) = error_of(
+            post(
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":"a","method":7}"#,
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!(id, json!("a"));
+        assert_eq!(message, "Invalid Request: \"method\" must be a string");
+
+        let (id, code, _) = error_of(
+            post("application/json", r#""ping""#).await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!((id, code), (Value::Null, -32600));
+
+        let (id, code, message) = error_of(
+            post("application/json", vec![b' '; MAX_REQUEST_BODY_BYTES + 1]).await,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        )
+        .await;
+        assert_eq!((id, code), (Value::Null, -32600));
+        assert!(message.contains("2 MB (2097152 bytes)"), "{message}");
     }
 
     // Ticket 7c787154: one registry serves every caller. A ChatGPT-like and a

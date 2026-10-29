@@ -1448,3 +1448,68 @@ mod alias_tests {
         assert!(is_listed_per_caller("slipstream"));
     }
 }
+
+mod destructive_split_tests {
+    use super::*;
+
+    fn text_of(result: &ToolResult) -> String {
+        serde_json::to_string(&result.content).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_irreversible_action_runs_only_through_delete() {
+        // #330/#334: the old tool says it does not destroy, so it must not.
+        let config = create_complete_config();
+        let mut registry = ToolRegistry::new(&config);
+        registry.register("workspace", Arc::new(MockTool::new("workspace")));
+        crate::domains::destructive::register_delete_tool(&mut registry);
+
+        let refused = registry
+            .execute(
+                "workspace",
+                json!({"action": "delete", "workspace_id": "w1"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("action=\"workspace.delete\""),
+            "{refused}"
+        );
+        assert!(
+            !registry
+                .get("workspace")
+                .unwrap()
+                .metadata
+                .annotations
+                .destructive
+        );
+
+        let ran = registry
+            .execute(
+                "delete",
+                json!({"action": "workspace.delete", "workspace_id": "w1"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            text_of(&ran).contains("Executed workspace"),
+            "{}",
+            text_of(&ran)
+        );
+        assert!(
+            registry
+                .get("delete")
+                .unwrap()
+                .metadata
+                .annotations
+                .destructive
+        );
+
+        // Its other actions still run on it.
+        let listed = registry
+            .execute("workspace", json!({"action": "list"}))
+            .await
+            .unwrap();
+        assert!(text_of(&listed).contains("Executed workspace"));
+    }
+}

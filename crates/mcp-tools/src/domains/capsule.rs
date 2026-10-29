@@ -1337,7 +1337,7 @@ fn format_schedule_create(value: &Value) -> String {
     }
     lines.push(
         "Use capsule(action=\"schedule_list\", capsule_id=...) to see all schedules; \
-         capsule(action=\"schedule_delete\", schedule_id=...) to cancel."
+         delete(action=\"capsule.schedule_delete\", schedule_id=...) to cancel."
             .to_string(),
     );
     lines.join("\n")

@@ -3022,9 +3022,10 @@ mod tests {
         (
             // #330: the irreversible actions of capsule, entity, feed, instruct,
             // media, memory, project, qa, session, skill, vcs and workspace left
-            // their action enums for `delete`; the old names still run.
+            // their action enums for `delete` (#334: the old names are refused,
+            // and parameters only those actions took left with them).
             "capsule",
-            "da346db49adfb1eb1aa0ade07fbeb7b651928836554590c08edf96e058bbfc88",
+            "0c524ef0743c2d4efd16ad74661684144d696b02fa0dd85d0dc4d1aaf65b832f",
         ),
         (
             "capture_plan",
@@ -3045,7 +3046,7 @@ mod tests {
         ),
         (
             "delete",
-            "6e7f684969e5b6601e6a814d4c7046670f670e8bc4b0dbcfc0403f6ef2efbf87",
+            "285fea941b0d4ad6f47098adc32c87174419ff9761fc8ee2aa6e563a045322e5",
         ),
         (
             // Advanced for tickets 2c0e695e and 9e5c9232: `target_project`
@@ -3056,7 +3057,7 @@ mod tests {
         ),
         (
             "feed",
-            "9043a0e9e1957f3a7702472917044745de5caf98514e3c540c8c6a715191589c",
+            "ff8a4876fecdbfa7732d298a19c788ac2f42f2d149bdfa3c65aa85a25f2aa942",
         ),
         (
             "graph",
@@ -3095,7 +3096,7 @@ mod tests {
             // successor_id) plus the `create_decision` / `decision_action`
             // enum values. Every earlier field and action still accepted.
             "memory",
-            "343942c8c1aa6555d4f12c9a871a2c3aa140fb6aa106cf1b7569c82df41a0925",
+            "1300eb376fb4c63b1cbdcf6f09ff2312ebc6114529094aa085dabf8a7901ccbc",
         ),
         (
             "memory_complete_todo",
@@ -3145,7 +3146,7 @@ mod tests {
             // (related projects for cross-project work). Every earlier field
             // and action still accepted.
             "project",
-            "be40b7d0238da7e6d3681e983b10a8e504f882489ac43675916380ac60c7d86c",
+            "1606c71bedf5fbb8572a3e4a1fae79eebb6af702ba8e563ff113381ec9b0b613",
         ),
         (
             // #325: without `recent_changes`, which the hosted gateway refuses.
@@ -3193,7 +3194,7 @@ mod tests {
         ),
         (
             "vcs",
-            "cada27f46baa6ec184d1af1133f09ea8931ef66f4e85ac6de1d87e3175f6da70",
+            "7c3fb5e6aedda38da89c1384c341d4d05dbd15ba7445439f4301836170aea3a6",
         ),
         (
             "workspace",
@@ -3746,11 +3747,38 @@ mod tests {
             .clone();
         for moved in domains::destructive::SEPARATED_ACTIONS {
             let qualified = serde_json::json!(format!("{}.{}", moved.tool, moved.action));
-            assert_eq!(
-                listed.contains(&qualified),
-                moved.listed_in.is_none(),
-                "{qualified}"
-            );
+            assert!(listed.contains(&qualified), "{qualified}");
+            // #334: the tool it came from neither lists nor teaches it. An
+            // underscored action name is unambiguous; `tool.action` is the
+            // pointer to `delete` and is fine.
+            if moved.action.contains('_') {
+                let tool = tool_by_name(&tools, moved.tool);
+                let mut texts = vec![tool["description"].as_str().unwrap_or_default().to_string()];
+                for property in tool["inputSchema"]["properties"]
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|properties| properties.values())
+                {
+                    if let Some(text) = property["description"].as_str() {
+                        texts.push(text.to_string());
+                    }
+                }
+                for text in texts {
+                    for (at, _) in text.match_indices(moved.action) {
+                        let before = text[..at].chars().last();
+                        let after = text[at + moved.action.len()..].chars().next();
+                        let word = before.is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+                            && after.is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                        assert!(
+                            !word || before == Some('.'),
+                            "{} still teaches {}: ...{}...",
+                            moved.tool,
+                            moved.action,
+                            &text[at.saturating_sub(60)..(at + 60).min(text.len())]
+                        );
+                    }
+                }
+            }
             for param in moved.params {
                 assert!(
                     delete["inputSchema"]["properties"][param].is_object(),
@@ -3847,13 +3875,12 @@ mod tests {
                 }
 
                 // #330: only the dedicated tools are destructive. `delete` holds
-                // the irreversible actions, the two memory aliases delete or
-                // replace a doc, `execute_operation` runs any operation and
-                // the coach surface has its own delete.
+                // the irreversible actions, `memory_delete_doc` deletes a doc,
+                // `execute_operation` runs any operation and the coach surface
+                // has its own delete. Edits (memory_update_doc) are not.
                 const DEDICATED_DESTRUCTIVE: &[&str] = &[
                     "delete",
                     "memory_delete_doc",
-                    "memory_update_doc",
                     "execute_operation",
                     "workflow_delete",
                 ];

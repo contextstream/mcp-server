@@ -792,7 +792,7 @@ impl ToolHandler for MediaTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "media".to_string(),
             title: "Media Operations".to_string(),
-            description: "Media operations for indexed assets: photos/images, videos, audio, and documents/PDFs. Actions: index (upload URL/local assets and trigger ML processing), status (check processing), search (semantic search with Knowledge Stream fallback), get_clip (extract video/audio clip details with output_format: remotion/ffmpeg/raw), list, delete.".to_string(),
+            description: "Media operations for indexed assets: photos/images, videos, audio, and documents/PDFs. Actions: index (upload URL/local assets and trigger ML processing), status (check processing), search (semantic search with Knowledge Stream fallback), get_clip (extract video/audio clip details with output_format: remotion/ffmpeg/raw), list (to delete an asset: the `delete` tool, action=\"media.delete\").".to_string(),
             category: ToolCategory::Ai,
             annotations: ToolAnnotations::destructive(),
             is_pro: true,

@@ -2315,29 +2315,44 @@ fn infer_default_doctor_scope(project_path: Option<&Path>) -> (DoctorScope, Opti
     }
 }
 
-fn infer_default_repair_scope(project_path: Option<&Path>, cwd: Option<&Path>) -> DoctorScope {
+/// Default scope (and project root) for a bare `doctor --repair`: the linked
+/// project the working directory is in, found the way read-only doctor finds
+/// it (walking up from a subfolder, #243), else global. A `--project-path`
+/// other than the working directory never infers project repair.
+fn infer_default_repair_scope(
+    project_path: Option<&Path>,
+    cwd: Option<&Path>,
+) -> (DoctorScope, Option<PathBuf>) {
     let (Some(project_path), Some(cwd)) = (project_path, cwd) else {
-        return DoctorScope::Global;
+        return (DoctorScope::Global, None);
     };
     let (Ok(canonical_project), Ok(canonical_cwd)) =
         (project_path.canonicalize(), cwd.canonicalize())
     else {
-        return DoctorScope::Global;
+        return (DoctorScope::Global, None);
     };
     if canonical_project != canonical_cwd {
-        return DoctorScope::Global;
+        return (DoctorScope::Global, None);
     }
-    if is_home_or_root_dir(&canonical_project) {
-        return DoctorScope::Global;
-    }
-    if super::wizard_config::project_config_path(&canonical_project).exists() {
-        DoctorScope::All
-    } else {
-        DoctorScope::Global
+    match resolve_linked_project_root(Some(&canonical_cwd)) {
+        Some(linked_root) => (DoctorScope::All, Some(linked_root)),
+        None => (DoctorScope::Global, None),
     }
 }
 
 fn validate_repair_scope(options: &DoctorOptions) -> Result<()> {
+    if !options.scope.include_project() {
+        return Ok(());
+    }
+    let cwd = std::env::current_dir().context(
+        "Doctor could not resolve the working directory; project repair changed no files",
+    )?;
+    validate_repair_scope_in(options, &cwd)
+}
+
+/// Project repair may change only the working directory, or the linked
+/// project root the working directory is inside.
+fn validate_repair_scope_in(options: &DoctorOptions, cwd: &Path) -> Result<()> {
     if !options.scope.include_project() {
         return Ok(());
     }
@@ -2347,9 +2362,6 @@ fn validate_repair_scope(options: &DoctorOptions) -> Result<()> {
             "Doctor could not resolve a project directory; project repair changed no files."
         )
     })?;
-    let cwd = std::env::current_dir().context(
-        "Doctor could not resolve the working directory; project repair changed no files",
-    )?;
     let canonical_project = project_path.canonicalize().with_context(|| {
         format!(
             "Doctor could not resolve project directory {}; project repair changed no files",
@@ -2359,7 +2371,9 @@ fn validate_repair_scope(options: &DoctorOptions) -> Result<()> {
     let canonical_cwd = cwd.canonicalize().with_context(|| {
         "Doctor could not resolve the working directory; project repair changed no files"
     })?;
-    if canonical_project != canonical_cwd {
+    let encloses_cwd = resolve_linked_project_root(Some(&canonical_cwd)).as_deref()
+        == Some(canonical_project.as_path());
+    if canonical_project != canonical_cwd && !encloses_cwd {
         anyhow::bail!(
             "Doctor project repair target {} is not the current working directory {}; no files were changed.",
             canonical_project.display(),
@@ -2892,11 +2906,10 @@ pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -
     if options.repair {
         if !options.scope_was_explicit {
             let cwd = std::env::current_dir().ok();
-            options.scope =
+            let (scope, linked_root) =
                 infer_default_repair_scope(options.project_path.as_deref(), cwd.as_deref());
-            if options.scope == DoctorScope::Global {
-                options.project_path = None;
-            }
+            options.scope = scope;
+            options.project_path = linked_root;
         }
         validate_repair_scope(&options)?;
         mcp_client::activation::existing_installation_id().context(
@@ -4391,7 +4404,7 @@ mod tests {
     fn repair_infers_safe_default_scope_and_enforces_matching_project_directory() {
         let unlinked = tempfile::tempdir().expect("unlinked directory");
         assert_eq!(
-            infer_default_repair_scope(Some(unlinked.path()), Some(unlinked.path())),
+            infer_default_repair_scope(Some(unlinked.path()), Some(unlinked.path())).0,
             DoctorScope::Global,
             "unlinked folder defaults to global repair so random folders never get project files"
         );
@@ -4406,15 +4419,33 @@ mod tests {
         )
         .expect("write config.json");
         assert_eq!(
-            infer_default_repair_scope(Some(linked.path()), Some(linked.path())),
+            infer_default_repair_scope(Some(linked.path()), Some(linked.path())).0,
             DoctorScope::All,
             "linked project folder defaults bare doctor --repair to all"
         );
         assert_eq!(
-            infer_default_repair_scope(Some(linked.path()), Some(unlinked.path())),
+            infer_default_repair_scope(Some(linked.path()), Some(unlinked.path())).0,
             DoctorScope::Global,
             "mismatched cwd never infers project repair"
         );
+
+        // From a subfolder, bare repair targets the linked root above it (#243),
+        // and only that root.
+        let sub = linked.path().join("src").join("sub");
+        std::fs::create_dir_all(&sub).expect("create subfolder");
+        let linked_root = linked.path().canonicalize().expect("canonical root");
+        assert_eq!(
+            infer_default_repair_scope(Some(&sub), Some(&sub)),
+            (DoctorScope::All, Some(linked_root.clone()))
+        );
+        let mut from_sub = DoctorOptions::new(Some(linked_root));
+        from_sub.repair = true;
+        from_sub.scope = DoctorScope::All;
+        validate_repair_scope_in(&from_sub, &sub).expect("linked root enclosing cwd");
+        assert!(validate_repair_scope_in(&from_sub, unlinked.path())
+            .expect_err("a root that does not enclose cwd is refused")
+            .to_string()
+            .contains("not the current working directory"));
 
         let mut global = DoctorOptions::new(None);
         global.repair = true;

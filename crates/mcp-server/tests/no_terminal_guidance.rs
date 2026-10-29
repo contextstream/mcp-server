@@ -129,3 +129,48 @@ fn index_and_ingest_without_credentials_or_a_terminal_say_how_to_sign_in() {
         );
     }
 }
+
+#[test]
+fn index_and_ingest_with_a_key_but_no_linked_folder_say_how_to_link_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&project)
+        .status()
+        .unwrap()
+        .success());
+
+    for (command, failed) in [("index", "Index failed"), ("ingest", "Ingest failed")] {
+        // A key is set, so there is nothing to sign in to: the folder just has
+        // no workspace yet, and choosing one is a prompt.
+        let output = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+            .arg(command)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("NO_COLOR", "1")
+            .env("CONTEXTSTREAM_WATCH", "0")
+            .env("CONTEXTSTREAM_API_URL", "http://127.0.0.1:9")
+            .env("CONTEXTSTREAM_API_KEY", "cs_test_not_used")
+            .env_remove("CONTEXTSTREAM_WORKSPACE_ID")
+            .current_dir(&project)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_asks_for_a_terminal(&output, &stderr);
+        assert!(
+            stderr.contains(&format!("{failed}: Choosing a workspace needs a terminal")),
+            "{stderr}"
+        );
+        assert!(stderr.contains("setup --yes"), "{stderr}");
+        assert!(stderr.contains("CONTEXTSTREAM_WORKSPACE_ID"), "{stderr}");
+        assert!(
+            !stderr.contains("Starting workspace setup"),
+            "must not claim to start a setup it cannot run:\n{stderr}"
+        );
+    }
+}

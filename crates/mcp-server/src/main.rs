@@ -3666,6 +3666,14 @@ async fn run_index_or_ingest(
             })
         }
         None => {
+            // Choosing a workspace is a prompt, so a script or coding agent
+            // needs the unattended way to link the folder first (#288).
+            setup::require_terminal(
+                "Choosing a workspace",
+                "Link this folder first with `contextstream-mcp setup --yes` (add \
+                 `--workspace-id <ID>` if your account has several workspaces), or set \
+                 CONTEXTSTREAM_WORKSPACE_ID.",
+            )?;
             eprintln!(
                 "  {}No trusted workspace mapping found. Starting workspace setup...",
                 style("ℹ  ").blue()

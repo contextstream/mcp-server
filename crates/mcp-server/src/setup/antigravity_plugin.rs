@@ -424,8 +424,9 @@ one at <https://contextstream.io/account/api-keys>.
 ## The hooks need `contextstream-mcp`
 
 The hooks run the local `contextstream-mcp` binary. Everything else works
-without it: with no binary on your `PATH` the hooks do nothing and print
-nothing. To add it, run `npx -y @contextstream/mcp-server setup`, which also
+without it: with no binary on your `PATH`, or one that is not signed in, the
+hooks add nothing (they answer `{}`, an empty hook result, and print no
+error). To add it, run `npx -y @contextstream/mcp-server setup`, which also
 signs the binary in. The hooks use a POSIX shell; on Windows run `setup`, which
 writes hooks for Windows.
 

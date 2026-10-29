@@ -135,7 +135,7 @@ pub fn build_registry(
     domains::charts::register_charts_tools(&mut registry, session.clone());
     domains::atlas_jobs::register_atlas_job_tools(&mut registry, session);
     // Read-only twins of memory, workspace, project and session: registered
-    // everywhere, listed per caller by `with_read_only_twins`.
+    // and listed wherever their tool is (#330).
     domains::read_only::register_read_only_twins(&mut registry);
 
     registry
@@ -903,24 +903,6 @@ async fn studio_listing_entry(
         return None;
     }
     Some(contextstream_tool_list_entry(tool))
-}
-
-/// Add the read-only twins (`domains::read_only`) to a listing, for a client that asks
-/// its person to confirm every tool call that may write. The registry's own listing
-/// leaves them out (`is_listed_per_caller`), so no other client pays for them.
-pub(crate) fn with_read_only_twins(
-    registry: &ToolRegistry,
-    category: Option<&str>,
-    tools: &mut Vec<serde_json::Value>,
-) {
-    for twin in domains::read_only::READ_ONLY_TWINS {
-        let Some(tool) = registry.get(twin.name) else {
-            continue;
-        };
-        if requested_category_matches(category, tool.metadata.category.as_str()) {
-            insert_sorted(tools, contextstream_tool_list_entry(tool));
-        }
-    }
 }
 
 fn insert_sorted(tools: &mut Vec<serde_json::Value>, entry: serde_json::Value) {
@@ -2968,19 +2950,25 @@ mod tests {
         // (consolidated) mode, so no client loses a tool by this addition.
         "memory_decisions",
         "memory_delete_doc",
+        // #330: the read-only twins are listed for every client, so reads run
+        // without confirmation. Additions only; no tool is removed.
+        "memory_read",
         "memory_update_doc",
         "memory_update_task",
         "project",
+        "project_read",
         "qa",
         "reminder",
         "search",
         "session",
         "session_capture",
         "session_capture_lesson",
+        "session_read",
         "session_remember",
         "skill",
         "vcs",
         "workspace",
+        "workspace_read",
     ];
 
     const V0_5_62_ROUTER_TOOL_NAMES: &[&str] = &["account", "execute_operation", "operations"];
@@ -2996,11 +2984,15 @@ mod tests {
         "instruct",
         "media",
         "memory",
+        "memory_read",
         "project",
+        "project_read",
         "search",
         "session",
+        "session_read",
         "tool_search",
         "workspace",
+        "workspace_read",
     ];
 
     // SHA-256 of each v0.5.62 broad-surface input schema after recursively
@@ -3123,6 +3115,11 @@ mod tests {
             "a7e9172ec0cb3d3f14889a92bf1d0c196d7d345647a04b3b7964e46485a5a7c1",
         ),
         (
+            // New rows for #330: the read-only twins are listed for every client.
+            "memory_read",
+            "a5b10ba8778b8dba4243d47a396200d9713b8b4bdce4fed7590bbbeda6d5bd3d",
+        ),
+        (
             "memory_update_doc",
             "309cc52b1a02a6376007278fbbedb60f8110a3901167b8c032080b366b7acd5e",
         ),
@@ -3136,6 +3133,10 @@ mod tests {
             // and action still accepted.
             "project",
             "2b9d0e81e9bd9c9eb1f49aef43daa57b7b59b76c5a3039a9b38aafd586905a65",
+        ),
+        (
+            "project_read",
+            "79ca59f71749e968bd97f74518fc4b0e1aa7938e505bcc66c1fa5abc9388f980",
         ),
         (
             "qa",
@@ -3165,6 +3166,10 @@ mod tests {
             "e14ad74849d35160cb0ebfb04a92cf6b90598c9ae1d1bf78ec28901b109c8c66",
         ),
         (
+            "session_read",
+            "0b9cc1ee78581307d1f5cf31285858488e23908f917dea4eb2640289536dfe8c",
+        ),
+        (
             "session_remember",
             "c0c5eda46edfcdb58a7782525dcd97026ba20783da91ec4c123691ea1673bcaf",
         ),
@@ -3179,6 +3184,10 @@ mod tests {
         (
             "workspace",
             "82b580b422c95161db9b0732d6a184f7f77fa511d28670c035939884bbc5ffba",
+        ),
+        (
+            "workspace_read",
+            "974d225433506ce39570767dcdac77092ee623e49e35867d2532c6b78bf6f5c1",
         ),
     ];
 
@@ -3326,27 +3335,29 @@ mod tests {
     }
 
     #[test]
-    fn read_only_twins_are_listed_only_on_request_and_offer_only_real_reads() {
+    fn read_only_twins_are_listed_for_every_client_and_offer_only_real_reads() {
+        // #330: reads in their own read-only tools, for every client.
         let registry = test_registry(Config::default());
-        let default = contextstream_tools_list(&registry, None);
-        let default_names = listed_names(&default);
-        let mut tools = default.clone();
-        with_read_only_twins(&registry, None, &mut tools);
-        assert_eq!(
-            tools.len(),
-            default.len() + domains::read_only::READ_ONLY_TWINS.len()
+        let tools = contextstream_tools_list(&registry, None);
+        let openai = contextstream_tools_list(
+            &test_registry(Config {
+                tool_surface_profile: ToolSurfaceProfile::OpenaiAgentic,
+                ..Config::default()
+            }),
+            None,
         );
-        let names = listed_names(&tools);
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-        assert_eq!(names, sorted);
+        let openai_names = listed_names(&openai);
         for twin in domains::read_only::READ_ONLY_TWINS {
             assert!(
-                !default_names.contains(&twin.name),
-                "{} is in the default listing",
+                openai_names.contains(&twin.name),
+                "{} is not on the OpenAI surface",
                 twin.name
             );
             let entry = tool_by_name(&tools, twin.name);
+            assert_eq!(
+                entry["annotations"]["destructiveHint"],
+                serde_json::json!(false)
+            );
             assert_eq!(
                 entry["annotations"]["readOnlyHint"],
                 serde_json::json!(true)
@@ -3361,7 +3372,7 @@ mod tests {
                 entry["inputSchema"]["properties"]["action"]["enum"],
                 serde_json::json!(twin.actions)
             );
-            let tool_actions = tool_by_name(&default, twin.tool)["inputSchema"]["properties"]
+            let tool_actions = tool_by_name(&tools, twin.tool)["inputSchema"]["properties"]
                 ["action"]["enum"]
                 .as_array()
                 .expect("action enum")
@@ -3725,6 +3736,27 @@ mod tests {
             for tool in &tools {
                 let name = tool["name"].as_str().unwrap_or("<unnamed>");
                 let annotations = &tool["annotations"];
+
+                // #330: directory review needs a human-readable title and a
+                // name of 64 characters or fewer, from [A-Za-z0-9_-].
+                assert!(
+                    tool["title"]
+                        .as_str()
+                        .is_some_and(|title| !title.trim().is_empty() && title != name),
+                    "{profile_name}/{name} has no human-readable title"
+                );
+                assert_eq!(
+                    annotations["title"], tool["title"],
+                    "{profile_name}/{name}: annotations.title differs from title"
+                );
+                assert!(
+                    !name.is_empty()
+                        && name.len() <= 64
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                    "{profile_name}/{name} is not a name directories accept"
+                );
 
                 // A missing hint is worse than a permissive one: the reviewer
                 // reads absence as unknown and the scan fails on it.

@@ -9,10 +9,10 @@
 //! twin accepts only its tool's read actions, runs the same handler, and is
 //! annotated read-only, like the coach surface's read/write split.
 //!
-//! The twins are direct tools only (never router operations) and are listed
-//! per caller: the hosted gateway adds them to `tools/list` for Google's MCP
-//! client, so every other client's listing is unchanged. Any client may call
-//! them.
+//! The twins are direct tools only (never router operations), listed for
+//! every client wherever their tool is: directory reviews (the Claude
+//! connector directory, ChatGPT's action control) want reads and writes in
+//! separate tools so reads run without confirmation (#330).
 
 use std::sync::Arc;
 

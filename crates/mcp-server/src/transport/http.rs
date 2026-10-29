@@ -600,6 +600,13 @@ fn is_streamable_mcp_path(path: &str) -> bool {
     )
 }
 
+/// The MCP endpoint's own protected-resource metadata (RFC 9728 §3.1: the
+/// well-known path followed by the resource's path). Directory checks (the
+/// Claude connector directory) read it there; the root one stays for clients
+/// that follow WWW-Authenticate (#329).
+const MCP_PATH: &str = "/mcp";
+const MCP_RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
+
 /// The Agent Coach Kit endpoint: only the three coach tools.
 const COACH_PATH: &str = "/coach";
 /// Its protected-resource metadata.
@@ -685,6 +692,10 @@ pub fn create_router(state: HttpState) -> Router {
         .route(
             "/.well-known/oauth-protected-resource",
             get(handle_oauth_protected_resource),
+        )
+        .route(
+            MCP_RESOURCE_METADATA_PATH,
+            get(handle_mcp_endpoint_protected_resource),
         )
         .route(
             COACH_RESOURCE_METADATA_PATH,
@@ -827,6 +838,11 @@ async fn handle_metrics(State(state): State<HttpState>) -> impl IntoResponse {
 /// OAuth 2.0 protected resource metadata for hosted MCP clients.
 async fn handle_oauth_protected_resource(headers: HeaderMap) -> impl IntoResponse {
     Json(oauth_protected_resource_metadata(&headers))
+}
+
+/// Protected resource metadata (RFC 9728) for the `/mcp` endpoint itself.
+async fn handle_mcp_endpoint_protected_resource(headers: HeaderMap) -> impl IntoResponse {
+    Json(mcp_endpoint_protected_resource_metadata(&headers))
 }
 
 /// Protected resource metadata (RFC 9728) for the Agent Coach Kit endpoint.
@@ -3209,7 +3225,9 @@ fn request_origin(headers: &HeaderMap) -> String {
 }
 
 fn oauth_resource_metadata_url(headers: &HeaderMap, path: &str) -> String {
-    let metadata = if path == COACH_PATH {
+    let metadata = if path == MCP_PATH {
+        MCP_RESOURCE_METADATA_PATH
+    } else if path == COACH_PATH {
         COACH_RESOURCE_METADATA_PATH
     } else if path == STUDIO_PATH {
         STUDIO_RESOURCE_METADATA_PATH
@@ -3225,6 +3243,15 @@ fn oauth_resource_metadata_url(headers: &HeaderMap, path: &str) -> String {
 fn oauth_protected_resource_metadata(headers: &HeaderMap) -> Value {
     json!({
         "resource": request_origin(headers),
+        "authorization_servers": [authorization_server_origin()]
+    })
+}
+
+/// The `/mcp` endpoint's resource: `<origin>/mcp`. The API binds a token to it
+/// with the reach of an unbound one (contextstream `oauth_resource`).
+fn mcp_endpoint_protected_resource_metadata(headers: &HeaderMap) -> Value {
+    json!({
+        "resource": format!("{}{MCP_PATH}", request_origin(headers).trim_end_matches('/')),
         "authorization_servers": [authorization_server_origin()]
     })
 }
@@ -5578,7 +5605,7 @@ mod tests {
                     .get(header::WWW_AUTHENTICATE)
                     .and_then(|value| value.to_str().ok()),
                 Some(
-                    r#"Bearer resource_metadata="https://mcp.contextstream.io/.well-known/oauth-protected-resource""#
+                    r#"Bearer resource_metadata="https://mcp.contextstream.io/.well-known/oauth-protected-resource/mcp""#
                 )
             );
 
@@ -5613,7 +5640,7 @@ mod tests {
                     .get(header::WWW_AUTHENTICATE)
                     .and_then(|value| value.to_str().ok()),
                 Some(
-                    r#"Bearer resource_metadata="https://mcp.contextstream.io/.well-known/oauth-protected-resource""#
+                    r#"Bearer resource_metadata="https://mcp.contextstream.io/.well-known/oauth-protected-resource/mcp""#
                 )
             );
 
@@ -5645,6 +5672,28 @@ mod tests {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["resource"], "https://mcp.contextstream.io");
+            assert_eq!(
+                json["authorization_servers"],
+                json!(["https://api.contextstream.io"])
+            );
+        }
+
+        // #329: the endpoint's own metadata, where directory checks look.
+        #[tokio::test]
+        async fn the_mcp_endpoint_has_its_own_protected_resource_metadata() {
+            let app = create_router(create_auth_state(true, None));
+            let request = Request::builder()
+                .method("GET")
+                .uri("/.well-known/oauth-protected-resource/mcp")
+                .header("host", "mcp.contextstream.io")
+                .header("x-forwarded-proto", "https")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["resource"], "https://mcp.contextstream.io/mcp");
             assert_eq!(
                 json["authorization_servers"],
                 json!(["https://api.contextstream.io"])
@@ -7195,7 +7244,7 @@ mod tests {
                 response.headers()[header::WWW_AUTHENTICATE]
                     .to_str()
                     .unwrap(),
-                r#"Bearer resource_metadata="https://mcp.contextstream.io/.well-known/oauth-protected-resource""#
+                r#"Bearer resource_metadata="https://mcp.contextstream.io/.well-known/oauth-protected-resource/mcp""#
             );
         }
 
@@ -7318,10 +7367,7 @@ mod tests {
                     "/.well-known/oauth-protected-resource/studio",
                     StatusCode::OK,
                 ),
-                (
-                    "/.well-known/oauth-protected-resource/mcp",
-                    StatusCode::NOT_FOUND,
-                ),
+                ("/.well-known/oauth-protected-resource/mcp", StatusCode::OK),
                 (
                     "/.well-known/oauth-protected-resource/claude",
                     StatusCode::NOT_FOUND,

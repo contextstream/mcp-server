@@ -14100,6 +14100,9 @@ impl SearchTool {
             .map(str::trim)
             .filter(|mode| !mode.is_empty())
             .is_some_and(|mode| SearchMode::from_str(mode) == SearchMode::Guided);
+        if let Some(message) = search_query_length_error(&input.query, explicitly_guided) {
+            return Err(Error::Validation(message));
+        }
 
         if !explicitly_guided {
             return self.execute_inner(input, handler_started, None).await;
@@ -14177,7 +14180,7 @@ impl ToolHandler for SearchTool {
     }
 
     fn input_schema(&self) -> Value {
-        SchemaBuilder::new()
+        let mut schema = SchemaBuilder::new()
             .description("Search the indexed codebase")
             .string(
                 "query",
@@ -14265,7 +14268,51 @@ impl ToolHandler for SearchTool {
                 "Opaque continuation returned as next_cursor by mode='refactor'. Pass it back unchanged with the same query and scope.",
                 false,
             )
-            .build()
+            .build();
+        schema["properties"]["query"]["maxLength"] = Value::from(SEARCH_QUERY_MAX_CHARS);
+        schema
+    }
+}
+
+/// The API refuses a longer search query (guided search allows a little more).
+const SEARCH_QUERY_MAX_CHARS: usize = 500;
+const GUIDED_SEARCH_QUERY_MAX_CHARS: usize = 512;
+
+/// A query over the API's limit, refused with the numbers before anything is
+/// sent; the API itself answers only "Validation error".
+fn search_query_length_error(query: &str, guided: bool) -> Option<String> {
+    let limit = if guided {
+        GUIDED_SEARCH_QUERY_MAX_CHARS
+    } else {
+        SEARCH_QUERY_MAX_CHARS
+    };
+    let chars = query.chars().count();
+    (chars > limit).then(|| {
+        format!(
+            "search: the query is {chars} characters; the limit is {limit}. Search for the words that identify what you want (a symbol, an error message, a short phrase), not a paragraph or a stack trace."
+        )
+    })
+}
+
+#[cfg(test)]
+mod query_length_tests {
+    use super::*;
+
+    #[test]
+    fn a_query_over_the_api_limit_is_refused_with_the_numbers() {
+        // #292: the limit counts characters, not bytes.
+        assert_eq!(search_query_length_error(&"a".repeat(500), false), None);
+        assert_eq!(
+            search_query_length_error(&"\u{1F600}".repeat(500), false),
+            None
+        );
+        let message = search_query_length_error(&"a".repeat(501), false).unwrap();
+        assert!(
+            message.starts_with("search: the query is 501 characters; the limit is 500."),
+            "{message}"
+        );
+        assert_eq!(search_query_length_error(&"a".repeat(512), true), None);
+        assert!(search_query_length_error(&"a".repeat(513), true).is_some());
     }
 }
 

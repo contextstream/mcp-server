@@ -2610,23 +2610,60 @@ async fn handle_call_tool_method(
                     "suppressed non-blocking ParserError in JSON-RPC tool response"
                 );
             }
-            Err(JsonRpcError {
-                code: if strict_protocol_errors
-                    && matches!(
-                        &err,
-                        mcp_types::Error::Validation(_)
-                            | mcp_types::Error::InvalidUuid(_)
-                            | mcp_types::Error::Serialization(_)
-                    ) {
-                    -32602
-                } else {
-                    -32603
-                },
-                message: err.user_facing_message(),
-                data: None,
-            })
+            tool_call_error_response(
+                err,
+                strict_protocol_errors,
+                call_title.as_deref(),
+                call_icon,
+            )
         }
     }
+}
+
+/// A failed tool call, answered as the stdio server answers it (#280): only the
+/// stateless contract's argument errors are JSON-RPC protocol errors (-32602);
+/// every other failure is a tool result with `isError: true`, so the model can
+/// read it and correct course, keeping the call's title and, for exhausted
+/// credits, the guidance `ToolResult::credits_exhausted` carries.
+fn tool_call_error_response(
+    err: mcp_types::Error,
+    strict_protocol_errors: bool,
+    call_title: Option<&str>,
+    call_icon: &str,
+) -> Result<Value, JsonRpcError> {
+    if strict_protocol_errors
+        && matches!(
+            &err,
+            mcp_types::Error::Validation(_)
+                | mcp_types::Error::InvalidUuid(_)
+                | mcp_types::Error::Serialization(_)
+        )
+    {
+        return Err(JsonRpcError {
+            code: -32602,
+            message: err.user_facing_message(),
+            data: None,
+        });
+    }
+    if let mcp_types::Error::InsufficientCredits {
+        required,
+        available,
+        ..
+    } = &err
+    {
+        let mut result = mcp_types::tool::ToolResult::credits_exhausted(*required, *available);
+        result.is_error = true;
+        return Ok(tool_result_response_with_title(
+            result,
+            call_title,
+            Some(call_icon),
+        ));
+    }
+    Ok(tool_error_response_with_title(
+        format!("[ERROR] {}", err.user_facing_message()),
+        call_title,
+        Some(call_icon),
+    ))
 }
 
 // ============================================================================
@@ -7170,5 +7207,50 @@ mod initialize_key_tests {
         let body = initialize(hosted_gateway(api_url), "transient-key-252").await;
         assert!(body.get("result").is_some(), "{body}");
         assert!(body.get("error").is_none(), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod tool_call_error_tests {
+    use super::*;
+
+    #[test]
+    fn session_tool_errors_are_tool_results_not_internal_errors() {
+        let validation = mcp_types::Error::Validation(
+            "target_id is required for dependencies action".to_string(),
+        );
+        let response = tool_call_error_response(
+            validation,
+            false,
+            Some("Reading code graph from ContextStream"),
+            "◎",
+        )
+        .expect("a tool result");
+        assert_eq!(response["isError"], true);
+        assert_eq!(response["title"], "Reading code graph from ContextStream");
+        assert!(response["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("target_id is required")));
+
+        let api = mcp_types::Error::http(404, "Not Found");
+        let response = tool_call_error_response(api, false, None, "◎").expect("a tool result");
+        assert_eq!(response["isError"], true);
+    }
+
+    #[test]
+    fn stateless_argument_errors_stay_protocol_errors() {
+        let error = tool_call_error_response(
+            mcp_types::Error::Validation("bad".to_string()),
+            true,
+            None,
+            "◎",
+        )
+        .expect_err("a protocol error");
+        assert_eq!(error.code, -32602);
+        // Other failures are tool results under the stateless contract too.
+        let response =
+            tool_call_error_response(mcp_types::Error::http(409, "Conflict"), true, None, "◎")
+                .expect("a tool result");
+        assert_eq!(response["isError"], true);
     }
 }

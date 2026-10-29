@@ -2289,6 +2289,35 @@ pub fn replace_contextstream_block(existing: &str, new_block: &str) -> Result<St
     Ok(format!("{}\n\n{}", new_block, existing))
 }
 
+/// Remove the shared `.contextstream/rules.md` that Aider and Gemini point at,
+/// once nothing points at it any more and it holds only what setup wrote.
+/// Another editor that still names it keeps it (#322).
+fn remove_unreferenced_shared_project_rules(project_path: &Path) -> Result<bool> {
+    let shared = project_path.join(SHARED_PROJECT_RULES_PATH);
+    let Ok(existing) = std::fs::read_to_string(&shared) else {
+        return Ok(false);
+    };
+    if !mcp_types::rules_hash::is_managed_rules_only(&existing) {
+        return Ok(false);
+    }
+    let still_pointed_at = ["GEMINI.md", ".aider.conf.yml"].iter().any(|name| {
+        std::fs::read_to_string(project_path.join(name))
+            .is_ok_and(|text| text.contains(SHARED_PROJECT_RULES_PATH))
+    });
+    if still_pointed_at {
+        return Ok(false);
+    }
+    let backup = safe_edit::backup_path(&shared)?;
+    let backup_text = safe_edit::read_recovery_file(&backup)?;
+    let removed = safe_edit::remove_owned_file_if_unchanged(&shared, &existing)?;
+    if let Some(backup_text) =
+        backup_text.filter(|text| mcp_types::rules_hash::is_managed_rules_only(text))
+    {
+        safe_edit::remove_owned_file_if_unchanged(&backup, &backup_text)?;
+    }
+    Ok(removed)
+}
+
 /// Remove the ContextStream block from a rules file, preserving other content.
 ///
 /// Returns the cleaned content, or None if the file didn't contain a block.
@@ -2302,6 +2331,12 @@ pub fn remove_contextstream_from_rules(
             continue;
         }
         removed |= remove_contextstream_from_path(&path)?;
+    }
+
+    if *editor == Editor::Aider || uses_project_gemini_md(editor) {
+        if let Some(project_path) = project_path {
+            removed |= remove_unreferenced_shared_project_rules(project_path)?;
+        }
     }
 
     if *editor == Editor::Copilot {
@@ -2332,6 +2367,22 @@ pub fn remove_contextstream_from_rules(
     }
 
     Ok(removed)
+}
+
+/// Nothing but whitespace and bare comment markers: what a config file such as
+/// `.aider.conf.yml` is left with once the commented-out managed block is gone.
+fn is_effectively_empty(text: &str) -> bool {
+    text.chars().all(|c| c == '#' || c.is_whitespace())
+}
+
+/// `text` without its managed block, or `None` when it has no closed one.
+fn without_managed_block(text: &str) -> Option<String> {
+    let (start, end) = find_contextstream_block_bounds(text)?;
+    let block = &text[start..end];
+    if !block.contains(CONTEXTSTREAM_END) && !block.contains(LEGACY_END) {
+        return None;
+    }
+    Some(format!("{}{}", &text[..start], &text[end..]))
 }
 
 fn remove_contextstream_from_path(path: &Path) -> Result<bool> {
@@ -2405,11 +2456,20 @@ fn remove_contextstream_from_path(path: &Path) -> Result<bool> {
             after = after.trim_start_matches(['\r', '\n']);
         }
         let cleaned = format!("{}{}", before, after);
-        if cleaned.trim().is_empty() {
+        if is_effectively_empty(&cleaned) {
             if backup.is_none() && adjusted_start == 0 {
                 safe_edit::remove_owned_file_if_unchanged(&resolved_path, &content)?;
             } else {
                 safe_edit::remove_file_if_unchanged(&resolved_path, &content)?;
+            }
+            // The backup a later refresh left holds an earlier managed version.
+            // When that is all it held, it goes with the file (#322).
+            if let Some(backup_text) = backup.as_deref() {
+                if without_managed_block(backup_text)
+                    .is_some_and(|rest| is_effectively_empty(&rest))
+                {
+                    safe_edit::remove_owned_file_if_unchanged(&backup_path, backup_text)?;
+                }
             }
         } else {
             safe_edit::write_if_unchanged(&resolved_path, &cleaned, Some(&content))?;
@@ -4075,6 +4135,62 @@ mod tests {
             Some("proj"),
         )
         .expect("write windsurf project rules");
+    }
+
+    #[test]
+    fn aider_files_setup_created_are_removed_with_their_backup_and_the_shared_rules() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        let conf = project.join(".aider.conf.yml");
+        let shared = project.join(".contextstream").join("rules.md");
+        let write = || {
+            write_project_rules(&Editor::Aider, project, Some("ws"), Some("W"), Some("p"))
+                .expect("write aider rules");
+        };
+
+        write();
+        // A refresh from an older version leaves a backup of the managed file.
+        let older = std::fs::read_to_string(&conf).unwrap().replace(
+            "contextstream-rules-hash: ",
+            "contextstream-rules-hash: 0000",
+        );
+        std::fs::write(&conf, older).unwrap();
+        write();
+        assert!(safe_edit::backup_path(&conf).unwrap().exists());
+        assert!(shared.is_file());
+
+        assert!(remove_contextstream_from_rules(&Editor::Aider, Some(project)).expect("remove"));
+        assert!(
+            !conf.exists(),
+            "the aider config remained: {:?}",
+            std::fs::read_to_string(&conf)
+        );
+        assert!(!safe_edit::backup_path(&conf).unwrap().exists());
+        assert!(!shared.exists(), "the shared rules file remained");
+    }
+
+    #[test]
+    fn the_shared_rules_stay_while_another_editor_still_points_at_them() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        for editor in [Editor::Aider, Editor::GeminiCli] {
+            write_project_rules(&editor, project, Some("ws"), Some("W"), Some("p"))
+                .expect("write rules");
+        }
+        let shared = project.join(".contextstream").join("rules.md");
+        remove_contextstream_from_rules(&Editor::Aider, Some(project)).expect("remove aider");
+        assert!(shared.is_file(), "Gemini still reads it");
+        remove_contextstream_from_rules(&Editor::GeminiCli, Some(project)).expect("remove gemini");
+        assert!(!shared.exists());
+    }
+
+    #[test]
+    fn a_config_with_only_comment_markers_left_counts_as_empty() {
+        assert!(is_effectively_empty(""));
+        assert!(is_effectively_empty("# \n#\n\n"));
+        assert!(is_effectively_empty("# # "));
+        assert!(!is_effectively_empty("# a comment\n"));
+        assert!(!is_effectively_empty("model: gpt\n"));
     }
 
     #[test]

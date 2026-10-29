@@ -3753,7 +3753,15 @@ mod tests {
             // pointer to `delete` and is fine.
             if moved.action.contains('_') {
                 let tool = tool_by_name(&tools, moved.tool);
-                let mut texts = vec![tool["description"].as_str().unwrap_or_default().to_string()];
+                // The schema's own description too (#330: capsule's still
+                // listed revoke_share there).
+                let mut texts = vec![
+                    tool["description"].as_str().unwrap_or_default().to_string(),
+                    tool["inputSchema"]["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                ];
                 for property in tool["inputSchema"]["properties"]
                     .as_object()
                     .into_iter()

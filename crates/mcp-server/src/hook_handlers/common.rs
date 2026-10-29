@@ -67,6 +67,515 @@ impl ApiConfig {
     }
 }
 
+/// Configuration and effective transcript-saving policy resolved for
+/// transcript-bearing lifecycle hooks (`pre-compact` and `session-end`).
+#[derive(Debug, Clone)]
+pub struct TranscriptHookConfig {
+    pub api_key: String,
+    pub api_url: String,
+    pub workspace_id: Option<String>,
+    pub project_id: Option<String>,
+    pub save_transcript_default: bool,
+}
+
+#[derive(Default, Debug)]
+struct McpConfigSnapshot {
+    env_api_key: Option<String>,
+    env_api_url: Option<String>,
+    header_api_key: Option<String>,
+    workspace_id: Option<String>,
+    project_id: Option<String>,
+    hook_override: Option<bool>,
+    hook_transcripts_enabled: Option<bool>,
+    transcripts_enabled: Option<bool>,
+}
+
+impl McpConfigSnapshot {
+    fn entry_policy(&self) -> Option<bool> {
+        if let Some(explicit) = self.hook_override {
+            return Some(explicit);
+        }
+        if self.hook_transcripts_enabled == Some(false) || self.transcripts_enabled == Some(false) {
+            return Some(false);
+        }
+        self.hook_transcripts_enabled.or(self.transcripts_enabled)
+    }
+}
+
+pub(crate) fn parse_hook_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn nonempty_trimmed(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn strip_bearer(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+        nonempty_trimmed(&trimmed[7..])
+    } else {
+        None
+    }
+}
+
+fn json_container_value(entry: &Value, containers: &[&str], key_ci: &str) -> Option<String> {
+    for container in containers {
+        let Some(map) = entry.get(*container).and_then(Value::as_object) else {
+            continue;
+        };
+        for (k, v) in map {
+            if k.eq_ignore_ascii_case(key_ci) {
+                if let Some(s) = v.as_str() {
+                    return Some(s.to_string());
+                }
+                if let Some(b) = v.as_bool() {
+                    return Some(if b { "true" } else { "false" }.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn snapshot_from_json_entry(entry: &Value, hook_override_env: &str) -> McpConfigSnapshot {
+    let env_containers = ["env", "environment"];
+    let header_containers = ["headers"];
+    let header_api_key = json_container_value(entry, &header_containers, "X-ContextStream-API-Key")
+        .and_then(|v| nonempty_trimmed(&v))
+        .or_else(|| {
+            json_container_value(entry, &header_containers, "X-API-Key")
+                .and_then(|v| nonempty_trimmed(&v))
+        })
+        .or_else(|| {
+            json_container_value(entry, &header_containers, "Authorization")
+                .and_then(|v| strip_bearer(&v))
+        });
+
+    McpConfigSnapshot {
+        env_api_key: json_container_value(entry, &env_containers, "CONTEXTSTREAM_API_KEY")
+            .and_then(|v| nonempty_trimmed(&v)),
+        env_api_url: json_container_value(entry, &env_containers, "CONTEXTSTREAM_API_URL")
+            .and_then(|v| nonempty_trimmed(&v)),
+        header_api_key,
+        workspace_id: json_container_value(entry, &env_containers, "CONTEXTSTREAM_WORKSPACE_ID")
+            .and_then(|v| nonempty_trimmed(&v))
+            .or_else(|| {
+                json_container_value(entry, &header_containers, "X-ContextStream-Workspace-Id")
+                    .and_then(|v| nonempty_trimmed(&v))
+            }),
+        project_id: json_container_value(entry, &env_containers, "CONTEXTSTREAM_PROJECT_ID")
+            .and_then(|v| nonempty_trimmed(&v))
+            .or_else(|| {
+                json_container_value(entry, &header_containers, "X-ContextStream-Project-Id")
+                    .and_then(|v| nonempty_trimmed(&v))
+            }),
+        hook_override: (!hook_override_env.is_empty())
+            .then(|| json_container_value(entry, &env_containers, hook_override_env))
+            .flatten()
+            .and_then(|v| parse_hook_bool(&v)),
+        hook_transcripts_enabled: json_container_value(
+            entry,
+            &env_containers,
+            "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED",
+        )
+        .and_then(|v| parse_hook_bool(&v))
+        .or_else(|| {
+            json_container_value(
+                entry,
+                &header_containers,
+                "X-ContextStream-Hook-Transcripts-Enabled",
+            )
+            .and_then(|v| parse_hook_bool(&v))
+        }),
+        transcripts_enabled: json_container_value(
+            entry,
+            &env_containers,
+            "CONTEXTSTREAM_TRANSCRIPTS_ENABLED",
+        )
+        .and_then(|v| parse_hook_bool(&v))
+        .or_else(|| {
+            json_container_value(
+                entry,
+                &header_containers,
+                "X-ContextStream-Transcripts-Enabled",
+            )
+            .and_then(|v| parse_hook_bool(&v))
+        }),
+    }
+}
+
+fn snapshots_from_mcp_file(
+    path: &Path,
+    cwd: &str,
+    hook_override_env: &str,
+) -> Vec<McpConfigSnapshot> {
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+    {
+        let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
+            return Vec::new();
+        };
+        let Some(entry) = doc
+            .get("mcp_servers")
+            .and_then(toml_edit::Item::as_table_like)
+            .and_then(|servers| servers.get("contextstream"))
+            .and_then(toml_edit::Item::as_table_like)
+        else {
+            return Vec::new();
+        };
+        let toml_scalar_to_string = |val: &toml_edit::Value| -> Option<String> {
+            if let Some(s) = val.as_str() {
+                return Some(s.to_string());
+            }
+            if let Some(b) = val.as_bool() {
+                return Some(if b { "true" } else { "false" }.to_string());
+            }
+            None
+        };
+        let toml_val = |tables: &[&str], key_ci: &str| -> Option<String> {
+            for table_name in tables {
+                let Some(sub_item) = entry.get(table_name) else {
+                    continue;
+                };
+                if let Some(sub) = sub_item.as_table_like() {
+                    for (k, item) in sub.iter() {
+                        if k.eq_ignore_ascii_case(key_ci) {
+                            if let Some(val) = item.as_value().and_then(toml_scalar_to_string) {
+                                return Some(val);
+                            }
+                        }
+                    }
+                }
+                if let Some(inline) = sub_item
+                    .as_value()
+                    .and_then(toml_edit::Value::as_inline_table)
+                {
+                    for (k, val) in inline.iter() {
+                        if k.eq_ignore_ascii_case(key_ci) {
+                            if let Some(out) = toml_scalar_to_string(val) {
+                                return Some(out);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        };
+        let header_tables = ["http_headers", "headers"];
+        let env_tables = ["env"];
+        let header_api_key = toml_val(&header_tables, "X-ContextStream-API-Key")
+            .and_then(|v| nonempty_trimmed(&v))
+            .or_else(|| toml_val(&header_tables, "X-API-Key").and_then(|v| nonempty_trimmed(&v)))
+            .or_else(|| toml_val(&header_tables, "Authorization").and_then(|v| strip_bearer(&v)));
+        return vec![McpConfigSnapshot {
+            env_api_key: toml_val(&env_tables, "CONTEXTSTREAM_API_KEY")
+                .and_then(|v| nonempty_trimmed(&v)),
+            env_api_url: toml_val(&env_tables, "CONTEXTSTREAM_API_URL")
+                .and_then(|v| nonempty_trimmed(&v)),
+            header_api_key,
+            workspace_id: toml_val(&env_tables, "CONTEXTSTREAM_WORKSPACE_ID")
+                .and_then(|v| nonempty_trimmed(&v))
+                .or_else(|| {
+                    toml_val(&header_tables, "X-ContextStream-Workspace-Id")
+                        .and_then(|v| nonempty_trimmed(&v))
+                }),
+            project_id: toml_val(&env_tables, "CONTEXTSTREAM_PROJECT_ID")
+                .and_then(|v| nonempty_trimmed(&v))
+                .or_else(|| {
+                    toml_val(&header_tables, "X-ContextStream-Project-Id")
+                        .and_then(|v| nonempty_trimmed(&v))
+                }),
+            hook_override: (!hook_override_env.is_empty())
+                .then(|| toml_val(&env_tables, hook_override_env))
+                .flatten()
+                .and_then(|v| parse_hook_bool(&v)),
+            hook_transcripts_enabled: toml_val(
+                &env_tables,
+                "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED",
+            )
+            .and_then(|v| parse_hook_bool(&v))
+            .or_else(|| {
+                toml_val(&header_tables, "X-ContextStream-Hook-Transcripts-Enabled")
+                    .and_then(|v| parse_hook_bool(&v))
+            }),
+            transcripts_enabled: toml_val(&env_tables, "CONTEXTSTREAM_TRANSCRIPTS_ENABLED")
+                .and_then(|v| parse_hook_bool(&v))
+                .or_else(|| {
+                    toml_val(&header_tables, "X-ContextStream-Transcripts-Enabled")
+                        .and_then(|v| parse_hook_bool(&v))
+                }),
+        }];
+    }
+
+    let Ok(parsed) = crate::setup::mcp_config::try_parse_json_like(&content) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    // Per-project entry inside `~/.claude.json` (`projects[<cwd>].mcpServers.contextstream`) if present.
+    if !cwd.is_empty() {
+        if let Some(proj_entry) = parsed
+            .get("projects")
+            .and_then(Value::as_object)
+            .and_then(|projects| projects.get(cwd))
+            .and_then(|proj| proj.get("mcpServers"))
+            .and_then(|servers| servers.get("contextstream"))
+        {
+            out.push(snapshot_from_json_entry(proj_entry, hook_override_env));
+        }
+    }
+    for container_path in [
+        &["mcpServers", "contextstream"][..],
+        &["servers", "contextstream"][..],
+        &["context_servers", "contextstream"][..],
+        &["mcp", "contextstream"][..],
+        &["mcp", "servers", "contextstream"][..],
+    ] {
+        if let Some(entry) = container_path
+            .iter()
+            .try_fold(&parsed, |node, key| node.get(*key))
+            .filter(|v| v.is_object())
+        {
+            out.push(snapshot_from_json_entry(entry, hook_override_env));
+            break;
+        }
+    }
+    out
+}
+
+/// Resolve API credentials, workspace/project IDs, and effective transcript
+/// policy across process env, project/global editor MCP configs (both remote
+/// HTTP `headers` and local stdio `env`), and `~/.contextstream/credentials.json`.
+pub fn load_transcript_hook_config(
+    cwd: &str,
+    hook_override_env: &str,
+    default_enabled: bool,
+) -> TranscriptHookConfig {
+    let mut api_key = std::env::var("CONTEXTSTREAM_API_KEY")
+        .ok()
+        .and_then(|v| nonempty_trimmed(&v))
+        .unwrap_or_default();
+    let explicit_api_url = std::env::var("CONTEXTSTREAM_API_URL")
+        .ok()
+        .and_then(|v| nonempty_trimmed(&v));
+    let mut api_url: Option<String> = explicit_api_url.clone();
+    let mut workspace_id = std::env::var("CONTEXTSTREAM_WORKSPACE_ID")
+        .ok()
+        .and_then(|v| nonempty_trimmed(&v));
+    let mut project_id = std::env::var("CONTEXTSTREAM_PROJECT_ID")
+        .ok()
+        .and_then(|v| nonempty_trimmed(&v));
+
+    let env_policy = (!hook_override_env.is_empty())
+        .then(|| std::env::var(hook_override_env).ok())
+        .flatten()
+        .and_then(|v| parse_hook_bool(&v))
+        .or_else(|| {
+            std::env::var("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED")
+                .ok()
+                .and_then(|v| parse_hook_bool(&v))
+        })
+        .or_else(|| {
+            std::env::var("CONTEXTSTREAM_TRANSCRIPTS_ENABLED")
+                .ok()
+                .and_then(|v| parse_hook_bool(&v))
+        });
+
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut project_snapshots = Vec::new();
+    let mut search_dir = PathBuf::from(cwd);
+    if !cwd.is_empty() {
+        for _ in 0..8 {
+            let mut candidates = vec![
+                search_dir.join(".mcp.json"),
+                search_dir.join(".codex").join("config.toml"),
+            ];
+            for editor in crate::setup::editors::Editor::all() {
+                if let Some(p) = editor.project_mcp_config_path(&search_dir) {
+                    candidates.push(p);
+                }
+            }
+            for candidate in candidates {
+                if seen_paths.insert(candidate.clone()) {
+                    project_snapshots.extend(snapshots_from_mcp_file(
+                        &candidate,
+                        cwd,
+                        hook_override_env,
+                    ));
+                }
+            }
+
+            if workspace_id.is_none() || project_id.is_none() {
+                let cs_config = search_dir.join(".contextstream").join("config.json");
+                if let Ok(content) = std::fs::read_to_string(&cs_config) {
+                    if let Ok(cfg) = serde_json::from_str::<Value>(&content) {
+                        if workspace_id.is_none() {
+                            workspace_id = cfg
+                                .get("workspace_id")
+                                .and_then(Value::as_str)
+                                .and_then(nonempty_trimmed);
+                        }
+                        if project_id.is_none() {
+                            project_id = cfg
+                                .get("project_id")
+                                .and_then(Value::as_str)
+                                .and_then(nonempty_trimmed);
+                        }
+                    }
+                }
+            }
+
+            if !search_dir.pop() {
+                break;
+            }
+        }
+    }
+
+    let mut global_snapshots = Vec::new();
+    if let Some(home) = home_dir() {
+        let mut candidates = vec![home.join(".mcp.json")];
+        for editor in crate::setup::editors::Editor::all() {
+            if let Some(p) = editor.mcp_config_path() {
+                candidates.push(p);
+            }
+        }
+        for candidate in candidates {
+            if seen_paths.insert(candidate.clone()) {
+                global_snapshots.extend(snapshots_from_mcp_file(
+                    &candidate,
+                    cwd,
+                    hook_override_env,
+                ));
+            }
+        }
+    }
+
+    // 1. Local stdio `env` credentials in project -> global MCP configs.
+    for snap in project_snapshots.iter().chain(global_snapshots.iter()) {
+        if api_key.is_empty() {
+            if let Some(ref key) = snap.env_api_key {
+                api_key = key.clone();
+                if api_url.is_none() {
+                    api_url = snap.env_api_url.clone();
+                }
+            }
+        }
+        if api_url.is_none() {
+            api_url = snap.env_api_url.clone();
+        }
+    }
+
+    // 2. Saved `~/.contextstream/credentials.json` (`api_key` + `api_url`).
+    if let Some(home) = home_dir() {
+        let creds_path = home.join(".contextstream").join("credentials.json");
+        if let Ok(content) = std::fs::read_to_string(&creds_path) {
+            if let Ok(creds) = serde_json::from_str::<Value>(&content) {
+                if api_key.is_empty() {
+                    if let Some(key) = creds
+                        .get("api_key")
+                        .and_then(Value::as_str)
+                        .and_then(nonempty_trimmed)
+                    {
+                        api_key = key;
+                    }
+                }
+                if api_url.is_none() {
+                    api_url = creds
+                        .get("api_url")
+                        .and_then(Value::as_str)
+                        .and_then(nonempty_trimmed);
+                }
+            }
+        }
+    }
+
+    // 3. Remote HTTP `headers` auth fallback (`--preauth` configs without credentials.json).
+    if api_key.is_empty() {
+        for snap in project_snapshots.iter().chain(global_snapshots.iter()) {
+            if let Some(ref key) = snap.header_api_key {
+                api_key = key.clone();
+                break;
+            }
+        }
+    }
+
+    // 4. Workspace/project fallback from MCP configs when `.contextstream/config.json` is absent.
+    for snap in &project_snapshots {
+        if workspace_id.is_none() {
+            workspace_id = snap.workspace_id.clone();
+        }
+        if project_id.is_none() {
+            project_id = snap.project_id.clone();
+        }
+    }
+    if workspace_id.is_none() {
+        for snap in &global_snapshots {
+            if snap.workspace_id.is_some() {
+                workspace_id = snap.workspace_id.clone();
+                break;
+            }
+        }
+    }
+
+    // 5. Transcript policy resolution:
+    //    - Explicit process env wins.
+    //    - Next, explicit hook-specific `env` override (`CONTEXTSTREAM_PRECOMPACT_AUTO_SAVE` /
+    //      `CONTEXTSTREAM_SESSION_END_SAVE_TRANSCRIPT`) in project -> global MCP config.
+    //    - Next, fail-closed opt-out across project and global MCP configs: if ANY
+    //      configured editor MCP entry has `false` (e.g. `configure --transcripts off`
+    //      or `configure --hook-transcripts off` at `--scope=global`, `--scope=project`,
+    //      or `--scope=all`), resolve to `false`.
+    //    - Next, any explicit `true` entry, otherwise `default_enabled`.
+    let save_transcript_default = if let Some(explicit_env) = env_policy {
+        explicit_env
+    } else if let Some(hook_specific) = project_snapshots
+        .iter()
+        .chain(global_snapshots.iter())
+        .find_map(|s| s.hook_override)
+    {
+        hook_specific
+    } else {
+        let policies: Vec<bool> = project_snapshots
+            .iter()
+            .chain(global_snapshots.iter())
+            .filter_map(McpConfigSnapshot::entry_policy)
+            .collect();
+        if policies.contains(&false) {
+            false
+        } else if policies.contains(&true) {
+            true
+        } else {
+            default_enabled
+        }
+    };
+
+    let resolved_url = api_url
+        .unwrap_or_else(|| "https://api.contextstream.io".to_string())
+        .trim_end_matches('/')
+        .to_string();
+
+    TranscriptHookConfig {
+        api_key,
+        api_url: resolved_url,
+        workspace_id,
+        project_id,
+        save_transcript_default,
+    }
+}
+
 /// The host's own id for the conversation: Claude Code and Codex send
 /// `session_id` (or `sessionId`), Cursor `conversation_id`. This is not the id
 /// `init` returns, which is what a transcript and a resume card use.
@@ -211,9 +720,22 @@ pub fn load_config(cwd: &str) -> ApiConfig {
         }
     }
 
+    if api_key.is_empty() {
+        let fallback = load_transcript_hook_config(cwd, "", true);
+        if !fallback.api_key.is_empty() {
+            api_key = fallback.api_key;
+        }
+        if workspace_id.is_none() {
+            workspace_id = fallback.workspace_id;
+        }
+        if project_id.is_none() {
+            project_id = fallback.project_id;
+        }
+    }
+
     ApiConfig {
         api_key,
-        api_url,
+        api_url: api_url.trim_end_matches('/').to_string(),
         workspace_id,
         project_id,
     }

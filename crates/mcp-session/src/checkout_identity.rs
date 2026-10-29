@@ -1251,11 +1251,42 @@ fn select_repository_remote(
     }
 }
 
+/// Whether a remote URL points at a path on a disk rather than at a host: an
+/// absolute or relative path, `~`, a Windows drive or UNC path, or `file://`.
+/// `host:path` (scp-style) and anything with another scheme are not local.
+fn is_local_remote_url(url: &str) -> bool {
+    let url = url.trim();
+    if url.starts_with("file://") {
+        return true;
+    }
+    if url.starts_with('/')
+        || url.starts_with("./")
+        || url.starts_with("../")
+        || url.starts_with('~')
+        || url.starts_with("\\\\")
+        || url == "."
+        || url == ".."
+    {
+        return true;
+    }
+    let bytes = url.as_bytes();
+    let windows_drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\');
+    // A bare relative path such as `app.git` or `..\\x.git` has no scheme or `host:`.
+    windows_drive || (!url.contains("://") && !url.contains(':') && !url.is_empty())
+}
+
 fn normalize_remote_set(
     urls: &[String],
     config_path: &Path,
 ) -> Result<BTreeSet<RepositoryRemoteIdentity>, CheckoutIdentityError> {
     urls.iter()
+        // A remote on this machine's own disk has no host, so it cannot say
+        // which repository this is anywhere else: the checkout is treated as
+        // having no remote, as one with none at all (#314).
+        .filter(|url| !is_local_remote_url(url))
         .map(|url| {
             RepositoryRemoteIdentity::from_remote_url(url).map_err(|_| {
                 CheckoutIdentityError::InvalidGitConfig {
@@ -2256,6 +2287,62 @@ mod tests {
                 .as_str(),
             "git-remote-v1:code.example.test/Org/Feature"
         );
+    }
+
+    #[test]
+    fn a_remote_on_local_disk_counts_as_no_remote_instead_of_failing() {
+        for url in [
+            "/srv/git/app.git",
+            "file:///srv/git/app.git",
+            "../app.git",
+            "./app.git",
+            "app.git",
+            "~/mirror/app.git",
+            "C:\\mirror\\app.git",
+            "C:/mirror/app.git",
+            "\\\\server\\share\\app.git",
+        ] {
+            assert!(is_local_remote_url(url), "{url}");
+            let checkout = tempdir().expect("checkout");
+            create_git_checkout(checkout.path());
+            fs::write(
+                checkout.path().join(".git/config"),
+                // Git writes a backslash in a config value as two.
+                format!(
+                    "[remote \"origin\"]\n\turl = {}\n",
+                    url.replace("\\", "\\\\")
+                ),
+            )
+            .expect("Git config");
+            assert_eq!(
+                current_repository_remote_identity(checkout.path())
+                    .unwrap_or_else(|error| panic!("{url}: {error}")),
+                None,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn remotes_with_a_host_are_not_mistaken_for_local_ones() {
+        for url in [
+            "https://code.example.test/Org/Repo.git",
+            "git@github.com:org/repo.git",
+            "git@github.com-work:org/repo.git",
+            "ssh://git@host:2222/org/repo.git",
+            "host:path/repo.git",
+        ] {
+            assert!(!is_local_remote_url(url), "{url}");
+        }
+        // A malformed URL that is not local still fails closed.
+        let checkout = tempdir().expect("checkout");
+        create_git_checkout(checkout.path());
+        fs::write(
+            checkout.path().join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://\n",
+        )
+        .expect("Git config");
+        assert!(current_repository_remote_identity(checkout.path()).is_err());
     }
 
     #[test]

@@ -1944,7 +1944,7 @@ ContextStream is the `contextstream` MCP server. Make each call above with `call
 The `contextstream` skill in this plugin is the full reference: every tool and action, each notice, and these workflows in detail.
 "#;
 
-fn antigravity_plugin_rules() -> String {
+pub(crate) fn antigravity_plugin_rules() -> String {
     let editor = Editor::Antigravity;
     let teaching = build_harness_teaching(
         Some(editor.harness_id()),
@@ -1955,6 +1955,12 @@ fn antigravity_plugin_rules() -> String {
         "{CONTEXTSTREAM_START}\n{}\n{teaching}\n\n{ANTIGRAVITY_PLUGIN_GUIDANCE}{CONTEXTSTREAM_END}\n",
         editor.rules_heading()
     )
+}
+
+/// What `setup` writes to the plugin's `rules/AGENTS.md` in an empty folder:
+/// the block with the ownership stamp that lets later runs recognise it.
+pub(crate) fn antigravity_plugin_rules_file() -> String {
+    stamp_block_with_canonical_rules_hash(&antigravity_plugin_rules())
 }
 
 /// The plugin's `contextstream` skill, around the full rules, which Antigravity

@@ -322,6 +322,183 @@ fn remove_dir_if_empty(dir: &Path) -> Result<()> {
     }
 }
 
+/// `plugin.json` `version` in the public repository. Setup's own manifest has
+/// none (it would go stale in a person's folder); change this when the
+/// published files change in a way people should see.
+const PUBLISHED_VERSION: &str = "1.0.0";
+const PUBLISHED_LOGO: &str = "assets/logo.png";
+const API_KEY_VARIABLE: &str = "CONTEXTSTREAM_API_KEY";
+const API_KEYS_URL: &str = "https://contextstream.io/account/api-keys";
+
+fn published_manifest() -> Value {
+    let mut manifest = manifest_value();
+    if let Value::Object(map) = &mut manifest {
+        for (key, value) in [
+            (
+                "$schema",
+                json!("https://antigravity.google/schemas/v1/plugin.json"),
+            ),
+            ("displayName", json!("ContextStream")),
+            ("version", json!(PUBLISHED_VERSION)),
+            ("logo", json!(PUBLISHED_LOGO)),
+            ("license", json!("MIT")),
+            (
+                "keywords",
+                json!([
+                    "memory",
+                    "context",
+                    "code-search",
+                    "mcp",
+                    "decisions",
+                    "lessons"
+                ]),
+            ),
+            (
+                "suggestedPrompts",
+                json!([
+                    "Ground this session with ContextStream",
+                    "Search this codebase with ContextStream before grepping",
+                    "Save this decision to ContextStream memory"
+                ]),
+            ),
+        ] {
+            map.insert(key.to_string(), value);
+        }
+    }
+    manifest
+}
+
+/// The hosted server, signed in with the person's API key. The plugin stays
+/// off until they enter it, and the key lives in Antigravity, not in the file.
+fn published_mcp_config() -> Value {
+    json!({
+        "mcpServers": {
+            "contextstream": {
+                "serverUrl": "https://mcp.contextstream.io/mcp",
+                "headers": { "Authorization": "Bearer ${CONTEXTSTREAM_API_KEY}" },
+                "variables": [{
+                    "name": API_KEY_VARIABLE,
+                    "title": "ContextStream API key",
+                    "description": "Your ContextStream API key. Create one in your account under API keys.",
+                    "link": API_KEYS_URL
+                }]
+            }
+        }
+    })
+}
+
+/// Whether the plugin in the person's folder came from the public repository:
+/// its `plugin.json` names a version, which setup's own never does.
+pub(crate) fn installed_from_repository() -> bool {
+    manifest_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|manifest| manifest.get("version").is_some())
+}
+
+const PUBLISHED_README: &str = r#"# ContextStream for Antigravity
+
+Persistent memory for your Antigravity sessions: decisions, lessons, plans and
+indexed code search from [ContextStream](https://contextstream.io), through the
+hosted MCP server at `https://mcp.contextstream.io/mcp`.
+
+## Install
+
+```sh
+agy plugin install https://github.com/contextstream/antigravity-plugin
+```
+
+The plugin stays off until you give it your ContextStream API key. Open
+`/plugin` in Antigravity, turn **contextstream** on and enter the key. Create
+one at <https://contextstream.io/account/api-keys>.
+
+## What it holds
+
+| File | What it does |
+| --- | --- |
+| `rules/AGENTS.md` | Compact always-on rules: ground each request with `context`, search ContextStream before `grep_search` and `find_by_name`, and save decisions and lessons |
+| `skills/contextstream/` | The full reference, loaded only when the agent asks for it |
+| `mcp_config.json` | The hosted ContextStream server; your API key is asked for when you turn the plugin on |
+| `hooks.json` | Reminders to call `init` and `context`, and to search ContextStream first |
+
+## The hooks need `contextstream-mcp`
+
+The hooks run the local `contextstream-mcp` binary. Everything else works
+without it: with no binary on your `PATH` the hooks do nothing and print
+nothing. To add it, run `npx -y @contextstream/mcp-server setup`, which also
+signs the binary in. The hooks use a POSIX shell; on Windows run `setup`, which
+writes hooks for Windows.
+
+If you already ran `contextstream-mcp setup` for Antigravity, you have this
+plugin and don't need to install it again.
+
+## Privacy
+
+What ContextStream collects, and how to turn each part off, is in
+[docs/data-handling.md](https://github.com/contextstream/mcp-server/blob/main/docs/data-handling.md).
+Hooks and indexing send nothing until `contextstream-mcp` is set up and signed in.
+
+## Where this comes from
+
+This repository is generated from
+[contextstream/mcp-server](https://github.com/contextstream/mcp-server) by the
+same code `setup` uses to write the plugin on your machine, so the two do not
+drift. Please don't edit files here; open issues and pull requests on
+`mcp-server`.
+"#;
+
+/// The text files of the public plugin repository, as `(path, content)`.
+/// `setup` writes the same rules, skill and hooks into a person's folder;
+/// this adds the manifest's listing fields, the hosted server entry and a
+/// README. The logo (`assets/logo.png`) is copied from `assets/`.
+pub(crate) fn published_files() -> Vec<(&'static str, String)> {
+    let pretty = |value: &Value| {
+        let mut text = serde_json::to_string_pretty(value).expect("plugin JSON serializes");
+        text.push('\n');
+        text
+    };
+    let skill = super::rules::antigravity_skill_files();
+    vec![
+        ("plugin.json", pretty(&published_manifest())),
+        ("README.md", PUBLISHED_README.to_string()),
+        (
+            "rules/AGENTS.md",
+            super::rules::antigravity_plugin_rules_file(),
+        ),
+        ("skills/contextstream/SKILL.md", skill.skill),
+        (
+            "skills/contextstream/references/reference.md",
+            skill.reference,
+        ),
+        (
+            "hooks.json",
+            pretty(&super::hooks::antigravity_published_hooks()),
+        ),
+        ("mcp_config.json", pretty(&published_mcp_config())),
+    ]
+}
+
+/// `export-antigravity-plugin`: print the published files as JSON, or write them
+/// under `out`.
+pub(crate) fn export(out: Option<&Path>, as_json: bool) -> Result<()> {
+    let files = published_files();
+    if as_json {
+        let map: std::collections::BTreeMap<_, _> = files.into_iter().collect();
+        println!("{}", serde_json::to_string_pretty(&map)?);
+        return Ok(());
+    }
+    let out = out.ok_or_else(|| anyhow::anyhow!("Give --out DIR, or --json to print them."))?;
+    for (relative, content) in &files {
+        let path = out.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, content)?;
+    }
+    println!("Wrote {} files to {}", files.len(), out.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,5 +684,125 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
         assert!(!remove_if_unused().unwrap());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn the_published_manifest_keeps_to_antigravitys_schema() {
+        // `additionalProperties: false` in antigravity.google/schemas/v1/plugin.json.
+        const ALLOWED: [&str; 19] = [
+            "$schema",
+            "name",
+            "displayName",
+            "display_name",
+            "description",
+            "version",
+            "disabled",
+            "logo",
+            "suggestedPrompts",
+            "suggested_prompts",
+            "skills",
+            "author",
+            "homepage",
+            "repository",
+            "license",
+            "keywords",
+            "extensions",
+            "source",
+            "sourcePath",
+        ];
+        let manifest = published_manifest();
+        for key in manifest.as_object().unwrap().keys() {
+            assert!(
+                ALLOWED.contains(&key.as_str()),
+                "{key} is not in the schema"
+            );
+        }
+        assert_eq!(manifest["name"], PLUGIN_NAME);
+        assert!(manifest["suggestedPrompts"].as_array().unwrap().len() <= 3);
+        // Everything setup writes to its own manifest is in the published one.
+        for (key, value) in manifest_value().as_object().unwrap() {
+            assert_eq!(manifest.get(key), Some(value), "{key}");
+        }
+        assert!(manifest_is_ours(
+            &serde_json::to_string(&manifest_value()).unwrap()
+        ));
+    }
+
+    #[test]
+    fn the_published_files_carry_the_same_rules_skill_and_hooks_setup_writes() {
+        let files: std::collections::BTreeMap<_, _> = published_files().into_iter().collect();
+        assert_eq!(
+            files.keys().copied().collect::<Vec<_>>(),
+            [
+                "README.md",
+                "hooks.json",
+                "mcp_config.json",
+                "plugin.json",
+                "rules/AGENTS.md",
+                "skills/contextstream/SKILL.md",
+                "skills/contextstream/references/reference.md",
+            ]
+        );
+        for text in files.values() {
+            assert!(text.ends_with('\n'));
+        }
+    }
+
+    #[test]
+    fn the_published_rules_and_skill_are_what_setup_writes() {
+        let (_guard, _home) = temp_home();
+        super::super::rules::write_editor_rules(&super::super::editors::Editor::Antigravity)
+            .expect("write the plugin's rules");
+        let files: std::collections::BTreeMap<_, _> = published_files().into_iter().collect();
+        let read = |path: Option<PathBuf>| std::fs::read_to_string(path.unwrap()).unwrap();
+        let rules = plugin_dir().unwrap().join("rules").join("AGENTS.md");
+        assert_eq!(files["rules/AGENTS.md"], read(Some(rules)));
+        assert_eq!(files["skills/contextstream/SKILL.md"], read(skill_path()));
+        assert_eq!(
+            files["skills/contextstream/references/reference.md"],
+            read(reference_path())
+        );
+    }
+
+    #[test]
+    fn setup_recognises_the_published_hooks_as_its_own() {
+        let hooks = super::super::hooks::antigravity_published_hooks();
+        assert_eq!(
+            super::super::hooks::validate_published_antigravity_hooks(&hooks),
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn the_published_hooks_name_the_binary_and_degrade_quietly() {
+        let hooks = super::super::hooks::antigravity_published_hooks();
+        let text = hooks.to_string();
+        // The same events and handlers setup installs, by name from the PATH.
+        for hook in [
+            "agy-session-start",
+            "agy-pre-invocation",
+            "agy-post-tool-use",
+        ] {
+            assert!(
+                text.contains(&format!("contextstream-mcp hook {hook} ")),
+                "{hook}: {text}"
+            );
+        }
+        let commands = text.matches("2>/dev/null || echo '{}'").count();
+        assert_eq!(commands, 3, "{text}");
+        assert!(hooks["contextstream"]["PostToolUse"][0]["matcher"] == "*");
+    }
+
+    #[test]
+    fn the_published_server_entry_holds_no_key() {
+        let config = published_mcp_config();
+        let server = &config["mcpServers"]["contextstream"];
+        assert_eq!(server["serverUrl"], "https://mcp.contextstream.io/mcp");
+        assert_eq!(
+            server["headers"]["Authorization"],
+            format!("Bearer ${{{API_KEY_VARIABLE}}}")
+        );
+        assert_eq!(server["variables"][0]["name"], API_KEY_VARIABLE);
+        assert!(!config.to_string().contains("cs_"));
     }
 }

@@ -63,6 +63,14 @@ fn normalize_input_shape(tool: &str, schema: &Value, input: &mut Value) -> Vec<S
     crate::input_shape::schema_type_mismatches(schema, input)
 }
 
+/// A negative `limit` (or other count) is refused before any request is sent.
+fn refuse_negative_counts(tool: &str, input: &Value) -> Result<()> {
+    match crate::input_shape::negative_count_argument(input) {
+        Some(message) => Err(Error::Validation(format!("{tool}: {message}"))),
+        None => Ok(()),
+    }
+}
+
 /// A handler's argument-parsing error, made actionable: the tool, the fields
 /// whose type still differs from the schema, and what to send instead.
 fn explain_input_error(
@@ -863,6 +871,7 @@ impl ToolRegistry {
             return Ok(result);
         }
         let mismatches = normalize_input_shape(name, &tool.input_schema, &mut input);
+        refuse_negative_counts(name, &input)?;
         ignore_placeholder_scope_ids(name, &mut input);
 
         // Attribute downstream server-side compliance events to the agent's
@@ -1214,6 +1223,7 @@ impl ToolRegistry {
             return Ok(result);
         }
         let mismatches = normalize_input_shape(name, &operation.input_schema, &mut input);
+        refuse_negative_counts(name, &input)?;
         ignore_placeholder_scope_ids(name, &mut input);
 
         let observation =

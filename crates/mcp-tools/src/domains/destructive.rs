@@ -234,12 +234,20 @@ pub fn split_listing(tool: &str, schema: &mut Value, annotations: &mut ToolAnnot
 /// The refusal for a call that names a moved action on its old tool: it
 /// cannot be undone, so it runs only through [`DELETE_TOOL`] (#334).
 pub fn moved_refusal(tool: &str, input: &Value) -> Option<String> {
-    let action = input.get("action").and_then(Value::as_str)?;
-    separated(tool, action)?;
+    // The handlers dispatch on the action trimmed and lower-cased, so the
+    // refusal must compare the same spelling: `DELETE` deleted (#334 retest).
+    let action = normalized_action(input.get("action").and_then(Value::as_str)?);
+    separated(tool, &action)?;
     Some(format!(
         "{tool}(action=\"{action}\") cannot be undone, so it runs only through the `{DELETE_TOOL}` tool: \
          call {DELETE_TOOL} with action=\"{tool}.{action}\" and the same ids, after confirming with the person."
     ))
+}
+
+/// An action as the tools dispatch on it: trimmed and lower-cased (some
+/// lower-case ASCII only, some all of Unicode; this covers both).
+fn normalized_action(action: &str) -> String {
+    action.trim().to_lowercase()
 }
 
 /// The call to retry `action` of `tool` with: through [`DELETE_TOOL`] when the
@@ -345,11 +353,8 @@ struct DeleteTool {
 #[async_trait]
 impl ToolHandler for DeleteTool {
     async fn execute(&self, mut input: Value) -> Result<ToolResult> {
-        let requested = input
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let requested =
+            normalized_action(input.get("action").and_then(Value::as_str).unwrap_or(""));
         let Some((moved, handler)) = self
             .actions
             .iter()
@@ -497,6 +502,26 @@ mod tests {
             refused.to_string().contains("workspace.delete"),
             "{refused}"
         );
+    }
+
+    #[test]
+    fn an_old_action_name_is_refused_however_it_is_spelled() {
+        // #334 retest: the handlers lower-case the action, so `DELETE`
+        // deleted while `delete` was refused.
+        for spelling in ["DELETE", "Delete", "dElEtE", " delete "] {
+            assert!(
+                moved_refusal("project", &json!({"action": spelling})).is_some(),
+                "{spelling:?}"
+            );
+        }
+        for spelling in ["DELETE_DOC", "Delete_Doc"] {
+            assert!(
+                moved_refusal("memory", &json!({"action": spelling})).is_some(),
+                "{spelling}"
+            );
+        }
+        // The Kelvin sign lower-cases to `k` for the handlers that use Unicode.
+        assert!(moved_refusal("capsule", &json!({"action": "revo\u{212A}e_share"})).is_some());
     }
 
     #[test]

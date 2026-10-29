@@ -288,7 +288,11 @@ pub async fn audit_folders(
             let unchanged = previous
                 .as_ref()
                 .is_some_and(|current| current.project_id == target.project_id && current.verified);
-            if !unchanged {
+            if unchanged {
+                if explicit == Some(target.project_id) {
+                    outcome.assessment.status = LinkStatus::Correct;
+                }
+            } else {
                 match relink(&facts.root, &target).await {
                     Ok(()) => {
                         record_audit(AuditEntry {
@@ -305,6 +309,19 @@ pub async fn audit_folders(
                             project_id: target.project_id.to_string(),
                             workspace_id: target.workspace_id.to_string(),
                             reason: status_reason(&outcome.assessment.status),
+                        });
+                        outcome.assessment.current = Some(mcp_session::project_link::CurrentLink {
+                            workspace_id: Some(target.workspace_id),
+                            project_id: target.project_id,
+                            verified: true,
+                            source: "checkout_config",
+                        });
+                        outcome.assessment.status = LinkStatus::Correct;
+                        outcome.linked_project = Some(LinkedProjectSummary {
+                            project_id: target.project_id,
+                            project_name: target.project_name.clone(),
+                            workspace_id: target.workspace_id,
+                            workspace_name: target.workspace_name.clone(),
                         });
                         outcome.relinked_to = Some(target);
                     }
@@ -480,11 +497,27 @@ fn describe_status(status: &LinkStatus) -> (&'static str, String) {
 
 fn format_outcome_lines(outcome: &LinkOutcome) -> Vec<String> {
     let assessment = &outcome.assessment;
-    let (level, detail) = describe_status(&assessment.status);
-    let mark = match level {
-        "ok" => "✓",
-        "warn" => "!",
-        _ => "✗",
+    let (level, base_detail) = describe_status(&assessment.status);
+    let (mark, detail) = if outcome.error.is_some() {
+        let status_text = if assessment.current.is_some() {
+            if matches!(assessment.status, LinkStatus::Correct) {
+                "re-link failed; existing link left unchanged".to_string()
+            } else {
+                format!("re-link failed; existing link left unchanged ({base_detail})")
+            }
+        } else {
+            "link failed; not linked".to_string()
+        };
+        ("✗", status_text)
+    } else if outcome.relinked_to.is_some() {
+        ("✓", "linked correctly".to_string())
+    } else {
+        let mark = match level {
+            "ok" => "✓",
+            "warn" => "!",
+            _ => "✗",
+        };
+        (mark, base_detail)
     };
     let mut lines = vec![format!("{mark} {}", assessment.root.display())];
     if let Some(repository) = &assessment.repository {
@@ -496,11 +529,16 @@ fn format_outcome_lines(outcome: &LinkOutcome) -> Vec<String> {
             "    project     {} in {} ({})",
             linked.project_name, linked.workspace_name, linked.project_id
         ));
+    } else if let Some(target) = &outcome.relinked_to {
+        lines.push(format!(
+            "    project     {} in {} ({})",
+            target.project_name, target.workspace_name, target.project_id
+        ));
     }
     if outcome.pinned {
         lines.push("    pinned      the background audit leaves this folder alone".to_string());
     }
-    if !matches!(assessment.status, LinkStatus::Correct) {
+    if outcome.relinked_to.is_none() && !matches!(assessment.status, LinkStatus::Correct) {
         match &assessment.verdict {
             Verdict::Confident { best } => lines.push(format!(
                 "    best match  {} in {} (score {}: {})",
@@ -523,7 +561,7 @@ fn format_outcome_lines(outcome: &LinkOutcome) -> Vec<String> {
                     ));
                 }
             }
-            Verdict::NoMatch => {
+            Verdict::NoMatch if outcome.error.is_none() => {
                 if matches!(assessment.status, LinkStatus::Unverified) {
                     if let Some(linked) = &outcome.linked_project {
                         lines.push(format!(
@@ -539,6 +577,7 @@ fn format_outcome_lines(outcome: &LinkOutcome) -> Vec<String> {
                     lines.push("    best match  none; link it with --project-id <id>".to_string());
                 }
             }
+            Verdict::NoMatch => {}
         }
     }
     if let Some(target) = &outcome.relinked_to {
@@ -586,6 +625,9 @@ pub async fn run(command: LinkCommand) -> Result<bool> {
 
     if command.pin {
         for outcome in &mut outcomes {
+            if outcome.error.is_some() {
+                continue;
+            }
             let project = outcome
                 .relinked_to
                 .as_ref()
@@ -637,7 +679,9 @@ pub async fn run(command: LinkCommand) -> Result<bool> {
         let _ = crate::watch::request_sync_bridge_reload();
     }
     Ok(outcomes.iter().all(|outcome| {
-        outcome.relinked_to.is_some() || matches!(outcome.assessment.status, LinkStatus::Correct)
+        outcome.error.is_none()
+            && (outcome.relinked_to.is_some()
+                || matches!(outcome.assessment.status, LinkStatus::Correct))
     }))
 }
 
@@ -750,6 +794,139 @@ mod tests {
         assert!(
             unlinked_rendered.contains("best match  none; link it with --project-id <id>"),
             "{unlinked_rendered}"
+        );
+    }
+
+    #[test]
+    fn failed_relink_and_successful_relink_render_post_operation_state_accurately() {
+        let project_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let workspace_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+
+        let failed_on_linked = LinkOutcome {
+            assessment: LinkAssessment {
+                root: PathBuf::from("/tmp/acme-service"),
+                repository: None,
+                current: Some(mcp_session::project_link::CurrentLink {
+                    workspace_id: Some(workspace_id),
+                    project_id,
+                    verified: true,
+                    source: "checkout_config",
+                }),
+                status: LinkStatus::Correct,
+                verdict: Verdict::NoMatch,
+                ranked: Vec::new(),
+            },
+            linked_project: Some(LinkedProjectSummary {
+                project_id,
+                project_name: "acme-service".to_string(),
+                workspace_id,
+                workspace_name: "Testing".to_string(),
+            }),
+            pinned: false,
+            relinked_to: None,
+            error: Some("that project is not in any workspace this account can open".to_string()),
+        };
+        let rendered_failed = format_outcome_lines(&failed_on_linked).join("\n");
+        assert!(
+            rendered_failed.starts_with("✗ /tmp/acme-service"),
+            "{rendered_failed}"
+        );
+        assert!(
+            rendered_failed.contains("status      re-link failed; existing link left unchanged"),
+            "{rendered_failed}"
+        );
+        assert!(
+            !rendered_failed.contains("status      linked correctly"),
+            "{rendered_failed}"
+        );
+        assert!(
+            rendered_failed
+                .contains("error       that project is not in any workspace this account can open"),
+            "{rendered_failed}"
+        );
+
+        let failed_on_unlinked = LinkOutcome {
+            assessment: LinkAssessment {
+                root: PathBuf::from("/tmp/unlinked-dir"),
+                repository: None,
+                current: None,
+                status: LinkStatus::Unlinked,
+                verdict: Verdict::NoMatch,
+                ranked: Vec::new(),
+            },
+            linked_project: None,
+            pinned: false,
+            relinked_to: None,
+            error: Some("that project is not in any workspace this account can open".to_string()),
+        };
+        let rendered_unlinked_err = format_outcome_lines(&failed_on_unlinked).join("\n");
+        assert!(
+            rendered_unlinked_err.starts_with("✗ /tmp/unlinked-dir"),
+            "{rendered_unlinked_err}"
+        );
+        assert!(
+            rendered_unlinked_err.contains("status      link failed; not linked"),
+            "{rendered_unlinked_err}"
+        );
+
+        let target = ScoredProject {
+            project_id,
+            project_name: "acme-service".to_string(),
+            workspace_id,
+            workspace_name: "Testing".to_string(),
+            score: 105,
+            reasons: vec!["tracks the same Git repository".to_string()],
+            strong_evidence: true,
+            isolated_workspace: false,
+        };
+        let relinked = LinkOutcome {
+            assessment: LinkAssessment {
+                root: PathBuf::from("/tmp/clone2"),
+                repository: Some("https://github.com/example-org/acme-service".to_string()),
+                current: Some(mcp_session::project_link::CurrentLink {
+                    workspace_id: Some(workspace_id),
+                    project_id,
+                    verified: true,
+                    source: "checkout_config",
+                }),
+                status: LinkStatus::Correct,
+                verdict: Verdict::Confident {
+                    best: target.clone(),
+                },
+                ranked: vec![target.clone()],
+            },
+            linked_project: Some(LinkedProjectSummary {
+                project_id,
+                project_name: "acme-service".to_string(),
+                workspace_id,
+                workspace_name: "Testing".to_string(),
+            }),
+            pinned: false,
+            relinked_to: Some(target),
+            error: None,
+        };
+        let rendered_relinked = format_outcome_lines(&relinked).join("\n");
+        assert!(
+            rendered_relinked.starts_with("✓ /tmp/clone2"),
+            "{rendered_relinked}"
+        );
+        assert!(
+            rendered_relinked.contains("status      linked correctly"),
+            "{rendered_relinked}"
+        );
+        assert!(
+            rendered_relinked.contains(
+                "re-linked   acme-service in Testing (11111111-1111-4111-8111-111111111111)"
+            ),
+            "{rendered_relinked}"
+        );
+        assert!(
+            !rendered_relinked.contains("not linked"),
+            "{rendered_relinked}"
+        );
+        assert!(
+            !rendered_relinked.contains("best match"),
+            "{rendered_relinked}"
         );
     }
 }

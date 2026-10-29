@@ -8327,6 +8327,50 @@ mod scope_widening_tests {
         assert!(!text.contains("Rephrase"), "{text}");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_checked_keyword_absence_is_one_short_answer() {
+        // #283: no caveat that contradicts the [LITERAL] line, no advice to
+        // run the full scan that was just run, no internal notes.
+        let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+        let server = RoutedServer::spawn(Box::new(move |line, _| {
+            if line.contains("/search/") {
+                return (200, json!({"results":[],"total":0,"project_index_state":"ready",
+                    "literal_match":{"complete":true,"found":false,"statement":"Every committed indexed file was checked. No indexed file contains this text."}
+                }).to_string());
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            (404, json!({"error":"not found"}).to_string())
+        }));
+        let (tool, session) = gateway_tool(&server.base_url);
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        let result = tool
+            .execute(json!({"query":"zzzqqq_nonexistent_token_12345","mode":"keyword"}))
+            .await
+            .unwrap();
+        let text = text_of(&result);
+        assert!(
+            text.contains("[LITERAL] Every committed indexed file was checked"),
+            "{text}"
+        );
+        assert!(
+            text.contains("No match for \"zzzqqq_nonexistent_token_12345\" (keyword search"),
+            "{text}"
+        );
+        for absent in [
+            "relevance threshold",
+            "mode=\"exhaustive\"",
+            "Bounded identifier lookup",
+            "activity-path",
+            "bounded search advisory",
+        ] {
+            assert!(!text.contains(absent), "{absent}: {text}");
+        }
+    }
+
     /// Routes for a workspace where project P exists but its project-scoped
     /// search fails transiently (404), while a workspace-wide search would
     /// return project Q's file `f`.

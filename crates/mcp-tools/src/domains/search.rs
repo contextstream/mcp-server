@@ -3819,6 +3819,34 @@ fn server_literal_page(result: &SearchResponse, executed_mode: SearchMode) -> bo
     matches!(executed_mode, SearchMode::Exhaustive) && result.literal_match.is_some()
 }
 
+/// The keyword path's caveat for an identifier lookup that may not have
+/// read every file. A completed literal check makes it false, so it is then
+/// left out.
+const BOUNDED_IDENTIFIER_NOTE: &str =
+    "Bounded identifier lookup; use exhaustive for complete coverage.";
+
+/// Whether the server's literal check read every indexed file.
+fn literal_check_complete(result: &SearchResponse) -> bool {
+    result
+        .literal_match
+        .as_ref()
+        .and_then(|summary| summary.get("complete"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+/// Whether the server's literal check read every indexed file and found the
+/// text in none of them: an answer, not a weak ranking.
+fn literal_check_found_nothing(result: &SearchResponse) -> bool {
+    literal_check_complete(result)
+        && result
+            .literal_match
+            .as_ref()
+            .and_then(|summary| summary.get("found"))
+            .and_then(Value::as_bool)
+            == Some(false)
+}
+
 /// What an empty exhaustive page says after its `[LITERAL]` line, in place of
 /// the ranking-miss advice ("did not meet the relevance threshold, rephrase"):
 /// the page is a grep over the indexed commit, so an empty one is an answer,
@@ -9022,7 +9050,7 @@ async fn run_search_for_mode(
             let note = if quoted_keyword_literal.is_some() {
                 Some("Normalized surrounding quotes before exact keyword search.".to_string())
             } else if bounded_identifier_keyword_path {
-                Some("Bounded identifier lookup; use exhaustive for complete coverage.".to_string())
+                Some(BOUNDED_IDENTIFIER_NOTE.to_string())
             } else {
                 None
             };
@@ -11780,13 +11808,12 @@ impl SearchTool {
         let sync_drift_note = if active_index_repair.reason.as_deref() == Some("drift") {
             if active_index_repair.complete {
                 Some(format!(
-                    "Detected {} locally changed file(s); committed {} repaired file(s) before searching, so this search includes the completed delta.",
-                    active_index_repair.changed_file_count,
-                    active_index_repair.files_indexed.unwrap_or(0)
+                    "{} locally changed file(s) were indexed before this search, so it includes them.",
+                    active_index_repair.changed_file_count
                 ))
             } else {
                 Some(format!(
-                    "Detected {} locally changed file(s); the bounded repair is queued or still indexing, so current search results may briefly lag those edits.",
+                    "{} file(s) changed locally and may not be indexed yet; results can lag those edits for a moment.",
                     active_index_repair.changed_file_count
                 ))
             }
@@ -11862,16 +11889,6 @@ impl SearchTool {
             candidate_project_ids.push(None);
         }
 
-        let hot_paths_hint_note = hot_paths_hint.as_ref().map(|hint| {
-            format!(
-                "Current editor activity supplied as a bounded search advisory ({} paths).",
-                hint.entries.len()
-            )
-        });
-        let hot_path_guardrail_note = hot_paths_hint.as_ref().map(|_| {
-            "Search relevance remains authoritative; activity-path context cannot manufacture a match."
-                .to_string()
-        });
         let base_params = SearchParams {
             query: input.query.clone(),
             cursor: input.cursor.clone(),
@@ -12122,13 +12139,16 @@ impl SearchTool {
         } else {
             true
         };
+        // Whether this checkout has changes the index may not hold; only then
+        // can an unconfirmed checkout overlay change the answer.
+        let local_changes_detected = sync_drift_note.is_some();
         if let Some(note) = sync_drift_note {
             mode_fallback_note = append_note(mode_fallback_note, &note);
         }
-        if !checkout_scope_confirmed {
+        if !checkout_scope_confirmed && local_changes_detected {
             mode_fallback_note = append_note(
                 mode_fallback_note,
-                "Hosted search served canonical project results, but the service did not confirm the active checkout overlay; do not infer that uncommitted worktree changes are present from project-wide index state alone.",
+                "The service did not confirm it searched this checkout's uncommitted changes; these results come from the committed index.",
             );
         }
 
@@ -13219,6 +13239,13 @@ impl SearchTool {
             text.push('\n');
         }
 
+        let mode_fallback_note = if literal_check_complete(&result) {
+            mode_fallback_note
+                .map(|note| note.replace(BOUNDED_IDENTIFIER_NOTE, "").trim().to_string())
+                .filter(|note| !note.is_empty())
+        } else {
+            mode_fallback_note
+        };
         if mode_auto_selected && !concise_text {
             text.push_str(&format!(
                 "Mode auto-selected: `{}`. {}\n",
@@ -13233,16 +13260,6 @@ impl SearchTool {
         }
         if let Some(note) = local_enrichment_warning.as_deref() {
             text.push_str(&format!("{}\n", note));
-        }
-        if let Some(note) = hot_paths_hint_note.as_deref() {
-            if !concise_text || no_hits {
-                text.push_str(&format!("{}\n", note));
-            }
-        }
-        if let Some(note) = hot_path_guardrail_note.as_deref() {
-            if !concise_text || no_hits {
-                text.push_str(&format!("{}\n", note));
-            }
         }
         if let Some(route) = project_map_route.as_ref() {
             text.push_str(&format_project_map_route_hint(route));
@@ -13374,36 +13391,49 @@ impl SearchTool {
                     .map(|ms| format!(" in {}ms", ms))
                     .unwrap_or_default();
 
-                text.push_str(&format!(
+                if literal_check_found_nothing(&result) {
+                    // The [LITERAL] line above says every file was read.
+                    text.push_str(&format!(
+                        "No match for \"{}\" ({} search{}).\n",
+                        input.query, mode_str, timing
+                    ));
+                    if matches!(executed_mode, SearchMode::Keyword | SearchMode::Pattern) {
+                        text.push_str("If you don't know the exact text, mode=\"semantic\" finds conceptual matches.\n");
+                    }
+                } else {
+                    text.push_str(&format!(
                     "Indexed codebase searched{}. Matches did not meet the relevance threshold for \"{}\" ({} search). Narrow or adjust your query:\n\n",
                     timing, input.query, mode_str
                 ));
 
-                // Suggest alternative modes the AI hasn't tried yet
-                match executed_mode {
-                    SearchMode::Keyword | SearchMode::Pattern => {
-                        text.push_str("  - mode=\"semantic\" — conceptual match, useful when exact text isn't known\n");
+                    // Suggest alternative modes the AI hasn't tried yet
+                    match executed_mode {
+                        SearchMode::Keyword | SearchMode::Pattern => {
+                            text.push_str("  - mode=\"semantic\" — conceptual match, useful when exact text isn't known\n");
+                        }
+                        SearchMode::Semantic => {
+                            text.push_str("  - mode=\"keyword\" — exact text match for specific identifiers or strings\n");
+                        }
+                        SearchMode::Hybrid => {
+                            text.push_str(
+                                "  - mode=\"keyword\" — strict text match for exact identifiers\n",
+                            );
+                            text.push_str("  - mode=\"semantic\" — broader conceptual search\n");
+                        }
+                        _ => {}
                     }
-                    SearchMode::Semantic => {
-                        text.push_str("  - mode=\"keyword\" — exact text match for specific identifiers or strings\n");
-                    }
-                    SearchMode::Hybrid => {
+                    if executed_mode != SearchMode::Exhaustive {
                         text.push_str(
-                            "  - mode=\"keyword\" — strict text match for exact identifiers\n",
+                            "  - mode=\"exhaustive\" — full scan across all indexed files\n",
                         );
-                        text.push_str("  - mode=\"semantic\" — broader conceptual search\n");
                     }
-                    _ => {}
-                }
-                if executed_mode != SearchMode::Exhaustive {
-                    text.push_str("  - mode=\"exhaustive\" — full scan across all indexed files\n");
-                }
-                text.push_str("  - Rephrase with different terms or fewer words\n");
+                    text.push_str("  - Rephrase with different terms or fewer words\n");
 
-                if is_doc_lookup_query(&input.query) {
-                    text.push_str(
+                    if is_doc_lookup_query(&input.query) {
+                        text.push_str(
                         "\nThis looks like a docs query. Try memory(action=\"list_docs\") then memory(action=\"get_doc\", doc_id=\"...\").\n",
                     );
+                    }
                 }
             }
         } else {

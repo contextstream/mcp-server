@@ -2285,8 +2285,16 @@ pub fn replace_contextstream_block(existing: &str, new_block: &str) -> Result<St
         return Ok(format!("{}{}{}", before, replacement, after));
     }
 
-    // Prepend to existing content
-    Ok(format!("{}\n\n{}", new_block, existing))
+    // The person's own text comes first: their instructions are read before
+    // the managed block (clients that cap how much of the file they read, such
+    // as Codex's 32 KiB for AGENTS.md, would otherwise cut their text and not
+    // ours), and their tracked file is changed at the end, not the top (#323).
+    let separator = if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    Ok(format!("{}{}{}", existing, separator, new_block))
 }
 
 /// Remove the shared `.contextstream/rules.md` that Aider and Gemini point at,
@@ -2948,11 +2956,41 @@ mod tests {
             "# Team notes\n\n# ContextStream API troubleshooting\nNever delete this runbook.\n";
         let result =
             replace_contextstream_block(existing, "<contextstream>\nmanaged\n</contextstream>")
-                .expect("prepend managed block");
+                .expect("append managed block");
 
         assert!(result.contains("# ContextStream API troubleshooting"));
         assert!(result.contains("Never delete this runbook."));
-        assert!(result.starts_with("<contextstream>"));
+        // The person's text stays first (#323).
+        assert!(result.starts_with(existing));
+        assert!(result.ends_with("<contextstream>\nmanaged\n</contextstream>"));
+    }
+
+    #[test]
+    fn the_block_goes_after_a_persons_existing_rules_and_uninstall_restores_them() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        let agents = project.join("AGENTS.md");
+        for original in [
+            "# Team notes\nAlways run the unit tests before pushing.\n",
+            "# No trailing newline\nKeep commits small.",
+        ] {
+            std::fs::write(&agents, original).unwrap();
+            let _ = std::fs::remove_file(safe_edit::backup_path(&agents).unwrap());
+
+            write_project_rules(&Editor::Codex, project, Some("ws"), Some("W"), Some("p"))
+                .expect("write rules");
+            let written = std::fs::read_to_string(&agents).unwrap();
+            assert!(written.starts_with(original), "{written:.200}");
+            let block_at = written.find(CONTEXTSTREAM_START).expect("block");
+            assert!(block_at >= original.len());
+            // A second write replaces the block in place and moves nothing.
+            write_project_rules(&Editor::Codex, project, Some("ws"), Some("W"), Some("p"))
+                .expect("rewrite rules");
+            assert_eq!(std::fs::read_to_string(&agents).unwrap(), written);
+
+            remove_contextstream_from_rules(&Editor::Codex, Some(project)).expect("remove");
+            assert_eq!(std::fs::read_to_string(&agents).unwrap(), original);
+        }
     }
 
     #[test]

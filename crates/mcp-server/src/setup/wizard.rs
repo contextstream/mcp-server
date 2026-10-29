@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mcp_client::ContextStreamClient;
 
 use super::ui::{self, ui, Mark};
@@ -570,16 +570,36 @@ fn initial_editors(
     detected: &[editors::Editor],
 ) -> Result<Vec<editors::Editor>> {
     if let Some(requested) = only {
+        let deduped = super::dedupe_editors(requested.iter().copied());
         ui::say(
             Mark::Ok,
             "Editors",
             Some(&format!(
                 "{} · from --editors",
-                super::selected_editors_summary(requested)
+                super::selected_editors_summary(&deduped)
             )),
         );
-        super::warn_deprecated_editors(requested);
-        return Ok(requested.to_vec());
+        super::warn_deprecated_editors(&deduped);
+        return Ok(deduped);
+    }
+    let selection = mcp_client::activation::configured_client_selection()
+        .context("Could not read the saved editor selection")?;
+    let configured = super::dedupe_editors(
+        selection
+            .clients
+            .iter()
+            .filter_map(|id| editors::Editor::from_id(id)),
+    );
+    if !configured.is_empty() {
+        ui::say(
+            Mark::Ok,
+            "Editors",
+            Some(&format!(
+                "{} · configured by setup",
+                super::selected_editors_summary(&configured)
+            )),
+        );
+        return Ok(configured);
     }
     if detected.is_empty() {
         ui::say(

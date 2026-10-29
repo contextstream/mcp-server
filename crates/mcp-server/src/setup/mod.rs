@@ -657,6 +657,51 @@ fn resolve_hook_refresh_editors(
     ))
 }
 
+/// Resolve which editors `setup` should configure when `--editors` is omitted.
+///
+/// An explicit `--editors` list always wins (`"requested"`). Otherwise, a
+/// non-empty selection previously saved in `installation.json` is preserved
+/// (`"configured by setup"`) so re-running `setup` never silently drops
+/// configured harnesses that lack fresh filesystem auto-detection markers or
+/// enrolls editors the user previously opted out of. Fresh installs (and global
+/// uninstalls that cleared `configured_clients`) fall back to auto-detection.
+pub(super) fn resolve_setup_editors(
+    explicit: Option<&[editors::Editor]>,
+) -> Result<(Vec<editors::Editor>, &'static str)> {
+    if let Some(requested) = explicit {
+        warn_deprecated_editors(requested);
+        return Ok((dedupe_editors(requested.iter().copied()), "requested"));
+    }
+    let selection = mcp_client::activation::configured_client_selection()
+        .context("Could not read the saved editor selection")?;
+    Ok(resolve_setup_editors_from(
+        explicit,
+        &selection.clients,
+        editors::detect_installed_editors_for_setup,
+    ))
+}
+
+fn resolve_setup_editors_from(
+    explicit: Option<&[editors::Editor]>,
+    configured_ids: &[String],
+    detect: impl FnOnce() -> Vec<editors::Editor>,
+) -> (Vec<editors::Editor>, &'static str) {
+    if let Some(requested) = explicit {
+        return (dedupe_editors(requested.iter().copied()), "requested");
+    }
+
+    let configured = dedupe_editors(
+        configured_ids
+            .iter()
+            .filter_map(|id| editors::Editor::from_id(id)),
+    );
+    if !configured.is_empty() {
+        return (configured, "configured by setup");
+    }
+
+    (dedupe_editors(detect()), "detected")
+}
+
 /// Pure core of [`resolve_hook_refresh_editors`], with the machine-state reads
 /// injected so the precedence rules are testable.
 fn resolve_hook_refresh_editors_from(
@@ -2551,15 +2596,9 @@ async fn run_setup_noninteractive(
         .summary_hint()
     };
 
-    // An explicit --editors list wins; otherwise fall back to detection, which
-    // is the documented behaviour of `setup --yes`.
-    let editors_to_configure = match only {
-        Some(list) => {
-            warn_deprecated_editors(list);
-            list.to_vec()
-        }
-        None => editors::detect_installed_editors_for_setup(),
-    };
+    // An explicit --editors list wins; otherwise preserve any previously saved
+    // setup selection before falling back to filesystem detection.
+    let (editors_to_configure, editor_provenance) = resolve_setup_editors(only)?;
     let cwd = std::env::current_dir()?;
     let project_path = resolve_setup_project_path(&cwd, explicit_project_path, account_only)?;
 
@@ -2601,11 +2640,7 @@ async fn run_setup_noninteractive(
         Some(&format!(
             "{} · {}",
             selected_editors_summary(&editors_to_configure),
-            if only.is_some() {
-                "requested"
-            } else {
-                "detected"
-            }
+            editor_provenance
         )),
     );
 
@@ -5155,13 +5190,14 @@ mod tests {
         parse_setup_ingest_job_progress, parse_setup_transport_preference,
         project_workspace_is_verified, read_setup_transport_marker,
         read_setup_transport_marker_result, require_project_workspace_ownership,
-        resolve_hook_refresh_editors, resolve_hook_refresh_editors_from,
-        resolve_setup_project_path, sanitize_index_error, select_project_for_current_directory,
-        setup_completion_evidence, setup_index_choices, setup_path_has_project_content_files,
-        setup_path_is_project_candidate, setup_teaching_contracts, setup_transport_marker_path,
-        targets_need_hosted_sync_bridge, targets_need_managed_helper, validate_editor_scope,
-        write_setup_transport_marker, SetupCompletionState, SetupTransportPreference,
-        WorkspaceInfo, WorkspaceOwnershipEvidence, ENV_ALLOW_LOCAL_MCP,
+        resolve_hook_refresh_editors, resolve_hook_refresh_editors_from, resolve_setup_editors,
+        resolve_setup_editors_from, resolve_setup_project_path, sanitize_index_error,
+        select_project_for_current_directory, setup_completion_evidence, setup_index_choices,
+        setup_path_has_project_content_files, setup_path_is_project_candidate,
+        setup_teaching_contracts, setup_transport_marker_path, targets_need_hosted_sync_bridge,
+        targets_need_managed_helper, validate_editor_scope, write_setup_transport_marker,
+        SetupCompletionState, SetupTransportPreference, WorkspaceInfo, WorkspaceOwnershipEvidence,
+        ENV_ALLOW_LOCAL_MCP,
     };
     use crate::setup::editors::Editor;
     use std::path::Path;
@@ -5585,6 +5621,52 @@ mod tests {
             resolve_hook_refresh_editors_from(None, true, &ids(&["not-an-editor"]), true, Vec::new);
 
         assert!(editors.is_empty());
+    }
+
+    #[test]
+    fn setup_reuses_saved_configured_clients_when_editors_flag_is_omitted() {
+        let (editors, provenance) =
+            resolve_setup_editors_from(None, &ids(&["claude", "codex"]), || {
+                panic!("detection must not drop previously configured editors")
+            });
+
+        assert_eq!(editors, vec![Editor::ClaudeCode, Editor::Codex]);
+        assert_eq!(provenance, "configured by setup");
+    }
+
+    #[test]
+    fn setup_falls_back_to_detection_when_no_configured_clients_exist() {
+        let (editors, provenance) =
+            resolve_setup_editors_from(None, &[], || vec![Editor::ClaudeCode, Editor::ClaudeCode]);
+
+        assert_eq!(editors, vec![Editor::ClaudeCode]);
+        assert_eq!(provenance, "detected");
+    }
+
+    #[test]
+    fn setup_explicit_editors_override_saved_selection_and_ignore_malformed_state() {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+        let state_dir = temp.path().join(".contextstream");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        std::fs::write(state_dir.join("installation.json"), "{not valid json")
+            .expect("seed malformed state");
+
+        let result = resolve_setup_editors(Some(&[Editor::Codex, Editor::Codex]));
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        let (editors, provenance) = result.expect("explicit --editors must not read broken state");
+        assert_eq!(editors, vec![Editor::Codex]);
+        assert_eq!(provenance, "requested");
     }
     use crate::env_test_mutex;
     use mcp_client::ContextStreamClient;

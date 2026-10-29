@@ -2569,7 +2569,6 @@ pub async fn run_setup_with_project_overrides(
             learning_choice,
         )
         .await
-        .map(|_| true)
     } else {
         wizard::run(only, project_path, account_only, learning_choice).await
     }
@@ -2579,6 +2578,179 @@ pub async fn run_setup_with_project_overrides(
 /// editors, hosted remote transport, background indexing, no media. Fails
 /// fast with guidance when credentials are missing/invalid or the workspace
 /// is ambiguous — it never guesses across workspaces.
+/// When plain `setup --yes` (with no override flags) is re-run inside a
+/// checkout that is already configured, linked, indexed, and passing all
+/// setup-managed doctor checks, emit a concise confirmation and return `true`
+/// without mutating files or spawning background indexing.
+async fn try_short_circuit_healthy_noninteractive_setup() -> Result<bool> {
+    struct RestorePersistence(bool);
+    impl Drop for RestorePersistence {
+        fn drop(&mut self) {
+            mcp_client::activation::set_installation_state_persistence_enabled(self.0);
+        }
+    }
+
+    if safe_edit::is_dry_run() || keep_claude_auto_memory() {
+        return Ok(false);
+    }
+
+    let restore_to = !safe_edit::is_dry_run();
+    mcp_client::activation::set_installation_state_persistence_enabled(false);
+    let _restore = RestorePersistence(restore_to);
+
+    let Ok(saved_creds) = read_saved_credentials() else {
+        return Ok(false);
+    };
+    let Some(saved_key) = saved_creds
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return Ok(false);
+    };
+    let Ok(Some(effective_key)) = get_api_key_result() else {
+        return Ok(false);
+    };
+    if effective_key.trim() != saved_key {
+        return Ok(false);
+    }
+
+    let config = setup_client_config(&effective_key);
+    let default_url = mcp_types::config::DEFAULT_API_URL.trim_end_matches('/');
+    let saved_effective_url = saved_creds
+        .api_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .map(normalize_api_url)
+        .unwrap_or_else(|| default_url.to_string());
+    if normalize_api_url(&config.api_url) != saved_effective_url {
+        return Ok(false);
+    }
+
+    let Ok(selection) = mcp_client::activation::configured_client_selection() else {
+        return Ok(false);
+    };
+    if !selection.recorded || selection.clients.is_empty() {
+        return Ok(false);
+    }
+    let saved_editors = dedupe_editors(
+        selection
+            .clients
+            .iter()
+            .filter_map(|id| editors::Editor::from_id(id)),
+    );
+    if saved_editors.is_empty() || saved_editors.len() != selection.clients.len() {
+        return Ok(false);
+    }
+    if !matches!(
+        read_setup_transport_marker_result(),
+        Ok(Some(SetupTransportPreference::HostedRemote))
+    ) {
+        return Ok(false);
+    }
+
+    let cwd = std::env::current_dir()?;
+    let Some(project_path) = resolve_setup_project_path(&cwd, None, false)? else {
+        return Ok(false);
+    };
+    let Ok(Some(local_cfg)) = read_project_config(&project_path) else {
+        return Ok(false);
+    };
+    let (Some(ws_id_str), Some(proj_id_str)) = (
+        local_cfg.workspace_id.as_deref(),
+        local_cfg.project_id.as_deref(),
+    ) else {
+        return Ok(false);
+    };
+    let (Ok(ws_uuid), Ok(proj_uuid)) = (
+        uuid::Uuid::parse_str(ws_id_str),
+        uuid::Uuid::parse_str(proj_id_str),
+    ) else {
+        return Ok(false);
+    };
+
+    if setup_path_has_project_content_files(&project_path, false)
+        && !ContextStreamClient::local_project_index_is_current(
+            &project_path.to_string_lossy(),
+            proj_uuid,
+        )
+    {
+        return Ok(false);
+    }
+
+    let client = ContextStreamClient::new(config);
+    let Ok(Ok(user)) = tokio::time::timeout(std::time::Duration::from_secs(10), client.me()).await
+    else {
+        return Ok(false);
+    };
+    let Ok(project) = client.get_project_fresh(proj_uuid).await else {
+        return Ok(false);
+    };
+    if require_project_workspace_ownership(&client, proj_uuid, project.workspace_id, ws_uuid)
+        .await
+        .is_err()
+    {
+        return Ok(false);
+    }
+    if !linked_project_name_matches_checkout(
+        &project.name,
+        local_cfg.project_name.as_deref(),
+        local_cfg.checkout_root.as_deref(),
+        &project_path,
+    ) {
+        return Ok(false);
+    }
+    let Ok(checkout_repo_id) = checkout_repository_identity(&project_path) else {
+        return Ok(false);
+    };
+    if !linked_project_repository_is_compatible(&project, checkout_repo_id.as_ref()) {
+        return Ok(false);
+    }
+
+    let report = doctor::build_report(Some(&project_path), &saved_editors).await;
+    let all_healthy = report.installation.status == doctor::CheckStatus::Pass
+        && report.credentials.status == doctor::CheckStatus::Pass
+        && report
+            .project_link
+            .as_ref()
+            .is_some_and(|check| check.status == doctor::CheckStatus::Pass)
+        && report.git_hooks.as_ref().is_none_or(|check| {
+            matches!(
+                check.status,
+                doctor::CheckStatus::Pass | doctor::CheckStatus::Skipped
+            )
+        })
+        && report.editors.iter().all(|editor| {
+            editor.checks.iter().all(|check| {
+                matches!(check.surface, "readiness_local" | "readiness_remote")
+                    || (check.status != doctor::CheckStatus::Fail
+                        && !(check.status == doctor::CheckStatus::Warn && check.fix.is_some()))
+            })
+        });
+    if !all_healthy {
+        return Ok(false);
+    }
+
+    let workspace_label = local_cfg
+        .workspace_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(ws_id_str);
+    ui::say(
+        ui::Mark::Ok,
+        "ContextStream is already set up and healthy",
+        Some(&format!(
+            "{} · {} / {} · {}",
+            user.email,
+            workspace_label,
+            project.name,
+            selected_editors_summary(&saved_editors)
+        )),
+    );
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_setup_noninteractive(
     only: Option<&[editors::Editor]>,
@@ -2588,7 +2760,7 @@ async fn run_setup_noninteractive(
     explicit_project_id: Option<&str>,
     explicit_project_name: Option<&str>,
     explicit_learning_choice: Option<bool>,
-) -> Result<()> {
+) -> Result<bool> {
     let parsed_project_id = match explicit_project_id {
         Some(raw) => {
             let trimmed = raw.trim();
@@ -2608,6 +2780,18 @@ async fn run_setup_noninteractive(
         }
         None => None,
     };
+
+    if !account_only
+        && only.is_none()
+        && explicit_project_path.is_none()
+        && explicit_workspace_id.is_none()
+        && parsed_project_id.is_none()
+        && normalized_project_name.is_none()
+        && explicit_learning_choice.is_none()
+        && try_short_circuit_healthy_noninteractive_setup().await?
+    {
+        return Ok(false);
+    }
 
     print_welcome_banner();
     print_data_collection_disclosure(true);
@@ -2707,7 +2891,7 @@ async fn run_setup_noninteractive(
             &outcome,
             learning_hint,
         );
-        return Ok(());
+        return Ok(true);
     }
     ui::say(
         ui::Mark::Ok,
@@ -2876,7 +3060,7 @@ async fn run_setup_noninteractive(
         &outcome,
         learning_hint,
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Resolve the workspace for `--yes` without prompting: an explicit

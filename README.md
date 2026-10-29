@@ -94,6 +94,11 @@ image, sound or music in plain words, and ContextStudio's producer plans the pie
 what your team knows (brand kit, docs, decisions, connected products). There are no models
 to pick.
 
+- **Brand work by name.** Brand images (social sets in each network's size, ad sets, hero
+  and product shots, posters and flyers with print PDFs, email headers, brand graphics) and
+  brand sounds (sonic logos, music beds, loops, effect packs, voice-overs, podcast intros
+  and outros): pass `form`, with `sizes` (up to 6, such as `instagram-post` or
+  `linkedin-post`) or a `voice`, and the plan keeps to it.
 - **Plan, then price.** `plan` returns the pieces and one price ("up to N credits, likely
   about M") and spends nothing. Pass what your agent knows that the workspace may not (the
   diff it just made, release notes, the doc it has open) as `context`; the producer reads
@@ -104,8 +109,13 @@ to pick.
 - **Following it.** `status` reports each piece while it waits (with
   `notifications/progress` where the call asks for them); a product film takes 13 to 21
   minutes. `result` shows images inline and links video and sound (signed links valid
-  about 15 minutes), with each piece's placard. Also `revise`, `stop`, `library`, `brand`
-  and `products`.
+  about 15 minutes), with each piece's placard. Brand work comes as files, each with its
+  own link: every size as PNG, JPG and WebP with a ZIP of the set, a print PDF, or WAV and
+  MP3 for the web with a broadcast master and stems, plus alt text, a caption and the
+  checks it was held to.
+- **Revising.** `revise` starts from a made image or sound: a `variation` (more like it), a
+  `revision` (it, changed as you say) or a `resize` (an image in new `sizes`). Also `stop`,
+  `library`, `brand` and `products`.
 - **Connector.** The hosted path `/studio` serves only this tool, for Claude.ai or ChatGPT
   connectors, with OAuth tokens bound to that resource (`read:studio`, `write:studio`).
 

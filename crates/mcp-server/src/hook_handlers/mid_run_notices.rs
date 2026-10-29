@@ -840,7 +840,6 @@ pub(crate) fn record_prompt_delivery(input: &Value, cwd: &str, context_text: &st
     let _ = update_session_entry(&key, |entry| {
         entry.last_poll_unix_ms = now_ms;
         entry.checked_in_summary = true;
-        entry.baselined_static = true;
         entry.cwd = Some(cwd);
         if entry.agent_name.is_none() {
             entry.agent_name = agent;
@@ -937,11 +936,14 @@ pub(crate) fn record_tool_result_delivery(input: &Value, cwd: &str, tool_respons
 
 /// Keep what a poll returned that this session has not seen: every new
 /// `[COORDINATION]` notice, and lessons or preferences that appeared after
-/// the first poll. Returns the rendered message (if any) and the notice ids
-/// to acknowledge.
+/// the first complete context. `complete` is false when the API answered
+/// from its cache-miss fallback, which leaves lessons and preferences out:
+/// those are then neither recorded nor announced. Returns the rendered
+/// message (if any) and the notice ids to acknowledge.
 pub(crate) fn filter_and_record_polled_context(
     entry: &mut MidRunSessionState,
     raw_context: &str,
+    complete: bool,
 ) -> (Option<String>, Vec<String>) {
     let mut emit_lines: Vec<String> = Vec::new();
     let mut ack_ids: Vec<String> = Vec::new();
@@ -965,6 +967,8 @@ pub(crate) fn filter_and_record_polled_context(
                 ack_ids.push(id);
             }
             emit_lines.push(block);
+        } else if !complete {
+            continue;
         } else if block.starts_with("[LESSONS_WARNING]") {
             let already_seen = entry.seen_lesson_lines.contains(&block);
             push_bounded(
@@ -987,7 +991,9 @@ pub(crate) fn filter_and_record_polled_context(
             }
         }
     }
-    entry.baselined_static = true;
+    if complete {
+        entry.baselined_static = true;
+    }
 
     if emit_lines.is_empty() {
         return (None, ack_ids);
@@ -1093,17 +1099,115 @@ fn poll_request_body(
     Value::Object(body)
 }
 
+/// Hook payload fields the background poll needs to resolve the session's
+/// scope, identity, and first task summary.
+const POLL_JOB_INPUT_KEYS: &[&str] = &[
+    "session_id",
+    "sessionId",
+    "conversation_id",
+    "conversationId",
+    "prompt",
+    "lastUserInput",
+    "agent_name",
+    "agentName",
+    "cwd",
+    "workspacePaths",
+];
+const POLL_JOB_MAX_FIELD_CHARS: usize = 8_000;
+
+/// Hand the poll to a detached process. Everything that reads files (scope,
+/// credentials, agent name) happens there, not on the hook's path.
 fn start_background_poll(input: &Value, cwd: &str, key: &str, editor: &str, first_poll: bool) {
-    let resolved = resolve_hook_scope(input, cwd);
-    if !resolved.config.is_configured() {
-        return;
+    let mut fields = serde_json::Map::new();
+    for name in POLL_JOB_INPUT_KEYS {
+        let Some(value) = input.get(*name) else {
+            continue;
+        };
+        let value = match value.as_str() {
+            Some(text) if text.chars().count() > POLL_JOB_MAX_FIELD_CHARS => {
+                Value::String(text.chars().take(POLL_JOB_MAX_FIELD_CHARS).collect())
+            }
+            _ => value.clone(),
+        };
+        fields.insert((*name).to_string(), value);
     }
     let job = serde_json::json!({
         "cwd": cwd,
         "state_key": key,
-        "body": poll_request_body(input, cwd, key, editor, &resolved, first_poll),
+        "editor": editor,
+        "first_poll": first_poll,
+        "input": Value::Object(fields),
     });
     spawn_poll_process(&job);
+}
+
+/// The workspace setup chose for an editor's ContextStream MCP server (its
+/// `X-ContextStream-Workspace-Id` header, or `CONTEXTSTREAM_WORKSPACE_ID` in
+/// its env), for a session with no linked folder that has not called `init`.
+fn configured_mcp_workspace(editor: &str) -> Option<String> {
+    let home = dirs::home_dir()?;
+    let claude = home.join(".claude.json");
+    let antigravity = home.join(".gemini").join("config").join("mcp_config.json");
+    let codex = home.join(".codex").join("config.toml");
+    let order: [PathBuf; 3] = match editor {
+        "antigravity" => [antigravity, claude, codex],
+        "codex" => [codex, claude, antigravity],
+        _ => [claude, codex, antigravity],
+    };
+    order.into_iter().find_map(|path| {
+        let text = std::fs::read_to_string(&path).ok()?;
+        if path.extension().is_some_and(|ext| ext == "toml") {
+            workspace_from_codex_toml(&text)
+        } else {
+            workspace_from_mcp_json(&text)
+        }
+    })
+}
+
+fn workspace_from_mcp_json(text: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(text).ok()?;
+    let server = parsed.get("mcpServers")?.get("contextstream")?;
+    server
+        .get("headers")
+        .and_then(|headers| headers.get("X-ContextStream-Workspace-Id"))
+        .or_else(|| {
+            server
+                .get("env")
+                .and_then(|env| env.get("CONTEXTSTREAM_WORKSPACE_ID"))
+        })
+        .and_then(Value::as_str)
+        .and_then(|raw| Uuid::parse_str(raw.trim()).ok())
+        .map(|id| id.to_string())
+}
+
+/// Codex keeps the header inside `[mcp_servers.contextstream]`.
+fn workspace_from_codex_toml(text: &str) -> Option<String> {
+    let mut in_contextstream = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_contextstream = line
+                .trim_matches(|c| c == '[' || c == ']')
+                .starts_with("mcp_servers.contextstream");
+            continue;
+        }
+        if !in_contextstream {
+            continue;
+        }
+        for marker in [
+            "\"X-ContextStream-Workspace-Id\"",
+            "CONTEXTSTREAM_WORKSPACE_ID",
+        ] {
+            if let Some(at) = line.find(marker) {
+                let rest = &line[at + marker.len()..];
+                let value = rest.split('"').nth(1)?;
+                if let Ok(id) = Uuid::parse_str(value.trim()) {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Start `contextstream-mcp hook mid-run-poll` detached, hand it the job on
@@ -1150,15 +1254,30 @@ pub async fn run_background_poll() -> anyhow::Result<()> {
     let Some(key) = job.get("state_key").and_then(Value::as_str) else {
         return Ok(());
     };
-    let Some(body) = job.get("body").filter(|body| body.is_object()) else {
-        return Ok(());
-    };
     let cwd = job.get("cwd").and_then(Value::as_str).unwrap_or_default();
-    let config = common::load_config(cwd);
+    let editor = job
+        .get("editor")
+        .and_then(Value::as_str)
+        .unwrap_or("claude");
+    let first_poll = job
+        .get("first_poll")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let input = job
+        .get("input")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut resolved = resolve_hook_scope(&input, cwd);
+    if resolved.config.workspace_id.is_none() {
+        resolved.config.workspace_id = configured_mcp_workspace(editor);
+    }
+    let config = resolved.config.clone();
     if config.is_configured() {
-        if let Some(raw_context) = fetch_poll_context(&config, body).await {
+        let body = poll_request_body(&input, cwd, key, editor, &resolved, first_poll);
+        if let Some((raw_context, complete)) = fetch_poll_context(&config, &body).await {
             let ack_ids = update_session_entry(key, |entry| {
-                let (rendered, ack_ids) = filter_and_record_polled_context(entry, &raw_context);
+                let (rendered, ack_ids) =
+                    filter_and_record_polled_context(entry, &raw_context, complete);
                 if let Some(rendered) = rendered {
                     entry.pending.push(rendered);
                     let excess = entry.pending.len().saturating_sub(MAX_PENDING_NOTICES);
@@ -1174,7 +1293,9 @@ pub async fn run_background_poll() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn fetch_poll_context(config: &ApiConfig, body: &Value) -> Option<String> {
+/// The hook context text, and whether it is complete (served from the API's
+/// context cache rather than its cache-miss fallback).
+async fn fetch_poll_context(config: &ApiConfig, body: &Value) -> Option<(String, bool)> {
     let response = super::api_http_client()
         .post(format!("{}/api/v1/context/hook", config.api_url))
         .header("X-API-Key", &config.api_key)
@@ -1188,11 +1309,14 @@ async fn fetch_poll_context(config: &ApiConfig, body: &Value) -> Option<String> 
         return None;
     }
     let payload: Value = response.json().await.ok()?;
-    payload
-        .get("data")
-        .and_then(|data| data.get("context"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    hook_context_of(&payload)
+}
+
+fn hook_context_of(payload: &Value) -> Option<(String, bool)> {
+    let data = payload.get("data")?;
+    let context = data.get("context").and_then(Value::as_str)?.to_string();
+    let complete = data.get("cached").and_then(Value::as_bool).unwrap_or(false);
+    Some((context, complete))
 }
 
 /// The API already acknowledged what a `consume_notices` poll returned; this
@@ -1386,22 +1510,16 @@ pub async fn attach_to_tool_result(
         }
         let client = client.clone();
         tokio::spawn(async move {
-            let raw_context = client
+            let fetched = client
                 .post::<Value, _>("/context/hook", body)
                 .await
                 .ok()
-                .and_then(|payload| {
-                    payload
-                        .get("data")
-                        .and_then(|data| data.get("context"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
+                .and_then(|payload| hook_context_of(&payload));
             let mut state = server_fallback();
             state.polling = false;
-            if let Some(raw_context) = raw_context {
+            if let Some((raw_context, complete)) = fetched {
                 let (rendered, _) =
-                    filter_and_record_polled_context(&mut state.session, &raw_context);
+                    filter_and_record_polled_context(&mut state.session, &raw_context, complete);
                 if let Some(rendered) = rendered {
                     state.session.pending.push(rendered);
                     let excess = state
@@ -1464,7 +1582,7 @@ mod tests {
     fn filter_delivers_each_coordination_notice_once_and_only_new_lessons_after_baseline() {
         let mut state = MidRunSessionState::default();
         let poll_1 = "[LESSONS_WARNING] Existing lesson\n[PREFERENCE] Prefer concise diffs\n[COORDINATION] (important) from Engineering/contextcode: item=x For cc-qa: Kimi key funded. — ack via coordination(action=\"ack\", notice_id=\"11111111-1111-1111-1111-111111111111\")";
-        let (msg_1, ack_1) = filter_and_record_polled_context(&mut state, poll_1);
+        let (msg_1, ack_1) = filter_and_record_polled_context(&mut state, poll_1, true);
         let msg_1 = msg_1.expect("coordination notice should emit on first poll");
         assert!(msg_1.contains("For cc-qa: Kimi key funded."));
         assert!(
@@ -1473,13 +1591,13 @@ mod tests {
         );
         assert_eq!(ack_1, vec!["11111111-1111-1111-1111-111111111111"]);
 
-        let (msg_2, ack_2) = filter_and_record_polled_context(&mut state, poll_1);
+        let (msg_2, ack_2) = filter_and_record_polled_context(&mut state, poll_1, true);
         assert!(msg_2.is_none());
         assert!(ack_2.is_empty());
 
         let poll_3 =
             "[LESSONS_WARNING] Existing lesson\n[LESSONS_WARNING] Brand new mid-run lesson";
-        let (msg_3, ack_3) = filter_and_record_polled_context(&mut state, poll_3);
+        let (msg_3, ack_3) = filter_and_record_polled_context(&mut state, poll_3, true);
         let msg_3 = msg_3.expect("new lesson should emit");
         assert!(msg_3.contains("Brand new mid-run lesson"));
         assert!(!msg_3.contains("Existing lesson"));
@@ -1487,10 +1605,38 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_miss_context_delivers_notices_but_does_not_baseline_lessons() {
+        let mut state = MidRunSessionState::default();
+        // The API's cache-miss fallback has no lessons or preferences yet.
+        let fallback = "[CONTEXTSTREAM] reminder\n[COORDINATION] (info) from W: x — ack via coordination(action=\"ack\", notice_id=\"44444444-4444-4444-8444-444444444444\")";
+        let (msg, ack) = filter_and_record_polled_context(&mut state, fallback, false);
+        assert!(msg.expect("notice emits").contains("[COORDINATION]"));
+        assert_eq!(ack.len(), 1);
+        assert!(!state.baselined_static);
+
+        // The first complete context is the baseline, not news.
+        let full = "[PREFERENCE] Prefer concise diffs\n[LESSONS_WARNING] Old lesson";
+        let (msg, _) = filter_and_record_polled_context(&mut state, full, true);
+        assert!(msg.is_none());
+        assert!(state.baselined_static);
+
+        // A cache miss later neither announces nor forgets anything.
+        let (msg, _) = filter_and_record_polled_context(&mut state, "[PREFERENCE] Other", false);
+        assert!(msg.is_none());
+        let (msg, _) = filter_and_record_polled_context(
+            &mut state,
+            "[PREFERENCE] Prefer concise diffs\n[PREFERENCE] New preference",
+            true,
+        );
+        let msg = msg.expect("new preference emits");
+        assert!(msg.contains("New preference") && !msg.contains("concise diffs"));
+    }
+
+    #[test]
     fn a_notice_whose_reason_spans_lines_stays_one_notice_with_its_id() {
         let mut state = MidRunSessionState::default();
         let raw = "[COORDINATION] (info) from Engineering/contextcode: Resume Kimi\nlive tests [now]. — ack via coordination(action=\"ack\", notice_id=\"22222222-2222-2222-2222-222222222222\")\n[CONTEXTSTREAM] other";
-        let (msg, ack) = filter_and_record_polled_context(&mut state, raw);
+        let (msg, ack) = filter_and_record_polled_context(&mut state, raw, true);
         let msg = msg.expect("notice emits");
         assert!(msg.contains("Resume Kimi live tests [now]."));
         assert_eq!(ack, vec!["22222222-2222-2222-2222-222222222222"]);
@@ -1533,6 +1679,33 @@ mod tests {
         assert_eq!(
             ids,
             vec!["33333333-3333-3333-3333-333333333333".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_configured_workspace_is_read_from_each_editor_mcp_config() {
+        let ws = "550e8400-e29b-41d4-a716-446655440000";
+        let claude = serde_json::json!({
+            "projects": {"/x": {"mcpServers": {"contextstream": {"headers": {"X-ContextStream-Workspace-Id": "not-this"}}}}},
+            "mcpServers": {"contextstream": {"type": "http", "headers": {"X-ContextStream-Workspace-Id": ws}}}
+        });
+        assert_eq!(
+            workspace_from_mcp_json(&claude.to_string()).as_deref(),
+            Some(ws)
+        );
+        let local = serde_json::json!({"mcpServers": {"contextstream": {"env": {"CONTEXTSTREAM_WORKSPACE_ID": ws}}}});
+        assert_eq!(
+            workspace_from_mcp_json(&local.to_string()).as_deref(),
+            Some(ws)
+        );
+        assert_eq!(workspace_from_mcp_json("{}"), None);
+        let toml = format!(
+            "[mcp_servers.other]\nhttp_headers = {{ \"X-ContextStream-Workspace-Id\" = \"00000000-0000-4000-8000-000000000042\" }}\n[mcp_servers.contextstream]\nurl = \"https://mcp.example\"\nhttp_headers = {{ \"X-ContextStream-Client\" = \"codex\", \"X-ContextStream-Workspace-Id\" = \"{ws}\" }}\n"
+        );
+        assert_eq!(workspace_from_codex_toml(&toml).as_deref(), Some(ws));
+        assert_eq!(
+            workspace_from_codex_toml("[mcp_servers.contextstream]\nurl = \"x\"\n"),
+            None
         );
     }
 

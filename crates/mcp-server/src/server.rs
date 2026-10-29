@@ -2955,7 +2955,9 @@ mod tests {
     // parameters, changed types/required fields, and enum drift.
     // Current broad-tool input contracts. Most entries remain the v0.5.62
     // baseline; entries intentionally advance when an additive, versioned
-    // input capability is added.
+    // input capability is added. They also advanced when the portable schema
+    // stopped advertising boolean `additionalProperties` (Gemini SDK and
+    // OpenAPI `parameters` compatibility); no parameter, type or enum moved.
     const EXPECTED_BROAD_SCHEMA_CONTRACTS: &[(&str, &str)] = &[
         (
             "account",
@@ -2963,7 +2965,7 @@ mod tests {
         ),
         (
             "answer",
-            "725feee5c960970b34ab4dec4a308792db1ea29b7f652c0ef36804beaac2cc0b",
+            "31a1e0b733ffe17a9514444bdffd2c6603ae733d4cee48d09d90de16b5c69bb6",
         ),
         (
             "capsule",
@@ -2984,18 +2986,18 @@ mod tests {
             // Coordination v2: action=reply with `message`, and `metadata`
             // (git branch/commit) on check_in as judge evidence.
             "coordination",
-            "8c566231ed75c196070bc0c632887509acb6474638b7696e5e31b30787c97be1",
+            "e2d3e012ea534f68d5064054920b3f0f1ce6383745002a2d164ab63e55c0fda8",
         ),
         (
             // Advanced for tickets 2c0e695e and 9e5c9232: `target_project`
             // (a project name) was added, and `kind` lost `discussion`, which
             // mapped to an API route that never existed, so every call failed.
             "entity",
-            "0f2e18be46f7b9065ecf20f360ccf647755f057259b6c84b4ab2a45fa3c22c30",
+            "e1ae3da8928ff62e4d69240d034132479d4a567e116a338a54a6ca30be22559c",
         ),
         (
             "feed",
-            "87629ecbc0ff8e4c6b9a877027e09c2671781c53af955c8ae7ecb44d10f8b80c",
+            "9f10868167ea4cdaceb968050674a934cbd7c74d75c29ae1def64e6e63c28298",
         ),
         (
             "graph",
@@ -3013,7 +3015,7 @@ mod tests {
         ),
         (
             "instruct",
-            "ad1e2260b3c50468dc64e6483d4e3e84f1333b8d964c5257216596d9e10898ca",
+            "ac3e393499454ba89a60e56dbe8ab6480629f0593d7adc26d30ea53779f90e68",
         ),
         (
             // Additive: connected-app actions (apps, find, read,
@@ -3021,7 +3023,7 @@ mod tests {
             // returned, for clients that keep no state), and the runtime
             // providers (microsoft, google_workspace, dropbox, box).
             "integration",
-            "d6d7fce258e02def04847766a5c4b0ecac466883a2a4c6ffcbf4dddf978d0ed7",
+            "fa584db2acb26aa9f26584b17e8e2bf3369c2107803054b3da68c4099dc52d4f",
         ),
         (
             "media",
@@ -3079,11 +3081,11 @@ mod tests {
             // (related projects for cross-project work). Every earlier field
             // and action still accepted.
             "project",
-            "24ebed24d7cf30248dfb89ce05e0f0c064db3f45b84f4dd63382afb789f63cda",
+            "2b9d0e81e9bd9c9eb1f49aef43daa57b7b59b76c5a3039a9b38aafd586905a65",
         ),
         (
             "qa",
-            "adc83752631c9e86d3a99f87bbba78ba5043c49771850cd3cd2da6c3928db102",
+            "bbebec6eca65166262d2d9b0ec92e7143ab3bc82e88b79cdbd801f4049a97d38",
         ),
         (
             "reminder",
@@ -3102,7 +3104,7 @@ mod tests {
         ),
         (
             "session_capture",
-            "2aec6a146a2658108ff68619acbc3ad89544aaae7fc5eed939b33d071266207a",
+            "b50ed068ec3abd5dd451544efddaa94a25f5e5c1dce16c81f12e0e53c7004a61",
         ),
         (
             "session_capture_lesson",
@@ -3114,11 +3116,11 @@ mod tests {
         ),
         (
             "skill",
-            "ce994b13cda7da6493f8a60950cb08b4a13e23e375a7be4d62e48f89ca2bce9f",
+            "77a796790a62943bb0034f6cddd5fb1ae7f575ee0137e1f2f3decf00859cd5e8",
         ),
         (
             "vcs",
-            "8e689ff055ae8139bbae176b61c6c6e746d15c92067d838ebea2d508f14971e3",
+            "b55f1fdce285368d22bd978f710a780350443c1fdbe7c1959eaa1857deecc126",
         ),
         (
             "workspace",

@@ -286,14 +286,24 @@ fn install_binary_impl(target_dir: &std::path::Path, report_success: bool) -> Re
     if target_canonical.as_ref() == Some(&current_canonical) {
         let version = verify_binary_runs(&target)?;
         if report_success {
-            eprintln!("Verified: {}", version);
+            eprintln!(
+                "{}{} Verified: {}",
+                super::ui::GUTTER,
+                super::ui::ui().mark(super::ui::Mark::Ok),
+                version
+            );
         }
         return Ok(());
     }
     if target.exists() && files_have_identical_contents(&current, &target).unwrap_or(false) {
         if let Ok(version) = verify_binary_runs(&target) {
             if report_success {
-                eprintln!("Verified: {}", version);
+                eprintln!(
+                    "{}{} Verified: {}",
+                    super::ui::GUTTER,
+                    super::ui::ui().mark(super::ui::Mark::Ok),
+                    version
+                );
             }
             return Ok(());
         }
@@ -397,7 +407,12 @@ fn install_binary_impl(target_dir: &std::path::Path, report_success: bool) -> Re
     sync_binary_parent(&target);
 
     if report_success {
-        eprintln!("Verified: {}", version);
+        eprintln!(
+            "{}{} Verified: {}",
+            super::ui::GUTTER,
+            super::ui::ui().mark(super::ui::Mark::Ok),
+            version
+        );
     }
     Ok(())
 }

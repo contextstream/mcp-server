@@ -3365,7 +3365,12 @@ async fn download_and_install_binary(client: &reqwest::Client, version: &str) ->
     match output {
         Ok(o) if o.status.success() => {
             let version = String::from_utf8_lossy(&o.stdout);
-            eprintln!("Verified: {}", version.trim());
+            eprintln!(
+                "{}{} Verified: {}",
+                mcp_server::setup::ui::GUTTER,
+                mcp_server::setup::ui::ui().mark(mcp_server::setup::ui::Mark::Ok),
+                version.trim()
+            );
         }
         Ok(o) => {
             eprintln!(

@@ -58,12 +58,13 @@ use tracing::warn;
 
 /// Activity marks in the ContextCode style (see [`ui::Mark`]), carrying the
 /// trailing space the old emoji constants had so existing format strings
-/// keep their alignment.
+/// keep their alignment, and the CLI's two-space margin so status lines line
+/// up with the reports around them (#253).
 struct MarkPrefix(ui::Mark);
 
 impl std::fmt::Display for MarkPrefix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ", ui::ui().mark(self.0))
+        write!(f, "{}{} ", ui::GUTTER, ui::ui().mark(self.0))
     }
 }
 
@@ -495,7 +496,7 @@ enum SetupIndexChoice {
 }
 
 fn info_label() -> String {
-    format!("{} ", ui::ui().mark(ui::Mark::Info))
+    format!("{}{} ", ui::GUTTER, ui::ui().mark(ui::Mark::Info))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1210,7 +1211,14 @@ pub async fn update_hooks_scoped(
         Some(SetupTransportPreference::LocalBinary)
     );
     let helper_ready = if targets_need_managed_helper(&targets) {
-        match hooks::ensure_managed_binary_installed() {
+        // Setup's own closing refresh already reported the helper.
+        let ensure_helper: fn() -> Result<PathBuf> =
+            if QUIET_HOOK_REFRESH.load(std::sync::atomic::Ordering::Relaxed) {
+                hooks::ensure_managed_binary_installed_quiet
+            } else {
+                hooks::ensure_managed_binary_installed
+            };
+        match ensure_helper() {
             Ok(_) => true,
             Err(error) => {
                 eprintln!(
@@ -1696,7 +1704,9 @@ async fn update_configs_scoped_with_interactivity(
     }
 
     if !use_local_transport && has_mcp_targets && crate::watch::watch_enabled() {
-        match hooks::ensure_managed_binary_installed()
+        // The sync bridge's helper is a precondition here, not news: the hook
+        // refresh that runs alongside (doctor --repair) reports it once.
+        match hooks::ensure_managed_binary_installed_quiet()
             .and_then(|_| register_managed_sync_bridge().map(|_| ()))
         {
             Ok(()) => {
@@ -5750,6 +5760,13 @@ mod tests {
     };
     use crate::setup::editors::Editor;
     use std::path::Path;
+
+    #[test]
+    fn status_lines_carry_the_cli_margin() {
+        let check = format!("{}Hooks updated", super::CHECK);
+        assert!(check.starts_with(super::ui::GUTTER), "{check:?}");
+        assert!(super::info_label().starts_with(super::ui::GUTTER));
+    }
 
     #[test]
     fn dry_run_status_lines_say_what_would_change_instead_of_claiming_it() {

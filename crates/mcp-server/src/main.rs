@@ -617,7 +617,6 @@ enum Commands {
         path: Option<String>,
 
         /// Pattern(s) to add or remove (for add/remove actions)
-        #[arg(trailing_var_arg = true)]
         patterns: Vec<String>,
     },
 
@@ -4367,6 +4366,54 @@ mod tests {
                 }),
                 "representative {metric} observation only reached +Inf: {rendered}"
             );
+        }
+    }
+
+    #[test]
+    fn exclude_cli_parses_path_and_flags_after_patterns() {
+        let add = Cli::try_parse_from([
+            "contextstream-mcp",
+            "exclude",
+            "add",
+            "*.log",
+            "dist/",
+            "--path",
+            "/tmp/target-project",
+            "-q",
+        ])
+        .expect("exclude add with trailing --path and -q should parse");
+        assert!(add.quiet);
+        match add.command {
+            Some(Commands::Exclude {
+                action: ExcludeAction::Add,
+                path,
+                patterns,
+            }) => {
+                assert_eq!(path.as_deref(), Some("/tmp/target-project"));
+                assert_eq!(patterns, vec!["*.log".to_string(), "dist/".to_string()]);
+            }
+            _ => panic!("expected exclude add command"),
+        }
+
+        let remove = Cli::try_parse_from([
+            "contextstream-mcp",
+            "exclude",
+            "remove",
+            "*.log",
+            "--path",
+            "/tmp/target-project",
+        ])
+        .expect("exclude remove with trailing --path should parse");
+        match remove.command {
+            Some(Commands::Exclude {
+                action: ExcludeAction::Remove,
+                path,
+                patterns,
+            }) => {
+                assert_eq!(path.as_deref(), Some("/tmp/target-project"));
+                assert_eq!(patterns, vec!["*.log".to_string()]);
+            }
+            _ => panic!("expected exclude remove command"),
         }
     }
 }

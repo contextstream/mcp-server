@@ -2340,6 +2340,54 @@ fn infer_default_repair_scope(
     }
 }
 
+/// The scope and project a repair acts on. Without `--scope`: the linked
+/// project the working directory is in, else global. With a project scope and
+/// the working directory as the project path: the linked project above it, as
+/// read-only doctor reads it (#243).
+fn resolve_repair_project(options: &mut DoctorOptions, cwd: Option<&Path>) {
+    if !options.scope_was_explicit {
+        let (scope, linked_root) = infer_default_repair_scope(options.project_path.as_deref(), cwd);
+        options.scope = scope;
+        options.project_path = linked_root;
+        return;
+    }
+    if !options.scope.include_project() {
+        return;
+    }
+    let (Some(project), Some(cwd)) = (options.project_path.as_deref(), cwd) else {
+        return;
+    };
+    let (Ok(canonical_project), Ok(canonical_cwd)) = (project.canonicalize(), cwd.canonicalize())
+    else {
+        return;
+    };
+    if canonical_project == canonical_cwd {
+        if let Some(linked_root) = resolve_linked_project_root(Some(&canonical_cwd)) {
+            options.project_path = Some(linked_root);
+        }
+    }
+}
+
+/// Move into the project root a validated project repair targets when it is
+/// not the working directory itself (it then encloses it).
+fn enter_repair_project_root(options: &DoctorOptions, cwd: Option<&Path>) -> Result<()> {
+    if !options.scope.include_project() {
+        return Ok(());
+    }
+    let (Some(root), Some(cwd)) = (options.project_path.as_deref(), cwd) else {
+        return Ok(());
+    };
+    if root.canonicalize().ok() != cwd.canonicalize().ok() {
+        std::env::set_current_dir(root).with_context(|| {
+            format!(
+                "Doctor could not enter project root {}; no files were changed",
+                root.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn validate_repair_scope(options: &DoctorOptions) -> Result<()> {
     if !options.scope.include_project() {
         return Ok(());
@@ -2904,14 +2952,12 @@ pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -
 
     let (targets, source, detection_fallback_allowed) = resolve_doctor_targets(&options)?;
     if options.repair {
-        if !options.scope_was_explicit {
-            let cwd = std::env::current_dir().ok();
-            let (scope, linked_root) =
-                infer_default_repair_scope(options.project_path.as_deref(), cwd.as_deref());
-            options.scope = scope;
-            options.project_path = linked_root;
-        }
+        let cwd = std::env::current_dir().ok();
+        resolve_repair_project(&mut options, cwd.as_deref());
         validate_repair_scope(&options)?;
+        // Repairs write project files relative to the working directory, so a
+        // repair started in a subfolder runs at the linked project root (#243).
+        enter_repair_project_root(&options, cwd.as_deref())?;
         mcp_client::activation::existing_installation_id().context(
             "installation identity is unreadable; repair was refused before any editor file changed",
         )?;
@@ -4442,6 +4488,21 @@ mod tests {
         from_sub.repair = true;
         from_sub.scope = DoctorScope::All;
         validate_repair_scope_in(&from_sub, &sub).expect("linked root enclosing cwd");
+
+        // An explicit project scope from the subfolder targets the same root.
+        let mut explicit = DoctorOptions::new(Some(sub.clone()));
+        explicit.repair = true;
+        explicit.scope = DoctorScope::Project;
+        explicit.scope_was_explicit = true;
+        resolve_repair_project(&mut explicit, Some(&sub));
+        assert_eq!(explicit.project_path, from_sub.project_path);
+        // ...but never one picked with --project-path elsewhere.
+        let mut elsewhere = DoctorOptions::new(Some(unlinked.path().to_path_buf()));
+        elsewhere.repair = true;
+        elsewhere.scope = DoctorScope::Project;
+        elsewhere.scope_was_explicit = true;
+        resolve_repair_project(&mut elsewhere, Some(&sub));
+        assert_eq!(elsewhere.project_path.as_deref(), Some(unlinked.path()));
         assert!(validate_repair_scope_in(&from_sub, unlinked.path())
             .expect_err("a root that does not enclose cwd is refused")
             .to_string()

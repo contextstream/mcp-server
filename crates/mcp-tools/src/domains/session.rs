@@ -3494,6 +3494,13 @@ impl ToolHandler for InitTool {
                             "\n\nProject index status is warming in the background. Search can be used immediately; run `project(action=\"index_status\")` only if you need an explicit progress check.",
                         );
                     }
+                    _ if matches!(backend_status, InitIndexStatus::Unavailable)
+                        && resolved_project_id.is_none() =>
+                    {
+                        text.push_str(
+                            "\n\nThis folder is not linked to a ContextStream project. Run `contextstream-mcp setup` in this folder to link it, or pass project_id; until then search covers every project in the workspace.",
+                        );
+                    }
                     _ if matches!(backend_status, InitIndexStatus::Unavailable) => {
                         text.push_str(
                             "\n\nProject index status could not be confirmed right now. This does not mean the project is unindexed. Keep hosted MCP configured and continue with ContextStream search; use `project(action=\"index_status\")` for an explicit verification.",

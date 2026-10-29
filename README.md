@@ -221,7 +221,7 @@ Use the pinned Rust toolchain. For contribution checks and commit sign-off, read
 
 [Docs](https://contextstream.io/docs/mcp) ·
 [Pricing](https://contextstream.io/pricing) ·
-[Integrations](https://contextstream.io/integrations) ·
+[Integrations](https://contextstream.io/docs/integrations) ·
 [Benchmarks](https://contextstream.io/benchmarks)
 
 ### Optional deep project learning

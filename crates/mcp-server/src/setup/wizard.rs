@@ -5,7 +5,7 @@
 //! only workspace, a new project named after the folder, and background
 //! indexing. One review screen is the single confirmation and the place to
 //! change any of those choices. Nothing on the server or on disk changes
-//! before the user chooses Save, except the sign-in itself.
+//! before the user chooses Save.
 
 use std::path::{Path, PathBuf};
 
@@ -126,6 +126,7 @@ pub(super) fn default_index_plan(project_path: Option<&Path>, plan: &ProjectPlan
 /// Everything the review screen shows and Save applies.
 struct Choices {
     api_key: String,
+    api_url: String,
     user_id: Option<String>,
     email: String,
     client: ContextStreamClient,
@@ -207,6 +208,16 @@ pub(super) async fn run(
     account_only: bool,
     explicit_learning_choice: Option<bool>,
 ) -> Result<bool> {
+    struct RestoreInstallationPersistence(bool);
+    impl Drop for RestoreInstallationPersistence {
+        fn drop(&mut self) {
+            mcp_client::activation::set_installation_state_persistence_enabled(self.0);
+        }
+    }
+    let persist_after_save = !safe_edit::is_dry_run();
+    mcp_client::activation::set_installation_state_persistence_enabled(false);
+    let _restore_installation_persistence = RestoreInstallationPersistence(persist_after_save);
+
     super::print_welcome_banner();
     super::print_data_collection_disclosure(false);
 
@@ -219,7 +230,7 @@ pub(super) async fn run(
         "Sign in to ContextStream",
         "Your agents' memory lives in your ContextStream account.",
     );
-    let (api_key, user_id, email) = sign_in(Some(signup_probe)).await?;
+    let (api_key, api_url, user_id, email) = sign_in(Some(signup_probe)).await?;
     let client = client_for(&api_key);
     let team_capable = load_team_capability(&client).await;
     let learning_state =
@@ -265,6 +276,7 @@ pub(super) async fn run(
 
     let mut choices = Choices {
         api_key,
+        api_url,
         user_id,
         email,
         client,
@@ -339,9 +351,10 @@ pub(super) async fn run(
                 choices.claude_auto_memory_off = choices.claude_auto_memory_off.map(|off| !off);
             }
             ReviewAction::Account => {
-                let (api_key, user_id, email) = sign_in(None).await?;
+                let (api_key, api_url, user_id, email) = sign_in(None).await?;
                 choices.client = client_for(&api_key);
                 choices.api_key = api_key;
+                choices.api_url = api_url;
                 choices.user_id = user_id;
                 choices.email = email;
                 choices.team_capable = load_team_capability(&choices.client).await;
@@ -385,6 +398,7 @@ pub(super) async fn run(
         }
     }
 
+    mcp_client::activation::set_installation_state_persistence_enabled(persist_after_save);
     print_step(5, "Finishing setup", "");
     let open_browser_after_finish = !choices.explicit_learning
         && choices.learning_state.should_prompt_in_wizard()
@@ -439,7 +453,7 @@ async fn load_team_capability(client: &ContextStreamClient) -> bool {
 /// Reuse a working saved sign-in without asking; otherwise sign in fresh.
 async fn sign_in(
     signup_probe: Option<tokio::task::JoinHandle<bool>>,
-) -> Result<(String, Option<String>, String)> {
+) -> Result<(String, String, Option<String>, String)> {
     if safe_edit::is_dry_run() {
         let api_key = super::get_api_key_result()?.ok_or_else(|| {
             anyhow::anyhow!(
@@ -457,13 +471,13 @@ async fn sign_in(
         .map_err(|error| {
             anyhow::anyhow!("Dry-run could not validate the existing credentials: {error}")
         })?;
-        super::persist_setup_credentials(&api_key, &api_url)?;
         ui::say(Mark::Ok, "Signed in", Some(&user.email));
-        return Ok((api_key, Some(user.id.to_string()), user.email));
+        return Ok((api_key, api_url, Some(user.id.to_string()), user.email));
     }
 
     // Only the first sign-in reuses env/saved credentials; switching accounts
-    // from the review screen always signs in fresh.
+    // from the review screen always signs in fresh. Credentials are persisted
+    // only after the user chooses Save on the review screen.
     if signup_probe.is_some() {
         if let Some(api_key) = std::env::var("CONTEXTSTREAM_API_KEY")
             .ok()
@@ -481,18 +495,8 @@ async fn sign_in(
             .await;
             match check {
                 Ok(Ok(user)) => {
-                    let saved = super::persist_setup_credentials(&api_key, &api_url)?;
-                    let detail = if saved {
-                        format!(
-                            "{} · saved to {}",
-                            user.email,
-                            display_path(&super::credentials_file_path())
-                        )
-                    } else {
-                        user.email.clone()
-                    };
-                    ui::say(Mark::Ok, "Signed in", Some(&detail));
-                    return Ok((api_key, Some(user.id.to_string()), user.email));
+                    ui::say(Mark::Ok, "Signed in", Some(&user.email));
+                    return Ok((api_key, api_url, Some(user.id.to_string()), user.email));
                 }
                 Ok(Err(error)) => ui::say(
                     Mark::Warn,
@@ -510,6 +514,7 @@ async fn sign_in(
             .and_then(|creds| creds.api_key)
             .filter(|key| !key.trim().is_empty())
         {
+            let api_url = super::setup_client_config(&api_key).api_url;
             let check = ui::spin(
                 "Checking your saved sign-in",
                 tokio::time::timeout(
@@ -521,7 +526,7 @@ async fn sign_in(
             match check {
                 Ok(Ok(user)) => {
                     ui::say(Mark::Ok, "Signed in", Some(&user.email));
-                    return Ok((api_key, Some(user.id.to_string()), user.email));
+                    return Ok((api_key, api_url, Some(user.id.to_string()), user.email));
                 }
                 Ok(Err(error)) => ui::say(
                     Mark::Warn,
@@ -547,22 +552,14 @@ async fn sign_in(
     };
     let (api_key, email) = super::authenticate_fresh(signup_available).await?;
     let config = super::setup_client_config(&api_key);
-    super::persist_setup_credentials(&api_key, &config.api_url)?;
     let user_id =
         tokio::time::timeout(std::time::Duration::from_secs(5), client_for(&api_key).me())
             .await
             .ok()
             .and_then(Result::ok)
             .map(|user| user.id.to_string());
-    ui::say(
-        Mark::Ok,
-        "Signed in",
-        Some(&format!(
-            "{email} · saved to {}",
-            display_path(&super::credentials_file_path())
-        )),
-    );
-    Ok((api_key, user_id, email))
+    ui::say(Mark::Ok, "Signed in", Some(&email));
+    Ok((api_key, config.api_url, user_id, email))
 }
 
 fn initial_editors(
@@ -899,6 +896,7 @@ async fn finish(
 ) -> Result<()> {
     let Choices {
         api_key,
+        api_url,
         user_id: _,
         email,
         client,
@@ -915,6 +913,15 @@ async fn finish(
         learning_choice: _,
         claude_auto_memory_off,
     } = choices;
+
+    let credentials_saved = super::persist_setup_credentials(&api_key, &api_url)?;
+    if credentials_saved && !safe_edit::is_dry_run() {
+        ui::say(
+            Mark::Ok,
+            "Credentials saved",
+            Some(&display_path(&super::credentials_file_path())),
+        );
+    }
 
     let selected_project = materialize_project(&client, project).await?;
     if selected_project.is_none() {
@@ -1362,6 +1369,7 @@ mod tests {
 
         let choices = Choices {
             api_key: String::new(),
+            api_url: String::new(),
             user_id: None,
             email: "you@example.com".into(),
             client: client_for("test"),

@@ -477,7 +477,15 @@ fn existing_installation_id_at(path: &Path) -> std::io::Result<Option<Uuid>> {
 /// strict identity: an ephemeral UUID must never be written into user config.
 /// Existing malformed state therefore fails closed and remains byte-identical.
 pub fn ensure_installation_id() -> std::io::Result<Uuid> {
-    ensure_installation_id_at(&installation_path())
+    let path = installation_path();
+    let id = ensure_installation_id_at(&path)?;
+    if let Some(metadata) = RUNTIME_METADATA.get() {
+        metadata
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .installation_id = id;
+    }
+    Ok(id)
 }
 
 fn ensure_installation_id_at(path: &Path) -> std::io::Result<Uuid> {
@@ -569,7 +577,16 @@ pub fn replace_configured_clients(client_names: &[String]) -> std::io::Result<()
     if !installation_state_persistence_enabled() {
         return Ok(());
     }
-    replace_configured_clients_at(&installation_path(), client_names)
+    let path = installation_path();
+    replace_configured_clients_at(&path, client_names)?;
+    if let Ok(Some(state)) = read_state(&path) {
+        if let Some(metadata) = RUNTIME_METADATA.get() {
+            let mut guard = metadata.write().unwrap_or_else(|error| error.into_inner());
+            guard.installation_id = state.installation_id;
+            guard.configured_clients = state.configured_clients;
+        }
+    }
+    Ok(())
 }
 
 fn replace_configured_clients_at(path: &Path, client_names: &[String]) -> std::io::Result<()> {

@@ -2528,6 +2528,16 @@ pub(crate) fn apply_claude_auto_memory_default(editors: &[editors::Editor]) {
     if keep_claude_auto_memory() || !editors.contains(&editors::Editor::ClaudeCode) {
         return;
     }
+    if safe_edit::is_dry_run() {
+        if hooks::claude_auto_memory_setting() != Some(hooks::ClaudeAutoMemory::Off) {
+            ui::say(
+                ui::Mark::Info,
+                "Would turn Claude auto memory off",
+                Some("memories and preferences go to ContextStream"),
+            );
+        }
+        return;
+    }
     match hooks::disable_claude_auto_memory() {
         Ok(true) => ui::say(
             ui::Mark::Ok,
@@ -2986,6 +2996,9 @@ async fn run_setup_noninteractive(
                 .iter()
                 .any(mcp_config::editor_supports_remote_mcp);
 
+    let _dry_run_auto_memory_guard = hooks::setup_dry_run_auto_memory_off_guard(
+        safe_edit::is_dry_run() && !keep_claude_auto_memory(),
+    );
     for editor in &editors_to_configure {
         configure_editor_with_workspace(
             &client,
@@ -2999,6 +3012,7 @@ async fn run_setup_noninteractive(
         )
         .await?;
     }
+    drop(_dry_run_auto_memory_guard);
     apply_claude_auto_memory_default(&editors_to_configure);
     let binding_established = if let Some(project_path) = configured_project_path {
         if let Some(ref workspace) = workspace {
@@ -3051,8 +3065,13 @@ async fn run_setup_noninteractive(
             (false, false)
         };
 
-    let report = doctor::build_report(configured_project_path, &editors_to_configure).await;
-    doctor::print_setup_health_report(&report);
+    let doctor_healthy = if safe_edit::is_dry_run() {
+        true
+    } else {
+        let report = doctor::build_report(configured_project_path, &editors_to_configure).await;
+        doctor::print_setup_health_report(&report);
+        !report.has_setup_failures()
+    };
     let outcome = setup_completion_evidence(
         editors_to_configure.len(),
         editors_to_configure
@@ -3064,7 +3083,7 @@ async fn run_setup_noninteractive(
         binding_established,
         index_started,
         awaiting_first_files,
-        !report.has_setup_failures(),
+        doctor_healthy,
         account_only,
         safe_edit::is_dry_run(),
     );

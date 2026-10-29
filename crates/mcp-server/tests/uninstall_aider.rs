@@ -127,3 +127,65 @@ fn uninstall_removes_every_aider_file_that_setup_and_its_refreshes_created() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn uninstall_gives_a_persons_own_aider_configs_back_byte_for_byte() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = home.join("app");
+    std::fs::create_dir_all(&project).unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&project)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(project.join("README.md"), "# app\n").unwrap();
+    let own = [
+        (
+            home.join(".aider.conf.yml"),
+            "model: gpt-4o\nauto-commits: false\n",
+        ),
+        (project.join(".aider.conf.yml"), "dark-mode: true\n"),
+    ];
+    for (path, text) in &own {
+        std::fs::write(path, text).unwrap();
+    }
+
+    let output = run(
+        &home,
+        &project,
+        &["update-rules", "--scope", "all", "--editors", "aider"],
+    );
+    assert!(output.status.success());
+    for (path, text) in &own {
+        let written = std::fs::read_to_string(path).unwrap();
+        assert!(written.starts_with(text) && written.contains("<contextstream>"));
+    }
+
+    let output = run(
+        &home,
+        &project,
+        &["uninstall", "--scope", "all", "--editors", "aider"],
+    );
+    assert!(
+        output.status.success(),
+        "uninstall failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (path, text) in &own {
+        assert_eq!(
+            &std::fs::read_to_string(path).unwrap(),
+            text,
+            "{} is not as it was",
+            path.display()
+        );
+    }
+    let left = aider_leftovers(&home, &project);
+    assert!(
+        left.iter()
+            .all(|path| !path.ends_with(".contextstream.bak")),
+        "setup's copies of their files remain: {left:?}"
+    );
+}

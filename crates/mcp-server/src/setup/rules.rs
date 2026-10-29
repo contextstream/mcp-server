@@ -447,8 +447,40 @@ fn write_contextstream_block_to_path(
 
     let new_content =
         render_contextstream_block_for_path(&resolved_path, existing_content, &stamped_block)?;
-    safe_edit::write_public_if_unchanged(&resolved_path, &new_content, existing.as_deref())?;
+    let skip_backup = existing
+        .as_deref()
+        .is_some_and(existing_rules_file_is_wholly_owned)
+        && !safe_edit::backup_path(&resolved_path)?.exists();
+    if skip_backup {
+        safe_edit::write_public_owned_file_if_unchanged(
+            &resolved_path,
+            &new_content,
+            existing.as_deref(),
+        )?;
+    } else {
+        safe_edit::write_public_if_unchanged(&resolved_path, &new_content, existing.as_deref())?;
+    }
     Ok(true)
+}
+
+fn existing_rules_file_is_wholly_owned(content: &str) -> bool {
+    let Some((start_pos, end_pos)) = find_contextstream_block_bounds(content) else {
+        return false;
+    };
+    let block = &content[start_pos..end_pos];
+    if (!block.contains(CONTEXTSTREAM_END) && !block.contains(LEGACY_END))
+        || !contextstream_rules_block_is_owned(block)
+    {
+        return false;
+    }
+    let prefix_owned = content[..start_pos].trim().is_empty()
+        || [WINDSURF_ALWAYS_ON_FRONTMATTER, CURSOR_MDC_FRONTMATTER]
+            .into_iter()
+            .any(|frontmatter| {
+                content.starts_with(frontmatter)
+                    && content[..start_pos].trim_end() == frontmatter.trim_end()
+            });
+    prefix_owned && content[end_pos..].trim().is_empty()
 }
 
 fn render_contextstream_block_for_path(
@@ -1168,7 +1200,15 @@ fn write_copilot_skill_file(project_path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    safe_edit::write_public_if_unchanged(&skill_path, &content, existing.as_deref())?;
+    if existing.is_some() && !safe_edit::backup_path(&skill_path)?.exists() {
+        safe_edit::write_public_owned_file_if_unchanged(
+            &skill_path,
+            &content,
+            existing.as_deref(),
+        )?;
+    } else {
+        safe_edit::write_public_if_unchanged(&skill_path, &content, existing.as_deref())?;
+    }
     Ok(())
 }
 

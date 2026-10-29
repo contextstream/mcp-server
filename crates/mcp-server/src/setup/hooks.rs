@@ -483,8 +483,33 @@ pub fn install_binary_bytes(target: &Path, bytes: &[u8]) -> Result<String> {
     Ok(version)
 }
 
+/// Executing a file that was just written can fail with "Text file busy" on
+/// Unix when another thread or process forked while the file was still open for
+/// writing: the child holds the descriptor until it execs. It clears within
+/// milliseconds, so it is retried rather than reported as a broken binary.
+fn is_text_file_busy(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ETXTBSY)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 fn verify_binary_runs(path: &Path) -> Result<String> {
-    let output = std::process::Command::new(path).arg("--version").output();
+    let mut busy_retries = 0;
+    let output = loop {
+        match std::process::Command::new(path).arg("--version").output() {
+            Err(error) if is_text_file_busy(&error) && busy_retries < 40 => {
+                busy_retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            other => break other,
+        }
+    };
 
     match output {
         Ok(o) if o.status.success() => {
@@ -3265,6 +3290,18 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         assert_eq!(helper_problem_at(&path), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_text_file_is_retried_not_reported_as_a_broken_binary() {
+        assert!(is_text_file_busy(&std::io::Error::from_raw_os_error(
+            libc::ETXTBSY
+        )));
+        assert!(!is_text_file_busy(&std::io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+        assert!(!is_text_file_busy(&std::io::Error::other("something else")));
     }
 
     #[cfg(unix)]

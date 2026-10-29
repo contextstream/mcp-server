@@ -98,6 +98,30 @@ pub struct EntityInput {
     pub body: Option<Value>,
     /// Query / filter params for list. Object whose keys map to query params.
     pub query: Option<Value>,
+    /// Entity fields given beside `body` (`title="..."` at the top level, as
+    /// other tools take them). Create and update fold them into `body`; a key
+    /// in `body` wins (#277).
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+/// Top-level arguments that describe the call, never the entity.
+const NON_ENTITY_ARGUMENTS: &[&str] = &["session_id", "format", "output_format", "_meta"];
+
+/// `body` plus the entity fields given at the top level; `body` wins.
+fn body_with_top_level_fields(
+    body: Option<Value>,
+    extra: &serde_json::Map<String, Value>,
+) -> Value {
+    let mut body = body.unwrap_or_else(|| serde_json::json!({}));
+    if let Some(object) = body.as_object_mut() {
+        for (key, value) in extra {
+            if !NON_ENTITY_ARGUMENTS.contains(&key.as_str()) {
+                object.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+    body
 }
 
 /// Unified entity tool handler.
@@ -875,11 +899,16 @@ impl ToolHandler for EntityTool {
             }
 
             "create" => {
-                let mut body = input.body.unwrap_or_else(|| serde_json::json!({}));
+                let mut body = body_with_top_level_fields(input.body, &input.extra);
                 if !body.is_object() {
                     return Err(Error::Validation(
                         "body must be a JSON object for create".to_string(),
                     ));
+                }
+                if body.as_object().is_some_and(|fields| fields.is_empty()) {
+                    return Err(Error::Validation(format!(
+                        "create needs the {kind}'s fields, e.g. body={{\"title\": \"...\"}}"
+                    )));
                 }
                 let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
                 Self::inject_scope_into_body(&mut body, &ws, &proj);
@@ -923,6 +952,18 @@ impl ToolHandler for EntityTool {
             }
 
             "update" => {
+                let merged_body = body_with_top_level_fields(input.body.clone(), &input.extra);
+                // An update with nothing to change would report "Updated" and
+                // change nothing.
+                if merged_body
+                    .as_object()
+                    .is_some_and(|fields| fields.is_empty())
+                {
+                    return Err(Error::Validation(
+                        "update needs at least one field to change, e.g. body={\"title\": \"...\"} or body={\"status\": \"...\"}"
+                            .to_string(),
+                    ));
+                }
                 let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
                 let lookup = input
                     .id
@@ -935,11 +976,7 @@ impl ToolHandler for EntityTool {
                 // each kind's statuses are defined by the API, not here. So
                 // every update that sets a status is resolved as strictly as a
                 // delete.
-                let status = input
-                    .body
-                    .as_ref()
-                    .and_then(|body| body.get("status"))
-                    .and_then(Value::as_str);
+                let status = merged_body.get("status").and_then(Value::as_str);
                 let (action, _) = lookup::update_action(status, &[]);
                 let hint = action.destructive.then_some(STATUS_CHANGE_HINT);
                 let found = match self
@@ -952,7 +989,7 @@ impl ToolHandler for EntityTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let mut body = input.body.unwrap_or_else(|| serde_json::json!({}));
+                let mut body = merged_body;
                 if !body.is_object() {
                     return Err(Error::Validation(
                         "body must be a JSON object for update".to_string(),
@@ -1156,6 +1193,34 @@ pub fn register_entity_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_level_entity_fields_join_the_body_and_body_wins() {
+        let input: EntityInput = serde_json::from_value(serde_json::json!({
+            "kind": "risk",
+            "action": "update",
+            "id": "x",
+            "title": "RENAMED",
+            "summary": "from the top level",
+            "session_id": "never-an-entity-field",
+            "body": {"summary": "from body"}
+        }))
+        .expect("input");
+        let body = body_with_top_level_fields(input.body, &input.extra);
+        assert_eq!(body["title"], "RENAMED");
+        assert_eq!(body["summary"], "from body");
+        assert!(body.get("session_id").is_none());
+        assert!(body.get("kind").is_none() && body.get("id").is_none());
+
+        let bare: EntityInput = serde_json::from_value(serde_json::json!({
+            "kind": "risk", "action": "update", "id": "x"
+        }))
+        .expect("input");
+        assert_eq!(
+            body_with_top_level_fields(bare.body, &bare.extra),
+            serde_json::json!({})
+        );
+    }
     use mcp_types::Config;
 
     const WORKSPACE_ID: &str = "11111111-1111-1111-1111-111111111111";

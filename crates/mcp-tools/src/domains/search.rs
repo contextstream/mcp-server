@@ -3817,6 +3817,92 @@ fn result_confidence_band(item: Option<&mcp_types::api::SearchResult>) -> &'stat
 }
 
 /// The server's literal account, as one line for the agent (`[LITERAL] ...`).
+/// Rows a ranked search scored at 0% are noise, not results (#289): drop
+/// them and count only the rows kept. An exact literal hit stays whatever its
+/// score.
+fn drop_zero_score_rows(response: &mut SearchResponse, executed_mode: SearchMode) -> usize {
+    if !matches!(executed_mode, SearchMode::Semantic | SearchMode::Hybrid) {
+        return 0;
+    }
+    let before = response.results.len();
+    response.results.retain(|item| {
+        let exact = item
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("literal_match"))
+            .and_then(Value::as_str)
+            == Some("exact");
+        exact
+            || item
+                .score
+                .is_none_or(|score| (score * 100.0).round() >= 1.0)
+    });
+    let dropped = before - response.results.len();
+    if dropped > 0 {
+        if let Some(total) = response.total.as_mut() {
+            *total = (*total - dropped as i64).max(response.results.len() as i64);
+        }
+    }
+    dropped
+}
+
+/// Whether the rows' shown percentages never rise down the list. A rerank can
+/// put a lower-scored row first; then no percentage is shown rather than one
+/// that contradicts the order (#289).
+fn scores_follow_order(rows: &[&mcp_types::api::SearchResult]) -> bool {
+    let shown: Vec<i64> = rows
+        .iter()
+        .filter_map(|row| row.score)
+        .map(|score| (score * 100.0).round() as i64)
+        .collect();
+    shown.windows(2).all(|pair| pair[0] >= pair[1])
+}
+
+#[cfg(test)]
+mod score_display_tests {
+    use super::*;
+
+    fn row(path: &str, score: f64) -> mcp_types::api::SearchResult {
+        mcp_types::api::SearchResult {
+            file_path: Some(path.to_string()),
+            score: Some(score),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zero_percent_rows_are_not_results() {
+        let mut exact = row("b.rs", 0.0);
+        exact.metadata = Some(serde_json::json!({"literal_match": "exact"}));
+        let mut response = SearchResponse {
+            results: vec![
+                row("a.rs", 0.96),
+                row("CLAUDE.md", 0.004),
+                exact,
+                row("c.rs", 0.06),
+            ],
+            total: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(drop_zero_score_rows(&mut response, SearchMode::Keyword), 0);
+        assert_eq!(drop_zero_score_rows(&mut response, SearchMode::Semantic), 1);
+        let paths: Vec<_> = response
+            .results
+            .iter()
+            .filter_map(|r| r.file_path.as_deref())
+            .collect();
+        assert_eq!(paths, ["a.rs", "b.rs", "c.rs"]);
+        assert_eq!(response.total, Some(3));
+    }
+
+    #[test]
+    fn a_percentage_is_shown_only_when_it_follows_the_order() {
+        let (a, b, c) = (row("a", 1.0), row("b", 0.96), row("c", 0.22));
+        assert!(scores_follow_order(&[&a, &b, &c]));
+        assert!(!scores_follow_order(&[&a, &c, &b]));
+    }
+}
+
 fn literal_match_banner(result: &SearchResponse) -> Option<String> {
     let statement = result
         .literal_match
@@ -12653,6 +12739,7 @@ impl SearchTool {
             }
         }
 
+        drop_zero_score_rows(&mut result, executed_mode);
         let no_hits = result.total.unwrap_or(result.results.len() as i64) == 0;
         let stale_reingest_note = if !no_hits {
             if let Some(ref health) = index_health {
@@ -13534,14 +13621,22 @@ impl SearchTool {
                 let output_budget = search_text_output_budget();
                 let mut idx = 0;
                 let mut omitted_rows = 0usize;
+                let show_scores = scores_follow_order(&code_results);
                 for item in &code_results {
                     if text.len() >= output_budget {
                         omitted_rows = code_results.len().saturating_sub(idx);
                         break;
                     }
                     idx += 1;
+                    let line = if show_scores {
+                        format_result_line(idx, item, show_content)
+                    } else {
+                        let mut unscored = (*item).clone();
+                        unscored.score = None;
+                        format_result_line(idx, &unscored, show_content)
+                    };
                     text.push_str(&label_widened_scope_row(
-                        format_result_line(idx, item, show_content),
+                        line,
                         widened_row_label(item).as_deref(),
                     ));
                 }

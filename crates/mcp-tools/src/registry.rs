@@ -1919,11 +1919,9 @@ const LISTED_PER_CALLER: &[&str] = &[
     crate::domains::studio::TOOL_NAME,
 ];
 
-/// Whether `name` is listed per caller rather than from the registry. The
-/// read-only twins (`domains::read_only`) are too: the hosted gateway lists
-/// them for a client that confirms every call that may write.
+/// Whether `name` is listed per caller rather than from the registry.
 pub fn is_listed_per_caller(name: &str) -> bool {
-    LISTED_PER_CALLER.contains(&name) || crate::domains::read_only::is_read_only_twin(name)
+    LISTED_PER_CALLER.contains(&name)
 }
 
 /// Check if tool is a router direct tool (exposed in router mode).
@@ -2498,6 +2496,12 @@ const OPENAI_AGENTIC_CORE_TOOLS: &[&str] = &[
     "project",
     "workspace",
     "help",
+    // The read-only twins of memory, project, session and workspace: reads
+    // that a client can run without asking its person to confirm (#330).
+    "memory_read",
+    "project_read",
+    "session_read",
+    "workspace_read",
 ];
 
 /// Tools exposed in router mode

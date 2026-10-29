@@ -170,6 +170,10 @@ impl ReadOnlyTwinTool {
 
 /// The tool's own schema with `action` narrowed to its read actions and
 /// required. Conditional rules at the root name write actions, so they go.
+/// The parameters keep their types and values but not their prose: the twin
+/// is listed beside its tool, whose schema documents every parameter, and
+/// copying that prose made each twin nearly as large as its tool (#330 retest:
+/// the four twins added 25 KB to every listing).
 fn twin_schema(twin: &ReadOnlyTwin, tool_schema: &Value) -> Value {
     let mut schema = tool_schema.clone();
     let Some(root) = schema.as_object_mut() else {
@@ -184,6 +188,9 @@ fn twin_schema(twin: &ReadOnlyTwin, tool_schema: &Value) -> Value {
         .or_insert_with(|| json!({}))
         .as_object_mut();
     if let Some(properties) = properties {
+        for property in properties.values_mut() {
+            strip_descriptions(property);
+        }
         properties.insert(
             "action".to_string(),
             json!({
@@ -207,6 +214,37 @@ fn twin_schema(twin: &ReadOnlyTwin, tool_schema: &Value) -> Value {
         }
     }
     schema
+}
+
+/// Remove the `description` of a parameter's schema and of the schemas
+/// nested in it. A nested parameter that is itself called `description`
+/// stays: only schema keywords are walked, never values or property names.
+fn strip_descriptions(schema: &mut Value) {
+    let Value::Object(map) = schema else {
+        return;
+    };
+    map.remove("description");
+    for (keyword, value) in map.iter_mut() {
+        match (keyword.as_str(), value) {
+            (
+                "properties" | "patternProperties" | "$defs" | "definitions",
+                Value::Object(named),
+            ) => {
+                for nested in named.values_mut() {
+                    strip_descriptions(nested);
+                }
+            }
+            ("anyOf" | "oneOf" | "allOf" | "prefixItems", Value::Array(nested)) => {
+                for item in nested {
+                    strip_descriptions(item);
+                }
+            }
+            ("items" | "additionalProperties" | "not" | "contains", nested) => {
+                strip_descriptions(nested)
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `Err` unless `input` names one of the twin's read actions.
@@ -291,6 +329,46 @@ mod tests {
                            "then": {"required": ["query"]}}]
             })
         }
+    }
+
+    #[test]
+    fn a_twin_schema_keeps_types_and_values_but_not_the_tools_prose() {
+        let tool_schema = json!({
+            "type": "object",
+            "description": "the tool",
+            "properties": {
+                "action": {"type": "string", "enum": ["search", "delete_doc"], "description": "long"},
+                "query": {"type": "string", "description": "What to look for, at length."},
+                "filters": {
+                    "type": "object",
+                    "description": "Filters.",
+                    "properties": {
+                        "tags": {"type": "array", "items": {"type": "string", "description": "A tag."}},
+                        "description": {"type": "string", "description": "A parameter with that name."}
+                    }
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10, "description": "How many."}
+            }
+        });
+        let schema = twin_schema(memory_twin(), &tool_schema);
+        let properties = &schema["properties"];
+        assert_eq!(properties["query"], json!({"type": "string"}));
+        assert_eq!(
+            properties["limit"],
+            json!({"type": "integer", "minimum": 1, "maximum": 100, "default": 10})
+        );
+        assert_eq!(
+            properties["filters"],
+            json!({"type": "object", "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "description": {"type": "string"}
+            }})
+        );
+        // The twin's own words stay: what it is, and what `action` reads.
+        assert_eq!(schema["description"], json!(memory_twin().description));
+        assert!(properties["action"]["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("only reads")));
     }
 
     fn memory_twin() -> &'static ReadOnlyTwin {

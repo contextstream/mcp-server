@@ -3348,6 +3348,7 @@ mod tests {
             None,
         );
         let openai_names = listed_names(&openai);
+        let (mut twins_bytes, mut tools_bytes) = (0, 0);
         for twin in domains::read_only::READ_ONLY_TWINS {
             assert!(
                 openai_names.contains(&twin.name),
@@ -3373,6 +3374,19 @@ mod tests {
                 entry["inputSchema"]["properties"]["action"]["enum"],
                 serde_json::json!(twin.actions)
             );
+            // A twin carries its tool's parameters without their prose (#330
+            // retest: copied prose made the four twins 25 KB).
+            let twin_bytes = entry["inputSchema"].to_string().len();
+            let tool_bytes = tool_by_name(&tools, twin.tool)["inputSchema"]
+                .to_string()
+                .len();
+            eprintln!(
+                "{}: {twin_bytes} bytes, {}: {tool_bytes} bytes",
+                twin.name, twin.tool
+            );
+            assert!(twin_bytes < tool_bytes, "{}", twin.name);
+            twins_bytes += twin_bytes;
+            tools_bytes += tool_bytes;
             let tool_actions = tool_by_name(&tools, twin.tool)["inputSchema"]["properties"]
                 ["action"]["enum"]
                 .as_array()
@@ -3387,6 +3401,10 @@ mod tests {
                 );
             }
         }
+        assert!(
+            twins_bytes * 2 < tools_bytes,
+            "the twins' schemas are {twins_bytes} bytes, their tools' {tools_bytes}"
+        );
         // Never an operation: the adaptive surface's catalog stays as it was.
         for twin in domains::read_only::READ_ONLY_TWINS {
             assert!(registry.get_operation(twin.name).is_none(), "{}", twin.name);

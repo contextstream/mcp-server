@@ -1986,6 +1986,9 @@ fn parse_editor_ids(ids: &[String]) -> Result<Option<Vec<setup::editors::Editor>
 // --only-configured: a self-update must refresh the editors the user chose,
 // never expand to whatever happens to be installed on the machine.
 const UPDATE_HOOKS_ARGS: &[&str] = &["update-hooks", "--scope=global", "--only-configured"];
+/// Hosted-remote migration for the editors setup configured. Its last step
+/// refreshes the global hooks for those same editors.
+const MIGRATE_REMOTE_ARGS: &[&str] = &["migrate-remote", "--scope=all", "--only-configured"];
 const UPDATE_GLOBAL_RULES_ARGS: &[&str] = &["update-rules", "--scope=global", "--only-configured"];
 const UPDATE_PROJECT_RULES_ARGS: &[&str] =
     &["update-rules", "--scope=project", "--only-configured"];
@@ -2019,6 +2022,20 @@ fn post_update_editor_refresh_commands(refresh_project_rules: bool) -> Vec<PostU
     }
 
     commands
+}
+
+/// The refresh steps `update` still has to run. A successful
+/// `migrate-remote --scope=all --only-configured` has just refreshed the hooks
+/// of the same editors, so a separate hook refresh would only print every
+/// editor's result a second time (#302).
+fn post_update_steps(
+    refresh_project_rules: bool,
+    hooks_refreshed_by_migration: bool,
+) -> Vec<PostUpdateCommand> {
+    post_update_editor_refresh_commands(refresh_project_rules)
+        .into_iter()
+        .filter(|command| !(hooks_refreshed_by_migration && command.args == UPDATE_HOOKS_ARGS))
+        .collect()
 }
 
 fn update_banner(current: &str) {
@@ -2106,19 +2123,20 @@ async fn refresh_editor_integrations_after_update(
         api_key = Some(setup::ensure_authenticated_api_key().await?);
     }
 
-    if api_key.is_some() {
+    let migrated = api_key.is_some();
+    if migrated {
         update_detail("Ensuring MCP configs use the hosted remote gateway");
         run_post_update_command_with_installed_binary(
-            &["migrate-remote", "--scope=all", "--only-configured"],
+            MIGRATE_REMOTE_ARGS,
             "hosted remote migration",
         )
         .await?;
-        update_ok("Hosted remote MCP configs refreshed");
+        update_ok("Hosted remote MCP configs and hooks refreshed");
     } else {
         update_skip("No saved credentials found; skipped hosted remote config migration");
     }
 
-    for command in post_update_editor_refresh_commands(refresh_project_rules) {
+    for command in post_update_steps(refresh_project_rules, migrated) {
         update_detail(command.start_message);
         match run_post_update_command_with_installed_binary(command.args, command.description).await
         {
@@ -3288,7 +3306,7 @@ async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
 
     match verified_version {
         Some(version_str) => {
-            update_ok(format!("Installed {}", version_str));
+            update_ok(format!("Your PATH runs {}", version_str));
             if !latest.is_empty() && !version_str.contains(&latest) {
                 update_warn(format!(
                     "Expected version v{} but resolved binary reports: {}",
@@ -4188,6 +4206,31 @@ mod tests {
         assert!(args.contains(&UPDATE_HOOKS_ARGS));
         assert!(args.contains(&UPDATE_GLOBAL_RULES_ARGS));
         assert!(args.contains(&UPDATE_PROJECT_RULES_ARGS));
+    }
+
+    #[test]
+    fn a_successful_migration_has_already_refreshed_the_hooks() {
+        // The step `update` skips relies on the migration covering the same
+        // editors and refreshing global hooks as its last step.
+        assert!(MIGRATE_REMOTE_ARGS.contains(&"--scope=all"));
+        assert!(MIGRATE_REMOTE_ARGS.contains(&"--only-configured"));
+        assert!(UPDATE_HOOKS_ARGS.contains(&"--only-configured"));
+
+        let after_migration = post_update_steps(true, true);
+        let args: Vec<&[&str]> = after_migration.iter().map(|command| command.args).collect();
+        assert!(!args.contains(&UPDATE_HOOKS_ARGS));
+        assert!(args.contains(&UPDATE_GLOBAL_RULES_ARGS));
+        assert!(args.contains(&UPDATE_PROJECT_RULES_ARGS));
+
+        // Without a migration (no saved credentials) the hooks still refresh.
+        let without_migration = post_update_steps(false, false);
+        let args: Vec<&[&str]> = without_migration
+            .iter()
+            .map(|command| command.args)
+            .collect();
+        assert!(args.contains(&UPDATE_HOOKS_ARGS));
+        assert!(args.contains(&UPDATE_GLOBAL_RULES_ARGS));
+        assert!(!args.contains(&UPDATE_PROJECT_RULES_ARGS));
     }
 
     #[test]

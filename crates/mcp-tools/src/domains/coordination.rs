@@ -66,7 +66,11 @@ pub struct CoordinationInput {
     pub to: Option<String>,
 }
 
-const SCOPE_DEFAULTED_ACTIONS: &[&str] = &["check_in", "inbox", "list", "share", "settings"];
+// A notice action names its workspace so the API looks the notice up on that
+// workspace's home primary (#309).
+const SCOPE_DEFAULTED_ACTIONS: &[&str] = &[
+    "check_in", "inbox", "list", "share", "settings", "get", "ack", "reply", "dismiss",
+];
 
 fn fill_scope_defaults(
     input: &mut CoordinationInput,
@@ -162,7 +166,7 @@ impl ToolHandler for CoordinationTool {
                         project_id,
                         &session_id,
                         input.task_summary.as_deref(),
-                        input.metadata.as_ref(),
+                        Some(&metadata),
                     )
                     .await?;
                 Ok(ToolResult::with_structured(
@@ -198,7 +202,10 @@ impl ToolHandler for CoordinationTool {
                         result,
                     )),
                     Err(_) => {
-                        let result = self.client.get_coordination_notice(uuid).await?;
+                        let result = self
+                            .client
+                            .get_coordination_notice(uuid, workspace_id)
+                            .await?;
                         Ok(ToolResult::with_structured(
                             format_notice(&result, id),
                             result,
@@ -267,7 +274,10 @@ impl ToolHandler for CoordinationTool {
                     .ok_or_else(|| Error::Validation("notice_id is required for ack".into()))?;
                 let uuid = Uuid::parse_str(&notice_id)
                     .map_err(|_| Error::Validation("Invalid notice_id".into()))?;
-                let result = self.client.ack_coordination_notice(uuid).await?;
+                let result = self
+                    .client
+                    .ack_coordination_notice(uuid, workspace_id)
+                    .await?;
                 Ok(ToolResult::with_structured(
                     format!("Acked coordination notice {notice_id}"),
                     result,
@@ -286,7 +296,10 @@ impl ToolHandler for CoordinationTool {
                     .map(str::trim)
                     .filter(|m| !m.is_empty())
                     .ok_or_else(|| Error::Validation("message is required for reply".into()))?;
-                let result = self.client.reply_coordination_notice(uuid, message).await?;
+                let result = self
+                    .client
+                    .reply_coordination_notice(uuid, message, workspace_id)
+                    .await?;
                 Ok(ToolResult::with_structured(
                     format_reply(&result, &notice_id),
                     result,
@@ -299,7 +312,10 @@ impl ToolHandler for CoordinationTool {
                     .ok_or_else(|| Error::Validation("notice_id is required for dismiss".into()))?;
                 let uuid = Uuid::parse_str(&notice_id)
                     .map_err(|_| Error::Validation("Invalid notice_id".into()))?;
-                let result = self.client.dismiss_coordination_notice(uuid).await?;
+                let result = self
+                    .client
+                    .dismiss_coordination_notice(uuid, workspace_id)
+                    .await?;
                 Ok(ToolResult::with_structured(
                     format!("Dismissed coordination notice {notice_id}"),
                     result,

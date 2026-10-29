@@ -105,7 +105,7 @@ enum Commands {
     /// Guided account, editor, workspace, project, and indexing setup
     #[command(
         about = "Run the guided ContextStream MCP setup wizard",
-        long_about = "Run the guided ContextStream MCP setup wizard.\n\nThe wizard authenticates your account, detects supported editors, links an exact folder to a canonical workspace/project, writes hosted MCP configs and rules, registers the managed local sync bridge, and offers foreground or background indexing when files already exist. Empty folders are valid new projects: setup links them immediately and the bridge syncs files as they appear. The bridge is not a local MCP transport; it keeps machine-local folders, checkouts, and Git worktrees fresh for hosted MCP. A review step lets you go back before setup continues.\n\nWith --yes, setup runs non-interactively using saved credentials (or CONTEXTSTREAM_API_KEY), selected or auto-detected editors, and the hosted remote gateway. On accounts with several workspaces, pass --workspace-id (or set CONTEXTSTREAM_WORKSPACE_ID) unless the folder is already linked. Pass --project-path to link and index an exact folder. Without it, setup uses the current directory when it is safely scoped; HOME and filesystem roots are rejected, while ordinary empty folders are allowed. Use --account-only to intentionally skip project linking.\n\nTeam accounts: after login the wizard surfaces team workspace tips, shared skill discovery, and non-interactive refresh commands you can run later."
+        long_about = "Run the guided ContextStream MCP setup wizard.\n\nThe wizard authenticates your account, detects supported editors, links an exact folder to a canonical workspace/project, writes hosted MCP configs and rules, registers the managed local sync bridge, and offers foreground or background indexing when files already exist. Empty folders are valid new projects: setup links them immediately and the bridge syncs files as they appear. The bridge is not a local MCP transport; it keeps machine-local folders, checkouts, and Git worktrees fresh for hosted MCP. A review step lets you go back before setup continues.\n\nWith --yes, setup runs non-interactively using saved credentials (or CONTEXTSTREAM_API_KEY), selected or auto-detected editors, and the hosted remote gateway. On accounts with several workspaces, pass --workspace-id (or set CONTEXTSTREAM_WORKSPACE_ID) unless the folder is already linked. Pass --project-path to link and index an exact folder, --project-id to link an existing workspace project, or --project-name to create a project under a chosen name when the folder basename is already in use. Without --project-path, setup uses the current directory when it is safely scoped; HOME and filesystem roots are rejected, while ordinary empty folders are allowed. Use --account-only to intentionally skip project linking.\n\nTeam accounts: after login the wizard surfaces team workspace tips, shared skill discovery, and non-interactive refresh commands you can run later."
     )]
     Setup {
         /// Run non-interactively with defaults (saved credentials required)
@@ -147,6 +147,26 @@ enum Commands {
         /// uses the folder's link, then CONTEXTSTREAM_WORKSPACE_ID.
         #[arg(long, value_name = "UUID", requires = "yes")]
         workspace_id: Option<String>,
+
+        /// Existing project UUID to link with --yes (disambiguates same-name
+        /// folders or links a second checkout without a Git remote).
+        #[arg(
+            long,
+            value_name = "UUID",
+            requires = "yes",
+            conflicts_with_all = ["account_only", "project_name"]
+        )]
+        project_id: Option<String>,
+
+        /// Project name to create with --yes instead of the folder basename
+        /// (for example when another project already uses that folder name).
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "yes",
+            conflicts_with_all = ["account_only", "project_id"]
+        )]
+        project_name: Option<String>,
 
         /// Leave Claude Code auto memory on. By default setup turns it off so
         /// memories and preferences are saved to ContextStream instead of
@@ -992,6 +1012,8 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             project_path,
             account_only,
             workspace_id,
+            project_id,
+            project_name,
             dry_run,
             keep_claude_auto_memory,
         }) => {
@@ -1023,12 +1045,14 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                 .await
                 .map(|_| true)
             } else {
-                setup::run_setup_with_learning_choice(
+                setup::run_setup_with_project_overrides(
                     yes,
                     explicit.as_deref(),
                     project_path.as_deref(),
                     account_only,
                     workspace_id.as_deref(),
+                    project_id.as_deref(),
+                    project_name.as_deref(),
                     account_learning.map(|choice| choice.as_bool()),
                 )
                 .await
@@ -4327,6 +4351,98 @@ mod tests {
             "11111111-1111-1111-1111-111111111111",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn setup_cli_accepts_project_id_and_project_name_for_non_interactive_runs() {
+        let with_id = Cli::try_parse_from([
+            "contextstream-mcp",
+            "setup",
+            "--yes",
+            "--project-id",
+            "33333333-3333-4333-8333-333333333333",
+        ])
+        .expect("--yes --project-id should parse");
+        match with_id.command {
+            Some(Commands::Setup {
+                project_id,
+                project_name,
+                ..
+            }) => {
+                assert_eq!(
+                    project_id.as_deref(),
+                    Some("33333333-3333-4333-8333-333333333333")
+                );
+                assert!(project_name.is_none());
+            }
+            _ => panic!("expected setup command"),
+        }
+
+        let with_name = Cli::try_parse_from([
+            "contextstream-mcp",
+            "setup",
+            "--yes",
+            "--project-name",
+            "qa-shared-name-2",
+        ])
+        .expect("--yes --project-name should parse");
+        match with_name.command {
+            Some(Commands::Setup {
+                project_id,
+                project_name,
+                ..
+            }) => {
+                assert!(project_id.is_none());
+                assert_eq!(project_name.as_deref(), Some("qa-shared-name-2"));
+            }
+            _ => panic!("expected setup command"),
+        }
+
+        // Requires --yes, conflicts with each other, and conflicts with --account-only.
+        for bad_args in [
+            vec![
+                "contextstream-mcp",
+                "setup",
+                "--project-id",
+                "33333333-3333-4333-8333-333333333333",
+            ],
+            vec![
+                "contextstream-mcp",
+                "setup",
+                "--project-name",
+                "qa-shared-name-2",
+            ],
+            vec![
+                "contextstream-mcp",
+                "setup",
+                "--yes",
+                "--project-id",
+                "33333333-3333-4333-8333-333333333333",
+                "--project-name",
+                "qa-shared-name-2",
+            ],
+            vec![
+                "contextstream-mcp",
+                "setup",
+                "--yes",
+                "--account-only",
+                "--project-id",
+                "33333333-3333-4333-8333-333333333333",
+            ],
+            vec![
+                "contextstream-mcp",
+                "setup",
+                "--yes",
+                "--account-only",
+                "--project-name",
+                "qa-shared-name-2",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(bad_args.clone()).is_err(),
+                "expected clap rejection for {bad_args:?}"
+            );
+        }
     }
 
     #[test]

@@ -14,8 +14,8 @@ use super::{read_stdin_json, write_stdout_json, HookOutput};
 /// Handle the Stop/SessionEnd hook.
 pub async fn handle() -> Result<()> {
     if std::env::var("CONTEXTSTREAM_SESSION_END_ENABLED")
-        .map(|v| v == "false")
-        .unwrap_or(false)
+        .ok()
+        .is_some_and(|v| super::common::parse_hook_bool(&v) == Some(false))
     {
         // Silent exit - no output needed for Stop hooks
         write_stdout_json(&HookOutput::empty())?;
@@ -126,138 +126,19 @@ struct ApiConfig {
     save_transcript_default: bool,
 }
 
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn read_mcp_json_env_bool(path: &Path, key: &str) -> Option<bool> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let config: Value = serde_json::from_str(&content).ok()?;
-    let value = config
-        .get("mcpServers")?
-        .get("contextstream")?
-        .get("env")?
-        .get(key)?
-        .as_str()?;
-    parse_bool(value)
-}
-
 fn load_config(cwd: &str) -> ApiConfig {
-    let mut api_key = std::env::var("CONTEXTSTREAM_API_KEY").unwrap_or_default();
-    let mut api_url = std::env::var("CONTEXTSTREAM_API_URL")
-        .unwrap_or_else(|_| "https://api.contextstream.io".to_string());
-    let mut workspace_id = std::env::var("CONTEXTSTREAM_WORKSPACE_ID").ok();
-    let mut project_id: Option<String> = None;
-    let mut save_transcript_default = std::env::var("CONTEXTSTREAM_SESSION_END_SAVE_TRANSCRIPT")
-        .ok()
-        .and_then(|v| parse_bool(&v))
-        .or_else(|| {
-            std::env::var("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED")
-                .ok()
-                .and_then(|v| parse_bool(&v))
-        })
-        .or_else(|| {
-            std::env::var("CONTEXTSTREAM_TRANSCRIPTS_ENABLED")
-                .ok()
-                .and_then(|v| parse_bool(&v))
-        });
-
-    let mut search_dir = std::path::PathBuf::from(cwd);
-    for _ in 0..5 {
-        let mcp_path = search_dir.join(".mcp.json");
-        if api_key.is_empty() {
-            if let Some((key, url)) = read_mcp_json_credentials(&mcp_path) {
-                api_key = key;
-                if let Some(u) = url {
-                    api_url = u;
-                }
-            }
-        }
-        if save_transcript_default.is_none() {
-            save_transcript_default =
-                read_mcp_json_env_bool(&mcp_path, "CONTEXTSTREAM_SESSION_END_SAVE_TRANSCRIPT")
-                    .or_else(|| {
-                        read_mcp_json_env_bool(&mcp_path, "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED")
-                    })
-                    .or_else(|| {
-                        read_mcp_json_env_bool(&mcp_path, "CONTEXTSTREAM_TRANSCRIPTS_ENABLED")
-                    });
-        }
-        if workspace_id.is_none() || project_id.is_none() {
-            let cs_config = search_dir.join(".contextstream").join("config.json");
-            if let Ok(content) = std::fs::read_to_string(&cs_config) {
-                if let Ok(cfg) = serde_json::from_str::<Value>(&content) {
-                    if workspace_id.is_none() {
-                        workspace_id = cfg
-                            .get("workspace_id")
-                            .and_then(|w| w.as_str())
-                            .map(String::from);
-                    }
-                    if project_id.is_none() {
-                        project_id = cfg
-                            .get("project_id")
-                            .and_then(|p| p.as_str())
-                            .map(String::from);
-                    }
-                }
-            }
-        }
-        if !search_dir.pop() {
-            break;
-        }
-    }
-
-    if api_key.is_empty() {
-        if let Some(home) = dirs::home_dir() {
-            let home_mcp = home.join(".mcp.json");
-            if let Some((key, url)) = read_mcp_json_credentials(&home_mcp) {
-                api_key = key;
-                if let Some(u) = url {
-                    api_url = u;
-                }
-            }
-            if save_transcript_default.is_none() {
-                save_transcript_default =
-                    read_mcp_json_env_bool(&home_mcp, "CONTEXTSTREAM_SESSION_END_SAVE_TRANSCRIPT")
-                        .or_else(|| {
-                            read_mcp_json_env_bool(
-                                &home_mcp,
-                                "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED",
-                            )
-                        })
-                        .or_else(|| {
-                            read_mcp_json_env_bool(&home_mcp, "CONTEXTSTREAM_TRANSCRIPTS_ENABLED")
-                        });
-            }
-        }
-    }
-
+    let resolved = super::common::load_transcript_hook_config(
+        cwd,
+        "CONTEXTSTREAM_SESSION_END_SAVE_TRANSCRIPT",
+        true,
+    );
     ApiConfig {
-        api_key,
-        api_url,
-        workspace_id,
-        project_id,
-        save_transcript_default: save_transcript_default.unwrap_or(false),
+        api_key: resolved.api_key,
+        api_url: resolved.api_url,
+        workspace_id: resolved.workspace_id,
+        project_id: resolved.project_id,
+        save_transcript_default: resolved.save_transcript_default,
     }
-}
-
-fn read_mcp_json_credentials(path: &Path) -> Option<(String, Option<String>)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let config: Value = serde_json::from_str(&content).ok()?;
-    let env = config.get("mcpServers")?.get("contextstream")?.get("env")?;
-    let key = env
-        .get("CONTEXTSTREAM_API_KEY")
-        .and_then(|k| k.as_str())?
-        .to_string();
-    let url = env
-        .get("CONTEXTSTREAM_API_URL")
-        .and_then(|u| u.as_str())
-        .map(String::from);
-    Some((key, url))
 }
 
 // ============================================================================

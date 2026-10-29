@@ -14,7 +14,7 @@ pub mod editors;
 pub mod git_hooks;
 mod hooks;
 pub mod local_memory_import;
-mod mcp_config;
+pub(crate) mod mcp_config;
 mod pending_connection;
 pub mod profile;
 mod prompts;

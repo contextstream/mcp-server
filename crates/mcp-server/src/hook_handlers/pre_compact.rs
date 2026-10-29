@@ -19,8 +19,8 @@ use super::{read_stdin_json, write_stdout_json, HookOutput};
 pub async fn handle() -> Result<()> {
     // Check if disabled
     if std::env::var("CONTEXTSTREAM_PRECOMPACT_ENABLED")
-        .map(|v| v == "false")
-        .unwrap_or(false)
+        .ok()
+        .is_some_and(|v| super::common::parse_hook_bool(&v) == Some(false))
     {
         write_stdout_json(&HookOutput::empty())?;
         return Ok(());
@@ -54,20 +54,14 @@ pub async fn handle() -> Result<()> {
         })
         .unwrap_or_default();
 
-    // Load config (API key, workspace ID) from env + local config files
+    // Load config (API key, API URL, workspace/project IDs, transcript policy)
+    // from env, remote/local editor MCP configs, and credentials.json.
     let config = load_config(&cwd);
-
-    // Parse transcript for context
-    let transcript_data = if !transcript_path.is_empty() && Path::new(transcript_path).exists() {
-        parse_transcript(transcript_path)
-    } else {
-        TranscriptData::default()
-    };
 
     // Auto-save if enabled and we have an API key (enabled by default).
     // Priority:
     // 1) Hook payload override (`transcripts_enabled` / `auto_save`)
-    // 2) Environment / .mcp.json policy
+    // 2) Environment / remote HTTP headers / local stdio env policy
     let auto_save = input
         .get("transcripts_enabled")
         .and_then(|v| v.as_bool())
@@ -76,6 +70,12 @@ pub async fn handle() -> Result<()> {
 
     let mut save_status = String::new();
     if auto_save && !config.api_key.is_empty() {
+        let transcript_data = if !transcript_path.is_empty() && Path::new(transcript_path).exists()
+        {
+            parse_transcript(transcript_path)
+        } else {
+            TranscriptData::default()
+        };
         let snapshot_result = save_snapshot(&config, session_id, &transcript_data, trigger).await;
         let transcript_result =
             save_full_transcript(&config, session_id, &transcript_data, trigger).await;
@@ -127,139 +127,19 @@ struct ApiConfig {
     auto_save_default: bool,
 }
 
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn read_mcp_json_env_bool(path: &Path, key: &str) -> Option<bool> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let config: Value = serde_json::from_str(&content).ok()?;
-    let value = config
-        .get("mcpServers")?
-        .get("contextstream")?
-        .get("env")?
-        .get(key)?
-        .as_str()?;
-    parse_bool(value)
-}
-
-/// Load API config from environment variables and local config files.
-/// Walks up directories (like TypeScript) to find .mcp.json and .contextstream/config.json.
 fn load_config(cwd: &str) -> ApiConfig {
-    let mut api_key = std::env::var("CONTEXTSTREAM_API_KEY").unwrap_or_default();
-    let mut api_url = std::env::var("CONTEXTSTREAM_API_URL")
-        .unwrap_or_else(|_| "https://api.contextstream.io".to_string());
-    let mut workspace_id = std::env::var("CONTEXTSTREAM_WORKSPACE_ID").ok();
-    let mut project_id = std::env::var("CONTEXTSTREAM_PROJECT_ID").ok();
-    let mut auto_save_default = std::env::var("CONTEXTSTREAM_PRECOMPACT_AUTO_SAVE")
-        .ok()
-        .and_then(|v| parse_bool(&v))
-        .or_else(|| {
-            std::env::var("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED")
-                .ok()
-                .and_then(|v| parse_bool(&v))
-        })
-        .or_else(|| {
-            std::env::var("CONTEXTSTREAM_TRANSCRIPTS_ENABLED")
-                .ok()
-                .and_then(|v| parse_bool(&v))
-        });
-
-    // Walk up directories to find config files
-    let mut search_dir = std::path::PathBuf::from(cwd);
-    for _ in 0..5 {
-        let mcp_path = search_dir.join(".mcp.json");
-        // Load API key from .mcp.json
-        if api_key.is_empty() {
-            if let Some((key, url)) = read_mcp_json_credentials(&mcp_path) {
-                api_key = key;
-                if let Some(u) = url {
-                    api_url = u;
-                }
-            }
-        }
-        if auto_save_default.is_none() {
-            auto_save_default =
-                read_mcp_json_env_bool(&mcp_path, "CONTEXTSTREAM_PRECOMPACT_AUTO_SAVE")
-                    .or_else(|| {
-                        read_mcp_json_env_bool(&mcp_path, "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED")
-                    })
-                    .or_else(|| {
-                        read_mcp_json_env_bool(&mcp_path, "CONTEXTSTREAM_TRANSCRIPTS_ENABLED")
-                    });
-        }
-
-        // Load workspace/project IDs from .contextstream/config.json
-        if workspace_id.is_none() || project_id.is_none() {
-            let cs_config = search_dir.join(".contextstream").join("config.json");
-            if let Some((ws_id, pid)) = read_contextstream_ids(&cs_config) {
-                if workspace_id.is_none() {
-                    workspace_id = ws_id;
-                }
-                if project_id.is_none() {
-                    project_id = pid;
-                }
-            }
-        }
-
-        if !search_dir.pop() {
-            break;
-        }
-    }
-
-    // Also check home directory for .mcp.json
-    if api_key.is_empty() {
-        if let Some(home) = dirs::home_dir() {
-            let home_mcp = home.join(".mcp.json");
-            if let Some((key, url)) = read_mcp_json_credentials(&home_mcp) {
-                api_key = key;
-                if let Some(u) = url {
-                    api_url = u;
-                }
-            }
-            if auto_save_default.is_none() {
-                auto_save_default =
-                    read_mcp_json_env_bool(&home_mcp, "CONTEXTSTREAM_PRECOMPACT_AUTO_SAVE")
-                        .or_else(|| {
-                            read_mcp_json_env_bool(
-                                &home_mcp,
-                                "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED",
-                            )
-                        })
-                        .or_else(|| {
-                            read_mcp_json_env_bool(&home_mcp, "CONTEXTSTREAM_TRANSCRIPTS_ENABLED")
-                        });
-            }
-        }
-    }
-
-    // Also check saved credentials
-    if api_key.is_empty() {
-        if let Some(home) = dirs::home_dir() {
-            let creds_path = home.join(".contextstream").join("credentials.json");
-            if let Ok(content) = std::fs::read_to_string(&creds_path) {
-                if let Ok(creds) = serde_json::from_str::<Value>(&content) {
-                    if let Some(key) = creds.get("api_key").and_then(|k| k.as_str()) {
-                        api_key = key.to_string();
-                    }
-                }
-            }
-        }
-    }
-
+    let resolved =
+        super::common::load_transcript_hook_config(cwd, "CONTEXTSTREAM_PRECOMPACT_AUTO_SAVE", true);
     ApiConfig {
-        api_key,
-        api_url,
-        workspace_id,
-        project_id,
-        auto_save_default: auto_save_default.unwrap_or(true),
+        api_key: resolved.api_key,
+        api_url: resolved.api_url,
+        workspace_id: resolved.workspace_id,
+        project_id: resolved.project_id,
+        auto_save_default: resolved.save_transcript_default,
     }
 }
 
+#[cfg(test)]
 /// Read API credentials from a .mcp.json file.
 fn read_mcp_json_credentials(path: &Path) -> Option<(String, Option<String>)> {
     let content = std::fs::read_to_string(path).ok()?;
@@ -277,6 +157,7 @@ fn read_mcp_json_credentials(path: &Path) -> Option<(String, Option<String>)> {
 }
 
 /// Read workspace/project IDs from a .contextstream/config.json file.
+#[cfg(test)]
 fn read_contextstream_ids(path: &Path) -> Option<(Option<String>, Option<String>)> {
     let content = std::fs::read_to_string(path).ok()?;
     let config: Value = serde_json::from_str(&content).ok()?;

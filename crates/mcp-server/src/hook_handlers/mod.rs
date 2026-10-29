@@ -396,8 +396,73 @@ fn handle_media_aware_hook() -> Result<()> {
     write_stdout_json(&HookOutput::context(media_aware_guidance().to_string()))
 }
 
+/// Whether editor lifecycle hooks are disabled via `CONTEXTSTREAM_HOOK_ENABLED`
+/// (`false`, `0`, `off`, or `no`, case-insensitive).
+pub fn editor_hooks_disabled() -> bool {
+    std::env::var("CONTEXTSTREAM_HOOK_ENABLED")
+        .ok()
+        .is_some_and(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+}
+
 /// Dispatch a hook by name.
 pub async fn dispatch_hook(name: &str) -> Result<()> {
+    if editor_hooks_disabled() {
+        match name {
+            // Managed local Git hooks have their own dedicated kill-switch
+            // (`CONTEXTSTREAM_GIT_CAPTURE=off` / `.contextstream/config.json`).
+            "git-post-commit" | "git-pre-push" | "git-post-checkout" | "git-post-merge" => {}
+            // Silent/detached editor hooks emit nothing on stdout.
+            "codex-notify" | mid_run_notices::BACKGROUND_POLL_HOOK => return Ok(()),
+            // Known JSON-stdout editor lifecycle hooks immediately no-op (`{}`).
+            "user-prompt-submit"
+            | "pre-tool-use"
+            | "package-bouncer"
+            | "post-tool-use"
+            | "post-write"
+            | "post-tool-use-failure"
+            | "git-bash-observed"
+            | "instructions-loaded"
+            | "session-start"
+            | "session-init"
+            | "stop"
+            | "stop-failure"
+            | "session-end"
+            | "subagent-start"
+            | "subagent-stop"
+            | "task-created"
+            | "task-completed"
+            | "teammate-idle"
+            | "notification"
+            | "agy-session-start"
+            | "agy-pre-invocation"
+            | "agy-post-tool-use"
+            | "mid-run-notices"
+            | "permission-request"
+            | "pre-compact"
+            | "post-compact"
+            | "on-save-intent"
+            | "config-change"
+            | "cwd-changed"
+            | "file-changed"
+            | "worktree-create"
+            | "worktree-remove"
+            | "elicitation"
+            | "elicitation-result"
+            | "media-aware"
+            | "on-read"
+            | "on-bash"
+            | "on-task"
+            | "on-web"
+            | "auto-rules" => return write_stdout_json(&HookOutput::empty()),
+            _ => {}
+        }
+    }
+
     match name {
         "user-prompt-submit" => user_prompt_submit::handle().await,
         "pre-tool-use" => pre_tool_use::handle().await,
@@ -760,5 +825,29 @@ mod tests {
         }
 
         assert_eq!(observed, "contextstream-mcp-rust/test");
+    }
+
+    #[test]
+    fn editor_hooks_disabled_parses_falsey_env_values() {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let prev = std::env::var("CONTEXTSTREAM_HOOK_ENABLED").ok();
+
+        for disabled in ["false", "FALSE", "0", "off", "OFF", "no", " false "] {
+            std::env::set_var("CONTEXTSTREAM_HOOK_ENABLED", disabled);
+            assert!(super::editor_hooks_disabled(), "{disabled}");
+        }
+        for enabled in ["true", "1", "on", "yes", ""] {
+            std::env::set_var("CONTEXTSTREAM_HOOK_ENABLED", enabled);
+            assert!(!super::editor_hooks_disabled(), "{enabled}");
+        }
+        std::env::remove_var("CONTEXTSTREAM_HOOK_ENABLED");
+        assert!(!super::editor_hooks_disabled());
+
+        match prev {
+            Some(v) => std::env::set_var("CONTEXTSTREAM_HOOK_ENABLED", v),
+            None => std::env::remove_var("CONTEXTSTREAM_HOOK_ENABLED"),
+        }
     }
 }

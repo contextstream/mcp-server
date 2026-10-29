@@ -15,6 +15,9 @@ pub const HARNESS_PROFILE_SCHEMA_VERSION: u16 = 1;
 /// Schema version for serialized harness readiness evidence.
 pub const HARNESS_READINESS_SCHEMA_VERSION: u16 = 1;
 
+/// The exact MCP `clientInfo.name` of the Gemini app's tool-call sessions.
+pub const GEMINI_APP_CLIENT_NAME: &str = "Gemini";
+
 /// A ContextStream-supported coding harness or first-party MCP host surface.
 ///
 /// Serialized ids are stable API/storage values. New variants must also be
@@ -259,7 +262,15 @@ impl HarnessId {
     ///
     /// Examples accepted: `Claude-Code/1.0`, `cursor 0.46`, and `codex`.
     /// Unknown prefixes remain unknown even if they contain a known name.
+    ///
+    /// The Gemini app (gemini.google.com custom apps) initializes its tool-call
+    /// sessions as exactly `Gemini`. It is a chat app in Google's cloud with no
+    /// files, rules or hooks, not Gemini CLI (which sends
+    /// `gemini-cli-mcp-client`), so that exact name resolves to no harness.
     pub fn from_client_hint(value: &str) -> Option<Self> {
+        if value.trim() == GEMINI_APP_CLIENT_NAME {
+            return None;
+        }
         let normalized = value.trim().to_ascii_lowercase();
         if let Some(id) = Self::from_alias(&normalized) {
             return Some(id);
@@ -872,6 +883,14 @@ mod tests {
                 "{client_info_name}"
             );
         }
+        // The Gemini app is not Gemini CLI; lowercase `gemini` (a model's own
+        // client_name) and Gemini CLI's clientInfo still are.
+        assert_eq!(HarnessId::from_client_hint(GEMINI_APP_CLIENT_NAME), None);
+        assert_eq!(HarnessId::from_client_hint(" Gemini "), None);
+        assert_eq!(
+            HarnessId::from_client_hint("gemini"),
+            Some(HarnessId::GeminiCli)
+        );
         assert_eq!(HarnessId::from_client_hint("Visual Studio"), None);
         assert_eq!(HarnessId::from_client_hint("cursor-vscode-fork"), None);
         assert_eq!(HarnessId::from_client_hint("my-cursor-proxy"), None);

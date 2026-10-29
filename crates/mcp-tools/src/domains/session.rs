@@ -14643,7 +14643,8 @@ impl ToolHandler for CapturePlanTool {
                 "steps",
                 serde_json::json!({
                     "type": "array",
-                    "description": "Structured plan steps. Required for useful plans; each description says what changes, where, and how it is verified in one to three sentences.",
+                    "minItems": 1,
+                    "description": "Structured plan steps, at least one; each description says what changes, where, and how it is verified in one to three sentences.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -14656,7 +14657,7 @@ impl ToolHandler for CapturePlanTool {
                         "required": ["id", "title", "order", "description"]
                     }
                 }),
-                false,
+                true,
             )
             .property(
                 "tasks",

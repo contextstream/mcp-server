@@ -645,10 +645,10 @@ enum Commands {
     /// Used by the remote-first install script as a fallback for config generation.
     /// Outputs a JSON payload containing config objects for each specified editor.
     #[command(
-        long_about = "Generate MCP config payloads as JSON without writing files.\n\nUsed by install scripts and team bootstrap automation. Pass --preauth to embed a validated API key so the editor can connect after it reloads the generated configuration."
+        long_about = "Generate MCP config payloads as JSON without writing files.\n\nUsed by install scripts and team bootstrap automation. Pass --preauth to embed a validated API key so the editor can connect after it reloads the generated configuration.\n\nLocal stdio config generation is opt-in only: pass --transport=local with CONTEXTSTREAM_ALLOW_LOCAL_MCP=1 (or after selecting local transport in `contextstream-mcp setup`)."
     )]
     GenerateConfigs {
-        /// Transport mode: remote or local
+        /// Transport mode: remote or local (local requires CONTEXTSTREAM_ALLOW_LOCAL_MCP=1 or a saved local transport marker)
         #[arg(long, default_value = "remote")]
         transport: String,
 
@@ -1535,21 +1535,23 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             } else {
                 None
             };
-            let requested_local = matches!(
-                transport.trim().to_ascii_lowercase().as_str(),
-                "local" | "binary" | "local-binary"
-            );
-            let normalized_transport = if requested_local && setup::local_mcp_allowed() {
-                "local"
-            } else {
-                if requested_local {
-                    eprintln!(
-                        "Ignoring local config generation request. Hosted remote gateway is the default; \
-                         set CONTEXTSTREAM_ALLOW_LOCAL_MCP=1 or run `contextstream-mcp setup` and choose \
-                         local transport (writes ~/.contextstream/setup-transport-mode)."
-                    );
+            let normalized_transport = match transport.trim().to_ascii_lowercase().as_str() {
+                "remote" | "http" | "hosted" | "hosted-remote" => "remote",
+                "local" | "binary" | "local-binary" => {
+                    if !setup::local_mcp_allowed() {
+                        eprintln!(
+                            "Refusing local MCP config generation without explicit opt-in. Hosted remote gateway is the default; \
+                             set CONTEXTSTREAM_ALLOW_LOCAL_MCP=1 or run `contextstream-mcp setup` and choose \
+                             local transport (writes ~/.contextstream/setup-transport-mode)."
+                        );
+                        std::process::exit(1);
+                    }
+                    "local"
                 }
-                "remote"
+                other => {
+                    eprintln!("Unknown --transport '{other}'. Use remote or local.");
+                    std::process::exit(2);
+                }
             };
 
             let result = setup::generate_all_configs_json(
@@ -4202,6 +4204,11 @@ mod tests {
             .to_string();
         assert!(help.contains("[env: CONTEXTSTREAM_API_KEY]"), "{help}");
         assert!(!help.contains("CONTEXTSTREAM_API_KEY="), "{help}");
+        assert!(
+            help.contains("CONTEXTSTREAM_ALLOW_LOCAL_MCP=1"),
+            "generate-configs --help must document CONTEXTSTREAM_ALLOW_LOCAL_MCP=1:
+{help}"
+        );
     }
 
     #[test]

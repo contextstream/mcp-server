@@ -3248,6 +3248,17 @@ async fn resolve_workspace_noninteractive(
         }
     }
 
+    if !account_only {
+        if let Some(sibling_ws_id) = sibling_checkout_workspace_id(cwd, &workspaces) {
+            if let Some(ws) = workspaces.iter().find(|w| w.id == sibling_ws_id) {
+                return Ok(Some(WorkspaceInfo {
+                    id: ws.id.to_string(),
+                    name: ws.name.clone(),
+                }));
+            }
+        }
+    }
+
     if let Some(id) = std::env::var(WORKSPACE_ID_ENV)
         .ok()
         .filter(|id| !id.trim().is_empty())
@@ -4559,11 +4570,264 @@ pub(crate) struct ProjectCandidates {
     pub(crate) checkout_repository_url: Option<String>,
     /// Projects bound to this checkout's Git remote.
     pub(crate) repository_matches: Vec<mcp_types::api::Project>,
+    /// Projects bound to a sibling checkout of the same Git repository on this machine.
+    pub(crate) sibling_checkout_matches: Vec<mcp_types::api::Project>,
     /// The folder's saved project, only when it still validates.
     pub(crate) linked_project: Option<mcp_types::api::Project>,
     pub(crate) legacy_folder_matches: Vec<mcp_types::api::Project>,
     /// The single project named like the folder (a display name, never identity).
     pub(crate) folder_match: Option<mcp_types::api::Project>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SiblingCheckoutLink {
+    pub(crate) workspace_id: Option<uuid::Uuid>,
+    pub(crate) project_id: uuid::Uuid,
+    pub(crate) is_main_checkout: bool,
+}
+
+pub(crate) fn read_machine_mappings_json() -> serde_json::Value {
+    dirs::home_dir()
+        .and_then(|home| {
+            std::fs::read_to_string(home.join(".contextstream").join("mappings.json")).ok()
+        })
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn upsert_sibling_checkout_link(
+    links: &mut Vec<SiblingCheckoutLink>,
+    workspace_id: Option<uuid::Uuid>,
+    project_id: uuid::Uuid,
+    is_main_checkout: bool,
+) {
+    if let Some(existing) = links.iter_mut().find(|item| item.project_id == project_id) {
+        if existing.workspace_id.is_none() {
+            existing.workspace_id = workspace_id;
+        }
+        existing.is_main_checkout |= is_main_checkout;
+    } else {
+        links.push(SiblingCheckoutLink {
+            workspace_id,
+            project_id,
+            is_main_checkout,
+        });
+    }
+}
+
+/// Discover verified sibling checkouts on this machine that share the same
+/// `git-common-dir-v1:` repository fingerprint (e.g. Git worktrees of a local
+/// repository that has no `origin` remote yet, or whose canonical project was
+/// created before adding a remote). Monorepo subpackage directories are
+/// excluded so subpackage links never bleed into checkout-root bindings or
+/// vice versa.
+pub(crate) fn sibling_checkout_links_from_sources(
+    cwd: &Path,
+    mappings: &serde_json::Value,
+) -> Vec<SiblingCheckoutLink> {
+    let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let Some(layout) = mcp_session::checkout_repository_layout(&canonical_cwd) else {
+        return Vec::new();
+    };
+    if canonical_cwd != layout.repository_root {
+        return Vec::new();
+    }
+    let Ok(fingerprint) = mcp_session::current_repository_fingerprint(&canonical_cwd) else {
+        return Vec::new();
+    };
+    let fp_str = fingerprint.as_str();
+    if !fp_str.starts_with("git-common-dir-v1:") {
+        return Vec::new();
+    }
+
+    let canonical_main = layout
+        .main_checkout
+        .as_deref()
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+
+    let mut links = Vec::new();
+
+    if let Some(main_root) = canonical_main
+        .as_ref()
+        .filter(|root| **root != canonical_cwd)
+    {
+        let main_cfg_path = main_root.join(".contextstream").join("config.json");
+        if let Ok(raw) = std::fs::read_to_string(&main_cfg_path) {
+            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let fp_matches = cfg
+                    .get("repository_fingerprint")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(fp_str);
+                let root_ok = cfg
+                    .get("checkout_root")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|stored| checkout_root_matches(Some(stored), main_root));
+                if fp_matches && root_ok {
+                    if let Some(project_id) = cfg
+                        .get("project_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|id| uuid::Uuid::parse_str(id.trim()).ok())
+                    {
+                        let workspace_id = cfg
+                            .get("workspace_id")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|id| uuid::Uuid::parse_str(id.trim()).ok());
+                        upsert_sibling_checkout_link(&mut links, workspace_id, project_id, true);
+                    }
+                }
+            }
+        }
+    }
+
+    let entries = mappings
+        .get("mappings")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| mappings.as_array());
+    if let Some(entries) = entries {
+        for entry in entries {
+            if entry
+                .get("repository_fingerprint")
+                .and_then(serde_json::Value::as_str)
+                != Some(fp_str)
+            {
+                continue;
+            }
+            let Some(raw_path) = entry.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let entry_path = Path::new(raw_path.trim_end_matches(['/', '\\']));
+            let canonical_entry = std::fs::canonicalize(entry_path).ok();
+
+            if entry_path == canonical_cwd
+                || entry_path.starts_with(&canonical_cwd)
+                || canonical_entry.as_ref().is_some_and(|canon| {
+                    *canon == canonical_cwd || canon.starts_with(&canonical_cwd)
+                })
+            {
+                continue;
+            }
+
+            if let Some(ref main_root) = canonical_main {
+                let subpackage_of_main = (entry_path.starts_with(main_root)
+                    && entry_path != main_root)
+                    || canonical_entry
+                        .as_ref()
+                        .is_some_and(|canon| canon.starts_with(main_root) && canon != main_root);
+                if subpackage_of_main {
+                    continue;
+                }
+            }
+
+            if let Some(ref canon) = canonical_entry {
+                let is_checkout_root = mcp_session::checkout_repository_layout(canon)
+                    .is_some_and(|entry_layout| entry_layout.repository_root == *canon);
+                if !is_checkout_root {
+                    continue;
+                }
+            }
+
+            let Some(project_id) = entry
+                .get("project_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| uuid::Uuid::parse_str(id.trim()).ok())
+            else {
+                continue;
+            };
+            let workspace_id = entry
+                .get("workspace_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| uuid::Uuid::parse_str(id.trim()).ok());
+            let is_main = canonical_main.as_ref().is_some_and(|main_root| {
+                entry_path == main_root || canonical_entry.as_ref() == Some(main_root)
+            });
+            upsert_sibling_checkout_link(&mut links, workspace_id, project_id, is_main);
+        }
+    }
+
+    links
+}
+
+pub(crate) fn sibling_checkout_workspace_id(
+    cwd: &Path,
+    available_workspaces: &[mcp_types::api::Workspace],
+) -> Option<uuid::Uuid> {
+    let links = sibling_checkout_links_from_sources(cwd, &read_machine_mappings_json());
+    let mut all_ws = Vec::new();
+    let mut main_ws = Vec::new();
+    for link in &links {
+        let Some(ws_id) = link.workspace_id else {
+            continue;
+        };
+        if !available_workspaces.iter().any(|ws| ws.id == ws_id) {
+            continue;
+        }
+        if !all_ws.contains(&ws_id) {
+            all_ws.push(ws_id);
+        }
+        if link.is_main_checkout && !main_ws.contains(&ws_id) {
+            main_ws.push(ws_id);
+        }
+    }
+    match all_ws.as_slice() {
+        [only] => Some(*only),
+        _ => match main_ws.as_slice() {
+            [only_main] => Some(*only_main),
+            _ => None,
+        },
+    }
+}
+
+pub(crate) fn resolve_sibling_checkout_projects(
+    cwd: &Path,
+    ws_id: Option<uuid::Uuid>,
+    existing_projects: &[mcp_types::api::Project],
+    checkout_repository_identity: Option<&mcp_session::RepositoryRemoteIdentity>,
+    mappings: &serde_json::Value,
+) -> Vec<mcp_types::api::Project> {
+    let links = sibling_checkout_links_from_sources(cwd, mappings);
+    let mut matched: Vec<(bool, mcp_types::api::Project)> = Vec::new();
+    for link in links {
+        if let (Some(expected_ws), Some(recorded_ws)) = (ws_id, link.workspace_id) {
+            if recorded_ws != expected_ws {
+                continue;
+            }
+        }
+        let Some(project) = existing_projects
+            .iter()
+            .find(|project| project.id == link.project_id)
+        else {
+            continue;
+        };
+        if !linked_project_repository_is_compatible(project, checkout_repository_identity) {
+            continue;
+        }
+        matched.push((link.is_main_checkout, project.clone()));
+    }
+
+    if matched.len() <= 1 {
+        return matched.into_iter().map(|(_, project)| project).collect();
+    }
+
+    let non_generated: Vec<(bool, mcp_types::api::Project)> = matched
+        .iter()
+        .filter(|(_, project)| !mcp_session::project_link::is_generated_name(&project.name))
+        .cloned()
+        .collect();
+    if non_generated.len() == 1 {
+        return vec![non_generated[0].1.clone()];
+    }
+    if non_generated.len() > 1 {
+        let main_non_generated: Vec<mcp_types::api::Project> = non_generated
+            .iter()
+            .filter(|(is_main, _)| *is_main)
+            .map(|(_, project)| project.clone())
+            .collect();
+        if main_non_generated.len() == 1 {
+            return main_non_generated;
+        }
+    }
+
+    matched.into_iter().map(|(_, project)| project).collect()
 }
 
 /// List the workspace's projects and classify them against `cwd`.
@@ -4673,6 +4937,14 @@ pub(crate) async fn gather_project_candidates(
         );
     }
 
+    let sibling_checkout_matches = resolve_sibling_checkout_projects(
+        cwd,
+        ws_id,
+        &existing_projects,
+        checkout_repository_identity.as_ref(),
+        &read_machine_mappings_json(),
+    );
+
     Ok(ProjectCandidates {
         ws_id,
         folder_project_name,
@@ -4680,6 +4952,7 @@ pub(crate) async fn gather_project_candidates(
         checkout_repository_identity,
         checkout_repository_url,
         repository_matches,
+        sibling_checkout_matches,
         linked_project,
         legacy_folder_matches,
         folder_match,
@@ -4835,6 +5108,7 @@ pub async fn select_project_for_current_directory_with_overrides(
         checkout_repository_identity,
         checkout_repository_url,
         repository_matches,
+        sibling_checkout_matches,
         linked_project,
         legacy_folder_matches,
         folder_match,
@@ -4865,6 +5139,19 @@ pub async fn select_project_for_current_directory_with_overrides(
                 if project.name.eq_ignore_ascii_case(requested_name) {
                     println!(
                         "{} Using project {} (matches Git repository)",
+                        CHECK,
+                        style(&project.name).cyan()
+                    );
+                    return Ok(Some(ProjectInfo {
+                        id: project.id.to_string(),
+                        name: project.name.clone(),
+                    }));
+                }
+            }
+            if let [project] = sibling_checkout_matches.as_slice() {
+                if project.name.eq_ignore_ascii_case(requested_name) {
+                    println!(
+                        "{} Using project {} (linked to sibling checkout)",
                         CHECK,
                         style(&project.name).cyan()
                     );
@@ -4965,6 +5252,26 @@ pub async fn select_project_for_current_directory_with_overrides(
                 );
             }
         }
+        match sibling_checkout_matches.as_slice() {
+            [project] => {
+                return Ok(Some(ProjectInfo {
+                    id: project.id.to_string(),
+                    name: project.name.clone(),
+                }))
+            }
+            [] => {}
+            duplicates => {
+                let ids = duplicates
+                    .iter()
+                    .map(|project| project.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "Multiple projects in workspace {} are linked to sibling checkouts of this Git repository ({ids}). Refusing to create or choose another duplicate during unattended setup; pass `--project-id <UUID>` to select the canonical project explicitly.",
+                    ws.id,
+                );
+            }
+        }
         if checkout_repository_identity.is_some() && !legacy_folder_matches.is_empty() {
             let ids = legacy_folder_matches
                 .iter()
@@ -5062,6 +5369,15 @@ pub async fn select_project_for_current_directory_with_overrides(
         if added.insert(project.id.to_string()) {
             options.push((
                 format!("{} · matches this Git repository", project.name),
+                ProjectChoice::Existing(ProjectInfo::from(project)),
+            ));
+        }
+    }
+
+    for project in &sibling_checkout_matches {
+        if added.insert(project.id.to_string()) {
+            options.push((
+                format!("{} · linked to a sibling checkout", project.name),
                 ProjectChoice::Existing(ProjectInfo::from(project)),
             ));
         }
@@ -6566,6 +6882,161 @@ mod tests {
             3,
             "selection must continue until the API returns an empty page"
         );
+    }
+
+    #[test]
+    fn sibling_checkout_matching_reuses_canonical_worktree_project_and_skips_subpackages() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let main_repo = temp.path().join("myapp");
+        std::fs::create_dir_all(&main_repo).expect("create main repo");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "dev@example.test"][..],
+            &["config", "user.name", "Dev"][..],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main_repo)
+                .status()
+                .expect("git init/config")
+                .success());
+        }
+        std::fs::write(
+            main_repo.join("README.md"),
+            "# myapp
+",
+        )
+        .expect("write readme");
+        assert!(std::process::Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&main_repo)
+            .status()
+            .expect("git add")
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(&main_repo)
+            .status()
+            .expect("git commit")
+            .success());
+
+        // Mint the shared git-common-dir-v1 repository fingerprint in <main>/.git/contextstream/repository-id.
+        let fingerprint = mcp_session::checkout_identity::ensure_checkout_fingerprint(
+            &main_repo,
+            mcp_session::CheckoutIdentityKind::Git,
+        )
+        .expect("mint git common-dir fingerprint");
+
+        let worktree = temp.path().join("myapp-worktree");
+        assert!(std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_string_lossy().as_ref(),
+                "-b",
+                "feat/login",
+            ])
+            .current_dir(&main_repo)
+            .status()
+            .expect("git worktree add")
+            .success());
+
+        let ws_id = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let canonical_id = uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let duplicate_wt_id =
+            uuid::Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
+        let subpkg_id = uuid::Uuid::parse_str("55555555-5555-4555-8555-555555555555").unwrap();
+
+        let subpkg_dir = main_repo.join("packages").join("web");
+        std::fs::create_dir_all(&subpkg_dir).expect("create subpackage");
+        let worktree_subpkg_dir = worktree.join("packages").join("mobile");
+        std::fs::create_dir_all(&worktree_subpkg_dir).expect("create worktree subpackage");
+
+        let old_worktree = temp.path().join("myapp-worktree-old");
+        let mappings = serde_json::json!({
+            "mappings": [
+                {
+                    "path": main_repo.canonicalize().unwrap().to_string_lossy(),
+                    "workspace_id": ws_id.to_string(),
+                    "project_id": canonical_id.to_string(),
+                    "repository_fingerprint": fingerprint.as_str()
+                },
+                {
+                    "path": old_worktree.to_string_lossy(),
+                    "workspace_id": ws_id.to_string(),
+                    "project_id": duplicate_wt_id.to_string(),
+                    "repository_fingerprint": fingerprint.as_str()
+                },
+                {
+                    "path": subpkg_dir.canonicalize().unwrap().to_string_lossy(),
+                    "workspace_id": ws_id.to_string(),
+                    "project_id": subpkg_id.to_string(),
+                    "repository_fingerprint": fingerprint.as_str()
+                }
+            ]
+        });
+
+        let make_project = |id: uuid::Uuid, name: &str| mcp_types::api::Project {
+            id,
+            name: name.to_string(),
+            description: None,
+            repository_url: None,
+            repository_type: None,
+            workspace_id: Some(ws_id),
+            path: None,
+            created_at: None,
+            updated_at: None,
+            indexed_at: None,
+            file_count: Some(1),
+        };
+        let existing = vec![
+            make_project(canonical_id, "myapp"),
+            make_project(duplicate_wt_id, "myapp-worktree-old"),
+            make_project(subpkg_id, "web"),
+        ];
+
+        // Worktree root resolves to canonical `myapp` (ignoring subpackage `web` and generated `myapp-worktree-old`).
+        let matched = super::resolve_sibling_checkout_projects(
+            &worktree,
+            Some(ws_id),
+            &existing,
+            None,
+            &mappings,
+        );
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, canonical_id);
+        assert_eq!(matched[0].name, "myapp");
+
+        // Subpackage directory inside worktree must NOT inherit checkout-root sibling project.
+        let subpkg_matched = super::resolve_sibling_checkout_projects(
+            &worktree_subpkg_dir,
+            Some(ws_id),
+            &existing,
+            None,
+            &mappings,
+        );
+        assert!(subpkg_matched.is_empty());
+
+        // If ONLY a subpackage was mapped (main repo root never mapped), worktree root must NOT match the subpackage project.
+        let subpkg_only_mappings = serde_json::json!({
+            "mappings": [
+                {
+                    "path": subpkg_dir.canonicalize().unwrap().to_string_lossy(),
+                    "workspace_id": ws_id.to_string(),
+                    "project_id": subpkg_id.to_string(),
+                    "repository_fingerprint": fingerprint.as_str()
+                }
+            ]
+        });
+        let subpkg_only_matched = super::resolve_sibling_checkout_projects(
+            &worktree,
+            Some(ws_id),
+            &existing,
+            None,
+            &subpkg_only_mappings,
+        );
+        assert!(subpkg_only_matched.is_empty());
     }
 
     #[test]

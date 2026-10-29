@@ -687,9 +687,17 @@ async fn choose_workspace(
                     .find(|workspace| workspace.id.to_string() == *id)
             })
         });
-        let (chosen, reason) = match (linked, workspaces.as_slice()) {
-            (Some(workspace), _) => (Some(workspace), "used by this folder before"),
-            (None, [only]) => (Some(only), ""),
+        let sibling_linked = if linked.is_none() {
+            project_path
+                .and_then(|path| super::sibling_checkout_workspace_id(path, &workspaces))
+                .and_then(|id| workspaces.iter().find(|workspace| workspace.id == id))
+        } else {
+            None
+        };
+        let (chosen, reason) = match (linked, sibling_linked, workspaces.as_slice()) {
+            (Some(workspace), _, _) => (Some(workspace), "used by this folder before"),
+            (None, Some(workspace), _) => (Some(workspace), "used by a sibling checkout"),
+            (None, None, [only]) => (Some(only), ""),
             _ => (None, ""),
         };
         if let Some(workspace) = chosen {
@@ -768,7 +776,19 @@ async fn plan_project(
     )
     .await?;
 
-    let plan = if let Some(project) = candidates.linked_project.as_ref() {
+    let plan = decide_unambiguous_project_plan(&candidates);
+
+    match plan {
+        Some(plan) => {
+            ui::say(Mark::Ok, "Project", Some(&plan.summary()));
+            Ok(plan)
+        }
+        None => pick_project(client, project_path, Some(workspace)).await,
+    }
+}
+
+fn decide_unambiguous_project_plan(candidates: &super::ProjectCandidates) -> Option<ProjectPlan> {
+    if let Some(project) = candidates.linked_project.as_ref() {
         Some(ProjectPlan::Existing {
             project: ProjectInfo::from(project),
             reason: "linked to this folder",
@@ -778,7 +798,15 @@ async fn plan_project(
             project: ProjectInfo::from(project),
             reason: "matches this Git repository",
         })
-    } else if candidates.repository_matches.is_empty() && candidates.folder_match.is_none() {
+    } else if let [project] = candidates.sibling_checkout_matches.as_slice() {
+        Some(ProjectPlan::Existing {
+            project: ProjectInfo::from(project),
+            reason: "linked to a sibling checkout",
+        })
+    } else if candidates.repository_matches.is_empty()
+        && candidates.sibling_checkout_matches.is_empty()
+        && candidates.folder_match.is_none()
+    {
         Some(ProjectPlan::Create {
             name: candidates.folder_project_name.clone(),
             workspace_id: candidates.ws_id,
@@ -786,14 +814,6 @@ async fn plan_project(
         })
     } else {
         None
-    };
-
-    match plan {
-        Some(plan) => {
-            ui::say(Mark::Ok, "Project", Some(&plan.summary()));
-            Ok(plan)
-        }
-        None => pick_project(client, project_path, Some(workspace)).await,
     }
 }
 
@@ -1501,6 +1521,46 @@ mod tests {
                 "restart to connect"
             )
         );
+    }
+
+    #[test]
+    fn wizard_project_plan_reuses_unique_sibling_checkout_before_creating_worktree_duplicate() {
+        let ws_id = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let proj_id = uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let sibling_project = mcp_types::api::Project {
+            id: proj_id,
+            name: "myapp".to_string(),
+            description: None,
+            repository_url: None,
+            repository_type: None,
+            workspace_id: Some(ws_id),
+            path: None,
+            created_at: None,
+            updated_at: None,
+            indexed_at: None,
+            file_count: Some(1),
+        };
+        let candidates = super::super::ProjectCandidates {
+            ws_id: Some(ws_id),
+            folder_project_name: "myapp-worktree".to_string(),
+            existing_projects: vec![sibling_project.clone()],
+            checkout_repository_identity: None,
+            checkout_repository_url: None,
+            repository_matches: Vec::new(),
+            sibling_checkout_matches: vec![sibling_project],
+            linked_project: None,
+            legacy_folder_matches: Vec::new(),
+            folder_match: None,
+        };
+        let plan = decide_unambiguous_project_plan(&candidates).expect("unambiguous sibling plan");
+        match plan {
+            ProjectPlan::Existing { project, reason } => {
+                assert_eq!(project.id, proj_id.to_string());
+                assert_eq!(project.name, "myapp");
+                assert_eq!(reason, "linked to a sibling checkout");
+            }
+            other => panic!("expected Existing sibling plan, got {:?}", other.summary()),
+        }
     }
 
     #[test]

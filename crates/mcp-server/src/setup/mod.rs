@@ -3399,10 +3399,12 @@ fn disclosure_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn data_collection_points(non_interactive: bool) -> [String; 6] {
+fn data_collection_points(non_interactive: bool) -> [String; 8] {
     let transcripts = disclosure_env_bool("CONTEXTSTREAM_TRANSCRIPTS_ENABLED", true);
     let hook_transcripts = disclosure_env_bool("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED", true);
     let git_capture = crate::config::git_capture_default_enabled();
+    let usage_metadata = mcp_client::activation::activation_enabled();
+    let coordination_notices = crate::hook_handlers::mid_run_notices::mid_run_notices_enabled();
     let index_behavior = if non_interactive {
         "starts in the background after a validated project binding"
     } else {
@@ -3416,6 +3418,8 @@ fn data_collection_points(non_interactive: bool) -> [String; 6] {
         format!("Project indexing {index_behavior}; matched source files are sent to your ContextStream workspace. Exclude files with gitignore-style rules in `.contextstream/ignore` (patterns relative to the project root) or a `.contextignore`; a file you exclude after it was indexed is de-indexed on the next index, or de-index everything with `project(action=\"purge\")`."),
         "Editor lifecycle hooks are installed for selected supported editors. Disable with `CONTEXTSTREAM_HOOK_ENABLED=false` or remove them with the setup/uninstall flow.".to_string(),
         format!("Local Git capture default: {git_capture}. Managed hooks send event type, commit SHA/time, branch/ref names, aggregate line/file counts, a 256-character redacted commit subject, an opaque checkout ID, and a credential-free canonical remote. Absolute paths, commit bodies, and author name/email are not sent. Disable with `CONTEXTSTREAM_GIT_CAPTURE=off` or `.contextstream/config.json` `git_capture.enabled=false`."),
+        format!("Usage metadata default: {usage_metadata}. A random installation ID kept in `~/.contextstream/installation.json`, the client name and version, OS family and version, CPU architecture, the editors setup configured, and workspace, project and session IDs go to ContextStream with `init`, and in two small events: a session's first successful tool call (tool name and category) and a connection failure (stage, error code, HTTP status). This metadata carries no file contents, queries, tool arguments or paths. Disable with `CONTEXTSTREAM_ACTIVATION_EVENTS=off`."),
+        format!("Coordination notices default: {coordination_notices}. While a session makes tool calls, at most every 35 seconds a background request sends the session ID, workspace and project, the folder path, the agent name, and once a 500-character task summary, and picks up notices from other agents. Disable with `CONTEXTSTREAM_MID_RUN_NOTICES=0`."),
     ]
 }
 
@@ -6394,9 +6398,19 @@ mod tests {
         let previous_hook_transcripts =
             std::env::var("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED").ok();
         let previous_git_capture = std::env::var("CONTEXTSTREAM_GIT_CAPTURE").ok();
+        let others = [
+            "CONTEXTSTREAM_ACTIVATION_EVENTS",
+            "CONTEXTSTREAM_ACTIVATION_SCHEMA_VERSION",
+            "CONTEXTSTREAM_MID_RUN_NOTICES",
+            "CONTEXTSTREAM_REMINDER_ENABLED",
+        ]
+        .map(|name| (name, std::env::var(name).ok()));
         std::env::remove_var("CONTEXTSTREAM_TRANSCRIPTS_ENABLED");
         std::env::remove_var("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED");
         std::env::remove_var("CONTEXTSTREAM_GIT_CAPTURE");
+        for (name, _) in &others {
+            std::env::remove_var(name);
+        }
 
         let disclosure = data_collection_disclosure(true);
         assert!(disclosure.contains("Transcript exchange saving default: true"));
@@ -6407,6 +6421,14 @@ mod tests {
             .contains("Absolute paths, commit bodies, and author name/email are not sent"));
         assert!(disclosure.contains("CONTEXTSTREAM_GIT_CAPTURE=off"));
         assert!(disclosure.contains("project(action=\"purge\")"));
+        // Everything the server sends on its own is disclosed, with its opt-out.
+        assert!(disclosure.contains("Usage metadata default: true"));
+        assert!(disclosure.contains("random installation ID"));
+        assert!(disclosure.contains("CONTEXTSTREAM_ACTIVATION_EVENTS=off"));
+        assert!(disclosure.contains("Coordination notices default: true"));
+        assert!(disclosure.contains("the folder path"));
+        assert!(disclosure.contains("500-character task summary"));
+        assert!(disclosure.contains("CONTEXTSTREAM_MID_RUN_NOTICES=0"));
 
         for (name, previous) in [
             ("CONTEXTSTREAM_TRANSCRIPTS_ENABLED", previous_transcripts),
@@ -6415,7 +6437,35 @@ mod tests {
                 previous_hook_transcripts,
             ),
             ("CONTEXTSTREAM_GIT_CAPTURE", previous_git_capture),
-        ] {
+        ]
+        .into_iter()
+        .chain(others)
+        {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn setup_disclosure_reports_the_usage_metadata_and_notice_switches_as_off_when_they_are() {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let names = [
+            "CONTEXTSTREAM_ACTIVATION_EVENTS",
+            "CONTEXTSTREAM_MID_RUN_NOTICES",
+        ];
+        let previous = names.map(|name| std::env::var(name).ok());
+        std::env::set_var("CONTEXTSTREAM_ACTIVATION_EVENTS", "off");
+        std::env::set_var("CONTEXTSTREAM_MID_RUN_NOTICES", "0");
+
+        let disclosure = data_collection_disclosure(true);
+        assert!(disclosure.contains("Usage metadata default: false"));
+        assert!(disclosure.contains("Coordination notices default: false"));
+
+        for (name, previous) in names.into_iter().zip(previous) {
             match previous {
                 Some(value) => std::env::set_var(name, value),
                 None => std::env::remove_var(name),

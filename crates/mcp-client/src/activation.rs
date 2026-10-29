@@ -136,11 +136,23 @@ fn installation_state_persistence_enabled() -> bool {
     }
 }
 
+/// Whether usage metadata (the runtime fields on `init` and the activation
+/// events) may be sent. `CONTEXTSTREAM_ACTIVATION_EVENTS=off` turns both off;
+/// `CONTEXTSTREAM_ACTIVATION_SCHEMA_VERSION=0` is the original opt-out and
+/// still works.
 pub fn activation_enabled() -> bool {
-    std::env::var("CONTEXTSTREAM_ACTIVATION_SCHEMA_VERSION")
-        .ok()
-        .map(|value| value.trim() != "0")
-        .unwrap_or(true)
+    activation_enabled_with(|name| std::env::var(name).ok())
+}
+
+fn activation_enabled_with(var: impl Fn(&str) -> Option<String>) -> bool {
+    let switched_off = var("CONTEXTSTREAM_ACTIVATION_EVENTS").is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no" | "disabled"
+        )
+    });
+    !switched_off
+        && var("CONTEXTSTREAM_ACTIVATION_SCHEMA_VERSION").is_none_or(|value| value.trim() != "0")
 }
 
 fn installation_path() -> PathBuf {
@@ -981,6 +993,49 @@ fn failure_event_with_metadata(
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    fn enabled_with(vars: &[(&str, &str)]) -> bool {
+        activation_enabled_with(|name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn usage_metadata_is_on_unless_one_of_its_opt_outs_is_set() {
+        assert!(enabled_with(&[]));
+        for off in ["off", "OFF", " false ", "0", "no", "disabled"] {
+            assert!(
+                !enabled_with(&[("CONTEXTSTREAM_ACTIVATION_EVENTS", off)]),
+                "CONTEXTSTREAM_ACTIVATION_EVENTS={off:?}"
+            );
+        }
+        // Anything that does not clearly say off leaves it on, like the other switches.
+        for on in ["on", "1", "true", "", "maybe"] {
+            assert!(
+                enabled_with(&[("CONTEXTSTREAM_ACTIVATION_EVENTS", on)]),
+                "CONTEXTSTREAM_ACTIVATION_EVENTS={on:?}"
+            );
+        }
+        // The original opt-out keeps working exactly as before.
+        assert!(!enabled_with(&[(
+            "CONTEXTSTREAM_ACTIVATION_SCHEMA_VERSION",
+            "0"
+        )]));
+        assert!(!enabled_with(&[(
+            "CONTEXTSTREAM_ACTIVATION_SCHEMA_VERSION",
+            " 0 "
+        )]));
+        assert!(enabled_with(&[(
+            "CONTEXTSTREAM_ACTIVATION_SCHEMA_VERSION",
+            "1"
+        )]));
+        assert!(!enabled_with(&[
+            ("CONTEXTSTREAM_ACTIVATION_EVENTS", "on"),
+            ("CONTEXTSTREAM_ACTIVATION_SCHEMA_VERSION", "0"),
+        ]));
+    }
 
     #[test]
     fn installation_id_persists_and_corruption_is_preserved() {

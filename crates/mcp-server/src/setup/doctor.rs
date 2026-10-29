@@ -851,6 +851,8 @@ fn check_rules_file(
     missing_status: CheckStatus,
     fix: &str,
 ) -> SurfaceCheck {
+    let resolved = super::rules::resolve_rules_file_path(path);
+    let path = resolved.as_path();
     if !path.exists() {
         return SurfaceCheck::problem(
             surface,
@@ -2262,12 +2264,33 @@ fn resolve_doctor_targets(options: &DoctorOptions) -> Result<(Vec<Editor>, &'sta
     Ok((targets, source, detection_fallback_allowed))
 }
 
-fn validate_repair_scope(options: &DoctorOptions) -> Result<()> {
-    if !options.scope_was_explicit {
-        anyhow::bail!(
-            "Doctor repair requires an explicit --scope global|project|all; no files were changed."
-        );
+fn infer_default_repair_scope(project_path: Option<&Path>, cwd: Option<&Path>) -> DoctorScope {
+    let (Some(project_path), Some(cwd)) = (project_path, cwd) else {
+        return DoctorScope::Global;
+    };
+    let (Ok(canonical_project), Ok(canonical_cwd)) =
+        (project_path.canonicalize(), cwd.canonicalize())
+    else {
+        return DoctorScope::Global;
+    };
+    if canonical_project != canonical_cwd {
+        return DoctorScope::Global;
     }
+    let is_root = canonical_project.parent().is_none();
+    let is_home = dirs::home_dir()
+        .and_then(|home| home.canonicalize().ok())
+        .is_some_and(|home| home == canonical_project);
+    if is_root || is_home {
+        return DoctorScope::Global;
+    }
+    if super::wizard_config::project_config_path(&canonical_project).exists() {
+        DoctorScope::All
+    } else {
+        DoctorScope::Global
+    }
+}
+
+fn validate_repair_scope(options: &DoctorOptions) -> Result<()> {
     if !options.scope.include_project() {
         return Ok(());
     }
@@ -2797,7 +2820,7 @@ impl Drop for DoctorDryRunReset {
 /// Run doctor and print a human, complete local JSON, or privacy-bounded
 /// support report.
 /// Returns whether any check failed so main can set the exit code.
-pub async fn run_doctor(options: DoctorOptions, json: bool, support: bool) -> Result<bool> {
+pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -> Result<bool> {
     if options.dry_run && !options.repair {
         anyhow::bail!("--dry-run requires --repair; no files were changed");
     }
@@ -2807,6 +2830,11 @@ pub async fn run_doctor(options: DoctorOptions, json: bool, support: bool) -> Re
 
     let (targets, source, detection_fallback_allowed) = resolve_doctor_targets(&options)?;
     if options.repair {
+        if !options.scope_was_explicit {
+            let cwd = std::env::current_dir().ok();
+            options.scope =
+                infer_default_repair_scope(options.project_path.as_deref(), cwd.as_deref());
+        }
         validate_repair_scope(&options)?;
         mcp_client::activation::existing_installation_id().context(
             "installation identity is unreadable; repair was refused before any editor file changed",
@@ -4280,17 +4308,38 @@ mod tests {
     }
 
     #[test]
-    fn repair_requires_explicit_scope_and_matching_project_directory() {
+    fn repair_infers_safe_default_scope_and_enforces_matching_project_directory() {
+        let unlinked = tempfile::tempdir().expect("unlinked directory");
+        assert_eq!(
+            infer_default_repair_scope(Some(unlinked.path()), Some(unlinked.path())),
+            DoctorScope::Global,
+            "unlinked folder defaults to global repair so random folders never get project files"
+        );
+
+        let linked = tempfile::tempdir().expect("linked directory");
+        let cs_dir = linked.path().join(".contextstream");
+        std::fs::create_dir_all(&cs_dir).expect("create .contextstream");
+        std::fs::write(
+            cs_dir.join("config.json"),
+            "{}
+",
+        )
+        .expect("write config.json");
+        assert_eq!(
+            infer_default_repair_scope(Some(linked.path()), Some(linked.path())),
+            DoctorScope::All,
+            "linked project folder defaults bare doctor --repair to all"
+        );
+        assert_eq!(
+            infer_default_repair_scope(Some(linked.path()), Some(unlinked.path())),
+            DoctorScope::Global,
+            "mismatched cwd never infers project repair"
+        );
+
         let mut global = DoctorOptions::new(None);
         global.repair = true;
         global.scope = DoctorScope::Global;
-        assert!(validate_repair_scope(&global)
-            .expect_err("implicit repair scope must be refused")
-            .to_string()
-            .contains("explicit --scope"));
-
-        global.scope_was_explicit = true;
-        validate_repair_scope(&global).expect("explicit global repair is safe");
+        validate_repair_scope(&global).expect("global repair is safe");
 
         let other_directory = tempfile::tempdir().expect("other directory");
         let mut project = DoctorOptions::new(Some(other_directory.path().to_path_buf()));

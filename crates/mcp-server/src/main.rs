@@ -38,6 +38,7 @@ Non-interactive shortcuts (CI, scripts, refresh after login):
   contextstream-mcp detect-editors --format=json
   contextstream-mcp clients --format=json|markdown
   contextstream-mcp generate-configs --transport=remote --preauth
+  contextstream-mcp configure --account-learning on|off|status
   contextstream-mcp configure --transcripts=on|off --scope=all
   printf %s "$KEY" | contextstream-mcp configure --api-key-stdin
   contextstream-mcp setup --yes --workspace-id=<UUID> --editors=claude
@@ -112,7 +113,7 @@ enum Commands {
         yes: bool,
 
         /// Optional deep project learning: on opens human consent; off withdraws. Omitted preserves your choice.
-        #[arg(long, value_enum)]
+        #[arg(long, visible_alias = "deep-learning", value_enum)]
         account_learning: Option<ToggleValue>,
 
         /// One-time setup token from the web "build your context engine"
@@ -173,7 +174,8 @@ enum Commands {
         support: bool,
 
         /// Surfaces to inspect or repair: global, project, or all. Read-only
-        /// doctor defaults to all; repair requires an explicit scope.
+        /// doctor defaults to all; repair defaults to all in a linked project
+        /// folder and global elsewhere.
         #[arg(long)]
         scope: Option<String>,
 
@@ -381,19 +383,25 @@ enum Commands {
         path: Option<String>,
     },
 
-    /// Configure editors, credentials, workspace, and transcript defaults
+    /// Configure deep project learning, transcript defaults, editors, and credentials
     #[command(
-        hide = true,
-        long_about = "Configure editors, credentials, workspace, and transcript defaults. With no flags, opens an interactive menu.\n\nNon-interactive examples:\n  contextstream-mcp configure --transcripts=on --scope=all\n  printf %s \"$KEY\" | contextstream-mcp configure --api-key-stdin"
+        long_about = "Configure deep project learning consent, transcript defaults, editors, workspace, and credentials. With no flags, opens an interactive menu.\n\nNon-interactive examples:\n  contextstream-mcp configure --account-learning status\n  contextstream-mcp configure --account-learning on\n  contextstream-mcp configure --account-learning off\n  contextstream-mcp configure --transcripts=off --scope=all\n  printf %s \"$KEY\" | contextstream-mcp configure --api-key-stdin"
     )]
     Configure {
         /// Print configurable options and exit
         #[arg(long)]
         list_options: bool,
 
-        /// Optional deep project learning: on opens human consent; off withdraws.
-        #[arg(long, value_enum, conflicts_with_all = ["list_options", "api_key_stdin"])]
-        account_learning: Option<ToggleValue>,
+        /// Optional deep project learning: status shows current state, on opens browser consent, off withdraws.
+        #[arg(
+            long,
+            visible_alias = "deep-learning",
+            value_enum,
+            num_args = 0..=1,
+            default_missing_value = "status",
+            conflicts_with_all = ["list_options", "api_key_stdin"]
+        )]
+        account_learning: Option<AccountLearningAction>,
 
         /// Verify an API key read from stdin and save it to the credentials
         /// file. Prompts without echo on a terminal. Reading stdin keeps the
@@ -646,6 +654,16 @@ enum Commands {
         #[arg(long)]
         preauth: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum AccountLearningAction {
+    /// Open the signed-in privacy page in your browser to review and confirm consent
+    On,
+    /// Withdraw deep project learning consent and queue learned-data deletion
+    Off,
+    /// Show the current deep project learning consent state
+    Status,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -936,12 +954,6 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             repair,
             dry_run,
         }) => {
-            if repair && scope.is_none() {
-                eprintln!(
-                    "Doctor failed: --repair requires an explicit --scope global|project|all; no files were changed"
-                );
-                std::process::exit(2);
-            }
             let explicit = match parse_editor_ids(&editors) {
                 Ok(list) => list,
                 Err(e) => {
@@ -1250,8 +1262,18 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                     std::process::exit(1);
                 }
             };
-            if let Some(choice) = account_learning {
-                setup::account_learning::configure(choice.as_bool()).await?;
+            if let Some(action) = account_learning {
+                match action {
+                    AccountLearningAction::Status => {
+                        setup::account_learning::show_status().await?;
+                    }
+                    AccountLearningAction::On => {
+                        setup::account_learning::configure(true).await?;
+                    }
+                    AccountLearningAction::Off => {
+                        setup::account_learning::configure(false).await?;
+                    }
+                }
                 if transcripts.is_none() && hook_transcripts.is_none() {
                     return Ok(());
                 }
@@ -2326,6 +2348,7 @@ async fn run_configure(
 
     let options = [
         "Editors        — Configure editor integrations (hooks, rules, MCP configs)",
+        "Deep Learning  — Check status, open browser consent, or withdraw",
         "Transcripts    — Set default transcript capture policy (on/off)",
         "API Key        — Update authentication credentials",
         "Workspace      — Select or create a workspace",
@@ -2356,18 +2379,22 @@ async fn run_configure(
             0 => {
                 run_configure_editors_flow().await?;
             }
-            // Transcripts
+            // Deep Learning
             1 => {
+                run_configure_account_learning_flow().await?;
+            }
+            // Transcripts
+            2 => {
                 run_configure_transcript_defaults().await?;
             }
             // API Key
-            2 => {
+            3 => {
                 let (api_key, email) = setup::authenticate().await?;
                 setup::write_saved_credentials(&api_key, None)?;
                 eprintln!("Credentials saved. Authenticated as {}.", email);
             }
             // Workspace
-            3 => {
+            4 => {
                 let config = load_config()?;
                 let client = mcp_client::ContextStreamClient::new(config);
                 match setup::setup_workspace(&client).await? {
@@ -2376,22 +2403,22 @@ async fn run_configure(
                 }
             }
             // Hooks
-            4 => {
+            5 => {
                 setup::update_hooks("all", None).await?;
                 eprintln!("Hooks updated.");
             }
             // Rules
-            5 => {
+            6 => {
                 setup::update_rules("all", None, None).await?;
                 eprintln!("Rules updated.");
             }
             // MCP Configs
-            6 => {
+            7 => {
                 setup::update_configs("all").await?;
                 eprintln!("MCP configs updated.");
             }
             // Exit
-            7 => {
+            8 => {
                 eprintln!("Done.");
                 return Ok(());
             }
@@ -2400,21 +2427,52 @@ async fn run_configure(
     }
 }
 
+async fn run_configure_account_learning_flow() -> Result<()> {
+    use dialoguer::Select;
+
+    setup::account_learning::show_status().await?;
+    let options = [
+        "Open privacy page in browser to review/enable consent",
+        "Turn off — withdraw consent and queue learned-data deletion",
+        "Back — return to configure menu",
+    ];
+    let Some(selection) = Select::new()
+        .with_prompt("Deep project learning")
+        .items(options)
+        .default(0)
+        .interact_opt()?
+    else {
+        return Ok(());
+    };
+    match selection {
+        0 => setup::account_learning::configure(true).await?,
+        1 => setup::account_learning::configure(false).await?,
+        2 => {}
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 fn print_configure_options() {
     eprintln!("Configurable options (run `contextstream-mcp configure` for the interactive menu):");
     eprintln!("  - editors: editor integrations, hooks, rules, and MCP configs");
+    eprintln!("  - deep project learning: check status, open browser consent, or withdraw (--account-learning status|on|off)");
+    eprintln!("  - transcripts: default transcript policy for new chats (--transcripts on|off)");
     eprintln!("  - api-key: authentication credentials (non-interactive: --api-key-stdin)");
     eprintln!("  - workspace: select/create default workspace");
     eprintln!("  - hooks: reinstall hook scripts");
     eprintln!("  - rules: regenerate AI rule files");
     eprintln!("  - mcp-configs: regenerate MCP config files");
-    eprintln!("  - deep project learning: review consent or withdraw (--account-learning on|off)");
-    eprintln!("  - transcripts: default transcript policy for new chats (--transcripts on|off)");
     eprintln!();
     eprintln!("Save an existing API key without the browser flow:");
     eprintln!(
         "  printf %s \"$CONTEXTSTREAM_API_KEY\" | contextstream-mcp configure --api-key-stdin"
     );
+    eprintln!();
+    eprintln!("Deep project learning commands:");
+    eprintln!("  contextstream-mcp configure --account-learning status");
+    eprintln!("  contextstream-mcp configure --account-learning on");
+    eprintln!("  contextstream-mcp configure --account-learning off");
     eprintln!();
     eprintln!("Quick transcript commands:");
     eprintln!("  contextstream-mcp configure --transcripts off");
@@ -4159,6 +4217,56 @@ mod tests {
             ])
             .is_err());
         }
+
+        // Bare `--account-learning` and `--deep-learning` default to `status` on `configure`.
+        for argv in [
+            vec!["contextstream-mcp", "configure", "--account-learning"],
+            vec![
+                "contextstream-mcp",
+                "configure",
+                "--account-learning",
+                "status",
+            ],
+            vec!["contextstream-mcp", "configure", "--deep-learning"],
+            vec![
+                "contextstream-mcp",
+                "configure",
+                "--deep-learning",
+                "status",
+            ],
+        ] {
+            let parsed = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(matches!(
+                parsed.command,
+                Some(Commands::Configure {
+                    account_learning: Some(AccountLearningAction::Status),
+                    ..
+                })
+            ));
+        }
+
+        let parsed_on =
+            Cli::try_parse_from(["contextstream-mcp", "configure", "--deep-learning", "on"])
+                .unwrap();
+        assert!(matches!(
+            parsed_on.command,
+            Some(Commands::Configure {
+                account_learning: Some(AccountLearningAction::On),
+                ..
+            })
+        ));
+
+        // Bare `doctor --repair` parses without requiring `--scope` or `--editors`.
+        let doctor_repair =
+            Cli::try_parse_from(["contextstream-mcp", "doctor", "--repair"]).unwrap();
+        assert!(matches!(
+            doctor_repair.command,
+            Some(Commands::Doctor {
+                repair: true,
+                scope: None,
+                ..
+            })
+        ));
     }
 
     #[test]

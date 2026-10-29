@@ -547,7 +547,7 @@ fn record_configured_client_at(
     let changed = if !state.configured_clients.contains(&client_name) {
         state.configured_clients.push(client_name);
         state.configured_clients.sort();
-        state.configured_clients.truncate(20);
+        state.configured_clients.truncate(64);
         true
     } else {
         false
@@ -579,7 +579,7 @@ fn replace_configured_clients_at(path: &Path, client_names: &[String]) -> std::i
         .collect();
     configured_clients.sort();
     configured_clients.dedup();
-    configured_clients.truncate(20);
+    configured_clients.truncate(64);
 
     let _lock = lock_state(path)?;
     let mut state = read_state(path)?.unwrap_or_else(new_installation_state);
@@ -1067,6 +1067,16 @@ mod tests {
             !remove_configured_clients_at(&path, &["claude".to_string()]).unwrap(),
             "an idempotent removal must not rewrite state"
         );
+    }
+
+    #[test]
+    fn configured_client_selection_preserves_more_than_twenty_editors() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("installation.json");
+        let many: Vec<String> = (1..=25).map(|n| format!("editor-{n:02}")).collect();
+        replace_configured_clients_at(&path, &many).unwrap();
+        let loaded = configured_client_selection_at(&path).unwrap();
+        assert_eq!(loaded.clients, many);
     }
 
     #[test]

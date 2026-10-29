@@ -7,7 +7,7 @@ setup wizard prints the same material before it writes configuration.
 
 | Flow | Default | Data sent | Control |
 |---|---:|---|---|
-| Deep project learning | off for new accounts | Context-use and feedback signals in the hosted account, only after separate consent | Account → Privacy; `configure --account-learning off` withdraws. An explicit `--account-learning on` opens browser consent. Plain `setup --yes` preserves the current choice |
+| Deep project learning | off for new accounts | Context-use and feedback signals in the hosted account, only after separate consent | Account → Privacy; `contextstream-mcp configure --account-learning status` checks state, `--account-learning on` (alias `--deep-learning on`) opens browser consent or prints the URL, and `--account-learning off` withdraws. Interactive `setup` remembers a decline per account locally under `~/.contextstream/account-learning.json`; plain `setup --yes` preserves the current choice |
 | MCP transcript exchange saving | on | User/assistant exchanges supplied to `context` when transcript saving applies | `CONTEXTSTREAM_TRANSCRIPTS_ENABLED=false` or `contextstream-mcp configure --transcripts off` |
 | Hook transcript saving | on | Supported editor lifecycle exchange payloads | `CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED=false` or `contextstream-mcp configure --hook-transcripts off` |
 | Project indexing | setup-dependent | Files matched after ignore rules, plus index metadata | Skip indexing; exclude paths with gitignore-style rules in `.contextstream/ignore` (relative to the project root) or in a `.contextignore` in any folder (files excluded after indexing are dropped on the next complete index; local search fallbacks skip them too, and so does the local snapshot refresh of hosted hits, so a checkout's rules also hide hits that another checkout of the same project uploaded earlier); use `project(action="purge")` to de-index server-side content |
@@ -50,9 +50,17 @@ the current ContextStream privacy documentation and account controls.
 
 Your signed-in dashboard shows the current server consent text, with a checkbox
 that starts unchecked. The CLI cannot grant consent and the MCP tools expose no
-consent mutation. `setup` and `configure` accept `--account-learning on|off`: on
-opens Account → Privacy for you to read and confirm; off withdraws using your
-saved credentials. Dry-run changes neither the account nor browser state.
+consent mutation. `configure` accepts `--account-learning [status|on|off]`
+(alias `--deep-learning`), and `setup` accepts `--account-learning on|off`:
+`status` (or bare `--account-learning`) shows your current state; `on` opens
+Account → Privacy (`https://contextstream.io/dashboard/account/privacy`) in a
+browser when available—or prints the URL on headless machines—unless consent is
+already active for the current terms; `off` withdraws using your saved
+credentials. Interactive `setup` offers the consent prompt once for first-time
+users (and once per updated consent version when `requires_reconsent` is set),
+storing a per-account dismissal locally in `~/.contextstream/account-learning.json`
+when you say no so later setup and update runs stay quiet. Dry-run changes
+neither the account nor browser state.
 
 Collection stops immediately on withdrawal. Learned history and generated
 learning items are queued for deletion in live systems within 30 days. Ordinary

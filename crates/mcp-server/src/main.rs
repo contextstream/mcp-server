@@ -389,6 +389,11 @@ enum Commands {
         #[arg(long)]
         git_hooks: bool,
 
+        /// Also remove ContextStream's managed git hooks from every repository
+        /// this machine has set up (this repo included), not just this one.
+        #[arg(long)]
+        all_git_hooks: bool,
+
         /// Show every file that would change, without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1168,6 +1173,7 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             scope,
             editors,
             git_hooks,
+            all_git_hooks,
             dry_run,
         }) => {
             setup::safe_edit::set_dry_run(dry_run);
@@ -1178,7 +1184,9 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                     std::process::exit(1);
                 }
             };
-            if let Err(e) = setup::uninstall(&scope, explicit.as_deref(), git_hooks).await {
+            if let Err(e) =
+                setup::uninstall(&scope, explicit.as_deref(), git_hooks, all_git_hooks).await
+            {
                 eprintln!("Uninstall failed: {}", e);
                 std::process::exit(1);
             }

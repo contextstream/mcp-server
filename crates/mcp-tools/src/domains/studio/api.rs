@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use uuid::Uuid;
 
+use super::forms::SignedFile;
 use super::words::{credits, quote_problem};
 
 /// How long one ordinary read or write may take.
@@ -267,6 +268,37 @@ impl Create<'_> {
             .get("expires_in_seconds")
             .and_then(Value::as_i64);
         Some((url, expires))
+    }
+
+    /// A short-lived signed link to one of a made piece's files
+    /// (`/create/jobs/{job}/files/{fileId}/download-url`: `url`, `expiresInSeconds`).
+    pub async fn file_download_url(
+        &self,
+        workspace_id: Uuid,
+        job_id: Uuid,
+        file_id: &str,
+    ) -> Option<SignedFile> {
+        let answer = self
+            .call(
+                "GET",
+                &format!(
+                    "/create/jobs/{job_id}/files/{}/download-url?workspaceId={workspace_id}",
+                    urlencoding::encode(file_id)
+                ),
+                None,
+                None,
+            )
+            .await
+            .ok()?;
+        if !answer.is_success() {
+            return None;
+        }
+        let url = answer.data.get("url").and_then(Value::as_str)?.to_string();
+        Some(SignedFile {
+            url,
+            expires_in_seconds: answer.data.get("expiresInSeconds").and_then(Value::as_i64),
+            size_bytes: answer.data.get("sizeBytes").and_then(Value::as_u64),
+        })
     }
 
     pub async fn attach(

@@ -386,6 +386,10 @@ fn the_tool_offers_a_producer_not_a_model_menu() {
         "piece",
         "change",
         "wait_seconds",
+        "form",
+        "sizes",
+        "voice",
+        "mode",
     ] {
         assert!(properties.contains_key(field), "{field}");
     }
@@ -397,6 +401,56 @@ fn the_tool_offers_a_producer_not_a_model_menu() {
             .unwrap()
             .contains(&format!("- {action}:")));
     }
+    // Brand work is named in the description an agent picks the tool by.
+    for words in [
+        "brand images (social sets in each network's size, ad sets, hero and product shots, posters and flyers with print PDFs, email headers, brand graphics)",
+        "brand sounds (sonic logos, music beds, loops, effect packs, voice-overs, podcast intros and outros)",
+        "form",
+        "alt text and captions",
+        "variation, revision or resize",
+    ] {
+        assert!(
+            metadata
+                .description
+                .to_lowercase()
+                .contains(&words.to_lowercase()),
+            "{words}"
+        );
+    }
+    assert_eq!(properties["form"]["enum"].as_array().unwrap().len(), 15);
+    assert_eq!(
+        properties["sizes"]["items"]["enum"]
+            .as_array()
+            .unwrap()
+            .len(),
+        23
+    );
+    assert_eq!(properties["voice"]["enum"].as_array().unwrap().len(), 12);
+    assert_eq!(
+        properties["mode"]["enum"],
+        json!(["variation", "revision", "resize"])
+    );
+    let form = properties["form"]["description"].as_str().unwrap();
+    for id in forms::form_ids() {
+        assert!(form.contains(&format!("{id}: ")), "{id}");
+    }
+    // Portable as advertised: the new parameters need nothing rewritten (a uuid's
+    // `format` is the only keyword folded away), and the advertised schema is clean.
+    let raw: Vec<String> = crate::portable_schema::portable_schema_violations(&schema)
+        .into_iter()
+        .filter(|v| !v.contains("keyword `format`"))
+        .collect();
+    assert!(raw.is_empty(), "{raw:?}");
+    let advertised = crate::portable_schema::portable_input_schema(&schema);
+    assert!(
+        crate::portable_schema::portable_schema_violations(&advertised).is_empty(),
+        "{:?}",
+        crate::portable_schema::portable_schema_violations(&advertised)
+    );
+    assert_eq!(
+        advertised["properties"]["sizes"]["items"]["enum"],
+        properties["sizes"]["items"]["enum"]
+    );
 }
 
 #[tokio::test]
@@ -699,7 +753,7 @@ async fn status_reports_progress_while_it_waits_and_result_shows_the_pieces() {
 }
 
 #[tokio::test]
-async fn revise_plans_another_like_a_made_piece() {
+async fn revise_plans_from_a_made_piece() {
     let stub = Stub::start(api(Arc::new(Mutex::new(("succeeded".into(), true))))).await;
     let tool = stub.tool();
     let result = tool
@@ -709,12 +763,14 @@ async fn revise_plans_another_like_a_made_piece() {
     assert!(!result.is_error, "{}", text_of(&result));
     let posted = stub.posts_to("/create/quotes");
     let request = &posted[0].body["request"];
-    let prompt = request["prompt"].as_str().unwrap();
-    assert!(prompt.starts_with("A sting for the release\n\nNow make one more piece: another “Brand Board” (image · wide 16:9), like the attached image. This time: darker ground."), "{prompt}");
+    // Create starts from the made image: the change is the prompt, and no earlier ask or
+    // style reference is rewritten into it.
     assert_eq!(
-        request["references"],
-        json!([{"contentId": IMAGE_ID, "role": "style"}])
+        request,
+        &json!({"kind": "make", "prompt": "darker ground",
+                "from": {"jobId": JOB, "piece": 1, "mode": "revision"}})
     );
+    assert!(text_of(&result).contains("A plan for “Brand Board”, changed as asked"));
     assert!(stub.posts_to("/create/jobs").is_empty());
 }
 
@@ -836,3 +892,5 @@ fn pieces_are_named_by_index_or_id() {
     );
     assert_eq!(piece_selector(&json!(" ")), None);
 }
+
+mod brand;

@@ -6,17 +6,22 @@
 //! [`gate`]). Its actions follow the web studio (contextstudio `packages/web/src/lib/make.ts`):
 //!
 //! - `plan`: a prompt, the agent's own context and any images, to a plan with one price
-//!   (`POST /create/quotes`, kind make). Spends nothing.
+//!   (`POST /create/quotes`, kind make). Spends nothing. Brand work can be asked for by name
+//!   (`form`, with `sizes` or a `voice`; see [`forms`]).
 //! - `make`: the person's go-ahead for a plan, then the making (`POST /create/jobs`). The
 //!   go-ahead is asked of the person through MCP elicitation when the client can ask them;
 //!   otherwise `accepted_price_credits` must be at or above the plan's price.
 //! - `status`: where each piece stands, waiting for change and reporting progress
 //!   (`notifications/progress`) while it waits when the call carried a progress token.
-//! - `result`: made images inline, video and sound as signed links, and each placard.
-//! - `revise`: a plan for another like a made piece, with a change.
+//! - `result`: made images inline, video and sound as signed links, and each placard; brand
+//!   work's files (each size, the set ZIP, a print PDF, the web and broadcast masters, stems)
+//!   as signed links, with its alt text, caption and checks.
+//! - `revise`: a plan from a made image or sound (`from`: a variation, a revision or a
+//!   resize), or for another like a made film, with a change.
 //! - `stop`, `library`, `brand`, `products`.
 
 pub(crate) mod api;
+pub(crate) mod forms;
 pub(crate) mod gate;
 pub(crate) mod words;
 
@@ -85,9 +90,9 @@ const LIBRARY_LIMIT_MAX: i64 = 50;
 /// How long a listing waits for the catalog before leaving the tool out.
 pub const LISTING_BUDGET: Duration = Duration::from_millis(2500);
 
-const DESCRIPTION: &str = "ContextStudio: make video, images, sound and music from one plain request, produced from what the team knows (brand kit, docs, decisions, connected products). No models to pick: say what is needed, and the producer plans the pieces.\n\nFlow: plan (prompt, plus context you hold, such as the diff you just made, release notes or the open doc) -> show the person the plan and its one price -> make, with their go-ahead -> status (a product film takes 13 to 21 minutes) -> result. Also: revise a made piece, stop, library, brand, products.\n\nMoney: plan spends nothing. make spends at most the plan's price and only with the person's go-ahead: the client asks them when it can; otherwise pass accepted_price_credits once they agree.";
+const DESCRIPTION: &str = "ContextStudio: films, explainers, brand images and brand sounds from one plain request, made from the team's brand and knowledge. No models to pick.\n\nBrand images (social sets in each network's size, ad sets, hero and product shots, posters and flyers with print PDFs, email headers, brand graphics) and brand sounds (sonic logos, music beds, loops, effect packs, voice-overs, podcast intros and outros): form, with sizes or voice, makes it exact.\n\nFlow: plan -> show the person its price -> make with their go-ahead -> status -> result: downloadable files with alt text and captions. revise a made piece: variation, revision or resize. Also stop, library, brand, products.\n\nMoney: plan is free; make spends at most the plan's price, only with the person's go-ahead (the client asks, or pass accepted_price_credits).";
 
-const TOOL_REFERENCE: &str = "ContextStudio makes finished pieces (films, product explainers filmed from the team's connected product, images, sound, music) from a plain request. Never choose a model, a medium, a shape or a length: describe what is needed and who it is for.\n\nActions:\n- plan: prompt (plain words, at most 4000 characters). context: what you know that the workspace may not (the change you just made, release notes, the doc you have open), as [{title, text}] or one string; at most 4 notes, 6000 characters each. attachments: images [{path (a local PNG, JPEG or WebP; stdio only) or content_id, role: subject|product|style|logo}]. Returns the plan: each piece, why, one price (up to N credits, likely about M), the balance, plan_id. Spends nothing. plan_id alone reads a plan again. wait_seconds (default 90, up to 100).\n- make: plan_id. Show the person the plan and its price first. If the client can ask them, it does; otherwise pass accepted_price_credits (the price they accepted, at least the plan's). Returns make_id.\n- status: make_id (default: the latest making), wait_seconds (default 50, up to 100). Each piece's state, with progress reported while it waits; call again until it has ended.\n- result: make_id, piece (index or id, optional). Images inline, video and sound as signed links (valid about 15 minutes), each piece's placard.\n- revise: make_id, piece, change (what to do differently). Plans another like a made piece, or that piece again when it wasn't made; make it like any plan.\n- stop: make_id. Stops a making; the hold is released and nothing undelivered is charged.\n- library: recent makings here, newest first (limit, at most 50).\n- brand: the workspace's brand kit, which everything is made from.\n- products: connected products and their maps; ask plan for an explainer of something in one, and it is filmed from the real product.";
+const TOOL_REFERENCE: &str = "ContextStudio makes finished pieces (films, product explainers filmed from the team's connected product, brand images, brand sounds, music) from a plain request, in the team's brand. Never choose a model: describe what is needed and who it is for. For brand work, name its form for an exact plan.\n\nBrand images: social-set (one post in each network's size), ad-set, hero, product-shot, email-header, brand-graphic, and poster and flyer (printed sheets with a print-ready PDF). An image is made once, as one idea, and delivered in each of its sizes (at most 6; the first is the master shape) as PNG, JPG and WebP with a ZIP of the set, with alt text and a caption, and checked (type inside each network's safe area, contrast, the mark).\nBrand sounds: sonic-logo, music-bed, loop, sfx-pack, voice-over, podcast-intro, podcast-outro. A sound comes as WAV and MP3 at -16 LUFS for the web, a -23 LUFS broadcast master and its stems (a pack: each sound, and a ZIP), with loudness checks.\n\nActions:\n- plan: prompt (plain words, at most 4000 characters). form: brand work by name (optional). sizes: image size ids for an image form other than poster or flyer (default: the form's own). voice: for voice-over, podcast-intro or podcast-outro. context: what you know that the workspace may not (the change you just made, release notes, the doc you have open), as [{title, text}] or one string; at most 4 notes, 6000 characters each. attachments: images [{path (a local PNG, JPEG or WebP; stdio only) or content_id, role: subject|product|style|logo}]. Returns the plan: each piece with its sizes, files and voice, why, one price (up to N credits, likely about M), the balance, plan_id. Spends nothing. plan_id alone reads a plan again. wait_seconds (default 90, up to 100).\n- make: plan_id. Show the person the plan and its price first. If the client can ask them, it does; otherwise pass accepted_price_credits (the price they accepted, at least the plan's). Returns make_id.\n- status: make_id (default: the latest making), wait_seconds (default 50, up to 100). Each piece's state, with progress reported while it waits; call again until it has ended.\n- result: make_id, piece (index or id, optional). Images inline, video and sound as signed links (valid about 15 minutes), each piece's placard. Brand work: each file as its own signed link (each size's PNG, the set ZIP or the print PDF; the web MP3, the broadcast WAV, the stems or the pack's ZIP; up to 12 a piece), its alt text and caption (use them when posting it), and any check that didn't pass.\n- revise: make_id, piece, mode, change, sizes. From a made image or sound: mode variation (more like it; change optional), revision (it, changed as change says) or resize (an image in new sizes: pass sizes; not a poster or flyer). Default: revision with a change, resize with only sizes, else variation. A made film: another like it, with the change. A piece that wasn't made: that piece again. Make the new plan like any plan.\n- stop: make_id. Stops a making; the hold is released and nothing undelivered is charged.\n- library: recent makings here, newest first (limit, at most 50).\n- brand: the workspace's brand kit, which everything is made from.\n- products: connected products and their maps; ask plan for an explainer of something in one, and it is filmed from the real product.";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StudioInput {
@@ -104,6 +109,11 @@ pub struct StudioInput {
     pub limit: Option<i64>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
+    // Brand work (forms.rs).
+    pub form: Option<String>,
+    pub sizes: Option<Value>,
+    pub voice: Option<String>,
+    pub mode: Option<String>,
 }
 
 /// The project each plan was made in, so `make` sends the same one (Create checks it).
@@ -239,6 +249,11 @@ impl StudioTool {
     // ------------------------------------------------------------------------------------
 
     async fn plan(&self, input: &StudioInput) -> Result<ToolResult> {
+        // Brand work asked for by name is checked before anything is sent.
+        let form = forms::parse_form(input.form.as_deref())?;
+        let sizes = forms::parse_sizes(input.sizes.as_ref())?;
+        let voice = forms::parse_voice(input.voice.as_deref())?;
+        forms::check_together(form, &sizes, voice)?;
         let (workspace_id, project_id) = self.scope(input).await?;
         let wait = self
             .wait(
@@ -274,6 +289,7 @@ impl StudioTool {
         if !references.is_empty() {
             request["references"] = json!(references);
         }
+        forms::ask(&mut request, form, &sizes, voice);
         self.ask_for_plan(workspace_id, project_id, &request, &notes, wait, &mut said)
             .await
     }
@@ -437,6 +453,7 @@ impl StudioTool {
                             ""
                         }
                     ));
+                    lines.extend(forms::plan_lines(piece));
                     if let Some(why) = sentence(piece.get("why").and_then(Value::as_str)) {
                         lines.push(format!("   Why: {why}"));
                     }
@@ -497,7 +514,17 @@ impl StudioTool {
                 ));
                 structured["understanding"] =
                     plan.get("understanding").cloned().unwrap_or(Value::Null);
-                structured["pieces"] = json!(pieces);
+                structured["pieces"] = json!(pieces
+                    .iter()
+                    .map(|piece| {
+                        let mut piece = piece.clone();
+                        let delivery = forms::plan_delivery(&piece);
+                        if let (Some(delivery), Some(map)) = (delivery, piece.as_object_mut()) {
+                            map.insert("delivery".to_string(), delivery);
+                        }
+                        piece
+                    })
+                    .collect::<Vec<_>>());
                 structured["needs_product"] =
                     plan.get("needsProduct").cloned().unwrap_or(Value::Null);
                 structured["price_credits"] = json!(price);
@@ -1151,23 +1178,57 @@ impl StudioTool {
                     }
                 }
             }
-            match &link {
-                Some((url, expires)) => {
-                    let minutes = expires.map_or(15, |s| (s / 60).max(1));
-                    lines.push(format!("   Link (valid about {minutes} minutes): {url}"));
-                    if !shown_inline {
-                        content.push(ContentItem::ResourceLink {
-                            uri: url.clone(),
-                            name: progress.title().to_string(),
-                            description: Some(piece_facts(piece)),
-                            mime_type: Some(mime_type.clone()),
-                        });
+            let made = progress.made.as_ref().unwrap_or(&Value::Null);
+            let files: Vec<Value> = made
+                .get("files")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let linked = if files.is_empty() {
+                false
+            } else {
+                lines.extend(forms::made_lines(piece, made));
+                forms::made_entry(&mut entry, piece, made);
+                self.file_links(
+                    workspace_id,
+                    job_id,
+                    progress,
+                    &files,
+                    &mut lines,
+                    &mut content,
+                    &mut entry,
+                    shown_inline,
+                )
+                .await
+            };
+            if !linked {
+                match &link {
+                    Some((url, expires)) => {
+                        let minutes = expires.map_or(15, |s| (s / 60).max(1));
+                        lines.push(format!("   Link (valid about {minutes} minutes): {url}"));
+                        if !shown_inline {
+                            content.push(ContentItem::ResourceLink {
+                                uri: url.clone(),
+                                name: progress.title().to_string(),
+                                description: Some(piece_facts(piece)),
+                                mime_type: Some(mime_type.clone()),
+                            });
+                        }
                     }
+                    None => lines.push(
+                        "   No download link could be made; it is in the ContextStudio library."
+                            .to_string(),
+                    ),
                 }
-                None => lines.push(
-                    "   No download link could be made; it is in the ContextStudio library."
-                        .to_string(),
-                ),
+            }
+            if let Some(checks) = made
+                .get("checks")
+                .and_then(Value::as_array)
+                .filter(|_| !files.is_empty())
+            {
+                if let Some(line) = forms::checks_line(checks, made.get("sizes")) {
+                    lines.push(line);
+                }
             }
             if let Some(placard) = progress.made.as_ref().and_then(|m| m.get("placard")) {
                 if let Some(asked) = sentence(placard.get("asked").and_then(Value::as_str)) {
@@ -1225,6 +1286,85 @@ impl StudioTool {
         Ok(result)
     }
 
+    /// A made piece's files, each with its own signed link, the most useful first (at most
+    /// [`forms::FILES_PER_PIECE`]): a line each, a resource link for its main downloads, and
+    /// the structured entry's `files`. Whether any link could be made.
+    #[allow(clippy::too_many_arguments)]
+    async fn file_links(
+        &self,
+        workspace_id: Uuid,
+        job_id: Uuid,
+        progress: &words::PieceProgress,
+        files: &[Value],
+        lines: &mut Vec<String>,
+        content: &mut Vec<ContentItem>,
+        entry: &mut Value,
+        shown_inline: bool,
+    ) -> bool {
+        let medium = progress
+            .piece
+            .get("medium")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let (chosen, rest) = forms::chosen_files(files, medium, forms::FILES_PER_PIECE);
+        let create = self.create();
+        let signed: Vec<Option<forms::SignedFile>> =
+            futures::future::join_all(chosen.iter().map(|file| {
+                let id = file.get("id").and_then(Value::as_str).unwrap_or("");
+                create.file_download_url(workspace_id, job_id, id)
+            }))
+            .await;
+        entry["files"] = json!(chosen
+            .iter()
+            .zip(&signed)
+            .map(|(file, signed)| forms::file_entry(file, signed.as_ref()))
+            .collect::<Vec<_>>());
+        if !rest.is_empty() {
+            entry["more_files"] = json!(rest
+                .iter()
+                .map(|f| json!({"id": f.get("id"), "label": forms::file_label(f), "format": f.get("format")}))
+                .collect::<Vec<_>>());
+        }
+        if signed.iter().all(Option::is_none) {
+            return false;
+        }
+        let minutes = signed
+            .iter()
+            .flatten()
+            .filter_map(|s| s.expires_in_seconds)
+            .min()
+            .map_or(15, |s| (s / 60).max(1));
+        lines.push(format!("   Files (links valid about {minutes} minutes):"));
+        let mut linked_main = false;
+        for (file, signed) in chosen.iter().zip(&signed) {
+            lines.push(forms::file_line(file, signed.as_ref()));
+            let Some(signed) = signed else { continue };
+            let main = forms::is_main_download(file, medium);
+            // A piece not shown inline is linked by its first file too.
+            let first_unshown = !shown_inline && !linked_main;
+            if main || first_unshown {
+                linked_main = true;
+                content.push(ContentItem::ResourceLink {
+                    uri: signed.url.clone(),
+                    name: forms::file_label(file),
+                    description: Some(format!(
+                        "{}: {}",
+                        progress.title(),
+                        piece_facts(&progress.piece)
+                    )),
+                    mime_type: file
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                });
+            }
+        }
+        if let Some(more) = forms::more_files_line(&rest, files) {
+            lines.push(more);
+        }
+        true
+    }
+
     // ------------------------------------------------------------------------------------
     // revise, stop, library, brand, products
     // ------------------------------------------------------------------------------------
@@ -1234,12 +1374,26 @@ impl StudioTool {
             .change
             .as_deref()
             .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .ok_or_else(|| {
-                Error::Validation(
-                    "change is required for revise: say what to do differently".to_string(),
-                )
-            })?;
+            .filter(|c| !c.is_empty());
+        let named_mode = forms::Mode::parse(input.mode.as_deref())?;
+        let sizes = forms::parse_sizes(input.sizes.as_ref())?;
+        let voice = forms::parse_voice(input.voice.as_deref())?;
+        let mode = named_mode.unwrap_or_else(|| forms::Mode::implied(change, &sizes));
+        match mode {
+            forms::Mode::Revision if change.is_none() => {
+                return Err(Error::Validation(
+                    "A revision needs change: say what to change (or use mode variation for more like it, or resize with sizes)."
+                        .to_string(),
+                ))
+            }
+            forms::Mode::Resize if sizes.is_empty() => {
+                return Err(Error::Validation(format!(
+                    "A resize needs sizes: the new sizes by id, at most {}, such as instagram-story or linkedin-post.",
+                    forms::MAX_SIZES
+                )))
+            }
+            _ => {}
+        }
         let (workspace_id, project_id) = self.scope(input).await?;
         let job_id = self.job_id(workspace_id, input).await?;
         let job = match self.read_job(workspace_id, job_id).await? {
@@ -1260,28 +1414,74 @@ impl StudioTool {
                 "No such piece in that making: name one by its index or id.".to_string(),
             ));
         };
+        let made = piece.state == PieceState::Made && piece.output.is_some();
+        let medium = piece
+            .piece
+            .get("medium")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let title = piece.title().to_string();
+        let wait = self
+            .wait(
+                input.wait_seconds.unwrap_or(PLAN_WAIT_DEFAULT),
+                PLAN_WAIT_MAX,
+            )
+            .await;
+        let (notes, mut said) = notes_from(input.context.as_ref())?;
+
+        // A made image or sound: Create starts from it.
+        if made && matches!(medium, "image" | "sound") {
+            if let Some(problem) = from_problem(mode, medium, &piece.piece, &title, &sizes, voice) {
+                return Err(Error::Validation(problem));
+            }
+            let mut request = json!({
+                "kind": "make",
+                "prompt": forms::from_prompt(mode, change, &sizes),
+                "from": {"jobId": job_id, "piece": piece.index(), "mode": mode.as_str()},
+            });
+            forms::ask(&mut request, None, &sizes, voice);
+            said.push(format!(
+                "A plan for {}; nothing is made until it is made like any plan.",
+                forms::from_words(mode, &title, &sizes)
+            ));
+            return self
+                .ask_for_plan(workspace_id, project_id, &request, &notes, wait, &mut said)
+                .await;
+        }
+
+        // A film, or a piece that wasn't made: a plan from the earlier ask.
+        if !made && named_mode.is_some_and(|m| m != forms::Mode::Revision) {
+            return Err(Error::Validation(format!(
+                "“{title}” wasn't made, so there is nothing to vary or resize. Revise it with a change to plan it again."
+            )));
+        }
+        if made && mode == forms::Mode::Resize {
+            return Err(Error::Validation(format!(
+                "Only an image can be resized; “{title}” is a {}. Ask for a revision with a change instead.",
+                words::medium_name(medium).to_lowercase()
+            )));
+        }
+        if !sizes.is_empty() || voice.is_some() {
+            return Err(Error::Validation(format!(
+                "sizes and voice are for revising a made image or sound; “{title}” {}.",
+                if made {
+                    format!("is a {}", words::medium_name(medium).to_lowercase())
+                } else {
+                    "wasn't made".to_string()
+                }
+            )));
+        }
+        let change = change.unwrap_or("");
         let earlier = job
             .pointer("/request/prompt")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let made = piece.state == PieceState::Made && piece.output.is_some();
-        let image = made && piece.piece.get("medium").and_then(Value::as_str) == Some("image");
         let prompt = if made {
-            another_like_this(earlier, change, &piece.piece, image)
+            another_like_this(earlier, change, &piece.piece)
         } else {
             this_one_again(earlier, change, &piece.piece)
         };
         let mut references: Vec<Value> = Vec::new();
-        if image {
-            if let Some(content_id) = piece
-                .output
-                .as_ref()
-                .and_then(|o| o.get("contentId"))
-                .and_then(Value::as_str)
-            {
-                references.push(json!({"contentId": content_id, "role": "style"}));
-            }
-        }
         if let Some(earlier_refs) = job.pointer("/request/references").and_then(Value::as_array) {
             for reference in earlier_refs {
                 if references.len() >= MAX_ATTACHMENTS {
@@ -1302,18 +1502,16 @@ impl StudioTool {
         {
             request["topicFeedIds"] = topics.clone();
         }
-        let (notes, mut said) = notes_from(input.context.as_ref())?;
         said.push(format!(
-            "A plan for {} “{}” with the change; nothing is made until it is made like any plan.",
+            "A plan for {} “{}”{}; nothing is made until it is made like any plan.",
             if made { "another" } else { "the unmade" },
-            piece.title()
+            title,
+            if change.is_empty() {
+                ""
+            } else {
+                " with the change"
+            }
         ));
-        let wait = self
-            .wait(
-                input.wait_seconds.unwrap_or(PLAN_WAIT_DEFAULT),
-                PLAN_WAIT_MAX,
-            )
-            .await;
         self.ask_for_plan(workspace_id, project_id, &request, &notes, wait, &mut said)
             .await
     }
@@ -1644,22 +1842,51 @@ fn read_lines(read: Option<&Value>, max: usize) -> Vec<String> {
     lines
 }
 
+/// Why a plan can't start from a made image or sound as asked, or `None` when it can.
+fn from_problem(
+    mode: forms::Mode,
+    medium: &str,
+    piece: &Value,
+    title: &str,
+    sizes: &[&forms::Size],
+    voice: Option<&str>,
+) -> Option<String> {
+    let form = piece
+        .get("form")
+        .and_then(Value::as_str)
+        .and_then(forms::find_form);
+    if medium == "sound" && (mode == forms::Mode::Resize || !sizes.is_empty()) {
+        return Some(format!(
+            "Only an image can be resized; “{title}” is a sound. Ask for a variation, or a revision with a change."
+        ));
+    }
+    if medium == "image" && voice.is_some() {
+        return Some(format!(
+            "“{title}” is an image: voice is for a sound that speaks."
+        ));
+    }
+    if let Some(form) = form.filter(|f| f.print) {
+        if mode == forms::Mode::Resize || !sizes.is_empty() {
+            return Some(format!(
+                "“{title}” is a {}: a printed sheet keeps its paper size and print PDF, so it can't be resized. Ask for a revision with a change, or plan a social-set from it.",
+                form.label.to_lowercase()
+            ));
+        }
+    }
+    None
+}
+
 /// The prompt for another like a made piece (the web studio's "make another like this"):
 /// the earlier ask, then which piece to make again and the change.
-fn another_like_this(earlier: &str, change: &str, piece: &Value, attached: bool) -> String {
+fn another_like_this(earlier: &str, change: &str, piece: &Value) -> String {
     let what = change.trim().trim_end_matches(['.', ' ']);
     let title = piece
         .get("title")
         .and_then(Value::as_str)
         .unwrap_or("piece");
     let which = format!(
-        "another “{title}” ({}){}",
-        piece_facts(piece).to_lowercase(),
-        if attached {
-            ", like the attached image"
-        } else {
-            ", like the one made before"
-        }
+        "another “{title}” ({}), like the one made before",
+        piece_facts(piece).to_lowercase()
     );
     let tail = format!(
         "\n\nNow make one more piece: {which}.{}",
@@ -1933,7 +2160,20 @@ pub(crate) fn input_schema() -> Value {
             false,
         )
         .string("piece", "A piece of the making, by index (0-based) or id (result, revise)", false)
-        .string("change", "What to do differently (revise)", false)
+        .string(
+            "change",
+            "What to do differently (revise): for a revision, the change itself (\"warmer light, no people\"); optional for a variation or a resize",
+            false,
+        )
+        .string_enum("form", &forms::form_description(), &forms::form_ids(), false)
+        .property("sizes", forms::sizes_schema(), false)
+        .string_enum("voice", &forms::voice_description(), &forms::voice_keys(), false)
+        .string_enum(
+            "mode",
+            "How revise starts from a made image or sound: variation (more like it), revision (it, changed as change says) or resize (an image in new sizes; pass sizes). Default: revision with a change, resize with only sizes, else variation.",
+            forms::MODES,
+            false,
+        )
         .integer(
             "wait_seconds",
             "How long to wait: plan (default 90, up to 100), status (default 50, up to 100)",

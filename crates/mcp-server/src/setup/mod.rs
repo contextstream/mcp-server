@@ -2531,12 +2531,38 @@ pub async fn run_setup_with_learning_choice(
     workspace_id: Option<&str>,
     learning_choice: Option<bool>,
 ) -> Result<bool> {
+    run_setup_with_project_overrides(
+        non_interactive,
+        only,
+        project_path,
+        account_only,
+        workspace_id,
+        None,
+        None,
+        learning_choice,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_setup_with_project_overrides(
+    non_interactive: bool,
+    only: Option<&[editors::Editor]>,
+    project_path: Option<&Path>,
+    account_only: bool,
+    workspace_id: Option<&str>,
+    project_id: Option<&str>,
+    project_name: Option<&str>,
+    learning_choice: Option<bool>,
+) -> Result<bool> {
     if non_interactive {
         run_setup_noninteractive(
             only,
             project_path,
             account_only,
             workspace_id,
+            project_id,
+            project_name,
             learning_choice,
         )
         .await
@@ -2550,13 +2576,36 @@ pub async fn run_setup_with_learning_choice(
 /// editors, hosted remote transport, background indexing, no media. Fails
 /// fast with guidance when credentials are missing/invalid or the workspace
 /// is ambiguous — it never guesses across workspaces.
+#[allow(clippy::too_many_arguments)]
 async fn run_setup_noninteractive(
     only: Option<&[editors::Editor]>,
     explicit_project_path: Option<&Path>,
     account_only: bool,
     explicit_workspace_id: Option<&str>,
+    explicit_project_id: Option<&str>,
+    explicit_project_name: Option<&str>,
     explicit_learning_choice: Option<bool>,
 ) -> Result<()> {
+    let parsed_project_id = match explicit_project_id {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            Some(uuid::Uuid::parse_str(trimmed).map_err(|_| {
+                anyhow::anyhow!("--project-id must be a project UUID, got {trimmed:?}.")
+            })?)
+        }
+        None => None,
+    };
+    let normalized_project_name = match explicit_project_name {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("--project-name cannot be empty.");
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+
     print_welcome_banner();
     print_data_collection_disclosure(true);
     ui::say(
@@ -2618,6 +2667,12 @@ async fn run_setup_noninteractive(
     let (editors_to_configure, editor_provenance) = resolve_setup_editors(only)?;
     let cwd = std::env::current_dir()?;
     let project_path = resolve_setup_project_path(&cwd, explicit_project_path, account_only)?;
+    if (parsed_project_id.is_some() || normalized_project_name.is_some()) && project_path.is_none()
+    {
+        anyhow::bail!(
+            "--project-id and --project-name require a project folder; run inside a project directory or pass --project-path <PATH>."
+        );
+    }
 
     if editors_to_configure.is_empty() {
         persist_setup_editor_selection(&editors_to_configure)?;
@@ -2663,21 +2718,42 @@ async fn run_setup_noninteractive(
 
     let transport_preference = prompt_setup_transport_preference(&editors_to_configure)?;
     let workspace_lookup_path = project_path.as_deref().unwrap_or(cwd.as_path());
-    let workspace = resolve_workspace_noninteractive(
-        &client,
-        workspace_lookup_path,
-        explicit_workspace_id,
-        account_only,
-    )
-    .await?;
+    let prefetched_project_workspace_id = if explicit_workspace_id.is_none() {
+        match parsed_project_id {
+            Some(project_uuid) => {
+                let project = client.get_project_fresh(project_uuid).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "Project {project_uuid} (from --project-id) is not available to this account: {e}"
+                    )
+                })?;
+                project.workspace_id
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let workspace = if let Some(proj_ws_id) = prefetched_project_workspace_id {
+        Some(resolve_requested_workspace(&client, &proj_ws_id.to_string(), "--project-id").await?)
+    } else {
+        resolve_workspace_noninteractive(
+            &client,
+            workspace_lookup_path,
+            explicit_workspace_id,
+            account_only,
+        )
+        .await?
+    };
     let selected_project = if let Some(project_path) = project_path.as_deref() {
-        select_project_for_current_directory(
+        select_project_for_current_directory_with_overrides(
             &client,
             project_path,
             workspace.as_ref(),
             false,
             true,
             true,
+            explicit_project_id,
+            normalized_project_name,
         )
         .await?
     } else {
@@ -4354,6 +4430,30 @@ pub async fn select_project_for_current_directory(
     allow_create: bool,
     allow_skip: bool,
 ) -> Result<Option<ProjectInfo>> {
+    select_project_for_current_directory_with_overrides(
+        client,
+        cwd,
+        workspace,
+        prompt_user,
+        allow_create,
+        allow_skip,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn select_project_for_current_directory_with_overrides(
+    client: &ContextStreamClient,
+    cwd: &std::path::Path,
+    workspace: Option<&WorkspaceInfo>,
+    prompt_user: bool,
+    allow_create: bool,
+    allow_skip: bool,
+    explicit_project_id: Option<&str>,
+    explicit_project_name: Option<&str>,
+) -> Result<Option<ProjectInfo>> {
     let Some(ws) = workspace else {
         if prompt_user {
             println!(
@@ -4363,6 +4463,38 @@ pub async fn select_project_for_current_directory(
         }
         return Ok(None);
     };
+
+    if !prompt_user {
+        if let Some(raw_id) = explicit_project_id {
+            let trimmed = raw_id.trim();
+            let project_uuid = uuid::Uuid::parse_str(trimmed).map_err(|_| {
+                anyhow::anyhow!("--project-id must be a project UUID, got {trimmed:?}.")
+            })?;
+            let project = client.get_project_fresh(project_uuid).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "Project {project_uuid} (from --project-id) is not available to this account: {e}"
+                )
+            })?;
+            if let Ok(expected_ws_id) = uuid::Uuid::parse_str(&ws.id) {
+                require_project_workspace_ownership(
+                    client,
+                    project.id,
+                    project.workspace_id,
+                    expected_ws_id,
+                )
+                .await?;
+            }
+            println!(
+                "{} Using project {} (from --project-id)",
+                CHECK,
+                style(&project.name).cyan()
+            );
+            return Ok(Some(ProjectInfo {
+                id: project.id.to_string(),
+                name: project.name,
+            }));
+        }
+    }
 
     let ProjectCandidates {
         ws_id,
@@ -4378,6 +4510,96 @@ pub async fn select_project_for_current_directory(
     let folder_project_name = folder_project_name.as_str();
 
     if !prompt_user {
+        if let Some(raw_name) = explicit_project_name {
+            let requested_name = raw_name.trim();
+            if requested_name.is_empty() {
+                anyhow::bail!("--project-name cannot be empty.");
+            }
+            if let Some(project) = linked_project
+                .as_ref()
+                .filter(|project| project.name.eq_ignore_ascii_case(requested_name))
+            {
+                println!(
+                    "{} Using project {} (linked to this folder)",
+                    CHECK,
+                    style(&project.name).cyan()
+                );
+                return Ok(Some(ProjectInfo {
+                    id: project.id.to_string(),
+                    name: project.name.clone(),
+                }));
+            }
+            if let [project] = repository_matches.as_slice() {
+                if project.name.eq_ignore_ascii_case(requested_name) {
+                    println!(
+                        "{} Using project {} (matches Git repository)",
+                        CHECK,
+                        style(&project.name).cyan()
+                    );
+                    return Ok(Some(ProjectInfo {
+                        id: project.id.to_string(),
+                        name: project.name.clone(),
+                    }));
+                }
+            }
+            let name_collisions: Vec<_> = existing_projects
+                .iter()
+                .filter(|project| project.name.eq_ignore_ascii_case(requested_name))
+                .collect();
+            if let [existing] = name_collisions.as_slice() {
+                let suggested_name = format!("{requested_name}-2");
+                anyhow::bail!(
+                    "Workspace {:?} ({}) already has a project named {:?} ({}), and this folder could not be matched to it by an existing link or Git remote.
+                     To link this folder to that existing project, re-run with `--project-id {}`.
+                     To create a separate project for this folder, choose a different `--project-name <NAME>` (for example `--project-name {suggested_name}`).",
+                    ws.name,
+                    ws.id,
+                    existing.name,
+                    existing.id,
+                    existing.id,
+                );
+            } else if !name_collisions.is_empty() {
+                let ids = name_collisions
+                    .iter()
+                    .map(|project| project.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "Workspace {:?} ({}) already has projects named {:?} ({ids}), and this folder could not be matched by an existing link or Git remote.
+                     Re-run with `--project-id <UUID>` to link an existing project or choose a different `--project-name <NAME>`.",
+                    ws.name,
+                    ws.id,
+                    requested_name,
+                );
+            }
+            if allow_create {
+                if safe_edit::is_dry_run() {
+                    warning(
+                        "Dry-run did not create a server-side project; previewing editor files without a new project binding.",
+                    );
+                    return Ok(None);
+                }
+                let project = client
+                    .create_project_with_repository(
+                        requested_name,
+                        None,
+                        ws_id,
+                        checkout_repository_url.as_deref(),
+                    )
+                    .await?;
+                println!(
+                    "{} Created project {} (from --project-name)",
+                    CHECK,
+                    style(&project.name).cyan()
+                );
+                return Ok(Some(ProjectInfo {
+                    id: project.id.to_string(),
+                    name: project.name,
+                }));
+            }
+            return Ok(None);
+        }
+
         // A validated checkout-local UUID wins. Otherwise a unique exact
         // credential-free repository match is portable across
         // machines/worktrees. A same-name project is never identity.
@@ -4402,7 +4624,7 @@ pub async fn select_project_for_current_directory(
                     .collect::<Vec<_>>()
                     .join(", ");
                 anyhow::bail!(
-                    "Multiple projects in workspace {} claim repository {} ({ids}). Refusing to create or choose another duplicate during unattended setup; select or merge the canonical project explicitly.",
+                    "Multiple projects in workspace {} claim repository {} ({ids}). Refusing to create or choose another duplicate during unattended setup; pass `--project-id <UUID>` to select the canonical project explicitly.",
                     ws.id,
                     checkout_repository_identity
                         .as_ref()
@@ -4418,12 +4640,43 @@ pub async fn select_project_for_current_directory(
                 .collect::<Vec<_>>()
                 .join(", ");
             anyhow::bail!(
-                "Same-name legacy project(s) {ids} in workspace {} have no trustworthy repository identity. Refusing to create another project during unattended setup; select the canonical project explicitly once so it can be bound and backfilled.",
+                "Same-name legacy project(s) {ids} in workspace {} have no trustworthy repository identity. Refusing to create another project during unattended setup; pass `--project-id <UUID>` to bind the canonical project or `--project-name <NAME>` to create a separate project.",
                 ws.id
             );
         }
 
         if allow_create {
+            let folder_matches: Vec<_> = existing_projects
+                .iter()
+                .filter(|project| project.name.eq_ignore_ascii_case(folder_project_name))
+                .collect();
+            if let [existing] = folder_matches.as_slice() {
+                let suggested_name = format!("{folder_project_name}-2");
+                anyhow::bail!(
+                    "Workspace {:?} ({}) already has a project named {:?} ({}), and this folder could not be matched to it by an existing link or Git remote.
+                     To link this folder to that existing project, re-run with `--project-id {}`.
+                     To create a separate project for this folder, re-run with `--project-name <NAME>` (for example `--project-name {suggested_name}`).",
+                    ws.name,
+                    ws.id,
+                    existing.name,
+                    existing.id,
+                    existing.id,
+                );
+            } else if !folder_matches.is_empty() {
+                let ids = folder_matches
+                    .iter()
+                    .map(|project| project.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "Workspace {:?} ({}) already has projects named {:?} ({ids}), and this folder could not be matched by an existing link or Git remote.
+                     Re-run with `--project-id <UUID>` to link an existing project or `--project-name <NAME>` to create a separate project.",
+                    ws.name,
+                    ws.id,
+                    folder_project_name,
+                );
+            }
+
             if safe_edit::is_dry_run() {
                 warning(
                     "Dry-run did not create a server-side project; previewing editor files without a new project binding.",

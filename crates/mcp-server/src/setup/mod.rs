@@ -3736,10 +3736,7 @@ async fn authenticate_api_key() -> Result<(String, String)> {
             continue;
         }
 
-        let client = ContextStreamClient::new(Config {
-            api_key: Some(api_key.clone()),
-            ..Default::default()
-        });
+        let client = ContextStreamClient::new(setup_client_config(&api_key));
 
         match ui::spin("Checking the key", client.me()).await {
             Ok(user) => {

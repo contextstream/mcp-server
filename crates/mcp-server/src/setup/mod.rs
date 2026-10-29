@@ -7,6 +7,7 @@
 //! - AI rules generation
 
 pub mod account_learning;
+mod antigravity_plugin;
 pub mod clients;
 mod credentials;
 pub mod doctor;

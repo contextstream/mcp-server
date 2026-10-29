@@ -682,6 +682,9 @@ fn global_rules_content(editor: &Editor) -> String {
     if *editor == Editor::Aider {
         return aider_read_pointer_block("~/.contextstream/rules.md");
     }
+    if *editor == Editor::Antigravity {
+        return antigravity_plugin_rules();
+    }
     without_workspace_identity_header(&generate_rule_content(
         editor,
         None,
@@ -755,6 +758,13 @@ fn compute_rules_bundle_hash(teaching_contract: &str) -> String {
         &mut material,
         "copilot-skill",
         &canonical_copilot_skill_content(),
+    );
+    let antigravity_skill = antigravity_skill_files();
+    append_fingerprint_component(&mut material, "antigravity-skill", &antigravity_skill.skill);
+    append_fingerprint_component(
+        &mut material,
+        "antigravity-skill-reference",
+        &antigravity_skill.reference,
     );
 
     mcp_types::rules_hash::fnv1a_64_hex(&material)
@@ -1317,6 +1327,12 @@ pub fn write_editor_rules(editor: &Editor) -> Result<()> {
 
     let rules = global_rules_content(editor);
 
+    if *editor == Editor::Antigravity {
+        // Antigravity loads the rules file only from a plugin with a manifest.
+        super::antigravity_plugin::ensure_manifest()?;
+        super::antigravity_plugin::write_skill(&antigravity_skill_files())?;
+    }
+
     let primary = &paths[0];
     write_contextstream_block_to_path(primary, &rules, true)?;
     for legacy in paths.iter().skip(1) {
@@ -1330,6 +1346,10 @@ pub fn write_editor_rules(editor: &Editor) -> Result<()> {
             continue;
         }
         let _ = remove_contextstream_from_path(&cleanup_path)?;
+    }
+
+    if *editor == Editor::Antigravity {
+        retire_antigravity_gemini_md_rules()?;
     }
 
     // Keep a canonical global long-form rules file for Aider pointer-based loading.
@@ -1902,11 +1922,61 @@ const COPILOT_SUPPLEMENT: &str = r#"
 - Before code discovery, use `search(mode="auto", query="...")`
 "#;
 
+/// Antigravity's rules, in the ContextStream plugin's `rules/AGENTS.md`.
+///
+/// Antigravity reaches MCP tools only through one generic `call_mcp_tool`, so
+/// these rules spell that call out. They stay compact because Antigravity
+/// inlines always-on and global rules within one 20,000-token budget and cuts
+/// a rule file at 24 KB: rules over the budget become a file path, and an
+/// oversized block pushes a repository's own `AGENTS.md` out instead. The full
+/// reference is the plugin's `contextstream` skill.
+const ANTIGRAVITY_PLUGIN_GUIDANCE: &str = r#"## Calling ContextStream in Antigravity
+ContextStream is the `contextstream` MCP server. Make each call above with `call_mcp_tool`: `ServerName` "contextstream", `ToolName` the tool, `Arguments` its parameters. For example, `search(mode="auto", query="...")` is `call_mcp_tool(ServerName="contextstream", ToolName="search", Arguments={"mode": "auto", "query": "..."})`. These calls need no schema lookup first:
+- **Once per conversation, first:** `init` with `{"folder_path": "<workspace path>"}`. Keep the `session_id`, `workspace_id` and `project_id` it returns and pass them on later calls.
+- **At the start of every request, before other tools:** `context` with `{"user_message": "<the request>", "session_id": "<id>"}`. `[LESSONS_WARNING]` and `[PREFERENCE]` are instructions for this task; read `[GROUNDING]` hits first; run `[MATCHED_SKILLS]` with `skill(action="run", name="...")`; read `[COORDINATION]` notices and ack them with `coordination(action="ack", notice_id="...")`.
+- **To find code:** `search` with `{"query": "<what you need>", "mode": "auto"}` before `grep_search`, `find_by_name`, or `grep`/`rg`/`find` in `run_command`. Results are file paths with line numbers; open them with `view_file`. Search locally only when ContextStream finds nothing relevant, for files created in this conversation, or to filter logs and command output.
+
+## Knowledge and records
+- Prior work, decisions and conventions: `memory(action="search", query="...")`, `memory(action="decisions", query="...")`, `session(action="get_lessons", query="...")`; earlier sessions: `session(action="recall", query="...")`.
+- Save plans with `session(action="capture_plan", title="...", steps=[...])`, decisions with `session(action="capture", event_type="decision", title="...", content="...")`, lessons from a mistake or correction with `session(action="capture_lesson", title="...", trigger="...", impact="...", prevention="...")`, docs with `memory(action="create_doc", title="...", content="...")` and handoffs with `entity(kind="handoff", action="create", body={...})`, not in local markdown files: ContextStream brings them back in later sessions.
+- If a ContextStream call fails, or `project(action="index_status")` shows the folder isn't indexed yet, say so and continue with local tools.
+
+The `contextstream` skill in this plugin is the full reference: every tool and action, each notice, and these workflows in detail.
+"#;
+
+fn antigravity_plugin_rules() -> String {
+    let editor = Editor::Antigravity;
+    let teaching = build_harness_teaching(
+        Some(editor.harness_id()),
+        HarnessTeachingDelivery::StaticRules,
+    )
+    .rendered_guidance;
+    format!(
+        "{CONTEXTSTREAM_START}\n{}\n{teaching}\n\n{ANTIGRAVITY_PLUGIN_GUIDANCE}{CONTEXTSTREAM_END}\n",
+        editor.rules_heading()
+    )
+}
+
+/// The plugin's `contextstream` skill, around the full rules, which Antigravity
+/// loads only when the agent asks for them.
+pub(crate) fn antigravity_skill_files() -> super::antigravity_plugin::SkillFiles {
+    let full = without_workspace_identity_header(&generate_full_rules(
+        &Editor::Antigravity,
+        DEFAULT_WORKSPACE_NAME,
+        DEFAULT_WORKSPACE_ID,
+    ));
+    super::antigravity_plugin::skill_files(
+        &full
+            .replace(CONTEXTSTREAM_START, "")
+            .replace(CONTEXTSTREAM_END, ""),
+    )
+}
+
 const GEMINI_MD_SUPPLEMENT: &str = r#"
 ---
 ## Reliability Notes for GEMINI.md Agents (Antigravity, Gemini CLI)
 
-- These agents have no documented lifecycle hooks for ContextStream enforcement.
+- Gemini CLI has no lifecycle hooks for ContextStream. Antigravity gets them from the ContextStream plugin `contextstream-mcp setup` installs in `~/.gemini/config/plugins/contextstream`.
 - Treat ContextStream-first behavior as mandatory policy: run `context(...)` first, then `search(mode="auto", ...)` before local discovery.
 - Keep the MCP config valid and minimal: preserve non-ContextStream servers and only update the `contextstream` block.
 - If ContextStream appears skipped, verify:
@@ -2374,6 +2444,11 @@ pub fn remove_contextstream_from_rules(
         }
     }
 
+    if *editor == Editor::Antigravity && project_path.is_none() {
+        removed |= retire_antigravity_gemini_md_rules()?;
+        removed |= super::antigravity_plugin::remove_if_unused()?;
+    }
+
     Ok(removed)
 }
 
@@ -2391,6 +2466,40 @@ fn without_managed_block(text: &str) -> Option<String> {
         return None;
     }
     Some(format!("{}{}", &text[..start], &text[end..]))
+}
+
+/// Where releases before the ContextStream plugin wrote Antigravity's global
+/// rules. The file is Gemini CLI's; Antigravity's CLI reads it as well.
+pub(crate) fn legacy_antigravity_gemini_md_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".gemini").join("GEMINI.md"))
+}
+
+/// Whether Gemini CLI is set up and reads its global rules from `path`. When
+/// the saved selection can't be read, assume it does, so its rules stay.
+fn gemini_cli_reads_global_rules_at(path: &Path) -> bool {
+    let configured = mcp_client::activation::configured_clients()
+        .map(|ids| ids.iter().any(|id| id == Editor::GeminiCli.id()))
+        .unwrap_or(true);
+    configured && Editor::GeminiCli.rules_path(None).as_deref() == Some(path)
+}
+
+/// `~/.gemini/GEMINI.md` when it still holds the managed block written for
+/// Antigravity and Gemini CLI doesn't use it.
+pub(crate) fn retired_antigravity_gemini_md_rules() -> Option<PathBuf> {
+    let path = legacy_antigravity_gemini_md_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    (content_has_owned_contextstream_rules(&content) && !gemini_cli_reads_global_rules_at(&path))
+        .then_some(path)
+}
+
+/// Take the managed block out of `~/.gemini/GEMINI.md` once the plugin holds
+/// Antigravity's rules, unless Gemini CLI uses that file. Antigravity's CLI
+/// inlines up to 24 KB of it beside the plugin's rules, from the same budget.
+fn retire_antigravity_gemini_md_rules() -> Result<bool> {
+    match retired_antigravity_gemini_md_rules() {
+        Some(path) => remove_contextstream_from_path(&path),
+        None => Ok(false),
+    }
 }
 
 fn remove_contextstream_from_path(path: &Path) -> Result<bool> {
@@ -4917,5 +5026,133 @@ mod global_rules_identity_tests {
         let stripped = without_workspace_identity_header(&content);
         assert!(stripped.contains(RULES_HASH_MARKER_PREFIX), "{stripped}");
         assert!(!stripped.contains("# Workspace"), "{stripped}");
+    }
+
+    #[test]
+    fn antigravity_plugin_rules_fit_its_rules_budget_and_name_call_mcp_tool() {
+        let rules = global_rules_content(&Editor::Antigravity);
+        // Antigravity shares 20,000 tokens among all always-on and global
+        // rules; stay a small part of that (about 2,000 tokens).
+        assert!(rules.len() < 8_000, "{} bytes", rules.len());
+        assert!(rules.starts_with(CONTEXTSTREAM_START));
+        assert!(rules.trim_end().ends_with(CONTEXTSTREAM_END));
+        assert!(rules.contains(HARNESS_TEACHING_VERSION));
+        assert!(rules.contains(
+            r#"call_mcp_tool(ServerName="contextstream", ToolName="search", Arguments={"mode": "auto", "query": "..."})"#
+        ));
+        assert!(rules.contains("`grep_search`, `find_by_name`"));
+        assert!(!rules.contains("# Workspace"));
+        assert!(!rules.contains("No Hooks Available"));
+    }
+
+    #[test]
+    fn antigravity_skill_stays_within_the_size_antigravity_reads() {
+        let files = antigravity_skill_files();
+        // Antigravity loads only the first 24,000 bytes of a skill.
+        assert!(files.skill.len() < 24_000, "{} bytes", files.skill.len());
+        assert!(files.skill.contains("- Plans and Tasks"), "{}", files.skill);
+        assert!(files.reference.contains("## Past Sessions Are Queryable"));
+        assert!(!files.reference.contains(CONTEXTSTREAM_START));
+        assert!(!files.reference.contains("# Workspace ID"));
+    }
+
+    fn with_temp_home<T>(run: impl FnOnce(&Path) -> T) -> T {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(temp.path())));
+        match previous {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    fn configure_clients(home: &Path, clients: &[&str]) {
+        let dir = home.join(".contextstream");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("installation.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "installation_id": uuid::Uuid::new_v4().to_string(),
+                "created_at": "2026-10-29T00:00:00Z",
+                "configured_clients": clients,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn antigravity_global_rules_install_the_plugin_and_retire_the_gemini_md_block() {
+        with_temp_home(|home| {
+            // An earlier release wrote Antigravity's rules into Gemini CLI's file,
+            // next to the person's own.
+            let gemini_md = home.join(".gemini").join("GEMINI.md");
+            std::fs::create_dir_all(gemini_md.parent().unwrap()).unwrap();
+            std::fs::write(&gemini_md, "My own Gemini notes.\n").unwrap();
+            write_contextstream_block_to_path(
+                &gemini_md,
+                &global_rules_content(&Editor::GeminiCli),
+                true,
+            )
+            .unwrap();
+            configure_clients(home, &["antigravity"]);
+            assert_eq!(
+                retired_antigravity_gemini_md_rules(),
+                Some(gemini_md.clone())
+            );
+
+            write_editor_rules(&Editor::Antigravity).expect("write Antigravity rules");
+            let plugin = home.join(".gemini/config/plugins/contextstream");
+            for file in [
+                "plugin.json",
+                "rules/AGENTS.md",
+                "skills/contextstream/SKILL.md",
+                "skills/contextstream/references/reference.md",
+            ] {
+                assert!(plugin.join(file).exists(), "{file} missing");
+            }
+            assert_eq!(
+                std::fs::read_to_string(&gemini_md).unwrap(),
+                "My own Gemini notes.\n"
+            );
+            assert_eq!(retired_antigravity_gemini_md_rules(), None);
+
+            // A second run changes nothing.
+            let before = std::fs::read_to_string(plugin.join("rules/AGENTS.md")).unwrap();
+            write_editor_rules(&Editor::Antigravity).expect("rewrite");
+            assert_eq!(
+                std::fs::read_to_string(plugin.join("rules/AGENTS.md")).unwrap(),
+                before
+            );
+
+            // Uninstall takes the plugin away.
+            assert!(remove_contextstream_from_rules(&Editor::Antigravity, None).unwrap());
+            assert!(!plugin.exists());
+        });
+    }
+
+    #[test]
+    fn gemini_md_rules_stay_while_gemini_cli_uses_them() {
+        with_temp_home(|home| {
+            let gemini_md = home.join(".gemini").join("GEMINI.md");
+            write_editor_rules(&Editor::GeminiCli).expect("write Gemini CLI rules");
+            configure_clients(home, &["antigravity", Editor::GeminiCli.id()]);
+            let before = std::fs::read_to_string(&gemini_md).unwrap();
+            assert!(content_has_owned_contextstream_rules(&before));
+
+            write_editor_rules(&Editor::Antigravity).expect("write Antigravity rules");
+            assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), before);
+            assert_eq!(retired_antigravity_gemini_md_rules(), None);
+
+            // An unreadable selection keeps them too.
+            std::fs::write(home.join(".contextstream/installation.json"), "{not json").unwrap();
+            assert_eq!(retired_antigravity_gemini_md_rules(), None);
+        });
     }
 }

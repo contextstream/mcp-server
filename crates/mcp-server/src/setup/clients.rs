@@ -636,7 +636,21 @@ static ANTIGRAVITY: ClientDescriptor = ClientDescriptor {
     tool_surface_profile: None,
     rules: RulesLayout {
         project: Some(ProjectPathSpec::At(&["GEMINI.md"])),
-        global: Some(PathSpec::At(Base::Home, &[".gemini", "GEMINI.md"])),
+        // Global rules live in the ContextStream plugin (see
+        // `antigravity_plugin.rs`). `~/.gemini/GEMINI.md`, where earlier
+        // releases wrote them, is Gemini CLI's file; `rules.rs` retires the
+        // block there unless Gemini CLI uses it.
+        global: Some(PathSpec::At(
+            Base::Home,
+            &[
+                ".gemini",
+                "config",
+                "plugins",
+                "contextstream",
+                "rules",
+                "AGENTS.md",
+            ],
+        )),
         legacy_project: &[ProjectPathSpec::At(&[
             ".agent",
             "rules",

@@ -209,6 +209,52 @@ async fn legacy_hosted_api_falls_back_without_recommending_local_mcp() {
 }
 
 #[tokio::test]
+async fn index_status_of_an_index_being_built_gives_its_counts_and_is_not_ready() {
+    // #326: "in progress" and "Index is ready ... API confirms index
+    // readiness" in one answer, with none of the counts.
+    let project_id = uuid::Uuid::new_v4();
+    let installation_id = uuid::Uuid::new_v4();
+    let (tool, server) = project_tool_with_http_sequence(vec![(
+        "200 OK",
+        json!({
+            "indexed": true,
+            "status": "indexing",
+            "project_index_state": "indexing",
+            "progress": 87,
+            "indexed_files": 6660,
+            "total_files": 7680,
+            "pending_files": 1020,
+            "committed_generation": 16,
+            "active_generation": 17
+        })
+        .to_string(),
+    )])
+    .await;
+
+    let result = mcp_client::run_with_installation_id(installation_id, || async {
+        tool.execute(json!({
+            "action": "index_status",
+            "project_id": project_id,
+            "path": "/Users/alice/projects/scale-repo"
+        }))
+        .await
+    })
+    .await
+    .expect("index status");
+    let text = tool_result_text(&result);
+    assert!(
+        text.contains(
+            "Project indexing is in progress: 6660 of 7680 files indexed so far, 1020 pending."
+        ),
+        "{text}"
+    );
+    assert!(text.contains("not found yet"), "{text}");
+    assert!(!text.contains("Index is ready"), "{text}");
+    assert!(!text.contains("API confirms index readiness"), "{text}");
+    drop(server);
+}
+
+#[tokio::test]
 async fn index_status_preserves_canonical_readiness_when_checkout_is_unconfirmed() {
     let project_id = uuid::Uuid::new_v4();
     let installation_id = uuid::Uuid::new_v4();
@@ -774,7 +820,7 @@ mod helper_tests {
 
     #[test]
     fn aging_ready_index_text_is_not_scary() {
-        let text = format_index_freshness_text("aging", Some(133), true);
+        let text = format_index_freshness_text("aging", Some(133), true, false);
 
         assert!(text.contains("Search is ready from the existing index"));
         assert!(text.contains("last confirmed ingest was 133h ago"));
@@ -783,7 +829,7 @@ mod helper_tests {
 
     #[test]
     fn stale_ready_index_text_is_not_scary() {
-        let text = format_index_freshness_text("stale", Some(140), true);
+        let text = format_index_freshness_text("stale", Some(140), true, false);
 
         assert!(text.contains("Search is ready from the existing index"));
         assert!(text.contains("last confirmed ingest was 140h ago"));

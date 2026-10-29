@@ -905,7 +905,34 @@ fn classify_index_confidence(
     )
 }
 
-fn format_index_freshness_text(freshness: &str, age_hours: Option<i64>, indexed: bool) -> String {
+/// How far an index that is being built has got, from the counts the API
+/// sends (#326: the text had none of them, so a 66% index read like a
+/// finished one).
+fn index_progress_text(result: &Value, pending_files: i64) -> Option<String> {
+    let count = |key: &str| {
+        result
+            .get(key)
+            .or_else(|| result.get("data").and_then(|data| data.get(key)))
+            .and_then(Value::as_i64)
+            .filter(|count| *count >= 0)
+    };
+    let indexed = count("indexed_files").or_else(|| count("indexed_file_count"))?;
+    let mut text = match count("total_files").filter(|total| *total >= indexed && *total > 0) {
+        Some(total) => format!(": {indexed} of {total} files indexed so far"),
+        None => format!(": {indexed} files indexed so far"),
+    };
+    if pending_files > 0 {
+        text.push_str(&format!(", {pending_files} pending"));
+    }
+    Some(text)
+}
+
+fn format_index_freshness_text(
+    freshness: &str,
+    age_hours: Option<i64>,
+    indexed: bool,
+    in_progress: bool,
+) -> String {
     let age_display = age_hours
         .map(|h| format!("{}h", h))
         .unwrap_or_else(|| "unknown".to_string());
@@ -919,6 +946,8 @@ fn format_index_freshness_text(freshness: &str, age_hours: Option<i64>, indexed:
             " Search is ready from the existing index; last confirmed ingest was {} ago. Background refresh can update coverage.",
             age_display
         ),
+        // An index still being built is not "ready" (#326).
+        "unknown" if in_progress => " Freshness timestamp is unavailable.".to_string(),
         "unknown" => " Index is ready; freshness timestamp is unavailable.".to_string(),
         _ => format!(" Freshness: {} ({}).", freshness, age_display),
     }
@@ -2672,11 +2701,16 @@ impl ToolHandler for ProjectTool {
                         );
                     }
                 }
+                let progress = index_progress_text(&result, pending_files).unwrap_or_default();
                 let mut text = if index_in_progress {
                     if indexed {
-                        "Project indexing is in progress. Search is using the latest committed generation."
+                        format!(
+                            "Project indexing is in progress{progress}. Search uses the latest committed generation, so a file that is not indexed yet is not found yet."
+                        )
                     } else {
-                        "Project indexing is in progress. Keyword search works now; semantic search comes online after the first commit. Use search and retry as it fills in; do not fall back to local tools while it is building."
+                        format!(
+                            "Project indexing is in progress{progress}. Keyword search works now; semantic search comes online after the first commit. Use search and retry as it fills in; do not fall back to local tools while it is building."
+                        )
                     }
                 } else if indexed {
                     if checkout_status_unconfirmed {
@@ -2686,10 +2720,11 @@ impl ToolHandler for ProjectTool {
                     } else {
                         "Project index is ready. Semantic search is available."
                     }
+                    .to_string()
                 } else {
                     "Project index not found. Keep hosted MCP configured. Re-establish the intended checkout with init(folder_path=\"<folder>\"), then run project(action=\"index\"); the exact-checkout sync bridge will provide local bytes. Until then use ContextStream search first; fall back to local tools only if search itself returns nothing."
-                }
-                .to_string();
+                    .to_string()
+                };
                 if checkout_status_unconfirmed {
                     if indexed {
                         text.push_str(
@@ -2701,7 +2736,12 @@ impl ToolHandler for ProjectTool {
                         );
                     }
                 }
-                text.push_str(&format_index_freshness_text(freshness, age_hours, indexed));
+                text.push_str(&format_index_freshness_text(
+                    freshness,
+                    age_hours,
+                    indexed,
+                    index_in_progress,
+                ));
                 if let Some(source) = canonical_source.as_ref() {
                     let repository = source
                         .get("repository")
@@ -2729,7 +2769,7 @@ impl ToolHandler for ProjectTool {
                         " Confidence: {}. {}",
                         confidence, confidence_reason
                     ));
-                } else if api_indexed && !locally_indexed {
+                } else if api_indexed && !locally_indexed && !index_in_progress {
                     text.push_str(" API confirms index readiness.");
                 }
                 if api_indexing && pending_files > 0 && pending_paths.is_empty() {

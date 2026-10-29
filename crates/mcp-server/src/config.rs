@@ -36,6 +36,40 @@ fn credential_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// An enum-valued setting, parsed: `None` when it is unset or blank, or when
+/// its value is not one `T` knows. The second value is what to tell the
+/// person about an unknown value, which used to be dropped without a word
+/// (#319: `CONTEXTSTREAM_TOOLSET=bogus` served the default toolset).
+fn parse_enum_setting<T: std::str::FromStr>(
+    name: &str,
+    raw: Option<&str>,
+    known: &str,
+) -> (Option<T>, Option<String>) {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (None, None);
+    };
+    match value.parse::<T>() {
+        Ok(parsed) => (Some(parsed), None),
+        Err(_) => (
+            None,
+            Some(format!(
+                "contextstream-mcp: {name}=\"{value}\" is not one of {known}; using the default."
+            )),
+        ),
+    }
+}
+
+/// An enum-valued environment variable; an unknown value is reported on
+/// stderr, which an MCP client shows in its server log.
+fn enum_env<T: std::str::FromStr>(name: &str, known: &str) -> Option<T> {
+    let raw = std::env::var(name).ok();
+    let (parsed, warning) = parse_enum_setting(name, raw.as_deref(), known);
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    parsed
+}
+
 fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
     let has_env_auth = credential_env("CONTEXTSTREAM_API_KEY").is_some()
         || credential_env("CONTEXTSTREAM_JWT").is_some();
@@ -83,20 +117,15 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
     let user_agent = std::env::var("CONTEXTSTREAM_USER_AGENT")
         .unwrap_or_else(|_| format!("contextstream-mcp-rust/{}", VERSION));
 
-    let toolset = std::env::var("CONTEXTSTREAM_TOOLSET")
-        .ok()
-        .and_then(|s| s.parse::<Toolset>().ok())
+    let toolset = enum_env::<Toolset>("CONTEXTSTREAM_TOOLSET", "light, standard or complete")
         .unwrap_or_default();
 
-    let log_level = std::env::var("CONTEXTSTREAM_LOG_LEVEL")
-        .ok()
-        .and_then(|s| s.parse::<LogLevel>().ok())
+    let log_level = enum_env::<LogLevel>("CONTEXTSTREAM_LOG_LEVEL", "quiet, normal or verbose")
         .unwrap_or_default();
 
-    let output_format = std::env::var("CONTEXTSTREAM_OUTPUT_FORMAT")
-        .ok()
-        .and_then(|s| s.parse::<OutputFormat>().ok())
-        .unwrap_or_default();
+    let output_format =
+        enum_env::<OutputFormat>("CONTEXTSTREAM_OUTPUT_FORMAT", "compact or pretty")
+            .unwrap_or_default();
 
     let context_pack_enabled = parse_bool_env_default("CONTEXTSTREAM_CONTEXT_PACK", true);
     let show_timing = parse_bool_env("CONTEXTSTREAM_SHOW_TIMING");
@@ -131,10 +160,9 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
         .and_then(|s| s.parse::<ToolSurfaceProfile>().ok())
         .unwrap_or_else(|| infer_tool_surface_profile(&user_agent));
 
-    let account_mode_preference = std::env::var("CONTEXTSTREAM_ACCOUNT_MODE")
-        .ok()
-        .and_then(|s| s.parse::<AccountModePreference>().ok())
-        .unwrap_or_default();
+    let account_mode_preference =
+        enum_env::<AccountModePreference>("CONTEXTSTREAM_ACCOUNT_MODE", "auto, team or personal")
+            .unwrap_or_default();
 
     // Opt-in that re-enables caller-supplied local file paths on the HTTP
     // gateway. Only `allow` enables it; anything else (including unset) keeps
@@ -259,6 +287,31 @@ mod tests {
     use super::*;
     use crate::env_test_mutex;
     use mcp_types::config::SavedCredentials;
+
+    #[test]
+    fn an_unknown_setting_value_is_reported_not_dropped() {
+        // #319: CONTEXTSTREAM_TOOLSET=bogus served the default toolset silently.
+        let (toolset, warning) = parse_enum_setting::<Toolset>(
+            "CONTEXTSTREAM_TOOLSET",
+            Some("bogus"),
+            "light, standard or complete",
+        );
+        assert_eq!(toolset, None);
+        assert_eq!(
+            warning.as_deref(),
+            Some("contextstream-mcp: CONTEXTSTREAM_TOOLSET=\"bogus\" is not one of light, standard or complete; using the default.")
+        );
+        let (toolset, warning) =
+            parse_enum_setting::<Toolset>("CONTEXTSTREAM_TOOLSET", Some(" Light "), "");
+        assert_eq!(toolset, Some(Toolset::Light));
+        assert_eq!(warning, None);
+        // Unset or blank is no value, and nothing to report.
+        for raw in [None, Some(""), Some("  ")] {
+            let (toolset, warning) =
+                parse_enum_setting::<Toolset>("CONTEXTSTREAM_TOOLSET", raw, "");
+            assert_eq!((toolset, warning), (None, None));
+        }
+    }
 
     #[test]
     fn resolve_api_url_prefers_saved_when_no_override_exists() {

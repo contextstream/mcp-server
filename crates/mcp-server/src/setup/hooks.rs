@@ -2485,9 +2485,12 @@ fn hook_config_is_wholly_managed(
         return false;
     };
     let allowed_top_level = match flavor {
-        HookConfigFlavor::Claude | HookConfigFlavor::Windsurf => {
-            root.keys().all(|key| key == "hooks")
-        }
+        HookConfigFlavor::Claude => root.keys().all(|key| {
+            key == "hooks"
+                || (key == "autoMemoryEnabled"
+                    && root.get("autoMemoryEnabled") == Some(&Value::Bool(false)))
+        }),
+        HookConfigFlavor::Windsurf => root.keys().all(|key| key == "hooks"),
         HookConfigFlavor::Cursor => {
             root.keys().all(|key| key == "hooks" || key == "version")
                 && root.get("version") == Some(&json!(1))
@@ -2500,13 +2503,14 @@ fn hook_config_is_wholly_managed(
     let Some(Value::Object(mut hooks)) = root.get("hooks").cloned() else {
         return false;
     };
+    let had_hooks = !hooks.is_empty();
     match flavor {
         HookConfigFlavor::Claude => strip_contextstream_hook_entries(&mut hooks),
         HookConfigFlavor::Cursor | HookConfigFlavor::Windsurf => {
             strip_flat_contextstream_hook_entries(&mut hooks)
         }
     }
-    hooks.is_empty()
+    had_hooks && hooks.is_empty()
 }
 
 fn commit_or_remove_hook_config(
@@ -2601,7 +2605,52 @@ fn uninstall_vscode_extension_hooks(editor: &Editor) -> Result<()> {
     Ok(())
 }
 
-/// Remove ContextStream hooks from Claude Code settings.json.
+fn try_restore_exact_claude_settings_backup(
+    settings_path: &Path,
+    current: &safe_edit::LoadedConfig,
+) -> Result<bool> {
+    let backup_path = safe_edit::backup_path(settings_path)?;
+    let Some(backup) =
+        safe_edit::read_recovery_for_edit(&backup_path, safe_edit::JsonDialect::Strict)?
+    else {
+        return Ok(false);
+    };
+    if contains_owned_hook_command(&backup.value) {
+        return Ok(false);
+    }
+
+    let hooks_updated = build_claude_hooks_update(&backup, settings_path, None)?;
+    let after_hooks_raw = safe_edit::render(&backup, &hooks_updated)?;
+    if after_hooks_raw == current.raw {
+        return safe_edit::restore_first_backup(settings_path, current, &backup.raw);
+    }
+
+    if claude_auto_memory_in(&hooks_updated) != ClaudeAutoMemory::Off {
+        let mut after_hooks = backup.clone();
+        after_hooks.raw = after_hooks_raw;
+        after_hooks.value = hooks_updated.clone();
+        let mut with_auto_memory = hooks_updated;
+        with_auto_memory["autoMemoryEnabled"] = Value::Bool(false);
+        if safe_edit::render(&after_hooks, &with_auto_memory)? == current.raw
+            || safe_edit::render(&backup, &with_auto_memory)? == current.raw
+        {
+            return safe_edit::restore_first_backup(settings_path, current, &backup.raw);
+        }
+    }
+
+    if claude_auto_memory_in(&backup.value) != ClaudeAutoMemory::Off {
+        let mut auto_memory_only = backup.value.clone();
+        auto_memory_only["autoMemoryEnabled"] = Value::Bool(false);
+        if safe_edit::render(&backup, &auto_memory_only)? == current.raw {
+            return safe_edit::restore_first_backup(settings_path, current, &backup.raw);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Remove ContextStream hooks and managed `autoMemoryEnabled: false` state from
+/// Claude Code `settings.json`.
 fn uninstall_claude_code_hooks() -> Result<()> {
     let settings_path = match claude_code_settings_path() {
         Some(p) => p,
@@ -2613,21 +2662,88 @@ fn uninstall_claude_code_hooks() -> Result<()> {
     }
 
     let loaded = safe_edit::read_for_edit(&settings_path, safe_edit::JsonDialect::Strict)?;
-    if try_restore_exact_hook_backup(&settings_path, &loaded, |backup| {
-        build_claude_hooks_update(backup, &settings_path, None)
-    })? {
+    if try_restore_exact_claude_settings_backup(&settings_path, &loaded)? {
         return Ok(());
     }
 
-    let Some(Value::Object(mut hooks)) = loaded.value.get("hooks").cloned() else {
-        return Ok(());
-    };
+    let backup_path = safe_edit::backup_path(&settings_path)?;
+    let backup = safe_edit::read_recovery_for_edit(&backup_path, safe_edit::JsonDialect::Strict)?;
+    let current_is_wholly_managed =
+        hook_config_is_wholly_managed(&loaded, HookConfigFlavor::Claude);
+    let backup_is_wholly_managed = backup
+        .as_ref()
+        .is_some_and(|b| hook_config_is_wholly_managed(b, HookConfigFlavor::Claude));
 
-    strip_contextstream_hook_entries(&mut hooks);
+    if current_is_wholly_managed && (backup.is_none() || backup_is_wholly_managed) {
+        safe_edit::remove_owned_file_if_unchanged(&settings_path, &loaded.raw)?;
+        if let Some(backup) = backup.filter(|_| backup_is_wholly_managed) {
+            safe_edit::remove_owned_file_if_unchanged(&backup_path, &backup.raw)?;
+        }
+        return Ok(());
+    }
+
+    let had_managed_hooks = contains_owned_hook_command(&loaded.value);
+    if !had_managed_hooks && backup.is_none() {
+        return Ok(());
+    }
 
     let mut updated = loaded.value.clone();
-    updated["hooks"] = Value::Object(hooks);
-    commit_or_remove_hook_config(&settings_path, &loaded, &updated, HookConfigFlavor::Claude)?;
+    let mut removed_keys: Vec<&str> = Vec::new();
+
+    if let Some(Value::Object(mut hooks)) = updated.get("hooks").cloned() {
+        strip_contextstream_hook_entries(&mut hooks);
+        let backup_had_hooks_key = backup
+            .as_ref()
+            .is_some_and(|b| !backup_is_wholly_managed && b.value.get("hooks").is_some());
+        if hooks.is_empty() && !backup_had_hooks_key {
+            if let Some(root) = updated.as_object_mut() {
+                root.remove("hooks");
+                removed_keys.push("hooks");
+            }
+        } else {
+            updated["hooks"] = Value::Object(hooks);
+        }
+    }
+
+    if updated.get("autoMemoryEnabled") == Some(&Value::Bool(false)) {
+        match backup.as_ref().filter(|_| !backup_is_wholly_managed) {
+            Some(pre_install) => match pre_install.value.get("autoMemoryEnabled") {
+                None => {
+                    if let Some(root) = updated.as_object_mut() {
+                        root.remove("autoMemoryEnabled");
+                        removed_keys.push("autoMemoryEnabled");
+                    }
+                }
+                Some(Value::Bool(false)) => {}
+                Some(previous_value) => {
+                    updated["autoMemoryEnabled"] = previous_value.clone();
+                }
+            },
+            None if !mcp_client::activation::keep_claude_auto_memory_preference()
+                .unwrap_or(false) =>
+            {
+                if let Some(root) = updated.as_object_mut() {
+                    root.remove("autoMemoryEnabled");
+                    removed_keys.push("autoMemoryEnabled");
+                }
+            }
+            None => {}
+        }
+    }
+
+    if updated.as_object().is_some_and(serde_json::Map::is_empty)
+        && (backup.is_none() || backup_is_wholly_managed)
+    {
+        safe_edit::remove_owned_file_if_unchanged(&settings_path, &loaded.raw)?;
+        if let Some(backup) = backup.filter(|_| backup_is_wholly_managed) {
+            safe_edit::remove_owned_file_if_unchanged(&backup_path, &backup.raw)?;
+        }
+        return Ok(());
+    }
+
+    if updated != loaded.value {
+        safe_edit::commit_with_removals(&settings_path, &loaded, &updated, &removed_keys)?;
+    }
 
     Ok(())
 }
@@ -4538,5 +4654,81 @@ mod customized_settings_tests {
                 && spec.matcher == Some("Bash")
                 && spec.hook_name == "git-bash-observed"
         }));
+    }
+
+    #[test]
+    fn uninstall_claude_hooks_cleans_auto_memory_and_preserves_user_settings() {
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+
+        let settings = claude_code_settings_path().expect("Claude settings path");
+
+        // 1. Fresh HOME: install_hooks + disable_claude_auto_memory -> uninstall removes both files.
+        install_hooks(&Editor::ClaudeCode, None).expect("install hooks");
+        assert!(disable_claude_auto_memory().expect("disable auto memory"));
+        assert!(settings.exists());
+        assert!(safe_edit::backup_path(&settings).unwrap().exists());
+        uninstall_hooks(&Editor::ClaudeCode).expect("uninstall fresh");
+        assert!(!settings.exists(), "owned settings.json should be deleted");
+        assert!(
+            !safe_edit::backup_path(&settings).unwrap().exists(),
+            "owned backup should be deleted"
+        );
+
+        // 2. Existing settings with autoMemoryEnabled: true + user edit after install -> restores true and drops empty hooks.
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            "{\n  \"model\": \"opus\",\n  \"autoMemoryEnabled\": true\n}\n",
+        )
+        .unwrap();
+        install_hooks(&Editor::ClaudeCode, None).expect("install hooks");
+        assert!(disable_claude_auto_memory().expect("disable auto memory"));
+        let edited = std::fs::read_to_string(&settings)
+            .unwrap()
+            .replace("\"opus\"", "\"sonnet\"");
+        std::fs::write(&settings, edited).unwrap();
+        uninstall_hooks(&Editor::ClaudeCode).expect("uninstall after user edit");
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(after, json!({"model": "sonnet", "autoMemoryEnabled": true}));
+
+        // 3. Existing settings where user explicitly had autoMemoryEnabled: false before install -> keeps false.
+        let _ = std::fs::remove_file(safe_edit::backup_path(&settings).unwrap());
+        std::fs::write(
+            &settings,
+            "{\n  \"model\": \"opus\",\n  \"autoMemoryEnabled\": false\n}\n",
+        )
+        .unwrap();
+        install_hooks(&Editor::ClaudeCode, None).expect("install hooks");
+        assert!(!disable_claude_auto_memory().expect("already false"));
+        let edited_false = std::fs::read_to_string(&settings)
+            .unwrap()
+            .replace("\"opus\"", "\"haiku\"");
+        std::fs::write(&settings, edited_false).unwrap();
+        uninstall_hooks(&Editor::ClaudeCode).expect("uninstall preserving user false");
+        let after_false: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            after_false,
+            json!({"model": "haiku", "autoMemoryEnabled": false})
+        );
+
+        // 4. Unmanaged Claude settings (no ContextStream hooks and no backup) are untouched.
+        let _ = std::fs::remove_file(safe_edit::backup_path(&settings).unwrap());
+        let unmanaged = "{\n  \"model\": \"opus\",\n  \"autoMemoryEnabled\": false\n}\n";
+        std::fs::write(&settings, unmanaged).unwrap();
+        uninstall_hooks(&Editor::ClaudeCode).expect("unmanaged no-op");
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), unmanaged);
+
+        if let Some(value) = previous_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 }

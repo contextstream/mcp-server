@@ -532,3 +532,156 @@ async fn setup_keep_claude_auto_memory_persists_passes_doctor_and_survives_repai
     stop_spawned_watch_helper_if_any(&home);
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_then_uninstall_restores_claude_auto_memory_and_cleans_settings() {
+    const SECRET: &str = "cs_test_uninstall_claude_auto_memory_274";
+    let (api_url, server) = spawn_mock_keepmem_server(SECRET).await;
+
+    // Case 1: Fresh HOME where ~/.claude/settings.json did not exist before setup.
+    let temp_fresh = tempfile::tempdir().unwrap();
+    let home_fresh = temp_fresh.path().join("home");
+    let project_fresh = temp_fresh.path().join("repo-fresh");
+    std::fs::create_dir_all(&home_fresh).unwrap();
+    std::fs::create_dir_all(&project_fresh).unwrap();
+    init_git_repo(&project_fresh);
+    assert!(!home_fresh.join(".claude/settings.json").exists());
+
+    let h1 = home_fresh.clone();
+    let p1 = project_fresh.clone();
+    let u1 = api_url.clone();
+    let setup_fresh = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+            .args([
+                "setup",
+                "--yes",
+                "--editors",
+                "claude",
+                "--workspace-id",
+                "11111111-1111-4111-8111-111111111111",
+            ])
+            .env("HOME", &h1)
+            .env("USERPROFILE", &h1)
+            .env("CONTEXTSTREAM_API_URL", &u1)
+            .env("CONTEXTSTREAM_API_KEY", SECRET)
+            .env("NO_COLOR", "1")
+            .current_dir(&p1)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        setup_fresh.status.success(),
+        "setup failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&setup_fresh.stdout),
+        String::from_utf8_lossy(&setup_fresh.stderr)
+    );
+    assert!(home_fresh.join(".claude/settings.json").exists());
+
+    let h1u = home_fresh.clone();
+    let p1u = project_fresh.clone();
+    let uninstall_fresh = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+            .args(["uninstall", "--scope", "all"])
+            .env("HOME", &h1u)
+            .env("USERPROFILE", &h1u)
+            .env("NO_COLOR", "1")
+            .current_dir(&p1u)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        uninstall_fresh.status.success(),
+        "uninstall failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&uninstall_fresh.stdout),
+        String::from_utf8_lossy(&uninstall_fresh.stderr)
+    );
+    assert!(
+        !home_fresh.join(".claude/settings.json").exists(),
+        "fresh ~/.claude/settings.json should be deleted on uninstall, found: {:?}",
+        std::fs::read_to_string(home_fresh.join(".claude/settings.json"))
+    );
+    assert!(!home_fresh
+        .join(".claude/settings.json.contextstream.bak")
+        .exists());
+    stop_spawned_watch_helper_if_any(&home_fresh);
+
+    // Case 2: Pre-existing ~/.claude/settings.json with user permissions and user hooks (no autoMemoryEnabled).
+    let temp_seeded = tempfile::tempdir().unwrap();
+    let home_seeded = temp_seeded.path().join("home");
+    let project_seeded = temp_seeded.path().join("repo-seeded");
+    std::fs::create_dir_all(home_seeded.join(".claude")).unwrap();
+    std::fs::create_dir_all(&project_seeded).unwrap();
+    init_git_repo(&project_seeded);
+
+    let seeded_settings = serde_json::to_string_pretty(&json!({
+        "permissions": {"allow": ["Bash(git status:*)"]},
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": "/bin/true"}]
+            }]
+        }
+    }))
+    .unwrap()
+        + "\n";
+    let seeded_path = home_seeded.join(".claude/settings.json");
+    std::fs::write(&seeded_path, &seeded_settings).unwrap();
+
+    let h2 = home_seeded.clone();
+    let p2 = project_seeded.clone();
+    let u2 = api_url.clone();
+    let setup_seeded = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+            .args([
+                "setup",
+                "--yes",
+                "--editors",
+                "claude",
+                "--workspace-id",
+                "11111111-1111-4111-8111-111111111111",
+            ])
+            .env("HOME", &h2)
+            .env("USERPROFILE", &h2)
+            .env("CONTEXTSTREAM_API_URL", &u2)
+            .env("CONTEXTSTREAM_API_KEY", SECRET)
+            .env("NO_COLOR", "1")
+            .current_dir(&p2)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(setup_seeded.status.success());
+
+    let h2u = home_seeded.clone();
+    let p2u = project_seeded.clone();
+    let uninstall_seeded = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+            .args(["uninstall", "--scope", "all"])
+            .env("HOME", &h2u)
+            .env("USERPROFILE", &h2u)
+            .env("NO_COLOR", "1")
+            .current_dir(&p2u)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(uninstall_seeded.status.success());
+
+    let restored = std::fs::read_to_string(&seeded_path).unwrap();
+    assert_eq!(
+        restored, seeded_settings,
+        "should restore exact pre-setup user settings"
+    );
+    assert!(!home_seeded
+        .join(".claude/settings.json.contextstream.bak")
+        .exists());
+
+    stop_spawned_watch_helper_if_any(&home_seeded);
+    server.abort();
+}

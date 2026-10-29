@@ -2388,7 +2388,14 @@ async fn run_configure(
         )
         .await?;
 
-        eprintln!("Transcript defaults updated (scope: {}).", scope.as_str());
+        if mcp_server::setup::safe_edit::is_dry_run() {
+            eprintln!(
+                "Transcript defaults would be updated (scope: {}).",
+                scope.as_str()
+            );
+        } else {
+            eprintln!("Transcript defaults updated (scope: {}).", scope.as_str());
+        }
         if let Some(value) = transcripts_enabled {
             eprintln!(
                 "  CONTEXTSTREAM_TRANSCRIPTS_ENABLED={}",

@@ -69,6 +69,17 @@ impl std::fmt::Display for MarkPrefix {
 
 static CHECK: MarkPrefix = MarkPrefix(ui::Mark::Ok);
 static CROSS: MarkPrefix = MarkPrefix(ui::Mark::Fail);
+static PLANNED: MarkPrefix = MarkPrefix(ui::Mark::Pending);
+
+/// The status line for one change: `✓ <done>` once it is written, and
+/// `○ <planned>` under `--dry-run`, which writes nothing (#249).
+fn change_line(done: impl std::fmt::Display, planned: impl std::fmt::Display) -> String {
+    if safe_edit::is_dry_run() {
+        format!("{PLANNED} {planned}")
+    } else {
+        format!("{CHECK} {done}")
+    }
+}
 
 /// Set while setup's final hook refresh runs: setup already reported what it
 /// configured, so the refresh prints only problems.
@@ -1241,7 +1252,14 @@ pub async fn update_hooks_scoped(
         // original recovery backup and makes refreshes true no-ops.
         match hooks::install_hooks(editor, None) {
             Ok(()) => {
-                refresh_note!("{} Hooks updated for {}", CHECK, editor.display_name());
+                let name = editor.display_name();
+                refresh_note!(
+                    "{}",
+                    change_line(
+                        format!("Hooks updated for {name}"),
+                        format!("Hooks would be updated for {name}"),
+                    )
+                );
                 updated_count += 1;
             }
             Err(e) => {
@@ -1270,9 +1288,14 @@ pub async fn update_hooks_scoped(
         match register_managed_sync_bridge() {
             Ok(registration) => {
                 refresh_note!(
-                    "{} Hosted sync bridge registration: {}",
-                    CHECK,
-                    registration.platform
+                    "{}",
+                    change_line(
+                        format!("Hosted sync bridge registration: {}", registration.platform),
+                        format!(
+                            "Hosted sync bridge registration would be written: {}",
+                            registration.platform
+                        ),
+                    )
                 );
                 if !safe_edit::is_dry_run() {
                     crate::watch::spawn_watch_helper();
@@ -1294,11 +1317,13 @@ pub async fn update_hooks_scoped(
         // directory happened to launch it.
         match mcp_config::repair_deleted_binary_path_configs(&targets, None) {
             Ok(repaired) if repaired > 0 => {
+                let paths = if repaired == 1 { "path" } else { "paths" };
                 refresh_note!(
-                    "{} Repaired {} stale local MCP config path{}",
-                    CHECK,
-                    repaired,
-                    if repaired == 1 { "" } else { "s" }
+                    "{}",
+                    change_line(
+                        format!("Repaired {repaired} stale local MCP config {paths}"),
+                        format!("{repaired} stale local MCP config {paths} would be repaired"),
+                    )
                 );
             }
             Ok(_) => {}
@@ -1564,15 +1589,18 @@ async fn update_configs_scoped_with_interactivity(
                     // server (Claude Desktop launches local servers only).
                     let local_only =
                         !use_local_transport && !mcp_config::editor_supports_remote_mcp(editor);
+                    let label = if local_only {
+                        "Local binary"
+                    } else {
+                        transport_label
+                    };
+                    let name = editor.display_name();
                     eprintln!(
-                        "{} {} MCP config updated for {}",
-                        CHECK,
-                        if local_only {
-                            "Local binary"
-                        } else {
-                            transport_label
-                        },
-                        editor.display_name()
+                        "{}",
+                        change_line(
+                            format!("{label} MCP config updated for {name}"),
+                            format!("{label} MCP config would be updated for {name}"),
+                        )
                     );
                     if local_only {
                         eprintln!(
@@ -1621,11 +1649,14 @@ async fn update_configs_scoped_with_interactivity(
                 };
                 match project_write_result {
                     Ok(()) => {
+                        let label = transport_label.to_lowercase();
+                        let name = editor.display_name();
                         eprintln!(
-                            "{} Project {} MCP config updated for {}",
-                            CHECK,
-                            transport_label.to_lowercase(),
-                            editor.display_name()
+                            "{}",
+                            change_line(
+                                format!("Project {label} MCP config updated for {name}"),
+                                format!("Project {label} MCP config would be updated for {name}"),
+                            )
                         );
                         if let Ok(Some(ignored_entry)) =
                             mcp_config::protect_non_git_secret_project_config(
@@ -1775,10 +1806,13 @@ pub async fn update_transcript_defaults_scoped(
             ) {
                 Ok(()) => {
                     updates += 1;
+                    let name = editor.display_name();
                     eprintln!(
-                        "{} Transcript defaults updated for {}",
-                        CHECK,
-                        editor.display_name()
+                        "{}",
+                        change_line(
+                            format!("Transcript defaults updated for {name}"),
+                            format!("Transcript defaults would be updated for {name}")
+                        )
                     );
                 }
                 Err(e) => {
@@ -1808,10 +1842,13 @@ pub async fn update_transcript_defaults_scoped(
                 ) {
                     Ok(()) => {
                         updates += 1;
+                        let name = editor.display_name();
                         eprintln!(
-                            "{} Project transcript defaults updated for {}",
-                            CHECK,
-                            editor.display_name()
+                            "{}",
+                            change_line(
+                                format!("Project transcript defaults updated for {name}"),
+                                format!("Project transcript defaults would be updated for {name}")
+                            )
                         );
                     }
                     Err(e) => {
@@ -1919,10 +1956,13 @@ pub async fn migrate_remote_scoped(
             ) {
                 Ok(()) => {
                     migrated += 1;
+                    let name = editor.display_name();
                     eprintln!(
-                        "{} Hosted remote MCP configured for {}",
-                        CHECK,
-                        editor.display_name()
+                        "{}",
+                        change_line(
+                            format!("Hosted remote MCP configured for {name}"),
+                            format!("Hosted remote MCP would be configured for {name}")
+                        )
                     );
                 }
                 Err(e) => {
@@ -1949,10 +1989,15 @@ pub async fn migrate_remote_scoped(
                 ) {
                     Ok(()) => {
                         migrated += 1;
+                        let name = editor.display_name();
                         eprintln!(
-                            "{} Project MCP migrated to hosted remote for {}",
-                            CHECK,
-                            editor.display_name()
+                            "{}",
+                            change_line(
+                                format!("Project MCP migrated to hosted remote for {name}"),
+                                format!(
+                                    "Project MCP would be migrated to hosted remote for {name}"
+                                )
+                            )
                         );
                         if matches!(editor, editors::Editor::Codex) {
                             if let Err(error) = mcp_config::ensure_codex_project_trust(project_path)
@@ -2122,11 +2167,10 @@ pub async fn update_rules_scoped(
         }
 
         if !updated.is_empty() {
+            let line = format!("{} ({})", editor.display_name(), updated.join(", "));
             eprintln!(
-                "{} {} ({})",
-                CHECK,
-                editor.display_name(),
-                updated.join(", ")
+                "{}",
+                change_line(&line, format_args!("{line} would be updated"))
             );
         }
     }
@@ -5706,6 +5750,27 @@ mod tests {
     };
     use crate::setup::editors::Editor;
     use std::path::Path;
+
+    #[test]
+    fn dry_run_status_lines_say_what_would_change_instead_of_claiming_it() {
+        super::safe_edit::set_dry_run(true);
+        let planned = super::change_line(
+            "Hooks updated for Claude Code",
+            "Hooks would be updated for Claude Code",
+        );
+        super::safe_edit::set_dry_run(false);
+        let done = super::change_line(
+            "Hooks updated for Claude Code",
+            "Hooks would be updated for Claude Code",
+        );
+        assert!(
+            planned.contains("Hooks would be updated for Claude Code"),
+            "{planned}"
+        );
+        assert!(!planned.contains("Hooks updated"), "{planned}");
+        assert!(done.contains("Hooks updated for Claude Code"), "{done}");
+        assert_ne!(planned, done);
+    }
 
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

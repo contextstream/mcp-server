@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "about": "Moments in a coding session where a ContextAgent can take work off the main agent. A moment fits a request (prompt), a shell command about to run or that failed (commands, failed_commands), or a file edit (paths). The agent that takes it is found from each agent's name and one-line job (job), so a new agent with a plain job line fits without a code change. Tokens: lowercase words; a trailing * matches a prefix; <version> matches v1, v1.2, 1.2.3; <pr-ref> matches #42 or .../pull/42. A prompt matches when every group of one any_of entry has a word in it, or a phrase is in it, and no `not` phrase is; `requires` adds question (the prompt asks something) and no_change (it asks for no change). Shared with ContextCode (contextcode mirrors this file).",
+  "about": "Moments in a coding session where a ContextAgent can take work off the main agent. A moment fits a request (prompt), a shell command about to run or that failed (commands, failed_commands), or a file edit (paths). The agent that takes it is found from each agent's name and one-line job (job), so a new agent with a plain job line fits without a code change. Tokens: lowercase words; a trailing * matches a prefix; <version> matches v1, v1.2, 1.2.3; <pr-ref> matches #42 or .../pull/42. A prompt matches when every group of one any_of entry has a word in it, or a phrase is in it, and no `not` phrase is; `requires` adds question (the prompt asks something) and no_change (it asks for no change). A moment is ruled out when every hit of its lead cues (the first word group of each any_of entry, and each phrase's start) has one of `negators` within the 3 words before it (\"don't upgrade the deps\", \"no need to update the packages\"). Shared with ContextCode (contextcode mirrors this file).",
   "moments": [
     {
       "id": "dependencies",
@@ -258,5 +258,6 @@
     }
   ],
   "change_verbs": ["fix", "add", "implement", "change", "update", "refactor", "write", "create", "remove", "delete", "rename", "make", "build", "upgrade", "bump", "migrate", "port", "rewrite", "edit", "modify", "replace", "move"],
-  "question_words": ["where", "how", "what", "which", "who", "why", "when", "is", "are", "does", "do", "can", "could", "should"]
+  "question_words": ["where", "how", "what", "which", "who", "why", "when", "is", "are", "does", "do", "can", "could", "should"],
+  "negators": ["not", "never", "without", "no", "avoid", "skip", "dont", "t"]
 }

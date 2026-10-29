@@ -174,6 +174,35 @@ fn ordinary_work_that_no_agent_should_take_fits_nothing() {
 }
 
 #[test]
+fn a_request_that_says_not_to_do_it_fits_nothing() {
+    for prompt in [
+        "don't upgrade the dependencies, just fix the bug",
+        "no need to update the packages",
+        "do not run a security audit",
+        "never bump the deps without asking",
+    ] {
+        assert!(
+            prompt_moments(prompt).is_empty(),
+            "{prompt}: {:?}",
+            moment_ids(&prompt_moments(prompt))
+        );
+    }
+    // A negation elsewhere in the request does not rule the moment out.
+    assert_eq!(
+        moment_ids(&prompt_moments(
+            "upgrade the deps but don't touch the public API"
+        )),
+        ["dependencies"]
+    );
+    assert_eq!(
+        moment_ids(&prompt_moments(
+            "don't change the code yet: is lodash usage here vulnerable?"
+        )),
+        ["security"]
+    );
+}
+
+#[test]
 fn a_request_can_fit_two_moments() {
     assert_eq!(
         moment_ids(&prompt_moments(

@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use mcp_client::ContextStreamClient;
-use mcp_types::Config;
 
 use super::ui::{self, ui, Mark};
 use super::{
@@ -408,20 +407,7 @@ pub(super) async fn run(
 }
 
 fn client_for(api_key: &str) -> ContextStreamClient {
-    let mut config = Config {
-        api_key: Some(api_key.to_string()),
-        ..Default::default()
-    };
-    if std::env::var_os("CONTEXTSTREAM_API_URL").is_none_or(|value| value.is_empty()) {
-        if let Some(saved_url) = super::read_saved_credentials()
-            .ok()
-            .and_then(|creds| creds.api_url)
-            .filter(|url| !url.trim().is_empty())
-        {
-            config.api_url = saved_url;
-        }
-    }
-    ContextStreamClient::new(config)
+    ContextStreamClient::new(super::setup_client_config(api_key))
 }
 
 async fn load_team_capability(client: &ContextStreamClient) -> bool {
@@ -453,19 +439,65 @@ async fn sign_in(
                  create server-side state. Authenticate once, then re-run --dry-run."
             )
         })?;
-        let user = ui::spin("Checking your sign-in", client_for(&api_key).me())
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("Dry-run could not validate the existing credentials: {error}")
-            })?;
+        let config = super::setup_client_config(&api_key);
+        let api_url = config.api_url.clone();
+        let user = ui::spin(
+            "Checking your sign-in",
+            ContextStreamClient::new(config).me(),
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("Dry-run could not validate the existing credentials: {error}")
+        })?;
+        super::persist_setup_credentials(&api_key, &api_url)?;
         ui::say(Mark::Ok, "Signed in", Some(&user.email));
         return Ok((api_key, Some(user.id.to_string()), user.email));
     }
 
-    // Only the first sign-in reuses saved credentials; switching accounts
+    // Only the first sign-in reuses env/saved credentials; switching accounts
     // from the review screen always signs in fresh.
     if signup_probe.is_some() {
-        if let Some(api_key) = super::read_saved_credentials()
+        if let Some(api_key) = std::env::var("CONTEXTSTREAM_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+        {
+            let config = super::setup_client_config(&api_key);
+            let api_url = config.api_url.clone();
+            let check = ui::spin(
+                "Checking CONTEXTSTREAM_API_KEY",
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    ContextStreamClient::new(config).me(),
+                ),
+            )
+            .await;
+            match check {
+                Ok(Ok(user)) => {
+                    let saved = super::persist_setup_credentials(&api_key, &api_url)?;
+                    let detail = if saved {
+                        format!(
+                            "{} · saved to {}",
+                            user.email,
+                            display_path(&super::credentials_file_path())
+                        )
+                    } else {
+                        user.email.clone()
+                    };
+                    ui::say(Mark::Ok, "Signed in", Some(&detail));
+                    return Ok((api_key, Some(user.id.to_string()), user.email));
+                }
+                Ok(Err(error)) => ui::say(
+                    Mark::Warn,
+                    "CONTEXTSTREAM_API_KEY was rejected",
+                    Some(&error.to_string()),
+                ),
+                Err(_) => ui::say(
+                    Mark::Warn,
+                    "Couldn't check CONTEXTSTREAM_API_KEY",
+                    Some("the server didn't answer in time"),
+                ),
+            }
+        } else if let Some(api_key) = super::read_saved_credentials()
             .ok()
             .and_then(|creds| creds.api_key)
             .filter(|key| !key.trim().is_empty())
@@ -506,7 +538,8 @@ async fn sign_in(
         None => super::inline_signup_available().await,
     };
     let (api_key, email) = super::authenticate_fresh(signup_available).await?;
-    super::write_saved_credentials(&api_key, None)?;
+    let config = super::setup_client_config(&api_key);
+    super::persist_setup_credentials(&api_key, &config.api_url)?;
     let user_id =
         tokio::time::timeout(std::time::Duration::from_secs(5), client_for(&api_key).me())
             .await

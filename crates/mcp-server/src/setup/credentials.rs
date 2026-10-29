@@ -65,6 +65,10 @@ pub fn read_saved_credentials() -> Result<SavedCredentials> {
 
 /// Write credentials to disk.
 pub fn write_saved_credentials(api_key: &str, api_url: Option<&str>) -> Result<()> {
+    write_saved_credentials_changed(api_key, api_url).map(|_| ())
+}
+
+fn write_saved_credentials_changed(api_key: &str, api_url: Option<&str>) -> Result<bool> {
     let path = credentials_file_path();
     let loaded = safe_edit::read_for_edit(&path, safe_edit::JsonDialect::Strict)?;
     if loaded.nonstandard_syntax {
@@ -109,9 +113,42 @@ pub fn write_saved_credentials(api_key: &str, api_url: Option<&str>) -> Result<(
     // the new secret. The private commit below never creates one, so even a
     // crash between atomic replacement and cleanup cannot strand the old key.
     remove_credentials_backup(&path)?;
-    safe_edit::commit_private(&path, &loaded, &updated, &["api_url", "jwt"])?;
+    safe_edit::commit_private(&path, &loaded, &updated, &["api_url", "jwt"])
+}
 
-    Ok(())
+/// Build an API client [`mcp_types::Config`] for setup and `configure`
+/// credential verification, honoring `CONTEXTSTREAM_API_URL` first, then any
+/// saved `api_url` override in `credentials.json`, then
+/// [`mcp_types::config::DEFAULT_API_URL`].
+pub fn setup_client_config(api_key: &str) -> mcp_types::Config {
+    let api_url = std::env::var("CONTEXTSTREAM_API_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            read_saved_credentials()
+                .ok()
+                .and_then(|creds| creds.api_url)
+                .filter(|url| !url.trim().is_empty())
+        })
+        .map(|url| normalize_api_url(&url))
+        .unwrap_or_else(|| mcp_types::config::DEFAULT_API_URL.to_string());
+    mcp_types::Config {
+        api_url,
+        api_key: Some(api_key.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Persist validated setup/configure credentials to `~/.contextstream/credentials.json`
+/// (`0600`, honoring `safe_edit` dry-run mode). Stores `api_url` only when it
+/// differs from [`mcp_types::config::DEFAULT_API_URL`], returning whether the
+/// credentials file changed (or would change under `--dry-run`).
+pub fn persist_setup_credentials(api_key: &str, api_url: &str) -> Result<bool> {
+    let normalized = normalize_api_url(api_url);
+    let default_url = mcp_types::config::DEFAULT_API_URL.trim_end_matches('/');
+    let api_url_override =
+        (!normalized.is_empty() && normalized != default_url).then_some(normalized.as_str());
+    write_saved_credentials_changed(api_key, api_url_override)
 }
 
 /// Delete saved credentials.
@@ -283,6 +320,7 @@ mod tests {
     struct EnvironmentGuard {
         home: Option<OsString>,
         api_key: Option<OsString>,
+        api_url: Option<OsString>,
     }
 
     impl EnvironmentGuard {
@@ -290,6 +328,7 @@ mod tests {
             Self {
                 home: std::env::var_os("HOME"),
                 api_key: std::env::var_os("CONTEXTSTREAM_API_KEY"),
+                api_url: std::env::var_os("CONTEXTSTREAM_API_URL"),
             }
         }
     }
@@ -303,6 +342,10 @@ mod tests {
             match self.api_key.take() {
                 Some(value) => std::env::set_var("CONTEXTSTREAM_API_KEY", value),
                 None => std::env::remove_var("CONTEXTSTREAM_API_KEY"),
+            }
+            match self.api_url.take() {
+                Some(value) => std::env::set_var("CONTEXTSTREAM_API_URL", value),
+                None => std::env::remove_var("CONTEXTSTREAM_API_URL"),
             }
         }
     }
@@ -500,5 +543,70 @@ mod tests {
 
         assert!(!path.exists());
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn persist_setup_credentials_omits_default_api_url_and_saves_custom_api_url() {
+        let _lock = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let _environment = EnvironmentGuard::capture();
+        let home = tempdir().expect("temporary home");
+        std::env::set_var("HOME", home.path());
+        std::env::remove_var("CONTEXTSTREAM_API_URL");
+        let path = credentials_file_path();
+
+        assert!(
+            persist_setup_credentials("env-setup-secret", "https://api.contextstream.io/")
+                .expect("persist default-url setup credentials")
+        );
+        assert!(
+            !persist_setup_credentials("env-setup-secret", "https://api.contextstream.io")
+                .expect("second write with identical credentials should be unchanged")
+        );
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["api_key"], "env-setup-secret");
+        assert!(saved.get("api_url").is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        assert!(
+            persist_setup_credentials("env-setup-secret", "http://127.0.0.1:18080/")
+                .expect("persist custom-url setup credentials")
+        );
+        let saved_custom: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved_custom["api_url"], "http://127.0.0.1:18080");
+        assert_eq!(
+            setup_client_config("rotated-secret").api_url,
+            "http://127.0.0.1:18080"
+        );
+    }
+
+    #[test]
+    fn persist_setup_credentials_respects_dry_run_without_creating_credentials_file() {
+        let _lock = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let _environment = EnvironmentGuard::capture();
+        let home = tempdir().expect("temporary home");
+        std::env::set_var("HOME", home.path());
+        let path = credentials_file_path();
+
+        safe_edit::set_dry_run(true);
+        let result =
+            persist_setup_credentials("dry-run-only-secret", "https://api.contextstream.io");
+        let planned = safe_edit::take_planned_changes();
+        safe_edit::set_dry_run(false);
+
+        assert!(result.expect("dry-run credential persistence should succeed"));
+        assert!(!path.exists(), "dry-run must not write credentials.json");
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].path, path);
+        assert_eq!(planned[0].action, safe_edit::ChangeAction::Create);
+        assert!(!planned[0].summary.contains("dry-run-only-secret"));
     }
 }

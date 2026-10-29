@@ -97,13 +97,37 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-/// Keep the background audit from changing this folder's link.
+/// Keep automatic and unrequested repairs from changing this folder's link.
 pub fn pin_folder(root: &Path, project_id: Uuid) -> Result<()> {
     let path = pins_path().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
     let mut pins = read_pins();
     pins.folders
         .insert(root.to_string_lossy().to_string(), project_id.to_string());
     write_json_file(&path, &pins)
+}
+
+fn unpin_folder(root: &Path) -> Result<()> {
+    let Some(path) = pins_path() else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut pins = read_pins();
+    if pins
+        .folders
+        .remove(root.to_string_lossy().as_ref())
+        .is_some()
+    {
+        write_json_file(&path, &pins)?;
+    }
+    Ok(())
+}
+
+fn pinned_project_for_root(pins: &Pins, root: &Path) -> Option<Uuid> {
+    pins.folders
+        .get(root.to_string_lossy().as_ref())
+        .and_then(|raw| Uuid::parse_str(raw.trim()).ok())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -184,10 +208,28 @@ pub async fn audit_folders(
     let mut outcomes = Vec::new();
     for folder in folders {
         let facts = gather_checkout_facts(folder, &mappings);
-        let pinned = pins
+        let has_pin_entry = pins
             .folders
             .contains_key(facts.root.to_string_lossy().as_ref());
-        let assessment = assess(&facts, candidates, now);
+        let pinned_project = pinned_project_for_root(&pins, &facts.root);
+        let current_matches_pin = match (&facts.current, pinned_project) {
+            (Some(current), Some(pinned_id)) => current.project_id == pinned_id,
+            (Some(_), None) => has_pin_entry,
+            (None, _) => false,
+        };
+        let pinned = has_pin_entry && (facts.current.is_none() || current_matches_pin);
+        let mut assessment = assess(&facts, candidates, now);
+        if current_matches_pin && matches!(assessment.status, LinkStatus::Wrong { .. }) {
+            if assessment
+                .current
+                .as_ref()
+                .is_some_and(|current| current.verified)
+            {
+                assessment.status = LinkStatus::Correct;
+            } else {
+                assessment.status = LinkStatus::Unverified;
+            }
+        }
         let target = match explicit {
             Some(project_id) => candidates
                 .iter()
@@ -211,7 +253,8 @@ pub async fn audit_folders(
                 }),
             None => match mode {
                 RepairMode::Check => None,
-                RepairMode::Confident => assessment.recommended().cloned(),
+                RepairMode::Confident if !pinned => assessment.recommended().cloned(),
+                RepairMode::Confident => None,
                 RepairMode::Automatic if !pinned && assessment.safe_to_auto_fix() => {
                     assessment.recommended().cloned()
                 }
@@ -539,10 +582,10 @@ pub async fn run(command: LinkCommand) -> Result<bool> {
     } else {
         RepairMode::Check
     };
-    let outcomes = audit_folders(&candidates, &folders, mode, command.project_id, "cli").await;
+    let mut outcomes = audit_folders(&candidates, &folders, mode, command.project_id, "cli").await;
 
     if command.pin {
-        for outcome in &outcomes {
+        for outcome in &mut outcomes {
             let project = outcome
                 .relinked_to
                 .as_ref()
@@ -554,6 +597,24 @@ pub async fn run(command: LinkCommand) -> Result<bool> {
                     .map(|current| current.project_id));
             if let Some(project) = project {
                 pin_folder(&outcome.assessment.root, project)?;
+                outcome.pinned = true;
+                if outcome.relinked_to.is_none()
+                    && matches!(outcome.assessment.status, LinkStatus::Wrong { .. })
+                    && outcome
+                        .assessment
+                        .current
+                        .as_ref()
+                        .is_some_and(|current| current.project_id == project && current.verified)
+                {
+                    outcome.assessment.status = LinkStatus::Correct;
+                }
+            }
+        }
+    } else if command.project_id.is_some() {
+        for outcome in &mut outcomes {
+            if outcome.relinked_to.is_some() {
+                let _ = unpin_folder(&outcome.assessment.root);
+                outcome.pinned = false;
             }
         }
     }

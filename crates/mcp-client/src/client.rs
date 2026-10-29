@@ -15808,6 +15808,16 @@ impl ContextStreamClient {
         if let Some(metadata) = metadata.filter(|value| value.is_object()) {
             body["metadata"] = metadata.clone();
         }
+        // The agent's handle lets a share that names it reach this session
+        // (mcp-server#310); one the caller sent wins.
+        if body["metadata"].get("agent_name").is_none() {
+            if let Some(handle) = crate::agent_handle::agent_handle(None) {
+                if !body["metadata"].is_object() {
+                    body["metadata"] = serde_json::json!({});
+                }
+                body["metadata"]["agent_name"] = serde_json::json!(handle);
+            }
+        }
         self.post("/coordination/check-in", &body).await
     }
 

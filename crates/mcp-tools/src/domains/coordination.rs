@@ -159,6 +159,23 @@ impl ToolHandler for CoordinationTool {
                 let session_id = input.session_id.ok_or_else(|| {
                     Error::Validation("session_id is required for check_in".into())
                 })?;
+                // The agent's handle lets a share that names it reach this
+                // session (#310); one the caller sent wins.
+                let mut metadata = input
+                    .metadata
+                    .clone()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if metadata.get("agent_name").is_none() {
+                    let folder = match self.session.as_deref() {
+                        Some(session) => session.state().await.folder_path,
+                        None => None,
+                    };
+                    if let Some(handle) = mcp_client::agent_handle::agent_handle(folder.as_deref())
+                    {
+                        metadata["agent_name"] = serde_json::json!(handle);
+                    }
+                }
                 let result = self
                     .client
                     .coordination_check_in(
@@ -393,7 +410,7 @@ impl ToolHandler for CoordinationTool {
             .string("title", "Title when sharing an item.", false)
             .string(
                 "to",
-                "For share: one agent of yours (e.g. \"cc-qa\") or a session id. Only that agent receives the share, mid-run included.",
+                "For share: one agent of yours (e.g. \"cc-qa\") or a session id. Only that agent receives the share, mid-run included. An agent's name is its CONTEXTSTREAM_AGENT_NAME or its agent-<name> folder; the reply says how many of its live sessions got the share.",
                 false,
             )
             .string("summary", "Short summary of the shared knowledge.", false)
@@ -556,10 +573,29 @@ fn format_inbox(result: &Value) -> String {
 }
 
 fn format_share(result: &Value, title: &str) -> String {
-    match coordination_id(result) {
-        Some(id) => format!("Shared coordination item {id} ({title}). This is not a handoff."),
-        None => format!("Shared coordination item ({title}). This is not a handoff."),
-    }
+    let shared = match coordination_id(result) {
+        Some(id) => format!("Shared coordination item {id} ({title})."),
+        None => format!("Shared coordination item ({title})."),
+    };
+    // A share that names an agent says whether that agent got it (#310).
+    let payload = result.get("data").unwrap_or(result);
+    let delivery = payload.get("delivery").and_then(|delivery| {
+        Some((
+            delivery.get("to")?.as_str()?,
+            delivery.get("live_sessions").and_then(Value::as_u64),
+        ))
+    });
+    let addressed = match delivery {
+        None => String::new(),
+        Some((to, Some(0))) => format!(
+            " No live agent named \"{to}\" right now; it reaches that agent if it checks in within 24 hours. An agent's name is its CONTEXTSTREAM_AGENT_NAME or its agent-<name> folder."
+        ),
+        Some((to, Some(live))) => format!(
+            " Delivered to {live} live session(s) of {to}: shown at their next tool call (with hooks) or their next context() or inbox."
+        ),
+        Some((to, None)) => format!(" Addressed to {to}; delivering in the background."),
+    };
+    format!("{shared}{addressed} This is not a handoff.")
 }
 
 fn format_item(result: &Value, id: &str) -> String {
@@ -743,6 +779,11 @@ mod tests {
     fn share_and_settings_text_include_ids_and_flags() {
         let share = json!({"id": "item-1", "title": "Ranking"});
         assert!(format_share(&share, "Ranking").contains("item-1"));
+        // #310: a share that names an agent says whether it reached anyone.
+        let none_live = serde_json::json!({"data": {"id": "item-2", "delivery": {"to": "no-such-agent", "live_sessions": 0}}});
+        assert!(format_share(&none_live, "probe").contains("No live agent named \"no-such-agent\""));
+        let live = serde_json::json!({"data": {"id": "item-3", "delivery": {"to": "qa-b", "live_sessions": 1}}});
+        assert!(format_share(&live, "probe").contains("Delivered to 1 live session(s) of qa-b"));
         let settings = json!({
             "enabled": true,
             "workspace_enabled": true,

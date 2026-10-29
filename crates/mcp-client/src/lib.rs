@@ -13,6 +13,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod activation;
+pub mod agent_handle;
 pub mod auth;
 pub mod cache;
 pub mod client;

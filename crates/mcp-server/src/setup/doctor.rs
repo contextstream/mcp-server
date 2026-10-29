@@ -2285,6 +2285,16 @@ fn sync_bridge_check(
     }
 }
 
+/// The line under the doctor title: what it checked and why those editors.
+/// With none, it says so plainly instead of printing a bare "none".
+fn scope_line(scope: &str, editors: &[&str], source: &str) -> String {
+    if editors.is_empty() {
+        format!("scope {scope} · no editors {source}")
+    } else {
+        format!("scope {scope} · {} ({source})", editors.join(", "))
+    }
+}
+
 /// A bridge that is running but monitors no checkout at all, while this
 /// checkout is bound to a project, has not picked it up yet: a new checkout is
 /// found within about two minutes. A green check would say otherwise (#306).
@@ -3204,11 +3214,6 @@ pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -
         "Unavailable"
     };
     let ui = super::ui::ui();
-    let target_names = if report.targeting.editors.is_empty() {
-        "none".to_string()
-    } else {
-        report.targeting.editors.join(", ")
-    };
     println!();
     println!(
         "{}{}  {}",
@@ -3223,11 +3228,10 @@ pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -
     println!(
         "{}{}",
         super::ui::GUTTER,
-        ui.muted(&format!(
-            "scope {} · {} ({})",
+        ui.muted(&scope_line(
             report.targeting.scope.as_cli_value(),
-            target_names,
-            report.targeting.source
+            &report.targeting.editors,
+            report.targeting.source,
         ))
     );
     println!();
@@ -3485,6 +3489,22 @@ mod tests {
         .expect("check");
         assert_eq!(stale.status, CheckStatus::Fail);
         assert!(stale.detail.contains("0.0.0-stale"));
+    }
+
+    #[test]
+    fn the_scope_line_says_when_no_editor_was_found() {
+        assert_eq!(
+            scope_line("global", &[], "detected"),
+            "scope global · no editors detected"
+        );
+        assert_eq!(
+            scope_line("project", &[], "requested"),
+            "scope project · no editors requested"
+        );
+        assert_eq!(
+            scope_line("all", &["claude", "codex"], "configured by setup"),
+            "scope all · claude, codex (configured by setup)"
+        );
     }
 
     #[test]

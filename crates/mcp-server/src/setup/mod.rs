@@ -1246,7 +1246,9 @@ fn no_target_editors_message(only_configured: bool) -> String {
             info_label()
         )
     } else {
-        "No supported editors to update.".to_string()
+        "No supported editors were found on this machine. Install one, or name one with \
+         --editors <id> (`contextstream-mcp clients` lists the ids)."
+            .to_string()
     }
 }
 
@@ -6658,6 +6660,17 @@ mod tests {
         assert!(message.contains("/work/r0") && message.contains("/work/r4"));
         assert!(!message.contains("/work/r5"), "{message}");
         assert!(message.contains("and 2 more"), "{message}");
+    }
+
+    #[test]
+    fn no_editors_messages_say_what_to_do_next() {
+        // Nothing installed: `setup` could not choose anything, so it is not the hint.
+        let found_none = no_target_editors_message(false);
+        assert!(found_none.contains("--editors <id>"), "{found_none}");
+        assert!(
+            found_none.contains("contextstream-mcp clients"),
+            "{found_none}"
+        );
     }
 
     #[test]

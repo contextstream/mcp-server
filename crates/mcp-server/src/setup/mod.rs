@@ -3815,6 +3815,7 @@ async fn inline_signup_available() -> bool {
 
 /// Sign in without reusing saved credentials.
 async fn authenticate_fresh(inline_signup_available: bool) -> Result<(String, String)> {
+    require_terminal_to_sign_in()?;
     let mut choices = vec!["Continue in your browser (recommended)", "Paste an API key"];
     if inline_signup_available {
         choices.push("Create an account with email and phone");

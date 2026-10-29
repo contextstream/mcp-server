@@ -3,6 +3,8 @@
 //! Provides reusable prompt functions using dialoguer, styled with the
 //! ContextCode terminal theme in [`super::ui`].
 
+use std::io::IsTerminal;
+
 use anyhow::Result;
 use dialoguer::{Input, MultiSelect, Password, Select};
 
@@ -12,6 +14,25 @@ use super::ui::{self, Mark, PromptTheme};
 /// The prompt theme for this terminal.
 fn theme() -> PromptTheme {
     PromptTheme::new(*ui::ui())
+}
+
+/// Fail before anything is drawn when a prompt cannot be shown (a script, a CI
+/// job or a coding agent), and say what to do instead. The prompts draw on
+/// stderr, so that is the stream that has to be a terminal.
+pub fn require_terminal(what: &str, instead: &str) -> Result<()> {
+    if std::io::stderr().is_terminal() {
+        return Ok(());
+    }
+    anyhow::bail!("{what} needs a terminal, and this session has none. {instead}")
+}
+
+/// Sign-in asks how to authenticate, so it needs a terminal too.
+pub fn require_terminal_to_sign_in() -> Result<()> {
+    require_terminal(
+        "Signing in",
+        "Set CONTEXTSTREAM_API_KEY, save a key with `printf %s \"$KEY\" | contextstream-mcp \
+         configure --api-key-stdin`, or run `contextstream-mcp setup` in a terminal first.",
+    )
 }
 
 /// Ask for text input.

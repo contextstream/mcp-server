@@ -63,23 +63,60 @@ pub struct CoordinationInput {
     pub metadata: Option<Value>,
 }
 
+const SCOPE_DEFAULTED_ACTIONS: &[&str] = &["check_in", "inbox", "list", "share", "settings"];
+
+fn fill_scope_defaults(
+    input: &mut CoordinationInput,
+    (workspace, project): (Option<Uuid>, Option<Uuid>),
+) {
+    let explicit_ws = input
+        .workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let explicit_proj = input
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let names_another_workspace = explicit_ws.is_some_and(|raw| match Uuid::parse_str(raw) {
+        Ok(named) => Some(named) != workspace,
+        Err(_) => true,
+    });
+    if explicit_ws.is_none() {
+        input.workspace_id = workspace.map(|id| id.to_string());
+    }
+    if explicit_proj.is_none() && !names_another_workspace {
+        input.project_id = project.map(|id| id.to_string());
+    }
+}
+
 pub struct CoordinationTool {
     client: ContextStreamClient,
+    session: Option<Arc<mcp_session::SessionManager>>,
 }
 
 impl CoordinationTool {
     pub fn new(client: ContextStreamClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            session: None,
+        }
+    }
+
+    pub fn with_session(mut self, session: Arc<mcp_session::SessionManager>) -> Self {
+        self.session = Some(session);
+        self
     }
 
     fn parse_uuid(value: &Option<String>, field: &str) -> Result<Option<Uuid>> {
-        match value {
+        match value.as_deref().map(str::trim) {
+            Some("") | None => Ok(None),
             Some(s) => {
                 Ok(Some(Uuid::parse_str(s).map_err(|_| {
                     Error::Validation(format!("Invalid {field}"))
                 })?))
             }
-            None => Ok(None),
         }
     }
 
@@ -99,9 +136,14 @@ impl CoordinationTool {
 #[async_trait]
 impl ToolHandler for CoordinationTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
-        let input: CoordinationInput =
+        let mut input: CoordinationInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
         let action = input.action.to_lowercase();
+        if SCOPE_DEFAULTED_ACTIONS.contains(&action.as_str()) {
+            let defaults =
+                super::scope::read_scope_defaults(&self.client, self.session.as_deref()).await;
+            fill_scope_defaults(&mut input, defaults);
+        }
         let workspace_id = Self::parse_uuid(&input.workspace_id, "workspace_id")?;
         let project_id = Self::parse_uuid(&input.project_id, "project_id")?;
 
@@ -166,6 +208,18 @@ impl ToolHandler for CoordinationTool {
                     .title
                     .ok_or_else(|| Error::Validation("title is required for share".into()))?;
                 let kind = validate_kind(input.kind.as_deref())?;
+                let workspace_id = workspace_id.ok_or_else(|| {
+                    Error::Validation(
+                        "workspace_id is required for action=\"share\" (pass workspace_id explicitly or call init(...) first)"
+                            .into(),
+                    )
+                })?;
+                let project_id = project_id.ok_or_else(|| {
+                    Error::Validation(
+                        "project_id is required for action=\"share\" (pass project_id explicitly or call init(...) first)"
+                            .into(),
+                    )
+                })?;
                 let mut body = serde_json::json!({
                     "title": title,
                     "summary": input.summary,
@@ -525,8 +579,12 @@ fn format_settings(result: &Value) -> String {
 pub fn register_coordination_tools(
     registry: &mut crate::registry::ToolRegistry,
     client: ContextStreamClient,
+    session: Arc<mcp_session::SessionManager>,
 ) {
-    registry.register("coordination", Arc::new(CoordinationTool::new(client)));
+    registry.register(
+        "coordination",
+        Arc::new(CoordinationTool::new(client).with_session(session)),
+    );
 }
 
 #[cfg(test)]
@@ -656,5 +714,131 @@ mod tests {
             format_settings(&settings),
             "Coordination settings: enabled=true workspace_enabled=true project_enabled=false"
         );
+    }
+
+    #[tokio::test]
+    async fn share_validates_missing_scope_without_leaking_backend_origin_field_names() {
+        let config = mcp_types::Config {
+            api_url: "http://127.0.0.1:9".to_string(),
+            ..Default::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(mcp_session::SessionManager::new(client.clone(), config));
+        let tool = CoordinationTool::new(client).with_session(session.clone());
+        let ws = Uuid::new_v4();
+
+        // Missing workspace_id and project_id: fails fast naming workspace_id.
+        let err = tool
+            .execute(json!({
+                "action": "share",
+                "kind": "status",
+                "title": "qa test",
+                "summary": "test"
+            }))
+            .await
+            .expect_err("missing workspace_id should fail client-side");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("workspace_id is required for action=\"share\""),
+            "{msg}"
+        );
+        assert!(!msg.contains("origin_workspace_id"), "{msg}");
+
+        // Explicit workspace_id without project_id and no session scope: fails fast naming project_id.
+        let err = tool
+            .execute(json!({
+                "action": "share",
+                "workspace_id": ws.to_string(),
+                "kind": "status",
+                "title": "qa test",
+                "summary": "test"
+            }))
+            .await
+            .expect_err("missing project_id should fail client-side");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("project_id is required for action=\"share\""),
+            "{msg}"
+        );
+        assert!(!msg.contains("origin_project_id"), "{msg}");
+
+        // Session scope in Workspace A is not borrowed when caller names Workspace B without project_id.
+        let other_ws = Uuid::new_v4();
+        let session_proj = Uuid::new_v4();
+        session
+            .update_scope(Some(ws), Some(session_proj), None)
+            .await;
+        let err = tool
+            .execute(json!({
+                "action": "share",
+                "workspace_id": other_ws.to_string(),
+                "kind": "status",
+                "title": "qa test",
+                "summary": "test"
+            }))
+            .await
+            .expect_err("cross-workspace share without project_id should fail client-side");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("project_id is required for action=\"share\""),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn share_inherits_active_session_scope_when_omitted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
+        let captured_srv = captured.clone();
+
+        let srv = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if let Some((_, body)) = req.split_once("\r\n\r\n") {
+                if let Ok(parsed) = serde_json::from_str::<Value>(body) {
+                    *captured_srv.lock().await = Some(parsed);
+                }
+            }
+            let resp_body =
+                r#"{"data":{"id":"11111111-1111-4111-8111-111111111111","title":"qa test"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let config = mcp_types::Config {
+            api_url: format!("http://{addr}/api/v1"),
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(mcp_session::SessionManager::new(client.clone(), config));
+        let ws = Uuid::new_v4();
+        let proj = Uuid::new_v4();
+        session.update_scope(Some(ws), Some(proj), None).await;
+
+        let tool = CoordinationTool::new(client).with_session(session);
+        let res = tool
+            .execute(json!({
+                "action": "share",
+                "kind": "status",
+                "title": "qa test",
+                "summary": "test"
+            }))
+            .await
+            .expect("share should inherit session scope");
+        assert!(!res.is_error);
+        srv.await.unwrap();
+
+        let body = captured.lock().await.clone().expect("captured body");
+        assert_eq!(body["workspace_id"], ws.to_string());
+        assert_eq!(body["project_id"], proj.to_string());
     }
 }

@@ -30,9 +30,19 @@ pub enum RepairMode {
     Automatic,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LinkedProjectSummary {
+    pub project_id: Uuid,
+    pub project_name: String,
+    pub workspace_id: Uuid,
+    pub workspace_name: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct LinkOutcome {
     pub assessment: LinkAssessment,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_project: Option<LinkedProjectSummary>,
     pub pinned: bool,
     /// The project the folder was re-linked to, when a repair ran.
     pub relinked_to: Option<ScoredProject>,
@@ -208,8 +218,20 @@ pub async fn audit_folders(
                 RepairMode::Automatic => None,
             },
         };
+        let linked_project = assessment.current.as_ref().and_then(|current| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.project.id == current.project_id)
+                .map(|candidate| LinkedProjectSummary {
+                    project_id: candidate.project.id,
+                    project_name: candidate.project.name.clone(),
+                    workspace_id: candidate.workspace.id,
+                    workspace_name: candidate.workspace.name.clone(),
+                })
+        });
         let mut outcome = LinkOutcome {
             assessment,
+            linked_project,
             pinned,
             relinked_to: None,
             error: None,
@@ -413,7 +435,7 @@ fn describe_status(status: &LinkStatus) -> (&'static str, String) {
     }
 }
 
-fn print_outcome(outcome: &LinkOutcome) {
+fn format_outcome_lines(outcome: &LinkOutcome) -> Vec<String> {
     let assessment = &outcome.assessment;
     let (level, detail) = describe_status(&assessment.status);
     let mark = match level {
@@ -421,43 +443,75 @@ fn print_outcome(outcome: &LinkOutcome) {
         "warn" => "!",
         _ => "✗",
     };
-    println!("{mark} {}", assessment.root.display());
+    let mut lines = vec![format!("{mark} {}", assessment.root.display())];
     if let Some(repository) = &assessment.repository {
-        println!("    repository  {repository}");
+        lines.push(format!("    repository  {repository}"));
     }
-    println!("    status      {detail}");
+    lines.push(format!("    status      {detail}"));
+    if let Some(linked) = &outcome.linked_project {
+        lines.push(format!(
+            "    project     {} in {} ({})",
+            linked.project_name, linked.workspace_name, linked.project_id
+        ));
+    }
     if outcome.pinned {
-        println!("    pinned      the background audit leaves this folder alone");
+        lines.push("    pinned      the background audit leaves this folder alone".to_string());
     }
-    match &assessment.verdict {
-        Verdict::Confident { best } => println!(
-            "    best match  {} in {} (score {}: {})",
-            best.project_name,
-            best.workspace_name,
-            best.score,
-            best.reasons.join("; ")
-        ),
-        Verdict::Ambiguous { candidates } => {
-            println!("    ambiguous   several projects fit; pick one with --project-id:");
-            for candidate in candidates {
-                println!(
-                    "                {} {} in {} (score {})",
-                    candidate.project_id,
-                    candidate.project_name,
-                    candidate.workspace_name,
-                    candidate.score
+    if !matches!(assessment.status, LinkStatus::Correct) {
+        match &assessment.verdict {
+            Verdict::Confident { best } => lines.push(format!(
+                "    best match  {} in {} (score {}: {})",
+                best.project_name,
+                best.workspace_name,
+                best.score,
+                best.reasons.join("; ")
+            )),
+            Verdict::Ambiguous { candidates } => {
+                lines.push(
+                    "    ambiguous   several projects fit; pick one with --project-id:".to_string(),
                 );
+                for candidate in candidates {
+                    lines.push(format!(
+                        "                {} {} in {} (score {})",
+                        candidate.project_id,
+                        candidate.project_name,
+                        candidate.workspace_name,
+                        candidate.score
+                    ));
+                }
+            }
+            Verdict::NoMatch => {
+                if matches!(assessment.status, LinkStatus::Unverified) {
+                    if let Some(linked) = &outcome.linked_project {
+                        lines.push(format!(
+                            "    re-verify   contextstream-mcp link --project-id {}",
+                            linked.project_id
+                        ));
+                    } else {
+                        lines.push(
+                            "    best match  none; link it with --project-id <id>".to_string(),
+                        );
+                    }
+                } else {
+                    lines.push("    best match  none; link it with --project-id <id>".to_string());
+                }
             }
         }
-        Verdict::NoMatch => println!("    best match  none; link it with --project-id <id>"),
     }
     if let Some(target) = &outcome.relinked_to {
-        println!(
+        lines.push(format!(
             "    re-linked   {} in {} ({})",
             target.project_name, target.workspace_name, target.project_id
-        );
+        ));
     } else if let Some(error) = &outcome.error {
-        println!("    error       {error}");
+        lines.push(format!("    error       {error}"));
+    }
+    lines
+}
+
+fn print_outcome(outcome: &LinkOutcome) {
+    for line in format_outcome_lines(outcome) {
+        println!("{line}");
     }
 }
 
@@ -565,5 +619,76 @@ mod tests {
         ));
         assert!(!is_agent_worktree("/work/app-wt/feature"));
         assert!(!is_agent_worktree("/work/app/.claude"));
+    }
+
+    #[test]
+    fn healthy_linked_outcome_prints_project_and_omits_unlinked_fallback_hint() {
+        let project_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let workspace_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let healthy = LinkOutcome {
+            assessment: LinkAssessment {
+                root: PathBuf::from("/tmp/qa-r2-b2-proj"),
+                repository: None,
+                current: Some(mcp_session::project_link::CurrentLink {
+                    workspace_id: Some(workspace_id),
+                    project_id,
+                    verified: true,
+                    source: "checkout_config",
+                }),
+                status: LinkStatus::Correct,
+                verdict: Verdict::NoMatch,
+                ranked: Vec::new(),
+            },
+            linked_project: Some(LinkedProjectSummary {
+                project_id,
+                project_name: "qa-r2-b2-proj".to_string(),
+                workspace_id,
+                workspace_name: "Testing".to_string(),
+            }),
+            pinned: false,
+            relinked_to: None,
+            error: None,
+        };
+
+        let rendered = format_outcome_lines(&healthy).join("\n");
+        assert!(rendered.contains("✓ /tmp/qa-r2-b2-proj"), "{rendered}");
+        assert!(
+            rendered.contains("status      linked correctly"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "project     qa-r2-b2-proj in Testing (11111111-1111-4111-8111-111111111111)"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("best match  none"),
+            "healthy link must not print unlinked fallback hint: {rendered}"
+        );
+        assert!(
+            !rendered.contains("link it with --project-id"),
+            "healthy link must not ask to relink: {rendered}"
+        );
+
+        let unlinked = LinkOutcome {
+            assessment: LinkAssessment {
+                root: PathBuf::from("/tmp/unlinked-proj"),
+                repository: None,
+                current: None,
+                status: LinkStatus::Unlinked,
+                verdict: Verdict::NoMatch,
+                ranked: Vec::new(),
+            },
+            linked_project: None,
+            pinned: false,
+            relinked_to: None,
+            error: None,
+        };
+        let unlinked_rendered = format_outcome_lines(&unlinked).join("\n");
+        assert!(
+            unlinked_rendered.contains("best match  none; link it with --project-id <id>"),
+            "{unlinked_rendered}"
+        );
     }
 }

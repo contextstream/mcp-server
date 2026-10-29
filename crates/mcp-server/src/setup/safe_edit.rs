@@ -372,10 +372,19 @@ fn record_planned_in(
     action: ChangeAction,
     summary: String,
 ) {
-    // Preserve every operation. A dry run deliberately leaves the real file
-    // untouched, so a later operation on the same path may have been derived
-    // from the same on-disk snapshot. Replacing the earlier entry would hide
-    // a real planned mutation (for example, Codex MCP config plus trust).
+    // Preserve distinct operations on the same path: a dry run deliberately
+    // leaves the real file untouched, so a later step on the same path (for
+    // example, Codex MCP config followed by Codex project trust, or a modify
+    // followed by a delete) may have been derived from the same on-disk
+    // snapshot and must stay visible. Coalesce only identical `(path, action,
+    // summary)` repeats emitted when per-editor iterations re-assert shared
+    // artifacts such as `contextstream-watch.service` or
+    // `~/.contextstream/bin/contextstream-mcp`.
+    if planned.iter().any(|existing| {
+        existing.path == path && existing.action == action && existing.summary == summary
+    }) {
+        return;
+    }
     planned.push(PlannedChange {
         path: path.to_path_buf(),
         action,
@@ -2012,6 +2021,59 @@ mod tests {
         let for_fresh = plan.iter().find(|c| c.path == fresh).unwrap();
         assert_eq!(for_fresh.action, ChangeAction::Create);
         assert!(!for_fresh.summary.contains("{}"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dry_run_deduplicates_identical_shared_operations_while_keeping_distinct_steps() {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!("cs-safe-dry-dedup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let watch_unit = dir.join("contextstream-watch.service");
+        let managed_bin = dir.join("contextstream-mcp");
+        let codex_toml = dir.join("config.toml");
+
+        let _ = take_planned_changes();
+        set_dry_run(true);
+        // Simulate four editor iterations planning the same watch unit and managed binary.
+        for _ in 0..4 {
+            write_if_changed(&watch_unit, "[Unit]\nDescription=Watch\n").unwrap();
+            record_external_change(&managed_bin, ChangeAction::Create);
+        }
+        // Simulate two distinct mutations to the same path during a single dry run
+        // (for example, Codex MCP server entry followed by Codex project trust).
+        write_if_changed(
+            &codex_toml,
+            "[mcp_servers.contextstream]\nurl = \"https://example\"\n",
+        )
+        .unwrap();
+        write_if_changed(
+            &codex_toml,
+            "[projects.\"/tmp/work\"]\ntrust_level = \"trusted\"\n",
+        )
+        .unwrap();
+        let plan = take_planned_changes();
+        set_dry_run(false);
+
+        assert_eq!(
+            plan.iter().filter(|c| c.path == watch_unit).count(),
+            1,
+            "identical shared watch service creates must be reported once: {plan:?}"
+        );
+        assert_eq!(
+            plan.iter().filter(|c| c.path == managed_bin).count(),
+            1,
+            "identical managed binary creates must be reported once: {plan:?}"
+        );
+        assert_eq!(
+            plan.iter().filter(|c| c.path == codex_toml).count(),
+            2,
+            "distinct operations on the same path must both remain visible: {plan:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

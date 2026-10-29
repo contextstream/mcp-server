@@ -1523,7 +1523,11 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             }
         },
 
-        Some(Commands::DetectEditors { format: _ }) => {
+        Some(Commands::DetectEditors { format }) => {
+            if !format.trim().eq_ignore_ascii_case("json") {
+                eprintln!("Unknown --format '{}'. Use json.", format.trim());
+                std::process::exit(2);
+            }
             let result = setup::editors::detect_installed_editors_json();
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
         }
@@ -1541,14 +1545,26 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                 .or_else(setup::get_api_key)
                 .unwrap_or_default();
 
+            // Bootstrap scripts call this, so a mistyped id must fail instead of
+            // quietly producing an empty or partial config set (#305).
             let target_editors = match editors {
                 Some(editor_list) => {
-                    let ids: Vec<&str> = editor_list.split(',').map(str::trim).collect();
-                    setup::editors::Editor::all()
-                        .iter()
-                        .copied()
-                        .filter(|e| ids.contains(&e.id()))
-                        .collect::<Vec<_>>()
+                    let ids: Vec<String> = editor_list.split(',').map(str::to_string).collect();
+                    match parse_editor_ids(&ids) {
+                        // Emit in the catalog's order whatever order they were typed in.
+                        Ok(parsed) => {
+                            let parsed = parsed.unwrap_or_default();
+                            setup::editors::Editor::all()
+                                .iter()
+                                .copied()
+                                .filter(|editor| parsed.contains(editor))
+                                .collect::<Vec<_>>()
+                        }
+                        Err(message) => {
+                            eprintln!("{message}");
+                            std::process::exit(2);
+                        }
+                    }
                 }
                 None => setup::editors::detect_installed_editors(),
             };

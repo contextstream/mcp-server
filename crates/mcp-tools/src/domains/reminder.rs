@@ -149,9 +149,15 @@ impl ToolHandler for ReminderTool {
                     Error::Validation("remind_at is required for create".to_string())
                 })?;
 
+                // The API requires content; the schema lets callers omit it,
+                // so a reminder without one repeats its title (#262).
+                let content = input
+                    .content
+                    .filter(|content| !content.trim().is_empty())
+                    .unwrap_or_else(|| title.clone());
                 let params = CreateReminderParams {
                     title,
-                    content: input.content,
+                    content: Some(content),
                     remind_at,
                     priority: input.priority,
                     recurrence: input.recurrence,
@@ -230,7 +236,11 @@ impl ToolHandler for ReminderTool {
             .string("context", "Context to match relevant reminders", false)
             // Create fields
             .string("title", "Reminder title", false)
-            .string("content", "Reminder content/description", false)
+            .string(
+                "content",
+                "Reminder content/description (defaults to the title)",
+                false,
+            )
             .string("remind_at", "When to remind (ISO 8601 datetime)", false)
             .string_enum("priority", "Reminder priority", VALID_PRIORITIES, false)
             .string_enum("recurrence", "Recurrence pattern", VALID_RECURRENCE, false)

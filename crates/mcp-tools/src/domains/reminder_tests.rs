@@ -459,3 +459,70 @@ mod registration_tests {
         assert_eq!(all_actions.len(), 6);
     }
 }
+
+// ============================================================================
+// Create without content (#262)
+// ============================================================================
+
+#[tokio::test]
+async fn create_without_content_sends_the_title_as_content() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            request.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&request).to_string();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if body.len() >= length {
+                    break;
+                }
+            }
+            if n == 0 {
+                break;
+            }
+        }
+        let body =
+            r#"{"data":{"id":"11111111-1111-4111-8111-111111111111","title":"QA reminder"}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        let text = String::from_utf8_lossy(&request).to_string();
+        let (_, body) = text.split_once("\r\n\r\n").expect("request body");
+        serde_json::from_str::<serde_json::Value>(body).expect("JSON body")
+    });
+
+    let config = mcp_types::Config {
+        api_url: format!("http://{addr}"),
+        api_key: Some("test-key".to_string()),
+        ..Default::default()
+    };
+    let tool = ReminderTool::new(ContextStreamClient::new(config));
+    let result = tool
+        .execute(json!({
+            "action": "create",
+            "title": "QA reminder",
+            "remind_at": "2027-01-01T00:00:00Z",
+            "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+        }))
+        .await
+        .expect("create without content");
+    assert!(!result.is_error);
+    let sent = server.await.unwrap();
+    assert_eq!(sent["content"], "QA reminder");
+}

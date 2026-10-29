@@ -13647,19 +13647,15 @@ impl SearchTool {
                         omitted_rows, next_offset
                     ));
                 } else {
-                    // The header counts every match: say when fewer are listed,
-                    // and how to get the next page (#313).
+                    // The header counts every match: say when fewer are listed
+                    // (#313). Only the server knows where its next page starts,
+                    // so the offset comes from its next_offset (#324).
                     let offset = resolved_offset.unwrap_or(0).max(0);
                     let shown = idx as i64;
                     if shown < total - offset {
                         text.push_str(&format!("Showing {shown} of {total}."));
-                        if let Some(limit) = resolved_limit.filter(|limit| *limit > 0) {
-                            if offset + limit < total {
-                                text.push_str(&format!(
-                                    " Pass offset={} for the next page.",
-                                    offset + limit
-                                ));
-                            }
+                        if let Some(next) = result.next_offset.filter(|next| *next > offset) {
+                            text.push_str(&format!(" Pass offset={next} for the next page."));
                         }
                         text.push('\n');
                     }

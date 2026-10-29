@@ -8330,17 +8330,21 @@ mod scope_widening_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_page_of_a_longer_result_says_how_many_are_listed() {
         // #313: the header said "24 results" over 10 rows, with no way on.
+        // #324: the offset to pass is the server's next_offset, and none is
+        // offered when the server has no next page.
         let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
-        let server = RoutedServer::spawn(Box::new(move |line, _| {
+        let server = RoutedServer::spawn(Box::new(move |line, body| {
             if line.contains("/search/") {
                 let rows: Vec<Value> = (0..10)
                     .map(|i| json!({"id": format!("r{i}"), "file_path": format!("src/loyalty_{i}.rs"), "start_line": 1, "content": format!("loyalty discount {i}"), "score": 0.9 - (i as f64) * 0.01}))
                     .collect();
-                return (
-                    200,
-                    json!({"results": rows, "total": 24, "project_index_state": "ready"})
-                        .to_string(),
-                );
+                let last_page = body.contains("\"offset\":90");
+                let body = if last_page {
+                    json!({"results": rows, "total": 124, "project_index_state": "ready"})
+                } else {
+                    json!({"results": rows, "total": 24, "has_more": true, "next_offset": 10, "project_index_state": "ready"})
+                };
+                return (200, body.to_string());
             }
             if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
                 return (200, project_body(project, workspace));
@@ -8361,6 +8365,14 @@ mod scope_widening_tests {
             text.contains("Showing 10 of 24. Pass offset=10 for the next page."),
             "{text}"
         );
+
+        let result = tool
+            .execute(json!({"query":"loyalty discount","mode":"semantic","limit":10,"offset":90}))
+            .await
+            .unwrap();
+        let text = text_of(&result);
+        assert!(text.contains("Showing 10 of 124."), "{text}");
+        assert!(!text.contains("Pass offset="), "{text}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

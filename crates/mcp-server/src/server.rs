@@ -1589,10 +1589,83 @@ fn decorate_stateless_json_rpc_response(response: String, method: &str) -> Strin
     envelope.to_string()
 }
 
+/// One stdio message. A notification (no `id`) is never answered (JSON-RPC 2.0
+/// section 4.1), and only `notifications/*` ones are acted on, so a request
+/// sent without its id runs nothing. A message that is not a request gets
+/// `-32600 Invalid Request` with a short reason.
+async fn handle_request(
+    registry: &Arc<ToolRegistry>,
+    client: &Arc<ContextStreamClient>,
+    session: &Arc<SessionManager>,
+    telemetry: &AgenticTelemetry,
+    request: serde_json::Value,
+    wire_observation: mcp_tools::wire_tokens::WireTokenObservation,
+) -> String {
+    let Some(message) = request.as_object() else {
+        let reason = if request.is_array() {
+            "batches are not supported; send one JSON-RPC message per line"
+        } else {
+            "a message must be a JSON-RPC object"
+        };
+        return json_rpc_error(None, -32600, &format!("Invalid Request: {reason}"));
+    };
+    let id = message.get("id").cloned();
+    let method = message.get("method").cloned();
+    // The stateless (2026-07-28) contract has no client notifications; its
+    // own validation answers a message there without an id with -32600.
+    let stateless = method.as_ref().and_then(serde_json::Value::as_str) == Some("server/discover")
+        || message
+            .get("params")
+            .is_some_and(has_stateless_protocol_metadata);
+    match (method, id) {
+        (Some(serde_json::Value::String(_)), _) if stateless => {
+            handle_request_message(
+                registry,
+                client,
+                session,
+                telemetry,
+                request,
+                wire_observation,
+            )
+            .await
+        }
+        (Some(serde_json::Value::String(method)), None) => {
+            if method.starts_with("notifications/") {
+                handle_request_message(
+                    registry,
+                    client,
+                    session,
+                    telemetry,
+                    request,
+                    wire_observation,
+                )
+                .await;
+            } else {
+                debug!(method = %method, "stdio: ignored a notification for a method that takes requests");
+            }
+            String::new()
+        }
+        (Some(serde_json::Value::String(_)), Some(_)) => {
+            handle_request_message(
+                registry,
+                client,
+                session,
+                telemetry,
+                request,
+                wire_observation,
+            )
+            .await
+        }
+        (_, None) => String::new(),
+        (Some(_), id) => json_rpc_error(id, -32600, "Invalid Request: \"method\" must be a string"),
+        (None, id) => json_rpc_error(id, -32600, "Invalid Request: missing \"method\""),
+    }
+}
+
 /// Handle either the initialize-era wire contract or the finalized stateless
 /// contract. Merely carrying a protocol-version metadata key opts the request
 /// into strict validation; unsupported/future versions never fall back.
-async fn handle_request(
+async fn handle_request_message(
     registry: &Arc<ToolRegistry>,
     client: &Arc<ContextStreamClient>,
     session: &Arc<SessionManager>,
@@ -1832,7 +1905,13 @@ async fn handle_request_dispatch(
 
         "tools/call" => {
             // Call a tool
-            let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let Some(tool_name) = params.get("name").and_then(|n| n.as_str()) else {
+                return json_rpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: tools/call requires \"name\", the tool to run",
+                );
+            };
             if let Some(message) = mcp_tools::input_shape::tools_call_arguments_error(
                 tool_name,
                 params.get("arguments"),
@@ -3691,6 +3770,93 @@ mod tests {
         ));
         let telemetry = AgenticTelemetry::new(client.as_ref().clone(), session.clone());
         (registry, client, session, telemetry)
+    }
+
+    #[tokio::test]
+    async fn stdio_never_answers_a_notification_and_says_what_a_bad_message_lacks() {
+        // #286
+        let (registry, client, session, telemetry) = protocol_test_runtime();
+        for notification in [
+            serde_json::json!({"jsonrpc": "2.0", "method": "foo/notify"}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "initialized"}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "memory"}}),
+            serde_json::json!({"jsonrpc": "2.0", "method": 5}),
+        ] {
+            let response = handle_request(
+                &registry,
+                &client,
+                &session,
+                &telemetry,
+                notification.clone(),
+                mcp_tools::wire_tokens::WireTokenObservation::default(),
+            )
+            .await;
+            assert_eq!(response, "", "{notification}");
+        }
+
+        let batch =
+            "Invalid Request: batches are not supported; send one JSON-RPC message per line";
+        let no_name = "Invalid params: tools/call requires \"name\", the tool to run";
+        for (message, id, code, reason) in [
+            (
+                serde_json::json!({"jsonrpc": "2.0", "id": 35}),
+                serde_json::json!(35),
+                -32600,
+                "Invalid Request: missing \"method\"",
+            ),
+            (
+                serde_json::json!({"jsonrpc": "2.0", "id": 36, "method": 5}),
+                serde_json::json!(36),
+                -32600,
+                "Invalid Request: \"method\" must be a string",
+            ),
+            (
+                serde_json::json!([]),
+                serde_json::Value::Null,
+                -32600,
+                batch,
+            ),
+            (
+                serde_json::json!([{"jsonrpc": "2.0", "id": 32, "method": "ping"}]),
+                serde_json::Value::Null,
+                -32600,
+                batch,
+            ),
+            (
+                serde_json::json!("just a string"),
+                serde_json::Value::Null,
+                -32600,
+                "Invalid Request: a message must be a JSON-RPC object",
+            ),
+            (
+                serde_json::json!({"jsonrpc": "2.0", "id": 20, "method": "tools/call", "params": {"arguments": {}}}),
+                serde_json::json!(20),
+                -32602,
+                no_name,
+            ),
+            (
+                serde_json::json!({"jsonrpc": "2.0", "id": 22, "method": "tools/call"}),
+                serde_json::json!(22),
+                -32602,
+                no_name,
+            ),
+        ] {
+            let response = handle_request(
+                &registry,
+                &client,
+                &session,
+                &telemetry,
+                message.clone(),
+                mcp_tools::wire_tokens::WireTokenObservation::default(),
+            )
+            .await;
+            let response: serde_json::Value =
+                serde_json::from_str(&response).expect("valid JSON-RPC response");
+            assert_eq!(response["id"], id, "{message}");
+            assert_eq!(response["error"]["code"], code, "{message}");
+            assert_eq!(response["error"]["message"], reason, "{message}");
+        }
     }
 
     #[tokio::test]

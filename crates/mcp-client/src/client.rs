@@ -27260,9 +27260,12 @@ mod tests {
     async fn a_refused_connection_fails_quickly_instead_of_backing_off() {
         // #320: four attempts with 1 s, 2 s and 4 s waits made every call take
         // 6.5 s or more with the network down.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        // A bound socket that never listens: connections to it are refused,
+        // and no parallel test can take its port (a dropped listener's port
+        // went to another test's server).
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = socket.local_addr().unwrap();
         let config = mcp_types::Config {
             api_url: format!("http://{address}"),
             api_key: Some("cs_test_refused".to_string()),
@@ -27277,6 +27280,7 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
+        drop(socket);
     }
 
     #[test]

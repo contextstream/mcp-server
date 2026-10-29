@@ -158,6 +158,18 @@ pub struct Ui {
 static UI: OnceLock<Ui> = OnceLock::new();
 
 /// The process-wide presentation settings.
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `-q` / `--quiet`: print errors only. Progress and confirmation lines check
+/// [`is_quiet`] (#255).
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn is_quiet() -> bool {
+    QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn ui() -> &'static Ui {
     UI.get_or_init(Ui::detect)
 }

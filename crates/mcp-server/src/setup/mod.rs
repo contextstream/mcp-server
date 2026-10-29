@@ -90,7 +90,17 @@ static QUIET_HOOK_REFRESH: std::sync::atomic::AtomicBool =
 /// Progress notes from `update-hooks`, silenced during setup's own refresh.
 macro_rules! refresh_note {
     ($($arg:tt)*) => {
-        if !QUIET_HOOK_REFRESH.load(std::sync::atomic::Ordering::Relaxed) {
+        if !QUIET_HOOK_REFRESH.load(std::sync::atomic::Ordering::Relaxed) && !ui::is_quiet() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+/// A progress or confirmation line on stderr, silenced by `-q` / `--quiet`
+/// ("errors only", #255). Failures keep using `eprintln!`.
+macro_rules! note {
+    ($($arg:tt)*) => {
+        if !ui::is_quiet() {
             eprintln!($($arg)*);
         }
     };
@@ -812,9 +822,9 @@ pub async fn uninstall(
     };
 
     if targets.is_empty() {
-        eprintln!("No editors to clean up.");
+        note!("No editors to clean up.");
     } else {
-        eprintln!(
+        note!(
             "{} Removing ContextStream from {} editor(s): {}",
             info_label(),
             targets.len(),
@@ -1438,7 +1448,7 @@ async fn update_configs_scoped_with_interactivity(
     validate_editor_scope(scope, "update-configs")?;
     let (detected, provenance) = resolve_hook_refresh_editors(only, only_configured)?;
     if detected.is_empty() {
-        eprintln!("{}", no_target_editors_message(only_configured));
+        note!("{}", no_target_editors_message(only_configured));
         return Ok(());
     }
 
@@ -1542,7 +1552,7 @@ async fn update_configs_scoped_with_interactivity(
     let project_id_ref = project_id.as_deref();
 
     let mut failures = Vec::new();
-    eprintln!(
+    note!(
         "{} Updating MCP configs for {} editor(s) ({}): {}",
         info_label(),
         detected.len(),
@@ -1562,7 +1572,7 @@ async fn update_configs_scoped_with_interactivity(
 
     for editor in &detected {
         if !editor.has_mcp_transport() {
-            eprintln!(
+            note!(
                 "{} {} is rules-only; no MCP config or sync bridge is required.",
                 info_label(),
                 editor.display_name()
@@ -1606,7 +1616,7 @@ async fn update_configs_scoped_with_interactivity(
                         transport_label
                     };
                     let name = editor.display_name();
-                    eprintln!(
+                    note!(
                         "{}",
                         change_line(
                             format!("{label} MCP config updated for {name}"),
@@ -1614,7 +1624,7 @@ async fn update_configs_scoped_with_interactivity(
                         )
                     );
                     if local_only {
-                        eprintln!(
+                        note!(
                             "{} {} only launches local servers from its config file. {}",
                             info_label(),
                             editor.display_name(),
@@ -1662,7 +1672,7 @@ async fn update_configs_scoped_with_interactivity(
                     Ok(()) => {
                         let label = transport_label.to_lowercase();
                         let name = editor.display_name();
-                        eprintln!(
+                        note!(
                             "{}",
                             change_line(
                                 format!("Project {label} MCP config updated for {name}"),
@@ -1770,7 +1780,7 @@ pub async fn update_transcript_defaults_scoped(
     validate_editor_scope(scope, "transcript-default update")?;
     let (detected, _) = resolve_hook_refresh_editors(only, only_configured)?;
     if detected.is_empty() {
-        eprintln!("{}", no_target_editors_message(only_configured));
+        note!("{}", no_target_editors_message(only_configured));
         return Ok(());
     }
 
@@ -1820,7 +1830,7 @@ pub async fn update_transcript_defaults_scoped(
                 Ok(()) => {
                     updates += 1;
                     let name = editor.display_name();
-                    eprintln!(
+                    note!(
                         "{}",
                         change_line(
                             format!("Transcript defaults updated for {name}"),
@@ -1856,7 +1866,7 @@ pub async fn update_transcript_defaults_scoped(
                     Ok(()) => {
                         updates += 1;
                         let name = editor.display_name();
-                        eprintln!(
+                        note!(
                             "{}",
                             change_line(
                                 format!("Project transcript defaults updated for {name}"),
@@ -1913,7 +1923,7 @@ pub async fn migrate_remote_scoped(
     validate_editor_scope(scope, "migrate-remote")?;
     let (detected, provenance) = resolve_hook_refresh_editors(only, only_configured)?;
     if detected.is_empty() {
-        eprintln!("{}", no_target_editors_message(only_configured));
+        note!("{}", no_target_editors_message(only_configured));
         return Ok(());
     }
 
@@ -1936,7 +1946,7 @@ pub async fn migrate_remote_scoped(
 
     let workspace_id_ref = workspace_id.as_deref();
     let project_id_ref = project_id.as_deref();
-    eprintln!(
+    note!(
         "{} Migrating {} editor(s) ({}): {}",
         info_label(),
         detected.len(),
@@ -1970,7 +1980,7 @@ pub async fn migrate_remote_scoped(
                 Ok(()) => {
                     migrated += 1;
                     let name = editor.display_name();
-                    eprintln!(
+                    note!(
                         "{}",
                         change_line(
                             format!("Hosted remote MCP configured for {name}"),
@@ -2003,7 +2013,7 @@ pub async fn migrate_remote_scoped(
                     Ok(()) => {
                         migrated += 1;
                         let name = editor.display_name();
-                        eprintln!(
+                        note!(
                             "{}",
                             change_line(
                                 format!("Project MCP migrated to hosted remote for {name}"),
@@ -2097,7 +2107,7 @@ pub async fn update_rules_scoped(
     let editors_to_update = targets;
 
     if editors_to_update.is_empty() {
-        eprintln!("{}", no_target_editors_message(only_configured));
+        note!("{}", no_target_editors_message(only_configured));
         return Ok(());
     }
 
@@ -2178,7 +2188,7 @@ pub async fn update_rules_scoped(
 
         if !updated.is_empty() {
             let line = format!("{} ({})", editor.display_name(), updated.join(", "));
-            eprintln!(
+            note!(
                 "{}",
                 change_line(&line, format_args!("{line} would be updated"))
             );

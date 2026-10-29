@@ -15819,8 +15819,12 @@ impl ContextStreamClient {
         self.get(&format!("/coordinations/{}", id)).await
     }
 
-    pub async fn get_coordination_notice(&self, notice_id: Uuid) -> Result<serde_json::Value> {
-        self.get(&format!("/coordination/notices/{}", notice_id))
+    pub async fn get_coordination_notice(
+        &self,
+        notice_id: Uuid,
+        workspace_id: Option<Uuid>,
+    ) -> Result<serde_json::Value> {
+        self.get(&coordination_notice_path(notice_id, None, workspace_id))
             .await
     }
 
@@ -15829,25 +15833,34 @@ impl ContextStreamClient {
         &self,
         notice_id: Uuid,
         message: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<serde_json::Value> {
         self.post(
-            &format!("/coordination/notices/{}/reply", notice_id),
+            &coordination_notice_path(notice_id, Some("reply"), workspace_id),
             &serde_json::json!({ "message": message }),
         )
         .await
     }
 
-    pub async fn ack_coordination_notice(&self, notice_id: Uuid) -> Result<serde_json::Value> {
+    pub async fn ack_coordination_notice(
+        &self,
+        notice_id: Uuid,
+        workspace_id: Option<Uuid>,
+    ) -> Result<serde_json::Value> {
         self.post(
-            &format!("/coordination/notices/{}/ack", notice_id),
+            &coordination_notice_path(notice_id, Some("ack"), workspace_id),
             &serde_json::json!({}),
         )
         .await
     }
 
-    pub async fn dismiss_coordination_notice(&self, notice_id: Uuid) -> Result<serde_json::Value> {
+    pub async fn dismiss_coordination_notice(
+        &self,
+        notice_id: Uuid,
+        workspace_id: Option<Uuid>,
+    ) -> Result<serde_json::Value> {
         self.post(
-            &format!("/coordination/notices/{}/dismiss", notice_id),
+            &coordination_notice_path(notice_id, Some("dismiss"), workspace_id),
             &serde_json::json!({}),
         )
         .await
@@ -20899,6 +20912,25 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+/// A coordination notice route. A notice lives on its workspace's home
+/// primary, which the API reaches only when the workspace is named
+/// (mcp-server#309), so it is sent whenever it is known.
+pub fn coordination_notice_path(
+    notice_id: Uuid,
+    action: Option<&str>,
+    workspace_id: Option<Uuid>,
+) -> String {
+    let mut path = format!("/coordination/notices/{notice_id}");
+    if let Some(action) = action {
+        path.push('/');
+        path.push_str(action);
+    }
+    if let Some(workspace_id) = workspace_id {
+        path.push_str(&format!("?workspace_id={workspace_id}"));
+    }
+    path
 }
 
 fn extract_error_message(body: &serde_json::Value, status: u16) -> String {
@@ -27165,6 +27197,20 @@ mod tests {
         );
 
         assert_eq!(message, "content_max_chars: must be between 50 and 10000");
+    }
+
+    #[test]
+    fn coordination_notice_routes_name_the_workspace_when_known() {
+        let notice = uuid::Uuid::nil();
+        let workspace = uuid::Uuid::max();
+        assert_eq!(
+            coordination_notice_path(notice, Some("ack"), Some(workspace)),
+            format!("/coordination/notices/{notice}/ack?workspace_id={workspace}")
+        );
+        assert_eq!(
+            coordination_notice_path(notice, None, None),
+            format!("/coordination/notices/{notice}")
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use super::editors::Editor;
 use super::mcp_config::{try_parse_json_like, MANAGED_CONFIG_VERSION};
-use super::rules::content_has_owned_contextstream_rules;
+use super::rules::{content_has_owned_contextstream_rules, has_duplicated_generated_frontmatter};
 
 pub const DOCTOR_REPORT_SCHEMA_VERSION: u16 = 2;
 const DOCTOR_COMPLETION_SUMMARY_SCHEMA_VERSION: u16 = 1;
@@ -933,6 +933,18 @@ fn check_rules_file(
         );
     }
     match std::fs::read_to_string(path) {
+        Ok(content)
+            if content_has_owned_contextstream_rules(&content)
+                && has_duplicated_generated_frontmatter(&content) =>
+        {
+            SurfaceCheck::problem(
+                surface,
+                missing_status,
+                "managed ContextStream rules start with duplicated front matter",
+                Some(path),
+                fix,
+            )
+        }
         Ok(content) if content_has_owned_contextstream_rules(&content) => {
             let installed_hash = mcp_types::rules_hash::extract_hash_marker(&content);
             let canonical_hash = mcp_types::rules_hash::canonical_rules_hash();
@@ -3798,6 +3810,35 @@ mod tests {
         .unwrap();
         let unowned = check_rules_file("rules_project", &path, CheckStatus::Fail, FIX);
         assert_eq!(unowned.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn rules_file_check_flags_front_matter_stacked_by_earlier_releases() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("contextstream.md");
+        const FIX: &str = "contextstream-mcp update-rules --scope project";
+        const FRONT_MATTER: &str = "---\ntrigger: always_on\n---\n\n";
+        crate::setup::install_canonical_rules_hash();
+        let canonical_hash =
+            mcp_types::rules_hash::canonical_rules_hash().expect("canonical rules hash");
+        let block = format!(
+            "<contextstream>\n<!-- contextstream-rules-hash: {canonical_hash} -->\n# ContextStream Rules\n</contextstream>\n"
+        );
+
+        std::fs::write(&path, format!("{FRONT_MATTER}{block}")).unwrap();
+        let single = check_rules_file("rules_project", &path, CheckStatus::Fail, FIX);
+        assert_eq!(single.status, CheckStatus::Pass);
+
+        // Up to 1.0.41 every rewrite added another copy above the block while
+        // the rules hash stayed current, so doctor reported it healthy.
+        std::fs::write(&path, format!("{FRONT_MATTER}{FRONT_MATTER}{block}")).unwrap();
+        let stacked = check_rules_file("rules_project", &path, CheckStatus::Fail, FIX);
+        assert_eq!(stacked.status, CheckStatus::Fail);
+        assert!(
+            stacked.detail.contains("duplicated front matter"),
+            "{}",
+            stacked.detail
+        );
     }
 
     #[test]

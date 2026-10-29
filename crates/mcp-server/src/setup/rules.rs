@@ -412,6 +412,28 @@ fn ensure_windsurf_always_on_frontmatter(content: &str) -> String {
     format!("{}{}", WINDSURF_ALWAYS_ON_FRONTMATTER, content)
 }
 
+/// Whether `prefix`, everything in a file before the managed block, is nothing
+/// but ContextStream's generated front matter for an editor. Releases through
+/// 1.0.41 stacked another copy of the Windsurf front matter on every rewrite,
+/// so a file can hold several.
+fn is_generated_frontmatter(prefix: &str, frontmatter: &str) -> bool {
+    prefix.starts_with(frontmatter)
+        && (prefix.trim_end() == frontmatter.trim_end()
+            || prefix.replace(frontmatter, "").trim().is_empty())
+}
+
+/// Whether a rules file starts with more than one copy of a generated front
+/// matter block, which `doctor --repair` collapses on the next rewrite.
+pub(super) fn has_duplicated_generated_frontmatter(content: &str) -> bool {
+    [WINDSURF_ALWAYS_ON_FRONTMATTER, CURSOR_MDC_FRONTMATTER]
+        .into_iter()
+        .any(|frontmatter| {
+            content
+                .strip_prefix(frontmatter)
+                .is_some_and(|rest| rest.starts_with(frontmatter))
+        })
+}
+
 /// Resolve a rules target path to an actual file path.
 ///
 /// Some editors may use directory-style rule locations (for example, `.clinerules/`).
@@ -476,10 +498,7 @@ fn existing_rules_file_is_wholly_owned(content: &str) -> bool {
     let prefix_owned = content[..start_pos].trim().is_empty()
         || [WINDSURF_ALWAYS_ON_FRONTMATTER, CURSOR_MDC_FRONTMATTER]
             .into_iter()
-            .any(|frontmatter| {
-                content.starts_with(frontmatter)
-                    && content[..start_pos].trim_end() == frontmatter.trim_end()
-            });
+            .any(|frontmatter| is_generated_frontmatter(&content[..start_pos], frontmatter));
     prefix_owned && content[end_pos..].trim().is_empty()
 }
 
@@ -493,6 +512,26 @@ fn render_contextstream_block_for_path(
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("mdc"));
     if !is_mdc {
+        // Windsurf's block arrives with its always-on front matter on the
+        // front. Front matter belongs only at the top of a file, so replace
+        // just the block and keep the file's own front matter (adding ours
+        // only when it has none) rather than stacking another copy above the
+        // block on every rewrite.
+        if let Some(block) = stamped_block.strip_prefix(WINDSURF_ALWAYS_ON_FRONTMATTER) {
+            let (frontmatter, mut body) = split_leading_frontmatter(existing)
+                .unwrap_or((WINDSURF_ALWAYS_ON_FRONTMATTER, existing));
+            if frontmatter == WINDSURF_ALWAYS_ON_FRONTMATTER {
+                // Collapse the copies earlier releases stacked up.
+                while let Some(rest) = body.strip_prefix(WINDSURF_ALWAYS_ON_FRONTMATTER) {
+                    body = rest;
+                }
+            }
+            return Ok(format!(
+                "{}{}",
+                frontmatter,
+                replace_contextstream_block(body, block)?
+            ));
+        }
         return replace_contextstream_block(existing, stamped_block);
     }
 
@@ -2323,10 +2362,7 @@ fn remove_contextstream_from_path(path: &Path) -> Result<bool> {
         }
         let generated_frontmatter = [WINDSURF_ALWAYS_ON_FRONTMATTER, CURSOR_MDC_FRONTMATTER]
             .into_iter()
-            .find(|frontmatter| {
-                content.starts_with(frontmatter)
-                    && content[..start_pos].trim_end() == frontmatter.trim_end()
-            });
+            .find(|frontmatter| is_generated_frontmatter(&content[..start_pos], frontmatter));
         let backup_path = safe_edit::backup_path(&resolved_path)?;
         let backup = safe_edit::read_recovery_file(&backup_path)?;
         let generated_frontmatter_was_preexisting =
@@ -4020,6 +4056,164 @@ mod tests {
             rules.matches(WINDSURF_ALWAYS_ON_FRONTMATTER).count(),
             1,
             "frontmatter should appear exactly once"
+        );
+    }
+
+    fn windsurf_project_rules(project: &Path) -> PathBuf {
+        project
+            .join(".windsurf")
+            .join("rules")
+            .join("contextstream.md")
+    }
+
+    fn write_windsurf_project_rules(project: &Path) {
+        write_project_rules(
+            &Editor::Windsurf,
+            project,
+            Some("ws"),
+            Some("Workspace"),
+            Some("proj"),
+        )
+        .expect("write windsurf project rules");
+    }
+
+    #[test]
+    fn rewriting_windsurf_rules_keeps_exactly_one_front_matter_block() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        let path = windsurf_project_rules(project);
+
+        write_windsurf_project_rules(project);
+        let first = std::fs::read_to_string(&path).expect("read rules");
+        assert!(first.starts_with(WINDSURF_ALWAYS_ON_FRONTMATTER));
+
+        // Every managed rewrite (setup, update-rules, doctor --repair) goes
+        // through the same writer; it used to add a copy per run.
+        for _ in 0..3 {
+            write_windsurf_project_rules(project);
+        }
+        let rewritten = std::fs::read_to_string(&path).expect("read rules");
+        assert_eq!(rewritten, first, "a rewrite changes nothing");
+        assert_eq!(rewritten.matches(WINDSURF_ALWAYS_ON_FRONTMATTER).count(), 1);
+        assert_eq!(rewritten.matches(CONTEXTSTREAM_START).count(), 1);
+        assert!(!has_duplicated_generated_frontmatter(&rewritten));
+    }
+
+    #[test]
+    fn rewriting_global_style_windsurf_rules_keeps_one_front_matter_block() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("global_rules.md");
+        let block = generate_rule_content(
+            &Editor::Windsurf,
+            Some("ws"),
+            Some("Workspace"),
+            RulesMode::Bootstrap,
+        );
+
+        for _ in 0..3 {
+            write_contextstream_block_to_path(&path, &block, true).expect("write rules");
+        }
+        let content = std::fs::read_to_string(&path).expect("read rules");
+        assert!(content.starts_with(WINDSURF_ALWAYS_ON_FRONTMATTER));
+        assert_eq!(content.matches(WINDSURF_ALWAYS_ON_FRONTMATTER).count(), 1);
+    }
+
+    #[test]
+    fn a_rewrite_collapses_front_matter_stacked_by_earlier_releases() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        let path = windsurf_project_rules(project);
+        write_windsurf_project_rules(project);
+        let healthy = std::fs::read_to_string(&path).expect("read rules");
+
+        let stacked = format!(
+            "{}{}{}",
+            WINDSURF_ALWAYS_ON_FRONTMATTER, WINDSURF_ALWAYS_ON_FRONTMATTER, healthy
+        );
+        assert!(has_duplicated_generated_frontmatter(&stacked));
+        std::fs::write(&path, &stacked).expect("seed stacked rules");
+
+        write_windsurf_project_rules(project);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read rules"),
+            healthy,
+            "the duplicates are gone and nothing else changed"
+        );
+        assert!(
+            !path.with_extension("md.contextstream.bak").exists()
+                && std::fs::read_dir(path.parent().unwrap())
+                    .unwrap()
+                    .flatten()
+                    .all(|entry| !entry.file_name().to_string_lossy().ends_with(".bak")),
+            "collapsing a file ContextStream owns leaves no backup behind"
+        );
+    }
+
+    #[test]
+    fn a_windsurf_rules_file_keeps_the_persons_own_front_matter_and_text() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        let path = windsurf_project_rules(project);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("rules dir");
+
+        // The person chose another trigger and wrote their own notes.
+        std::fs::write(&path, "---\ntrigger: manual\n---\n\nMy own notes.\n").expect("seed rules");
+        write_windsurf_project_rules(project);
+        write_windsurf_project_rules(project);
+
+        let content = std::fs::read_to_string(&path).expect("read rules");
+        assert!(
+            content.starts_with("---\ntrigger: manual\n---\n\n"),
+            "{content}"
+        );
+        assert!(content.contains("My own notes."), "{content}");
+        assert_eq!(content.matches("trigger: manual").count(), 1, "{content}");
+        assert_eq!(
+            content.matches("trigger: always_on").count(),
+            0,
+            "{content}"
+        );
+        assert_eq!(content.matches(CONTEXTSTREAM_START).count(), 1);
+    }
+
+    #[test]
+    fn a_windsurf_rules_file_without_front_matter_gets_it_once_at_the_top() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        let path = windsurf_project_rules(project);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("rules dir");
+        std::fs::write(&path, "My own notes.\n").expect("seed rules");
+
+        write_windsurf_project_rules(project);
+        write_windsurf_project_rules(project);
+
+        let content = std::fs::read_to_string(&path).expect("read rules");
+        assert!(
+            content.starts_with(WINDSURF_ALWAYS_ON_FRONTMATTER),
+            "{content}"
+        );
+        assert!(content.contains("My own notes."));
+        assert_eq!(content.matches(WINDSURF_ALWAYS_ON_FRONTMATTER).count(), 1);
+        assert_eq!(content.matches(CONTEXTSTREAM_START).count(), 1);
+    }
+
+    #[test]
+    fn removing_the_rules_also_removes_stacked_front_matter() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        let path = windsurf_project_rules(project);
+        write_windsurf_project_rules(project);
+        let healthy = std::fs::read_to_string(&path).expect("read rules");
+        std::fs::write(
+            &path,
+            format!("{}{}", WINDSURF_ALWAYS_ON_FRONTMATTER, healthy),
+        )
+        .expect("seed stacked rules");
+
+        assert!(remove_contextstream_from_path(&path).expect("remove rules"));
+        assert!(
+            !path.exists(),
+            "a file that held only generated front matter and the block is removed"
         );
     }
 

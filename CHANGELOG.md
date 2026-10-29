@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.41
+
+- Coordination notices reach long-running and headless sessions mid-run. Claude Code, Antigravity and
+  Codex hooks show a new notice at the next tool call, exactly once, without waiting on the network.
+  A share can name its recipient (`to`), and scratch or temp folders no longer create projects.
+- Setup, configure and doctor fixes retested since 1.0.40, including:
+  - `--dry-run` previews project files and hooks during first-time setup, with duplicates removed;
+  - leaving the `configure` menu without acting no longer rewrites hooks (#257);
+  - `-q/--quiet` and `--dry-run` wording;
+  - `CONTEXTSTREAM_HOOK_ENABLED=false` is honoured by every editor lifecycle hook;
+  - clearer network and error messages, and `exclude --path` parsing.
+  - Issues: #243 #248 #249 #252 #253 #255 #257 #261 #262 #264 #270 #276.
+
 ## 1.0.40
 
 - Setup keeps what you set before:

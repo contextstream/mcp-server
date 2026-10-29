@@ -2569,8 +2569,38 @@ fn remove_contextstream_from_path(path: &Path) -> Result<bool> {
             } else {
                 start_pos
             };
-        let before = &content[..adjusted_start];
+        let mut before = &content[..adjusted_start];
         let mut after = &content[end_pos..];
+        // A block in a YAML file is commented out line by line, so the `# ` in
+        // front of the opening tag and the line break after the closing one
+        // are the block's own lines. Take them with it, and the blank line
+        // setup put between the person's text and the block, so a file that
+        // was theirs comes back as it was (#327).
+        if adjusted_start == start_pos {
+            let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+            let prefix = &before[line_start..];
+            if prefix.contains('#') && is_effectively_empty(prefix) {
+                before = &before[..line_start];
+                let ends_line = after.starts_with('\n') || after.starts_with("\r\n");
+                if ends_line {
+                    after = after
+                        .strip_prefix("\r\n")
+                        .or_else(|| after.strip_prefix('\n'))
+                        .unwrap_or(after);
+                }
+                if after.is_empty() {
+                    before = before
+                        .strip_suffix("\r\n\r\n")
+                        .map(|rest| &before[..rest.len() + 2])
+                        .or_else(|| {
+                            before
+                                .strip_suffix("\n\n")
+                                .map(|_| &before[..before.len() - 1])
+                        })
+                        .unwrap_or(before);
+                }
+            }
+        }
         if let Some(original) = backup.as_deref() {
             let original_body = if resolved_path
                 .extension()
@@ -2618,6 +2648,11 @@ fn remove_contextstream_from_path(path: &Path) -> Result<bool> {
             }
         } else {
             safe_edit::write_if_unchanged(&resolved_path, &cleaned, Some(&content))?;
+            // Setup's copy of the person's file is redundant once the file is
+            // back to exactly that (#327).
+            if let Some(backup_text) = backup.as_deref().filter(|text| *text == cleaned) {
+                safe_edit::remove_owned_file_if_unchanged(&backup_path, backup_text)?;
+            }
         }
         return Ok(true);
     }
@@ -4424,6 +4459,54 @@ mod tests {
         std::fs::write(&conf, stacked).unwrap();
         write();
         assert_eq!(std::fs::read_to_string(&conf).unwrap(), first);
+    }
+
+    #[test]
+    fn uninstall_gives_a_persons_aider_config_back_as_it_was() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path();
+        let conf = project.join(".aider.conf.yml");
+        let write = || {
+            write_project_rules(&Editor::Aider, project, Some("ws"), Some("W"), Some("p"))
+                .expect("write aider rules");
+        };
+
+        // Their settings, then setup's block at the end.
+        let original = "model: gpt-4o\nauto-commits: false\n";
+        std::fs::write(&conf, original).unwrap();
+        write();
+        assert!(std::fs::read_to_string(&conf)
+            .unwrap()
+            .starts_with(original));
+        remove_contextstream_from_rules(&Editor::Aider, Some(project)).expect("remove");
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), original);
+        assert!(
+            !safe_edit::backup_path(&conf).unwrap().exists(),
+            "setup's copy of a file that is back as it was is not kept"
+        );
+
+        // Windows line endings: setup's separator is a bare newline after theirs.
+        let crlf = "model: gpt-4o\r\n";
+        std::fs::write(&conf, crlf).unwrap();
+        write();
+        remove_contextstream_from_rules(&Editor::Aider, Some(project)).expect("remove");
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), crlf);
+
+        // A block they put between two of their own lines takes only its own lines.
+        std::fs::remove_file(&conf).unwrap();
+        let _ = std::fs::remove_file(safe_edit::backup_path(&conf).unwrap());
+        write();
+        let block = std::fs::read_to_string(&conf).unwrap();
+        std::fs::write(
+            &conf,
+            format!("# my own notes about aider\n{block}\nmodel: claude-3-opus\n"),
+        )
+        .unwrap();
+        remove_contextstream_from_rules(&Editor::Aider, Some(project)).expect("remove");
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            "# my own notes about aider\nmodel: claude-3-opus\n"
+        );
     }
 
     #[test]

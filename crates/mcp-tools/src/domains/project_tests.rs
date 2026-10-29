@@ -71,6 +71,46 @@ fn tool_result_text(result: &mcp_types::tool::ToolResult) -> &str {
 }
 
 #[tokio::test]
+async fn team_projects_calls_the_team_route_and_explains_a_non_team_account() {
+    // #295: `/projects/team` was read as a project id ("UUID parsing failed").
+    let (tool, server) = project_tool_with_http_sequence(vec![
+        (
+            "200 OK",
+            json!({"items": [{"id": uuid::Uuid::new_v4()}, {"id": uuid::Uuid::new_v4()}], "total": 2})
+                .to_string(),
+        ),
+        (
+            "403 Forbidden",
+            json!({"success": false, "error": {"code": "FORBIDDEN", "message": "Forbidden: User is not part of a team"}})
+                .to_string(),
+        ),
+    ])
+    .await;
+
+    let result = tool
+        .execute(json!({"action": "team_projects"}))
+        .await
+        .expect("team projects");
+    assert_eq!(tool_result_text(&result), "Found 2 team projects.");
+    let error = tool
+        .execute(json!({"action": "team_projects"}))
+        .await
+        .expect_err("a non-team account is refused");
+    assert_eq!(
+        error.to_string(),
+        "Feature not available: team_projects lists a team plan's projects; this account is not part of a team."
+    );
+
+    let requests = server.await.expect("server");
+    for request in &requests {
+        assert!(
+            request.starts_with("GET /api/v1/team/projects HTTP/1.1"),
+            "{request}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn hosted_folder_index_requests_the_installed_bridge_before_reporting_status() {
     let project_id = uuid::Uuid::new_v4();
     let workspace_id = uuid::Uuid::new_v4();

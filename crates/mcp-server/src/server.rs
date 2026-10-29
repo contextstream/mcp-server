@@ -134,6 +134,9 @@ pub fn build_registry(
     // Compatibility chart/job surfaces self-gate when no provider is available.
     domains::charts::register_charts_tools(&mut registry, session.clone());
     domains::atlas_jobs::register_atlas_job_tools(&mut registry, session);
+    // Read-only twins of memory, workspace, project and session: registered
+    // everywhere, listed per caller by `with_read_only_twins`.
+    domains::read_only::register_read_only_twins(&mut registry);
 
     registry
 }
@@ -900,6 +903,24 @@ async fn studio_listing_entry(
         return None;
     }
     Some(contextstream_tool_list_entry(tool))
+}
+
+/// Add the read-only twins (`domains::read_only`) to a listing, for a client that asks
+/// its person to confirm every tool call that may write. The registry's own listing
+/// leaves them out (`is_listed_per_caller`), so no other client pays for them.
+pub(crate) fn with_read_only_twins(
+    registry: &ToolRegistry,
+    category: Option<&str>,
+    tools: &mut Vec<serde_json::Value>,
+) {
+    for twin in domains::read_only::READ_ONLY_TWINS {
+        let Some(tool) = registry.get(twin.name) else {
+            continue;
+        };
+        if requested_category_matches(category, tool.metadata.category.as_str()) {
+            insert_sorted(tools, contextstream_tool_list_entry(tool));
+        }
+    }
 }
 
 fn insert_sorted(tools: &mut Vec<serde_json::Value>, entry: serde_json::Value) {
@@ -3302,6 +3323,62 @@ mod tests {
             None,
         );
         assert_eq!(listed_names(&openai), V0_5_62_OPENAI_AGENTIC_TOOL_NAMES);
+    }
+
+    #[test]
+    fn read_only_twins_are_listed_only_on_request_and_offer_only_real_reads() {
+        let registry = test_registry(Config::default());
+        let default = contextstream_tools_list(&registry, None);
+        let default_names = listed_names(&default);
+        let mut tools = default.clone();
+        with_read_only_twins(&registry, None, &mut tools);
+        assert_eq!(
+            tools.len(),
+            default.len() + domains::read_only::READ_ONLY_TWINS.len()
+        );
+        let names = listed_names(&tools);
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+        for twin in domains::read_only::READ_ONLY_TWINS {
+            assert!(
+                !default_names.contains(&twin.name),
+                "{} is in the default listing",
+                twin.name
+            );
+            let entry = tool_by_name(&tools, twin.name);
+            assert_eq!(
+                entry["annotations"]["readOnlyHint"],
+                serde_json::json!(true)
+            );
+            assert!(
+                mcp_tools::portable_schema::portable_schema_violations(&entry["inputSchema"])
+                    .is_empty(),
+                "{}",
+                twin.name
+            );
+            assert_eq!(
+                entry["inputSchema"]["properties"]["action"]["enum"],
+                serde_json::json!(twin.actions)
+            );
+            let tool_actions = tool_by_name(&default, twin.tool)["inputSchema"]["properties"]
+                ["action"]["enum"]
+                .as_array()
+                .expect("action enum")
+                .clone();
+            for action in twin.actions {
+                assert!(
+                    tool_actions.contains(&serde_json::json!(action)),
+                    "{}: `{action}` is not a `{}` action",
+                    twin.name,
+                    twin.tool
+                );
+            }
+        }
+        // Never an operation: the adaptive surface's catalog stays as it was.
+        for twin in domains::read_only::READ_ONLY_TWINS {
+            assert!(registry.get_operation(twin.name).is_none(), "{}", twin.name);
+        }
     }
 
     #[test]

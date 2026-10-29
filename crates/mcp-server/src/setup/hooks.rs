@@ -417,6 +417,72 @@ fn install_binary_impl(target_dir: &std::path::Path, report_success: bool) -> Re
     Ok(())
 }
 
+/// Install downloaded binary bytes at `target` the way the managed helper is
+/// installed: stage them beside it, make them executable, prove they run, then
+/// replace the target atomically. A failed or interrupted update therefore
+/// leaves the previous binary in place, never a missing or half-written file
+/// that every hook would then fail on. Returns the version the new binary
+/// reports.
+pub fn install_binary_bytes(target: &Path, bytes: &[u8]) -> Result<String> {
+    use std::io::Write;
+
+    let target_dir = target.parent().ok_or_else(|| {
+        anyhow::anyhow!("Binary path has no parent directory: {}", target.display())
+    })?;
+    std::fs::create_dir_all(target_dir)?;
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("contextstream-mcp");
+    let counter = BINARY_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let staged = target_dir.join(format!(
+        ".{name}.contextstream.tmp.{}.{counter}",
+        std::process::id()
+    ));
+
+    let staged_result = (|| -> Result<String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .with_context(|| {
+                format!("Could not create staged binary beside {}", target.display())
+            })?;
+        file.write_all(bytes)
+            .with_context(|| format!("Failed to stage binary for {}", target.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))
+                .with_context(|| {
+                    format!(
+                        "Could not make staged binary {} executable",
+                        staged.display()
+                    )
+                })?;
+        }
+        file.sync_all()
+            .with_context(|| format!("Could not sync staged binary {}", staged.display()))?;
+        drop(file);
+        verify_binary_runs(&staged).context(
+            "The downloaded ContextStream binary failed validation; the existing binary was left untouched",
+        )
+    })();
+    let version = match staged_result {
+        Ok(version) => version,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+    };
+    if let Err(error) = replace_binary_atomically(&staged, target) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    sync_binary_parent(target);
+    Ok(version)
+}
+
 fn verify_binary_runs(path: &Path) -> Result<String> {
     let output = std::process::Command::new(path).arg("--version").output();
 
@@ -538,6 +604,34 @@ pub fn managed_binary_path() -> PathBuf {
         "contextstream-mcp"
     };
     contextstream_config_dir().join("bin").join(binary_name)
+}
+
+/// Why the helper binary at `path` cannot run a hook, or `None` when it can.
+/// Checked without running it, so `doctor` stays quick and side-effect free.
+fn helper_problem_at(path: &Path) -> Option<String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => Some(format!("{} is not a file", path.display())),
+        Ok(metadata) if metadata.len() == 0 => Some(format!("{} is empty", path.display())),
+        #[cfg(unix)]
+        Ok(metadata)
+            if std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o111 == 0 =>
+        {
+            Some(format!("{} is not executable", path.display()))
+        }
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(format!("{} is missing", path.display()))
+        }
+        Err(error) => Some(format!("{} cannot be read: {error}", path.display())),
+    }
+}
+
+/// Why the managed helper binary that every managed hook runs cannot run, or
+/// `None` when it is in place. Each hook entry calls it by absolute path, so
+/// when it is gone the entries still look installed while every hook fails
+/// silently.
+pub(super) fn managed_helper_problem() -> Option<String> {
+    helper_problem_at(&managed_binary_path())
 }
 
 /// Ensure the managed local helper binary exists at a stable user-writable path.
@@ -3137,6 +3231,77 @@ mod tests {
         assert!(!is_contextstream_hook_command(
             "contextstream-mcp hook session-start"
         ));
+    }
+
+    #[test]
+    fn helper_problem_names_what_is_wrong_with_the_binary_hooks_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("contextstream-mcp");
+
+        let missing = helper_problem_at(&path).expect("a missing helper is a problem");
+        assert!(missing.contains("is missing"), "{missing}");
+
+        std::fs::write(&path, b"").expect("empty file");
+        let empty = helper_problem_at(&path).expect("an empty helper is a problem");
+        assert!(empty.contains("is empty"), "{empty}");
+
+        std::fs::remove_file(&path).expect("remove");
+        std::fs::create_dir(&path).expect("directory");
+        let directory = helper_problem_at(&path).expect("a directory is a problem");
+        assert!(directory.contains("is not a file"), "{directory}");
+        std::fs::remove_dir(&path).expect("remove dir");
+
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+            let not_executable =
+                helper_problem_at(&path).expect("a non-executable helper is a problem");
+            assert!(
+                not_executable.contains("is not executable"),
+                "{not_executable}"
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        assert_eq!(helper_problem_at(&path), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installing_downloaded_bytes_replaces_atomically_and_never_loses_the_old_binary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("bin").join("contextstream-mcp");
+        let script = |version: &str| format!("#!/bin/sh\necho contextstream-mcp {version}\n");
+        let leftovers = || -> Vec<String> {
+            std::fs::read_dir(target.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .filter(|name| name != "contextstream-mcp")
+                .collect()
+        };
+
+        // Nothing there yet: the directory is created and the binary runs.
+        let first = install_binary_bytes(&target, script("1.0.0").as_bytes()).expect("install");
+        assert_eq!(first, "contextstream-mcp 1.0.0");
+        assert!(target.is_file());
+        assert!(leftovers().is_empty(), "{:?}", leftovers());
+
+        // A newer one replaces it in one step.
+        let second = install_binary_bytes(&target, script("2.0.0").as_bytes()).expect("upgrade");
+        assert_eq!(second, "contextstream-mcp 2.0.0");
+        assert!(helper_problem_at(&target).is_none());
+        assert!(leftovers().is_empty(), "{:?}", leftovers());
+
+        // A download that does not run (truncated, corrupt, wrong platform)
+        // is refused and the working binary is still there, byte for byte.
+        let before = std::fs::read(&target).expect("read");
+        let error = install_binary_bytes(&target, b"#!/bin/sh\nexit 1\n")
+            .expect_err("a binary that fails --version must not be installed");
+        assert!(format!("{error:#}").contains("left untouched"), "{error:#}");
+        assert_eq!(std::fs::read(&target).expect("read"), before);
+        assert!(leftovers().is_empty(), "{:?}", leftovers());
     }
 
     #[test]

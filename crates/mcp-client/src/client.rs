@@ -20954,7 +20954,29 @@ fn extract_error_message(body: &serde_json::Value, status: u16) -> String {
 }
 
 fn extract_validation_error_message(body: &serde_json::Value) -> Option<String> {
-    let errors = body.get("details")?.get("errors")?.as_object()?;
+    // The API nests field errors as `error.details.errors`, a list of
+    // `{field, rule, message}`; other answers carry a top-level
+    // `details.errors` map of field to messages.
+    let errors = body
+        .get("error")
+        .and_then(|error| error.get("details"))
+        .and_then(|details| details.get("errors"))
+        .or_else(|| {
+            body.get("details")
+                .and_then(|details| details.get("errors"))
+        })?;
+    if let Some(items) = errors.as_array() {
+        let parts = items
+            .iter()
+            .filter_map(|item| {
+                let field = item.get("field")?.as_str()?;
+                let message = item.get("message")?.as_str()?;
+                Some(format!("{field}: {message}"))
+            })
+            .collect::<Vec<_>>();
+        return (!parts.is_empty()).then(|| parts.join("; "));
+    }
+    let errors = errors.as_object()?;
     let mut parts = Vec::new();
 
     for (field, value) in errors {
@@ -27164,6 +27186,33 @@ mod tests {
         );
 
         assert_eq!(message, "content_max_chars: must be between 50 and 10000");
+    }
+
+    #[test]
+    fn extract_error_message_reads_the_api_field_error_list() {
+        // #292: the API's own shape; reading only `details.errors` left
+        // every validation failure as a bare "Validation error".
+        let message = extract_error_message(
+            &serde_json::json!({
+                "success": false,
+                "error": {
+                    "code": "VALIDATION_ERROR",
+                    "message": "Validation error",
+                    "details": {
+                        "errors": [
+                            {"field": "query", "rule": "length", "message": "length must be between 1 and 500"},
+                            {"field": "limit", "rule": "range", "message": "value must be between 1 and 100"}
+                        ]
+                    }
+                }
+            }),
+            400,
+        );
+
+        assert_eq!(
+            message,
+            "query: length must be between 1 and 500; limit: value must be between 1 and 100"
+        );
     }
 
     #[test]

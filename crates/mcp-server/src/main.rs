@@ -78,8 +78,11 @@ struct Cli {
     #[arg(short, long, global = true)]
     quiet: bool,
 
+    // The variable is read with the rest of the configuration, which reports
+    // an unknown value and goes on with the default; read here, an editor's
+    // typo in it stopped the server before it started (#319).
     /// Default team vs personal execution mode (also CONTEXTSTREAM_ACCOUNT_MODE).
-    #[arg(long, env = "CONTEXTSTREAM_ACCOUNT_MODE", global = true, value_enum)]
+    #[arg(long, global = true, value_enum)]
     account_mode: Option<AccountModeCli>,
 }
 
@@ -4119,6 +4122,19 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn the_account_mode_variable_cannot_stop_the_server() {
+        // #319: CONTEXTSTREAM_ACCOUNT_MODE=both made clap exit before the
+        // server started; config reads the variable and reports a bad value.
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let flag = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "account_mode")
+            .expect("the --account-mode flag");
+        assert!(flag.get_env().is_none());
+    }
 
     #[cfg(unix)]
     #[test]

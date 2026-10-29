@@ -22,8 +22,14 @@
 //!   `enum`, and an `enum` holds one scalar type and never `null`;
 //! - `format`, numeric and length bounds, `pattern`, and `examples` are folded
 //!   into `description`, so models that could use them keep the guidance;
-//! - every node has a `type` (inferred from its shape when missing), and
-//!   `additionalProperties: {}` becomes `true`;
+//! - every node has a `type` (inferred from its shape when missing);
+//! - `additionalProperties` survives only as a schema, never as a boolean.
+//!   `true` and `{}` are the default; `false` only narrows what a model may
+//!   add, and handlers parse their own input. Both are dropped because Google's
+//!   `google-genai` SDK reads the keyword as a schema in its MCP adapter and
+//!   fails on a boolean (`'bool' object has no attribute 'items'`, so a
+//!   Gemini app built on it loads none of our tools), and Gemini's
+//!   OpenAPI-style `parameters` refuse the keyword with HTTP 400;
 //! - `$ref` into `definitions`/`$defs` is inlined.
 //!
 //! The server never validates arguments against these schemas (handlers parse
@@ -364,12 +370,10 @@ fn normalize_object(
     }
 
     match node.get("additionalProperties") {
-        Some(Value::Bool(allowed)) => {
-            out.insert("additionalProperties".to_string(), json!(allowed));
-        }
-        Some(Value::Object(schema)) if schema.is_empty() => {
-            out.insert("additionalProperties".to_string(), json!(true));
-        }
+        // A boolean, or `{}`, is dropped (see the module docs); the node
+        // stays an object below.
+        Some(Value::Bool(_)) => {}
+        Some(Value::Object(schema)) if schema.is_empty() => {}
         Some(schema @ Value::Object(_)) => {
             out.insert(
                 "additionalProperties".to_string(),
@@ -409,7 +413,13 @@ fn normalize_object(
         }
     }
 
-    let kind = kind.unwrap_or_else(|| infer_kind(&out).to_string());
+    let kind = kind.unwrap_or_else(|| {
+        if node.contains_key("additionalProperties") {
+            "object".to_string()
+        } else {
+            infer_kind(&out).to_string()
+        }
+    });
     if kind == "any" {
         let mut any = any_value_schema();
         if let Some(description) = out.remove("description") {
@@ -751,7 +761,9 @@ fn collect_violations(value: &Value, pointer: &str, violations: &mut Vec<String>
         collect_violations(items, &format!("{pointer}/items"), violations);
     }
     if let Some(additional) = object.get("additionalProperties") {
-        if !additional.is_boolean() {
+        if additional.is_boolean() {
+            violations.push(format!("{at}: `additionalProperties` is a boolean"));
+        } else {
             collect_violations(
                 additional,
                 &format!("{pointer}/additionalProperties"),
@@ -871,10 +883,7 @@ mod tests {
                 "anything": {}
             }
         }));
-        assert_eq!(
-            out["properties"]["data"],
-            json!({"type": "object", "additionalProperties": true})
-        );
+        assert_eq!(out["properties"]["data"], json!({"type": "object"}));
         assert_eq!(
             out["properties"]["anything"]["anyOf"]
                 .as_array()
@@ -946,7 +955,7 @@ mod tests {
             out["description"],
             json!("Ask a question. When action=receipt, also send request_id.")
         );
-        assert_eq!(out["additionalProperties"], json!(false));
+        assert!(out.get("additionalProperties").is_none(), "{out:#}");
         assert_eq!(
             out["properties"]["request_id"]["description"],
             json!("Receipt to recover. UUID.")
@@ -990,6 +999,46 @@ mod tests {
         ] {
             assert_eq!(portable(schema), empty_object_schema());
         }
+    }
+
+    #[test]
+    fn boolean_additional_properties_are_dropped_and_objects_keep_their_type() {
+        let out = portable(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "open": {"type": "object", "additionalProperties": true},
+                "untyped_open": {"additionalProperties": true, "description": "Any fields"},
+                "closed": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"n": {"type": "integer"}}
+                },
+                "map": {"type": "object", "additionalProperties": {"type": "string"}}
+            }
+        }));
+        assert!(out.get("additionalProperties").is_none(), "{out:#}");
+        assert_eq!(out["properties"]["open"], json!({"type": "object"}));
+        assert_eq!(
+            out["properties"]["untyped_open"],
+            json!({"type": "object", "description": "Any fields"})
+        );
+        assert_eq!(
+            out["properties"]["closed"],
+            json!({"type": "object", "properties": {"n": {"type": "integer"}}})
+        );
+        assert_eq!(
+            out["properties"]["map"],
+            json!({"type": "object", "additionalProperties": {"type": "string"}})
+        );
+        let violations = portable_schema_violations(&json!({
+            "type": "object",
+            "properties": {"o": {"type": "object", "additionalProperties": true}}
+        }));
+        assert_eq!(
+            violations,
+            vec!["/properties/o: `additionalProperties` is a boolean".to_string()]
+        );
     }
 
     #[test]

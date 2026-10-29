@@ -1020,9 +1020,11 @@ async fn handle_mcp_streamable(
     // A refused credential fails initialize the way a missing one does:
     // HTTP 401 with WWW-Authenticate, which an editor reports as a failed
     // connection, where a JSON-RPC error in a 200 still read "Connected"
-    // (#252, #303).
-    if request.method == "initialize" && !uses_stateless_http_contract(&headers, &request) {
-        if let Some(refusal) = credential_refused_at_initialize(&state, &headers).await {
+    // (#252, #303). The stateless protocol has no initialize: every request
+    // stands alone, and Claude Code's health check is its server/discover
+    // and tools/list, so each one is checked (a cached verdict, mostly).
+    if request.method == "initialize" || uses_stateless_http_contract(&headers, &request) {
+        if let Some(refusal) = credential_refused(&state, &headers).await {
             let path = matched_path.as_ref().map_or("/mcp", |path| path.as_str());
             return oauth_unauthorized_response(&headers, path, refusal, refusal);
         }
@@ -2547,17 +2549,15 @@ fn initialize_key_verdicts() -> &'static std::sync::Mutex<HashMap<String, (bool,
     VERDICTS.get_or_init(Default::default)
 }
 
-/// On the hosted gateway (`require_auth`), an `initialize` whose credential the
-/// API refuses with a definite 401 fails, so an editor does not report a
-/// connection whose every tool call would fail (#252, #303). A bearer token is
-/// checked the same way unless the gateway verified it itself (it has the JWT
-/// secret). An unreachable, slow or failing API lets the initialize through.
-/// The API is asked with this request's own credentials (the middleware's
-/// task-local auth override). Returns what to tell the client.
-async fn credential_refused_at_initialize(
-    state: &HttpState,
-    headers: &HeaderMap,
-) -> Option<&'static str> {
+/// On the hosted gateway (`require_auth`), an `initialize` or a stateless
+/// request whose credential the API refuses with a definite 401 fails, so an
+/// editor does not report a connection whose every tool call would fail
+/// (#252, #303). A bearer token is checked the same way unless the gateway
+/// verified it itself (it has the JWT secret). An unreachable, slow or failing
+/// API lets the request through. The API is asked with this request's own
+/// credentials (the middleware's task-local auth override), and its verdict is
+/// remembered per credential. Returns what to tell the client.
+async fn credential_refused(state: &HttpState, headers: &HeaderMap) -> Option<&'static str> {
     if !state.require_auth {
         return None;
     }
@@ -7865,6 +7865,83 @@ mod initialize_key_tests {
             0,
             "nothing was asked of the API"
         );
+    }
+
+    /// A request under the stateless 2026-07-28 contract, as Claude Code
+    /// 2.1.312 sends its health check.
+    async fn stateless_with(router: axum::Router, method: &str, api_key: &str) -> Response {
+        let version = "2026-07-28";
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .header(MCP_PROTOCOL_VERSION_HEADER, version)
+                    .header(MCP_METHOD_HEADER, method)
+                    .header("x-contextstream-api-key", api_key)
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": method,
+                            "params": {
+                                "_meta": {
+                                    mcp_types::MCP_META_PROTOCOL_VERSION: version,
+                                    mcp_types::MCP_META_CLIENT_INFO: {
+                                        "name": "claude-code",
+                                        "version": "2.1.312"
+                                    },
+                                    mcp_types::MCP_META_CLIENT_CAPABILITIES: {}
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("stateless request"),
+            )
+            .await
+            .expect("stateless response")
+    }
+
+    #[tokio::test]
+    async fn a_stateless_health_check_with_a_refused_key_is_refused() {
+        // #252: Claude Code sends no initialize; its server/discover and
+        // tools/list answered 200, so a refused key showed "Connected".
+        let (api_url, hits) = api_answering("HTTP/1.1 401 Unauthorized").await;
+        let response = stateless_with(
+            hosted_gateway(api_url.clone()),
+            "server/discover",
+            "refused-key-252-stateless",
+        )
+        .await;
+        assert_refused(response, "did not accept the API key").await;
+        let asked = hits.load(Ordering::SeqCst);
+        assert!(asked >= 1);
+
+        let response = stateless_with(
+            hosted_gateway(api_url),
+            "tools/list",
+            "refused-key-252-stateless",
+        )
+        .await;
+        assert_refused(response, "did not accept the API key").await;
+        assert_eq!(hits.load(Ordering::SeqCst), asked, "the verdict is reused");
+    }
+
+    #[tokio::test]
+    async fn a_stateless_request_goes_through_when_the_api_cannot_answer() {
+        let (api_url, _) = api_answering("HTTP/1.1 503 Service Unavailable").await;
+        let response = stateless_with(
+            hosted_gateway(api_url),
+            "server/discover",
+            "transient-key-252-stateless",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(body.get("result").is_some(), "{body}");
     }
 
     #[tokio::test]

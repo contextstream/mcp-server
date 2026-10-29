@@ -1365,7 +1365,7 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                 );
                 std::process::exit(1);
             }
-            if let Err(e) = run_configure(
+            let outcome = match run_configure(
                 list_options,
                 transcripts,
                 hook_transcripts,
@@ -1375,10 +1375,13 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             )
             .await
             {
-                eprintln!("Configure failed: {}", e);
-                std::process::exit(1);
-            }
-            if !list_options {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    eprintln!("Configure failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            if outcome == ConfigureOutcome::Changed {
                 // Keep `configure --list-options` strictly read-only, and
                 // only refresh editors the user already configured — tweaking
                 // a setting must not enroll a new editor.
@@ -2368,10 +2371,10 @@ async fn run_configure(
     scope: ConfigureScope,
     only: Option<&[setup::editors::Editor]>,
     only_configured: bool,
-) -> Result<()> {
+) -> Result<ConfigureOutcome> {
     if list_options {
         print_configure_options();
-        return Ok(());
+        return Ok(ConfigureOutcome::Unchanged);
     }
 
     if transcripts.is_some() || hook_transcripts.is_some() {
@@ -2408,11 +2411,11 @@ async fn run_configure(
                 if value { "true" } else { "false" }
             );
         }
-        return Ok(());
+        return Ok(ConfigureOutcome::Changed);
     }
 
     if list_options {
-        return Ok(());
+        return Ok(ConfigureOutcome::Unchanged);
     }
 
     use dialoguer::Select;
@@ -2429,6 +2432,9 @@ async fn run_configure(
         "Exit           — Leave configure menu",
     ];
 
+    // Leaving the menu without acting changes nothing, so the caller skips
+    // its hook refresh (#257).
+    let mut outcome = ConfigureOutcome::Unchanged;
     loop {
         eprintln!();
         let selection = Select::new()
@@ -2441,9 +2447,12 @@ async fn run_configure(
             Some(s) => s,
             None => {
                 eprintln!("Done.");
-                return Ok(());
+                return Ok(outcome);
             }
         };
+        if selection != options.len() - 1 {
+            outcome = ConfigureOutcome::Changed;
+        }
 
         match selection {
             // Editors
@@ -2491,11 +2500,18 @@ async fn run_configure(
             // Exit
             8 => {
                 eprintln!("Done.");
-                return Ok(());
+                return Ok(outcome);
             }
             _ => unreachable!(),
         }
     }
+}
+
+/// Whether a `configure` run changed anything the editors' hooks depend on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigureOutcome {
+    Changed,
+    Unchanged,
 }
 
 async fn run_configure_account_learning_flow() -> Result<()> {

@@ -1861,6 +1861,7 @@ fn local_memory_writes_allowed() -> bool {
     std::env::var("CONTEXTSTREAM_ALLOW_LOCAL_MEMORY")
         .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
         .unwrap_or(false)
+        || mcp_client::activation::keep_claude_auto_memory_preference().unwrap_or(false)
 }
 
 /// Deny reason for a Claude auto memory write, routed by the memory's type.

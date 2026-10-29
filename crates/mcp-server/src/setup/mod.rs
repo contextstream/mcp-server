@@ -2493,21 +2493,38 @@ pub fn set_keep_claude_auto_memory(keep: bool) {
     KEEP_CLAUDE_AUTO_MEMORY.store(keep, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Whether setup leaves Claude Code auto memory alone: the
-/// `--keep-claude-auto-memory` flag or `CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY`.
-pub(crate) fn keep_claude_auto_memory() -> bool {
+/// Whether this invocation explicitly passed `--keep-claude-auto-memory` or
+/// `CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY=1|true`.
+pub(crate) fn explicit_keep_claude_auto_memory_requested() -> bool {
     KEEP_CLAUDE_AUTO_MEMORY.load(std::sync::atomic::Ordering::SeqCst)
         || std::env::var("CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY")
             .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
             .unwrap_or(false)
 }
 
+/// Whether setup leaves Claude Code auto memory alone: the
+/// `--keep-claude-auto-memory` flag, `CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY`,
+/// or an opt-in persisted in `~/.contextstream/installation.json`.
+pub(crate) fn keep_claude_auto_memory() -> bool {
+    explicit_keep_claude_auto_memory_requested()
+        || mcp_client::activation::keep_claude_auto_memory_preference().unwrap_or(false)
+}
+
 /// Setup default: when Claude Code is configured, turn its auto memory off.
 /// While it is on, Claude Code's system prompt saves "remember" requests and
 /// preferences to local files that ContextStream, other machines and Codex
-/// never see. Respects `--keep-claude-auto-memory` and dry-run, and never
-/// prompts.
+/// never see. Respects `--keep-claude-auto-memory` (persisting the preference
+/// in `~/.contextstream/installation.json`) and dry-run, and never prompts.
 pub(crate) fn apply_claude_auto_memory_default(editors: &[editors::Editor]) {
+    if explicit_keep_claude_auto_memory_requested() {
+        if !safe_edit::is_dry_run() {
+            if let Err(error) = mcp_client::activation::set_keep_claude_auto_memory_preference(true)
+            {
+                tracing::warn!(%error, "could not persist keep_claude_auto_memory preference");
+            }
+        }
+        return;
+    }
     if keep_claude_auto_memory() || !editors.contains(&editors::Editor::ClaudeCode) {
         return;
     }
@@ -2590,7 +2607,7 @@ async fn try_short_circuit_healthy_noninteractive_setup() -> Result<bool> {
         }
     }
 
-    if safe_edit::is_dry_run() || keep_claude_auto_memory() {
+    if safe_edit::is_dry_run() || explicit_keep_claude_auto_memory_requested() {
         return Ok(false);
     }
 

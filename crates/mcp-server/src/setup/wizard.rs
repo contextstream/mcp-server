@@ -962,6 +962,13 @@ async fn finish(
     }
 
     if claude_auto_memory_off == Some(true) {
+        if !safe_edit::is_dry_run() {
+            if let Err(error) =
+                mcp_client::activation::set_keep_claude_auto_memory_preference(false)
+            {
+                tracing::warn!(%error, "could not clear keep_claude_auto_memory preference");
+            }
+        }
         match super::hooks::disable_claude_auto_memory() {
             Ok(_) => ui::say(
                 Mark::Ok,
@@ -973,6 +980,13 @@ async fn finish(
                 "Claude auto memory is still on",
                 Some(&error.to_string()),
             ),
+        }
+    } else if (claude_auto_memory_off == Some(false)
+        || super::explicit_keep_claude_auto_memory_requested())
+        && !safe_edit::is_dry_run()
+    {
+        if let Err(error) = mcp_client::activation::set_keep_claude_auto_memory_preference(true) {
+            tracing::warn!(%error, "could not persist keep_claude_auto_memory preference");
         }
     }
 

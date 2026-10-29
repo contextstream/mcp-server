@@ -173,9 +173,8 @@ enum Commands {
         #[arg(long, conflicts_with = "json")]
         support: bool,
 
-        /// Surfaces to inspect or repair: global, project, or all. Read-only
-        /// doctor defaults to all; repair defaults to all in a linked project
-        /// folder and global elsewhere.
+        /// Surfaces to inspect or repair: global, project, or all. Defaults to
+        /// all inside a linked project folder and global elsewhere.
         #[arg(long)]
         scope: Option<String>,
 

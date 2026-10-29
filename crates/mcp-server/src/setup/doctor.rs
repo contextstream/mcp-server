@@ -2264,6 +2264,42 @@ fn resolve_doctor_targets(options: &DoctorOptions) -> Result<(Vec<Editor>, &'sta
     Ok((targets, source, detection_fallback_allowed))
 }
 
+fn is_home_or_root_dir(canonical_dir: &Path) -> bool {
+    if canonical_dir.parent().is_none() {
+        return true;
+    }
+    dirs::home_dir()
+        .and_then(|home| home.canonicalize().ok())
+        .is_some_and(|home| home == canonical_dir)
+}
+
+/// Resolve the nearest linked project checkout at or above `project_path`,
+/// stopping before HOME and the filesystem root. Used by read-only `doctor`
+/// when `--scope` is omitted so running `contextstream-mcp doctor` from `~`,
+/// an unlinked folder, or after `setup --account-only` checks global health
+/// instead of reporting false missing-project-rules failures, while running
+/// inside any subfolder of a linked project still checks that project.
+fn resolve_linked_project_root(project_path: Option<&Path>) -> Option<PathBuf> {
+    let canonical_start = project_path?.canonicalize().ok()?;
+    let mut current: &Path = canonical_start.as_path();
+    loop {
+        if is_home_or_root_dir(current) {
+            return None;
+        }
+        if super::wizard_config::project_config_path(current).exists() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
+fn infer_default_doctor_scope(project_path: Option<&Path>) -> (DoctorScope, Option<PathBuf>) {
+    match resolve_linked_project_root(project_path) {
+        Some(linked_root) => (DoctorScope::All, Some(linked_root)),
+        None => (DoctorScope::Global, None),
+    }
+}
+
 fn infer_default_repair_scope(project_path: Option<&Path>, cwd: Option<&Path>) -> DoctorScope {
     let (Some(project_path), Some(cwd)) = (project_path, cwd) else {
         return DoctorScope::Global;
@@ -2276,11 +2312,7 @@ fn infer_default_repair_scope(project_path: Option<&Path>, cwd: Option<&Path>) -
     if canonical_project != canonical_cwd {
         return DoctorScope::Global;
     }
-    let is_root = canonical_project.parent().is_none();
-    let is_home = dirs::home_dir()
-        .and_then(|home| home.canonicalize().ok())
-        .is_some_and(|home| home == canonical_project);
-    if is_root || is_home {
+    if is_home_or_root_dir(&canonical_project) {
         return DoctorScope::Global;
     }
     if super::wizard_config::project_config_path(&canonical_project).exists() {
@@ -2676,6 +2708,16 @@ fn check_git_hooks(project_path: &Path) -> Option<SurfaceCheck> {
 async fn check_project_link(client: &ContextStreamClient, project_path: &Path) -> SurfaceCheck {
     const SURFACE: &str = "project_link";
     const FIX: &str = "contextstream-mcp link --fix";
+    if project_path
+        .canonicalize()
+        .ok()
+        .is_some_and(|canonical| is_home_or_root_dir(&canonical))
+    {
+        return SurfaceCheck::skipped(
+            SURFACE,
+            "home and root directories cannot be linked as a project",
+        );
+    }
     let candidates = match mcp_session::project_link::load_candidates(client).await {
         Ok(candidates) => candidates,
         Err(error) => {
@@ -2834,6 +2876,9 @@ pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -
             let cwd = std::env::current_dir().ok();
             options.scope =
                 infer_default_repair_scope(options.project_path.as_deref(), cwd.as_deref());
+            if options.scope == DoctorScope::Global {
+                options.project_path = None;
+            }
         }
         validate_repair_scope(&options)?;
         mcp_client::activation::existing_installation_id().context(
@@ -2852,6 +2897,13 @@ pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -
                 "No API key found. Run 'contextstream-mcp setup' first; repair changed no editor files."
             );
         }
+    } else if !options.scope_was_explicit {
+        let (inferred_scope, inferred_project) =
+            infer_default_doctor_scope(options.project_path.as_deref());
+        options.scope = inferred_scope;
+        options.project_path = inferred_project;
+    } else if options.scope == DoctorScope::Global {
+        options.project_path = None;
     }
     super::safe_edit::set_dry_run(options.dry_run);
     let _dry_run_reset = DoctorDryRunReset;
@@ -2882,19 +2934,22 @@ pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -
         return Ok(report.has_failures());
     }
 
-    let learning = match doctor_client_config() {
-        Ok(config) => tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            ContextStreamClient::new(config).account_learning_status(),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .map(|v| super::account_learning::status_label(&v))
-        .unwrap_or("Unavailable"),
-        Err(_) => "Unavailable",
+    let learning = if report.credentials.status == CheckStatus::Pass {
+        match doctor_client_config() {
+            Ok(config) => tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                ContextStreamClient::new(config).account_learning_status(),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|v| super::account_learning::status_label(&v))
+            .unwrap_or("Unavailable"),
+            Err(_) => "Unavailable",
+        }
+    } else {
+        "Unavailable"
     };
-    println!("Deep project learning: {learning} (status only; Account → Privacy controls consent)");
     let ui = super::ui::ui();
     let target_names = if report.targeting.editors.is_empty() {
         "none".to_string()
@@ -2925,6 +2980,13 @@ pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -
     println!();
     print_check(&report.installation, "");
     print_check(&report.credentials, "");
+    println!(
+        "{}  {}",
+        super::ui::GUTTER,
+        ui.muted(&format!(
+            "Deep project learning: {learning} (status only; Account → Privacy controls consent)"
+        ))
+    );
     if let Some(project_link) = &report.project_link {
         print_check(project_link, "");
     }
@@ -4397,5 +4459,111 @@ mod tests {
         let healthy =
             check_codex_mcp_config("mcp_global", &path, &managed, Some(installation_id), FIX);
         assert_eq!(healthy.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn read_only_doctor_infers_linked_project_root_and_defaults_to_global_outside_projects() {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let unlinked = home.join("code").join("unlinked");
+        let linked = home.join("code").join("my-app");
+        let nested_src = linked.join("src").join("components");
+        let nested_pkg = linked.join("packages").join("web");
+        std::fs::create_dir_all(&unlinked).expect("create unlinked");
+        std::fs::create_dir_all(&nested_src).expect("create nested_src");
+        std::fs::create_dir_all(nested_pkg.join(".contextstream")).expect("create nested_pkg");
+        std::fs::create_dir_all(linked.join(".contextstream")).expect("create linked");
+        std::fs::create_dir_all(home.join(".contextstream")).expect("create home .contextstream");
+        // Even if ~/.contextstream/config.json accidentally exists, HOME is never a project.
+        std::fs::write(home.join(".contextstream").join("config.json"), "{}\n")
+            .expect("write home config");
+        std::fs::write(linked.join(".contextstream").join("config.json"), "{}\n")
+            .expect("write linked config");
+        std::fs::write(
+            nested_pkg.join(".contextstream").join("config.json"),
+            "{}\n",
+        )
+        .expect("write nested_pkg config");
+
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+
+        let canonical_linked = linked.canonicalize().expect("canonical linked");
+        let canonical_nested_pkg = nested_pkg.canonicalize().expect("canonical nested_pkg");
+
+        assert_eq!(
+            infer_default_doctor_scope(Some(&home)),
+            (DoctorScope::Global, None),
+            "HOME must never infer project scope"
+        );
+        assert_eq!(
+            infer_default_doctor_scope(Some(Path::new("/"))),
+            (DoctorScope::Global, None),
+            "filesystem root must never infer project scope"
+        );
+        assert_eq!(
+            infer_default_doctor_scope(Some(&unlinked)),
+            (DoctorScope::Global, None),
+            "unlinked directory defaults bare doctor to global scope"
+        );
+        assert_eq!(
+            infer_default_doctor_scope(Some(&linked)),
+            (DoctorScope::All, Some(canonical_linked.clone())),
+            "linked project root defaults bare doctor to all scope"
+        );
+        assert_eq!(
+            infer_default_doctor_scope(Some(&nested_src)),
+            (DoctorScope::All, Some(canonical_linked)),
+            "subdirectory inside a linked project resolves to its linked project root"
+        );
+        assert_eq!(
+            infer_default_doctor_scope(Some(&nested_pkg)),
+            (DoctorScope::All, Some(canonical_nested_pkg)),
+            "nested linked package resolves to its nearest linked project root"
+        );
+
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn project_link_skips_home_and_root_without_suggesting_link_fix() {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let client = ContextStreamClient::new(Config {
+                api_url: "http://127.0.0.1:9/api/v1".to_string(),
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            });
+            let home_check = check_project_link(&client, &home).await;
+            assert_eq!(home_check.status, CheckStatus::Skipped);
+            assert!(home_check.fix.is_none());
+
+            let root_check = check_project_link(&client, Path::new("/")).await;
+            assert_eq!(root_check.status, CheckStatus::Skipped);
+            assert!(root_check.fix.is_none());
+        });
+
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }

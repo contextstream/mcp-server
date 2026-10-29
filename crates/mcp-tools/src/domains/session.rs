@@ -2402,6 +2402,9 @@ impl ToolHandler for InitTool {
         let concise_text = concise_tool_text_enabled();
 
         let is_post_compact = input.is_post_compact.unwrap_or(false);
+        // The session this process was in before this init (before a
+        // compaction, the one to restore).
+        let previous_session_id = self.session.state().await.session_id;
         let init_session_id = input
             .session_id
             .clone()
@@ -3592,12 +3595,25 @@ impl ToolHandler for InitTool {
             }
         }
 
-        if is_post_compact {
-            let restore_session_id = init_session_id.clone();
+        // Restore the session given, else the one this process was in before
+        // compaction, else the one init just opened. Never post without one:
+        // the API answers that with a raw parse error.
+        let restore_session_id = if is_post_compact {
+            match init_session_id.clone().or(previous_session_id) {
+                Some(session_id) => Some(session_id),
+                None => self.session.state().await.session_id,
+            }
+        } else {
+            None
+        };
+        if is_post_compact && restore_session_id.is_none() {
+            text.push_str("\n\n--- Post-Compaction Restore ---\n[POST_COMPACTION_RESTORE] No session id is known, so nothing was restored. Pass session_id (the id the earlier init returned), or use `session(action=\"recall\", query=\"what were we doing before compaction\")`.");
+        }
+        if let Some(restore_session_id) = restore_session_id {
             let restore = self
                 .client
                 .session_restore_context(SessionRestoreContextParams {
-                    session_id: restore_session_id,
+                    session_id: Some(restore_session_id),
                     workspace_id: resolved_workspace_id,
                     project_id: resolved_project_id,
                     trigger: Some("manual_post_compact".to_string()),

@@ -250,7 +250,7 @@ pub(super) async fn run(
             None if account_only => (None, true),
             None => prompt_project_path(&cwd)?,
         };
-    let workspace = choose_workspace(&client, project_path.as_deref(), true).await?;
+    let workspace = choose_workspace(&client, project_path.as_deref(), true, account_only).await?;
     let project = plan_project(&client, project_path.as_deref(), workspace.as_ref()).await?;
     let index = default_index_plan(project_path.as_deref(), &project);
 
@@ -308,9 +308,13 @@ pub(super) async fn run(
                 choices.claude_auto_memory_off = claude_auto_memory_default(&choices.editors);
             }
             ReviewAction::Project => {
-                choices.workspace =
-                    choose_workspace(&choices.client, choices.project_path.as_deref(), false)
-                        .await?;
+                choices.workspace = choose_workspace(
+                    &choices.client,
+                    choices.project_path.as_deref(),
+                    false,
+                    false,
+                )
+                .await?;
                 choices.project = pick_project(
                     &choices.client,
                     choices.project_path.as_deref(),
@@ -357,9 +361,13 @@ pub(super) async fn run(
                         None
                     };
                 }
-                choices.workspace =
-                    choose_workspace(&choices.client, choices.project_path.as_deref(), true)
-                        .await?;
+                choices.workspace = choose_workspace(
+                    &choices.client,
+                    choices.project_path.as_deref(),
+                    true,
+                    choices.account_only,
+                )
+                .await?;
                 choices.project = plan_project(
                     &choices.client,
                     choices.project_path.as_deref(),
@@ -635,11 +643,26 @@ async fn choose_workspace(
     client: &ContextStreamClient,
     project_path: Option<&Path>,
     auto: bool,
+    account_only: bool,
 ) -> Result<Option<WorkspaceInfo>> {
-    let previous = project_path.and_then(|path| super::read_project_config(path).ok().flatten());
+    let previous = project_path
+        .filter(|_| !account_only)
+        .and_then(|path| super::read_project_config(path).ok().flatten());
     let workspaces = ui::spin("Loading workspaces", client.list_workspaces(None, None)).await?;
 
     if auto {
+        if account_only {
+            return Ok(match workspaces.as_slice() {
+                [only] => {
+                    ui::say(Mark::Ok, "Workspace", Some(&only.name));
+                    Some(WorkspaceInfo {
+                        id: only.id.to_string(),
+                        name: only.name.clone(),
+                    })
+                }
+                _ => None,
+            });
+        }
         let linked = previous.as_ref().and_then(|config| {
             config.workspace_id.as_ref().and_then(|id| {
                 workspaces
@@ -873,13 +896,13 @@ async fn finish(
         claude_auto_memory_off,
     } = choices;
 
-    super::persist_setup_editor_selection(&editors)?;
-
     let selected_project = materialize_project(&client, project).await?;
     if selected_project.is_none() {
         account_only = true;
     }
     let configured_project_path = selected_project.as_ref().and(project_path.as_deref());
+
+    super::persist_setup_editor_selection(&editors)?;
 
     let preauth = matches!(transport, SetupTransportPreference::HostedRemote)
         && editors

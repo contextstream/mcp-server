@@ -184,8 +184,13 @@ pub async fn run_setup_with_profile(
     let project_path =
         super::resolve_setup_project_path(&cwd, explicit_project_path, account_only)?;
     let workspace_lookup_path = project_path.as_deref().unwrap_or(cwd.as_path());
-    let workspace =
-        resolve_profile_workspace(&client, &payload.profile, workspace_lookup_path).await;
+    let workspace = resolve_profile_workspace(
+        &client,
+        &payload.profile,
+        workspace_lookup_path,
+        account_only,
+    )
+    .await;
     let workspace = workspace?;
     if let Some(ref ws) = workspace {
         println!("{}Workspace: {}", CHECK, style(&ws.name).cyan());
@@ -720,6 +725,7 @@ async fn resolve_profile_workspace(
     client: &ContextStreamClient,
     profile: &ProfileDetails,
     workspace_lookup_path: &Path,
+    account_only: bool,
 ) -> Result<Option<WorkspaceInfo>> {
     if let Some(ref id) = profile.workspace_id {
         let workspaces = client
@@ -745,7 +751,7 @@ async fn resolve_profile_workspace(
         }));
     }
 
-    super::resolve_workspace_noninteractive(client, workspace_lookup_path, None)
+    super::resolve_workspace_noninteractive(client, workspace_lookup_path, None, account_only)
         .await
         .context("resolving a workspace for profile setup")
 }

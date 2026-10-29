@@ -306,6 +306,20 @@ fn json_type(value: &Value) -> &'static str {
     }
 }
 
+/// Arguments that count or page results. The API answers a negative one with
+/// a raw parse or database error, so none may be negative.
+const COUNT_ARGUMENTS: &[&str] = &["limit", "offset", "page", "page_size", "per_page"];
+
+/// The first count argument with a negative value, as
+/// `` `limit` can't be negative (got -1) ``.
+pub fn negative_count_argument(input: &Value) -> Option<String> {
+    let object = input.as_object()?;
+    COUNT_ARGUMENTS.iter().find_map(|field| {
+        let value = object.get(*field)?.as_i64()?;
+        (value < 0).then(|| format!("`{field}` can't be negative (got {value})"))
+    })
+}
+
 /// Properties whose present, non-null value still does not have the schema's
 /// type, as `` `field` must be a T (got U) `` (names and types only, no values).
 pub fn schema_type_mismatches(schema: &Value, input: &Value) -> Vec<String> {

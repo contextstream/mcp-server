@@ -1324,6 +1324,35 @@ mod input_shape_tests {
         );
         assert!(!message.contains(W), "values are not echoed: {message}");
     }
+
+    #[tokio::test]
+    async fn a_negative_count_fails_before_the_handler_runs() {
+        // #293: the API answered these with raw parse or database errors.
+        let registry = registry();
+        for (call, field, got) in [
+            (json!({"limit": -1}), "limit", -1),
+            (json!({"limit": "-5"}), "limit", -5),
+            (json!({"offset": -2}), "offset", -2),
+        ] {
+            let message = registry
+                .execute("typed_tool", call.clone())
+                .await
+                .expect_err("a negative count is refused")
+                .to_string();
+            assert_eq!(
+                message,
+                format!("Validation error: typed_tool: `{field}` can't be negative (got {got})"),
+                "{call}"
+            );
+        }
+        let out = text(
+            &registry
+                .execute("typed_tool", json!({"limit": 0}))
+                .await
+                .unwrap(),
+        );
+        assert!(out.contains("limit=Some(0)"), "{out}");
+    }
 }
 
 // ============================================================================

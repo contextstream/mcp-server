@@ -2499,16 +2499,15 @@ async fn run_configure_api_key_from_stdin() -> Result<()> {
     };
     let api_key = parse_api_key_input(&input)?;
 
-    let client = mcp_client::ContextStreamClient::new(mcp_types::Config {
-        api_key: Some(api_key.to_string()),
-        ..Default::default()
-    });
+    let config = setup::setup_client_config(api_key);
+    let api_url = config.api_url.clone();
+    let client = mcp_client::ContextStreamClient::new(config);
     let user = tokio::time::timeout(std::time::Duration::from_secs(10), client.me())
         .await
         .map_err(|_| anyhow::anyhow!("Key verification timed out; check connectivity and re-run."))?
         .map_err(|e| anyhow::anyhow!("The API key was not accepted ({}); nothing was saved.", e))?;
 
-    setup::write_saved_credentials(api_key, None)?;
+    setup::persist_setup_credentials(api_key, &api_url)?;
     eprintln!(
         "Credentials saved to {}. Authenticated as {}.",
         setup::credentials_file_path().display(),

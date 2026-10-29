@@ -2511,10 +2511,8 @@ async fn run_setup_noninteractive(
         )
     })?;
 
-    let config = Config {
-        api_key: Some(api_key.clone()),
-        ..Default::default()
-    };
+    let config = setup_client_config(&api_key);
+    let api_url = config.api_url.clone();
     let client = ContextStreamClient::new(config);
     let user = tokio::time::timeout(std::time::Duration::from_secs(10), client.me())
         .await
@@ -2527,7 +2525,20 @@ async fn run_setup_noninteractive(
                 e
             )
         })?;
-    ui::say(ui::Mark::Ok, "Signed in", Some(&user.email));
+    let credentials_saved = persist_setup_credentials(&api_key, &api_url)?;
+    if credentials_saved && !safe_edit::is_dry_run() {
+        ui::say(
+            ui::Mark::Ok,
+            "Signed in",
+            Some(&format!(
+                "{} · saved to {}",
+                user.email,
+                wizard::display_path(&credentials_file_path())
+            )),
+        );
+    } else {
+        ui::say(ui::Mark::Ok, "Signed in", Some(&user.email));
+    }
     let learning_hint = if explicit_learning_choice.is_some() {
         account_learning::SummaryLearningHint::None
     } else {

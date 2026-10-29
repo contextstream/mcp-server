@@ -2798,9 +2798,24 @@ impl ToolHandler for ProjectTool {
                 ).await
             }
             "team_projects" => {
-                let result = self.client.team_projects(workspace_id, input.page, input.page_size).await?;
-                let count = result.as_array().map(|a| a.len()).unwrap_or(0);
-                Ok(ToolResult::with_structured(format!("Found {} team projects.", count), result))
+                let result = match self.client.team_projects().await {
+                    Err(Error::Http { status: 403, message, .. })
+                        if message.contains("not part of a team") =>
+                    {
+                        return Err(Error::PlanRestriction(
+                            "team_projects lists a team plan's projects; this account is not part of a team."
+                                .to_string(),
+                        ));
+                    }
+                    other => other?,
+                };
+                let count = result
+                    .get("total")
+                    .and_then(Value::as_i64)
+                    .or_else(|| result.get("items").and_then(Value::as_array).map(|items| items.len() as i64))
+                    .or_else(|| result.as_array().map(|items| items.len() as i64))
+                    .unwrap_or(0);
+                Ok(ToolResult::with_structured(format!("Found {count} team projects."), result))
             }
             "recent_changes" => {
                 if !self.client.config().await.local_files_allowed() {

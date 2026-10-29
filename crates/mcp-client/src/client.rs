@@ -11676,32 +11676,11 @@ impl ContextStreamClient {
         })
     }
 
-    /// List team projects.
-    pub async fn team_projects(
-        &self,
-        workspace_id: Option<Uuid>,
-        page: Option<i64>,
-        page_size: Option<i64>,
-    ) -> Result<serde_json::Value> {
-        let config = self.config.read().await;
-        let ws_id = workspace_id.or(config.default_workspace_id);
-        drop(config);
-
-        let mut path = "/projects/team".to_string();
-        let mut params = vec![];
-        if let Some(id) = ws_id {
-            params.push(format!("workspace_id={}", id));
-        }
-        if let Some(p) = page {
-            params.push(format!("page={}", p));
-        }
-        if let Some(ps) = page_size {
-            params.push(format!("page_size={}", ps));
-        }
-        if !params.is_empty() {
-            path = format!("{}?{}", path, params.join("&"));
-        }
-        self.get(&path).await
+    /// List the projects of the caller's team. The API serves it to team
+    /// admins and owners at `/team/projects`, all at once (no workspace or
+    /// paging); `/projects/team` would be read as a project id.
+    pub async fn team_projects(&self) -> Result<serde_json::Value> {
+        self.get("/team/projects").await
     }
 
     // =========================================================================

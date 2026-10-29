@@ -4731,6 +4731,29 @@ mod validation_tests {
     }
 
     #[tokio::test]
+    async fn restore_context_without_a_session_id_says_it_needs_one() {
+        // #294: no id given and none active, so nothing is sent and the
+        // answer names the missing field instead of a backend parse error.
+        let tool = SessionTool::new(
+            create_mock_client(),
+            create_mock_session(),
+            mcp_types::atlas_layer::noop_layer(),
+        );
+        for input in [
+            json!({"action": "restore_context"}),
+            json!({"action": "restore_context", "trigger": "manual"}),
+            json!({"action": "restore_context", "session_id": "  "}),
+        ] {
+            let err = tool.execute(input.clone()).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Validation error: restore_context requires session_id (the id init returned)",
+                "{input}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_session_tool_ground_requires_user_message() {
         let client = create_mock_client();
         let session = create_mock_session();

@@ -13881,10 +13881,21 @@ impl ToolHandler for SessionRestoreContextTool {
             .as_ref()
             .and_then(|s| Uuid::parse_str(s).ok());
 
+        let session_id = input
+            .session_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .or_else(mcp_client::get_task_mcp_session_id)
+            .ok_or_else(|| {
+                Error::Validation(
+                    "restore_context requires session_id (the id init returned)".to_string(),
+                )
+            })?;
+
         let params = mcp_client::SessionRestoreContextParams {
             snapshot_id,
             max_snapshots: input.max_snapshots,
-            session_id: input.session_id,
+            session_id: Some(session_id),
             workspace_id,
             project_id,
             trigger: input.trigger,
@@ -17212,10 +17223,15 @@ impl ToolHandler for SessionTool {
                 Ok(ToolResult::with_structured(text, result))
             }
             "restore_context" => {
+                // The API restores one session; default to the one init started.
+                let session_id = match input.session_id.filter(|id| !id.trim().is_empty()) {
+                    Some(session_id) => Some(session_id),
+                    None => self.session.state().await.session_id,
+                };
                 let restore_input = SessionRestoreContextInput {
                     snapshot_id: input.snapshot_id,
                     max_snapshots: input.max_snapshots,
-                    session_id: input.session_id,
+                    session_id,
                     workspace_id: input.workspace_id,
                     project_id: input.project_id,
                     trigger: input.trigger,

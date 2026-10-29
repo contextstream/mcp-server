@@ -1004,8 +1004,36 @@ fn windsurf_entry_keys_valid(entry: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Check the hooks surface for one editor.
+/// Check the hooks surface for one editor: the hook entries, and the helper
+/// binary they all call.
 fn check_hooks(editor: &Editor) -> SurfaceCheck {
+    with_helper_check(
+        check_hooks_config(editor),
+        super::hooks::managed_helper_problem(),
+    )
+}
+
+/// Fail a passing hooks check when the helper binary every managed hook runs
+/// is missing or unusable. The entries still look installed in that case, so
+/// without this every hook fails silently (#296). A check that already failed
+/// keeps its own, more specific, detail.
+fn with_helper_check(check: SurfaceCheck, helper_problem: Option<String>) -> SurfaceCheck {
+    match helper_problem {
+        Some(problem) if check.status == CheckStatus::Pass => SurfaceCheck::problem(
+            "hooks",
+            CheckStatus::Fail,
+            format!(
+                "the helper binary the hooks run is unusable: {problem}, so every hook fails silently"
+            ),
+            Some(&super::hooks::managed_binary_path()),
+            "contextstream-mcp doctor --repair",
+        ),
+        _ => check,
+    }
+}
+
+/// Check the hook entries for one editor.
+fn check_hooks_config(editor: &Editor) -> SurfaceCheck {
     const SURFACE: &str = "hooks";
     let fix = format!(
         "contextstream-mcp update-hooks --scope global --editors {}",
@@ -3839,6 +3867,41 @@ mod tests {
             "{}",
             stacked.detail
         );
+    }
+
+    #[test]
+    fn hooks_check_fails_when_the_helper_binary_they_run_is_gone() {
+        let healthy = SurfaceCheck::pass("hooks", "5 current managed hook entries installed", None);
+
+        let in_place = with_helper_check(healthy.clone(), None);
+        assert_eq!(in_place.status, CheckStatus::Pass);
+
+        let missing = with_helper_check(
+            healthy,
+            Some("/home/u/.contextstream/bin/contextstream-mcp is missing".to_string()),
+        );
+        assert_eq!(missing.status, CheckStatus::Fail);
+        assert!(missing.detail.contains("is missing"), "{}", missing.detail);
+        assert!(
+            missing.detail.contains("every hook fails silently"),
+            "{}",
+            missing.detail
+        );
+        assert_eq!(
+            missing.fix.as_deref(),
+            Some("contextstream-mcp doctor --repair")
+        );
+
+        // A hooks check that already failed keeps its own, more specific, detail.
+        let broken = SurfaceCheck::problem(
+            "hooks",
+            CheckStatus::Fail,
+            "hooks file missing",
+            None,
+            "contextstream-mcp update-hooks",
+        );
+        let kept = with_helper_check(broken, Some("the binary is missing".to_string()));
+        assert_eq!(kept.detail, "hooks file missing");
     }
 
     #[test]

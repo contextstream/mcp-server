@@ -3391,47 +3391,21 @@ async fn download_and_install_binary(client: &reqwest::Client, version: &str) ->
         std::fs::create_dir_all(parent)?;
     }
 
-    // On Windows, a running binary can't be overwritten directly.
-    // Rename the existing binary to .old first, then write the new one.
-    let old_path = install_path.with_extension("old.exe");
-    if install_path.exists() {
-        // Remove any previous .old file
-        let _ = std::fs::remove_file(&old_path);
-        // Try to rename the current binary
-        match std::fs::rename(&install_path, &old_path) {
-            Ok(()) => {
-                eprintln!("Renamed existing binary to {}", old_path.display());
-            }
-            Err(e) => {
-                // If rename fails (binary is locked by running MCP server), try direct overwrite
-                eprintln!(
-                    "Warning: Could not rename existing binary ({}). Attempting direct write...",
-                    e
-                );
-            }
-        }
-    }
-
-    // Write the new binary
-    std::fs::write(&install_path, &bytes).map_err(|e| {
+    // Stage, prove the download runs, then replace atomically (a running
+    // Windows executable is renamed aside and rolled back on failure). A failed
+    // or interrupted update leaves the previous binary in place, never a
+    // missing or half-written file that every hook would then fail on (#296).
+    // A leftover from the older rename-aside scheme is tidied up first.
+    let _ = std::fs::remove_file(install_path.with_extension("old.exe"));
+    setup::install_binary_bytes(&install_path, &bytes).map_err(|e| {
         anyhow::anyhow!(
-            "Failed to write binary to {}: {}. \
+            "Failed to install binary at {}: {:#}. \
              If the binary is locked by a running MCP server, \
              restart your editor and try again.",
             install_path.display(),
             e
         )
     })?;
-
-    // Set executable permissions on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&install_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    // Clean up old binary
-    let _ = std::fs::remove_file(&old_path);
 
     if !setup::ui::is_quiet() {
         eprintln!(

@@ -28,6 +28,7 @@ mod wizard_config;
 
 pub use credentials::*;
 pub use hooks::install_binary;
+pub use hooks::install_binary_bytes;
 pub use hooks::managed_binary_path;
 pub use hooks::MANAGED_HOOK_ARGUMENT;
 pub use pending_connection::*;

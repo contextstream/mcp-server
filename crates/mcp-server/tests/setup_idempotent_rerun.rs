@@ -295,9 +295,14 @@ fn stop_spawned_watch_helper_if_any(home: &Path) {
 }
 
 fn run_setup_yes(home: &Path, cwd: &Path, extra_args: Vec<String>) -> std::process::Output {
+    let mut args = vec!["setup".to_string(), "--yes".to_string()];
+    args.extend(extra_args);
+    run_cli(home, cwd, args)
+}
+
+fn run_cli(home: &Path, cwd: &Path, args: Vec<String>) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
-        .args(["setup", "--yes"])
-        .args(extra_args)
+        .args(args)
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("CONTEXTSTREAM_NO_BROWSER", "1")
@@ -571,8 +576,9 @@ async fn setup_yes_rerun_on_healthy_indexed_project_is_quiet_and_mutates_nothing
     let other_workspace = "99999999-9999-4999-8999-999999999999";
     for different in [
         format!("--workspace-id={other_workspace}"),
-        "--project-name=a-different-name".to_string(),
-        // Last: the full setup it triggers adds a second editor.
+        // Last: the full setup it triggers adds a second editor. (A different
+        // `--project-name` is not tried here: it asks setup to create a
+        // separate project, which this mock API answers with the same id.)
         "--editors=claude,codex".to_string(),
     ] {
         let diff_home = home.clone();
@@ -592,6 +598,66 @@ async fn setup_yes_rerun_on_healthy_indexed_project_is_quiet_and_mutates_nothing
             "{different} should run the full setup, got:\n{diff_stdout}"
         );
     }
+
+    // 2d. If the helper binary that every managed hook calls vanishes, the hook
+    // entries still look installed and every hook fails silently. doctor must
+    // say so, and `doctor --repair` must put the binary back (#296).
+    let managed_binary = home.join(".contextstream/bin/contextstream-mcp");
+    assert!(
+        managed_binary.is_file(),
+        "setup installs the helper binary that hooks run"
+    );
+    std::fs::remove_file(&managed_binary).unwrap();
+    let doctor_home = home.clone();
+    let doctor_proj = project.clone();
+    let doctor_out = tokio::task::spawn_blocking(move || {
+        run_cli(&doctor_home, &doctor_proj, vec!["doctor".to_string()])
+    })
+    .await
+    .unwrap();
+    let doctor_stdout = String::from_utf8_lossy(&doctor_out.stdout);
+    assert!(
+        doctor_stdout.contains("every hook fails silently")
+            && doctor_stdout.contains("contextstream-mcp is missing"),
+        "doctor must flag the missing helper binary, got:\n{doctor_stdout}"
+    );
+    assert!(
+        !doctor_out.status.success(),
+        "a missing helper binary is a failing check"
+    );
+    let repair_home = home.clone();
+    let repair_proj = project.clone();
+    let repair_out = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &repair_home,
+            &repair_proj,
+            vec!["doctor".to_string(), "--repair".to_string()],
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        managed_binary.is_file(),
+        "doctor --repair reinstalls the helper binary:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&repair_out.stdout),
+        String::from_utf8_lossy(&repair_out.stderr)
+    );
+    let after_repair_home = home.clone();
+    let after_repair_proj = project.clone();
+    let after_repair = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &after_repair_home,
+            &after_repair_proj,
+            vec!["doctor".to_string()],
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&after_repair.stdout).contains("every hook fails silently"),
+        "doctor is clean about the helper once it is back:\n{}",
+        String::from_utf8_lossy(&after_repair.stdout)
+    );
 
     // 3. Introducing drift (deleting CLAUDE.md) disables the short-circuit and self-heals.
     std::fs::remove_file(project.join("README.md")).unwrap();

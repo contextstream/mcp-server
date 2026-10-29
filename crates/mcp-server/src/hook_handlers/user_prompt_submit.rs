@@ -561,15 +561,24 @@ fn coordination_checkin_enabled() -> bool {
     })
 }
 
+/// A turn the harness starts on its own to report a background task (Claude
+/// Code's `<task-notification>` block), not a request from the person.
+fn is_harness_notification(prompt: &str) -> bool {
+    prompt.contains("<task-notification>")
+        || prompt.contains("SYSTEM NOTIFICATION - NOT USER INPUT")
+}
+
 /// The turn's prompt as a single line, capped at the 500 characters the server
-/// keeps for a coordination summary.
+/// keeps for a coordination summary. A harness notification is no summary:
+/// the server keeps the session's last one. Sent as the task, "background
+/// command completed (exit code 0)" made unrelated agents look alike, and the
+/// coordination judge paired them on it.
 fn prompt_task_summary(input: &Value) -> Option<String> {
-    let collapsed = input
-        .get("prompt")
-        .and_then(Value::as_str)?
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let prompt = input.get("prompt").and_then(Value::as_str)?;
+    if is_harness_notification(prompt) {
+        return None;
+    }
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     (!collapsed.is_empty()).then(|| collapsed.chars().take(500).collect())
 }
 
@@ -736,6 +745,8 @@ mod tests {
         assert_eq!(prompt_task_summary(&serde_json::json!({})), None);
         let long = serde_json::json!({"prompt": "word ".repeat(300)});
         assert_eq!(prompt_task_summary(&long).unwrap().chars().count(), 500);
+        let notification = serde_json::json!({"prompt": "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Background command \"Rust gate\" completed (exit code 0)</summary>\n</task-notification>"});
+        assert_eq!(prompt_task_summary(&notification), None);
     }
 
     #[test]

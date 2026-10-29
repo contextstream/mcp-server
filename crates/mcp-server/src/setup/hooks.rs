@@ -1244,11 +1244,43 @@ fn remove_codex_notice_hooks(loaded: &safe_edit::LoadedConfig, path: &Path) -> R
 }
 
 fn antigravity_hook_entry(binary: &str) -> Value {
+    antigravity_hook_entry_with(|hook_name| hook_command(binary, hook_name))
+}
+
+/// What the public plugin's hook commands end with: no output on stderr, and
+/// an empty hook result when the command fails or `contextstream-mcp` is not
+/// there. Recognised as part of a ContextStream hook command.
+const QUIET_HOOK_GUARD: &str = "2>/dev/null || echo '{}'";
+
+/// `command` without a trailing [`QUIET_HOOK_GUARD`].
+fn without_quiet_guard(command: &str) -> &str {
+    let command = command.trim();
+    command
+        .strip_suffix(QUIET_HOOK_GUARD)
+        .map_or(command, str::trim_end)
+}
+
+/// The `hooks.json` of the public Antigravity plugin, which people install
+/// from its repository without running setup. It finds `contextstream-mcp` on
+/// the PATH, and answers with an empty hook result when there is none, so a
+/// machine without the binary sees no error.
+pub(crate) fn antigravity_published_hooks() -> Value {
+    let mut root = JsonMap::new();
+    root.insert(
+        ANTIGRAVITY_HOOK_ENTRY.to_string(),
+        antigravity_hook_entry_with(|hook_name| {
+            format!("contextstream-mcp hook {hook_name} {MANAGED_HOOK_ARGUMENT} {QUIET_HOOK_GUARD}")
+        }),
+    );
+    Value::Object(root)
+}
+
+fn antigravity_hook_entry_with(command_for: impl Fn(&str) -> String) -> Value {
     let mut entry = JsonMap::new();
     for (event, hook_name, timeout) in ANTIGRAVITY_HOOK_SPECS {
         let handler = json!({
             "type": "command",
-            "command": hook_command(binary, hook_name),
+            "command": command_for(hook_name),
             "timeout": timeout,
         });
         let handlers = if *event == "PostToolUse" {
@@ -1347,6 +1379,15 @@ fn validate_codex_notice_hooks(value: &Value) -> std::result::Result<usize, Stri
     } else {
         Err("the mid-run notice hook is not installed".to_string())
     }
+}
+
+/// Whether setup and doctor see the published plugin's `hooks.json` as
+/// ContextStream's complete hook entry.
+#[cfg(test)]
+pub(crate) fn validate_published_antigravity_hooks(
+    value: &Value,
+) -> std::result::Result<usize, String> {
+    validate_antigravity_hooks(value)
 }
 
 fn validate_antigravity_hooks(value: &Value) -> std::result::Result<usize, String> {
@@ -2332,7 +2373,7 @@ fn parse_hook_command(command: &str) -> Option<(&str, &str)> {
 /// must remain refreshable and uninstallable without falling back to unsafe
 /// product-name sniffing.
 fn is_contextstream_hook_command(command: &str) -> bool {
-    let Some((_, rest)) = parse_hook_command(command) else {
+    let Some((_, rest)) = parse_hook_command(without_quiet_guard(command)) else {
         return false;
     };
     let mut args = rest.split_whitespace();
@@ -2385,7 +2426,7 @@ pub(super) fn contains_owned_hook_command(value: &Value) -> bool {
 
 fn current_managed_hook_name(command: &str) -> Option<&str> {
     let command = command.trim().strip_prefix("& ").unwrap_or(command.trim());
-    let (_, rest) = parse_hook_command(command)?;
+    let (_, rest) = parse_hook_command(without_quiet_guard(command))?;
     let mut args = rest.split_whitespace();
     match (args.next(), args.next(), args.next(), args.next()) {
         (Some("hook"), Some(hook_name), Some(MANAGED_HOOK_ARGUMENT), None) => Some(hook_name),

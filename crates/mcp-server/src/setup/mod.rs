@@ -9,6 +9,12 @@
 pub mod account_learning;
 mod antigravity_plugin;
 pub mod clients;
+
+/// `export-antigravity-plugin`: the files of the public Antigravity plugin
+/// repository, generated from the code setup uses for its own plugin.
+pub fn export_antigravity_plugin(out: Option<&std::path::Path>, json: bool) -> anyhow::Result<()> {
+    antigravity_plugin::export(out, json)
+}
 mod credentials;
 pub mod doctor;
 pub mod editors;
@@ -1088,6 +1094,24 @@ pub async fn uninstall(
         if !remaining.is_empty() {
             println!();
             println!("  {}", style(git_hooks_remain_message(&remaining)).yellow());
+        }
+        // The plugin people install from GitHub is theirs: uninstall takes out
+        // the rules and hooks setup owns and leaves the rest, so say how to
+        // remove it.
+        if include_global
+            && targets.contains(&editors::Editor::Antigravity)
+            && antigravity_plugin::installed_from_repository()
+        {
+            println!();
+            println!(
+                "  {}",
+                style(
+                    "The ContextStream plugin you installed from GitHub is still in \
+                     ~/.gemini/config/plugins/contextstream. Remove it with \
+                     `agy plugin uninstall contextstream`."
+                )
+                .dim()
+            );
         }
         // Only when there is something left: on a machine that never signed in
         // the note names a directory that does not exist.

@@ -629,6 +629,20 @@ enum Commands {
         format: String,
     },
 
+    /// Write the files of the public Antigravity plugin repository
+    #[command(
+        hide = true,
+        long_about = "Generate the plugin published at github.com/contextstream/antigravity-plugin from the same code `setup` uses to write the plugin on a machine. Use --out DIR to write the files, or --json to print them as one JSON object. The logo (assets/logo.png) is not generated: copy it from the repository's assets folder."
+    )]
+    ExportAntigravityPlugin {
+        /// Directory to write the files into
+        #[arg(long, value_name = "DIR")]
+        out: Option<std::path::PathBuf>,
+        /// Print the files as JSON instead of writing them
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Manage file exclusion patterns for indexing
     ///
     /// View, add, or remove patterns that control which files are excluded
@@ -959,6 +973,7 @@ fn silence_stdout_when_quiet(quiet: bool, command: &Option<Commands>) {
                 | Commands::Clients { .. }
                 | Commands::DetectEditors { .. }
                 | Commands::GenerateConfigs { .. }
+                | Commands::ExportAntigravityPlugin { json: true, .. }
         )
     );
     if !stdout_is_data {
@@ -1535,6 +1550,13 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                 std::process::exit(2);
             }
         },
+
+        Some(Commands::ExportAntigravityPlugin { out, json }) => {
+            if let Err(error) = setup::export_antigravity_plugin(out.as_deref(), json) {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
 
         Some(Commands::DetectEditors { format }) => {
             if !format.trim().eq_ignore_ascii_case("json") {

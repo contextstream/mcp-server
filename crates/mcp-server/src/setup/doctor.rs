@@ -633,11 +633,23 @@ fn validate_json_managed_identity(
     )
 }
 
+#[cfg(test)]
 fn check_codex_mcp_config(
     surface: &'static str,
     path: &Path,
     content: &str,
     expected_installation_id: Option<Uuid>,
+    fix: &str,
+) -> SurfaceCheck {
+    check_codex_mcp_config_with_api_key(surface, path, content, expected_installation_id, None, fix)
+}
+
+fn check_codex_mcp_config_with_api_key(
+    surface: &'static str,
+    path: &Path,
+    content: &str,
+    expected_installation_id: Option<Uuid>,
+    expected_api_key: Option<&str>,
     fix: &str,
 ) -> SurfaceCheck {
     let document = match super::mcp_config::parse_codex_toml(content, path) {
@@ -699,11 +711,25 @@ fn check_codex_mcp_config(
         ),
         expected_installation_id,
     ) {
-        Ok(()) => SurfaceCheck::pass(
-            surface,
-            format!("{shape}; managed identity current"),
-            Some(path),
-        ),
+        Ok(()) => {
+            if let Some(expected_key) = expected_api_key.map(str::trim).filter(|k| !k.is_empty()) {
+                let embedded = super::mcp_config::embedded_codex_toml_api_keys(entry);
+                if embedded.iter().any(|found| found != expected_key) {
+                    return SurfaceCheck::problem(
+                        surface,
+                        CheckStatus::Fail,
+                        "embedded API key does not match saved credentials",
+                        Some(path),
+                        fix,
+                    );
+                }
+            }
+            SurfaceCheck::pass(
+                surface,
+                format!("{shape}; managed identity current"),
+                Some(path),
+            )
+        }
         Err(detail) => SurfaceCheck::problem(surface, CheckStatus::Fail, detail, Some(path), fix),
     }
 }
@@ -768,13 +794,34 @@ fn validate_entry_shape(editor: &Editor, entry: &Value) -> std::result::Result<S
     Err("entry has neither a url/serverUrl nor a command".to_string())
 }
 
-/// Check one JSON-like MCP config file for a working contextstream entry.
+#[cfg(test)]
 fn check_mcp_config_file(
     editor: &Editor,
     surface: &'static str,
     path: &Path,
     missing_status: CheckStatus,
     expected_installation_id: Option<Uuid>,
+    fix: &str,
+) -> SurfaceCheck {
+    check_mcp_config_file_with_api_key(
+        editor,
+        surface,
+        path,
+        missing_status,
+        expected_installation_id,
+        None,
+        fix,
+    )
+}
+
+/// Check one JSON-like MCP config file for a working contextstream entry.
+fn check_mcp_config_file_with_api_key(
+    editor: &Editor,
+    surface: &'static str,
+    path: &Path,
+    missing_status: CheckStatus,
+    expected_installation_id: Option<Uuid>,
+    expected_api_key: Option<&str>,
     fix: &str,
 ) -> SurfaceCheck {
     if !path.exists() {
@@ -800,7 +847,14 @@ fn check_mcp_config_file(
     };
 
     if matches!(editor, Editor::Codex) {
-        return check_codex_mcp_config(surface, path, &content, expected_installation_id, fix);
+        return check_codex_mcp_config_with_api_key(
+            surface,
+            path,
+            &content,
+            expected_installation_id,
+            expected_api_key,
+            fix,
+        );
     }
 
     let parsed = match try_parse_json_like(&content) {
@@ -820,11 +874,27 @@ fn check_mcp_config_file(
         Some(entry) => match validate_entry_shape(editor, entry) {
             Ok(detail) => {
                 match validate_json_managed_identity(editor, entry, expected_installation_id) {
-                    Ok(()) => SurfaceCheck::pass(
-                        surface,
-                        format!("{detail}; managed identity current"),
-                        Some(path),
-                    ),
+                    Ok(()) => {
+                        if let Some(expected_key) =
+                            expected_api_key.map(str::trim).filter(|k| !k.is_empty())
+                        {
+                            let embedded = super::mcp_config::embedded_json_api_keys(entry);
+                            if embedded.iter().any(|found| found != expected_key) {
+                                return SurfaceCheck::problem(
+                                    surface,
+                                    CheckStatus::Fail,
+                                    "embedded API key does not match saved credentials",
+                                    Some(path),
+                                    fix,
+                                );
+                            }
+                        }
+                        SurfaceCheck::pass(
+                            surface,
+                            format!("{detail}; managed identity current"),
+                            Some(path),
+                        )
+                    }
                     Err(identity) => {
                         SurfaceCheck::problem(surface, CheckStatus::Fail, identity, Some(path), fix)
                     }
@@ -1101,6 +1171,7 @@ fn check_editor_surfaces(
     project_path: Option<&Path>,
     scope: DoctorScope,
     expected_installation_id: Option<Uuid>,
+    expected_api_key: Option<&str>,
 ) -> Vec<SurfaceCheck> {
     let mut checks = Vec::new();
 
@@ -1117,12 +1188,13 @@ fn check_editor_surfaces(
                 editor.id()
             );
             match editor.mcp_config_path() {
-                Some(path) => checks.push(check_mcp_config_file(
+                Some(path) => checks.push(check_mcp_config_file_with_api_key(
                     editor,
                     "mcp_global",
                     &path,
                     CheckStatus::Fail,
                     expected_installation_id,
+                    expected_api_key,
                     &fix,
                 )),
                 None => checks.push(SurfaceCheck::skipped("mcp_global", "no global config path")),
@@ -1139,12 +1211,13 @@ fn check_editor_surfaces(
                         "contextstream-mcp update-configs --scope project --editors {}",
                         editor.id()
                     );
-                    checks.push(check_mcp_config_file(
+                    checks.push(check_mcp_config_file_with_api_key(
                         editor,
                         "mcp_project",
                         &path,
                         CheckStatus::Warn,
                         expected_installation_id,
+                        expected_api_key,
                         &fix,
                     ));
                 }
@@ -1249,7 +1322,18 @@ pub fn check_editor(editor: &Editor, project_path: Option<&Path>) -> EditorRepor
     } else {
         DoctorScope::Global
     };
-    let mut checks = check_editor_surfaces(editor, project_path, scope, expected_installation_id);
+    let expected_api_key = doctor_client_config()
+        .ok()
+        .and_then(|cfg| cfg.api_key)
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+    let mut checks = check_editor_surfaces(
+        editor,
+        project_path,
+        scope,
+        expected_installation_id,
+        expected_api_key.as_deref(),
+    );
     if installation_result.is_err() {
         checks.insert(
             0,
@@ -2279,7 +2363,7 @@ fn resolve_doctor_targets(options: &DoctorOptions) -> Result<(Vec<Editor>, &'sta
     Ok((targets, source, detection_fallback_allowed))
 }
 
-fn is_home_or_root_dir(canonical_dir: &Path) -> bool {
+pub(super) fn is_home_or_root_dir(canonical_dir: &Path) -> bool {
     if canonical_dir.parent().is_none() {
         return true;
     }
@@ -2294,7 +2378,7 @@ fn is_home_or_root_dir(canonical_dir: &Path) -> bool {
 /// an unlinked folder, or after `setup --account-only` checks global health
 /// instead of reporting false missing-project-rules failures, while running
 /// inside any subfolder of a linked project still checks that project.
-fn resolve_linked_project_root(project_path: Option<&Path>) -> Option<PathBuf> {
+pub(super) fn resolve_linked_project_root(project_path: Option<&Path>) -> Option<PathBuf> {
     let canonical_start = project_path?.canonicalize().ok()?;
     let mut current: &Path = canonical_start.as_path();
     loop {
@@ -2610,6 +2694,11 @@ async fn build_report_for_targets(
         }
     };
     let ledger_result = read_harness_readiness();
+    let expected_api_key = doctor_client_config()
+        .ok()
+        .and_then(|cfg| cfg.api_key)
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
     let credential_probe = check_credentials().await;
     let remote_results = if let (Some(client), Some(installation_id)) =
         (credential_probe.client.as_ref(), installation_id)
@@ -2634,6 +2723,7 @@ async fn build_report_for_targets(
                 options.project_path.as_deref(),
                 options.scope,
                 installation_id,
+                expected_api_key.as_deref(),
             );
             let local = match (&installation_result, &ledger_result) {
                 (Err(_), _) => failed_readiness_snapshot(
@@ -4680,5 +4770,105 @@ mod tests {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    #[test]
+    fn mcp_config_checks_flag_stale_embedded_api_keys_without_leaking_secret_values() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let installation_id = Uuid::from_u128(0x1234);
+        let stale_secret = "cs_revoked_dead_key_000";
+        let active_secret = "cs_active_rotated_key_999";
+        const FIX: &str = "contextstream-mcp doctor --repair";
+
+        let claude_path = temp.path().join(".claude.json");
+        let claude_json = serde_json::json!({
+            "mcpServers": {
+                "contextstream": {
+                    "type": "http",
+                    "url": "https://mcp.contextstream.io/mcp",
+                    "headers": {
+                        "Authorization": format!("Bearer {stale_secret}"),
+                        "X-ContextStream-Client": "claude",
+                        "X-ContextStream-Managed-Config-Version": MANAGED_CONFIG_VERSION,
+                        "X-ContextStream-Teaching-Version": HARNESS_TEACHING_VERSION,
+                        "X-ContextStream-Installation-Id": installation_id.to_string(),
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            &claude_path,
+            serde_json::to_string_pretty(&claude_json).unwrap(),
+        )
+        .expect("write claude config");
+
+        let stale_check = check_mcp_config_file_with_api_key(
+            &Editor::ClaudeCode,
+            "mcp_global",
+            &claude_path,
+            CheckStatus::Fail,
+            Some(installation_id),
+            Some(active_secret),
+            FIX,
+        );
+        assert_eq!(stale_check.status, CheckStatus::Fail);
+        assert!(
+            stale_check
+                .detail
+                .contains("does not match saved credentials"),
+            "unexpected detail: {}",
+            stale_check.detail
+        );
+        assert!(!stale_check.detail.contains(stale_secret));
+        assert!(!stale_check.detail.contains(active_secret));
+
+        let matching_check = check_mcp_config_file_with_api_key(
+            &Editor::ClaudeCode,
+            "mcp_global",
+            &claude_path,
+            CheckStatus::Fail,
+            Some(installation_id),
+            Some(stale_secret),
+            FIX,
+        );
+        assert_eq!(matching_check.status, CheckStatus::Pass);
+
+        let codex_path = temp.path().join("config.toml");
+        let codex_raw = format!(
+            concat!(
+                "# ContextStream MCP Server Configuration\n",
+                "[mcp_servers.contextstream]\n",
+                "url = \"https://mcp.contextstream.io/mcp\"\n",
+                "http_headers = {{ ",
+                "\"Authorization\" = \"Bearer {}\", ",
+                "\"X-ContextStream-Client\" = \"codex\", ",
+                "\"X-ContextStream-Managed-Config-Version\" = \"{}\", ",
+                "\"X-ContextStream-Teaching-Version\" = \"{}\", ",
+                "\"X-ContextStream-Installation-Id\" = \"{}\" ",
+                "}}\n"
+            ),
+            stale_secret, MANAGED_CONFIG_VERSION, HARNESS_TEACHING_VERSION, installation_id
+        );
+        let codex_stale = check_codex_mcp_config_with_api_key(
+            "mcp_global",
+            &codex_path,
+            &codex_raw,
+            Some(installation_id),
+            Some(active_secret),
+            FIX,
+        );
+        assert_eq!(codex_stale.status, CheckStatus::Fail);
+        assert!(!codex_stale.detail.contains(stale_secret));
+        assert!(!codex_stale.detail.contains(active_secret));
+
+        let codex_matching = check_codex_mcp_config_with_api_key(
+            "mcp_global",
+            &codex_path,
+            &codex_raw,
+            Some(installation_id),
+            Some(stale_secret),
+            FIX,
+        );
+        assert_eq!(codex_matching.status, CheckStatus::Pass);
     }
 }

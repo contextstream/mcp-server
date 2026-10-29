@@ -1411,6 +1411,48 @@ pub async fn update_configs(scope: &str) -> Result<()> {
     update_configs_scoped(scope, None, false).await
 }
 
+/// Refresh pre-authenticated API keys in existing global and active-project
+/// editor MCP configs after credential rotation (`configure --api-key-stdin`
+/// or interactive `configure`). Never creates missing MCP configs or adds an
+/// embedded key where none existed.
+pub fn refresh_existing_mcp_config_credentials(api_key: &str) -> usize {
+    let mut project_roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(canonical_cwd) = cwd.canonicalize() {
+            if !doctor::is_home_or_root_dir(&canonical_cwd) {
+                project_roots.push(canonical_cwd.clone());
+            }
+            if let Some(linked_root) = doctor::resolve_linked_project_root(Some(&canonical_cwd)) {
+                if !project_roots.contains(&linked_root) {
+                    project_roots.push(linked_root);
+                }
+            }
+        }
+    }
+
+    let mut updated_paths = HashSet::new();
+    for (path, outcome) in
+        mcp_config::refresh_embedded_api_key_in_existing_configs(api_key, &project_roots)
+    {
+        match outcome {
+            Ok(true) => {
+                let dedupe_key = path.canonicalize().unwrap_or(path);
+                updated_paths.insert(dedupe_key);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!("Could not refresh API key in {}: {}", path.display(), error);
+                eprintln!(
+                    "Warning: could not refresh API key in {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
+    }
+    updated_paths.len()
+}
+
 /// Non-interactive MCP-config refresh, scoped to the editors the user chose.
 pub async fn update_configs_scoped(
     scope: &str,

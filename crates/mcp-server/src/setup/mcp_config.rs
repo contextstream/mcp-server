@@ -837,13 +837,140 @@ fn build_remote_http_headers(
         );
     }
 
-    if existing_header_string(existing_server, HEADER_API_KEY).is_none() {
-        if let Some(api_key) = remote_auth_api_key.filter(|value| !value.is_empty()) {
-            headers.insert(HEADER_API_KEY.to_string(), json!(api_key));
-        }
+    if let Some(api_key) = remote_auth_api_key.filter(|value| !value.is_empty()) {
+        headers.retain(|key, value| {
+            if key.eq_ignore_ascii_case(HEADER_API_KEY) || key.eq_ignore_ascii_case("x-api-key") {
+                return false;
+            }
+            if key.eq_ignore_ascii_case("authorization") {
+                return value.as_str().and_then(extract_bearer_api_key).is_none();
+            }
+            true
+        });
+        headers.insert(HEADER_API_KEY.to_string(), json!(api_key));
     }
 
     Value::Object(headers)
+}
+
+fn is_embedded_api_key_value(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("{env:") && trimmed.ends_with('}') {
+        return false;
+    }
+    if trimmed.starts_with("${") && trimmed.ends_with('}') {
+        return false;
+    }
+    true
+}
+
+fn extract_bearer_api_key(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let prefix = trimmed.get(..7)?;
+    if !prefix.eq_ignore_ascii_case("bearer ") {
+        return None;
+    }
+    let token = trimmed[7..].trim();
+    if !is_embedded_api_key_value(token) {
+        return None;
+    }
+    // Three non-empty dot-separated segments indicate a JWT rather than an API key.
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() == 3 && parts.iter().all(|part| !part.is_empty()) {
+        return None;
+    }
+    Some(token)
+}
+
+pub(super) fn embedded_json_api_keys(entry: &Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(headers) = entry.get("headers").and_then(Value::as_object) {
+        for (key, value) in headers {
+            let Some(raw) = value.as_str() else {
+                continue;
+            };
+            if key.eq_ignore_ascii_case(HEADER_API_KEY) || key.eq_ignore_ascii_case("x-api-key") {
+                if is_embedded_api_key_value(raw) {
+                    keys.push(raw.trim().to_string());
+                }
+            } else if key.eq_ignore_ascii_case("authorization") {
+                if let Some(token) = extract_bearer_api_key(raw) {
+                    keys.push(token.to_string());
+                }
+            }
+        }
+    }
+    for env_field in ["env", "environment"] {
+        if let Some(raw) = entry
+            .get(env_field)
+            .and_then(Value::as_object)
+            .and_then(|env| env.get("CONTEXTSTREAM_API_KEY"))
+            .and_then(Value::as_str)
+        {
+            if is_embedded_api_key_value(raw) {
+                keys.push(raw.trim().to_string());
+            }
+        }
+    }
+    keys
+}
+
+pub(super) fn embedded_codex_toml_api_keys(entry: &Item) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(raw) = toml_nested_string(entry, "env", "CONTEXTSTREAM_API_KEY") {
+        if is_embedded_api_key_value(raw) {
+            keys.push(raw.trim().to_string());
+        }
+    }
+    if let Some(table_like) = entry.as_table_like() {
+        for table_name in ["http_headers", "headers"] {
+            let Some(nested) = table_like.get(table_name) else {
+                continue;
+            };
+            if let Some(sub) = nested.as_table_like() {
+                for (key, item) in sub.iter() {
+                    let Some(raw) = item.as_value().and_then(toml_edit::Value::as_str) else {
+                        continue;
+                    };
+                    if key.eq_ignore_ascii_case(HEADER_API_KEY)
+                        || key.eq_ignore_ascii_case("x-api-key")
+                    {
+                        if is_embedded_api_key_value(raw) {
+                            keys.push(raw.trim().to_string());
+                        }
+                    } else if key.eq_ignore_ascii_case("authorization") {
+                        if let Some(token) = extract_bearer_api_key(raw) {
+                            keys.push(token.to_string());
+                        }
+                    }
+                }
+            } else if let Some(inline) = nested
+                .as_value()
+                .and_then(toml_edit::Value::as_inline_table)
+            {
+                for (key, val) in inline.iter() {
+                    let Some(raw) = val.as_str() else {
+                        continue;
+                    };
+                    if key.eq_ignore_ascii_case(HEADER_API_KEY)
+                        || key.eq_ignore_ascii_case("x-api-key")
+                    {
+                        if is_embedded_api_key_value(raw) {
+                            keys.push(raw.trim().to_string());
+                        }
+                    } else if key.eq_ignore_ascii_case("authorization") {
+                        if let Some(token) = extract_bearer_api_key(raw) {
+                            keys.push(token.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    keys
 }
 
 fn build_remote_http_server_json(
@@ -1371,6 +1498,15 @@ fn build_codex_remote_http_headers(
     }
 
     if let Some(api_key) = remote_auth_api_key.filter(|value| !value.is_empty()) {
+        headers.retain(|key, value| {
+            if key.eq_ignore_ascii_case(HEADER_API_KEY) || key.eq_ignore_ascii_case("x-api-key") {
+                return false;
+            }
+            if key.eq_ignore_ascii_case("authorization") {
+                return extract_bearer_api_key(value).is_none();
+            }
+            true
+        });
         headers.insert("Authorization".to_string(), format!("Bearer {}", api_key));
     }
     headers.insert(
@@ -1516,7 +1652,9 @@ fn generate_config_json_with_identity(
     // Mirror the per-editor writers exactly: install scripts paste this entry
     // verbatim when server-side generation is unavailable.
     let mut server_config = match (use_remote, editor.descriptor().dialect) {
-        (true, ConfigDialect::OpenCode) => build_opencode_remote_server_json(None),
+        (true, ConfigDialect::OpenCode) => {
+            build_opencode_remote_server_json(None, remote_auth_api_key)
+        }
         (true, ConfigDialect::Kilo) => kilo_remote_server_json(build_remote_http_server_json(
             None,
             workspace_id,
@@ -2093,6 +2231,7 @@ fn write_mcp_config_with_transport_mode(
             transcripts_enabled,
             hook_transcripts_enabled,
             transport_mode,
+            remote_auth_api_key,
             &identity,
         ),
     };
@@ -2439,6 +2578,13 @@ fn build_opencode_environment(
             .or_insert_with(|| Value::String(value));
     }
 
+    if let Some(api_key) = api_key.filter(|key| !key.is_empty()) {
+        environment.insert(
+            "CONTEXTSTREAM_API_KEY".to_string(),
+            Value::String(api_key.to_string()),
+        );
+    }
+
     let resolved_api_url = resolved_api_url(existing_server);
     if resolved_api_url != "https://api.contextstream.io" {
         environment.insert(
@@ -2492,7 +2638,10 @@ fn build_opencode_server_json(
     server
 }
 
-fn build_opencode_remote_server_json(existing_server: Option<&Value>) -> Value {
+fn build_opencode_remote_server_json(
+    existing_server: Option<&Value>,
+    remote_auth_api_key: Option<&str>,
+) -> Value {
     let mut server = existing_server.cloned().unwrap_or_else(|| json!({}));
     server["type"] = json!("remote");
     server["url"] = json!(resolved_remote_mcp_url(existing_server));
@@ -2502,6 +2651,9 @@ fn build_opencode_remote_server_json(existing_server: Option<&Value>) -> Value {
         obj.remove("environment");
         obj.remove("env");
         obj.remove("args");
+    }
+    if let Some(api_key) = remote_auth_api_key.filter(|key| !key.is_empty()) {
+        let _ = refresh_json_entry_headers_api_key(&mut server, api_key);
     }
     server
 }
@@ -2514,6 +2666,7 @@ fn write_opencode_mcp_config(
     _transcripts_enabled: Option<bool>,
     _hook_transcripts_enabled: Option<bool>,
     transport_mode: TransportMode,
+    remote_auth_api_key: Option<&str>,
     identity: &ManagedConfigIdentity,
 ) -> Result<()> {
     let path = Editor::OpenCode.mcp_config_path().ok_or_else(|| {
@@ -2535,7 +2688,7 @@ fn write_opencode_mcp_config(
     let existing_server = existing_server.as_ref();
     validate_existing_json_like_server(existing_server, "OpenCode mcp.contextstream")?;
     let mut server = if should_use_remote_http(editor, existing_server, transport_mode) {
-        build_opencode_remote_server_json(existing_server)
+        build_opencode_remote_server_json(existing_server, remote_auth_api_key)
     } else {
         build_opencode_server_json(existing_server, Some(api_key), None)
     };
@@ -3986,7 +4139,7 @@ fn write_project_mcp_config_with_transport_mode(
 
     let mut server = if dialect == ConfigDialect::OpenCode {
         if should_use_remote_http(editor, existing_server.as_ref(), transport_mode) {
-            build_opencode_remote_server_json(existing_server.as_ref())
+            build_opencode_remote_server_json(existing_server.as_ref(), remote_auth_api_key)
         } else {
             // Embed the actual api_key in opencode's `environment` block —
             // opencode does NOT expand `{env:VAR}` placeholders there, so a
@@ -4045,6 +4198,276 @@ fn write_project_mcp_config_with_transport_mode(
     record_configured_evidence(editor);
 
     Ok(())
+}
+
+fn refresh_json_entry_headers_api_key(entry: &mut Value, api_key: &str) -> bool {
+    let Some(headers) = entry.get_mut("headers").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, value) in headers.iter_mut() {
+        let Some(raw) = value.as_str() else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case(HEADER_API_KEY) || key.eq_ignore_ascii_case("x-api-key") {
+            if is_embedded_api_key_value(raw) && raw != api_key {
+                *value = Value::String(api_key.to_string());
+                changed = true;
+            }
+        } else if key.eq_ignore_ascii_case("authorization") && extract_bearer_api_key(raw).is_some()
+        {
+            let desired = format!("Bearer {}", api_key);
+            if raw != desired {
+                *value = Value::String(desired);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn refresh_json_entry_embedded_api_key(entry: &mut Value, api_key: &str) -> bool {
+    let mut changed = refresh_json_entry_headers_api_key(entry, api_key);
+    for env_field in ["env", "environment"] {
+        if let Some(env) = entry.get_mut(env_field).and_then(Value::as_object_mut) {
+            if let Some(value) = env.get_mut("CONTEXTSTREAM_API_KEY") {
+                if let Some(raw) = value.as_str() {
+                    if is_embedded_api_key_value(raw) && raw != api_key {
+                        *value = Value::String(api_key.to_string());
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn refresh_codex_toml_file_embedded_api_key(path: &Path, api_key: &str) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw_existing = std::fs::read_to_string(path)
+        .with_context(|| format!("Could not read Codex config {}", path.display()))?;
+    let mut document = parse_codex_toml(&raw_existing, path)?;
+    let Some(entry) = document
+        .get_mut("mcp_servers")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|servers| servers.get_mut("contextstream"))
+        .and_then(Item::as_table_like_mut)
+    else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+    if let Some(env_table) = entry.get_mut("env").and_then(Item::as_table_like_mut) {
+        if let Some(item) = env_table.get_mut("CONTEXTSTREAM_API_KEY") {
+            if let Some(raw) = item.as_value().and_then(toml_edit::Value::as_str) {
+                if is_embedded_api_key_value(raw) && raw != api_key {
+                    *item = toml_edit::value(api_key);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    for table_name in ["http_headers", "headers"] {
+        let Some(nested) = entry.get_mut(table_name) else {
+            continue;
+        };
+        if let Some(sub) = nested.as_table_like_mut() {
+            let keys: Vec<String> = sub.iter().map(|(k, _)| k.to_string()).collect();
+            for key in keys {
+                let Some(item) = sub.get_mut(&key) else {
+                    continue;
+                };
+                let Some(raw) = item.as_value().and_then(toml_edit::Value::as_str) else {
+                    continue;
+                };
+                if key.eq_ignore_ascii_case(HEADER_API_KEY) || key.eq_ignore_ascii_case("x-api-key")
+                {
+                    if is_embedded_api_key_value(raw) && raw != api_key {
+                        *item = toml_edit::value(api_key);
+                        changed = true;
+                    }
+                } else if key.eq_ignore_ascii_case("authorization")
+                    && extract_bearer_api_key(raw).is_some()
+                {
+                    let desired = format!("Bearer {}", api_key);
+                    if raw != desired {
+                        *item = toml_edit::value(desired);
+                        changed = true;
+                    }
+                }
+            }
+        } else if let Some(inline) = nested
+            .as_value_mut()
+            .and_then(toml_edit::Value::as_inline_table_mut)
+        {
+            let keys: Vec<String> = inline.iter().map(|(k, _)| k.to_string()).collect();
+            for key in keys {
+                let Some(val) = inline.get_mut(&key) else {
+                    continue;
+                };
+                let Some(raw) = val.as_str() else {
+                    continue;
+                };
+                if key.eq_ignore_ascii_case(HEADER_API_KEY) || key.eq_ignore_ascii_case("x-api-key")
+                {
+                    if is_embedded_api_key_value(raw) && raw != api_key {
+                        let decor = val.decor().clone();
+                        *val = toml_edit::Value::from(api_key);
+                        *val.decor_mut() = decor;
+                        changed = true;
+                    }
+                } else if key.eq_ignore_ascii_case("authorization")
+                    && extract_bearer_api_key(raw).is_some()
+                {
+                    let desired = format!("Bearer {}", api_key);
+                    if raw != desired {
+                        let decor = val.decor().clone();
+                        *val = toml_edit::Value::from(desired);
+                        *val.decor_mut() = decor;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+    let updated = document.to_string();
+    safe_edit::write_if_unchanged(path, &updated, Some(&raw_existing))
+}
+
+/// Surgically refresh embedded ContextStream API keys in existing global and
+/// project MCP config files without creating missing files or adding keys to
+/// configs that do not embed one.
+pub fn refresh_embedded_api_key_in_existing_configs(
+    api_key: &str,
+    project_roots: &[PathBuf],
+) -> Vec<(PathBuf, Result<bool>)> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Vec::new();
+    }
+
+    let mut outcomes = Vec::new();
+
+    for editor in Editor::all() {
+        if !has_mcp_config_surface(editor) {
+            continue;
+        }
+        match editor.descriptor().dialect {
+            ConfigDialect::CodexToml => {
+                if let Some(path) = dirs::home_dir().map(|h| h.join(".codex").join("config.toml")) {
+                    if path.exists() {
+                        let result = refresh_codex_toml_file_embedded_api_key(&path, api_key);
+                        outcomes.push((path, result));
+                    }
+                }
+            }
+            ConfigDialect::VsCodeSettings { key } => {
+                let Some(path) = get_vscode_settings_path() else {
+                    continue;
+                };
+                if !path.exists() {
+                    continue;
+                }
+                let result = (|| -> Result<bool> {
+                    let loaded = safe_edit::read_for_edit(&path, safe_edit::JsonDialect::Jsonc)?;
+                    let mut config = loaded.value.clone();
+                    let Some(entry) = config
+                        .get_mut(key)
+                        .and_then(Value::as_object_mut)
+                        .and_then(|servers| servers.get_mut("contextstream"))
+                    else {
+                        return Ok(false);
+                    };
+                    if !refresh_json_entry_embedded_api_key(entry, api_key) {
+                        return Ok(false);
+                    }
+                    safe_edit::commit(&path, &loaded, &config)
+                })();
+                outcomes.push((path, result));
+            }
+            ConfigDialect::JsonServers { .. } | ConfigDialect::Kilo | ConfigDialect::OpenCode => {
+                let Some(path) = editor.mcp_config_path() else {
+                    continue;
+                };
+                if !path.exists() {
+                    continue;
+                }
+                let server_path: Vec<&str> = match editor.descriptor().dialect {
+                    ConfigDialect::Kilo | ConfigDialect::OpenCode => vec!["mcp"],
+                    _ => server_map_path(editor),
+                };
+                let dialect = match editor.descriptor().dialect {
+                    ConfigDialect::Kilo => safe_edit::JsonDialect::Jsonc,
+                    ConfigDialect::OpenCode => safe_edit::JsonDialect::Strict,
+                    _ => mcp_json_dialect(editor, &path),
+                };
+                let result = (|| -> Result<bool> {
+                    let loaded = safe_edit::read_for_edit(&path, dialect)?;
+                    let mut config = loaded.value.clone();
+                    let Some(entry) = server_map_mut(&mut config, &server_path)
+                        .and_then(Value::as_object_mut)
+                        .and_then(|servers| servers.get_mut("contextstream"))
+                    else {
+                        return Ok(false);
+                    };
+                    if !refresh_json_entry_embedded_api_key(entry, api_key) {
+                        return Ok(false);
+                    }
+                    commit_mcp_config(editor, &path, &loaded, &config, &[])
+                })();
+                outcomes.push((path, result));
+            }
+            ConfigDialect::RulesOnly => {}
+        }
+    }
+
+    for project_root in project_roots {
+        let codex_project_path = project_root.join(".codex").join("config.toml");
+        if codex_project_path.exists() {
+            let result = refresh_codex_toml_file_embedded_api_key(&codex_project_path, api_key);
+            outcomes.push((codex_project_path, result));
+        }
+
+        for editor in Editor::all() {
+            let Some(path) = editor.project_mcp_config_path(project_root) else {
+                continue;
+            };
+            if !path.exists() {
+                continue;
+            }
+            let server_path = project_server_map_path(editor);
+            let dialect = mcp_json_dialect(editor, &path);
+            let result = (|| -> Result<bool> {
+                let loaded = safe_edit::read_for_edit(&path, dialect)?;
+                let mut config = loaded.value.clone();
+                let Some(entry) = server_map_mut(&mut config, server_path)
+                    .and_then(Value::as_object_mut)
+                    .and_then(|servers| servers.get_mut("contextstream"))
+                else {
+                    return Ok(false);
+                };
+                if !refresh_json_entry_embedded_api_key(entry, api_key) {
+                    return Ok(false);
+                }
+                let changed = safe_edit::commit(&path, &loaded, &config)?;
+                if changed {
+                    keep_secret_config_out_of_git(project_root, &path);
+                }
+                Ok(changed)
+            })();
+            outcomes.push((path, result));
+        }
+    }
+
+    outcomes
 }
 
 /// When CLI setup/update writes a secret-bearing project MCP config in a
@@ -9406,6 +9829,140 @@ CONTEXTSTREAM_API_KEY = "test-key"
         let server = read_json(&path)["mcpServers"]["contextstream"].clone();
         assert_eq!(server["httpUrl"], json!("https://mcp.contextstream.io/mcp"));
         assert!(server.get("url").is_none(), "Qwen reads `url` as SSE");
+    }
+
+    #[test]
+    fn remote_auth_update_replaces_stale_api_key_and_bearer_headers() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeGuard::isolate_under(temp.path());
+        let _xdg = XdgConfigGuard::isolate_under(temp.path());
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        let claude_path = temp.path().join(".claude.json");
+        seed_json(
+            &claude_path,
+            &json!({
+                "mcpServers": {
+                    "contextstream": {
+                        "type": "http",
+                        "url": default_remote_mcp_url(),
+                        "headers": {
+                            "Authorization": "Bearer cs_revoked_dead_key_000",
+                            HEADER_API_KEY: "cs_old_key_a",
+                            "X-Custom-User-Header": "keep-me"
+                        }
+                    }
+                }
+            }),
+        );
+
+        write_mcp_config_force_remote_with_auth(
+            &Editor::ClaudeCode,
+            "cs_new_key_b",
+            Some("ws-1"),
+            None,
+            None,
+            None,
+            Some("cs_new_key_b"),
+        )
+        .expect("refresh claude remote config");
+
+        let raw = std::fs::read_to_string(&claude_path).expect("read claude config");
+        assert!(!raw.contains("cs_old_key_a"), "{raw}");
+        assert!(!raw.contains("cs_revoked_dead_key_000"), "{raw}");
+        let server = read_json(&claude_path)["mcpServers"]["contextstream"].clone();
+        assert_eq!(server["headers"][HEADER_API_KEY], json!("cs_new_key_b"));
+        assert!(server["headers"].get("Authorization").is_none());
+        assert_eq!(server["headers"]["X-Custom-User-Header"], json!("keep-me"));
+    }
+
+    #[test]
+    fn surgical_refresh_updates_existing_embedded_keys_without_creating_unconfigured_files() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(home.join(".claude")).expect("mkdir .claude");
+        std::fs::create_dir_all(&project).expect("mkdir project");
+        let _home = HomeGuard::isolate_under(&home);
+        let _xdg = XdgConfigGuard::isolate_under(&home);
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        // Fresh HOME before setup: `.claude/` exists, `.claude.json` does not.
+        let initial = refresh_embedded_api_key_in_existing_configs(
+            "cs_key_a",
+            std::slice::from_ref(&project),
+        );
+        assert!(initial.is_empty());
+        assert!(!home.join(".claude.json").exists());
+        assert!(!project.join(".mcp.json").exists());
+
+        write_mcp_config_force_remote_with_auth(
+            &Editor::ClaudeCode,
+            "cs_key_a",
+            Some("ws-1"),
+            None,
+            None,
+            None,
+            Some("cs_key_a"),
+        )
+        .expect("write claude");
+        write_mcp_config_force_remote_with_auth(
+            &Editor::Codex,
+            "cs_key_a",
+            Some("ws-1"),
+            None,
+            None,
+            None,
+            Some("cs_key_a"),
+        )
+        .expect("write codex");
+        write_project_mcp_config_force_remote_with_auth(
+            &Editor::ClaudeCode,
+            &project,
+            "cs_key_a",
+            Some("ws-1"),
+            Some("proj-1"),
+            None,
+            None,
+            Some("cs_key_a"),
+        )
+        .expect("write project .mcp.json");
+
+        let outcomes = refresh_embedded_api_key_in_existing_configs(
+            "cs_key_b",
+            std::slice::from_ref(&project),
+        );
+        let changed_count = outcomes
+            .iter()
+            .filter(|(_, res)| matches!(res, Ok(true)))
+            .count();
+        assert_eq!(changed_count, 3, "{outcomes:?}");
+
+        for path in [
+            home.join(".claude.json"),
+            home.join(".codex").join("config.toml"),
+            project.join(".mcp.json"),
+        ] {
+            let content = std::fs::read_to_string(&path).expect("read rotated config");
+            assert!(
+                !content.contains("cs_key_a"),
+                "{} still had old key:
+{content}",
+                path.display()
+            );
+            assert!(
+                content.contains("cs_key_b"),
+                "{} missing new key:
+{content}",
+                path.display()
+            );
+        }
+        assert!(
+            !home.join(".cursor").join("mcp.json").exists(),
+            "must never create unconfigured editor files"
+        );
     }
 }
 

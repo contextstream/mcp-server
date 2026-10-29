@@ -2495,8 +2495,19 @@ async fn run_configure(
             // API Key
             3 => {
                 let (api_key, email) = setup::authenticate().await?;
-                setup::write_saved_credentials(&api_key, None)?;
-                eprintln!("Credentials saved. Authenticated as {}.", email);
+                let api_url = setup::get_api_url();
+                setup::persist_setup_credentials(&api_key, &api_url)?;
+                if !setup::ui::is_quiet() {
+                    eprintln!("Credentials saved. Authenticated as {}.", email);
+                }
+                let refreshed = setup::refresh_existing_mcp_config_credentials(&api_key);
+                if refreshed > 0 && !setup::ui::is_quiet() {
+                    if mcp_server::setup::safe_edit::is_dry_run() {
+                        eprintln!("Would refresh API key in {refreshed} editor MCP config(s).");
+                    } else {
+                        eprintln!("Refreshed API key in {refreshed} editor MCP config(s).");
+                    }
+                }
             }
             // Workspace
             4 => {
@@ -2638,6 +2649,14 @@ async fn run_configure_api_key_from_stdin() -> Result<()> {
             setup::credentials_file_path().display(),
             user.email
         );
+    }
+    let refreshed = setup::refresh_existing_mcp_config_credentials(api_key);
+    if refreshed > 0 && !setup::ui::is_quiet() {
+        if mcp_server::setup::safe_edit::is_dry_run() {
+            eprintln!("Would refresh API key in {refreshed} editor MCP config(s).");
+        } else {
+            eprintln!("Refreshed API key in {refreshed} editor MCP config(s).");
+        }
     }
     if std::env::var("CONTEXTSTREAM_API_KEY").is_ok_and(|env| env.trim() != api_key) {
         eprintln!(

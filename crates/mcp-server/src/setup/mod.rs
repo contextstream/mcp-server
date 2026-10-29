@@ -2562,9 +2562,9 @@ async fn run_setup_noninteractive(
     };
     let cwd = std::env::current_dir()?;
     let project_path = resolve_setup_project_path(&cwd, explicit_project_path, account_only)?;
-    persist_setup_editor_selection(&editors_to_configure)?;
 
     if editors_to_configure.is_empty() {
+        persist_setup_editor_selection(&editors_to_configure)?;
         ui::say(
             ui::Mark::Warn,
             "No editors selected or detected",
@@ -2610,14 +2610,14 @@ async fn run_setup_noninteractive(
     );
 
     let transport_preference = prompt_setup_transport_preference(&editors_to_configure)?;
-    // Record the selected transport before any per-editor writes. If one
-    // editor fails partway through setup, later `--only-configured` repair
-    // runs must not silently fall back to a different transport.
-    write_setup_transport_marker(transport_preference)?;
     let workspace_lookup_path = project_path.as_deref().unwrap_or(cwd.as_path());
-    let workspace =
-        resolve_workspace_noninteractive(&client, workspace_lookup_path, explicit_workspace_id)
-            .await?;
+    let workspace = resolve_workspace_noninteractive(
+        &client,
+        workspace_lookup_path,
+        explicit_workspace_id,
+        account_only,
+    )
+    .await?;
     let selected_project = if let Some(project_path) = project_path.as_deref() {
         select_project_for_current_directory(
             &client,
@@ -2639,6 +2639,14 @@ async fn run_setup_noninteractive(
         None
     };
     let configured_project_path = selected_project.as_ref().and(project_path.as_deref());
+
+    // Record the selected editors and transport only after workspace/project
+    // preflight succeeds so an aborted `--yes` run never leaves
+    // `installation.json` claiming unconfigured editors. Recording before the
+    // per-editor loop still keeps partial setups repairable with the same
+    // selection and transport.
+    persist_setup_editor_selection(&editors_to_configure)?;
+    write_setup_transport_marker(transport_preference)?;
 
     let preauth_remote_configs =
         matches!(transport_preference, SetupTransportPreference::HostedRemote)
@@ -2751,6 +2759,7 @@ async fn resolve_workspace_noninteractive(
     client: &ContextStreamClient,
     cwd: &std::path::Path,
     explicit_workspace_id: Option<&str>,
+    account_only: bool,
 ) -> Result<Option<WorkspaceInfo>> {
     if let Some(id) = explicit_workspace_id {
         return resolve_requested_workspace(client, id, "--workspace-id")
@@ -2758,7 +2767,11 @@ async fn resolve_workspace_noninteractive(
             .map(Some);
     }
 
-    let previous = read_project_config(cwd)?;
+    let previous = if account_only {
+        None
+    } else {
+        read_project_config(cwd)?
+    };
     let workspaces = client.list_workspaces(None, None).await?;
 
     if let Some(prev_id) = previous.and_then(|cfg| cfg.workspace_id) {
@@ -2777,6 +2790,16 @@ async fn resolve_workspace_noninteractive(
         return resolve_requested_workspace(client, &id, WORKSPACE_ID_ENV)
             .await
             .map(Some);
+    }
+
+    if account_only {
+        return Ok(match workspaces.as_slice() {
+            [only] => Some(WorkspaceInfo {
+                id: only.id.to_string(),
+                name: only.name.clone(),
+            }),
+            _ => None,
+        });
     }
 
     match workspaces.len() {

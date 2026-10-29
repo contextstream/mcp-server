@@ -4570,6 +4570,9 @@ pub(super) fn protect_non_git_secret_project_config(
 /// shared `.gitignore`) unless the repository already tracks or ignores it.
 /// Best-effort: outside a Git checkout, or without `git`, nothing changes.
 fn keep_secret_config_out_of_git(project_path: &Path, config_path: &Path) {
+    if safe_edit::is_dry_run() {
+        return;
+    }
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .arg("-C")
@@ -4668,7 +4671,8 @@ pub fn write_workspace_config(
     }
     config["checkout_root"] = json!(checkout_root);
     if association_changed || !has_valid_associated_at {
-        config["associated_at"] = json!(chrono::Utc::now().to_rfc3339());
+        config["associated_at"] =
+            json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     }
     config["version"] = json!(mcp_types::config::VERSION);
 

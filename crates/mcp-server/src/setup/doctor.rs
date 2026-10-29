@@ -1219,6 +1219,15 @@ fn check_claude_auto_memory() -> SurfaceCheck {
             ),
             None,
         ),
+        Some(_) if mcp_client::activation::keep_claude_auto_memory_preference().unwrap_or(false) => {
+            SurfaceCheck::pass(
+                SURFACE,
+                format!(
+                    "Claude Code auto memory is kept on by setup preference (--keep-claude-auto-memory); memories saved by Claude stay in ~/.claude/projects/*/memory.{local_files}"
+                ),
+                None,
+            )
+        }
         Some(_) => SurfaceCheck::warning(
             SURFACE,
             format!(
@@ -2461,8 +2470,11 @@ async fn run_repairs(options: &DoctorOptions, targets: &[Editor]) -> DoctorRepai
             failures.push(format!("hooks: {error}"));
         }
         // An explicit global repair for Claude Code also turns off its auto
-        // memory, which otherwise routes memories away from ContextStream.
-        if targets.contains(&Editor::ClaudeCode) {
+        // memory, which otherwise routes memories away from ContextStream,
+        // unless setup explicitly opted in to keeping it on.
+        if targets.contains(&Editor::ClaudeCode)
+            && !mcp_client::activation::keep_claude_auto_memory_preference().unwrap_or(false)
+        {
             operations.push("claude_auto_memory");
             if let Err(error) = super::hooks::disable_claude_auto_memory() {
                 failures.push(format!("claude_auto_memory: {error}"));

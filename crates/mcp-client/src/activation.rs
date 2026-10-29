@@ -28,6 +28,8 @@ struct InstallationState {
     created_at: DateTime<Utc>,
     #[serde(default)]
     configured_clients: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    keep_claude_auto_memory: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_install_completed_at: Option<DateTime<Utc>>,
     /// Preserve fields written by newer installers so an older runtime
@@ -226,6 +228,7 @@ fn new_installation_state() -> InstallationState {
         installation_id: Uuid::new_v4(),
         created_at: Utc::now(),
         configured_clients: Vec::new(),
+        keep_claude_auto_memory: false,
         last_install_completed_at: None,
         extra: serde_json::Map::new(),
     }
@@ -469,6 +472,49 @@ pub fn existing_installation_id() -> std::io::Result<Option<Uuid>> {
 
 fn existing_installation_id_at(path: &Path) -> std::io::Result<Option<Uuid>> {
     Ok(read_state(path)?.map(|state| state.installation_id))
+}
+
+/// Whether setup recorded an explicit opt-in to leave Claude Code auto memory
+/// enabled on this machine (`--keep-claude-auto-memory`).
+///
+/// Read straight from disk with no side effects so `doctor`, `setup`, and hook
+/// handlers never create `~/.contextstream` merely by checking it.
+pub fn keep_claude_auto_memory_preference() -> std::io::Result<bool> {
+    keep_claude_auto_memory_preference_at(&installation_path())
+}
+
+fn keep_claude_auto_memory_preference_at(path: &Path) -> std::io::Result<bool> {
+    Ok(read_state(path)?.is_some_and(|state| state.keep_claude_auto_memory))
+}
+
+/// Record whether setup opted in to keeping Claude Code auto memory enabled.
+pub fn set_keep_claude_auto_memory_preference(keep: bool) -> std::io::Result<()> {
+    if !installation_state_persistence_enabled() {
+        return Ok(());
+    }
+    set_keep_claude_auto_memory_preference_at(&installation_path(), keep)
+}
+
+fn set_keep_claude_auto_memory_preference_at(path: &Path, keep: bool) -> std::io::Result<()> {
+    let _lock = lock_state(path)?;
+    match read_state(path)? {
+        Some(mut state) => {
+            if state.keep_claude_auto_memory == keep {
+                return Ok(());
+            }
+            state.keep_claude_auto_memory = keep;
+            write_state(path, &state)?;
+        }
+        None => {
+            if !keep {
+                return Ok(());
+            }
+            let mut state = new_installation_state();
+            state.keep_claude_auto_memory = true;
+            write_state(path, &state)?;
+        }
+    }
+    Ok(())
 }
 
 /// Return a durable installation id, creating state only when it is absent.
@@ -1425,5 +1471,50 @@ mod tests {
         assert_eq!(json["error_stage"], "initialize");
         assert_eq!(json["error_code"], "unauthorized");
         assert!(json.get("raw_error").is_none());
+    }
+
+    #[test]
+    fn keep_claude_auto_memory_preference_persists_without_losing_clients() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".contextstream/installation.json");
+
+        assert!(!keep_claude_auto_memory_preference_at(&path).expect("absent reads false"));
+        assert!(
+            !path.exists(),
+            "reading absent preference must not create files"
+        );
+
+        set_keep_claude_auto_memory_preference_at(&path, false).expect("clearing absent is no-op");
+        assert!(
+            !path.exists(),
+            "clearing false on absent file must not create state"
+        );
+
+        replace_configured_clients_at(&path, &["claude".to_string()]).expect("save clients");
+        let initial_id = existing_installation_id_at(&path)
+            .expect("read id")
+            .expect("id present");
+
+        set_keep_claude_auto_memory_preference_at(&path, true).expect("persist keep=true");
+        assert!(keep_claude_auto_memory_preference_at(&path).expect("reads true"));
+
+        replace_configured_clients_at(&path, &["claude".to_string(), "cursor".to_string()])
+            .expect("update clients");
+        assert!(
+            keep_claude_auto_memory_preference_at(&path).expect("still true after client update")
+        );
+        assert_eq!(
+            existing_installation_id_at(&path).expect("read id"),
+            Some(initial_id)
+        );
+
+        set_keep_claude_auto_memory_preference_at(&path, false).expect("clear keep=false");
+        assert!(!keep_claude_auto_memory_preference_at(&path).expect("reads false"));
+        let raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("raw json")).unwrap();
+        assert!(
+            raw.get("keep_claude_auto_memory").is_none(),
+            "false preference should omit field: {raw}"
+        );
     }
 }

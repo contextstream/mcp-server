@@ -293,3 +293,70 @@ async fn setup_yes_dry_run_with_env_api_key_does_not_write_credentials_file() {
         "expected dry-run plan to list credentials.json:\n{stdout}"
     );
 }
+
+#[tokio::test]
+async fn setup_yes_dry_run_deduplicates_shared_artifacts_across_multiple_editors() {
+    const SECRET: &str = "dry-run-multi-editor-secret";
+    let (api_url, server) = spawn_mock_setup_server(SECRET).await;
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().to_path_buf();
+
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+            .args([
+                "setup",
+                "--yes",
+                "--dry-run",
+                "--account-only",
+                "--editors=claude,cursor,windsurf,codex",
+                &format!("--workspace-id={WORKSPACE_ID}"),
+            ])
+            .env_clear()
+            .env("HOME", &home_path)
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("CONTEXTSTREAM_API_KEY", SECRET)
+            .env("CONTEXTSTREAM_API_URL", &api_url)
+            .env("CONTEXTSTREAM_NO_BROWSER", "1")
+            .env("NO_COLOR", "1")
+            .current_dir(&home_path)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    stop_spawned_watch_helper_if_any(home.path());
+    server.abort();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "setup --yes --dry-run multi-editor failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let create_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with("+ create"))
+        .collect();
+    let bin_creates = create_lines
+        .iter()
+        .filter(|line| line.contains("bin/contextstream-mcp"))
+        .count();
+    assert_eq!(
+        bin_creates, 1,
+        "managed binary create should appear once across multiple editors:\n{stdout}"
+    );
+    let watch_creates = create_lines
+        .iter()
+        .filter(|line| {
+            line.contains("contextstream-watch.service")
+                || line.contains("com.contextstream.watch.plist")
+        })
+        .count();
+    assert!(
+        watch_creates <= 1,
+        "watch service create should appear at most once across multiple editors:\n{stdout}"
+    );
+}

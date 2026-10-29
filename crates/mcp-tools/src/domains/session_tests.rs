@@ -6583,6 +6583,94 @@ fn the_api_session_id_is_read_from_the_top_of_the_init_response() {
 /// A mock API on a local port. `session/init` answers `init_response` (404 when
 /// there is none); the first resume request is answered and its JSON body
 /// returned by the task; anything else is a 404.
+/// Answers session/init with `init_response` and returns the body of the
+/// first /session/restore request.
+async fn spawn_restore_mock(
+    init_response: Value,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<Value>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (head, body) = loop {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0, "request ended before its body");
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_string();
+                        let length: usize = head
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse().unwrap())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break (head, request[end + 4..end + 4 + length].to_vec());
+                        }
+                    }
+                };
+                let is_restore = head.starts_with("POST /api/v1/session/restore");
+                let (status, payload) = if head.starts_with("POST /api/v1/session/init") {
+                    ("200 OK", init_response.to_string())
+                } else if is_restore {
+                    (
+                        "200 OK",
+                        json!({"restored": false, "source": "none", "active_files": []}).to_string(),
+                    )
+                } else {
+                    ("404 Not Found", json!({"error": "not found"}).to_string())
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                if is_restore {
+                    return serde_json::from_slice::<Value>(&body).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("a restore request within 10 s")
+    });
+    (address, server)
+}
+
+#[tokio::test]
+async fn post_compact_init_restores_a_known_session_never_none() {
+    // init(is_post_compact=true) without session_id posted /session/restore
+    // without one, and printed the API's raw "Failed to deserialize" error.
+    let workspace_id = Uuid::new_v4();
+    let (address, server) = spawn_restore_mock(json!({
+        "workspace_id": workspace_id,
+        "session_id": "api-assigned-session",
+    }))
+    .await;
+    let mut config = TestFixtures::test_config();
+    config.api_url = format!("http://{address}");
+    let client = ContextStreamClient::new(config.clone());
+    let session = Arc::new(SessionManager::new(client.clone(), config));
+
+    let result = InitTool::new(client, session)
+        .execute(json!({"auto_update": false, "is_post_compact": true}))
+        .await
+        .expect("init");
+    let body = server.await.expect("restore server");
+    assert_eq!(body["session_id"], "api-assigned-session");
+    assert!(!result_text(&result).contains("Failed to deserialize"));
+}
+
 async fn spawn_resume_mock(
     init_response: Option<Value>,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Value>) {

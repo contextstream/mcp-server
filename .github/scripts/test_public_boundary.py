@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -26,7 +27,9 @@ class PublicBoundaryTest(unittest.TestCase):
                     boundary.verify_paths_and_source(root)
 
     def test_repository_satisfies_public_boundary(self) -> None:
-        self.assertEqual(boundary.verify(REPOSITORY_ROOT), "1.0.39")
+        # The release version, from the manifest, so a version bump never has to edit this test.
+        expected = json.loads((REPOSITORY_ROOT / "package.json").read_text(encoding="utf-8"))["version"]
+        self.assertEqual(boundary.verify(REPOSITORY_ROOT), expected)
 
     def test_forbidden_private_source_is_detected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="public-boundary-") as temporary:

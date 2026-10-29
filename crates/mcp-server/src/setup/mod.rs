@@ -3415,10 +3415,10 @@ fn data_collection_points(non_interactive: bool) -> [String; 8] {
         "Deep project learning is optional and starts off. Only you can consent in Account → Privacy. Plain setup --yes preserves your choice. Use --account-learning on to open consent, or configure --account-learning off to withdraw.".to_string(),
         format!("Transcript exchange saving default: {transcripts}. Change with `contextstream-mcp configure --transcripts on|off`."),
         format!("Hook transcript saving default: {hook_transcripts}. Change with `contextstream-mcp configure --hook-transcripts on|off`."),
-        format!("Project indexing {index_behavior}; matched source files are sent to your ContextStream workspace. Exclude files with gitignore-style rules in `.contextstream/ignore` (patterns relative to the project root) or a `.contextignore`; a file you exclude after it was indexed is de-indexed on the next index, or de-index everything with `project(action=\"purge\")`."),
+        format!("Project indexing {index_behavior}; matched source files are sent to your ContextStream workspace, with the checkout's credential-free repository identity, branch, commit SHA and time, whether the tree is dirty, and a random machine ID (no hostname or local path). Exclude files with gitignore-style rules in `.contextstream/ignore` (patterns relative to the project root) or a `.contextignore`; a file you exclude after it was indexed is de-indexed on the next index, or de-index everything with `project(action=\"purge\")`."),
         "Editor lifecycle hooks are installed for selected supported editors. Disable with `CONTEXTSTREAM_HOOK_ENABLED=false` or remove them with the setup/uninstall flow.".to_string(),
         format!("Local Git capture default: {git_capture}. Managed hooks send event type, commit SHA/time, branch/ref names, aggregate line/file counts, a 256-character redacted commit subject, an opaque checkout ID, and a credential-free canonical remote. Absolute paths, commit bodies, and author name/email are not sent. Disable with `CONTEXTSTREAM_GIT_CAPTURE=off` or `.contextstream/config.json` `git_capture.enabled=false`."),
-        format!("Usage metadata default: {usage_metadata}. A random installation ID kept in `~/.contextstream/installation.json`, the client name and version, OS family and version, CPU architecture, the editors setup configured, and workspace, project and session IDs go to ContextStream with `init`, and in two small events: a session's first successful tool call (tool name and category) and a connection failure (stage, error code, HTTP status). This metadata carries no file contents, queries, tool arguments or paths. Disable with `CONTEXTSTREAM_ACTIVATION_EVENTS=off`."),
+        format!("Usage metadata default: {usage_metadata}. Requests to ContextStream carry a random installation ID (kept in `~/.contextstream/installation.json`), the client name and version, OS family and version, and CPU architecture; `init` adds the editors setup configured. Two small events add workspace, project and session IDs: a session's first successful tool call (tool name and category) and a connection failure (stage, error code, HTTP status). This metadata carries no file contents, queries, tool arguments or paths. Disable with `CONTEXTSTREAM_ACTIVATION_EVENTS=off`."),
         format!("Coordination notices default: {coordination_notices}. While a session makes tool calls, at most every 35 seconds a background request sends the session ID, workspace and project, the folder path, the agent name, and once a 500-character task summary, and picks up notices from other agents. Disable with `CONTEXTSTREAM_MID_RUN_NOTICES=0`."),
     ]
 }
@@ -6416,6 +6416,7 @@ mod tests {
         assert!(disclosure.contains("Transcript exchange saving default: true"));
         assert!(disclosure.contains("Hook transcript saving default: true"));
         assert!(disclosure.contains("matched source files are sent"));
+        assert!(disclosure.contains("a random machine ID (no hostname or local path)"));
         assert!(disclosure.contains("256-character redacted commit subject"));
         assert!(disclosure
             .contains("Absolute paths, commit bodies, and author name/email are not sent"));
@@ -6423,7 +6424,7 @@ mod tests {
         assert!(disclosure.contains("project(action=\"purge\")"));
         // Everything the server sends on its own is disclosed, with its opt-out.
         assert!(disclosure.contains("Usage metadata default: true"));
-        assert!(disclosure.contains("random installation ID"));
+        assert!(disclosure.contains("Requests to ContextStream carry a random installation ID"));
         assert!(disclosure.contains("CONTEXTSTREAM_ACTIVATION_EVENTS=off"));
         assert!(disclosure.contains("Coordination notices default: true"));
         assert!(disclosure.contains("the folder path"));

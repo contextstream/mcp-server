@@ -536,20 +536,73 @@ fn recorded_link(
         })
 }
 
+fn is_home_or_root_path(path: &Path) -> bool {
+    if path.parent().is_none() {
+        return true;
+    }
+    dirs::home_dir()
+        .and_then(|home| std::fs::canonicalize(home).ok())
+        .is_some_and(|home| home == path)
+}
+
+fn resolve_linked_ancestor(
+    start: &Path,
+    stop_inclusive: Option<&Path>,
+    mappings: &Value,
+) -> Option<PathBuf> {
+    let mut current = if start.is_file() {
+        start.parent()?
+    } else {
+        start
+    };
+    loop {
+        if is_home_or_root_path(current) {
+            return None;
+        }
+        if let Some(boundary) = stop_inclusive {
+            if !current.starts_with(boundary) {
+                return None;
+            }
+        }
+        if recorded_link(current, mappings).is_some() {
+            return Some(current.to_path_buf());
+        }
+        if stop_inclusive == Some(current) {
+            return None;
+        }
+        current = current.parent()?;
+    }
+}
+
 /// Collect the local facts about the checkout containing `path`. `mappings`
 /// is the parsed `~/.contextstream/mappings.json`.
 pub fn gather_checkout_facts(path: &Path, mappings: &Value) -> CheckoutFacts {
+    let canonical_path = std::fs::canonicalize(path).ok();
     let layout = checkout_repository_layout(path);
-    let root = layout
-        .as_ref()
-        .map(|layout| layout.repository_root.clone())
-        .or_else(|| std::fs::canonicalize(path).ok())
+    let linked_ancestor = canonical_path.as_deref().and_then(|start| {
+        resolve_linked_ancestor(
+            start,
+            layout.as_ref().map(|repo| repo.repository_root.as_path()),
+            mappings,
+        )
+    });
+    let root = linked_ancestor
+        .or_else(|| layout.as_ref().map(|repo| repo.repository_root.clone()))
+        .or(canonical_path)
         .unwrap_or_else(|| path.to_path_buf());
+    let is_subpackage_link = layout
+        .as_ref()
+        .is_some_and(|repo| repo.repository_root != root);
+
     let folder_name = root
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
-    let repository = current_repository_remote_identity(&root).ok().flatten();
+    let repository = if is_subpackage_link {
+        None
+    } else {
+        current_repository_remote_identity(&root).ok().flatten()
+    };
     let repository_name = repository.as_ref().and_then(|identity| {
         identity
             .canonical_https_url()
@@ -560,13 +613,19 @@ pub fn gather_checkout_facts(path: &Path, mappings: &Value) -> CheckoutFacts {
     });
     let main_checkout_name = layout
         .as_ref()
-        .and_then(|layout| layout.main_checkout.as_ref())
+        .filter(|_| !is_subpackage_link)
+        .and_then(|repo| repo.main_checkout.as_ref())
         .and_then(|main| main.file_name())
         .map(|name| name.to_string_lossy().to_string());
 
-    let fingerprint = current_repository_fingerprint(&root)
-        .ok()
+    let fingerprint = (!is_subpackage_link)
+        .then(|| current_repository_fingerprint(&root).ok())
+        .flatten()
         .map(|fingerprint| fingerprint.to_string());
+    let repo_root_for_siblings = layout
+        .as_ref()
+        .map(|repo| repo.repository_root.as_path())
+        .unwrap_or(root.as_path());
     let sibling_projects = fingerprint
         .map(|fingerprint| {
             mapping_entries(mappings)
@@ -577,7 +636,14 @@ pub fn gather_checkout_facts(path: &Path, mappings: &Value) -> CheckoutFacts {
                         && !entry
                             .get("path")
                             .and_then(Value::as_str)
-                            .is_some_and(|path| same_path(path, &root))
+                            .is_some_and(|raw| {
+                                let candidate = Path::new(raw.trim_end_matches('/'));
+                                same_path(raw, &root)
+                                    || candidate.starts_with(repo_root_for_siblings)
+                                    || std::fs::canonicalize(candidate).is_ok_and(|canon| {
+                                        canon.starts_with(repo_root_for_siblings)
+                                    })
+                            })
                 })
                 .filter_map(|entry| uuid_field(entry, "project_id"))
                 .collect()
@@ -962,5 +1028,106 @@ mod tests {
         assert_eq!(link.0, config_project);
         assert_eq!(link.3, "checkout_config");
         assert!(link.2);
+    }
+
+    #[test]
+    fn monorepo_linked_subpackage_resolves_subpackage_before_unlinked_git_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let monorepo = std::fs::canonicalize(temp.path()).unwrap().join("monorepo");
+        let web_pkg = monorepo.join("packages/web");
+        let web_src = web_pkg.join("src");
+        let api_pkg = monorepo.join("packages/api");
+        let unlinked_pkg = monorepo.join("packages/shared");
+        std::fs::create_dir_all(&web_src).unwrap();
+        std::fs::create_dir_all(&api_pkg).unwrap();
+        std::fs::create_dir_all(&unlinked_pkg).unwrap();
+
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&monorepo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let _ = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/monorepo.git",
+            ])
+            .current_dir(&monorepo)
+            .status();
+
+        let ws = workspace("Testing", None, true);
+        let repo_project = project(
+            "monorepo",
+            Some("https://github.com/acme/monorepo.git"),
+            Some("/Users/dev/monorepo"),
+            50,
+        );
+        let web_project = project("web", None, Some(&web_pkg.to_string_lossy()), 12);
+        let api_project = project("api", None, Some(&api_pkg.to_string_lossy()), 10);
+
+        std::fs::create_dir_all(web_pkg.join(".contextstream")).unwrap();
+        std::fs::write(
+            web_pkg.join(".contextstream/config.json"),
+            serde_json::json!({
+                "workspace_id": ws.id.to_string(),
+                "project_id": web_project.id.to_string(),
+                "repository_fingerprint": "fp-monorepo"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(api_pkg.join(".contextstream")).unwrap();
+        std::fs::write(
+            api_pkg.join(".contextstream/config.json"),
+            serde_json::json!({
+                "workspace_id": ws.id.to_string(),
+                "project_id": api_project.id.to_string(),
+                "repository_fingerprint": "fp-monorepo"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mappings = serde_json::json!({
+            "mappings": [
+                {
+                    "path": web_pkg.to_string_lossy(),
+                    "workspace_id": ws.id.to_string(),
+                    "project_id": web_project.id.to_string(),
+                    "repository_fingerprint": "fp-monorepo"
+                },
+                {
+                    "path": api_pkg.to_string_lossy(),
+                    "workspace_id": ws.id.to_string(),
+                    "project_id": api_project.id.to_string(),
+                    "repository_fingerprint": "fp-monorepo"
+                }
+            ]
+        });
+
+        let candidates = vec![
+            candidate(repo_project, &ws),
+            candidate(web_project.clone(), &ws),
+            candidate(api_project, &ws),
+        ];
+
+        for query_dir in [&web_pkg, &web_src] {
+            let facts = gather_checkout_facts(query_dir, &mappings);
+            assert_eq!(facts.root, web_pkg);
+            assert_eq!(
+                facts.current.as_ref().map(|link| link.project_id),
+                Some(web_project.id)
+            );
+            let assessment = assess(&facts, &candidates, now());
+            assert_eq!(assessment.status, LinkStatus::Correct, "{assessment:?}");
+        }
+
+        // An unlinked sibling subpackage still resolves to the enclosing git root.
+        let unlinked_facts = gather_checkout_facts(&unlinked_pkg, &mappings);
+        assert_eq!(unlinked_facts.root, monorepo);
+        assert!(unlinked_facts.current.is_none());
     }
 }

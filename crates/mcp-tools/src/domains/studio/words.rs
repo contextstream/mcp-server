@@ -6,6 +6,8 @@
 
 use serde_json::Value;
 
+use super::forms::form_label;
+
 /// A piece's medium in words.
 pub(crate) fn medium_name(medium: &str) -> &'static str {
     match medium {
@@ -56,18 +58,50 @@ pub(crate) fn length_words(seconds: Option<f64>, max_seconds: Option<f64>) -> Op
     })
 }
 
-/// "Video · Tall 9:16 · 8 seconds".
+/// "Video · Tall 9:16 · 8 seconds"; brand work also names its form and how many sizes or
+/// sounds: "Image · Social set · 3 sizes", "Sound · Sound effects pack · 4 sounds · 1.5
+/// seconds each".
 pub(crate) fn piece_facts(piece: &Value) -> String {
     let medium = medium_name(piece.get("medium").and_then(Value::as_str).unwrap_or(""));
     let mut parts = vec![medium.to_string()];
-    if let Some(shape) = shape_words(piece.get("aspect").and_then(Value::as_str)) {
-        parts.push(shape);
+    if let Some(form) = piece
+        .get("form")
+        .and_then(Value::as_str)
+        .filter(|f| !f.trim().is_empty())
+    {
+        parts.push(form_label(form));
+    }
+    let sizes = piece.get("sizes").and_then(Value::as_array);
+    match sizes.map(Vec::len).unwrap_or(0) {
+        n if n > 1 => parts.push(format!("{n} sizes")),
+        _ => {
+            let aspect = piece.get("aspect").and_then(Value::as_str).or_else(|| {
+                sizes
+                    .and_then(|s| s.first())
+                    .and_then(|s| s.get("aspect"))
+                    .and_then(Value::as_str)
+            });
+            if let Some(shape) = shape_words(aspect) {
+                parts.push(shape);
+            }
+        }
+    }
+    let count = piece
+        .get("count")
+        .and_then(Value::as_u64)
+        .filter(|c| *c > 1);
+    if let Some(count) = count {
+        parts.push(format!("{count} sounds"));
     }
     if let Some(length) = length_words(
         piece.get("seconds").and_then(Value::as_f64),
         piece.get("maxSeconds").and_then(Value::as_f64),
     ) {
-        parts.push(length);
+        parts.push(if count.is_some() {
+            format!("{length} each")
+        } else {
+            length
+        });
     }
     parts.join(" · ")
 }
@@ -576,6 +610,24 @@ mod tests {
         assert_eq!(
             piece_facts(&json!({"medium": "sound", "seconds": 1.5})),
             "Sound · 1.5 seconds"
+        );
+        assert_eq!(
+            piece_facts(
+                &json!({"medium": "image", "form": "social-set", "aspect": "4:5",
+                "sizes": [{"id": "instagram-post"}, {"id": "instagram-story"}, {"id": "linkedin-post"}]})
+            ),
+            "Image · Social set · 3 sizes"
+        );
+        assert_eq!(
+            piece_facts(&json!({"medium": "image", "form": "hero",
+                "sizes": [{"id": "web-hero", "aspect": "16:9"}]})),
+            "Image · Hero image · Wide 16:9"
+        );
+        assert_eq!(
+            piece_facts(
+                &json!({"medium": "sound", "form": "sfx-pack", "count": 4, "seconds": 1.5})
+            ),
+            "Sound · Sound effects pack · 4 sounds · 1.5 seconds each"
         );
         assert_eq!(credits(1234567), "1,234,567");
         assert_eq!(credits(950), "950");

@@ -190,6 +190,15 @@ impl Error {
             return "ContextStream completed with an internal parse warning. The session can continue."
                 .to_string();
         }
+        // A 401 is the key itself being refused; say what to do about it (#252).
+        if matches!(self, Self::Http { status: 401, .. }) {
+            return format!(
+                "{self}. ContextStream did not accept the API key (invalid, expired or revoked). \
+                 Save a valid key with `contextstream-mcp setup` (or `contextstream-mcp configure \
+                 --api-key-stdin`) and restart the editor; for the hosted gateway, update the \
+                 X-ContextStream-API-Key header in the editor's MCP config."
+            );
+        }
 
         self.to_string()
     }
@@ -296,6 +305,20 @@ mod tests {
         assert!(!err
             .user_facing_message()
             .contains("non-blocking status code"));
+    }
+
+    #[test]
+    fn a_refused_key_says_how_to_fix_it_and_other_errors_are_unchanged() {
+        let refused = Error::http(401, "Unauthorized").user_facing_message();
+        assert!(
+            refused.starts_with("HTTP error (401): Unauthorized."),
+            "{refused}"
+        );
+        assert!(refused.contains("did not accept the API key"), "{refused}");
+        assert!(refused.contains("contextstream-mcp setup"), "{refused}");
+
+        let forbidden = Error::http(403, "Forbidden");
+        assert_eq!(forbidden.user_facing_message(), forbidden.to_string());
     }
 
     #[test]

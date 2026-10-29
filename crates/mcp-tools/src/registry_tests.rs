@@ -1464,17 +1464,19 @@ mod destructive_split_tests {
         registry.register("workspace", Arc::new(MockTool::new("workspace")));
         crate::domains::destructive::register_delete_tool(&mut registry);
 
-        let refused = registry
-            .execute(
-                "workspace",
-                json!({"action": "delete", "workspace_id": "w1"}),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            refused.to_string().contains("action=\"workspace.delete\""),
-            "{refused}"
-        );
+        for spelling in ["delete", "DELETE", "Delete", " dElEtE "] {
+            let refused = registry
+                .execute(
+                    "workspace",
+                    json!({"action": spelling, "workspace_id": "w1"}),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("action=\"workspace.delete\""),
+                "{spelling:?}: {refused}"
+            );
+        }
         assert!(
             !registry
                 .get("workspace")

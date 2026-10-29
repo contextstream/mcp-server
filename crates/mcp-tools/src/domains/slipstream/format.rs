@@ -281,8 +281,15 @@ pub(crate) fn task_list_text(list: &Value) -> String {
             Some(charged) if charged > 0 => format!(", charged {charged} credits"),
             _ => String::new(),
         };
+        // A run a client started on its own (`auto_mcp`, `auto_contextcode`, `auto_web`).
+        let automatic = match task.get("source").and_then(Value::as_str) {
+            Some(source) if source.starts_with("auto_") => {
+                format!(", started automatically ({source})")
+            }
+            _ => String::new(),
+        };
         out.push_str(&format!(
-            "- {agent}: {status}{cost}, asked {created} [task {id}]\n"
+            "- {agent}: {status}{cost}{automatic}, asked {created} [task {id}]\n"
         ));
     }
     out.push_str(&format!(

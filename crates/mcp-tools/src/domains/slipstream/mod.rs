@@ -23,13 +23,20 @@
 //! - `settings`, `enable`, `disable`, `choose`: which agents are on in the workspace, and
 //!   choosing them (see [`settings`]); only an owner or admin changes it.
 //!
+//! With the workspace's automatic runs on (`auto_run.mcp`), the agent starts a fitting agent
+//! itself: `run` with `automatic: true` sends `source: "auto_mcp"`, skips the quote (the API
+//! holds the run within the workspace's limits) and returns at once; `context()` and the
+//! hooks say when a task fits one (see [`auto`] and [`moments`]).
+//!
 //! A run is charged its price once, only when it succeeds; a declined, failed, cancelled or
 //! timed-out run costs nothing.
 
+pub mod auto;
 pub(crate) mod catalog;
 pub(crate) mod describe;
 pub(crate) mod format;
 pub(crate) mod gate;
+pub mod moments;
 pub(crate) mod settings;
 
 use async_trait::async_trait;
@@ -103,8 +110,10 @@ const CHANGE_CHECK_BUDGET: Duration = Duration::from_millis(1500);
 const IDEMPOTENCY_WINDOW_SECS: u64 = 600;
 /// The API's bound on a session id.
 const MAX_SESSION_ID_CHARS: usize = 200;
+/// How long an automatic run waits for the workspace's setting when it is not kept.
+const AUTO_SETTING_BUDGET: Duration = Duration::from_secs(5);
 
-const TOOL_REFERENCE: &str = "ContextStream Agents: each does one job with the workspace's decisions, lessons, docs and code, and declines anything else (a declined run is free).\n\nActions:\n- find: the workspace's agents with job, price per run, input fields (with what each means) and an example; on = an owner or admin turned it on.\n- run: agent (id or id@version), input (the agent's input object; a required project_id defaults to the session's project). A priced agent needs accepted_price_credits at or above its price: call run without it to get the quote, show the person the price, then call again with their acceptance. Runs priced within the person's auto-accept cap start at once. wait_ms (default 20000, up to 25000) waits for the result; a run still working returns its task_id for get_run. An identical ask within 10 minutes returns the same task; pass a new idempotency_key to run the same job again.\n- get_run: task_id, wait_ms (default 20000, up to 25000): status (queued, running, succeeded, failed, declined, cancelled, timed_out), the result, and what the run cost.\n- list_runs: agent (optional filter), limit (at most 50).\n- cancel_run: task_id.\n- settings: which ContextAgents are on in the workspace, grouped by kind of work: what each does, what it may access, which need review, and who can change them.\n- choose: the person picks which agents are on in a form their client shows (every agent, those on checked); a client without forms gets the checklist. agents=[ids] (or \"all\" / \"none\") sets exactly that set without a form.\n- enable / disable: agent (an id, \"all\" or \"none\") or agents (a list). Only an owner or admin changes them; anyone else is told who can. Naming an agent that needs review in enable grants its new access.\n\nBilling: a run costs its price once, only when it succeeds.";
+const TOOL_REFERENCE: &str = "ContextStream Agents: each does one job with the workspace's decisions, lessons, docs and code, and declines anything else (a declined run is free).\n\nActions:\n- find: the workspace's agents with job, price per run, input fields (with what each means) and an example; on = an owner or admin turned it on.\n- run: agent (id or id@version), input (the agent's input object; a required project_id defaults to the session's project). A priced agent needs accepted_price_credits at or above its price: call run without it to get the quote, show the person the price, then call again with their acceptance. Runs priced within the person's auto-accept cap start at once. wait_ms (default 20000, up to 25000) waits for the result; a run still working returns its task_id for get_run. An identical ask within 10 minutes returns the same task; pass a new idempotency_key to run the same job again.\n- get_run: task_id, wait_ms (default 20000, up to 25000): status (queued, running, succeeded, failed, declined, cancelled, timed_out), the result, and what the run cost.\n- list_runs: agent (optional filter), limit (at most 50).\n- cancel_run: task_id.\n- automatic=true (run): when the workspace's automatic runs are on and context() or a hook names a fitting agent, start it yourself without a quote; it runs in the background (wait_ms defaults to 0) and is recorded as automatic. Off, nothing runs.\n- settings: which ContextAgents are on in the workspace, grouped by kind of work: what each does, what it may access, which need review, and who can change them.\n- choose: the person picks which agents are on in a form their client shows (every agent, those on checked); a client without forms gets the checklist. agents=[ids] (or \"all\" / \"none\") sets exactly that set without a form.\n- enable / disable: agent (an id, \"all\" or \"none\") or agents (a list). Only an owner or admin changes them; anyone else is told who can. Naming an agent that needs review in enable grants its new access.\n\nBilling: a run costs its price once, only when it succeeds.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SlipstreamInput {
@@ -121,6 +130,8 @@ pub struct SlipstreamInput {
     pub session_id: Option<String>,
     /// Agents for enable, disable and choose: a list of ids, or `all` / `none`.
     pub agents: Option<Value>,
+    /// `run` started by the agent on its own: the workspace's automatic runs must be on.
+    pub automatic: Option<bool>,
 }
 
 pub struct SlipstreamTool {
@@ -238,6 +249,9 @@ impl SlipstreamTool {
     }
 
     async fn run(&self, input: &SlipstreamInput) -> Result<ToolResult> {
+        if input.automatic == Some(true) {
+            return self.run_automatic(input).await;
+        }
         let agent = input
             .agent
             .as_deref()
@@ -405,6 +419,202 @@ impl SlipstreamTool {
             ));
         }
         Ok(task_result(task, Some(catalog.as_ref()), &notes))
+    }
+
+    /// A run the agent starts on its own (`automatic: true`): only with the workspace's
+    /// automatic runs on and an agent they may use; no quote, since the API holds the run
+    /// within the workspace's limits; in the background unless `wait_ms` asks to wait. A
+    /// refusal stops suggestions in the workspace for an hour.
+    async fn run_automatic(&self, input: &SlipstreamInput) -> Result<ToolResult> {
+        let agent = input
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| Error::Validation("agent is required for run".to_string()))?
+            .to_string();
+        if !is_agent_id(agent_id_of(&agent)) {
+            return Err(Error::Validation(format!("{agent} is not an agent id")));
+        }
+        let task_input = match input.input.clone() {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::Object(map)) => map,
+            Some(_) => {
+                return Err(Error::Validation(
+                    "input must be the agent's input object".to_string(),
+                ))
+            }
+        };
+        let (workspace_id, project_id) = self.scope(input).await?;
+        let not_run = |why: String| {
+            ToolResult::with_structured(
+                format!(
+                    "Not run: {why} Nothing was charged. To run it anyway, ask the person first: {TOOL_NAME}(action=\"run\") without automatic gives its price to accept."
+                ),
+                json!({"ran": false, "automatic": true, "agent": agent}),
+            )
+        };
+        let Some(caller) = caller_identity(&self.client).await else {
+            return Ok(not_run(
+                "automatic runs need a signed-in caller.".to_string(),
+            ));
+        };
+        let shared = !self.client.config().await.is_http_transport;
+        let ledger = auto::Ledger::for_process(shared);
+        let read = auto::SettingCache::global()
+            .read(
+                &self.client,
+                &caller,
+                workspace_id,
+                AUTO_SETTING_BUDGET,
+                shared,
+            )
+            .await;
+        let Some(setting) = read.on() else {
+            ledger.pause(&caller, workspace_id);
+            let why = match &read {
+                auto::SettingRead::Read { setting } if setting.mcp => format!(
+                    "this workspace's ContextAgent runs are blocked: {}.",
+                    setting.blocked.as_deref().unwrap_or("blocked")
+                ),
+                auto::SettingRead::Unreachable => {
+                    "the workspace's automatic-run setting could not be read.".to_string()
+                }
+                _ => "automatic ContextAgent runs are off in this workspace (an owner or admin turns them on in the web app's ContextAgents settings).".to_string(),
+            };
+            return Ok(not_run(why));
+        };
+        let Some(runnable) = setting.runnable(&agent) else {
+            return Ok(not_run(format!(
+                "{} is not an agent automatic runs may use here: it is off, or its access needs review.",
+                agent_id_of(&agent)
+            )));
+        };
+        let needs_project_id = runnable.inputs_required.iter().any(|f| f == "project_id");
+        let project_id = project_id.ok_or_else(|| {
+            Error::Validation(
+                "No project: run init for this folder, or pass project_id (a run belongs to a project)"
+                    .to_string(),
+            )
+        })?;
+        // The input is checked against the agent's schema when the catalog is at hand.
+        let mut notes = Vec::new();
+        let task_input = match self
+            .known_catalog(workspace_id)
+            .await
+            .and_then(|catalog| catalog.find(&agent).cloned())
+        {
+            Some(entry) => {
+                let prepared = catalog::prepare_input(&entry, task_input, Some(project_id))
+                    .map_err(Error::Validation)?;
+                notes.extend(prepared.notes);
+                prepared.input
+            }
+            // Without the catalog, the setting says whether the agent takes a project_id.
+            None => {
+                let mut map = task_input;
+                if needs_project_id {
+                    map.entry("project_id".to_string())
+                        .or_insert_with(|| json!(project_id));
+                }
+                Value::Object(map)
+            }
+        };
+
+        let state = self.session.state().await;
+        let session_id = input
+            .session_id
+            .as_deref()
+            .or(state.api_session_id.as_deref())
+            .or(state.session_id.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.chars().count() <= MAX_SESSION_ID_CHARS)
+            .map(str::to_string);
+        let idempotency_key = match input
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
+            Some(key) if key.chars().count() <= 200 => key.to_string(),
+            Some(_) => {
+                return Err(Error::Validation(
+                    "idempotency_key is at most 200 characters".to_string(),
+                ))
+            }
+            None => derived_idempotency_key(
+                &caller,
+                workspace_id,
+                project_id,
+                &agent,
+                &task_input,
+                session_id.as_deref(),
+                chrono::Utc::now().timestamp().max(0) as u64,
+            )
+            .replacen("mcp-", "auto-mcp-", 1),
+        };
+        let wait_ms = input.wait_ms.unwrap_or(0).min(MAX_WAIT_MS);
+        let mut body = json!({
+            "agent": agent,
+            "input": task_input,
+            "context": { "project_id": project_id },
+            "wait_ms": wait_ms,
+            "source": auto::AUTO_SOURCE,
+            "idempotency_key": idempotency_key,
+        });
+        if let Some(session_id) = &session_id {
+            body["session_id"] = json!(session_id);
+        }
+        let sent: Result<Value> = self
+            .client
+            .post_with_options(
+                &format!("/workspaces/{workspace_id}/tasks"),
+                body,
+                RequestOptions {
+                    timeout: Some(Duration::from_millis(wait_ms) + REQUEST_SLACK),
+                    ..RequestOptions::default()
+                },
+            )
+            .await;
+        let task = match sent {
+            Ok(response) => unwrap_data(response),
+            Err(error) if auto::is_refusal(&error) => {
+                ledger.pause(&caller, workspace_id);
+                auto::SettingCache::global().forget(&caller, workspace_id);
+                let message = match &error {
+                    Error::Http { message, .. } => message.clone(),
+                    other => other.to_string(),
+                };
+                return Ok(ToolResult::with_structured(
+                    format!(
+                        "Not run: {message} Nothing was charged, and no more ContextAgents will be suggested in this workspace for an hour."
+                    ),
+                    json!({"ran": false, "automatic": true, "agent": agent, "refused": message}),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let task_id = task
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok());
+        if let Some(task_id) = task_id {
+            ledger.mark_started(&caller, workspace_id, Some(project_id), &agent, task_id);
+            if task.get("done").and_then(Value::as_bool) != Some(true) {
+                notes.push(format!(
+                    "Started automatically, in the background: keep working, and read its result later with {TOOL_NAME}(action=\"get_run\", task_id=\"{task_id}\"); context() also says when it finishes."
+                ));
+            }
+        }
+        let mut result = task_result(task, None, &notes);
+        if let Some(map) = result
+            .structured_content
+            .as_mut()
+            .and_then(Value::as_object_mut)
+        {
+            map.insert("automatic".to_string(), json!(true));
+        }
+        Ok(result)
     }
 
     /// A run the API refused: a raised price is a new quote; the rest say what to do.
@@ -616,6 +826,11 @@ pub(crate) fn input_schema() -> Value {
         .object(
             "input",
             "The agent's input object (run). find lists each agent's fields; a required project_id defaults to the session's project.",
+            false,
+        )
+        .boolean(
+            "automatic",
+            "run started on your own because context() or a hook named this agent for the task: only when the workspace's automatic runs are on; no quote, runs in the background",
             false,
         )
         .integer(
@@ -844,10 +1059,11 @@ impl SlipstreamListing {
         entry: &GateEntry,
         base_schema: &Value,
         auto_accept_max_credits: u32,
+        automatic_runs: bool,
     ) -> Self {
         let described = match &entry.availability {
             Availability::Available(catalog) => {
-                describe::describe(catalog, auto_accept_max_credits)
+                describe::describe_auto(catalog, auto_accept_max_credits, automatic_runs)
             }
             // Agents the workspace has, none on: listed with how to turn them on, so an owner
             // or admin can from here.
@@ -934,7 +1150,15 @@ pub async fn listing(
     };
     let entry = gate.ensure(client, &key, budget).await;
     let cap = client.config().await.slipstream_auto_accept_max_credits;
-    SlipstreamListing::from_entry(Some(identity), &entry, base_schema, cap)
+    let automatic = automatic_runs_known_on(&identity, workspace_id);
+    SlipstreamListing::from_entry(Some(identity), &entry, base_schema, cap, automatic)
+}
+
+/// Whether the workspace's automatic runs were on when last read (never reads).
+fn automatic_runs_known_on(identity: &str, workspace_id: Uuid) -> bool {
+    auto::SettingCache::global()
+        .peek(identity, workspace_id)
+        .is_some_and(|read| read.on().is_some())
 }
 
 /// Read the catalog for the current caller in the background, so the tools/list that
@@ -952,7 +1176,21 @@ pub fn prefetch(
                 identity,
                 workspace_id,
             };
-            gate.ensure(&client, &key, CATALOG_READ_BUDGET).await;
+            let entry = gate.ensure(&client, &key, CATALOG_READ_BUDGET).await;
+            // With agents on, the automatic-run setting too, so the listing and the first
+            // hint find it.
+            if matches!(entry.availability, Availability::Available(_)) {
+                let shared = !client.config().await.is_http_transport;
+                auto::SettingCache::global()
+                    .read(
+                        &client,
+                        &key.identity,
+                        workspace_id,
+                        CATALOG_READ_BUDGET,
+                        shared,
+                    )
+                    .await;
+            }
         }
     });
 }
@@ -995,7 +1233,14 @@ pub async fn listing_changed(
                 None => gate.ensure(client, &key, CHANGE_CHECK_BUDGET).await,
             };
             let cap = client.config().await.slipstream_auto_accept_max_credits;
-            SlipstreamListing::from_entry(Some(identity.clone()), &entry, base_schema, cap)
+            let automatic = automatic_runs_known_on(&identity, workspace_id);
+            SlipstreamListing::from_entry(
+                Some(identity.clone()),
+                &entry,
+                base_schema,
+                cap,
+                automatic,
+            )
         }
     };
     let changed = current.fingerprint() != advertised;

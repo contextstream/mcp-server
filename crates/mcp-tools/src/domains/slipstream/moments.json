@@ -1,0 +1,262 @@
+{
+  "version": 1,
+  "about": "Moments in a coding session where a ContextAgent can take work off the main agent. A moment fits a request (prompt), a shell command about to run or that failed (commands, failed_commands), or a file edit (paths). The agent that takes it is found from each agent's name and one-line job (job), so a new agent with a plain job line fits without a code change. Tokens: lowercase words; a trailing * matches a prefix; <version> matches v1, v1.2, 1.2.3; <pr-ref> matches #42 or .../pull/42. A prompt matches when every group of one any_of entry has a word in it, or a phrase is in it, and no `not` phrase is; `requires` adds question (the prompt asks something) and no_change (it asks for no change). Shared with ContextCode (contextcode mirrors this file).",
+  "moments": [
+    {
+      "id": "dependencies",
+      "why": "a dependency upgrade",
+      "prompt": {
+        "any_of": [
+          [
+            ["upgrade*", "update", "updating", "bump*", "refresh*", "renovate", "moderni*"],
+            ["dep", "deps", "dependency", "dependencies", "packages", "libraries", "crates", "lockfile", "lockfiles", "gems", "requirements.txt"]
+          ]
+        ],
+        "phrases": ["npm outdated", "outdated packages", "outdated dependencies", "outdated deps", "dependabot", "cargo outdated", "npm update", "cargo update", "yarn upgrade"],
+        "not": []
+      },
+      "commands": ["npm outdated", "npm update", "npm upgrade", "npx npm-check-updates", "npm-check-updates", "ncu", "yarn upgrade", "yarn outdated", "pnpm update", "pnpm up", "pnpm outdated", "cargo update", "cargo upgrade", "cargo outdated", "pip list --outdated", "pip install -u", "pip install --upgrade", "pip3 install -u", "pip3 install --upgrade", "poetry update", "uv lock --upgrade", "go get -u", "bundle update", "composer update"],
+      "failed_commands": ["npm install", "npm ci", "npm i", "yarn install", "pnpm install", "pip install", "pip3 install", "poetry install", "bundle install"],
+      "paths": [],
+      "job": {
+        "any_of": [
+          [
+            ["dependenc*", "upgrad*"]
+          ]
+        ],
+        "not": ["vulnerab*", "security"]
+      }
+    },
+    {
+      "id": "security",
+      "why": "a security question about the code or its dependencies",
+      "prompt": {
+        "any_of": [
+          [
+            ["vulnerable", "vulnerability", "vulnerabilities", "vuln", "vulns", "cve", "cves", "exploit", "exploitable", "advisory", "advisories", "osv"]
+          ]
+        ],
+        "phrases": ["security audit", "security scan", "security issue", "security issues", "security hole", "security holes", "security review", "npm audit", "cargo audit", "pip audit", "supply chain"],
+        "not": []
+      },
+      "commands": ["npm audit", "yarn audit", "pnpm audit", "cargo audit", "cargo deny", "pip-audit", "osv-scanner", "snyk test", "trivy fs"],
+      "failed_commands": [],
+      "paths": [
+        {"name": "package-lock.json"},
+        {"name": "yarn.lock"},
+        {"name": "pnpm-lock.yaml"},
+        {"name": "Cargo.lock"},
+        {"name": "poetry.lock"},
+        {"name": "Pipfile.lock"},
+        {"name": "uv.lock"},
+        {"name": "Gemfile.lock"},
+        {"name": "go.sum"},
+        {"name": "composer.lock"}
+      ],
+      "job": {
+        "any_of": [
+          [
+            ["vulnerab*", "security", "cve*", "osv*"]
+          ]
+        ],
+        "not": []
+      }
+    },
+    {
+      "id": "ci_failure",
+      "why": "failing CI or tests",
+      "prompt": {
+        "any_of": [
+          [
+            ["ci", "pipeline", "pipelines", "checks"],
+            ["fail", "fails", "failing", "failed", "failure", "failures", "broken", "red", "flaky"]
+          ]
+        ],
+        "phrases": ["tests are failing", "test is failing", "failing tests", "failing test", "tests fail", "test fails", "fix the build", "build is broken", "build is failing", "build is red", "github actions failing", "github actions is failing", "github actions are failing"],
+        "not": []
+      },
+      "commands": ["gh run view", "gh run rerun", "gh run watch"],
+      "failed_commands": ["gh pr checks", "gh run watch", "gh run view"],
+      "paths": [],
+      "job": {
+        "any_of": [
+          [
+            ["ci", "failing", "failure*"]
+          ]
+        ],
+        "not": ["upgrad*"]
+      }
+    },
+    {
+      "id": "docs",
+      "why": "docs that may no longer match the code",
+      "prompt": {
+        "any_of": [
+          [
+            ["doc", "docs", "documentation", "readme", "readmes"],
+            ["outdated", "stale", "drift", "drifted", "accurate", "inaccurate", "match", "matches", "mismatch*", "date"]
+          ]
+        ],
+        "phrases": [],
+        "not": []
+      },
+      "commands": [],
+      "failed_commands": [],
+      "paths": [
+        {
+          "name": "README*"
+        },
+        {
+          "dir": "docs",
+          "ext": ["md", "mdx", "rst"]
+        }
+      ],
+      "job": {
+        "any_of": [
+          [
+            ["doc", "docs", "documentation", "readme*"],
+            ["drift*", "match*", "stale", "outdated"]
+          ]
+        ],
+        "not": []
+      }
+    },
+    {
+      "id": "release",
+      "why": "an upcoming release",
+      "prompt": {
+        "any_of": [
+          [
+            ["release", "releasing", "released", "ship", "shipping", "tag", "tagging", "cut", "publish", "publishing"],
+            ["<version>"]
+          ],
+          [
+            ["release", "releases", "releasing"],
+            ["notes", "ready", "prepare", "preparing", "prep", "upcoming", "cut", "draft", "candidate", "announcement"]
+          ],
+          [
+            ["changelog", "changelogs"]
+          ]
+        ],
+        "phrases": [],
+        "not": ["release build", "build release", "release mode", "release profile", "release flag", "release the lock", "release lock", "memory release"]
+      },
+      "commands": ["git tag v", "git tag -a v", "git tag -s v", "gh release create", "npm version", "cargo release", "changeset version", "semantic-release"],
+      "failed_commands": [],
+      "paths": [
+        {"name": "CHANGELOG*"},
+        {"name": "CHANGES*"},
+        {"name": "RELEASE_NOTES*"}
+      ],
+      "job": {
+        "any_of": [
+          [
+            ["release*", "changelog*"]
+          ]
+        ],
+        "not": []
+      }
+    },
+    {
+      "id": "onboarding",
+      "why": "getting to know the repository",
+      "prompt": {
+        "any_of": [],
+        "phrases": ["new to this repo", "new to the repo", "new to this codebase", "new to the codebase", "new to this project", "onboard me", "onboarding guide", "overview of this repo", "overview of the repo", "overview of this codebase", "overview of the codebase", "overview of this project", "walk me through the codebase", "walk me through this repo", "walk me through the repo", "walk me through this codebase", "how is this repo organized", "how is the repo organized", "how is this codebase organized", "how is this repo structured", "how is the codebase structured", "how is this codebase structured", "architecture overview", "explain this codebase", "explain this repo", "tour of the codebase", "tour of this repo"],
+        "not": []
+      },
+      "commands": [],
+      "failed_commands": [],
+      "paths": [],
+      "job": {
+        "any_of": [
+          [
+            ["onboarding", "guide", "overview", "orient*"]
+          ]
+        ],
+        "not": ["status"]
+      }
+    },
+    {
+      "id": "code_question",
+      "why": "a question about where code is or how it works",
+      "prompt": {
+        "any_of": [
+          [
+            ["where", "how", "what", "which", "who"],
+            ["defined", "implemented", "handled", "handles", "calls", "called", "flow", "flows", "work", "works", "live", "lives", "located", "wired", "registered", "configured", "happen", "happens", "computed", "stored", "validated", "used", "loaded", "initialized", "created", "parsed", "sent", "checked", "emitted"]
+          ]
+        ],
+        "phrases": [],
+        "not": [],
+        "requires": ["question", "no_change"]
+      },
+      "commands": [],
+      "failed_commands": [],
+      "paths": [],
+      "job": {
+        "any_of": [
+          [
+            ["where", "calls", "flows", "code"],
+            ["question", "questions", "answers"]
+          ]
+        ],
+        "not": []
+      }
+    },
+    {
+      "id": "memory_hygiene",
+      "why": "stale or conflicting decisions, lessons or todos",
+      "prompt": {
+        "any_of": [
+          [
+            ["stale", "outdated", "duplicate", "duplicated", "conflicting", "obsolete"],
+            ["decision", "decisions", "lesson", "lessons", "todos", "todo", "reminders", "memory", "memories", "plans"]
+          ]
+        ],
+        "phrases": ["clean up memory", "clean up the memory", "tidy up memory", "tidy memory", "clean up decisions", "clean up todos"],
+        "not": []
+      },
+      "commands": [],
+      "failed_commands": [],
+      "paths": [],
+      "job": {
+        "any_of": [
+          [
+            ["stale", "duplicate", "conflicting", "garden*"],
+            ["decision*", "lesson*", "todo*", "memory"]
+          ]
+        ],
+        "not": []
+      }
+    },
+    {
+      "id": "pr_review",
+      "why": "a pull request to review",
+      "prompt": {
+        "any_of": [
+          [
+            ["review", "reviewing"],
+            ["pr", "prs", "pull", "<pr-ref>"]
+          ]
+        ],
+        "phrases": [],
+        "not": []
+      },
+      "commands": [],
+      "failed_commands": [],
+      "paths": [],
+      "job": {
+        "any_of": [
+          [
+            ["review*"],
+            ["pull", "pr", "prs"]
+          ]
+        ],
+        "not": []
+      }
+    }
+  ],
+  "change_verbs": ["fix", "add", "implement", "change", "update", "refactor", "write", "create", "remove", "delete", "rename", "make", "build", "upgrade", "bump", "migrate", "port", "rewrite", "edit", "modify", "replace", "move"],
+  "question_words": ["where", "how", "what", "which", "who", "why", "when", "is", "are", "does", "do", "can", "could", "should"]
+}

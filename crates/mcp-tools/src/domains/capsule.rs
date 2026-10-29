@@ -984,7 +984,7 @@ impl ToolHandler for CapsuleTool {
 
     fn input_schema(&self) -> Value {
         SchemaBuilder::new()
-            .description("Portable ContextCapsule operations. open|get|list|create|share|chunk|stream|context_doc|graph|audit|list_shares|revoke_share|explain — see tool description for when to use each.")
+            .description("Portable ContextCapsule operations. open|get|list|create|share|chunk|stream|context_doc|graph|audit|list_shares|explain — see tool description for when to use each.")
             .string_enum(
                 "action",
                 &crate::schema::with_full_reference("Action to perform", CAPSULE_TOOL_REFERENCE),

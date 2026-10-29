@@ -199,6 +199,26 @@ pub fn commit(path: &Path, loaded: &LoadedConfig, updated: &Value) -> Result<boo
     commit_with_removals(path, loaded, updated, &[])
 }
 
+/// Commit a non-secret JSON/JSONC project document so newly created files
+/// inherit permissions from the caller's `umask` (`0o666 & !umask`) instead of
+/// `0600`, while existing files keep their current mode.
+pub(crate) fn commit_public(path: &Path, loaded: &LoadedConfig, updated: &Value) -> Result<bool> {
+    commit_public_with_removals(path, loaded, updated, &[])
+}
+
+/// Variant of [`commit_with_removals`] for non-secret project config files
+/// (such as `.contextstream/config.json`) whose newly created mode should
+/// respect `umask`.
+pub(crate) fn commit_public_with_removals(
+    path: &Path,
+    loaded: &LoadedConfig,
+    updated: &Value,
+    removed_keys: &[&str],
+) -> Result<bool> {
+    let content = render_with_removals(loaded, updated, removed_keys)?;
+    write_if_changed_from_snapshot_full(path, &content, loaded, false, true, true)
+}
+
 /// Commit a secret-bearing JSON document with owner-only permissions already
 /// applied to the staged file before its atomic rename. Secret-bearing state
 /// deliberately gets no recovery sidecar: retaining the previous secret is a
@@ -562,6 +582,13 @@ fn unique_sibling_path(path: &Path, purpose: &str) -> Result<PathBuf> {
 }
 
 fn create_unique_temp(path: &Path) -> Result<(PathBuf, File)> {
+    create_unique_temp_with_mode(path, 0o600)
+}
+
+fn create_unique_temp_with_mode(path: &Path, initial_mode: u32) -> Result<(PathBuf, File)> {
+    #[cfg(not(unix))]
+    let _ = initial_mode;
+
     for _ in 0..100 {
         let candidate = unique_sibling_path(path, "tmp")?;
         let mut options = OpenOptions::new();
@@ -569,10 +596,11 @@ fn create_unique_temp(path: &Path) -> Result<(PathBuf, File)> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            // A staged editor config can contain credentials. Keep it private
-            // from creation; widen to the destination's mode only after all
-            // bytes have been written.
-            options.mode(0o600);
+            // Secret-bearing configs pass 0o600 so staged bytes stay private
+            // from creation; non-secret project files pass 0o666 on fresh
+            // creation so the kernel applies `0o666 & !umask` atomically
+            // without mutating process-global umask state across threads.
+            options.mode(initial_mode);
         }
         match options.open(&candidate) {
             Ok(file) => return Ok((candidate, file)),
@@ -891,6 +919,25 @@ pub fn write_if_unchanged(
     write_if_changed_impl(path, content, Some(expected_existing), true)
 }
 
+/// Write a non-secret rules/project text file whose initial creation mode
+/// should respect the caller's `umask` (`0o666 & !umask`) rather than `0600`.
+/// Existing files preserve their current permissions.
+pub(crate) fn write_public_if_unchanged(
+    path: &Path,
+    content: &str,
+    expected_existing: Option<&str>,
+) -> Result<bool> {
+    write_if_changed_impl_full(
+        path,
+        content,
+        Some(expected_existing),
+        true,
+        false,
+        None,
+        true,
+    )
+}
+
 /// Write a Git hook replacement with executable permissions already applied
 /// to the staged file before its atomic rename.
 pub(crate) fn write_executable_if_unchanged(
@@ -966,6 +1013,24 @@ fn write_if_changed_from_snapshot_with_options(
     force_private_permissions: bool,
     create_backup: bool,
 ) -> Result<bool> {
+    write_if_changed_from_snapshot_full(
+        path,
+        content,
+        loaded,
+        force_private_permissions,
+        create_backup,
+        false,
+    )
+}
+
+fn write_if_changed_from_snapshot_full(
+    path: &Path,
+    content: &str,
+    loaded: &LoadedConfig,
+    force_private_permissions: bool,
+    create_backup: bool,
+    allow_umask_for_new: bool,
+) -> Result<bool> {
     let resolved_path = resolve_edit_path(path)?;
     if resolved_path != loaded.resolved_path {
         bail!(
@@ -978,13 +1043,14 @@ fn write_if_changed_from_snapshot_with_options(
     } else {
         Some(None)
     };
-    write_if_changed_impl_with_permissions(
+    write_if_changed_impl_full(
         &resolved_path,
         content,
         expected,
         create_backup,
         force_private_permissions,
         None,
+        allow_umask_for_new,
     )
 }
 
@@ -1008,6 +1074,26 @@ fn write_if_changed_impl_with_permissions(
     create_backup: bool,
     force_private_permissions: bool,
     replacement_permissions: Option<std::fs::Permissions>,
+) -> Result<bool> {
+    write_if_changed_impl_full(
+        path,
+        content,
+        expected,
+        create_backup,
+        force_private_permissions,
+        replacement_permissions,
+        false,
+    )
+}
+
+fn write_if_changed_impl_full(
+    path: &Path,
+    content: &str,
+    expected: Option<Option<&str>>,
+    create_backup: bool,
+    force_private_permissions: bool,
+    replacement_permissions: Option<std::fs::Permissions>,
+    allow_umask_for_new: bool,
 ) -> Result<bool> {
     #[cfg(not(unix))]
     let _ = force_private_permissions;
@@ -1056,20 +1142,30 @@ fn write_if_changed_impl_with_permissions(
     // Explicitly requested permissions (an executable Git hook) win over the
     // private default for newly created files; otherwise a new hook would be
     // staged as 0600 and Git would silently skip it.
+    #[cfg(not(unix))]
+    let _ = allow_umask_for_new;
+
     let explicit_permissions = replacement_permissions.is_some();
     let original_permissions = replacement_permissions.or_else(|| {
         std::fs::metadata(path)
             .ok()
             .map(|metadata| metadata.permissions())
     });
-    let (tmp, mut file) = create_unique_temp(path)?;
+    let use_umask_for_new = allow_umask_for_new
+        && !force_private_permissions
+        && existing.is_none()
+        && !explicit_permissions;
+    let initial_temp_mode = if use_umask_for_new { 0o666 } else { 0o600 };
+    let (tmp, mut file) = create_unique_temp_with_mode(path, initial_temp_mode)?;
     let prepare_result = (|| -> Result<()> {
         file.write_all(content.as_bytes())?;
         if let Some(permissions) = original_permissions {
             std::fs::set_permissions(&tmp, permissions)?;
         }
         #[cfg(unix)]
-        if force_private_permissions || (existing.is_none() && !explicit_permissions) {
+        if force_private_permissions
+            || (existing.is_none() && !explicit_permissions && !allow_umask_for_new)
+        {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         }
@@ -2187,6 +2283,53 @@ mod tests {
 
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_writes_respect_umask_on_creation_and_preserve_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference = dir.path().join("reference.md");
+        std::fs::write(&reference, "# ref\n").unwrap();
+        let expected_umask_mode =
+            std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+
+        let rules_path = dir.path().join("AGENTS.md");
+        write_public_if_unchanged(&rules_path, "# agents\n", None).unwrap();
+        assert_eq!(
+            std::fs::metadata(&rules_path).unwrap().permissions().mode() & 0o777,
+            expected_umask_mode
+        );
+
+        let config_path = dir.path().join("config.json");
+        let loaded = read_for_edit(&config_path, JsonDialect::Strict).unwrap();
+        let mut updated = loaded.value.clone();
+        updated["workspace_id"] = json!("ws-1");
+        commit_public(&config_path, &loaded, &updated).unwrap();
+        assert_eq!(
+            std::fs::metadata(&config_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            expected_umask_mode
+        );
+
+        // Pre-existing private files keep their existing mode on public updates.
+        let private_rules = dir.path().join("CLAUDE.md");
+        std::fs::write(&private_rules, "# old\n").unwrap();
+        std::fs::set_permissions(&private_rules, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_public_if_unchanged(&private_rules, "# new\n", Some("# old\n")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private_rules)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
     }

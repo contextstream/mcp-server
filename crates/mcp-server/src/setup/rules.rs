@@ -447,7 +447,7 @@ fn write_contextstream_block_to_path(
 
     let new_content =
         render_contextstream_block_for_path(&resolved_path, existing_content, &stamped_block)?;
-    safe_edit::write_if_unchanged(&resolved_path, &new_content, existing.as_deref())?;
+    safe_edit::write_public_if_unchanged(&resolved_path, &new_content, existing.as_deref())?;
     Ok(true)
 }
 
@@ -1168,7 +1168,7 @@ fn write_copilot_skill_file(project_path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    safe_edit::write_if_unchanged(&skill_path, &content, existing.as_deref())?;
+    safe_edit::write_public_if_unchanged(&skill_path, &content, existing.as_deref())?;
     Ok(())
 }
 

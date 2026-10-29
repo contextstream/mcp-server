@@ -978,9 +978,18 @@ pub async fn uninstall(
                     failures.push(format!("saved editor selection: {error}"));
                 }
             }
-        } else if let Err(error) = mcp_client::activation::remove_configured_clients(&target_ids) {
-            warn!("Could not update the saved editor selection: {}", error);
-            failures.push(format!("saved editor selection: {error}"));
+        } else {
+            if let Err(error) = mcp_client::activation::remove_configured_clients(&target_ids) {
+                warn!("Could not update the saved editor selection: {}", error);
+                failures.push(format!("saved editor selection: {error}"));
+            }
+            if targets.contains(&editors::Editor::ClaudeCode) {
+                if let Err(error) =
+                    mcp_client::activation::set_keep_claude_auto_memory_preference(false)
+                {
+                    warn!("Could not clear Claude auto-memory preference: {}", error);
+                }
+            }
         }
     }
 

@@ -114,6 +114,48 @@ pub fn is_managed_rules_only(text: &str) -> bool {
     blocks > 0 && !inside
 }
 
+/// `text` with the lines of every managed rules block (the opening and closing
+/// tags included) emptied, and every line break kept, so the person's own text
+/// stays where it was and line numbers still match the file on disk.
+///
+/// A rules file that has the person's guidance next to the block cannot be left
+/// out of the index whole, but the block's instructions to the agent would
+/// outrank project code in search just the same (#312). A block that is not
+/// closed is an edit in progress, so then the text is returned unchanged.
+pub fn blank_managed_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut inside = false;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let tag = line
+            .strip_prefix('\u{feff}')
+            .filter(|_| index == 0)
+            .unwrap_or(line)
+            .trim()
+            .trim_start_matches('#')
+            .trim();
+        let line_break = if line.ends_with("\r\n") {
+            "\r\n"
+        } else if line.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        if inside {
+            out.push_str(line_break);
+            inside = !MANAGED_BLOCK_CLOSERS.contains(&tag);
+        } else if MANAGED_BLOCK_OPENERS.contains(&tag) {
+            out.push_str(line_break);
+            inside = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    if inside {
+        return text.to_string();
+    }
+    out
+}
+
 /// Comment marker used inside the `<contextstream>` block of locally-
 /// generated rules files to record the canonical teaching-bundle
 /// fingerprint that wrote them. Reading this back lets the MCP binary
@@ -387,6 +429,41 @@ mod tests {
         assert!(!is_managed_rules_only(
             "Wrap it in <contextstream> and </contextstream> tags.\n"
         ));
+    }
+
+    #[test]
+    fn blanking_a_block_keeps_the_persons_text_and_every_line_number() {
+        let block =
+            "<contextstream>\n# ContextStream Rules\nUse context() first.\n</contextstream>\n";
+        let text =
+            format!("# Our conventions\n\nPrefer small functions.\n\n{block}\n## Release notes\n");
+        let blanked = blank_managed_blocks(&text);
+        assert_eq!(
+            blanked,
+            "# Our conventions\n\nPrefer small functions.\n\n\n\n\n\n\n## Release notes\n"
+        );
+        assert_eq!(blanked.lines().count(), text.lines().count());
+        assert!(!blanked.contains("context()"));
+
+        // CRLF endings are kept, several blocks are each blanked, and the
+        // commented-out YAML form and legacy markers count.
+        let crlf = "notes\r\n<contextstream>\r\nrules\r\n</contextstream>\r\nmore\r\n";
+        assert_eq!(blank_managed_blocks(crlf), "notes\r\n\r\n\r\n\r\nmore\r\n");
+        let two = "a\n<!-- BEGIN ContextStream -->\nx\n<!-- END ContextStream -->\nb\n# <contextstream>\n# y\n# </contextstream>\nc";
+        assert_eq!(blank_managed_blocks(two), "a\n\n\n\nb\n\n\n\nc");
+    }
+
+    #[test]
+    fn blanking_leaves_text_without_a_closed_block_exactly_as_it_was() {
+        for text in [
+            "",
+            "no block here\n",
+            "<contextstream>\nnever closed\n",
+            "mentions <contextstream> inline\nand </contextstream> too\n",
+            "no trailing newline",
+        ] {
+            assert_eq!(blank_managed_blocks(text), text);
+        }
     }
 
     #[test]

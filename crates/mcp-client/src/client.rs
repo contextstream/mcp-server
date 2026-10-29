@@ -3130,6 +3130,7 @@ impl ContextStreamClient {
         if Self::is_managed_rules_content(name, &content) {
             return TargetedFileDecision::Delete(relative);
         }
+        let content = Self::content_for_index(name, content);
         if std::fs::canonicalize(&candidate).ok().as_ref() != Some(&canonical_before) {
             return TargetedFileDecision::Reject;
         }
@@ -11136,7 +11137,7 @@ impl ContextStreamClient {
             // The managed rules `setup` writes are instructions for the agent,
             // not project code. Checked even when the fingerprint says the
             // file is unchanged, so a copy an older release indexed goes too.
-            let managed_rules_bytes = mcp_types::rules_hash::is_managed_rules_file_name(name)
+            let rules_text = mcp_types::rules_hash::is_managed_rules_file_name(name)
                 .then(|| {
                     Self::read_bounded_text_beneath(
                         &canonical_root,
@@ -11144,11 +11145,25 @@ impl ContextStreamClient {
                         5 * 1024 * 1024,
                     )
                     .ok()
-                    .filter(|content| Self::is_managed_rules_content(name, content))
-                    .map(|content| content.len())
                 })
                 .flatten();
-            let reused = cached_hash.is_some();
+            let managed_rules_bytes = rules_text
+                .as_ref()
+                .filter(|content| Self::is_managed_rules_content(name, content))
+                .map(|content| content.len());
+            // A rules file with the person's text next to the block is indexed
+            // with the block blanked (#312). A copy indexed before that still
+            // holds the block, so it is sent again once: it counts as unchanged
+            // only when the stored hash is the hash of what would be sent now.
+            let blanked_rules_text = rules_text
+                .as_ref()
+                .map(|content| mcp_types::rules_hash::blank_managed_blocks(content))
+                .filter(|blanked| Some(blanked) != rules_text.as_ref());
+            let reused = match (cached_hash, blanked_rules_text.as_ref()) {
+                (Some(stored), Some(blanked)) => *stored == Self::sha256_hex(blanked),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
             if let Some(bytes) = managed_rules_bytes {
                 content_files_read += 1;
                 content_bytes_read = content_bytes_read.saturating_add(bytes as u64);
@@ -11192,6 +11207,7 @@ impl ContextStreamClient {
                     5 * 1024 * 1024,
                 ) {
                     Ok(content) => {
+                        let content = Self::content_for_index(name, content);
                         content_files_read += 1;
                         content_bytes_read =
                             content_bytes_read.saturating_add(content.len() as u64);
@@ -11462,6 +11478,17 @@ impl ContextStreamClient {
     fn is_managed_rules_content(name: &str, content: &str) -> bool {
         mcp_types::rules_hash::is_managed_rules_file_name(name)
             && mcp_types::rules_hash::is_managed_rules_only(content)
+    }
+
+    /// The text of a file as it is indexed: a rules file has its managed
+    /// block blanked, line breaks kept, so only the person's own text is
+    /// searchable (#312). Any other file is unchanged.
+    fn content_for_index(name: &str, content: String) -> String {
+        if mcp_types::rules_hash::is_managed_rules_file_name(name) {
+            mcp_types::rules_hash::blank_managed_blocks(&content)
+        } else {
+            content
+        }
     }
 
     /// [`Self::is_managed_rules_content`] for a file on disk. Anything that
@@ -28446,6 +28473,33 @@ mod tests {
             .collect();
         uploaded.sort();
         assert_eq!(uploaded, ["AGENTS.md", "README.md", "main.rs"]);
+        // The person's own text is indexed where it was; the block is blanked,
+        // line for line (#312). README.md is not a rules file, so it is as written.
+        let agents = scan
+            .files
+            .iter()
+            .find(|file| file["path"] == "AGENTS.md")
+            .expect("AGENTS.md uploaded");
+        let sent = agents["content"].as_str().unwrap();
+        assert!(sent.starts_with("# Our conventions\n\nPrefer small functions.\n"));
+        assert!(!sent.contains("context()"), "{sent}");
+        let on_disk = std::fs::read_to_string(root.join("AGENTS.md"))?;
+        assert_eq!(sent.lines().count(), on_disk.lines().count());
+        let readme = scan
+            .files
+            .iter()
+            .find(|file| file["path"] == "README.md")
+            .unwrap();
+        assert!(readme["content"].as_str().unwrap().contains("context()"));
+        match ContextStreamClient::targeted_text_file_decision(
+            &root_path,
+            root.join("AGENTS.md").to_string_lossy().as_ref(),
+        ) {
+            TargetedFileDecision::Upload(payload) => {
+                assert_eq!(payload["content"].as_str().unwrap(), sent);
+            }
+            _ => panic!("AGENTS.md is uploaded by the targeted path too"),
+        }
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -28518,6 +28572,71 @@ mod tests {
         assert_eq!(scan.reused_files, 1, "only src/lib.rs is still reused");
         assert_eq!(scan.policy_deleted_paths, ["CLAUDE.md"]);
         assert!(!scan.fingerprints.contains_key("CLAUDE.md"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rules_file_with_a_block_is_resent_once_then_reused_when_its_hash_is_of_the_blanked_text(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("mcp-client-managed-rules-mixed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        let mixed = format!("# Our conventions\n\nPrefer small functions.\n\n{MANAGED_RULES_FILE}");
+        std::fs::write(root.join("AGENTS.md"), &mixed)?;
+        let blanked = mcp_types::rules_hash::blank_managed_blocks(&mixed);
+        assert_ne!(blanked, mixed);
+
+        let fingerprint = ContextStreamClient::local_file_fingerprint(&std::fs::metadata(
+            root.join("AGENTS.md"),
+        )?)
+        .expect("regular file fingerprint");
+        let cutoff = std::cmp::max(
+            (
+                fingerprint.modified_seconds,
+                fingerprint.modified_nanoseconds,
+            ),
+            (fingerprint.changed_seconds, fingerprint.changed_nanoseconds),
+        );
+        let policy = FingerprintReusePolicy {
+            closed_tick_cutoff: Some(FilesystemTimestamp {
+                seconds: cutoff.0,
+                nanoseconds: cutoff.1,
+            }),
+            refresh_cutoff_per_file: false,
+            filesystem_supported_override: Some(true),
+        };
+        let scan_with = |stored_hash: String| {
+            let manifest = HashManifestData {
+                hashes: std::collections::HashMap::from([("AGENTS.md".to_string(), stored_hash)]),
+                fingerprints: std::collections::HashMap::from([(
+                    "AGENTS.md".to_string(),
+                    fingerprint.clone(),
+                )]),
+            };
+            ContextStreamClient::new(Config::default()).read_local_files_scoped_with_policy(
+                root.to_string_lossy().as_ref(),
+                usize::MAX,
+                false,
+                "managed-rules-mixed",
+                Some(&manifest),
+                false,
+                policy,
+            )
+        };
+
+        // Indexed by an earlier release, block and all: sent again, blanked.
+        let resent = scan_with(ContextStreamClient::sha256_hex(&mixed))?;
+        assert_eq!(resent.reused_files, 0);
+        assert_eq!(resent.files.len(), 1);
+        assert_eq!(resent.files[0]["content"], blanked.as_str());
+
+        // Already indexed as it is sent now: nothing to send.
+        let current = scan_with(ContextStreamClient::sha256_hex(&blanked))?;
+        assert_eq!(current.reused_files, 1);
+        assert!(current.files.is_empty());
 
         std::fs::remove_dir_all(root)?;
         Ok(())

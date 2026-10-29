@@ -169,7 +169,11 @@ fn create_test_registry() -> mcp_tools::ToolRegistry {
         session.clone(),
     );
     mcp_tools::domains::reminder::register_reminder_tools(&mut registry, client.clone());
-    mcp_tools::domains::coordination::register_coordination_tools(&mut registry, client.clone());
+    mcp_tools::domains::coordination::register_coordination_tools(
+        &mut registry,
+        client.clone(),
+        session.clone(),
+    );
     mcp_tools::domains::media::register_media_tools(&mut registry, client.clone(), session.clone());
     mcp_tools::domains::help::register_help_tools(&mut registry, client.clone());
 
@@ -240,6 +244,7 @@ mod notice_conformance_tests {
         mcp_tools::domains::coordination::register_coordination_tools(
             &mut registry,
             client.clone(),
+            session.clone(),
         );
         mcp_tools::domains::help::register_help_tools(&mut registry, client.clone());
         let registered: std::collections::HashSet<String> =

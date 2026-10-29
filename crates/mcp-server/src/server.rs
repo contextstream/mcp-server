@@ -103,7 +103,11 @@ pub fn build_registry(
         );
     }
     domains::reminder::register_reminder_tools(&mut registry, client.clone());
-    domains::coordination::register_coordination_tools(&mut registry, client.clone());
+    domains::coordination::register_coordination_tools(
+        &mut registry,
+        client.clone(),
+        session.clone(),
+    );
     domains::feed::register_feed_tools(&mut registry, client.clone(), session.clone());
     // Phase 1-3 taxonomy expansion: unified entity CRUD across tickets,
     // handoffs, backlog_views, incidents, releases, experiments, goals,

@@ -426,6 +426,69 @@ pub fn take_planned_changes() -> Vec<PlannedChange> {
     }
 }
 
+#[cfg(not(test))]
+fn applied_journal() -> &'static std::sync::Mutex<Option<Vec<PlannedChange>>> {
+    static APPLIED: std::sync::OnceLock<std::sync::Mutex<Option<Vec<PlannedChange>>>> =
+        std::sync::OnceLock::new();
+    APPLIED.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_APPLIED: std::cell::RefCell<Option<Vec<PlannedChange>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Start recording the changes real (non-dry-run) writes make, so a caller
+/// such as `doctor --repair` can report what it actually changed (#264).
+pub fn begin_applied_journal() {
+    #[cfg(not(test))]
+    {
+        *applied_journal().lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    }
+    #[cfg(test)]
+    {
+        TEST_APPLIED.with(|applied| *applied.borrow_mut() = Some(Vec::new()));
+    }
+}
+
+/// Stop recording and return what was written since [`begin_applied_journal`].
+pub fn take_applied_changes() -> Vec<PlannedChange> {
+    #[cfg(not(test))]
+    {
+        applied_journal()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default()
+    }
+    #[cfg(test)]
+    {
+        TEST_APPLIED.with(|applied| applied.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+fn record_applied(path: &Path, action: ChangeAction) {
+    #[cfg(not(test))]
+    {
+        if let Some(applied) = applied_journal()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            record_planned_in(applied, path, action, String::new());
+        }
+    }
+    #[cfg(test)]
+    {
+        TEST_APPLIED.with(|applied| {
+            if let Some(applied) = applied.borrow_mut().as_mut() {
+                record_planned_in(applied, path, action, String::new());
+            }
+        });
+    }
+}
+
 /// Record a non-text mutation implemented outside this module, such as
 /// installing the managed executable. Callers must invoke this instead of
 /// touching disk when dry-run mode is active.
@@ -495,6 +558,7 @@ fn remove_file_if_unchanged_bytes(path: &Path, expected: &[u8]) -> Result<bool> 
 
     std::fs::remove_file(path)?;
     sync_parent_directory(path);
+    record_applied(path, ChangeAction::Delete);
     Ok(true)
 }
 
@@ -529,6 +593,7 @@ pub(crate) fn remove_owned_file_if_unchanged(path: &Path, expected: &str) -> Res
     }
     std::fs::remove_file(path)?;
     sync_parent_directory(path);
+    record_applied(path, ChangeAction::Delete);
     Ok(true)
 }
 
@@ -1346,6 +1411,7 @@ fn write_if_changed_impl_full(
         return Err(error);
     }
     sync_parent_directory(path);
+    record_applied(path, action);
     Ok(true)
 }
 
@@ -2164,6 +2230,46 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_applied_journal_lists_real_writes_only_while_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let created = dir.path().join("created.md");
+        let untouched = dir.path().join("untouched.md");
+        std::fs::write(&untouched, "same\n").expect("seed");
+
+        write_if_changed(&created, "before journal\n").expect("write");
+        begin_applied_journal();
+        write_if_changed(&created, "changed\n").expect("modify");
+        write_if_changed(&untouched, "same\n").expect("unchanged");
+        let fresh = dir.path().join("fresh.md");
+        write_if_changed(&fresh, "new\n").expect("create");
+        let applied = take_applied_changes();
+        let summary: Vec<(String, ChangeAction)> = applied
+            .iter()
+            .map(|change| {
+                (
+                    change
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    change.action,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("created.md".to_string(), ChangeAction::Modify),
+                ("fresh.md".to_string(), ChangeAction::Create),
+            ]
+        );
+        // Closed again: later writes are not recorded.
+        write_if_changed(&fresh, "newer\n").expect("modify");
+        assert!(take_applied_changes().is_empty());
     }
 
     #[test]

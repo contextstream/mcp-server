@@ -208,6 +208,12 @@ pub(super) async fn run(
     account_only: bool,
     explicit_learning_choice: Option<bool>,
 ) -> Result<bool> {
+    prompts::require_terminal(
+        "Guided setup",
+        "Run `contextstream-mcp setup` in a terminal. For scripts, CI and coding agents, save a key \
+         with `printf %s \"$KEY\" | contextstream-mcp configure --api-key-stdin` (or set \
+         CONTEXTSTREAM_API_KEY), then run `contextstream-mcp setup --yes`.",
+    )?;
     struct RestoreInstallationPersistence(bool);
     impl Drop for RestoreInstallationPersistence {
         fn drop(&mut self) {

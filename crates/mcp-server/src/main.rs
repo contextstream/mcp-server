@@ -2443,6 +2443,13 @@ async fn run_configure(
         return Ok(ConfigureOutcome::Unchanged);
     }
 
+    setup::require_terminal(
+        "The configure menu",
+        "Pass a flag instead: `--account-learning status|on|off`, `--transcripts on|off`, \
+         `--hook-transcripts on|off`, or `printf %s \"$KEY\" | contextstream-mcp configure \
+         --api-key-stdin` (see `contextstream-mcp configure --help`).",
+    )?;
+
     use dialoguer::Select;
 
     let options = [
@@ -3534,6 +3541,7 @@ async fn run_index_or_ingest(
     // Ensure we have valid credentials
     let config = match load_config() {
         Ok(c) if c.api_key.as_ref().is_none_or(|k| k.is_empty()) => {
+            setup::require_terminal_to_sign_in()?;
             eprintln!(
                 "  {}No API key found. Authenticating...",
                 style("ℹ  ").blue()
@@ -3543,6 +3551,7 @@ async fn run_index_or_ingest(
         }
         Ok(c) => c,
         Err(_) => {
+            setup::require_terminal_to_sign_in()?;
             eprintln!(
                 "  {}No credentials found. Authenticating...",
                 style("ℹ  ").blue()

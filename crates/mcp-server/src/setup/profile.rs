@@ -29,9 +29,9 @@ use mcp_types::{Config, Error as McpError};
 use super::editors::{self, Editor};
 use super::{
     doctor, git_hooks, mcp_config, normalize_api_url, prompt_setup_transport_preference,
-    read_saved_credentials, safe_edit, select_project_for_current_directory,
-    spawn_background_index, spawn_warmup, write_saved_credentials, write_setup_transport_marker,
-    SetupTransportPreference, WorkspaceInfo, CHECK, CROSS,
+    read_saved_credentials, safe_edit, spawn_background_index, spawn_warmup,
+    write_saved_credentials, write_setup_transport_marker, SetupTransportPreference, WorkspaceInfo,
+    CHECK, CROSS,
 };
 
 const REDEEM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -192,13 +192,16 @@ pub async fn run_setup_with_profile(
         println!("{}Workspace: {}", CHECK, style(&ws.name).cyan());
     }
 
-    let selected_project = if let Some(project_path) = project_path.as_deref() {
-        select_project_for_current_directory(
+    let project_resolution = if let Some(project_path) = project_path.as_deref() {
+        super::resolve_setup_project_for_current_directory_with_overrides(
             &client,
             project_path,
             workspace.as_ref(),
             false,
             true,
+            true,
+            None,
+            None,
             true,
         )
         .await?
@@ -209,9 +212,11 @@ pub async fn run_setup_with_profile(
                 super::info_label()
             );
         }
-        None
+        super::SetupProjectResolution::None
     };
-    let configured_project_path = selected_project.as_ref().and(project_path.as_deref());
+    let selected_project = project_resolution.selected_project().cloned();
+    let configured_project_path =
+        project_resolution.configured_project_path(project_path.as_deref());
 
     let transport_preference = prompt_setup_transport_preference(&editors_to_configure)?;
     let preauth_remote_configs =
@@ -230,12 +235,13 @@ pub async fn run_setup_with_profile(
         safe_edit::is_dry_run() && !super::keep_claude_auto_memory(),
     );
     for editor in &editors_to_configure {
-        super::configure_editor_with_workspace(
+        super::configure_editor_with_workspace_and_project_name(
             &client,
             editor,
             &active_key,
             workspace.as_ref(),
             selected_project.as_ref().map(|p| p.id.as_str()),
+            project_resolution.planned_project_name(),
             configured_project_path,
             transport_preference,
             preauth_remote_configs,

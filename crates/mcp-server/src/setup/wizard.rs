@@ -827,15 +827,25 @@ async fn pick_project(
     let Some(path) = project_path else {
         return Ok(ProjectPlan::Unlinked);
     };
-    let selected =
-        super::select_project_for_current_directory(client, path, workspace, true, true, true)
-            .await?;
-    Ok(match selected {
-        Some(project) => ProjectPlan::Existing {
+    let resolved = super::resolve_setup_project_for_current_directory_with_overrides(
+        client, path, workspace, true, true, true, None, None, true,
+    )
+    .await?;
+    Ok(match resolved {
+        super::SetupProjectResolution::Selected(project) => ProjectPlan::Existing {
             project,
             reason: "chosen",
         },
-        None => ProjectPlan::Unlinked,
+        super::SetupProjectResolution::PlannedCreateInDryRun {
+            name,
+            workspace_id,
+            repository_url,
+        } => ProjectPlan::Create {
+            name,
+            workspace_id,
+            repository_url,
+        },
+        super::SetupProjectResolution::None => ProjectPlan::Unlinked,
     })
 }
 
@@ -943,11 +953,13 @@ async fn finish(
         );
     }
 
-    let selected_project = materialize_project(&client, project).await?;
-    if selected_project.is_none() {
+    let project_resolution = materialize_project(&client, project).await?;
+    let selected_project = project_resolution.selected_project().cloned();
+    if !project_resolution.has_project_target() {
         account_only = true;
     }
-    let configured_project_path = selected_project.as_ref().and(project_path.as_deref());
+    let configured_project_path =
+        project_resolution.configured_project_path(project_path.as_deref());
 
     super::persist_setup_editor_selection(&editors)?;
 
@@ -966,12 +978,13 @@ async fn finish(
         for editor in &editors {
             // One editor failing (a locked or malformed config file) must not
             // stop the others; the failure is listed and repair is offered.
-            if let Err(error) = super::configure_editor_with_workspace(
+            if let Err(error) = super::configure_editor_with_workspace_and_project_name(
                 &client,
                 editor,
                 &api_key,
                 workspace.as_ref(),
                 selected_project.as_ref().map(|p| p.id.as_str()),
+                project_resolution.planned_project_name(),
                 configured_project_path,
                 transport,
                 preauth,
@@ -1033,7 +1046,11 @@ async fn finish(
     };
     if binding_established {
         if let Some(path) = configured_project_path {
-            ui::say(Mark::Ok, "Project linked", Some(&display_path(path)));
+            if safe_edit::is_dry_run() {
+                ui::say(Mark::Info, "Would link project", Some(&display_path(path)));
+            } else {
+                ui::say(Mark::Ok, "Project linked", Some(&display_path(path)));
+            }
             install_git_capture(path);
         }
     }
@@ -1125,10 +1142,12 @@ async fn finish(
 async fn materialize_project(
     client: &ContextStreamClient,
     plan: ProjectPlan,
-) -> Result<Option<ProjectInfo>> {
+) -> Result<super::SetupProjectResolution> {
     match plan {
-        ProjectPlan::Unlinked => Ok(None),
-        ProjectPlan::Existing { project, .. } => Ok(Some(project)),
+        ProjectPlan::Unlinked => Ok(super::SetupProjectResolution::None),
+        ProjectPlan::Existing { project, .. } => {
+            Ok(super::SetupProjectResolution::Selected(project))
+        }
         ProjectPlan::Create {
             name,
             workspace_id,
@@ -1140,7 +1159,11 @@ async fn materialize_project(
                     &format!("Would create project {name}"),
                     Some("dry run · nothing was created"),
                 );
-                return Ok(None);
+                return Ok(super::SetupProjectResolution::PlannedCreateInDryRun {
+                    name,
+                    workspace_id,
+                    repository_url,
+                });
             }
             let project = ui::spin(
                 &format!("Creating project {name}"),
@@ -1153,7 +1176,7 @@ async fn materialize_project(
             )
             .await?;
             ui::say(Mark::Ok, "Project created", Some(&project.name));
-            Ok(Some(ProjectInfo {
+            Ok(super::SetupProjectResolution::Selected(ProjectInfo {
                 id: project.id.to_string(),
                 name: project.name,
             }))
@@ -1173,6 +1196,11 @@ fn install_git_capture(path: &Path) {
         return;
     }
     match git_hooks::install_git_hooks(&repo_root) {
+        Ok(()) if safe_edit::is_dry_run() => ui::say(
+            Mark::Info,
+            "Would turn Git capture on",
+            Some("commits, pushes, checkouts, and merges"),
+        ),
         Ok(()) => ui::say(
             Mark::Ok,
             "Git capture on",

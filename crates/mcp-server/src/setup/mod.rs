@@ -2326,6 +2326,15 @@ fn prompt_setup_index_choice(cwd: &std::path::Path) -> Result<SetupIndexChoice> 
 }
 
 fn print_empty_project_ready() {
+    if safe_edit::is_dry_run() {
+        let detail = if crate::watch::watch_enabled() {
+            "it's empty for now; files are indexed as you add them"
+        } else {
+            "add files, then ask your agent to run project(action=\"index\")"
+        };
+        ui::say(ui::Mark::Info, "Would link empty project", Some(detail));
+        return;
+    }
     if crate::watch::watch_enabled() {
         ui::say(
             ui::Mark::Ok,
@@ -3072,8 +3081,8 @@ async fn run_setup_noninteractive(
         )
         .await?
     };
-    let selected_project = if let Some(project_path) = project_path.as_deref() {
-        select_project_for_current_directory_with_overrides(
+    let project_resolution = if let Some(project_path) = project_path.as_deref() {
+        resolve_setup_project_for_current_directory_with_overrides(
             &client,
             project_path,
             workspace.as_ref(),
@@ -3082,6 +3091,7 @@ async fn run_setup_noninteractive(
             true,
             explicit_project_id,
             normalized_project_name,
+            true,
         )
         .await?
     } else {
@@ -3092,9 +3102,11 @@ async fn run_setup_noninteractive(
                 Some("editors are set up; link a project later with --project-path"),
             );
         }
-        None
+        SetupProjectResolution::None
     };
-    let configured_project_path = selected_project.as_ref().and(project_path.as_deref());
+    let selected_project = project_resolution.selected_project().cloned();
+    let configured_project_path =
+        project_resolution.configured_project_path(project_path.as_deref());
 
     // Record the selected editors and transport only after workspace/project
     // preflight succeeds so an aborted `--yes` run never leaves
@@ -3114,12 +3126,13 @@ async fn run_setup_noninteractive(
         safe_edit::is_dry_run() && !keep_claude_auto_memory(),
     );
     for editor in &editors_to_configure {
-        configure_editor_with_workspace(
+        configure_editor_with_workspace_and_project_name(
             &client,
             editor,
             &api_key,
             workspace.as_ref(),
             selected_project.as_ref().map(|p| p.id.as_str()),
+            project_resolution.planned_project_name(),
             configured_project_path,
             transport_preference,
             preauth_remote_configs,
@@ -3548,7 +3561,20 @@ fn print_setup_outcome(
         let folder = project_path
             .map(wizard::display_path)
             .unwrap_or_else(|| "linked checkout".to_string());
-        let status = if outcome.index_started {
+        let status = if matches!(outcome.state, SetupCompletionState::DryRunPreview) {
+            match (
+                outcome.project_selected,
+                outcome.index_started,
+                outcome.awaiting_first_files,
+            ) {
+                (false, true, _) => "would create, link & index",
+                (false, false, true) => "would create & link · empty for now",
+                (false, false, false) => "would create & link",
+                (true, true, _) => "would link & index",
+                (true, false, true) => "would link · empty for now",
+                (true, false, false) => "would link",
+            }
+        } else if outcome.index_started {
             "indexing"
         } else if outcome.awaiting_first_files {
             "empty · indexed as files appear"
@@ -4096,12 +4122,39 @@ async fn authenticate_api_key() -> Result<(String, String)> {
 }
 
 /// Configure a single editor with workspace information.
+#[allow(clippy::too_many_arguments)]
 pub async fn configure_editor_with_workspace(
     client: &ContextStreamClient,
     editor: &editors::Editor,
     api_key: &str,
     workspace: Option<&WorkspaceInfo>,
     project_id: Option<&str>,
+    project_path: Option<&Path>,
+    transport_preference: SetupTransportPreference,
+    preauth_remote_configs: bool,
+) -> Result<()> {
+    configure_editor_with_workspace_and_project_name(
+        client,
+        editor,
+        api_key,
+        workspace,
+        project_id,
+        None,
+        project_path,
+        transport_preference,
+        preauth_remote_configs,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn configure_editor_with_workspace_and_project_name(
+    client: &ContextStreamClient,
+    editor: &editors::Editor,
+    api_key: &str,
+    workspace: Option<&WorkspaceInfo>,
+    project_id: Option<&str>,
+    planned_project_name: Option<&str>,
     project_path: Option<&Path>,
     transport_preference: SetupTransportPreference,
     preauth_remote_configs: bool,
@@ -4167,6 +4220,11 @@ pub async fn configure_editor_with_workspace(
     let project_name = selected_project
         .as_ref()
         .map(|project| project.name.as_str())
+        .or_else(|| {
+            planned_project_name
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+        })
         .unwrap_or(folder_project_name);
 
     let workspace_id = workspace.map(|w| w.id.as_str());
@@ -5027,6 +5085,52 @@ async fn resolve_workspace_from_api(
     })
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum SetupProjectResolution {
+    Selected(ProjectInfo),
+    PlannedCreateInDryRun {
+        name: String,
+        workspace_id: Option<uuid::Uuid>,
+        repository_url: Option<String>,
+    },
+    None,
+}
+
+impl SetupProjectResolution {
+    pub(crate) fn into_selected(self) -> Option<ProjectInfo> {
+        match self {
+            Self::Selected(project) => Some(project),
+            Self::PlannedCreateInDryRun { .. } | Self::None => None,
+        }
+    }
+
+    pub(crate) fn selected_project(&self) -> Option<&ProjectInfo> {
+        match self {
+            Self::Selected(project) => Some(project),
+            Self::PlannedCreateInDryRun { .. } | Self::None => None,
+        }
+    }
+
+    pub(crate) fn has_project_target(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub(crate) fn configured_project_path<'a>(
+        &self,
+        project_path: Option<&'a Path>,
+    ) -> Option<&'a Path> {
+        self.has_project_target().then_some(project_path).flatten()
+    }
+
+    pub(crate) fn planned_project_name(&self) -> Option<&str> {
+        match self {
+            Self::Selected(project) => Some(project.name.as_str()),
+            Self::PlannedCreateInDryRun { name, .. } => Some(name.as_str()),
+            Self::None => None,
+        }
+    }
+}
+
 pub async fn select_project_for_current_directory(
     client: &ContextStreamClient,
     cwd: &std::path::Path,
@@ -5059,6 +5163,33 @@ pub async fn select_project_for_current_directory_with_overrides(
     explicit_project_id: Option<&str>,
     explicit_project_name: Option<&str>,
 ) -> Result<Option<ProjectInfo>> {
+    resolve_setup_project_for_current_directory_with_overrides(
+        client,
+        cwd,
+        workspace,
+        prompt_user,
+        allow_create,
+        allow_skip,
+        explicit_project_id,
+        explicit_project_name,
+        false,
+    )
+    .await
+    .map(SetupProjectResolution::into_selected)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolve_setup_project_for_current_directory_with_overrides(
+    client: &ContextStreamClient,
+    cwd: &std::path::Path,
+    workspace: Option<&WorkspaceInfo>,
+    prompt_user: bool,
+    allow_create: bool,
+    allow_skip: bool,
+    explicit_project_id: Option<&str>,
+    explicit_project_name: Option<&str>,
+    allow_dry_run_create_preview: bool,
+) -> Result<SetupProjectResolution> {
     let Some(ws) = workspace else {
         if prompt_user {
             println!(
@@ -5066,7 +5197,7 @@ pub async fn select_project_for_current_directory_with_overrides(
                 info_label()
             );
         }
-        return Ok(None);
+        return Ok(SetupProjectResolution::None);
     };
 
     if !prompt_user {
@@ -5094,7 +5225,7 @@ pub async fn select_project_for_current_directory_with_overrides(
                 CHECK,
                 style(&project.name).cyan()
             );
-            return Ok(Some(ProjectInfo {
+            return Ok(SetupProjectResolution::Selected(ProjectInfo {
                 id: project.id.to_string(),
                 name: project.name,
             }));
@@ -5130,7 +5261,7 @@ pub async fn select_project_for_current_directory_with_overrides(
                     CHECK,
                     style(&project.name).cyan()
                 );
-                return Ok(Some(ProjectInfo {
+                return Ok(SetupProjectResolution::Selected(ProjectInfo {
                     id: project.id.to_string(),
                     name: project.name.clone(),
                 }));
@@ -5142,7 +5273,7 @@ pub async fn select_project_for_current_directory_with_overrides(
                         CHECK,
                         style(&project.name).cyan()
                     );
-                    return Ok(Some(ProjectInfo {
+                    return Ok(SetupProjectResolution::Selected(ProjectInfo {
                         id: project.id.to_string(),
                         name: project.name.clone(),
                     }));
@@ -5155,7 +5286,7 @@ pub async fn select_project_for_current_directory_with_overrides(
                         CHECK,
                         style(&project.name).cyan()
                     );
-                    return Ok(Some(ProjectInfo {
+                    return Ok(SetupProjectResolution::Selected(ProjectInfo {
                         id: project.id.to_string(),
                         name: project.name.clone(),
                     }));
@@ -5193,10 +5324,22 @@ pub async fn select_project_for_current_directory_with_overrides(
             }
             if allow_create {
                 if safe_edit::is_dry_run() {
+                    if allow_dry_run_create_preview {
+                        ui::say(
+                            ui::Mark::Info,
+                            &format!("Would create project {requested_name}"),
+                            Some("dry run · nothing was created"),
+                        );
+                        return Ok(SetupProjectResolution::PlannedCreateInDryRun {
+                            name: requested_name.to_string(),
+                            workspace_id: ws_id,
+                            repository_url: checkout_repository_url.clone(),
+                        });
+                    }
                     warning(
                         "Dry-run did not create a server-side project; previewing editor files without a new project binding.",
                     );
-                    return Ok(None);
+                    return Ok(SetupProjectResolution::None);
                 }
                 let project = client
                     .create_project_with_repository(
@@ -5211,26 +5354,26 @@ pub async fn select_project_for_current_directory_with_overrides(
                     CHECK,
                     style(&project.name).cyan()
                 );
-                return Ok(Some(ProjectInfo {
+                return Ok(SetupProjectResolution::Selected(ProjectInfo {
                     id: project.id.to_string(),
                     name: project.name,
                 }));
             }
-            return Ok(None);
+            return Ok(SetupProjectResolution::None);
         }
 
         // A validated checkout-local UUID wins. Otherwise a unique exact
         // credential-free repository match is portable across
         // machines/worktrees. A same-name project is never identity.
         if let Some(project) = linked_project.clone() {
-            return Ok(Some(ProjectInfo {
+            return Ok(SetupProjectResolution::Selected(ProjectInfo {
                 id: project.id.to_string(),
                 name: project.name,
             }));
         }
         match repository_matches.as_slice() {
             [project] => {
-                return Ok(Some(ProjectInfo {
+                return Ok(SetupProjectResolution::Selected(ProjectInfo {
                     id: project.id.to_string(),
                     name: project.name.clone(),
                 }))
@@ -5254,7 +5397,7 @@ pub async fn select_project_for_current_directory_with_overrides(
         }
         match sibling_checkout_matches.as_slice() {
             [project] => {
-                return Ok(Some(ProjectInfo {
+                return Ok(SetupProjectResolution::Selected(ProjectInfo {
                     id: project.id.to_string(),
                     name: project.name.clone(),
                 }))
@@ -5317,10 +5460,22 @@ pub async fn select_project_for_current_directory_with_overrides(
             }
 
             if safe_edit::is_dry_run() {
+                if allow_dry_run_create_preview {
+                    ui::say(
+                        ui::Mark::Info,
+                        &format!("Would create project {folder_project_name}"),
+                        Some("dry run · nothing was created"),
+                    );
+                    return Ok(SetupProjectResolution::PlannedCreateInDryRun {
+                        name: folder_project_name.to_string(),
+                        workspace_id: ws_id,
+                        repository_url: checkout_repository_url.clone(),
+                    });
+                }
                 warning(
                     "Dry-run did not create a server-side project; previewing editor files without a new project binding.",
                 );
-                return Ok(None);
+                return Ok(SetupProjectResolution::None);
             }
             let project = client
                 .create_project_with_repository(
@@ -5330,13 +5485,13 @@ pub async fn select_project_for_current_directory_with_overrides(
                     checkout_repository_url.as_deref(),
                 )
                 .await?;
-            return Ok(Some(ProjectInfo {
+            return Ok(SetupProjectResolution::Selected(ProjectInfo {
                 id: project.id.to_string(),
                 name: project.name,
             }));
         }
 
-        return Ok(None);
+        return Ok(SetupProjectResolution::None);
     }
 
     ui::say(
@@ -5416,16 +5571,23 @@ pub async fn select_project_for_current_directory_with_overrides(
     }
 
     if options.is_empty() {
-        return Ok(None);
+        return Ok(SetupProjectResolution::None);
     }
 
     let option_refs: Vec<&str> = options.iter().map(|(label, _)| label.as_str()).collect();
     let choice = prompts::select("Which project?", &option_refs)?;
 
     match &options[choice].1 {
-        ProjectChoice::Existing(project) => Ok(Some(project.clone())),
+        ProjectChoice::Existing(project) => Ok(SetupProjectResolution::Selected(project.clone())),
         ProjectChoice::CreateNew => {
             if safe_edit::is_dry_run() {
+                if allow_dry_run_create_preview {
+                    return Ok(SetupProjectResolution::PlannedCreateInDryRun {
+                        name: folder_project_name.to_string(),
+                        workspace_id: ws_id,
+                        repository_url: checkout_repository_url.clone(),
+                    });
+                }
                 anyhow::bail!(
                     "Dry-run refused to create a server-side project. \
                      Create or select it first, then re-run the preview."
@@ -5439,12 +5601,12 @@ pub async fn select_project_for_current_directory_with_overrides(
                     checkout_repository_url.as_deref(),
                 )
                 .await?;
-            Ok(Some(ProjectInfo {
+            Ok(SetupProjectResolution::Selected(ProjectInfo {
                 id: project.id.to_string(),
                 name: project.name,
             }))
         }
-        ProjectChoice::Skip => Ok(None),
+        ProjectChoice::Skip => Ok(SetupProjectResolution::None),
     }
 }
 
@@ -5581,6 +5743,11 @@ fn spawn_background_index(
     include_media: bool,
 ) {
     if safe_edit::is_dry_run() {
+        ui::say(
+            ui::Mark::Info,
+            "Would index in the background",
+            Some("search fills in as it builds"),
+        );
         return;
     }
     match spawn_detached_index_worker(

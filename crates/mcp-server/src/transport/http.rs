@@ -1192,6 +1192,17 @@ async fn serve_mcp_streamable(
         .and_then(|h| h.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok());
     let managed_runtime_identity = managed_harness_runtime_identity(&headers);
+    // The stateless contract has no initialize: server/discover and
+    // tools/list are its handshake, and the managed identity rides on every
+    // request, so readiness is recorded from them (#328).
+    let stateless_handshake =
+        stateless_request && matches!(request.method.as_str(), "server/discover" | "tools/list");
+    if stateless_request {
+        state
+            .telemetry
+            .ensure_managed_stateless_hints(&request.params, managed_runtime_identity.clone())
+            .await;
+    }
 
     // Dispatch through the same JSON-RPC handler logic. The observation slot
     // is shared with the tool's task-local wire context and consumed exactly
@@ -1288,6 +1299,12 @@ async fn serve_mcp_streamable(
     })
     .await;
 
+    if stateless_handshake && result.is_ok() {
+        state
+            .telemetry
+            .emit_managed_connected_readiness(None, workspace_id_for_stream, project_id_for_stream)
+            .await;
+    }
     if let (Some(name), Err(error)) = (tool_name.as_deref(), result.as_ref()) {
         log_failed_tool_call(&headers, name, error);
     }

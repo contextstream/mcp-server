@@ -263,7 +263,7 @@ fn workspace_drift_get_result(
     );
     let text = compose_text(
         format!(
-            "Loaded 0 instruction entries (workspace access drift). {}",
+            "Could not load instruction entries (workspace access drift). {}",
             hint
         ),
         bootstrap_note,
@@ -739,12 +739,16 @@ mod tests {
     }
 
     #[test]
-    fn workspace_access_error_matches_403_and_401() {
+    fn workspace_access_error_is_403_and_a_refused_credential_is_not_drift() {
         assert!(is_workspace_access_error(&Error::http(
             403,
             "Forbidden: You do not have access to this workspace"
         )));
-        assert!(is_workspace_access_error(&Error::http(401, "Unauthorized")));
+        // A refused credential keeps its own 401 message (#304).
+        assert!(!is_workspace_access_error(&Error::http(
+            401,
+            "Unauthorized"
+        )));
     }
 
     #[test]

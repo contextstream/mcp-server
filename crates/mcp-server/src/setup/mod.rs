@@ -785,6 +785,7 @@ pub async fn uninstall(
     scope: &str,
     only: Option<&[editors::Editor]>,
     include_git_hooks: bool,
+    all_git_hooks: bool,
 ) -> Result<()> {
     validate_editor_scope(scope, "uninstall")?;
     let include_global = matches!(scope, "global" | "all");
@@ -1067,7 +1068,26 @@ pub async fn uninstall(
         }
     }
 
+    if all_git_hooks {
+        for repo in known_repos_with_managed_git_hooks(cwd.as_deref()) {
+            match git_hooks::uninstall_git_hooks(&repo) {
+                Ok(()) => println!("  {} managed git hooks in {}", CHECK, repo.display()),
+                Err(e) => {
+                    warn!("Could not remove git hooks from {}: {}", repo.display(), e);
+                    failures.push(format!("managed git hooks in {}: {e}", repo.display()));
+                }
+            }
+        }
+    }
+
     if !safe_edit::is_dry_run() {
+        // Git hooks live in each repository, not in an editor, so removing the
+        // editors does not remove them: say where they remain (#308).
+        let remaining = known_repos_with_managed_git_hooks(cwd.as_deref());
+        if !remaining.is_empty() {
+            println!();
+            println!("  {}", style(git_hooks_remain_message(&remaining)).yellow());
+        }
         println!();
         println!(
             "  {}",
@@ -1088,6 +1108,64 @@ pub async fn uninstall(
             failures.join("; ")
         )
     }
+}
+
+/// The repositories among `folders` that still carry ContextStream's managed
+/// git hooks, each once, in the order found.
+fn repos_with_managed_git_hooks(folders: &[String]) -> Vec<PathBuf> {
+    let mut repos: Vec<PathBuf> = Vec::new();
+    for folder in folders {
+        let Some(root) = git_hooks::resolve_repo_root(Path::new(folder)) else {
+            continue;
+        };
+        if repos.contains(&root) {
+            continue;
+        }
+        if git_hooks::managed_hooks_status(&root).is_some_and(|status| !status.installed.is_empty())
+        {
+            repos.push(root);
+        }
+    }
+    repos
+}
+
+/// Repositories this machine has set up, from its project registries and the
+/// current directory, that still carry the managed git hooks.
+fn known_repos_with_managed_git_hooks(cwd: Option<&Path>) -> Vec<PathBuf> {
+    let dir = dirs::home_dir().map(|home| home.join(".contextstream"));
+    let read = |name: &str| {
+        dir.as_ref()
+            .and_then(|dir| std::fs::read_to_string(dir.join(name)).ok())
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let mut folders =
+        crate::link::registry_folders(&read("mappings.json"), &read("indexed-projects.json"));
+    if let Some(cwd) = cwd {
+        folders.push(cwd.to_string_lossy().to_string());
+    }
+    repos_with_managed_git_hooks(&folders)
+}
+
+fn git_hooks_remain_message(repos: &[PathBuf]) -> String {
+    const SHOWN: usize = 5;
+    let mut listed: Vec<String> = repos
+        .iter()
+        .take(SHOWN)
+        .map(|repo| repo.display().to_string())
+        .collect();
+    if repos.len() > SHOWN {
+        listed.push(format!("and {} more", repos.len() - SHOWN));
+    }
+    format!(
+        "Git capture hooks remain in {} repositor{}: {}. They are per repository, so \
+         removing the editors leaves them. Remove them all with \
+         `contextstream-mcp uninstall --all-git-hooks`, or one with \
+         `contextstream-mcp git-hooks --uninstall --path <repo>`.",
+        repos.len(),
+        if repos.len() == 1 { "y" } else { "ies" },
+        listed.join(", ")
+    )
 }
 
 /// Print everything a dry run planned, then clear the recording.
@@ -6514,6 +6592,72 @@ mod tests {
                 None => std::env::remove_var(name),
             }
         }
+    }
+
+    #[test]
+    fn repos_that_still_carry_managed_git_hooks_are_found_once_and_can_be_cleaned() {
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let init = |name: &str| {
+            let path = temp.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success());
+            path
+        };
+        let hooked = init("hooked");
+        let plain = init("plain");
+        let not_a_repo = temp.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        std::fs::create_dir_all(hooked.join("src")).unwrap();
+        super::git_hooks::install_git_hooks(&hooked).expect("install");
+
+        let folders: Vec<String> = [
+            &hooked,
+            &hooked.join("src"),
+            &plain,
+            &not_a_repo,
+            &temp.path().join("gone"),
+        ]
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+        let found = super::repos_with_managed_git_hooks(&folders);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            std::fs::canonicalize(&found[0]).unwrap(),
+            std::fs::canonicalize(&hooked).unwrap()
+        );
+
+        let message = super::git_hooks_remain_message(&found);
+        assert!(message.contains("remain in 1 repository"), "{message}");
+        assert!(message.contains("uninstall --all-git-hooks"), "{message}");
+        assert!(
+            message.contains("git-hooks --uninstall --path"),
+            "{message}"
+        );
+
+        super::git_hooks::uninstall_git_hooks(&found[0]).expect("uninstall");
+        assert!(super::repos_with_managed_git_hooks(&folders).is_empty());
+    }
+
+    #[test]
+    fn the_hooks_remain_message_lists_a_few_repos_and_counts_the_rest() {
+        let repos: Vec<std::path::PathBuf> = (0..7)
+            .map(|i| std::path::PathBuf::from(format!("/work/r{i}")))
+            .collect();
+        let message = super::git_hooks_remain_message(&repos);
+        assert!(message.contains("remain in 7 repositories"), "{message}");
+        assert!(message.contains("/work/r0") && message.contains("/work/r4"));
+        assert!(!message.contains("/work/r5"), "{message}");
+        assert!(message.contains("and 2 more"), "{message}");
     }
 
     #[test]

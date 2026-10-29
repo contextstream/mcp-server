@@ -335,7 +335,7 @@ pub async fn audit_folders(
 }
 
 /// Folders listed in `mappings.json` and `indexed-projects.json`.
-fn registry_folders(mappings: &Value, indexed: &Value) -> Vec<String> {
+pub(crate) fn registry_folders(mappings: &Value, indexed: &Value) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     if let Some(entries) = mappings
         .get("mappings")

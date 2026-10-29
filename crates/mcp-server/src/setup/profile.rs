@@ -226,6 +226,9 @@ pub async fn run_setup_with_profile(
         // fails to configure.
         write_setup_transport_marker(transport_preference)?;
     }
+    let _dry_run_auto_memory_guard = super::hooks::setup_dry_run_auto_memory_off_guard(
+        safe_edit::is_dry_run() && !super::keep_claude_auto_memory(),
+    );
     for editor in &editors_to_configure {
         super::configure_editor_with_workspace(
             &client,
@@ -240,6 +243,7 @@ pub async fn run_setup_with_profile(
         .await
         .with_context(|| format!("configuring {}", editor.display_name()))?;
     }
+    drop(_dry_run_auto_memory_guard);
     super::apply_claude_auto_memory_default(&editors_to_configure);
     if !editors_to_configure.is_empty() {
         // Heal deleted local-binary paths so a re-run leaves a working machine.
@@ -303,8 +307,16 @@ pub async fn run_setup_with_profile(
     // ------------------------------------------------------------------
     // Verify, report back, celebrate.
     // ------------------------------------------------------------------
-    let report = doctor::build_report(configured_project_path, &editors_to_configure).await;
-    doctor::print_setup_health_report(&report);
+    let report = if safe_edit::is_dry_run() {
+        None
+    } else {
+        let report = doctor::build_report(configured_project_path, &editors_to_configure).await;
+        doctor::print_setup_health_report(&report);
+        Some(report)
+    };
+    let doctor_healthy = report
+        .as_ref()
+        .is_none_or(|report| !report.has_setup_failures());
     let outcome = super::setup_completion_evidence(
         editors_to_configure.len(),
         editors_to_configure
@@ -316,21 +328,23 @@ pub async fn run_setup_with_profile(
         binding_established,
         index_started,
         awaiting_first_files,
-        !report.has_setup_failures(),
+        doctor_healthy,
         account_only,
         safe_edit::is_dry_run(),
     );
 
-    report_completion(
-        &client,
-        &payload,
-        &editors_to_configure,
-        &editors_skipped,
-        &report,
-        &outcome,
-        started,
-    )
-    .await;
+    if let Some(ref report) = report {
+        report_completion(
+            &client,
+            &payload,
+            &editors_to_configure,
+            &editors_skipped,
+            report,
+            &outcome,
+            started,
+        )
+        .await;
+    }
 
     print_engine_outcome(
         &payload,
@@ -584,7 +598,14 @@ async fn resolve_credentials(
     let existing = read_saved_credentials()?.api_key;
     let Some(existing_key) = existing else {
         write_saved_credentials(&minted, Some(api_url))?;
-        println!("{}Credentials installed for this machine", CHECK);
+        if safe_edit::is_dry_run() {
+            println!(
+                "{}Would install credentials for this machine",
+                super::info_label()
+            );
+        } else {
+            println!("{}Credentials installed for this machine", CHECK);
+        }
         return Ok((minted, false));
     };
 
@@ -638,7 +659,14 @@ async fn resolve_credentials(
                 ));
             }
             write_saved_credentials(&minted, Some(api_url))?;
-            println!("{}Credentials replaced for this machine", CHECK);
+            if safe_edit::is_dry_run() {
+                println!(
+                    "{}Would replace credentials for this machine",
+                    super::info_label()
+                );
+            } else {
+                println!("{}Credentials replaced for this machine", CHECK);
+            }
             Ok((minted, false))
         }
         Ok(Err(McpError::Http {
@@ -648,7 +676,11 @@ async fn resolve_credentials(
             // invoked this one-time setup profile, so replacing it with the
             // freshly minted key is the requested recovery action.
             write_saved_credentials(&minted, Some(api_url))?;
-            println!("{}Stale credentials replaced", CHECK);
+            if safe_edit::is_dry_run() {
+                println!("{}Would replace stale credentials", super::info_label());
+            } else {
+                println!("{}Stale credentials replaced", CHECK);
+            }
             Ok((minted, false))
         }
         Ok(Err(error)) => Err(anyhow!(

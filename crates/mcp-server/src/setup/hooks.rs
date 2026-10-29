@@ -714,6 +714,31 @@ fn build_claude_hooks_update(
     Ok(updated)
 }
 
+static SETUP_DRY_RUN_DISABLE_CLAUDE_AUTO_MEMORY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) struct SetupDryRunAutoMemoryGuard(bool);
+
+impl Drop for SetupDryRunAutoMemoryGuard {
+    fn drop(&mut self) {
+        SETUP_DRY_RUN_DISABLE_CLAUDE_AUTO_MEMORY.store(self.0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Fold `autoMemoryEnabled: false` into Claude Code's hook `settings.json`
+/// preview during `setup --dry-run` so the dry-run plan records one combined
+/// `~/.claude/settings.json` operation instead of two conflicting snapshots of
+/// an unwritten file.
+pub(crate) fn setup_dry_run_auto_memory_off_guard(enabled: bool) -> SetupDryRunAutoMemoryGuard {
+    let previous =
+        SETUP_DRY_RUN_DISABLE_CLAUDE_AUTO_MEMORY.swap(enabled, std::sync::atomic::Ordering::SeqCst);
+    SetupDryRunAutoMemoryGuard(previous)
+}
+
+fn setup_dry_run_auto_memory_off_enabled() -> bool {
+    SETUP_DRY_RUN_DISABLE_CLAUDE_AUTO_MEMORY.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Install Claude Code hooks into ~/.claude/settings.json.
 fn install_claude_code_hooks(api_key: Option<&str>) -> Result<()> {
     let settings_path = claude_code_settings_path()
@@ -724,7 +749,10 @@ fn install_claude_code_hooks(api_key: Option<&str>) -> Result<()> {
 
     // Merge into the existing hooks object in place, so unknown event names
     // and unparseable entries are preserved rather than replaced wholesale.
-    let updated = build_claude_hooks_update(&loaded, &settings_path, api_key)?;
+    let mut updated = build_claude_hooks_update(&loaded, &settings_path, api_key)?;
+    if safe_edit::is_dry_run() && setup_dry_run_auto_memory_off_enabled() {
+        updated["autoMemoryEnabled"] = Value::Bool(false);
+    }
 
     // Surgical write: only the "hooks" key is rewritten, so everything else in
     // the user's settings file keeps its exact bytes.

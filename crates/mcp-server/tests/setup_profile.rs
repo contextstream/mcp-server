@@ -384,7 +384,7 @@ async fn setup_profile_file_uses_payload_api_url_for_all_requests() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let proj = temp.path().join("proj");
-    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
     std::fs::create_dir_all(&proj).unwrap();
     init_git_repo(&proj);
 
@@ -492,6 +492,110 @@ async fn setup_profile_file_uses_payload_api_url_for_all_requests() {
         );
     }
     drop(recorded);
+
+    stop_spawned_watch_helper_if_any(&home);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_profile_file_dry_run_previews_cleanly_without_false_doctor_failures() {
+    const MINTED_KEY: &str = "cs_dry_run_profile_key_265";
+    static KEYS: &[&str] = &[MINTED_KEY];
+
+    let (api_url, hits, server) = spawn_mock_profile_server(KEYS).await;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("dry-home");
+    let proj = temp.path().join("dry-proj");
+    std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+    init_git_repo(&proj);
+
+    let profile_path = temp.path().join("dry-profile.json");
+    std::fs::write(
+        &profile_path,
+        serde_json::to_string_pretty(&json!({
+            "device_id": DEVICE_ID,
+            "user_id": USER_ID,
+            "email": "dryrun@example.test",
+            "api_key": {"id": "", "secret": MINTED_KEY},
+            "api_url": api_url,
+            "profile": {
+                "editors": ["claude"],
+                "workspace_id": WORKSPACE_ID,
+                "workspace_name": "Testing"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let run_home = home.clone();
+    let run_proj = proj.clone();
+    let run_pf = profile_path.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+            .args([
+                "setup",
+                "--profile-file",
+                run_pf.to_str().unwrap(),
+                "--dry-run",
+            ])
+            .env("HOME", &run_home)
+            .env("USERPROFILE", &run_home)
+            .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
+            .env("NO_COLOR", "1")
+            .env_remove("CONTEXTSTREAM_API_URL")
+            .env_remove("CONTEXTSTREAM_API_KEY")
+            .current_dir(&run_proj)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "setup --profile-file --dry-run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Preview finished · nothing was changed"),
+        "expected preview banner:\n{stdout}"
+    );
+    for forbidden in [
+        "still need attention",
+        "some checks failed",
+        "Credentials installed for this machine",
+        "✓ Claude auto memory off",
+        "managed installation identity is missing",
+        "credentials are missing or unreadable",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "dry-run output must not contain {forbidden:?}:\n{stdout}"
+        );
+    }
+
+    let settings_path_str = home.join(".claude/settings.json").display().to_string();
+    let settings_occurrences = stdout.matches(&settings_path_str).count();
+    assert_eq!(
+        settings_occurrences, 1,
+        "expected exactly one planned operation for {settings_path_str}, got {settings_occurrences}:\n{stdout}"
+    );
+
+    assert!(
+        !home.join(".contextstream").exists(),
+        "dry-run must not create ~/.contextstream"
+    );
+    assert!(
+        !home.join(".claude/settings.json").exists(),
+        "dry-run must not write ~/.claude/settings.json"
+    );
+    assert!(
+        hits.lock().unwrap().completion_bodies.is_empty(),
+        "dry-run must not POST device completion"
+    );
 
     stop_spawned_watch_helper_if_any(&home);
     server.abort();

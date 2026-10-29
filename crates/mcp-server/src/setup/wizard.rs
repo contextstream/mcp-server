@@ -940,6 +940,9 @@ async fn finish(
         // Persist transport intent before the first editor mutation so a
         // partial setup remains repairable with the same connection mode.
         super::write_setup_transport_marker(transport)?;
+        let _dry_run_auto_memory_guard = super::hooks::setup_dry_run_auto_memory_off_guard(
+            safe_edit::is_dry_run() && claude_auto_memory_off == Some(true),
+        );
         for editor in &editors {
             // One editor failing (a locked or malformed config file) must not
             // stop the others; the failure is listed and repair is offered.
@@ -962,24 +965,30 @@ async fn finish(
     }
 
     if claude_auto_memory_off == Some(true) {
-        if !safe_edit::is_dry_run() {
+        if safe_edit::is_dry_run() {
+            ui::say(
+                Mark::Info,
+                "Would turn Claude auto memory off",
+                Some("memories and preferences go to ContextStream"),
+            );
+        } else {
             if let Err(error) =
                 mcp_client::activation::set_keep_claude_auto_memory_preference(false)
             {
                 tracing::warn!(%error, "could not clear keep_claude_auto_memory preference");
             }
-        }
-        match super::hooks::disable_claude_auto_memory() {
-            Ok(_) => ui::say(
-                Mark::Ok,
-                "Claude auto memory off",
-                Some("memories and preferences go to ContextStream"),
-            ),
-            Err(error) => ui::say(
-                Mark::Warn,
-                "Claude auto memory is still on",
-                Some(&error.to_string()),
-            ),
+            match super::hooks::disable_claude_auto_memory() {
+                Ok(_) => ui::say(
+                    Mark::Ok,
+                    "Claude auto memory off",
+                    Some("memories and preferences go to ContextStream"),
+                ),
+                Err(error) => ui::say(
+                    Mark::Warn,
+                    "Claude auto memory is still on",
+                    Some(&error.to_string()),
+                ),
+            }
         }
     } else if (claude_auto_memory_off == Some(false)
         || super::explicit_keep_claude_auto_memory_requested())
@@ -1055,12 +1064,17 @@ async fn finish(
         );
     }
 
-    let report = ui::spin(
-        "Checking everything works",
-        super::doctor::build_report(configured_project_path, &editors),
-    )
-    .await;
-    super::doctor::print_setup_health_report(&report);
+    let doctor_healthy = if safe_edit::is_dry_run() {
+        failed_editors.is_empty()
+    } else {
+        let report = ui::spin(
+            "Checking everything works",
+            super::doctor::build_report(configured_project_path, &editors),
+        )
+        .await;
+        super::doctor::print_setup_health_report(&report);
+        !report.has_setup_failures() && failed_editors.is_empty()
+    };
     let outcome = super::setup_completion_evidence(
         editors.len(),
         editors
@@ -1072,7 +1086,7 @@ async fn finish(
         binding_established,
         index_started,
         awaiting_first_files,
-        !report.has_setup_failures() && failed_editors.is_empty(),
+        doctor_healthy,
         account_only,
         safe_edit::is_dry_run(),
     );

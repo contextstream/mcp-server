@@ -270,7 +270,7 @@ pub fn get_api_key() -> Option<String> {
 pub fn get_jwt() -> Option<String> {
     // First check environment
     if let Ok(jwt) = std::env::var("CONTEXTSTREAM_JWT") {
-        if !jwt.is_empty() {
+        if !jwt.trim().is_empty() {
             return Some(jwt);
         }
     }

@@ -26,9 +26,19 @@ pub fn load_limited_config() -> Result<Config> {
     Ok(config)
 }
 
+/// A credential variable's value, or `None` when it is unset, empty or blank.
+/// An empty one is what an editor config sends when the variable it names
+/// (`"${CONTEXTSTREAM_API_KEY}"`) is unset; it is no credential (#311).
+fn credential_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
-    let has_env_auth = std::env::var("CONTEXTSTREAM_API_KEY").is_ok()
-        || std::env::var("CONTEXTSTREAM_JWT").is_ok();
+    let has_env_auth = credential_env("CONTEXTSTREAM_API_KEY").is_some()
+        || credential_env("CONTEXTSTREAM_JWT").is_some();
     let saved_credentials = if !has_env_auth || std::env::var("CONTEXTSTREAM_API_URL").is_err() {
         load_saved_credentials()
     } else {
@@ -51,8 +61,8 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
         std::env::set_var("CONTEXTSTREAM_API_URL", &api_url);
     }
 
-    let api_key = std::env::var("CONTEXTSTREAM_API_KEY").ok();
-    let jwt = std::env::var("CONTEXTSTREAM_JWT").ok();
+    let api_key = credential_env("CONTEXTSTREAM_API_KEY");
+    let jwt = credential_env("CONTEXTSTREAM_JWT");
     let allow_header_auth = parse_bool_env("CONTEXTSTREAM_ALLOW_HEADER_AUTH");
 
     // Check for credentials

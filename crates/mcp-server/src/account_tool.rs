@@ -91,6 +91,8 @@ pub enum CredentialsSource {
     /// file, so a key saved by this tool will not take effect until the
     /// editor config is updated.
     EnvironmentOverride,
+    /// No API key anywhere; the editor config supplies `CONTEXTSTREAM_JWT`.
+    EnvironmentJwt,
 }
 
 pub fn detect_credentials_source() -> CredentialsSource {
@@ -103,7 +105,11 @@ pub fn detect_credentials_source() -> CredentialsSource {
         .and_then(|c| c.api_key)
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty());
+    let env_jwt = std::env::var("CONTEXTSTREAM_JWT")
+        .ok()
+        .is_some_and(|jwt| !jwt.trim().is_empty());
     match (env_key, saved_key) {
+        (None, None) if env_jwt => CredentialsSource::EnvironmentJwt,
         (None, None) => CredentialsSource::None,
         (None, Some(_)) => CredentialsSource::SavedFile,
         (Some(env), Some(saved)) if env == saved => CredentialsSource::SavedFile,
@@ -148,9 +154,24 @@ struct AccountInput {
     channel: Option<String>,
 }
 
+/// What the API said about the active credentials when `status` asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CredentialCheck {
+    Accepted,
+    /// A definite 401: invalid, expired or revoked.
+    Rejected,
+    /// Unreachable, slow or failing API; the reason, without secrets.
+    Unverified(String),
+}
+
+/// How long `status` waits for the API to confirm the credentials.
+const CREDENTIAL_CHECK_TIMEOUT: Duration = Duration::from_secs(4);
+
 pub struct AccountTool {
     metadata: ToolMetadata,
     mode: AccountToolMode,
+    /// The server's own configuration, to check its credentials with.
+    config: Config,
     api_url: String,
     flow: Arc<Mutex<Option<BrowserFlow>>>,
     inline: Arc<Mutex<Option<PendingConnection>>>,
@@ -217,6 +238,7 @@ impl AccountTool {
                 required_tier: None,
             },
             mode,
+            config: config.clone(),
             api_url: config.api_url.trim_end_matches('/').to_string(),
             flow: Arc::new(Mutex::new(None)),
             inline: Arc::new(Mutex::new(inline)),
@@ -277,11 +299,35 @@ impl AccountTool {
     // status / cancel
     // ----------------------------------------------------------------------
 
+    /// Ask the API whether the server's credentials work (#261).
+    async fn check_credentials(&self) -> CredentialCheck {
+        let client = ContextStreamClient::new(self.config.clone());
+        match tokio::time::timeout(CREDENTIAL_CHECK_TIMEOUT, client.me()).await {
+            Ok(Ok(_)) => CredentialCheck::Accepted,
+            Ok(Err(mcp_types::Error::Http { status: 401, .. })) => CredentialCheck::Rejected,
+            Ok(Err(mcp_types::Error::Http { status, .. })) => {
+                CredentialCheck::Unverified(format!("the API answered HTTP {status}"))
+            }
+            Ok(Err(_)) => CredentialCheck::Unverified("the API could not be reached".to_string()),
+            Err(_) => CredentialCheck::Unverified(format!(
+                "the API did not answer within {} s",
+                CREDENTIAL_CHECK_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
     async fn status(&self) -> ToolResult {
         let source = detect_credentials_source();
         let flow = self.flow.lock().await.clone();
         let inline = self.inline.lock().await.clone();
-        let inline_available = self.inline_available().await;
+        // Signup routes matter only before an account is connected.
+        let inline_available =
+            self.mode == AccountToolMode::Limited && self.inline_available().await;
+        let check = if self.mode == AccountToolMode::Full && source != CredentialsSource::None {
+            Some(self.check_credentials().await)
+        } else {
+            None
+        };
         let flow_summary = flow.as_ref().map(|f| {
             json!({
                 "verification_uri": f.verification_uri,
@@ -296,7 +342,7 @@ impl AccountTool {
                 "phone_last4": p.phone_last4,
             })
         });
-        let connected = source != CredentialsSource::None && self.mode == AccountToolMode::Full;
+        let connected = check == Some(CredentialCheck::Accepted);
         let mut routes = vec!["browser"];
         if inline_available {
             routes.push("email");
@@ -315,7 +361,9 @@ impl AccountTool {
                 } else {
                     text.push_str(". The inline email route is not available on this server.");
                 }
-                text.push_str(" Do not ask for an email or phone number unless they choose the inline route.");
+                text.push_str(
+                    " Do not ask for an email or phone number unless they choose the inline route.",
+                );
                 if flow.is_some() {
                     text.push_str(" A browser sign-in is already in progress; call account(action=connect_poll) after the user approves it.");
                 }
@@ -329,18 +377,18 @@ impl AccountTool {
                 }
                 text
             }
-            (AccountToolMode::Full, CredentialsSource::EnvironmentOverride) => {
-                "Connected using an API key supplied by the editor configuration (CONTEXTSTREAM_API_KEY). \
-                 A key saved by this tool will not take effect until that configuration is updated; run \
-                 `contextstream-mcp update-configs` after connecting, or remove the env entry."
-                    .to_string()
-            }
-            (AccountToolMode::Full, _) => "Connected. Credentials are saved locally.".to_string(),
+            (AccountToolMode::Full, source) => full_mode_status_text(source, check.as_ref()),
         };
-        ToolResult::with_structured(
+        let status = match (&check, connected) {
+            (_, true) => "connected",
+            (Some(CredentialCheck::Rejected), _) => "credentials_rejected",
+            (Some(CredentialCheck::Unverified(_)), _) => "unverified",
+            _ => "setup_required",
+        };
+        let mut result = ToolResult::with_structured(
             text,
             json!({
-                "status": if connected { "connected" } else { "setup_required" },
+                "status": status,
                 "mode": self.mode.as_str(),
                 "credentials_source": source,
                 "credentials_path": credentials_file_path().display().to_string(),
@@ -349,7 +397,7 @@ impl AccountTool {
                 "inline_signup_available": inline_available,
                 "browser_flow": flow_summary,
                 "inline_signup": inline_summary,
-                "next": if connected {
+                "next": if connected || matches!(check, Some(CredentialCheck::Unverified(_))) {
                     Value::Null
                 } else if let Some(p) = &inline {
                     json!(next_inline_action(&p.stage))
@@ -357,7 +405,10 @@ impl AccountTool {
                     json!("account(action=\"connect_browser\")")
                 },
             }),
-        )
+        );
+        // Every ContextStream tool fails with these credentials.
+        result.is_error = check == Some(CredentialCheck::Rejected);
+        result
     }
 
     async fn cancel(&self) -> ToolResult {
@@ -881,6 +932,43 @@ impl AccountTool {
     }
 }
 
+/// What `status` says when credentials are configured (#261).
+fn full_mode_status_text(source: CredentialsSource, check: Option<&CredentialCheck>) -> String {
+    let origin = match source {
+        CredentialsSource::EnvironmentOverride => {
+            "an API key supplied by the editor configuration (CONTEXTSTREAM_API_KEY)"
+        }
+        CredentialsSource::EnvironmentJwt => {
+            "a token supplied by the editor configuration (CONTEXTSTREAM_JWT)"
+        }
+        CredentialsSource::SavedFile | CredentialsSource::None => "the credentials saved locally",
+    };
+    match check {
+        Some(CredentialCheck::Accepted) => match source {
+            CredentialsSource::EnvironmentOverride => {
+                "Connected using an API key supplied by the editor configuration (CONTEXTSTREAM_API_KEY). \
+                 A key saved by this tool will not take effect until that configuration is updated; run \
+                 `contextstream-mcp update-configs` after connecting, or remove the env entry."
+                    .to_string()
+            }
+            CredentialsSource::EnvironmentJwt => {
+                "Connected using a token supplied by the editor configuration (CONTEXTSTREAM_JWT).".to_string()
+            }
+            _ => "Connected. Credentials are saved locally and ContextStream accepted them.".to_string(),
+        },
+        Some(CredentialCheck::Rejected) => format!(
+            "Not connected: ContextStream did not accept {origin} (HTTP 401; invalid, expired or \
+             revoked), so ContextStream tools will fail. Reconnect with \
+             account(action=\"connect_browser\") or run `contextstream-mcp setup`, then {RECONNECT_INSTRUCTIONS}"
+        ),
+        Some(CredentialCheck::Unverified(reason)) => format!(
+            "ContextStream is configured with {origin}, but they could not be verified: {reason}. \
+             Check the network connection; ContextStream tools will fail until the API is reachable."
+        ),
+        None => format!("ContextStream is configured with {origin}."),
+    }
+}
+
 fn next_inline_action(stage: &PendingStage) -> &'static str {
     match stage {
         PendingStage::EmailSent => "account(action=\"signup_verify_email\", code=...)",
@@ -976,6 +1064,87 @@ mod tests {
         let mut tool = AccountTool::new(&Config::default(), mode);
         tool.inline = Arc::new(Mutex::new(None));
         tool
+    }
+
+    /// An API that answers every request with `status_line`.
+    async fn api_answering(status_line: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind api");
+        let address = listener.local_addr().expect("api address");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = vec![0u8; 16 * 1024];
+                let _ = socket.read(&mut buffer).await;
+                let body = r#"{"success":false,"error":"no"}"#;
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn full_tool(api_url: String) -> AccountTool {
+        let config = Config {
+            api_url,
+            api_key: Some("cs_invalid_deadbeef_000000000000".to_string()),
+            ..Config::default()
+        };
+        let mut tool = AccountTool::new(&config, AccountToolMode::Full);
+        tool.inline = Arc::new(Mutex::new(None));
+        tool
+    }
+
+    #[tokio::test]
+    async fn status_checks_the_credentials_instead_of_assuming_them() {
+        let rejected = full_tool(api_answering("HTTP/1.1 401 Unauthorized").await)
+            .check_credentials()
+            .await;
+        assert_eq!(rejected, CredentialCheck::Rejected);
+
+        let started = Instant::now();
+        let offline = full_tool("http://127.0.0.1:9".to_string())
+            .check_credentials()
+            .await;
+        assert!(
+            matches!(offline, CredentialCheck::Unverified(_)),
+            "{offline:?}"
+        );
+        assert!(started.elapsed() < CREDENTIAL_CHECK_TIMEOUT + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn status_text_says_connected_only_when_the_api_accepted_the_credentials() {
+        let rejected = full_mode_status_text(
+            CredentialsSource::SavedFile,
+            Some(&CredentialCheck::Rejected),
+        );
+        assert!(rejected.starts_with("Not connected"), "{rejected}");
+        assert!(rejected.contains("connect_browser"), "{rejected}");
+        let jwt = full_mode_status_text(
+            CredentialsSource::EnvironmentJwt,
+            Some(&CredentialCheck::Rejected),
+        );
+        assert!(
+            jwt.contains("CONTEXTSTREAM_JWT") && !jwt.contains("saved locally"),
+            "{jwt}"
+        );
+        let offline = full_mode_status_text(
+            CredentialsSource::SavedFile,
+            Some(&CredentialCheck::Unverified(
+                "the API could not be reached".into(),
+            )),
+        );
+        assert!(!offline.contains("Connected"), "{offline}");
+        assert!(full_mode_status_text(
+            CredentialsSource::SavedFile,
+            Some(&CredentialCheck::Accepted)
+        )
+        .starts_with("Connected."));
     }
 
     #[tokio::test]

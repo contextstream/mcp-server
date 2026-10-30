@@ -4798,12 +4798,19 @@ impl ContextStreamClient {
         if response.status() == reqwest::StatusCode::NO_CONTENT {
             return deserialize_empty_success();
         }
+        let status = response.status().as_u16();
+        let host = response
+            .url()
+            .host_str()
+            .unwrap_or("the API URL")
+            .to_string();
 
         let content_type = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
 
         if content_type.contains("application/json") {
             let body = response
@@ -4813,12 +4820,11 @@ impl ContextStreamClient {
             if body.iter().all(u8::is_ascii_whitespace) {
                 return deserialize_empty_success();
             }
-            let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-                Error::Serialization(serde_json::Error::io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid JSON response: {}", e),
-                )))
-            })?;
+            let value: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|_| not_an_api_reply(status, &host, "a body that is not JSON"))?;
+            if let Some(error) = failed_success_envelope(&value, status) {
+                return Err(error);
+            }
 
             // Unwrap API response wrapper if present
             let data = unwrap_api_response(value);
@@ -4831,7 +4837,17 @@ impl ContextStreamClient {
             if text.trim().is_empty() {
                 return deserialize_empty_success();
             }
-            serde_json::from_str(&text).map_err(Error::Serialization)
+            let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+                let kind = match content_type.split(';').next().map(str::trim) {
+                    Some(kind) if !kind.is_empty() => format!("a {kind} page"),
+                    _ => "a body that is not JSON".to_string(),
+                };
+                not_an_api_reply(status, &host, &kind)
+            })?;
+            if let Some(error) = failed_success_envelope(&value, status) {
+                return Err(error);
+            }
+            serde_json::from_value(value).map_err(Error::Serialization)
         }
     }
 
@@ -21610,6 +21626,26 @@ fn unwrap_api_response(value: serde_json::Value) -> serde_json::Value {
     value
 }
 
+/// A success status whose envelope says the request failed (`"success":
+/// false`) is that failure, with its message (#420). The API never sends one
+/// with a 2xx; a proxy or a gateway in between can.
+fn failed_success_envelope(body: &serde_json::Value, status: u16) -> Option<Error> {
+    (body.get("success").and_then(serde_json::Value::as_bool) == Some(false))
+        .then(|| Error::http(status, extract_error_message(body, status)))
+}
+
+/// A success status with a body ContextStream's API never sends (an HTML
+/// login page, plain text): something else answered at the API URL (#420).
+fn not_an_api_reply(status: u16, host: &str, kind: &str) -> Error {
+    Error::http(
+        status,
+        format!(
+            "The server at {host} answered {status} with {kind}, not a ContextStream API reply. \
+             Check CONTEXTSTREAM_API_URL and any proxy in between."
+        ),
+    )
+}
+
 fn deserialize_empty_success<T: DeserializeOwned>() -> Result<T> {
     serde_json::from_value(serde_json::Value::Object(serde_json::Map::new()))
         .or_else(|_| serde_json::from_value(serde_json::Value::Null))
@@ -28782,6 +28818,25 @@ mod tests {
         assert_eq!(
             ContextStreamClient::map_session_capture_api_event_type("bug"),
             "ticket"
+        );
+    }
+
+    #[test]
+    fn a_success_status_that_says_it_failed_is_an_error() {
+        // #420: {"success":false,…} in a 200 read as "created (ID: unknown)".
+        let body = serde_json::json!({"success": false, "data": null,
+            "error": {"code": "X", "message": "nope: write rejected"}});
+        let error = failed_success_envelope(&body, 200).expect("an error");
+        assert_eq!(error.to_string(), "HTTP error (200): nope: write rejected");
+        assert!(
+            failed_success_envelope(&serde_json::json!({"success": true, "data": {}}), 200)
+                .is_none()
+        );
+        assert!(failed_success_envelope(&serde_json::json!({"id": "x"}), 200).is_none());
+        assert_eq!(
+            not_an_api_reply(200, "portal.example", "a text/html page").to_string(),
+            "HTTP error (200): The server at portal.example answered 200 with a text/html page, \
+             not a ContextStream API reply. Check CONTEXTSTREAM_API_URL and any proxy in between."
         );
     }
 

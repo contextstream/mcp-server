@@ -3095,3 +3095,27 @@ mod doc_body_match_tests {
         assert_eq!(full.len(), 1);
     }
 }
+
+mod transcript_match_tests {
+    use super::format_transcript_matches;
+    use serde_json::json;
+
+    #[test]
+    fn a_transcript_search_lists_each_match_with_a_snippet() {
+        // #390: "Found 10 matching transcripts." and nothing to follow.
+        let result = json!({"items": [{
+            "id": "11111111-1111-4111-8111-111111111111",
+            "title": "Create t4 directory and count hostname bytes",
+            "client_name": "contextcode",
+            "started_at": "2026-10-28T18:56:15Z",
+            "message_count": 2,
+            "messages": [{"role": "user", "content": "Please Create the t4 directory now."}]
+        }]});
+        let text = format_transcript_matches(&result, "create");
+        assert!(text.contains("1. **Create t4 directory and count hostname bytes** (id: 11111111-1111-4111-8111-111111111111) — contextcode, 2026-10-28T18:56:15Z, 2 messages"), "{text}");
+        assert!(
+            text.contains("…Please Create the t4 directory now.…"),
+            "{text}"
+        );
+    }
+}

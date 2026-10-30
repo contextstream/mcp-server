@@ -526,6 +526,49 @@ fn paging_footer(result: &Value, offset: Option<i64>, limit: Option<i64>) -> Str
     }
 }
 
+/// One line per transcript a search matched (#390): title, id, client, when
+/// it started and its size, then the first message that holds the query.
+fn format_transcript_matches(result: &Value, query: &str) -> String {
+    let Some(items) = extract_collection_array(result) else {
+        return String::new();
+    };
+    let needle = query.trim().to_lowercase();
+    let mut text = String::new();
+    for (i, item) in items.iter().take(20).enumerate() {
+        let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
+        text.push_str(&format!(
+            "\n{}. **{}** (id: {}) — {}, {}, {} messages",
+            i + 1,
+            extract_display_title(item),
+            field("id"),
+            field("client_name"),
+            field("started_at"),
+            item.get("message_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ));
+        let snippet = item
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .find_map(|content| {
+                let at = content.to_lowercase().find(&needle)?;
+                // Lowercasing can move byte offsets; a miss starts at 0.
+                let start = content.get(..at).map_or(0, |before| {
+                    before.char_indices().rev().nth(40).map_or(0, |(i, _)| i)
+                });
+                let excerpt: String = content[start..].chars().take(160).collect();
+                Some(excerpt.replace('\n', " "))
+            });
+        if let Some(snippet) = snippet {
+            text.push_str(&format!("\n   …{}…", snippet.trim()));
+        }
+    }
+    text
+}
+
 /// Format a collection of items into a human-readable list with IDs and titles.
 /// This allows the AI to see item details (especially IDs) so it can act on them.
 fn format_collection(entity_name: &str, value: &Value) -> String {
@@ -6102,9 +6145,9 @@ impl ToolHandler for MemoryTool {
 
             // === Transcript Actions ===
             "list_transcripts" => {
-                let result = self
-                    .client
-                    .list_transcripts(
+                let result = mcp_client::with_list_offset(
+                    input.offset,
+                    self.client.list_transcripts(
                         workspace_id,
                         project_id,
                         input.session_id,
@@ -6112,9 +6155,14 @@ impl ToolHandler for MemoryTool {
                         input.started_after,
                         input.started_before,
                         input.limit,
-                    )
-                    .await?;
-                let text = format_collection("transcripts", &result);
+                    ),
+                )
+                .await?;
+                let text = format!(
+                    "{}{}",
+                    format_collection("transcripts", &result),
+                    paging_footer(&result, input.offset, input.limit)
+                );
                 Ok(ToolResult::with_structured(text, result))
             }
             "get_transcript" => {
@@ -6197,7 +6245,7 @@ impl ToolHandler for MemoryTool {
                     .and_then(|v| v.as_array())
                     .map(|a| a.len())
                     .unwrap_or(0);
-                let text = if atlas_count > 0 {
+                let mut text = if atlas_count > 0 {
                     format!(
                         "Found {} matching transcripts (+{} fuzzy hit(s)).",
                         pg_count, atlas_count
@@ -6205,6 +6253,8 @@ impl ToolHandler for MemoryTool {
                 } else {
                     format!("Found {} matching transcripts.", pg_count)
                 };
+                // Each match, so get_transcript can follow (#390).
+                text.push_str(&format_transcript_matches(&result, &query));
                 if let Some(cache_key) = cache_key {
                     put_transcripts_search_cache(
                         caller_cache_identity.as_deref(),

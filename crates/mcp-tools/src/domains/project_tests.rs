@@ -70,6 +70,83 @@ fn tool_result_text(result: &mcp_types::tool::ToolResult) -> &str {
     }
 }
 
+fn empty_page() -> String {
+    json!({"items": [], "total": 0, "page": 1, "page_size": 20, "total_pages": 0}).to_string()
+}
+
+// #342: an unknown or inaccessible workspace read as an empty one, with a
+// hint naming a tool that does not exist.
+#[tokio::test]
+async fn an_empty_list_for_a_workspace_that_cannot_be_reached_is_an_error() {
+    let workspace = uuid::Uuid::new_v4();
+    for (status, body) in [
+        (
+            "404 Not Found",
+            json!({"error": "Workspace not found"}).to_string(),
+        ),
+        (
+            "403 Forbidden",
+            json!({"error": "No access to workspace"}).to_string(),
+        ),
+    ] {
+        let (tool, server) =
+            project_tool_with_http_sequence(vec![("200 OK", empty_page()), (status, body)]).await;
+        let result = tool
+            .execute(json!({"action": "list", "workspace_id": workspace.to_string()}))
+            .await
+            .expect("an answer");
+        let text = tool_result_text(&result);
+        assert!(result.is_error, "{status}: {text}");
+        assert!(
+            text.contains(&format!(
+                "Workspace {workspace} was not found, or these credentials cannot access it"
+            )),
+            "{status}: {text}"
+        );
+        assert!(!text.contains("No projects found"), "{text}");
+        let requests = server.await.unwrap();
+        assert!(
+            requests[1].starts_with(&format!("GET /api/v1/workspaces/{workspace}")),
+            "{}",
+            requests[1]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_empty_workspace_says_so_and_names_the_create_action_that_exists() {
+    let workspace = uuid::Uuid::new_v4();
+    let found = json!({"id": workspace, "name": "Empty space",
+        "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"})
+    .to_string();
+    let (tool, _server) =
+        project_tool_with_http_sequence(vec![("200 OK", empty_page()), ("200 OK", found)]).await;
+    let result = tool
+        .execute(json!({"action": "list", "workspace_id": workspace.to_string()}))
+        .await
+        .expect("an answer");
+    let text = tool_result_text(&result);
+    assert!(!result.is_error, "{text}");
+    assert_eq!(
+        text,
+        format!("Workspace Empty space ({workspace}) has no projects yet. Create one with project(action=\"create\", name=\"...\").")
+    );
+    assert!(!text.contains("projects_create"), "{text}");
+}
+
+#[tokio::test]
+async fn a_workspace_id_that_is_not_a_uuid_is_refused_instead_of_listing_another_workspace() {
+    let (tool, _server) = project_tool_with_http_sequence(vec![]).await;
+    let error = tool
+        .execute(json!({"action": "list", "workspace_id": "not-a-workspace"}))
+        .await
+        .expect_err("refused before any request");
+    assert!(
+        error.to_string().contains("is not a workspace ID"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn team_projects_calls_the_team_route_and_explains_a_non_team_account() {
     // #295: `/projects/team` was read as a project id ("UUID parsing failed").

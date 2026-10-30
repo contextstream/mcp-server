@@ -2755,7 +2755,8 @@ mod tests {
         std::fs::write(&keep, "fn keep() {}\n").unwrap();
         std::fs::write(&ignored, "fn secret() {}\n").unwrap();
         std::fs::write(&secret, r#"{"env":{"API_KEY":"secret"}}"#).unwrap();
-        std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+        // Binary (a NUL): not text in any encoding, so it is rejected.
+        std::fs::write(&invalid, [0x00, 0xff, 0xfe]).unwrap();
         std::fs::write(dir.path().join(".contextignore"), "ignored.rs\n").unwrap();
         let selected = vec![
             keep.to_string_lossy().into_owned(),

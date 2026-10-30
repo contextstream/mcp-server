@@ -3862,7 +3862,8 @@ mod tests {
         std::fs::write(&keep, "fn keep() {}\n").unwrap();
         std::fs::write(&ignored, "fn secret() {}\n").unwrap();
         std::fs::write(&secret, r#"{"headers":{"Authorization":"secret"}}"#).unwrap();
-        std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+        // Binary (a NUL): not text in any encoding, so it is rejected.
+        std::fs::write(&invalid, [0x00, 0xff, 0xfe]).unwrap();
         std::fs::write(dir.path().join(".gitignore"), "ignored.rs\n").unwrap();
 
         let changed = HashSet::from([

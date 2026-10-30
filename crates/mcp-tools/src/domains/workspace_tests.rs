@@ -590,3 +590,26 @@ mod list_heading_tests {
         );
     }
 }
+
+#[test]
+fn index_settings_are_shown_with_what_zero_and_empty_mean() {
+    // #429: "Index settings retrieved." and nothing else.
+    let result = json!({"index_settings": {"allowed_machines": [], "auto_sync_enabled": false,
+        "branch_policy": "", "conflict_resolution": "newest_timestamp", "max_machines": 0},
+        "workspace_id": "11111111-1111-4111-8111-111111111111"});
+    assert_eq!(
+        index_settings_text(&result, false, &[]),
+        "Index settings:\n- auto_sync_enabled: false\n- max_machines: 0 (no limit)\n- allowed_machines: (any machine)\n- branch_policy: (not set)\n- conflict_resolution: newest_timestamp"
+    );
+    let text = index_settings_text(&result, true, &["auto_index", "context_hint"]);
+    assert!(
+        text.starts_with("Index settings updated. They are now:"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "Not applied: auto_index and context_hint only apply to action=\"bootstrap\"."
+        ),
+        "{text}"
+    );
+}

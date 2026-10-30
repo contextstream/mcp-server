@@ -411,6 +411,19 @@ impl ToolHandler for WorkspaceTool {
                     .ok_or_else(|| Error::Validation("workspace_id is required for index_settings".to_string()))?;
                 let id = Uuid::parse_str(workspace_id.trim())
                     .map_err(|_| not_an_id("workspace_id", "workspace", &workspace_id))?;
+                if let Some(max) = input.max_machines.filter(|max| *max < 0) {
+                    return Err(Error::Validation(format!(
+                        "index_settings: max_machines can't be negative (got {max}); 0 means no limit"
+                    )));
+                }
+                // Fields only bootstrap reads were dropped without a word (#429).
+                let ignored: Vec<&str> = [
+                    ("auto_index", input.auto_index.is_some()),
+                    ("context_hint", input.context_hint.is_some()),
+                ]
+                .into_iter()
+                .filter_map(|(field, given)| given.then_some(field))
+                .collect();
 
                 // If any settings are provided, update; otherwise get
                 let has_updates = input.auto_sync_enabled.is_some()
@@ -432,8 +445,10 @@ impl ToolHandler for WorkspaceTool {
                 };
 
                 let result = self.client.workspace_index_settings(id, settings).await?;
-                let action_text = if has_updates { "updated" } else { "retrieved" };
-                Ok(ToolResult::with_structured(format!("Index settings {}.", action_text), result))
+                Ok(ToolResult::with_structured(
+                    index_settings_text(&result, has_updates, &ignored),
+                    result,
+                ))
             }
             _ => Err(Error::Validation(format!(
                 "Unknown action: {}. Available actions: list, get, create, delete, associate, bootstrap, team_members, index_settings.",
@@ -554,6 +569,65 @@ pub fn register_workspace_tools(
         "workspaces_create",
         Arc::new(WorkspacesCreateTool::new(client.clone())),
     );
+}
+
+/// A workspace's index settings as text (#429): each setting with its value
+/// and what 0 or an empty list means, whether this call changed them, and
+/// the bootstrap-only fields it did not apply.
+fn index_settings_text(result: &Value, updated: bool, ignored: &[&str]) -> String {
+    let settings = result.get("index_settings").unwrap_or(result);
+    let named = |key: &str| {
+        settings
+            .get(key)
+            .and_then(Value::as_str)
+            .map(crate::domains::display_title::one_line)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "(not set)".to_string())
+    };
+    let auto_sync = settings
+        .get("auto_sync_enabled")
+        .and_then(Value::as_bool)
+        .map_or_else(|| "(not set)".to_string(), |enabled| enabled.to_string());
+    let max_machines = match settings.get("max_machines").and_then(Value::as_u64) {
+        Some(0) => "0 (no limit)".to_string(),
+        Some(max) => max.to_string(),
+        None => "(not set)".to_string(),
+    };
+    let allowed: Vec<String> = settings
+        .get("allowed_machines")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(crate::domains::display_title::one_line)
+        .collect();
+    let allowed = if allowed.is_empty() {
+        "(any machine)".to_string()
+    } else {
+        allowed.join(", ")
+    };
+    let mut text = format!(
+        "{}\n- auto_sync_enabled: {auto_sync}\n- max_machines: {max_machines}\n- allowed_machines: {allowed}\n- branch_policy: {}\n- conflict_resolution: {}",
+        if updated {
+            "Index settings updated. They are now:"
+        } else {
+            "Index settings:"
+        },
+        named("branch_policy"),
+        named("conflict_resolution"),
+    );
+    if !ignored.is_empty() {
+        text.push_str(&format!(
+            "\nNot applied: {} only {} to action=\"bootstrap\".",
+            ignored.join(" and "),
+            if ignored.len() == 1 {
+                "applies"
+            } else {
+                "apply"
+            }
+        ));
+    }
+    text
 }
 
 #[cfg(test)]

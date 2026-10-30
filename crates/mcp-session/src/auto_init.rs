@@ -213,6 +213,63 @@ pub async fn resolve_workspace(folder_path: &str) -> Option<WorkspaceMapping> {
     }
 }
 
+/// The nearest checkout-local config, when it is there but is not a readable
+/// binding at all: empty, truncated, not JSON, not an object, or with duplicate
+/// keys (mcp-server#387).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableLocalConfig {
+    pub path: std::path::PathBuf,
+    /// Why it cannot be read, as a phrase: "it is empty", "it is not valid JSON (...)".
+    pub reason: String,
+}
+
+/// Whether the nearest `.contextstream/config.json` above `folder_path` is
+/// unreadable as a binding. `init` uses it to refuse binding a workspace and
+/// `doctor` to report the link as broken: resolution fails closed for such a
+/// file (no ancestor or global project is inherited), and what followed was the
+/// account's default workspace, with nothing said. A config that parses but does
+/// not match this checkout is a different case and is not reported here.
+pub async fn unreadable_local_config(folder_path: &str) -> Option<UnreadableLocalConfig> {
+    if mcp_client::local_files_denied() {
+        return None;
+    }
+    let mut current = Path::new(folder_path).to_path_buf();
+    loop {
+        match safe_checkout_config_path(&current, false) {
+            Ok(path) => {
+                // The nearest config is the one that decides.
+                return unreadable_config_reason(&path)
+                    .map(|reason| UnreadableLocalConfig { path, reason });
+            }
+            Err(CheckoutIdentityError::MissingLocalConfig(_)) => {}
+            // Symlinks and other unreadable states have their own boundary
+            // handling (`LocalConfigResolution::InvalidBoundary`).
+            Err(_) => return None,
+        }
+        if !current.pop() || current.as_os_str().is_empty() || current == Path::new("/") {
+            return None;
+        }
+        if dirs::home_dir().is_some_and(|home| current == home) {
+            let path = safe_checkout_config_path(&current, false).ok()?;
+            return unreadable_config_reason(&path)
+                .map(|reason| UnreadableLocalConfig { path, reason });
+        }
+    }
+}
+
+fn unreadable_config_reason(path: &Path) -> Option<String> {
+    match read_regular_text_snapshot(path) {
+        Err(error) => Some(format!("it could not be read ({error})")),
+        Ok(None) => None,
+        Ok(Some(text)) if text.trim().is_empty() => Some("it is empty".to_string()),
+        Ok(Some(text)) => match parse_value_without_duplicate_keys(&text) {
+            Ok(value) if value.is_object() => None,
+            Ok(_) => Some("it is not a JSON object".to_string()),
+            Err(error) => Some(format!("it is not valid JSON ({error})")),
+        },
+    }
+}
+
 /// Verify that a local checkout explicitly authorizes content operations for
 /// the supplied project/workspace scope.
 ///
@@ -1516,8 +1573,8 @@ mod tests {
         checkout_binding_matches, checkout_binding_workspace, folder_checkout_id_for_git_upgrade,
         parse_local_config, parse_workspace_mapping, persist_folder_mapping,
         refresh_local_config_if_valid, resolve_checkout_id_for_establishment, resolve_local_config,
-        select_best_mapping, write_established_global_mapping, write_established_local_config,
-        LocalConfigResolution, RepositoryBindingIdentity,
+        select_best_mapping, unreadable_local_config, write_established_global_mapping,
+        write_established_local_config, LocalConfigResolution, RepositoryBindingIdentity,
     };
     use crate::checkout_identity::{
         current_repository_fingerprint, current_repository_remote_identity,
@@ -2009,6 +2066,63 @@ mod tests {
             fs::read_to_string(config_path).expect("unchanged config"),
             "{ definitely not json"
         );
+    }
+
+    // mcp-server#387: a truncated or empty config.json made init bind the
+    // account's default workspace without a word.
+    #[tokio::test]
+    async fn an_unreadable_checkout_config_is_named_and_a_readable_one_is_not() {
+        let checkout = tempdir().expect("checkout");
+        create_git_checkout(checkout.path());
+        let root = checkout.path().to_str().expect("path").to_string();
+        let config_dir = checkout.path().join(".contextstream");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        let config_path = config_dir.join("config.json");
+
+        // No config at all: nothing to report.
+        assert_eq!(unreadable_local_config(&root).await, None);
+
+        let good = serde_json::to_string_pretty(&json!({
+            "workspace_id": Uuid::new_v4(),
+            "project_id": Uuid::new_v4(),
+        }))
+        .unwrap();
+        fs::write(&config_path, &good).expect("good config");
+        assert_eq!(
+            unreadable_local_config(&root).await,
+            None,
+            "a readable binding"
+        );
+
+        for (content, reason_starts) in [
+            (String::new(), "it is empty"),
+            ("  \n".to_string(), "it is empty"),
+            (good[..good.len() / 2].to_string(), "it is not valid JSON"),
+            ("not json at all".to_string(), "it is not valid JSON"),
+            ("[1, 2]".to_string(), "it is not a JSON object"),
+            (
+                r#"{"workspace_id":"a","workspace_id":"b"}"#.to_string(),
+                "it is not valid JSON",
+            ),
+        ] {
+            fs::write(&config_path, &content).expect("broken config");
+            let found = unreadable_local_config(&root)
+                .await
+                .unwrap_or_else(|| panic!("{content:?} is unreadable"));
+            assert_eq!(found.path, config_path);
+            assert!(
+                found.reason.starts_with(reason_starts),
+                "{content:?}: {found:?}"
+            );
+            // From a folder inside the checkout, the nearest config still decides.
+            let nested = checkout.path().join("src/deep");
+            fs::create_dir_all(&nested).expect("nested");
+            let from_nested = unreadable_local_config(nested.to_str().expect("path")).await;
+            assert_eq!(
+                from_nested.map(|found| found.path),
+                Some(config_path.clone())
+            );
+        }
     }
 
     #[tokio::test]

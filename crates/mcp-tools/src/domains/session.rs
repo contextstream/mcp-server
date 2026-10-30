@@ -2594,6 +2594,18 @@ impl ToolHandler for InitTool {
                         project_id_from_implicit_mapping = project_id.is_some();
                         local_project_name = mapping.project_name;
                     }
+                } else if let Some(broken) =
+                    mcp_session::auto_init::unreadable_local_config(folder_path).await
+                {
+                    // The folder is bound, but its config cannot be read, so
+                    // resolution fails closed and the rest of init would pick the
+                    // account's default workspace: memory, docs and decisions
+                    // would be written there with nothing said (#387).
+                    return Err(Error::Validation(format!(
+                        "{} cannot be read ({}), so this folder's workspace and project are unknown. init did not bind the account's default workspace. Fix or delete that file, then run `contextstream-mcp setup` in this folder, or pass workspace_id (and project_id) explicitly.",
+                        broken.path.display(),
+                        broken.reason
+                    )));
                 }
             }
         }

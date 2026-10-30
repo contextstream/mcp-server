@@ -3078,6 +3078,21 @@ async fn check_project_link(client: &ContextStreamClient, project_path: &Path) -
             "home and root directories cannot be linked as a project",
         );
     }
+    // The runtime fails closed on a config it cannot read, whatever the folder
+    // mapping says: report what it reads, not the mapping's "linked" (#387).
+    if let Some(broken) =
+        mcp_session::auto_init::unreadable_local_config(&project_path.to_string_lossy()).await
+    {
+        return SurfaceCheck::failure(
+            SURFACE,
+            format!(
+                ".contextstream/config.json cannot be read ({})",
+                broken.reason
+            ),
+            Some(broken.path.as_path()),
+            Some("fix or delete that file, then run contextstream-mcp setup in this folder"),
+        );
+    }
     let candidates = match mcp_session::project_link::load_candidates(client).await {
         Ok(candidates) => candidates,
         Err(error) => {

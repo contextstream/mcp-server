@@ -729,6 +729,38 @@ impl SkillTool {
             ));
         }
         let project_id = self.resolve_target_project_id(input).await?;
+        // For team skills, resolve workspace from session; for personal, only use explicit
+        let workspace_id = if input.scope.as_deref() == Some("team") {
+            self.resolve_workspace_id(&input.workspace_id).await
+        } else {
+            Self::parse_explicit_uuid(&input.workspace_id)
+        };
+        // The API stores a skill under a name already in use in that
+        // workspace by replacing it in place: same id, still version 1, the
+        // old instructions gone, while the reply said "created" (#360).
+        if let Some(workspace) = workspace_id {
+            let listed = self
+                .client
+                .list_skills(
+                    Some(workspace),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(name.trim().to_string()),
+                    None,
+                    Some(25),
+                )
+                .await?;
+            if let Some((id, version)) = existing_skill_named(name, &listed) {
+                let version = version
+                    .map(|v| format!(", version {v}"))
+                    .unwrap_or_default();
+                return Err(Error::Validation(format!(
+                    "Skill '{name}' already exists (id {id}{version}). Use skill(action=\"update\", name=\"{name}\", ...) to change it, or create it under another name."
+                )));
+            }
+        }
 
         let result = self
             .client
@@ -748,12 +780,7 @@ impl SkillTool {
                 status: input.status.clone().or_else(|| Some("active".to_string())),
                 source_tool: input.source_tool.clone(),
                 source_file: input.source_file.clone(),
-                // For team skills, resolve workspace from session; for personal, only use explicit
-                workspace_id: if input.scope.as_deref() == Some("team") {
-                    self.resolve_workspace_id(&input.workspace_id).await
-                } else {
-                    Self::parse_explicit_uuid(&input.workspace_id)
-                },
+                workspace_id,
                 project_id,
             })
             .await?;
@@ -877,7 +904,18 @@ impl SkillTool {
             )
             .await?;
 
-        let text = format_run_result(&result);
+        let mut result = result;
+        let mut text = format_run_result(&result);
+        // A run executes the skill's actions. A skill made of instructions has
+        // none, so the run said "completed" and never said what the skill asks
+        // for (#359): every run carries the instructions.
+        if let Ok(skill) = self.client.get_skill(resolved_id).await {
+            if let Some(body) = append_skill_instructions(&mut text, &skill) {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("instruction_body".to_string(), Value::String(body));
+                }
+            }
+        }
         Ok(ToolResult::with_structured(text, result))
     }
 
@@ -937,11 +975,30 @@ impl SkillTool {
     }
 
     async fn handle_export(&self, input: &SkillInput) -> Result<ToolResult> {
-        let skill_ids = input.skill_ids.as_ref().map(|ids| {
+        let mut skill_ids = input.skill_ids.as_ref().map(|ids| {
             ids.iter()
                 .filter_map(|s| Uuid::parse_str(s).ok())
                 .collect::<Vec<_>>()
         });
+        // A named skill is exported alone, found the way delete finds it.
+        // Export read only skill_ids, so export(name=…) returned every skill
+        // the account can see, 344 KB for QA, even for a name that does not
+        // exist (#358).
+        let named = [&input.skill_id, &input.name].into_iter().any(|value| {
+            value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+        if named {
+            let id = match self
+                .resolve_skill_exactly(input, LookupAction::READ, "export", None)
+                .await?
+            {
+                Lookup::Found(found) => found.id,
+                Lookup::Candidates(candidates) => return Ok(candidates),
+            };
+            skill_ids.get_or_insert_with(Vec::new).push(id);
+        }
 
         let result = self
             .client
@@ -1094,6 +1151,38 @@ fn skill_items(value: &Value) -> Vec<Value> {
         return items.clone();
     }
     value.as_array().cloned().unwrap_or_default()
+}
+
+/// The listed skill whose name is exactly `name`: its id and version (#360).
+fn existing_skill_named(name: &str, listed: &Value) -> Option<(String, Option<i64>)> {
+    let name = name.trim();
+    skill_items(listed).into_iter().find_map(|item| {
+        (item.get("name").and_then(Value::as_str).map(str::trim) == Some(name)).then(|| {
+            let id = item
+                .get("id")
+                .or_else(|| item.get("skill_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            (id, item.get("version").and_then(Value::as_i64))
+        })
+    })
+}
+
+/// Adds the skill's instructions to a run's text and returns them; `None`
+/// when the skill has none (#359).
+fn append_skill_instructions(text: &mut String, skill: &Value) -> Option<String> {
+    let body = skill
+        .get("instruction_body")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|body| !body.is_empty())?;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("Skill instructions (follow these):\n");
+    text.push_str(body);
+    Some(body.to_string())
 }
 
 fn skill_item_key(item: &Value) -> Option<String> {
@@ -2140,5 +2229,42 @@ mod tests {
                 .to_string();
             assert!(message.contains(expected), "{input}: {message}");
         }
+    }
+
+    #[test]
+    fn create_finds_a_skill_already_named_so() {
+        // #360: create replaced it in place.
+        let listed = serde_json::json!({"items": [
+            {"id": "a", "name": "deploy-checker-v2", "version": 1},
+            {"id": "b", "name": "deploy-checker", "version": 3},
+        ]});
+        assert_eq!(
+            existing_skill_named(" deploy-checker ", &listed),
+            Some(("b".to_string(), Some(3)))
+        );
+        assert_eq!(existing_skill_named("deploy", &listed), None);
+        assert_eq!(existing_skill_named("x", &serde_json::json!([])), None);
+    }
+
+    #[test]
+    fn a_run_carries_the_skills_instructions() {
+        // #359: a skill without actions ran to "completed" and said nothing.
+        let mut text =
+            "Execution: completed (id: e1)\nSummary: All declared capabilities are satisfied.\n"
+                .to_string();
+        let skill = serde_json::json!({"instruction_body": "  When asked for a pelican check, reply pelican.  "});
+        assert_eq!(
+            append_skill_instructions(&mut text, &skill).as_deref(),
+            Some("When asked for a pelican check, reply pelican.")
+        );
+        assert!(text.ends_with(
+            "satisfied.\nSkill instructions (follow these):\nWhen asked for a pelican check, reply pelican."
+        ));
+        let mut untouched = "Execution: completed".to_string();
+        assert_eq!(
+            append_skill_instructions(&mut untouched, &serde_json::json!({})),
+            None
+        );
+        assert_eq!(untouched, "Execution: completed");
     }
 }

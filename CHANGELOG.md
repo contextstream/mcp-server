@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.45
+
+- `search(mode="exhaustive")` with no project in scope no longer fails. With one project in the workspace it searches
+  that project and says so; with several it lists them with ids and says to pass `project_id` or run `init`; with
+  none it says to index a folder or use `mode="keyword"`. Failed tool calls now record a short error class and the
+  JSON-RPC code in tool telemetry, never the message.
+- `initialize` answers the client's MCP revision when it is supported (2025-11-25, 2025-06-18, 2025-03-26,
+  2024-11-05), otherwise the newest, and 2025-03-26 JSON-RPC batches are received on stdio and HTTP (#316).
+- A person's own index or ingest asks the server even while credits are held, so the answer is typed instead of a
+  silent skip (#337).
+- Each batch of a scan says how big the checkout is, or that more follows, so a large index no longer reads
+  "completed" between scans (#326).
+- `verify-key` respects `-q`, and `verify-key`, `setup --yes`, `link`, `update --check` and
+  `configure --account-learning` status say what a refused key or an unreachable server means; the status command
+  exits 1 when it could not check (#338, #343).
+- `doctor` without `--repair` and `verify-key` write no installation state (#341).
+- Listing projects for a workspace that doesn't exist or that you can't access says so, instead of "No projects
+  found", and names the real create action; a workspace id that isn't a UUID is refused (#342).
+- `exclude` never overwrites a `.contextignore` it can't read, keeps CRLF line endings, names the path in errors, and
+  refuses empty, comment and duplicate patterns (#349).
+
 ## 1.0.44
 
 - Studio email, on the team's own Resend account, where Create offers it (#332, #335). `email_draft` writes a

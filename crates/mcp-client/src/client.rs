@@ -14078,6 +14078,20 @@ impl ContextStreamClient {
         status: Option<&str>,
         limit: Option<i64>,
     ) -> Result<serde_json::Value> {
+        self.list_plans_filtered_at(workspace_id, project_id, query, status, limit, None)
+            .await
+    }
+
+    /// `list_plans_filtered` from `offset` on (#452).
+    pub async fn list_plans_filtered_at(
+        &self,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        query: Option<&str>,
+        status: Option<&str>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<serde_json::Value> {
         let config = self.config.read().await;
         let path = build_plan_list_path(
             &config,
@@ -14086,6 +14100,7 @@ impl ContextStreamClient {
             query,
             status,
             limit,
+            offset,
             true,
         )?;
         drop(config);
@@ -14110,8 +14125,30 @@ impl ContextStreamClient {
         status: Option<&str>,
         limit: Option<i64>,
     ) -> Result<serde_json::Value> {
+        self.list_workspace_plans_filtered_at(workspace_id, query, status, limit, None)
+            .await
+    }
+
+    /// `list_workspace_plans_filtered` from `offset` on (#452).
+    pub async fn list_workspace_plans_filtered_at(
+        &self,
+        workspace_id: Option<Uuid>,
+        query: Option<&str>,
+        status: Option<&str>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<serde_json::Value> {
         let config = self.config.read().await;
-        let path = build_plan_list_path(&config, workspace_id, None, query, status, limit, false)?;
+        let path = build_plan_list_path(
+            &config,
+            workspace_id,
+            None,
+            query,
+            status,
+            limit,
+            offset,
+            false,
+        )?;
         drop(config);
         self.get(&path).await
     }
@@ -15092,6 +15129,7 @@ impl ContextStreamClient {
     }
 
     /// List skills.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_skills(
         &self,
         workspace_id: Option<Uuid>,
@@ -15102,6 +15140,34 @@ impl ContextStreamClient {
         query: Option<String>,
         is_personal: Option<bool>,
         limit: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        self.list_skills_page(
+            workspace_id,
+            project_id,
+            scope,
+            status,
+            category,
+            query,
+            is_personal,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    /// `list_skills` for one page of `limit` skills (#452).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_skills_page(
+        &self,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        scope: Option<String>,
+        status: Option<String>,
+        category: Option<String>,
+        query: Option<String>,
+        is_personal: Option<bool>,
+        limit: Option<i64>,
+        page: Option<i64>,
     ) -> Result<serde_json::Value> {
         let config = self.config.read().await;
         let ws_id = workspace_id.or(config.default_workspace_id);
@@ -15134,6 +15200,9 @@ impl ContextStreamClient {
         }
         if let Some(l) = limit {
             params.push(format!("per_page={}", l.clamp(1, 100)));
+        }
+        if let Some(page) = page.filter(|page| *page > 1) {
+            params.push(format!("page={page}"));
         }
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));
@@ -21654,6 +21723,7 @@ fn build_plan_list_path(
     query: Option<&str>,
     status: Option<&str>,
     limit: Option<i64>,
+    offset: Option<i64>,
     apply_default_project: bool,
 ) -> Result<String> {
     let workspace_id = workspace_id.or(config.default_workspace_id).ok_or_else(|| {
@@ -21680,6 +21750,9 @@ fn build_plan_list_path(
     }
     if let Some(limit) = limit.filter(|value| *value > 0) {
         params.push(format!("limit={}", limit));
+    }
+    if let Some(offset) = offset.filter(|value| *value > 0) {
+        params.push(format!("offset={}", offset));
     }
 
     Ok(format!("/plans?{}", params.join("&")))
@@ -28191,8 +28264,9 @@ mod tests {
 
     #[test]
     fn plan_list_path_requires_workspace_scope() {
-        let err = build_plan_list_path(&Config::default(), None, None, None, None, None, true)
-            .expect_err("missing workspace should fail locally");
+        let err =
+            build_plan_list_path(&Config::default(), None, None, None, None, None, None, true)
+                .expect_err("missing workspace should fail locally");
 
         assert!(err.to_string().contains("workspace_id is required"));
     }
@@ -28210,6 +28284,7 @@ mod tests {
             Some("Fix Daily Recap On Dashboard"),
             Some("draft,active"),
             Some(25),
+            Some(40),
             true,
         )
         .expect("path should build");
@@ -28217,7 +28292,7 @@ mod tests {
         assert_eq!(
             path,
             format!(
-                "/plans?workspace_id={}&project_id={}&query=Fix%20Daily%20Recap%20On%20Dashboard&status=draft%2Cactive&limit=25",
+                "/plans?workspace_id={}&project_id={}&query=Fix%20Daily%20Recap%20On%20Dashboard&status=draft%2Cactive&limit=25&offset=40",
                 workspace_id, project_id
             )
         );
@@ -28237,6 +28312,7 @@ mod tests {
             Some(workspace_id),
             None,
             Some("daily recap"),
+            None,
             None,
             None,
             false,

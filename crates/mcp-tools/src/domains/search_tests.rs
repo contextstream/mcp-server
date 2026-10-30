@@ -3255,6 +3255,19 @@ mod auto_mode_tests {
     }
 
     #[test]
+    fn test_suggest_output_format_for_identifier_exhaustive_keeps_line_numbers() {
+        // #382: "paths" gave one bare path per file, no line.
+        assert_eq!(
+            suggest_output_format("gnumark_py", SearchMode::Exhaustive),
+            Some("minimal")
+        );
+        assert_eq!(
+            suggest_output_format("gnumark_py", SearchMode::Refactor),
+            Some("paths")
+        );
+    }
+
+    #[test]
     fn test_suggest_output_format_for_identifier_hybrid_has_no_forced_minimal() {
         let output = suggest_output_format("handleSearch", SearchMode::Hybrid);
         assert_eq!(output, None);

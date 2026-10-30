@@ -14971,7 +14971,7 @@ impl ToolHandler for CapturePlanTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "capture_plan".to_string(),
             title: "Capture Plan".to_string(),
-            description: "Save the canonical ContextStream implementation plan. Use this instead of session(action=\"capture\", event_type=\"plan\") or memory events. Provide a short description, goals and structured steps (each step a clear title plus one to three sentences); by default the tool creates one linked task per step with plan_id and plan_step_id.".to_string(),
+            description: "Save the canonical ContextStream implementation plan. Use this instead of session(action=\"capture\", event_type=\"plan\") or memory events. Provide a short description, goals and structured steps (each step a clear title plus one to three sentences); by default the tool creates one linked task per step with plan_id and plan_step_id. A new plan starts as draft; set it active when work starts and completed when its tasks are done, with session(action=\"update_plan\").".to_string(),
             category: ToolCategory::Session,
             annotations: ToolAnnotations::write(),
             is_pro: false,
@@ -15126,6 +15126,20 @@ fn plan_is_substantive(plan: &Value) -> bool {
     has_items("tasks") || has_items("steps")
 }
 
+/// A plan whose tasks are all done but that nobody closed: the API keeps it
+/// `draft` or `active` at 100% (#428). It is not actionable.
+fn plan_is_finished(plan: &Value) -> bool {
+    !is_terminal_plan_status(plan_status(plan)) && plan_progress(plan) >= 99.95
+}
+
+/// What to do with a finished plan that is still open (#428).
+fn finished_plan_note(plan: &Value) -> String {
+    format!(
+        "All of its tasks are complete; close it with session(action=\"update_plan\", plan_id=\"{}\", status=\"completed\").",
+        plan_id(plan).unwrap_or("<plan id>")
+    )
+}
+
 fn select_latest_actionable_plan(plans: &Value) -> Option<Value> {
     let arr = plans.as_array()?;
     arr.iter()
@@ -15135,12 +15149,15 @@ fn select_latest_actionable_plan(plans: &Value) -> Option<Value> {
             let right_terminal = is_terminal_plan_status(plan_status(right));
             (
                 !left_terminal,
+                // Open tasks beat a finished plan nobody closed (#428).
+                !plan_is_finished(left),
                 plan_is_substantive(left),
                 plan_timestamp_key(left),
                 std::cmp::Reverse(*left_idx),
             )
                 .cmp(&(
                     !right_terminal,
+                    !plan_is_finished(right),
                     plan_is_substantive(right),
                     plan_timestamp_key(right),
                     std::cmp::Reverse(*right_idx),
@@ -15508,6 +15525,10 @@ fn format_plan_text(result: &Value) -> String {
         progress,
         plan_id(result).unwrap_or("unknown")
     );
+    if plan_is_finished(result) {
+        text.push_str(&finished_plan_note(result));
+        text.push_str("\n\n");
+    }
 
     if let Some(steps) = result.get("steps").and_then(|v| v.as_array()) {
         text.push_str("Steps:\n");
@@ -16213,7 +16234,15 @@ impl ToolHandler for ListPlansTool {
         };
 
         if let Some(plan) = latest_plan.as_ref().or(latest_plan_summary.as_ref()) {
-            text.push_str("Latest actionable plan:\n");
+            if plan_is_finished(plan) {
+                // Every plan in scope is finished or closed (#428).
+                text.push_str(&format!(
+                    "No plan has open tasks. Latest plan: {}\n",
+                    finished_plan_note(plan)
+                ));
+            } else {
+                text.push_str("Latest actionable plan:\n");
+            }
             text.push_str(&format!(
                 "- {} [{}] ({:.1}%) — id: {}\n",
                 plan_title(plan),
@@ -16255,12 +16284,17 @@ impl ToolHandler for ListPlansTool {
                     .unwrap_or("draft");
                 let progress = plan.get("progress").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 text.push_str(&format!(
-                    "{}. {} [{}] ({:.1}%) — id: {}\n",
+                    "{}. {} [{}] ({:.1}%) — id: {}{}\n",
                     i + 1,
-                    title,
-                    status,
+                    one_line(title),
+                    one_line(status),
                     progress,
-                    id
+                    one_line(id),
+                    if plan_is_finished(plan) {
+                        " — all tasks complete, not closed"
+                    } else {
+                        ""
+                    }
                 ));
             }
         }

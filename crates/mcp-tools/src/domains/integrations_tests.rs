@@ -931,3 +931,22 @@ async fn search_refuses_providers_the_api_cannot_search() {
         .expect_err("notion search is not served");
     assert!(error.to_string().contains("not searchable"), "{error}");
 }
+
+#[test]
+fn status_says_each_providers_state_and_which_are_not_connected() {
+    // #398: "Retrieved 2 integration statuses." and a 404 for slack.
+    let all = json!([
+        {"provider": "github", "status": "disconnected", "error_message": "GitHub authentication needs attention."},
+        {"provider": "local", "status": "connected", "error_message": null}
+    ]);
+    let text = super::integration_status_text("all", &all);
+    assert!(text.starts_with("Integration status (2):\n- github: disconnected — GitHub authentication needs attention.\n- local: connected\nNot connected: slack, notion,"), "{text}");
+    assert!(!text.contains("Not connected: slack, github"), "{text}");
+    assert_eq!(
+        super::integration_status_text(
+            "slack",
+            &json!({"provider": "slack", "status": "not_connected"})
+        ),
+        "slack integration status: not connected."
+    );
+}

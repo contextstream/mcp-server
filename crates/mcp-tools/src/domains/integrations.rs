@@ -39,6 +39,48 @@ const VALID_PROVIDERS: &[&str] = &[
     "all",
 ];
 
+/// What `status` says (#398): one provider's state and any error the API
+/// keeps for it, or, for `all`, each integration's state and the providers
+/// that are not connected.
+fn integration_status_text(provider: &str, result: &Value) -> String {
+    let line = |item: &Value| {
+        let field = |key: &str| {
+            item.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        let status = field("status").unwrap_or("unknown").replace('_', " ");
+        match field("error_message") {
+            Some(error) => format!("{status} — {error}"),
+            None => status,
+        }
+    };
+    if provider != "all" {
+        return format!("{provider} integration status: {}.", line(result));
+    }
+    let items = result.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut text = format!("Integration status ({}):", items.len());
+    let mut listed = Vec::new();
+    for item in items {
+        let name = item
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        listed.push(name);
+        text.push_str(&format!("\n- {name}: {}", line(item)));
+    }
+    let missing: Vec<&str> = VALID_PROVIDERS
+        .iter()
+        .copied()
+        .filter(|name| *name != "all" && !listed.contains(name))
+        .collect();
+    if !missing.is_empty() {
+        text.push_str(&format!("\nNot connected: {}.", missing.join(", ")));
+    }
+    text
+}
+
 /// Providers whose content `search` can reach.
 const SEARCHABLE_PROVIDERS: &[&str] = &["slack", "github", "all"];
 
@@ -212,20 +254,29 @@ impl ToolHandler for IntegrationTool {
 
             // Common actions (all providers)
             "status" => {
-                let result = self
-                    .client
-                    .integration_status(&provider, workspace_id)
-                    .await?;
-                let text = if provider == "all" {
-                    let count = result.as_array().map(|items| items.len()).unwrap_or(0);
-                    format!("Retrieved {} integration statuses.", count)
-                } else {
-                    let status = result
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    format!("{} integration status: {}.", provider, status)
+                // A provider outside the list is refused by name, not with
+                // the API's "not enabled yet" (#398).
+                if !VALID_PROVIDERS.contains(&provider.trim()) {
+                    return Err(Error::Validation(format!(
+                        "provider \"{}\" is not one of: {}.",
+                        input.provider,
+                        VALID_PROVIDERS.join(", ")
+                    )));
+                }
+                let provider = provider.trim();
+                let result = match self.client.integration_status(provider, workspace_id).await {
+                    Ok(result) => result,
+                    // A provider that was never connected has no integration
+                    // row, and the API answers 404 (#398).
+                    Err(Error::Http { status: 404, .. }) if provider != "all" => {
+                        serde_json::json!({
+                            "provider": provider,
+                            "status": "not_connected",
+                        })
+                    }
+                    Err(error) => return Err(error),
                 };
+                let text = integration_status_text(provider, &result);
                 Ok(ToolResult::with_structured(text, result))
             }
 

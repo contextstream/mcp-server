@@ -394,7 +394,9 @@ mod constants_tests {
         assert!(VALID_ACTIONS.contains(&"snooze"));
         assert!(VALID_ACTIONS.contains(&"complete"));
         assert!(VALID_ACTIONS.contains(&"dismiss"));
-        assert_eq!(VALID_ACTIONS.len(), 6);
+        // Listed only through the delete tool, as reminder.delete (#426).
+        assert!(VALID_ACTIONS.contains(&"delete"));
+        assert_eq!(VALID_ACTIONS.len(), 7);
     }
 
     #[test]
@@ -563,4 +565,28 @@ mod enum_argument_tests {
             assert!(!error.to_string().contains("is not one of"), "{error}");
         }
     }
+}
+
+#[test]
+fn keywords_and_priority_narrow_a_reminder_list() {
+    // #426: both were stored, then ignored by list and active.
+    let mut result = json!([
+        {"id": "1", "title": "Rotate the alphakw signing key", "content": "", "priority": "urgent", "keywords": []},
+        {"id": "2", "title": "Other", "content": "", "priority": "normal", "keywords": ["betakw"]},
+        {"id": "3", "title": "Third", "content": "mentions BETAKW", "priority": "urgent", "keywords": []}
+    ]);
+    let mut by_keyword = result.clone();
+    keep_matching_reminders(&mut by_keyword, Some(&["betakw".to_string()]), None);
+    let ids: Vec<&str> = by_keyword
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["2", "3"]);
+    keep_matching_reminders(&mut result, Some(&["betakw".to_string()]), Some("urgent"));
+    assert_eq!(
+        result,
+        json!([{"id": "3", "title": "Third", "content": "mentions BETAKW", "priority": "urgent", "keywords": []}])
+    );
 }

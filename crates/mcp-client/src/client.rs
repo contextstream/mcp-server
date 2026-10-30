@@ -16424,6 +16424,9 @@ impl ContextStreamClient {
         if let Some(ctx) = &params.context {
             query_params.push(format!("context={}", Self::url_encode(ctx)));
         }
+        if let Some(priority) = &params.priority {
+            query_params.push(format!("priority={}", Self::url_encode(priority)));
+        }
         if let Some(l) = params.limit {
             query_params.push(format!("limit={}", l));
         }
@@ -16494,6 +16497,11 @@ impl ContextStreamClient {
             &serde_json::json!({}),
         )
         .await
+    }
+
+    /// Delete a reminder for good (#426).
+    pub async fn delete_reminder(&self, reminder_id: Uuid) -> Result<serde_json::Value> {
+        self.delete(&format!("/reminders/{}", reminder_id)).await
     }
 
     /// Dismiss a reminder.
@@ -18008,6 +18016,8 @@ pub struct ListRemindersParams {
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<i64>,
 }

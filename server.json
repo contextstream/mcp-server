@@ -3,7 +3,7 @@
   "name": "io.github.contextstream/mcp-server",
   "title": "ContextStream MCP Server",
   "description": "The context platform for AI agents: code search, team decisions, and grounded project context.",
-  "version": "1.0.44",
+  "version": "1.0.45",
   "repository": {
     "url": "https://github.com/contextstream/mcp-server",
     "source": "github"
@@ -20,7 +20,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@contextstream/mcp-server",
-      "version": "1.0.44",
+      "version": "1.0.45",
       "transport": {
         "type": "stdio"
       },

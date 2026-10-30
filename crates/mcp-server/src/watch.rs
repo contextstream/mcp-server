@@ -198,6 +198,14 @@ pub fn watch_enabled() -> bool {
     )
 }
 
+/// A watcher whose `~/.contextstream` is gone has nothing left to keep
+/// fresh: a test's temporary home deleted under it, or a person removing the
+/// folder. Test runs left such watchers running for hours, each holding an
+/// inotify instance, until the host ran out (#457).
+fn contextstream_dir_is_gone(dir: Option<&Path>) -> bool {
+    dir.is_some_and(|dir| !dir.is_dir())
+}
+
 fn contextstream_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".contextstream"))
 }
@@ -2266,6 +2274,10 @@ pub async fn run_watch() -> Result<()> {
                 lock.write_heartbeat(targets.len());
             }
             _ = lock_tick.tick() => {
+                if contextstream_dir_is_gone(contextstream_dir().as_deref()) {
+                    tracing::info!("watch: ~/.contextstream is gone; stopping");
+                    break;
+                }
                 lock.write_heartbeat(targets.len());
             }
             _ = link_audit_tick.tick() => {
@@ -3813,6 +3825,18 @@ mod tests {
         assert_eq!(params.project_id, Some(pid_a()));
         assert_eq!(params.workspace_id, Some(ws()));
         assert_eq!(params.max_files, Some(WATCH_MAX_FILES));
+    }
+
+    #[test]
+    fn a_watcher_stops_once_its_contextstream_dir_is_gone() {
+        // #457: watchers outlived the temporary homes the tests ran setup in.
+        let home = tempfile::tempdir().expect("temp home");
+        let dir = home.path().join(".contextstream");
+        std::fs::create_dir_all(&dir).expect("contextstream dir");
+        assert!(!contextstream_dir_is_gone(Some(&dir)));
+        drop(home);
+        assert!(contextstream_dir_is_gone(Some(&dir)));
+        assert!(!contextstream_dir_is_gone(None));
     }
 
     #[test]

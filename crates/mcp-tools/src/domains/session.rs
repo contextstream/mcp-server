@@ -1400,6 +1400,13 @@ fn refuse_malformed_scope_id(field: &str, kind: &str, arg: &ScopeIdArg) -> Resul
     }
 }
 
+/// The body `POST /lessons/:id/supersede` takes: the existing lesson that
+/// replaces this one. The server read `successor_id` as nothing and answered
+/// 422 "missing field superseded_by" to every call (#356).
+fn supersede_lesson_body(successor_id: Uuid) -> Value {
+    serde_json::json!({ "superseded_by": successor_id })
+}
+
 /// Input for the init tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitInput {
@@ -12394,6 +12401,9 @@ pub struct SessionGetLessonsInput {
     pub category: Option<String>,
     pub severity: Option<String>,
     pub limit: Option<i64>,
+    /// Lessons to skip: the `Next offset` a page names (#357).
+    #[serde(default)]
+    pub offset: Option<i64>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
 }
@@ -12914,6 +12924,7 @@ impl ToolHandler for SessionGetLessonsTool {
             min_severity: input.severity.clone(),
             category: input.category.clone(),
             limit: input.limit.or(Some(10)),
+            offset: input.offset.filter(|offset| *offset > 0),
             ..Default::default()
         };
         let legacy_note: Option<&str> = match self.client.list_lessons(typed_params).await {
@@ -13206,6 +13217,11 @@ impl ToolHandler for SessionGetLessonsTool {
                 false,
             )
             .integer("limit", "Maximum lessons to return", false)
+            .integer(
+                "offset",
+                "Lessons to skip: the next offset a page names",
+                false,
+            )
             .uuid("workspace_id", "Workspace ID", false)
             .uuid("project_id", "Project ID", false)
             .build()
@@ -16573,7 +16589,8 @@ pub struct SessionInput {
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub keywords: Option<Vec<String>>,
     pub lesson_id: Option<String>,
-    #[serde(default)]
+    /// `superseded_by`, the API's name for it, is read too (#356).
+    #[serde(default, alias = "superseded_by")]
     pub successor_id: Option<String>,
     // Decision fields: capture(event_type="decision") routes to the typed
     // create when any of these is present.
@@ -16593,6 +16610,9 @@ pub struct SessionInput {
     #[serde(default)]
     pub user_message: Option<String>,
     pub limit: Option<i64>,
+    /// For get_lessons: lessons to skip (#357).
+    #[serde(default)]
+    pub offset: Option<i64>,
     // Plan fields
     pub plan_id: Option<String>,
     pub include_tasks: Option<bool>,
@@ -16904,6 +16924,7 @@ impl ToolHandler for SessionTool {
                     category: input.category,
                     severity: input.severity,
                     limit: input.limit,
+                    offset: input.offset,
                     workspace_id: input.workspace_id,
                     project_id: input.project_id,
                 };
@@ -17117,37 +17138,74 @@ impl ToolHandler for SessionTool {
                     },
                     None => None,
                 };
-                if successor_id.is_none()
-                    && input.title.as_deref().map(str::trim).is_none_or(str::is_empty)
+                // The API supersedes with an existing lesson only, so replacement
+                // fields are captured as a new lesson first (#356).
+                let (successor_id, created) = match successor_id {
+                    Some(id) => (id, None),
+                    None => {
+                        let field = |value: &Option<String>| {
+                            value
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                        };
+                        let (Some(title), Some(trigger), Some(prevention)) = (
+                            field(&input.title),
+                            field(&input.trigger),
+                            field(&input.prevention),
+                        ) else {
+                            return Err(Error::Validation(
+                                "supersede_lesson needs successor_id (an existing lesson), or the replacement lesson's title, trigger and prevention (impact optional), as capture_lesson takes them".to_string(),
+                            ));
+                        };
+                        let lesson_input = SessionCaptureLessonInput {
+                            title: title.clone(),
+                            trigger,
+                            impact: input.impact.clone().unwrap_or_default(),
+                            prevention,
+                            severity: input.severity.clone(),
+                            category: input.category.clone(),
+                            keywords: input.keywords.clone(),
+                            workspace_id: input.workspace_id.clone(),
+                            project_id: input.project_id.clone(),
+                        };
+                        let captured =
+                            SessionCaptureLessonTool::new(self.client.clone(), self.session.clone())
+                                .execute(serde_json::to_value(&lesson_input).unwrap())
+                                .await?;
+                        let id = captured
+                            .structured_content
+                            .as_ref()
+                            .and_then(|value| value.get("id"))
+                            .and_then(Value::as_str)
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                            .ok_or_else(|| {
+                                Error::Validation(format!(
+                                    "The replacement lesson \"{title}\" was not created (a lesson like it was captured in the last two minutes). Pass that lesson's id as successor_id."
+                                ))
+                            })?;
+                        (id, Some(title))
+                    }
+                };
+                match self
+                    .client
+                    .supersede_lesson(target.found.id, supersede_lesson_body(successor_id))
+                    .await
                 {
-                    return Err(Error::Validation(
-                        "supersede_lesson needs successor_id (an existing lesson) or the replacement lesson fields (title, trigger, impact, prevention)".to_string(),
-                    ));
-                }
-                let body = serde_json::json!({
-                    "successor_id": successor_id,
-                    "title": input.title,
-                    "trigger": input.trigger,
-                    "impact": input.impact,
-                    "prevention": input.prevention,
-                    "severity": input.severity,
-                    "category": input.category,
-                    "keywords": input.keywords,
-                });
-                match self.client.supersede_lesson(target.found.id, body).await {
                     Ok(result) => {
-                        let mut text = String::new();
-                        let successor = successor_id
-                            .map(|id| id.to_string())
-                            .or_else(|| {
-                                result
-                                    .get("successor_id")
-                                    .or_else(|| result.get("successor").and_then(|s| s.get("id")))
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .unwrap_or_else(|| "new lesson".to_string());
-                        text.push_str(&format!("Lesson superseded: {} → {}.", target.found.id, successor));
+                        let mut text = format!(
+                            "Lesson superseded: {} → {}.",
+                            target.found.id, successor_id
+                        );
+                        if let Some(title) = created {
+                            text.push_str(&format!(
+                                " The replacement lesson \"{title}\" was created first."
+                            ));
+                        }
+                        if result.get("status").and_then(Value::as_str) == Some("unchanged") {
+                            text.push_str(" The API changed nothing (status: unchanged).");
+                        }
                         Ok(ToolResult::with_structured(text, result))
                     }
                     Err(err) if is_not_found_error(&err) => Err(Error::Validation(format!(
@@ -17935,6 +17993,11 @@ impl ToolHandler for SessionTool {
                 false,
             )
             .integer("limit", "Max results", false)
+            .integer(
+                "offset",
+                "For get_lessons: lessons to skip, the next offset a page names",
+                false,
+            )
             .uuid(
                 "rule_id",
                 "Suggested rule ID (for suggested_rule_action)",

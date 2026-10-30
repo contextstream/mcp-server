@@ -1792,6 +1792,15 @@ async fn handle_request_message(
     }
 
     let stateless_request = method == "server/discover" || has_stateless_protocol_metadata(&params);
+    // A message that names a JSON-RPC version must name 2.0 (#368); stdio still
+    // takes one that names none.
+    if !stateless_request
+        && request
+            .get("jsonrpc")
+            .is_some_and(|version| version.as_str() != Some("2.0"))
+    {
+        return json_rpc_error(id, -32600, "Invalid Request: \"jsonrpc\" must be \"2.0\"");
+    }
     if stateless_request {
         if let Err(error) =
             validate_stateless_jsonrpc_envelope(jsonrpc, id.as_ref(), method.as_str())
@@ -2203,6 +2212,11 @@ async fn handle_request_dispatch(
                 }
             }
 
+            // MCP lists an unknown tool as a protocol error (#368).
+            if registry.get(tool_name).is_none() {
+                return json_rpc_error(id, -32602, &unknown_tool_message(registry, tool_name));
+            }
+
             let call_title = registry.get(tool_name).map(|tool| {
                 contextstream_call_title(
                     &tool.metadata.name,
@@ -2454,6 +2468,38 @@ fn auto_init_recently_unreachable() -> bool {
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .is_some_and(|at| at.elapsed() < AUTO_INIT_UNREACHABLE_BACKOFF)
+}
+
+/// What a tools/call naming a tool this session does not have is told: MCP
+/// lists unknown tools as protocol errors (-32602), and the answer says where
+/// the tools are and which listed names are close (#368).
+pub(crate) fn unknown_tool_message(registry: &ToolRegistry, name: &str) -> String {
+    let wanted = name.trim().to_ascii_lowercase();
+    let mut close: Vec<&str> = registry
+        .names()
+        .into_iter()
+        .filter(|candidate| {
+            let candidate = candidate.to_ascii_lowercase();
+            wanted.len() >= 3
+                && candidate.len() >= 3
+                && (candidate.contains(&wanted) || wanted.contains(&candidate))
+        })
+        .collect();
+    // Names that go on from what was typed come first (`memory_create` →
+    // `memory_create_doc`), then names it holds (`memory`).
+    close.sort_unstable_by_key(|candidate| {
+        (
+            !candidate.to_ascii_lowercase().starts_with(&wanted),
+            *candidate,
+        )
+    });
+    close.truncate(3);
+    let mut message = format!("Unknown tool: {name}. tools/list shows the tools this session has.");
+    if !close.is_empty() {
+        let names: Vec<String> = close.iter().map(|name| format!("`{name}`")).collect();
+        message.push_str(&format!(" Did you mean {}?", names.join(", ")));
+    }
+    message
 }
 
 fn json_rpc_error(id: Option<serde_json::Value>, code: i32, message: &str) -> String {
@@ -3523,6 +3569,21 @@ mod tests {
         for twin in domains::read_only::READ_ONLY_TWINS {
             assert!(registry.get_operation(twin.name).is_none(), "{}", twin.name);
         }
+    }
+
+    #[test]
+    fn an_unknown_tool_says_where_the_tools_are_and_which_names_are_close() {
+        let registry = test_registry(Config::default());
+        let message = unknown_tool_message(&registry, "no_such_tool");
+        assert_eq!(
+            message,
+            "Unknown tool: no_such_tool. tools/list shows the tools this session has."
+        );
+        let message = unknown_tool_message(&registry, "memory_create");
+        assert!(
+            message.contains("Did you mean `memory_create_"),
+            "{message}"
+        );
     }
 
     #[test]

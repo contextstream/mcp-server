@@ -9131,3 +9131,88 @@ mod literal_contract_tests {
         assert!(!SEARCH_TOOL_REFERENCE.contains("FASTER than grep"));
     }
 }
+
+// A customer's hosted exhaustive search with no project in scope ended
+// "Project not found for current context" (2026-10-30, 08:36Z).
+mod exhaustive_without_a_project {
+    use super::*;
+
+    fn page(projects: &[(Uuid, &str)], total: i64) -> String {
+        json!({
+            "items": projects.iter().map(|(id, name)| json!({
+                "id": id, "name": name, "workspace_id": Uuid::nil(),
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            })).collect::<Vec<_>>(),
+            "total": total, "page": 1, "page_size": 10, "total_pages": 1
+        })
+        .to_string()
+    }
+
+    fn client_for(base_url: &str) -> ContextStreamClient {
+        ContextStreamClient::new(mcp_types::Config {
+            api_url: base_url.to_string(),
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        })
+    }
+
+    async fn fallback(body: String) -> Result<(Uuid, String)> {
+        let (base_url, requests, server) =
+            spawn_search_recording_server(vec![RecordingHttpResponse {
+                expected_path: "/projects",
+                status: 200,
+                body,
+                delay: std::time::Duration::ZERO,
+            }]);
+        let workspace = Uuid::new_v4();
+        let result = exhaustive_project_fallback(&client_for(&base_url), Some(workspace)).await;
+        let (line, _) = requests.recv().expect("one request");
+        assert!(line.contains(&workspace.to_string()), "{line}");
+        server.join().unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn the_only_project_in_the_workspace_is_searched() {
+        let only = Uuid::new_v4();
+        let (id, name) = fallback(page(&[(only, "fleet")], 1)).await.unwrap();
+        assert_eq!((id, name.as_str()), (only, "fleet"));
+    }
+
+    #[tokio::test]
+    async fn several_projects_are_named_with_what_to_pass() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let error = fallback(page(&[(a, "fleet"), (b, "docs")], 12))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!("Validation error: {EXHAUSTIVE_NEEDS_PROJECT}")),
+            "{message}"
+        );
+        assert!(message.contains("project_id=\"<id>\""), "{message}");
+        assert!(message.contains(&format!("- fleet ({a})")), "{message}");
+        assert!(message.contains(&format!("- docs ({b})")), "{message}");
+        assert!(message.contains("and 10 more"), "{message}");
+        assert!(!message.contains("Project not found"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_says_to_index_a_folder_first() {
+        let message = fallback(page(&[], 0)).await.unwrap_err().to_string();
+        assert!(message.contains("has no projects yet"), "{message}");
+        assert!(message.contains("init(folder_path="), "{message}");
+    }
+
+    #[test]
+    fn an_exhaustive_search_with_no_project_takes_the_fallback_before_any_search() {
+        let source = include_str!("search.rs");
+        let guard = source
+            .find("if requested_mode == SearchMode::Exhaustive\n            && candidate_project_ids.iter().all(Option::is_none)")
+            .expect("the exhaustive guard");
+        let first_search = source
+            .find("for (idx, candidate_project_id) in candidate_project_ids.iter().enumerate()")
+            .expect("the candidate loop");
+        assert!(guard < first_search);
+    }
+}

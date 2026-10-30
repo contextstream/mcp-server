@@ -762,6 +762,79 @@ fn format_doc_detail(value: &Value) -> String {
     text
 }
 
+/// A node as get_node shows it: type, title and id, then what changes its
+/// meaning (superseded, tags, last update) and its content (#396).
+fn format_node_detail(value: &Value) -> String {
+    let node = extract_primary_object(value, &["id", "node_type", "summary"]);
+    let text_of = |key: &str| {
+        node.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let title = text_of("title")
+        .or_else(|| text_of("summary"))
+        .unwrap_or("Untitled");
+    let mut text = format!(
+        "[{}] {}\nID: {}",
+        text_of("node_type")
+            .or_else(|| text_of("type"))
+            .unwrap_or("unknown"),
+        title,
+        text_of("id").unwrap_or("unknown")
+    );
+    if let Some(successor) = text_of("superseded_by") {
+        text.push_str(&format!("\nSuperseded by: {successor}"));
+    }
+    let tags: Vec<&str> = node
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|tags| tags.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !tags.is_empty() {
+        text.push_str(&format!("\nTags: {}", tags.join(", ")));
+    }
+    if let Some(updated) = text_of("updated_at") {
+        text.push_str(&format!("\nUpdated: {updated}"));
+    }
+    match text_of("details").or_else(|| text_of("content")) {
+        Some(content) if content != title => {
+            text.push_str("\n\n");
+            text.push_str(content);
+        }
+        Some(_) => {}
+        None => text.push_str("\n\nThe node has no content beyond its title."),
+    }
+    text
+}
+
+/// A diagram as get_diagram shows it: title, type and id, then its Mermaid
+/// source in a code block (#396).
+fn format_diagram_detail(value: &Value) -> String {
+    let diagram = extract_primary_object(value, &["id", "title", "content"]);
+    let text_of = |key: &str| {
+        diagram
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let mut text = format!(
+        "**{}** ({})\nID: {}",
+        text_of("title").unwrap_or("Untitled"),
+        text_of("diagram_type").unwrap_or("diagram"),
+        text_of("id").unwrap_or("unknown")
+    );
+    if let Some(updated) = text_of("updated_at") {
+        text.push_str(&format!("\nUpdated: {updated}"));
+    }
+    match text_of("content") {
+        Some(source) => text.push_str(&format!("\n\n```mermaid\n{source}\n```")),
+        None => text.push_str("\n\nThe diagram has no source."),
+    }
+    text
+}
+
 fn format_event_detail(value: &Value) -> String {
     let event = extract_primary_object(value, &["id", "title", "content"]);
     let id = event.get("id").and_then(|v| v.as_str()).unwrap_or("—");
@@ -3692,21 +3765,7 @@ impl ToolHandler for MemoryTool {
                 };
                 let id = found.id;
                 let result = self.client.get_memory_node(id).await?;
-                let node_type = result
-                    .get("node_type")
-                    .or_else(|| result.get("type"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let title = result
-                    .get("title")
-                    .or_else(|| result.get("summary"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Untitled");
-                let node_id_str = result
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let text = format!("[{}] {}\nID: {}", node_type, title, node_id_str);
+                let text = format_node_detail(&result);
                 Ok(found.tool_result(text, result))
             }
             "update_node" => {
@@ -5221,7 +5280,7 @@ impl ToolHandler for MemoryTool {
                 };
                 let id = found.id;
                 let result = self.client.get_diagram(id).await?;
-                let text = "Diagram retrieved.";
+                let text = format_diagram_detail(&result);
                 Ok(found.tool_result(text, result))
             }
             "update_diagram" => {

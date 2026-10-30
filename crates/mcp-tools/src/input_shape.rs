@@ -347,6 +347,66 @@ fn article(ty: &str) -> String {
     }
 }
 
+/// Keys tool inputs accept through a serde alias, so not in any schema.
+const ACCEPTED_ALIASES: &[&str] = &["encoding", "superseded_by", "said", "reference", "ref"];
+
+/// The arguments that are not the schema's but one edit away from one of its
+/// properties (two for longer names), as `` `limt` (did you mean `limit`?) ``
+/// (#423). A misspelled argument was dropped, so `priorty` lost the priority
+/// and `limt` returned the default page. Other unknown keys are left alone.
+pub fn mistyped_arguments(schema: &Value, input: &Value) -> Vec<String> {
+    let (Some(props), Some(object)) = (properties(schema), input.as_object()) else {
+        return Vec::new();
+    };
+    object
+        .keys()
+        .filter(|key| {
+            !props.contains_key(key.as_str())
+                && !key.starts_with('_')
+                && !ACCEPTED_ALIASES.contains(&key.as_str())
+        })
+        .filter_map(|key| {
+            let near = |name: &&String| {
+                let singular_or_plural =
+                    name.strip_suffix('s') == Some(key) || key.strip_suffix('s') == Some(name);
+                let allowed = if key.chars().count() <= 5 { 1 } else { 2 };
+                !singular_or_plural && typo_distance(key, name) <= allowed
+            };
+            let closest = props
+                .keys()
+                .filter(near)
+                .min_by_key(|name| typo_distance(key, name))?;
+            Some(format!("`{key}` (did you mean `{closest}`?)"))
+        })
+        .collect()
+}
+
+/// Edits (insert, delete, change, swap of neighbours) from `a` to `b`.
+fn typo_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[a.len()][b.len()]
+}
+
 /// Why a `tools/call` request's own `params.arguments` is refused as invalid
 /// params (`-32602`), or None when it is accepted.
 ///
@@ -410,6 +470,33 @@ pub fn enum_argument(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_misspelled_argument_is_named_with_the_one_meant() {
+        // #423: limt, priorty, severty, qurey and projet_id were dropped.
+        let schema = json!({"properties": {
+            "action": {}, "limit": {}, "priority": {}, "severity": {}, "query": {},
+            "project_id": {}, "tags": {}, "node_id": {}
+        }});
+        let input = json!({"action": "x", "limt": 2, "priorty": "urgent", "severty": "high",
+                           "qurey": "q", "projet_id": "p"});
+        let mut found = mistyped_arguments(&schema, &input);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "`limt` (did you mean `limit`?)",
+                "`priorty` (did you mean `priority`?)",
+                "`projet_id` (did you mean `project_id`?)",
+                "`qurey` (did you mean `query`?)",
+                "`severty` (did you mean `severity`?)",
+            ]
+        );
+        // Known keys, plurals, aliases, _meta and unrelated keys are left alone.
+        let fine = json!({"action": "x", "tag": "t", "node_ids": [], "ref": "r",
+                          "_meta": {}, "something_else": 1});
+        assert!(mistyped_arguments(&schema, &fine).is_empty());
+    }
 
     #[test]
     fn an_enum_argument_is_one_of_the_advertised_values_or_refused_with_them() {

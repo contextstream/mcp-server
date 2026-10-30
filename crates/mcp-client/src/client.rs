@@ -13455,36 +13455,25 @@ impl ContextStreamClient {
             scope_ids_with_defaults(params.workspace_id, params.project_id, &config);
         drop(config);
 
-        // Delta is a composite operation - get recent events since the timestamp
+        // `since` filters: it was never applied, so delta read "0 changes"
+        // whatever happened (#395).
+        let since = chrono::DateTime::parse_from_rfc3339(params.since.trim()).map_err(|_| {
+            Error::Validation(format!(
+                "since must be an RFC 3339 time, like 2026-10-30T13:22:26Z; got \"{}\"",
+                params.since
+            ))
+        })?;
+        const WINDOW: i64 = 100;
         let events = self
-            .list_memory_events(ws_id, proj_id, None, params.limit.or(Some(20)))
+            .list_memory_events(ws_id, proj_id, None, Some(WINDOW))
             .await?;
-
-        // Filter and count by type
-        let items = events
-            .get("items")
-            .cloned()
-            .unwrap_or(serde_json::json!([]));
-        let items_arr = items.as_array().cloned().unwrap_or_default();
-
-        let mut new_decisions = 0;
-        let mut new_memory = 0;
-        for item in &items_arr {
-            if let Some(event_type) = item.get("event_type").and_then(|v| v.as_str()) {
-                if event_type == "decision" {
-                    new_decisions += 1;
-                } else {
-                    new_memory += 1;
-                }
-            }
-        }
-
-        Ok(serde_json::json!({
-            "new_decisions": new_decisions,
-            "new_memory": new_memory,
-            "items": items_arr,
-            "since": params.since
-        }))
+        Ok(delta_since(
+            &events,
+            since.with_timezone(&chrono::Utc),
+            params.limit.unwrap_or(20).clamp(1, 100) as usize,
+            WINDOW as usize,
+            &params.since,
+        ))
     }
 
     /// Context-enriched smart search.
@@ -22298,6 +22287,52 @@ fn infer_workspace_id_from_body<B: Serialize>(body: &Option<B>) -> Option<Uuid> 
     Uuid::parse_str(ws_id).ok()
 }
 
+/// The events at or after `since` among the newest `window` (#395): counted
+/// by decisions and other memory, at most `limit` listed. `complete` is
+/// false when every fetched event is that recent, so there may be more.
+pub fn delta_since(
+    events: &serde_json::Value,
+    since: chrono::DateTime<chrono::Utc>,
+    limit: usize,
+    window: usize,
+    since_text: &str,
+) -> serde_json::Value {
+    let all = events
+        .as_array()
+        .or_else(|| events.get("items").and_then(serde_json::Value::as_array))
+        .cloned()
+        .unwrap_or_default();
+    let at = |event: &serde_json::Value| {
+        ["created_at", "occurred_at", "timestamp"]
+            .iter()
+            .find_map(|key| event.get(*key).and_then(serde_json::Value::as_str))
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+            .map(|time| time.with_timezone(&chrono::Utc))
+    };
+    let recent: Vec<serde_json::Value> = all
+        .iter()
+        .filter(|event| at(event).is_some_and(|time| time >= since))
+        .cloned()
+        .collect();
+    let decisions = recent
+        .iter()
+        .filter(|event| {
+            event.get("event_type").and_then(serde_json::Value::as_str) == Some("decision")
+        })
+        .count();
+    let complete = all.len() < window || recent.len() < all.len();
+    let listed: Vec<serde_json::Value> = recent.iter().take(limit).cloned().collect();
+    serde_json::json!({
+        "since": since_text,
+        "count": recent.len(),
+        "new_decisions": decisions,
+        "new_memory": recent.len() - decisions,
+        "complete": complete,
+        "changes": listed,
+        "items": listed,
+    })
+}
+
 /// Keep the events captured as `requested` (the type a caller passed to
 /// create_event), at most `limit` (#410). A captured event records it in
 /// `metadata.original_type`; an event without one is matched on its own type.
@@ -28566,6 +28601,28 @@ mod tests {
         );
         assert_eq!(replacement_title("  \n", Some("Old title")), "Old title");
         assert_eq!(replacement_title("# Heading line", None), "Heading line");
+    }
+
+    #[test]
+    fn delta_counts_only_what_happened_after_since() {
+        // #395: "0 changes since …" whatever happened.
+        let since = chrono::DateTime::parse_from_rfc3339("2026-10-30T13:22:26Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let events = serde_json::json!({"items": [
+            {"id": "1", "event_type": "decision", "title": "QA delta decision", "created_at": "2026-10-30T13:23:26Z"},
+            {"id": "2", "event_type": "manual_note", "title": "QA delta note", "created_at": "2026-10-30T13:23:27Z"},
+            {"id": "3", "event_type": "decision", "title": "Older", "created_at": "2026-10-30T12:00:00Z"}
+        ]});
+        let delta = delta_since(&events, since, 20, 100, "2026-10-30T13:22:26Z");
+        assert_eq!(delta["count"], 2);
+        assert_eq!(delta["new_decisions"], 1);
+        assert_eq!(delta["new_memory"], 1);
+        assert_eq!(delta["complete"], true);
+        let future = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(delta_since(&events, future, 20, 100, "2099")["count"], 0);
     }
 
     #[test]

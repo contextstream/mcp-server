@@ -4053,6 +4053,23 @@ async fn run_index_or_ingest(
                         project_name_clone, outcome.files_deferred
                     ),
                 ),
+                Err(e)
+                    if e.downcast_ref::<mcp_types::Error>()
+                        .is_some_and(mcp_client::client::is_ingest_in_progress_error) =>
+                {
+                    (
+                        format!(
+                            "Status: Already running\nProject: {}\nAnother ContextStream process is already indexing this project and will include these files.\nChecked: {}\n",
+                            project_name_clone,
+                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                        ),
+                        "ContextStream Index Already Running".to_string(),
+                        format!(
+                            "{}: another process is already indexing this project",
+                            project_name_clone
+                        ),
+                    )
+                }
                 Err(e) => (
                     format!(
                         "Status: Failed\nProject: {}\nError: {}\nCompleted: {}\n",
@@ -4082,12 +4099,15 @@ async fn run_index_or_ingest(
         )
         .await
         {
-            Ok(()) => {
+            Ok(setup::IndexRun::Finished) => {
                 setup::warmup_context(&client, workspace.as_ref().map(|w| &w.id)).await;
                 eprintln!(
                     "\n  Semantic search is now available via search(mode=\"auto\", query=\"...\") in your editor."
                 );
             }
+            // Another process is indexing this project and will include these
+            // files: nothing to retry, and not yet searchable (#348).
+            Ok(setup::IndexRun::AlreadyRunning) => {}
             Err(e) => {
                 eprintln!(
                     "\n  You can retry later using: {}",

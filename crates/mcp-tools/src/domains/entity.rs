@@ -669,6 +669,101 @@ fn format_entity_summary(kind: &str, result: &Value) -> String {
     summary
 }
 
+/// The record's other fields, one `name: value` line each, for `get` (#355).
+/// The summary line names it; these lines carry the rest, so a client that
+/// shows only text (stdio sends no structured content) reads what it wrote: a
+/// handoff's summary, scope and next steps, a ticket's description, a
+/// release's environments. Each value is cut at 1,500 characters.
+fn format_entity_fields(kind: &str, result: &Value) -> String {
+    let item = extract_entity_object(kind, result);
+    let Some(fields) = item.as_object() else {
+        return String::new();
+    };
+    let title_field = ENTITY_TITLE_FIELDS.iter().copied().find(|field| {
+        item.get(*field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    let mut lines = Vec::new();
+    for (name, value) in fields {
+        if matches!(name.as_str(), "id" | "status") || Some(name.as_str()) == title_field {
+            continue;
+        }
+        if let Some(rendered) = render_field_value(value) {
+            // An indented block (a list, or text on several lines) starts under its name.
+            if rendered.starts_with("  ") {
+                lines.push(format!("{name}:\n{rendered}"));
+            } else {
+                lines.push(format!("{name}: {rendered}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// One field's value as text; `None` for null and empty values. A value on
+/// several lines comes back indented under its name.
+fn render_field_value(value: &Value) -> Option<String> {
+    const MAX_CHARS: usize = 1_500;
+    let cut = |text: String| -> String {
+        if text.chars().count() <= MAX_CHARS {
+            return text;
+        }
+        let kept: String = text.chars().take(MAX_CHARS - 1).collect();
+        format!("{}…", kept.trim_end())
+    };
+    let indent = |text: &str| -> String {
+        text.lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match value {
+        Value::Null => None,
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else if text.contains('\n') {
+                Some(indent(&cut(text.to_string())))
+            } else {
+                Some(cut(text.to_string()))
+            }
+        }
+        Value::Bool(_) | Value::Number(_) => Some(value.to_string()),
+        Value::Array(items) if items.is_empty() => None,
+        Value::Array(items)
+            if items
+                .iter()
+                .all(|item| !item.is_object() && !item.is_array()) =>
+        {
+            let scalars: Vec<String> = items
+                .iter()
+                .map(|item| match item {
+                    Value::String(text) => text.trim().to_string(),
+                    other => other.to_string(),
+                })
+                .collect();
+            if scalars.iter().any(|item| item.chars().count() > 40) {
+                Some(cut(scalars
+                    .iter()
+                    .map(|item| format!("  - {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")))
+            } else {
+                Some(cut(scalars.join(", ")))
+            }
+        }
+        Value::Array(items) => Some(cut(items
+            .iter()
+            .map(|item| format!("  - {item}"))
+            .collect::<Vec<_>>()
+            .join("\n"))),
+        Value::Object(map) if map.is_empty() => None,
+        Value::Object(_) => Some(cut(value.to_string())),
+    }
+}
+
 /// Render the list response as a numbered, human-readable summary so the
 /// LLM-visible text content carries enough info to act on the entities (id +
 /// title + kind + status). Without this the structured payload alone is
@@ -894,11 +989,16 @@ impl ToolHandler for EntityTool {
                     self.client.entity_get(&kind, id).await?
                 };
                 let summary = format_entity_summary(&kind, &result);
-                let text = if summary.is_empty() {
+                let mut text = if summary.is_empty() {
                     format!("Fetched {} {}.", kind, id)
                 } else {
                     format!("Fetched {}: {}", kind, summary)
                 };
+                let fields = format_entity_fields(&kind, &result);
+                if !fields.is_empty() {
+                    text.push('\n');
+                    text.push_str(&fields);
+                }
                 Ok(found.tool_result(text, result))
             }
 
@@ -1770,6 +1870,70 @@ mod tests {
         assert_eq!(plural_kind("key_result"), "key results");
         // Unknown kinds get naive 's' suffix.
         assert_eq!(plural_kind("widget"), "widgets");
+    }
+
+    #[test]
+    fn get_text_carries_every_field_the_record_has() {
+        // #355: over stdio only the text reaches the model.
+        let handoff = serde_json::json!({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "title": "Hand off the gate",
+            "status": "pending",
+            "summary": "Gates pass; push is next.",
+            "scope": "mcp-server #350",
+            "next_steps": ["push main", "comment on the issue"],
+            "to_user_id": null,
+            "notes": "",
+            "metadata": {},
+            "verified": ["fmt ok", "a step that is long enough to need its own line in the list"],
+            "details": "line one\nline two",
+            "links": [{"kind": "doc", "id": "d1"}],
+            "attempts": 2,
+        });
+        let text = format_entity_fields("handoff", &handoff);
+        assert!(
+            text.contains("summary: Gates pass; push is next."),
+            "{text}"
+        );
+        assert!(text.contains("scope: mcp-server #350"), "{text}");
+        assert!(
+            text.contains("next_steps: push main, comment on the issue"),
+            "{text}"
+        );
+        assert!(text.contains("verified:\n  - fmt ok\n  - a step"), "{text}");
+        assert!(text.contains("details:\n  line one\n  line two"), "{text}");
+        assert!(text.contains("links:\n  - {"), "{text}");
+        assert!(
+            text.contains("\"id\":\"d1\"") && text.contains("\"kind\":\"doc\""),
+            "{text}"
+        );
+        assert!(text.contains("attempts: 2"), "{text}");
+        for absent in [
+            "title:",
+            "status:",
+            "id:",
+            "to_user_id",
+            "notes",
+            "metadata",
+        ] {
+            assert!(!text.contains(absent), "{absent} in {text}");
+        }
+
+        // A ticket wrapped in its kind: the description is there.
+        let ticket = serde_json::json!({"ticket": {"id": "t1", "title": "QA t", "kind": "bug", "priority": "high", "description": "steps"}});
+        let text = format_entity_fields("ticket", &ticket);
+        assert!(
+            text.contains("description: steps") && text.contains("priority: high"),
+            "{text}"
+        );
+
+        let long = "x".repeat(2_000);
+        let text = format_entity_fields("ticket", &serde_json::json!({"description": long}));
+        assert!(
+            text.ends_with('…') && text.chars().count() < 1_600,
+            "{}",
+            text.len()
+        );
     }
 
     #[test]

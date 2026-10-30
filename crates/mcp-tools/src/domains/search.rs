@@ -6975,6 +6975,50 @@ fn resolve_include_memory(
     .enabled
 }
 
+/// The start of the error an exhaustive search with no project gets; the
+/// gateway's tool-error class reads it as `scope_required`.
+pub const EXHAUSTIVE_NEEDS_PROJECT: &str =
+    "Exhaustive search scans one project, and none is set for this session.";
+
+/// The project an exhaustive search with none in scope can use: the
+/// workspace's only project. With several, or none, the error says what to
+/// pass instead.
+async fn exhaustive_project_fallback(
+    client: &ContextStreamClient,
+    workspace_id: Option<Uuid>,
+) -> Result<(Uuid, String)> {
+    const SHOWN: usize = 10;
+    let page = client
+        .list_projects_page(workspace_id, Some(1), Some(SHOWN as i64))
+        .await?;
+    // A server that leaves out the total is taken at its page.
+    let total = page.total.unwrap_or(page.items.len() as i64);
+    match page.items.as_slice() {
+        [only] if total <= 1 => Ok((only.id, only.name.clone())),
+        [] => Err(Error::Validation(format!(
+            "{EXHAUSTIVE_NEEDS_PROJECT} This workspace has no projects yet: index a folder with \
+             init(folder_path=\"...\") first, or search with mode=\"keyword\"."
+        ))),
+        projects => {
+            let mut message = format!(
+                "{EXHAUSTIVE_NEEDS_PROJECT} Pass project_id, as in search(mode=\"exhaustive\", \
+                 query=\"...\", project_id=\"<id>\"), or call init(folder_path=\"...\") in the \
+                 checkout. Projects in this workspace:"
+            );
+            for project in projects.iter().take(SHOWN) {
+                message.push_str(&format!("\n- {} ({})", project.name, project.id));
+            }
+            let more = total.saturating_sub(projects.len().min(SHOWN) as i64);
+            if more > 0 {
+                message.push_str(&format!(
+                    "\n… and {more} more: project(action=\"list\") shows them all."
+                ));
+            }
+            Err(Error::Validation(message))
+        }
+    }
+}
+
 fn is_not_found_error(err: &Error) -> bool {
     is_project_scope_error(err)
         || matches!(
@@ -11982,6 +12026,24 @@ impl SearchTool {
             }
         }
 
+        // Exhaustive search scans one project, and the API refuses it without
+        // one (400 "exhaustive search requires project_id scope"). That 400
+        // read as a stale project: a workspace-scope retry failed the same
+        // way, and the call ended "Project not found for current context", a
+        // customer's hosted call with no project in scope (2026-10-30). Search
+        // the workspace's only project, or say which projects there are.
+        let mut exhaustive_scope_note: Option<String> = None;
+        if requested_mode == SearchMode::Exhaustive
+            && candidate_project_ids.iter().all(Option::is_none)
+        {
+            let (id, name) = exhaustive_project_fallback(&self.client, workspace_id).await?;
+            candidate_project_ids = vec![Some(id)];
+            exhaustive_scope_note = Some(format!(
+                "Searched {name} ({id}), the only project in this workspace: exhaustive search \
+                 scans one project. Pass project_id to search another."
+            ));
+        }
+
         let has_project_scope_candidates = candidate_project_ids.iter().any(|id| id.is_some());
         if should_allow_workspace_scope_fallback(
             requested_mode,
@@ -12441,6 +12503,9 @@ impl SearchTool {
         }
 
         if let Some(note) = team_scope_note.take() {
+            mode_fallback_note = append_note(mode_fallback_note, &note);
+        }
+        if let Some(note) = exhaustive_scope_note.take() {
             mode_fallback_note = append_note(mode_fallback_note, &note);
         }
         if let Some(note) = shared_scope.note.as_deref() {

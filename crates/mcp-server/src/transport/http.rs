@@ -1418,12 +1418,19 @@ async fn serve_mcp_streamable(
         let outcome = if result.is_ok() { "ok" } else { "error" };
         let elapsed_ms = tool_call_started.elapsed().as_millis() as u64;
         let action = tool_action.unwrap_or("other");
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "tool_name": name,
             "action": action,
             "outcome": outcome,
             "duration_ms": elapsed_ms,
         });
+        // Why a call failed, as a short class and the JSON-RPC code, never the
+        // message, which can quote the caller's arguments. A customer's failed
+        // search carried only {"outcome":"error"} (2026-10-30).
+        if let Err(error) = result.as_ref() {
+            payload["error_class"] = Value::String(tool_error_class(&error.message));
+            payload["error_code"] = Value::from(error.code);
+        }
         if let Some(signals) = state.registry.acceleration_layer().signals() {
             let mut event = mcp_types::acceleration_layer::AccelerationSignalEvent::with_scope(
                 mcp_types::acceleration_layer::AccelerationSignalKind::ToolCall,
@@ -2547,6 +2554,10 @@ fn tool_error_class(message: &str) -> String {
             "invalid_value"
         } else if rest.starts_with("repository_url") {
             "repository_url"
+        } else if rest.starts_with(mcp_tools::domains::search::EXHAUSTIVE_NEEDS_PROJECT) {
+            "scope_required"
+        } else if rest.contains("Project not found for current context") {
+            "scope_unresolved"
         } else {
             "other"
         };
@@ -7029,6 +7040,14 @@ mod tests {
                 "validation:repository_url",
             ),
             ("Validation error: something else", "validation:other"),
+            (
+                "Validation error: Exhaustive search scans one project, and none is set for this session. Pass project_id …",
+                "validation:scope_required",
+            ),
+            (
+                "Validation error: Project not found for current context. Call init(...) in this folder or pass a valid project_id explicitly.",
+                "validation:scope_unresolved",
+            ),
             ("HTTP error (403): workspace not accessible", "http:403"),
             ("Request timeout after 10 seconds", "timeout"),
             ("Invalid UUID: abc", "invalid_uuid"),

@@ -951,9 +951,9 @@ fn restore_default_sigpipe(_command: &Option<Commands>) {}
 /// confirmation lines on stderr are silenced (`setup::ui::is_quiet`), and
 /// stdout goes to the null device unless it carries the data the command was
 /// asked for (`--json`, `--support`, `clients`, `detect-editors`,
-/// `generate-configs`). Errors and the exit status are unchanged. The stdio
-/// server, the HTTP gateway, the sync bridge and editor hooks own their
-/// output and are left alone. Must run before any output.
+/// `generate-configs`, `exclude list|info`). Errors and the exit status are
+/// unchanged. The stdio server, the HTTP gateway, the sync bridge and editor
+/// hooks own their output and are left alone. Must run before any output.
 fn silence_stdout_when_quiet(quiet: bool, command: &Option<Commands>) {
     let owns_output = matches!(
         command,
@@ -974,6 +974,10 @@ fn silence_stdout_when_quiet(quiet: bool, command: &Option<Commands>) {
                 | Commands::DetectEditors { .. }
                 | Commands::GenerateConfigs { .. }
                 | Commands::ExportAntigravityPlugin { json: true, .. }
+                | Commands::Exclude {
+                    action: ExcludeAction::List | ExcludeAction::Info,
+                    ..
+                }
         )
     );
     if !stdout_is_data {
@@ -1707,6 +1711,16 @@ async fn run_exclude(
 ) -> Result<()> {
     use console::style;
 
+    // `list` and `info` print the listing asked for, on stdout; `add`,
+    // `remove` and `reset` confirm on stderr, which `-q` silences (#354).
+    macro_rules! note {
+        ($($arg:tt)*) => {
+            if !setup::ui::is_quiet() {
+                eprintln!($($arg)*);
+            }
+        };
+    }
+
     let project_dir = match path {
         Some(p) => std::path::PathBuf::from(p),
         None => std::env::current_dir()?,
@@ -1724,34 +1738,34 @@ async fn run_exclude(
 
     match action {
         ExcludeAction::List => {
-            eprintln!(
+            println!(
                 "\n{} Exclusion Patterns {}",
                 style("⬡").cyan(),
                 style(format!("({})", ignore_path.display())).dim()
             );
-            eprintln!();
+            println!();
 
             let current = read_contextignore(&ignore_path)?.lines;
             if current.is_empty() {
-                eprintln!(
+                println!(
                     "  {}No .contextignore file found. Using server defaults only.",
                     style("ℹ  ").blue()
                 );
-                eprintln!();
-                eprintln!(
+                println!();
+                println!(
                     "  Run {} to create one with sensible defaults.",
                     style("contextstream-mcp exclude reset").cyan()
                 );
             } else {
                 for pattern in &current {
                     if pattern.starts_with('#') || pattern.is_empty() {
-                        eprintln!("  {}", style(pattern).dim());
+                        println!("  {}", style(pattern).dim());
                     } else {
-                        eprintln!("  {}", style(pattern).yellow());
+                        println!("  {}", style(pattern).yellow());
                     }
                 }
-                eprintln!();
-                eprintln!(
+                println!();
+                println!(
                     "  {} {} active pattern(s)",
                     style("→").dim(),
                     current
@@ -1761,12 +1775,12 @@ async fn run_exclude(
                 );
             }
 
-            eprintln!();
-            eprintln!(
+            println!();
+            println!(
                 "  {} Server-side protections (.env, keys, credentials) are always active.",
                 style("🛡").green()
             );
-            eprintln!(
+            println!(
                 "  Run {} for details.",
                 style("contextstream-mcp exclude info").cyan()
             );
@@ -1791,19 +1805,19 @@ async fn run_exclude(
             }
 
             if added.is_empty() {
-                eprintln!(
+                note!(
                     "  {}All patterns already exist in .contextignore",
                     style("ℹ  ").blue()
                 );
             } else {
                 write_contextignore(&ignore_path, &file.lines, file.line_ending)?;
-                eprintln!(
+                note!(
                     "\n{} Added {} pattern(s) to .contextignore:",
                     style("✓").green(),
                     added.len()
                 );
                 for p in &added {
-                    eprintln!("  {} {}", style("+").green(), style(p).yellow());
+                    note!("  {} {}", style("+").green(), style(p).yellow());
                 }
             }
         }
@@ -1816,7 +1830,7 @@ async fn run_exclude(
             let patterns = normalize_exclude_patterns(&patterns, false)?;
             let file = read_contextignore(&ignore_path)?;
             if file.lines.is_empty() {
-                eprintln!("  {}No .contextignore file found.", style("ℹ  ").blue());
+                note!("  {}No .contextignore file found.", style("ℹ  ").blue());
                 return Ok(());
             }
 
@@ -1840,19 +1854,19 @@ async fn run_exclude(
                 .collect();
 
             if removed.is_empty() {
-                eprintln!(
+                note!(
                     "  {}None of the specified patterns were found in .contextignore",
                     style("ℹ  ").blue()
                 );
             } else {
                 write_contextignore(&ignore_path, &filtered, file.line_ending)?;
-                eprintln!(
+                note!(
                     "\n{} Removed {} pattern(s) from .contextignore:",
                     style("✓").green(),
                     removed.len()
                 );
                 for p in &removed {
-                    eprintln!("  {} {}", style("-").red(), style(p).yellow());
+                    note!("  {} {}", style("-").red(), style(p).yellow());
                 }
             }
         }
@@ -1870,32 +1884,32 @@ async fn run_exclude(
             }
 
             write_contextignore(&ignore_path, &lines, "\n")?;
-            eprintln!(
+            note!(
                 "\n{} Reset .contextignore to default patterns ({} patterns)",
                 style("✓").green(),
                 DEFAULT_EXCLUDE_PATTERNS.len()
             );
-            eprintln!("  File: {}", style(ignore_path.display()).dim());
+            note!("  File: {}", style(ignore_path.display()).dim());
         }
 
         ExcludeAction::Info => {
-            eprintln!(
+            println!(
                 "\n{} ContextStream Server-Side Security Protections",
                 style("⬡").cyan()
             );
-            eprintln!();
-            eprintln!(
+            println!();
+            println!(
                 "  {}",
                 style("These protections are always active and cannot be disabled.").dim()
             );
-            eprintln!();
+            println!();
 
-            eprintln!(
+            println!(
                 "  {} {}",
                 style("■").red(),
                 style("Always Blocked Files").bold()
             );
-            eprintln!("  Files that are never indexed regardless of settings:");
+            println!("  Files that are never indexed regardless of settings:");
             let blocked = [
                 ".env and all .env.* (except .env.example/.sample/.template/.dist/.defaults)",
                 ".pem, .key, .p12, .pfx, .jks",
@@ -1905,16 +1919,16 @@ async fn run_exclude(
                 "credential dirs (skipped entirely): .ssh, .aws, .gnupg, .kube, .docker",
             ];
             for group in &blocked {
-                eprintln!("    {}", style(group).yellow());
+                println!("    {}", style(group).yellow());
             }
 
-            eprintln!();
-            eprintln!(
+            println!();
+            println!(
                 "  {} {}",
                 style("■").yellow(),
                 style("Content Scanning").bold()
             );
-            eprintln!(
+            println!(
                 "  All file content is scanned before storage. Detected secrets are redacted:"
             );
             let scanned = [
@@ -1924,19 +1938,17 @@ async fn run_exclude(
                 "High-entropy strings that look like secrets",
             ];
             for item in &scanned {
-                eprintln!("    → {}", style(item).dim());
+                println!("    → {}", style(item).dim());
             }
 
-            eprintln!();
-            eprintln!(
+            println!();
+            println!(
                 "  {} {}",
                 style("■").blue(),
                 style("Your Custom Exclusions").bold()
             );
-            eprintln!(
-                "  In addition to server protections, manage project-specific patterns with:"
-            );
-            eprintln!(
+            println!("  In addition to server protections, manage project-specific patterns with:");
+            println!(
                 "    {}",
                 style("contextstream-mcp exclude list|add|remove|reset").cyan()
             );
@@ -2157,7 +2169,13 @@ fn post_update_steps(
         .collect()
 }
 
+/// `update`'s progress lines (banner, steps, details, ✓ and skipped lines) are
+/// silent under `-q`; warnings stay, as they carry the answer or the failure
+/// (#354).
 fn update_banner(current: &str) {
+    if setup::ui::is_quiet() {
+        return;
+    }
     let ui = setup::ui::ui();
     eprintln!();
     eprintln!(
@@ -2174,6 +2192,9 @@ fn update_banner(current: &str) {
 }
 
 fn update_step(message: impl AsRef<str>) {
+    if setup::ui::is_quiet() {
+        return;
+    }
     let ui = setup::ui::ui();
     eprintln!(
         "{}{} {}",
@@ -2184,6 +2205,9 @@ fn update_step(message: impl AsRef<str>) {
 }
 
 fn update_detail(message: impl AsRef<str>) {
+    if setup::ui::is_quiet() {
+        return;
+    }
     eprintln!(
         "{}  {}",
         setup::ui::GUTTER,
@@ -2192,6 +2216,9 @@ fn update_detail(message: impl AsRef<str>) {
 }
 
 fn update_ok(message: impl AsRef<str>) {
+    if setup::ui::is_quiet() {
+        return;
+    }
     eprintln!(
         "{}",
         setup::ui::ui().line(setup::ui::Mark::Ok, message.as_ref(), None)
@@ -2206,6 +2233,9 @@ fn update_warn(message: impl AsRef<str>) {
 }
 
 fn update_skip(message: impl AsRef<str>) {
+    if setup::ui::is_quiet() {
+        return;
+    }
     let ui = setup::ui::ui();
     eprintln!(
         "{}",

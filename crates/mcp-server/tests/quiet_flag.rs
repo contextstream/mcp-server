@@ -6,6 +6,10 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 fn run(args: &[&str], stdin: &str) -> Output {
+    run_with(args, stdin, &[])
+}
+
+fn run_with(args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
     let home = tempfile::tempdir().expect("isolated home");
     let mut command = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"));
     for (key, _) in std::env::vars_os() {
@@ -13,6 +17,7 @@ fn run(args: &[&str], stdin: &str) -> Output {
             command.env_remove(key);
         }
     }
+    command.envs(env.iter().copied());
     let mut child = command
         .args(args)
         .env("HOME", home.path())
@@ -107,5 +112,98 @@ fn quiet_keeps_errors_on_stderr() {
     assert!(
         !quiet.stderr.is_empty(),
         "the error stays visible on stderr under -q"
+    );
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[test]
+fn quiet_update_check_drops_its_progress_and_keeps_why_it_failed() {
+    // The proxy refuses the connection, so the version check fails offline.
+    let offline = [
+        ("HTTPS_PROXY", "http://127.0.0.1:9"),
+        ("https_proxy", "http://127.0.0.1:9"),
+        ("NO_PROXY", ""),
+        ("no_proxy", ""),
+        ("NO_COLOR", "1"),
+    ];
+    let loud = run_with(&["update", "--check"], "", &offline);
+    let quiet = run_with(&["-q", "update", "--check"], "", &offline);
+    assert!(!quiet.status.success(), "an unanswered check fails");
+    assert_eq!(quiet.status.code(), loud.status.code());
+    assert!(text(&loud.stderr).contains("Version check"));
+
+    let stderr = text(&quiet.stderr);
+    for progress in [
+        "CONTEXTSTREAM UPDATE",
+        "Version check",
+        "Fetching latest release metadata",
+    ] {
+        assert!(
+            !stderr.contains(progress),
+            "-q update --check printed {progress:?}:\n{stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("Could not check the latest version"),
+        "the failure still says why:\n{stderr}"
+    );
+}
+
+#[test]
+fn quiet_exclude_keeps_its_listing_on_stdout_and_drops_confirmations() {
+    let project = tempfile::tempdir().expect("project");
+    let path = project.path().to_str().expect("utf-8 path");
+
+    for (args, heading) in [
+        (&["exclude", "--path", path][..], "Exclusion Patterns"),
+        (&["exclude", "info"][..], "Server-Side Security Protections"),
+    ] {
+        for quiet in [false, true] {
+            let full: Vec<&str> = quiet
+                .then_some("-q")
+                .into_iter()
+                .chain(args.iter().copied())
+                .collect();
+            let out = run_with(&full, "", &[("NO_COLOR", "1")]);
+            assert!(out.status.success(), "{full:?}: {:?}", out.status);
+            assert!(
+                text(&out.stdout).contains(heading),
+                "{full:?} lists on stdout:\n{}",
+                text(&out.stdout)
+            );
+            assert!(
+                out.stderr.is_empty(),
+                "{full:?} printed on stderr:\n{}",
+                text(&out.stderr)
+            );
+        }
+    }
+
+    for args in [
+        &["-q", "exclude", "add", "*.log", "--path", path][..],
+        &["-q", "exclude", "remove", "*.log", "--path", path][..],
+        &["-q", "exclude", "reset", "--path", path][..],
+    ] {
+        let out = run_with(args, "", &[("NO_COLOR", "1")]);
+        assert!(out.status.success(), "{args:?}: {:?}", out.status);
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "{args:?} printed:\n{}{}",
+            text(&out.stdout),
+            text(&out.stderr)
+        );
+    }
+    let contextignore = std::fs::read_to_string(project.path().join(".contextignore"))
+        .expect("reset wrote .contextignore");
+    assert!(contextignore.contains("node_modules"), "{contextignore}");
+
+    let failed = run_with(&["-q", "exclude", "add", "--path", path], "", &[]);
+    assert!(!failed.status.success());
+    assert!(
+        text(&failed.stderr).contains("No patterns specified"),
+        "an exclude error stays visible under -q"
     );
 }

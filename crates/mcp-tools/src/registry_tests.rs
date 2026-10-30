@@ -1577,3 +1577,13 @@ mod help_listing_tests {
         assert!(crate::registry::listed_tools().is_none());
     }
 }
+
+#[test]
+fn terminal_control_bytes_never_reach_a_client() {
+    // #419: ESC and BEL in stored text reached the client as is.
+    let result = drop_control_characters(ToolResult::text("a\u{1b}[31mred\u{7}\r\nb\tc"));
+    assert!(matches!(
+        &result.content[0],
+        mcp_types::tool::ContentItem::Text { text } if text == "a[31mred\nb\tc"
+    ));
+}

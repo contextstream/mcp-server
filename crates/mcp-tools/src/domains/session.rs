@@ -3,6 +3,7 @@
 #[path = "recall_supplements.rs"]
 mod recall_supplements;
 
+use crate::domains::display_title::one_line;
 use crate::domains::scope_resolution::{
     self, classify_scope_id_arg, refuse_malformed_scope_id, with_scope_repair, ScopeRepair,
     UnmatchedFolderScope, SCOPE_REPAIRS_KEY,
@@ -6455,7 +6456,7 @@ fn format_typed_skills(items: &[&SmartContextItem], compact: bool) -> String {
                 "{}. [{}] {} (score: {:.2}){}\n",
                 i + 1,
                 urgency,
-                preview,
+                one_line(&preview),
                 item.score,
                 run_hint
             ));
@@ -6714,7 +6715,8 @@ fn lesson_line_body(line: &LessonWarningLine) -> String {
     if line.superseded {
         body.push_str(" [superseded]");
     }
-    body
+    // A stored title or guidance cannot start a line of its own (#419).
+    crate::domains::display_title::one_line(&body)
 }
 
 /// The single `[LESSONS_WARNING]` renderer used by `context()` and
@@ -6742,7 +6744,7 @@ pub(crate) fn render_lessons_warning(lines: &[LessonWarningLine], compact: bool)
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_ascii_lowercase)
+            .map(|value| crate::domains::display_title::one_line(value).to_ascii_lowercase())
             .unwrap_or_else(|| "unspecified".to_string())
     };
     let relevance_label = |line: &LessonWarningLine| match line.relevance {
@@ -9491,7 +9493,7 @@ impl ToolHandler for ContextTool {
                     let cat = rule.category.as_deref().unwrap_or("general");
                     text.push_str(&format!(
                         "\n  [{cat}] {} (confidence: {:.0}%, seen {}x) id={}",
-                        rule.instruction,
+                        one_line(&rule.instruction),
                         rule.confidence * 100.0,
                         rule.occurrence_count,
                         rule.id,
@@ -9605,9 +9607,9 @@ impl ToolHandler for ContextTool {
                     let preview: String = content.chars().take(300).collect();
                     text.push_str(&format!(
                         "\n  [{}] {}: {}",
-                        node_type.to_uppercase(),
-                        title,
-                        preview
+                        one_line(node_type).to_uppercase(),
+                        one_line(title),
+                        one_line(&preview)
                     ));
                 }
             }
@@ -9875,10 +9877,10 @@ impl ToolHandler for ContextTool {
                         "{}. [{}] {} (confidence: {:.0}%, seen {}x)\n   Keywords: {}\n   Rule ID: {}\n",
                         i + 1,
                         cat,
-                        rule.instruction,
+                        one_line(&rule.instruction),
                         rule.confidence * 100.0,
                         rule.occurrence_count,
-                        keywords,
+                        one_line(&keywords),
                         rule.id,
                     ));
                 }
@@ -9920,12 +9922,12 @@ impl ToolHandler for ContextTool {
                         "{}. [{}] {}{} — {}\n   → Run: skill(action=\"run\", name=\"{}\")\n",
                         i + 1,
                         urgency,
-                        label,
+                        one_line(&label),
                         matched_skill_scope_cue(skill)
                             .map(|cue| format!(" ({cue})"))
                             .unwrap_or_default(),
-                        preview,
-                        name
+                        one_line(&preview),
+                        one_line(name)
                     ));
                 }
                 text.push('\n');
@@ -10020,9 +10022,9 @@ impl ToolHandler for ContextTool {
                     text.push_str(&format!(
                         "{}. [{}] {} — {}\n",
                         i + 1,
-                        node_type.to_uppercase(),
-                        title,
-                        preview
+                        one_line(node_type).to_uppercase(),
+                        one_line(title),
+                        one_line(&preview)
                     ));
                 }
                 text.push('\n');
@@ -10460,11 +10462,11 @@ impl ToolHandler for SessionCaptureTool {
         let mut text = match conflict_note.as_deref() {
             Some(note) => format!(
                 "Captured: {} (ID: {}).\nProgress: completed.\n[DECISION_CONFLICT] {} Confirm with the user which decision stands before relying on either; supersede the loser.",
-                input.title, event_id, note
+                crate::domains::display_title::one_line(&input.title), event_id, note
             ),
             None => format!(
                 "Captured: {} (ID: {}).\nProgress: completed.",
-                input.title, event_id
+                crate::domains::display_title::one_line(&input.title), event_id
             ),
         };
         if let Some((_, notice)) = conflict_check_notice {
@@ -11437,8 +11439,8 @@ fn build_retro_capture_content(
             text.push_str(&format!(
                 "{}. [{}] {}",
                 index + 1,
-                source.kind,
-                source.title
+                one_line(&source.kind),
+                one_line(&source.title)
             ));
             if let Some(id) = source.id.as_deref() {
                 text.push_str(&format!(" ({})", id));
@@ -12401,7 +12403,8 @@ impl ToolHandler for SessionCaptureLessonTool {
         }
         let mut text = format!(
             "Lesson captured: {} (ID: {}).\nProgress: completed.",
-            input.title, event_id
+            crate::domains::display_title::one_line(&input.title),
+            event_id
         );
         if let Some(note) = partial_note {
             text.push('\n');
@@ -12894,10 +12897,10 @@ fn render_typed_lessons_result(envelope: Value, scope_note: Option<String>) -> T
             text.push_str(&format!(
                 "{}. [{}] {} {}\n   {}\n",
                 index + 1,
-                severity.to_uppercase(),
-                title,
-                labels,
-                preview
+                one_line(&severity).to_uppercase(),
+                one_line(&title),
+                one_line(&labels),
+                one_line(&preview)
             ));
             if let Some(successor) = lesson.get("superseded_by").and_then(Value::as_str) {
                 text.push_str(&format!("   superseded_by={successor}\n"));
@@ -13161,9 +13164,9 @@ impl ToolHandler for SessionGetLessonsTool {
                     out.push_str(&format!(
                         "{}. [{}] {}\n   {}\n\n",
                         i + 1,
-                        severity.to_uppercase(),
-                        title,
-                        preview
+                        one_line(&severity).to_uppercase(),
+                        one_line(&title),
+                        one_line(&preview)
                     ));
                 }
             }
@@ -13183,9 +13186,9 @@ impl ToolHandler for SessionGetLessonsTool {
                     out.push_str(&format!(
                         "{}. [{}] {}\n   {}\n\n",
                         i + 1,
-                        node_type.to_uppercase(),
-                        title,
-                        preview
+                        one_line(&node_type).to_uppercase(),
+                        one_line(&title),
+                        one_line(&preview)
                     ));
                 }
             }
@@ -13810,13 +13813,19 @@ impl ToolHandler for SessionSmartSearchTool {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Untitled");
                 let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("item");
-                text.push_str(&format!("{}. [{}] **{}**", i + 1, item_type, title));
+                let one_line = crate::domains::display_title::one_line;
+                text.push_str(&format!(
+                    "{}. [{}] **{}**",
+                    i + 1,
+                    one_line(item_type),
+                    one_line(title)
+                ));
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                    text.push_str(&format!(" (id: {id})"));
+                    text.push_str(&format!(" (id: {})", one_line(id)));
                 }
                 text.push('\n');
                 if let Some(preview) = item.get("preview").and_then(|v| v.as_str()) {
-                    text.push_str(&format!("   {}\n", preview.replace('\n', " ")));
+                    text.push_str(&format!("   {}\n", one_line(preview)));
                 }
             }
             if results.len() > shown {
@@ -15442,7 +15451,13 @@ fn format_task_item(task: &Value, index: usize) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("pending");
     let id = task.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let mut line = format!("{}. [{}] {} — id: {}", index, status, title, id);
+    let mut line = format!(
+        "{}. [{}] {} — id: {}",
+        index,
+        one_line(status),
+        one_line(title),
+        one_line(id)
+    );
     if let Some(step_id) = task.get("plan_step_id").and_then(|v| v.as_str()) {
         line.push_str(&format!(" — step: {}", step_id));
     }

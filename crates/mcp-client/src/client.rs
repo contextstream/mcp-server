@@ -726,6 +726,51 @@ pub fn get_task_model_id() -> Option<String> {
 }
 
 tokio::task_local! {
+    /// The workspace and project a ContextCapsule call is made in, set by the
+    /// capsule tool. A by-id capsule path carries no scope, so before the
+    /// client had learned the tenant home the API sent it to the account's
+    /// home region, which answered 404 "ContextCapsule not found" (#361).
+    static TASK_CAPSULE_SCOPE: (Option<Uuid>, Option<Uuid>);
+}
+
+/// Run a future in which by-id ContextCapsule calls name `workspace_id` (else
+/// `project_id`) in their query, which the API's home forwarder routes by.
+pub async fn run_with_capsule_scope<F, Fut>(
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    f: F,
+) -> Fut::Output
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future,
+{
+    TASK_CAPSULE_SCOPE
+        .scope((workspace_id, project_id), f())
+        .await
+}
+
+/// `path` with the task's capsule scope in its query when it names a capsule
+/// by id (`/capsules/{id}…`); share-token paths and other calls are unchanged.
+fn capsule_routed(path: String) -> String {
+    let by_id = path
+        .strip_prefix("/capsules/")
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with("shares/"));
+    let Some((workspace_id, project_id)) = TASK_CAPSULE_SCOPE.try_with(|scope| *scope).ok() else {
+        return path;
+    };
+    let (key, id) = match (workspace_id, project_id) {
+        (Some(workspace_id), _) => ("workspace_id", workspace_id),
+        (None, Some(project_id)) => ("project_id", project_id),
+        (None, None) => return path,
+    };
+    if !by_id {
+        return path;
+    }
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{separator}{key}={id}")
+}
+
+tokio::task_local! {
     /// What the edge knew about the caller's location, set by the HTTP
     /// transport from the router's headers. `request()` / `request_text()`
     /// forward it so the API records the caller's nearest region per request
@@ -917,6 +962,52 @@ fn is_tenant_home_scope_token(token: &str) -> bool {
     matches!(kind, "workspace" | "project")
         && digest.len() == 16
         && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod capsule_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_by_id_capsule_call_names_its_workspace_or_project() {
+        // #361: without it the API sent the call to the account's home region.
+        let ws = Uuid::from_u128(1);
+        let project = Uuid::from_u128(2);
+        assert_eq!(capsule_routed("/capsules/cap_1".into()), "/capsules/cap_1");
+        let routed = run_with_capsule_scope(Some(ws), Some(project), || async {
+            [
+                capsule_routed("/capsules/cap_1".into()),
+                capsule_routed("/capsules/cap_1/shares".into()),
+                capsule_routed("/capsules/cap_1?format=summary".into()),
+                capsule_routed("/capsules/shares/capsule_tok".into()),
+                capsule_routed("/projects/p/capsules".into()),
+            ]
+        })
+        .await;
+        assert_eq!(
+            routed,
+            [
+                format!("/capsules/cap_1?workspace_id={ws}"),
+                format!("/capsules/cap_1/shares?workspace_id={ws}"),
+                format!("/capsules/cap_1?format=summary&workspace_id={ws}"),
+                "/capsules/shares/capsule_tok".to_string(),
+                "/projects/p/capsules".to_string(),
+            ]
+        );
+        let by_project = run_with_capsule_scope(None, Some(project), || async {
+            capsule_routed("/capsules/cap_1/share".into())
+        })
+        .await;
+        assert_eq!(
+            by_project,
+            format!("/capsules/cap_1/share?project_id={project}")
+        );
+        let unscoped = run_with_capsule_scope(None, None, || async {
+            capsule_routed("/capsules/cap_1".into())
+        })
+        .await;
+        assert_eq!(unscoped, "/capsules/cap_1");
+    }
 }
 
 #[cfg(test)]
@@ -12056,11 +12147,12 @@ impl ContextStreamClient {
     }
 
     pub async fn get_capsule(&self, capsule_id: &str) -> Result<ContextCapsuleResponse> {
-        self.get(&format!("/capsules/{}", capsule_id)).await
+        self.get(&capsule_routed(format!("/capsules/{}", capsule_id)))
+            .await
     }
 
     pub async fn open_capsule(&self, params: CapsuleOpenParams) -> Result<ContextCapsuleResponse> {
-        let path = self.capsule_open_path(&params)?;
+        let path = capsule_routed(self.capsule_open_path(&params)?);
         self.get(&path).await
     }
 
@@ -12074,7 +12166,7 @@ impl ContextStreamClient {
         } else {
             Some("text/markdown")
         };
-        let path = self.capsule_locator_path(&params, Some(suffix))?;
+        let path = capsule_routed(self.capsule_locator_path(&params, Some(suffix))?);
         self.get_text(&path, accept).await
     }
 
@@ -12082,13 +12174,14 @@ impl ContextStreamClient {
         &self,
         params: CapsuleChunkParams,
     ) -> Result<ContextCapsuleChunkResponse> {
-        let path =
-            self.capsule_locator_path(&params, Some(&format!("chunks/{}", params.chunk_id)))?;
+        let path = capsule_routed(
+            self.capsule_locator_path(&params, Some(&format!("chunks/{}", params.chunk_id)))?,
+        );
         self.get(&path).await
     }
 
     pub async fn capsule_stream(&self, params: CapsuleStreamParams) -> Result<String> {
-        let path = self.capsule_locator_path(&params, Some("stream"))?;
+        let path = capsule_routed(self.capsule_locator_path(&params, Some("stream"))?);
         let mut body = serde_json::Map::new();
         if let Some(cursor_chunk_id) = params.cursor_chunk_id {
             body.insert(
@@ -12105,15 +12198,19 @@ impl ContextStreamClient {
         capsule_id: &str,
         params: CapsuleShareParams,
     ) -> Result<ContextCapsuleShareResponse> {
-        self.post(&format!("/capsules/{}/share", capsule_id), params)
-            .await
+        self.post(
+            &capsule_routed(format!("/capsules/{}/share", capsule_id)),
+            params,
+        )
+        .await
     }
 
     pub async fn capsule_list_shares(
         &self,
         capsule_id: &str,
     ) -> Result<Vec<ContextCapsuleShareResponse>> {
-        self.get(&format!("/capsules/{}/shares", capsule_id)).await
+        self.get(&capsule_routed(format!("/capsules/{}/shares", capsule_id)))
+            .await
     }
 
     pub async fn capsule_list_shares_scoped(
@@ -12134,7 +12231,8 @@ impl ContextStreamClient {
 
     /// Soft-delete a ContextCapsule. Calls `DELETE /capsules/{capsule_id}`.
     pub async fn delete_capsule(&self, capsule_id: &str) -> Result<serde_json::Value> {
-        self.delete(&format!("/capsules/{}", capsule_id)).await
+        self.delete(&capsule_routed(format!("/capsules/{}", capsule_id)))
+            .await
     }
 
     /// Register a recurring capsule refresh on a cron schedule.

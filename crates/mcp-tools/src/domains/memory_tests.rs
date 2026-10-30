@@ -3005,3 +3005,37 @@ mod timeline_and_summary_tests {
         );
     }
 }
+
+mod paging_footer_tests {
+    use super::paging_footer;
+    use serde_json::json;
+
+    #[test]
+    fn a_page_says_where_it_sits_and_how_to_get_the_next() {
+        // #411: lists returned the same first page for every offset and said nothing.
+        let page = |n: usize, total: u64| json!({"items": (0..n).map(|i| json!({"id": i.to_string()})).collect::<Vec<_>>(), "total": total, "per_page": 5});
+        assert_eq!(
+            paging_footer(&page(5, 52), None, Some(5)),
+            "\nShowing 1–5 of 52. Pass offset=5 for more."
+        );
+        assert_eq!(
+            paging_footer(&page(5, 52), Some(5), Some(5)),
+            "\nShowing 6–10 of 52. Pass offset=10 for more."
+        );
+        assert_eq!(
+            paging_footer(&page(2, 52), Some(50), Some(5)),
+            "\nShowing 51–52 of 52 (the end)."
+        );
+        assert_eq!(paging_footer(&page(3, 3), None, Some(5)), "");
+        // A total smaller than what was shown is not trusted; a full page says there may be more.
+        assert_eq!(
+            paging_footer(&page(5, 3), None, Some(5)),
+            "\nShowing 1–5. Pass offset=5 for more."
+        );
+        let bare = json!([{"id": "a"}, {"id": "b"}]);
+        assert_eq!(
+            paging_footer(&bare, None, Some(2)),
+            "\nShowing 1–2. Pass offset=2 for more."
+        );
+    }
+}

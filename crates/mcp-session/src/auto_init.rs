@@ -1129,6 +1129,7 @@ async fn refresh_local_config_if_valid(
     ) {
         return false;
     }
+    let before = config.clone();
     config["workspace_name"] = serde_json::json!(workspace_name);
     config["checkout_id"] = serde_json::json!(repository_identity.checkout_id.as_str());
     match project_name {
@@ -1138,6 +1139,14 @@ async fn refresh_local_config_if_valid(
                 object.remove("project_name");
             }
         }
+    }
+    // Every session's first tool call lands here. With nothing to change, leave
+    // the file as it is: re-stamping `associated_at` each time rewrote the file
+    // every session, and (before the checkout guard stopped hashing it) made the
+    // guard, the hash manifest keyed by it and so every unchanged file look new:
+    // the whole checkout was uploaded again per session (mcp-server#365).
+    if config == before {
+        return true;
     }
     config["associated_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
     let Ok(rendered) = serde_json::to_string_pretty(&config) else {
@@ -1827,12 +1836,102 @@ mod tests {
             .await
         );
         let refreshed: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(config_path).expect("refreshed config"))
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("refreshed config"))
                 .expect("parse refreshed config");
         assert_eq!(
             refreshed["checkout_id"].as_str(),
             Some(binding.checkout_id.as_str())
         );
+    }
+
+    // mcp-server#365: the first tool call of every session refreshes the
+    // checkout's config.json. With nothing to change it must leave the file
+    // alone, `associated_at` included: a new stamp every session made the
+    // checkout guard, and the hash manifest keyed by it, new every session.
+    #[tokio::test]
+    async fn refreshing_an_unchanged_binding_leaves_config_json_untouched() {
+        let checkout = tempdir().expect("checkout");
+        create_git_checkout(checkout.path());
+        let fingerprint = ensure_repository_fingerprint(checkout.path()).expect("identity");
+        let workspace_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let canonical_root = fs::canonicalize(checkout.path()).expect("canonical root");
+        let config_dir = checkout.path().join(".contextstream");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        let config_path = config_dir.join("config.json");
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({
+                "workspace_id": workspace_id,
+                "workspace_name": "Old",
+                "project_id": project_id,
+                "project_name": "Old project",
+                "checkout_root": canonical_root,
+                "repository_fingerprint": fingerprint.as_str(),
+            }))
+            .expect("config"),
+        )
+        .expect("write config");
+        let binding = crate::checkout_identity::validate_checkout_binding(
+            checkout.path(),
+            Some(workspace_id),
+            project_id,
+        )
+        .expect("trusted binding");
+        let refresh = || async {
+            refresh_local_config_if_valid(
+                checkout.path().to_str().expect("path"),
+                workspace_id,
+                "Engineering",
+                Some(project_id),
+                Some("mcp"),
+                RepositoryBindingIdentity {
+                    fingerprint: &fingerprint,
+                    remote: None,
+                    checkout_id: &binding.checkout_id,
+                    kind: CheckoutIdentityKind::Git,
+                },
+            )
+            .await
+        };
+
+        // A first refresh has changes to make (names, checkout id) and stamps it.
+        assert!(refresh().await);
+        let after_first = fs::read_to_string(&config_path).expect("config");
+        let stamped: serde_json::Value = serde_json::from_str(&after_first).expect("json");
+        assert!(stamped["associated_at"].as_str().is_some(), "{after_first}");
+
+        // The same inputs again, as in every later session: the bytes do not move,
+        // even a moment later.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        for _ in 0..3 {
+            assert!(refresh().await);
+            assert_eq!(
+                fs::read_to_string(&config_path).expect("config"),
+                after_first
+            );
+        }
+
+        // A real change (a renamed project) is written and re-stamped.
+        let renamed = refresh_local_config_if_valid(
+            checkout.path().to_str().expect("path"),
+            workspace_id,
+            "Engineering",
+            Some(project_id),
+            Some("renamed"),
+            RepositoryBindingIdentity {
+                fingerprint: &fingerprint,
+                remote: None,
+                checkout_id: &binding.checkout_id,
+                kind: CheckoutIdentityKind::Git,
+            },
+        )
+        .await;
+        assert!(renamed);
+        let after_rename: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("config")).expect("json");
+        assert_eq!(after_rename["project_name"].as_str(), Some("renamed"));
+        assert_ne!(after_rename["associated_at"], stamped["associated_at"]);
     }
 
     #[tokio::test]

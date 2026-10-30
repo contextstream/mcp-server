@@ -3083,6 +3083,7 @@ impl ContextStreamClient {
             "detached"
         }
         .to_string();
+        let guard_remote_identity = repository_identity.clone().unwrap_or_default();
         let provenance = CheckoutProvenance {
             checkout_id: checkout_id.clone(),
             installation_id: effective_installation_id().map(|id| id.to_string()),
@@ -3100,6 +3101,12 @@ impl ContextStreamClient {
             dirty,
             captured_at: Utc::now().to_rfc3339(),
         };
+        // What the guard stands for is the binding: root, project, workspace,
+        // repository fingerprint, remote identity, identity kind and checkout id.
+        // The text of config.json is not part of it: the file also holds names and
+        // an `associated_at` stamp that change without the binding changing, and
+        // a guard that moved with them gave every session a new hash manifest, so
+        // an unchanged checkout was uploaded whole again (mcp-server#365).
         let guard = Self::sha256_hex(&format!(
             "{}\0{}\0{}\0{}\0{}\0{}",
             root.display(),
@@ -3107,7 +3114,9 @@ impl ContextStreamClient {
             project_id,
             workspace_id,
             configured_fingerprint.trim(),
-            Self::sha256_hex(&format!("{config_text}\0{checkout_id}")),
+            Self::sha256_hex(&format!(
+                "{checkout_id}\0{identity_kind}\0{guard_remote_identity}"
+            )),
         ));
         Ok(Some(LocalCheckoutSnapshot { guard, provenance }))
     }
@@ -30505,6 +30514,59 @@ mod tests {
     }
 
     #[cfg(unix)]
+    // mcp-server#365: the guard keys the hash manifest. It moved with every
+    // rewrite of config.json (`associated_at` is re-stamped by a session), so an
+    // unchanged checkout found no manifest and was uploaded whole again.
+    #[test]
+    fn local_checkout_guard_ignores_what_config_json_holds_besides_the_binding(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-guard-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home)?;
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let root = initialize_bound_ingest_fixture(&temp_home, project_id, workspace_id)?;
+        let root_text = root.to_string_lossy().to_string();
+        let config_path = root.join(".contextstream").join("config.json");
+        let guard =
+            || ContextStreamClient::local_checkout_guard(&root_text, project_id, workspace_id);
+        let original = guard()?.expect("a bound checkout has a guard");
+
+        // A session re-stamps the file and renames: the binding is the same.
+        let mut config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+        config["associated_at"] = serde_json::json!("2026-10-30T10:36:17.870Z");
+        config["workspace_name"] = serde_json::json!("Renamed workspace");
+        config["project_name"] = serde_json::json!("Renamed project");
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+        assert_eq!(guard()?.as_deref(), Some(original.as_str()));
+        config["associated_at"] = serde_json::json!("2026-10-30T11:00:00Z");
+        std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
+        assert_eq!(
+            guard()?.as_deref(),
+            Some(original.as_str()),
+            "formatting too"
+        );
+
+        // A binding for another workspace is refused outright; another checkout id
+        // is another guard.
+        assert!(
+            ContextStreamClient::local_checkout_guard(&root_text, project_id, Uuid::new_v4())
+                .is_err()
+        );
+        config["checkout_id"] = serde_json::json!(format!("checkout-v1:{}", Uuid::new_v4()));
+        std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
+        assert_ne!(guard()?.as_deref(), Some(original.as_str()));
+
+        let _ = std::fs::remove_dir_all(&temp_home);
+        Ok(())
+    }
+
     #[test]
     fn local_checkout_guard_rejects_symlinked_security_metadata_parents(
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {

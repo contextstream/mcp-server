@@ -8,9 +8,13 @@ use std::process::{Command, ExitStatus, Stdio};
 /// Runs the binary with a stdout whose reader is already gone, so its first
 /// write meets a broken pipe: deterministic, and before any network call.
 fn run_with_closed_stdout(args: &[&str]) -> (ExitStatus, String) {
-    let home = tempfile::tempdir().expect("isolated home");
     let (reader, writer) = std::io::pipe().expect("pipe");
     drop(reader);
+    run_with_stdout(args, Stdio::from(writer))
+}
+
+fn run_with_stdout(args: &[&str], stdout: Stdio) -> (ExitStatus, String) {
+    let home = tempfile::tempdir().expect("isolated home");
     let mut command = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"));
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("CONTEXTSTREAM_") {
@@ -24,7 +28,7 @@ fn run_with_closed_stdout(args: &[&str]) -> (ExitStatus, String) {
         .env("CONTEXTSTREAM_API_URL", "http://127.0.0.1:9")
         .env("CONTEXTSTREAM_WATCH", "0")
         .stdin(Stdio::null())
-        .stdout(writer)
+        .stdout(stdout)
         .stderr(Stdio::piped())
         .output()
         .expect("run contextstream-mcp");
@@ -67,5 +71,29 @@ fn setup_and_doctor_do_not_panic_on_a_closed_stdout() {
     ] {
         let (status, stderr) = run_with_closed_stdout(args);
         assert_no_panic(args, status, &stderr);
+    }
+}
+
+/// A stdout that fails every write (`> /dev/full`, a full disk) is an error to
+/// report, not a panic: a message on stderr and exit status 1 (#422).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stdout_that_cannot_be_written_gives_a_message_and_exit_1() {
+    for args in [
+        &["about"][..],
+        &["detect-editors", "--format=json"][..],
+        &["doctor", "--editors=claude"][..],
+    ] {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full");
+        let (status, stderr) = run_with_stdout(args, Stdio::from(full));
+        assert_no_panic(args, status, &stderr);
+        assert_eq!(status.code(), Some(1), "{args:?}: {status:?}\n{stderr}");
+        assert!(
+            stderr.contains("cannot write to stdout: No space left on device"),
+            "{args:?} must say why it stopped:\n{stderr}"
+        );
     }
 }

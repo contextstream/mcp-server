@@ -247,27 +247,119 @@ pub(crate) fn strip_descriptions(schema: &mut Value) {
     }
 }
 
-/// `Err` unless `input` names one of the twin's read actions.
-fn check_read_action(twin: &ReadOnlyTwin, input: &Value) -> Result<()> {
-    let action = input.get("action").and_then(Value::as_str).unwrap_or("");
-    if twin.actions.contains(&action) {
-        return Ok(());
+/// The read action `input` asks the twin for, as the twin lists it. The tool
+/// behind a twin trims and lower-cases its action, so `"Search"` and
+/// `" search"` read here too: refused before any request, a customer's
+/// `memory_read` call failed and had to be repeated (2026-10-30). With no
+/// action, `memory_read` given a query searches, the only read a bare query
+/// can mean. `Err` says what to pass instead: the twin that reads it, the
+/// write tool for a write, or the closest reads.
+fn read_action(twin: &ReadOnlyTwin, tool_actions: &[&str], input: &Value) -> Result<&'static str> {
+    let given = input.get("action").and_then(Value::as_str).unwrap_or("");
+    let asked = given.trim().to_lowercase();
+    if let Some(action) = twin.actions.iter().copied().find(|action| *action == asked) {
+        return Ok(action);
     }
     let reads = twin.actions.join(", ");
-    Err(Error::Validation(if action.is_empty() {
-        format!("`{}` needs an action: one of {reads}.", twin.name)
-    } else {
-        format!(
-            "`{}` only reads (actions: {reads}). Use `{}` for `{action}`.",
+    if asked.is_empty() {
+        let has_query = input
+            .get("query")
+            .and_then(Value::as_str)
+            .is_some_and(|query| !query.trim().is_empty());
+        if twin.name == "memory_read" && has_query {
+            return Ok("search");
+        }
+        return Err(Error::Validation(format!(
+            "`{}` needs an action: one of {reads}.",
+            twin.name
+        )));
+    }
+    if let Some(other) = READ_ONLY_TWINS
+        .iter()
+        .find(|other| other.name != twin.name && other.actions.contains(&asked.as_str()))
+    {
+        return Err(Error::Validation(format!(
+            "`{}` has no `{asked}`: call {}(action=\"{asked}\").",
+            twin.name, other.name
+        )));
+    }
+    if tool_actions.contains(&asked.as_str()) {
+        return Err(Error::Validation(format!(
+            "`{}` only reads (actions: {reads}). Use `{}` for `{asked}`.",
             twin.name, twin.tool
-        )
-    }))
+        )));
+    }
+    let close = closest_reads(twin, &asked);
+    let hint = match close.as_slice() {
+        [] => String::new(),
+        [only] => format!(" Did you mean `{only}`?"),
+        [rest @ .., last] => format!(
+            " Did you mean {} or `{last}`?",
+            rest.iter()
+                .map(|action| format!("`{action}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    Err(Error::Validation(format!(
+        "`{}` has no action `{asked}`.{hint} Its actions: {reads}.",
+        twin.name
+    )))
+}
+
+/// Up to three of the twin's reads sharing a word with `asked` (`docs` and
+/// `doc` count as one), shortest first.
+fn closest_reads(twin: &ReadOnlyTwin, asked: &str) -> Vec<&'static str> {
+    fn words(action: &str) -> Vec<&str> {
+        action
+            .split('_')
+            .map(|word| {
+                word.strip_suffix('s')
+                    .filter(|w| w.len() > 2)
+                    .unwrap_or(word)
+            })
+            .filter(|word| !word.is_empty())
+            .collect()
+    }
+    let asked = words(asked);
+    let mut close: Vec<(usize, &'static str)> = twin
+        .actions
+        .iter()
+        .copied()
+        .filter_map(|action| {
+            let shared = words(action)
+                .iter()
+                .filter(|word| asked.contains(word))
+                .count();
+            (shared > 0).then_some((shared, action))
+        })
+        .collect();
+    close.sort_by(|(a_shared, a), (b_shared, b)| {
+        b_shared
+            .cmp(a_shared)
+            .then(a.len().cmp(&b.len()))
+            .then(a.cmp(b))
+    });
+    close
+        .into_iter()
+        .take(3)
+        .map(|(_, action)| action)
+        .collect()
 }
 
 #[async_trait]
 impl ToolHandler for ReadOnlyTwinTool {
-    async fn execute(&self, input: Value) -> Result<ToolResult> {
-        check_read_action(self.twin, &input)?;
+    async fn execute(&self, mut input: Value) -> Result<ToolResult> {
+        let tool_schema = self.inner.input_schema();
+        let tool_actions: Vec<&str> = tool_schema
+            .pointer("/properties/action/enum")
+            .and_then(Value::as_array)
+            .map(|actions| actions.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let action = read_action(self.twin, &tool_actions, &input)?;
+        if let Some(object) = input.as_object_mut() {
+            object.insert("action".to_string(), Value::String(action.to_string()));
+        }
         self.inner.execute(input).await
     }
 
@@ -404,6 +496,47 @@ mod tests {
             *inner.calls.lock().unwrap(),
             vec![json!({"action": "search", "query": "auth"})]
         );
+    }
+
+    // A customer's memory_read failed before any request (2026-10-30, 09:01Z).
+    #[tokio::test]
+    async fn a_twin_reads_the_spellings_its_tool_reads_and_says_what_to_pass() {
+        let inner = Arc::new(Recording::new());
+        let tool = ReadOnlyTwinTool::new(memory_twin(), inner.clone());
+        for given in ["Search", " search ", "SEARCH"] {
+            tool.execute(json!({"action": given, "query": "IGE-94"}))
+                .await
+                .unwrap_or_else(|error| panic!("{given:?}: {error}"));
+        }
+        // A bare query is a search.
+        tool.execute(json!({"query": "IGE-94"}))
+            .await
+            .expect("a bare query searches");
+        assert_eq!(
+            *inner.calls.lock().unwrap(),
+            vec![json!({"action": "search", "query": "IGE-94"}); 4]
+        );
+
+        let message = |input: Value| {
+            let tool = &tool;
+            async move { tool.execute(input).await.expect_err("refused").to_string() }
+        };
+        let other_twin = message(json!({"action": "recall", "query": "x"})).await;
+        assert!(
+            other_twin.contains("call session_read(action=\"recall\")"),
+            "{other_twin}"
+        );
+        let unknown = message(json!({"action": "search_docs", "query": "x"})).await;
+        assert!(unknown.contains("has no action `search_docs`"), "{unknown}");
+        assert!(unknown.contains("Did you mean `search`"), "{unknown}");
+        assert!(unknown.contains("`list_docs`"), "{unknown}");
+        assert!(!unknown.contains("Use `memory`"), "{unknown}");
+        // A real write still points at the write tool.
+        let write = message(json!({"action": "Create_Doc", "title": "x"})).await;
+        assert!(write.contains("Use `memory` for `create_doc`"), "{write}");
+        // No action and nothing to search for.
+        let bare = message(json!({})).await;
+        assert!(bare.contains("needs an action"), "{bare}");
     }
 
     #[test]

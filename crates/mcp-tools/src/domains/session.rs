@@ -5839,6 +5839,113 @@ fn suggested_rules_message(result: &Value) -> Option<&str> {
 /// Typed `[SUGGESTED_RULES]` lines for `session(action="list_suggested_rules")`:
 /// one line per rule with its source lesson ids, then the server's native
 /// guidance snippet (an AGENTS.md-ready block) when present.
+/// The person's preferences as user_context shows them (#430): one line per
+/// preference with its category, summary, what it holds and its confidence,
+/// instead of the API's reply as pretty JSON with its internal fields.
+fn render_user_context(result: &Value) -> String {
+    let preferences = result.get("preferences").unwrap_or(&Value::Null);
+    let items: Vec<&Value> = preferences
+        .get("results")
+        .or_else(|| preferences.get("items"))
+        .and_then(Value::as_array)
+        .map(|items| items.iter().collect())
+        .unwrap_or_default();
+    let total = preferences
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or(items.len() as u64);
+    let mut text = if items.is_empty() {
+        "No preferences recorded for this scope.".to_string()
+    } else {
+        format!("Preferences ({} of {total}):", items.len())
+    };
+    for (index, item) in items.iter().enumerate() {
+        let metadata = item.get("metadata").unwrap_or(&Value::Null);
+        let field = |key: &str| {
+            metadata
+                .get(key)
+                .or_else(|| item.get(key))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        let mut line = format!("\n{}. ", index + 1);
+        if let Some(category) = field("category") {
+            line.push_str(&format!("[{}] ", one_line(category)));
+        }
+        line.push_str(&one_line(
+            field("summary").or(field("title")).unwrap_or("Preference"),
+        ));
+        if let Some(details) = field("details").map(preference_details) {
+            line.push_str(&format!(": {details}"));
+        }
+        if let Some(confidence) = metadata.get("confidence").and_then(Value::as_f64) {
+            line.push_str(&format!(" (confidence {confidence:.2})"));
+        }
+        if let Some(id) = item.get("id").and_then(Value::as_str) {
+            line.push_str(&format!(" — id: {}", one_line(id)));
+        }
+        text.push_str(&line);
+    }
+    if let Some(summary) = result
+        .get("summary")
+        .and_then(Value::as_object)
+        .filter(|summary| !summary.is_empty())
+    {
+        text.push_str("\nMemory in this scope:");
+        for (key, value) in summary {
+            // The *_total keys repeat the others; ids and nulls say nothing.
+            if key.ends_with("_total") || key == "workspace_id" || value.is_null() {
+                continue;
+            }
+            let value = match value {
+                Value::String(text) => text.clone(),
+                // Counts by type: the five largest, and how many more.
+                Value::Object(counts) => {
+                    let mut counts: Vec<(&String, u64)> = counts
+                        .iter()
+                        .filter_map(|(name, count)| count.as_u64().map(|count| (name, count)))
+                        .collect();
+                    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    let mut shown: Vec<String> = counts
+                        .iter()
+                        .take(5)
+                        .map(|(name, count)| format!("{name} {count}"))
+                        .collect();
+                    if counts.len() > 5 {
+                        shown.push(format!("+{} more", counts.len() - 5));
+                    }
+                    shown.join(", ")
+                }
+                other => other.to_string(),
+            };
+            text.push_str(&format!("\n- {}: {}", one_line(key), one_line(&value)));
+        }
+    }
+    text
+}
+
+/// A preference's stored details, read out: `{"preserve_indentation": true}`
+/// is "preserve indentation"; text that is not a JSON object is kept as is.
+fn preference_details(details: &str) -> String {
+    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(details) else {
+        return one_line(details);
+    };
+    fields
+        .iter()
+        .map(|(key, value)| {
+            let key = key.replace('_', " ");
+            match value {
+                Value::Bool(true) => key,
+                Value::Bool(false) => format!("not {key}"),
+                Value::String(text) => format!("{key}: {}", one_line(text)),
+                other => format!("{key}: {other}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub(crate) fn render_suggested_rules_list(result: &Value) -> String {
     let rules = suggested_rule_items(result);
     let payload = suggested_rules_payload(result);
@@ -17852,7 +17959,10 @@ impl ToolHandler for SessionTool {
                     project_id: input.project_id.and_then(|s| Uuid::parse_str(&s).ok()),
                 };
                 let result = self.client.session_user_context(params).await?;
-                Ok(ToolResult::text(serde_json::to_string_pretty(&result)?))
+                Ok(ToolResult::with_structured(
+                    render_user_context(&result),
+                    result,
+                ))
             }
             "list_suggested_rules" => {
                 use mcp_client::ListSuggestedRulesParams;

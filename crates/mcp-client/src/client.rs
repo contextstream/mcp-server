@@ -14035,6 +14035,8 @@ impl ContextStreamClient {
         let mut result: serde_json::Value = self.get(&path).await?;
         if let Some(requested) = event_type.as_deref() {
             filter_memory_events_by_type(&mut result, requested, limit);
+        } else if list_offset().unwrap_or(0) <= 0 {
+            drop_lower_bound_total(&mut result);
         }
         Ok(result)
     }
@@ -22354,6 +22356,25 @@ fn list_filter_api_type(requested: &str) -> String {
     }
 }
 
+/// The API answers an unfiltered first page of events without counting: its
+/// `total` is the rows shown plus one when there are more, which read as
+/// "1-5 of 6" for 27,609 events (#411). Such a total becomes `has_more`.
+fn drop_lower_bound_total(result: &mut serde_json::Value) {
+    let Some(obj) = result.as_object_mut() else {
+        return;
+    };
+    let shown = obj
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len) as u64;
+    let total = obj.get("total").and_then(serde_json::Value::as_u64);
+    if shown > 0 && total == Some(shown + 1) {
+        obj.remove("total");
+        obj.remove("total_pages");
+        obj.insert("has_more".to_string(), serde_json::Value::Bool(true));
+    }
+}
+
 /// Keep the events captured as `requested` (the type a caller passed to
 /// create_event), at most `limit` (#410). A captured event records it in
 /// `metadata.original_type`; an event without one is matched on its own type.
@@ -28648,6 +28669,23 @@ mod tests {
             ContextStreamClient::map_session_capture_api_event_type("bug"),
             "ticket"
         );
+    }
+
+    #[test]
+    fn a_first_page_total_of_one_more_than_shown_is_not_a_count() {
+        // #411: the API's count-free first page said "of 6".
+        let mut probe = serde_json::json!({
+            "items": [{}, {}, {}, {}, {}], "total": 6, "page": 1, "per_page": 5, "total_pages": 2
+        });
+        drop_lower_bound_total(&mut probe);
+        assert!(probe.get("total").is_none() && probe.get("total_pages").is_none());
+        assert_eq!(probe["has_more"], true);
+        let mut counted = serde_json::json!({"items": [{}, {}], "total": 27609});
+        drop_lower_bound_total(&mut counted);
+        assert_eq!(counted["total"], 27609);
+        let mut all = serde_json::json!({"items": [{}, {}], "total": 2});
+        drop_lower_bound_total(&mut all);
+        assert_eq!(all["total"], 2);
     }
 
     #[test]

@@ -385,16 +385,79 @@ fn extract_collection_array(value: &Value) -> Option<&Vec<Value>> {
     obj.get("data").and_then(extract_collection_array)
 }
 
-fn collection_count(value: &Value) -> usize {
-    if let Some(arr) = extract_collection_array(value) {
-        return arr.len();
+/// The collection array `extract_collection_array` finds, for editing.
+fn extract_collection_array_mut(value: &mut Value) -> Option<&mut Vec<Value>> {
+    if value.is_array() {
+        return value.as_array_mut();
     }
+    let key = [
+        "items",
+        "results",
+        "todos",
+        "tasks",
+        "events",
+        "nodes",
+        "diagrams",
+        "docs",
+        "transcripts",
+    ]
+    .into_iter()
+    .find(|key| value.get(*key).is_some_and(Value::is_array));
+    match key {
+        Some(key) => value.get_mut(key)?.as_array_mut(),
+        None => extract_collection_array_mut(value.get_mut("data")?),
+    }
+}
 
-    value
-        .get("total")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(0)
+/// The most matches `POST /transcripts/search` returns; `offset` pages
+/// through them (#462).
+const TRANSCRIPT_SEARCH_MAX: usize = 50;
+
+/// Keep one page of transcript matches in `result` and say which (#462). The
+/// search has no offset, so the caller fetched `offset + page_size + 1` (at
+/// most `TRANSCRIPT_SEARCH_MAX`) and this cuts the page out.
+fn page_transcript_matches(
+    result: &mut Value,
+    offset: usize,
+    page_size: usize,
+    asked_limit: Option<i64>,
+) -> String {
+    let Some(items) = extract_collection_array_mut(result) else {
+        return "Found 0 matching transcripts.".to_string();
+    };
+    let fetched = items.len();
+    let reached_max = fetched >= TRANSCRIPT_SEARCH_MAX;
+    let end = (offset + page_size).min(fetched);
+    let page: Vec<Value> = items.drain(..).skip(offset).take(page_size).collect();
+    *items = page;
+    let shown = items.len();
+    let mut text = if shown == 0 && offset > 0 && reached_max {
+        format!(
+            "Offset {offset} is past the {TRANSCRIPT_SEARCH_MAX} best matches the transcript search returns. Narrow the query to reach others."
+        )
+    } else if shown == 0 && offset > 0 && fetched > 0 {
+        format!(
+            "Offset {offset} is past the end of the {fetched} matching transcripts; pass an offset below {fetched}."
+        )
+    } else if fetched > end {
+        format!(
+            "Showing matches {}\u{2013}{end}. Pass offset={end} for more.",
+            offset + 1
+        )
+    } else if offset > 0 {
+        format!("Showing matches {}\u{2013}{end} of {fetched}.", offset + 1)
+    } else {
+        format!("Found {shown} matching transcripts.")
+    };
+    if shown > 0 && reached_max && fetched <= end {
+        text.push_str(&format!(
+            " The search returns its {TRANSCRIPT_SEARCH_MAX} best matches; narrow the query to reach others."
+        ));
+    }
+    if asked_limit.is_some_and(|limit| limit > TRANSCRIPT_SEARCH_MAX as i64) {
+        text.push_str(&format!(" limit is at most {TRANSCRIPT_SEARCH_MAX} here."));
+    }
+    text
 }
 
 fn extract_metadata_str<'a>(item: &'a Value, field: &str) -> Option<&'a str> {
@@ -529,17 +592,18 @@ fn paging_footer(result: &Value, offset: Option<i64>, limit: Option<i64>) -> Str
 
 /// One line per transcript a search matched (#390): title, id, client, when
 /// it started and its size, then the first message that holds the query.
-fn format_transcript_matches(result: &Value, query: &str) -> String {
+fn format_transcript_matches(result: &Value, query: &str, offset: usize) -> String {
     let Some(items) = extract_collection_array(result) else {
         return String::new();
     };
     let needle = query.trim().to_lowercase();
     let mut text = String::new();
-    for (i, item) in items.iter().take(20).enumerate() {
+    // The page is at most TRANSCRIPT_SEARCH_MAX rows, numbered by position.
+    for (i, item) in items.iter().enumerate() {
         let field = |key: &str| one_line(item.get(key).and_then(Value::as_str).unwrap_or(""));
         text.push_str(&format!(
             "\n{}. **{}** (id: {}) — {}, {}, {} messages",
-            i + 1,
+            offset + i + 1,
             extract_display_title(item),
             field("id"),
             field("client_name"),
@@ -6326,9 +6390,17 @@ impl MemoryTool {
                 let query = input
                     .query
                     .ok_or_else(|| Error::Validation("query is required".to_string()))?;
+                // The search has no offset: fetch through the page plus one
+                // row, to know whether more follow, and cut the page out
+                // (#462). Only a first page is cached or enriched.
+                let offset = input.offset.unwrap_or(0).max(0) as usize;
+                let page_size =
+                    input.limit.unwrap_or(10).clamp(1, TRANSCRIPT_SEARCH_MAX as i64) as usize;
+                let fetch = (offset + page_size + 1).min(TRANSCRIPT_SEARCH_MAX);
                 let caller_cache_identity = current_memory_cache_identity();
                 let atlas_search_provider = caller_cache_identity
                     .as_ref()
+                    .filter(|_| offset == 0)
                     .and_then(|_| self.atlas_layer.search());
                 let cache_key = transcripts_search_cache_key_for_caller(
                     caller_cache_identity.as_deref(),
@@ -6337,7 +6409,8 @@ impl MemoryTool {
                     &query,
                     input.limit,
                     atlas_search_provider.is_some(),
-                );
+                )
+                .filter(|_| offset == 0);
                 if let Some(cache_key) = cache_key.as_deref() {
                     if let Some((cached_text, cached_structured)) =
                         transcripts_search_cache().get(cache_key)
@@ -6355,11 +6428,13 @@ impl MemoryTool {
                 }
                 let params = SearchTranscriptsParams {
                     query: query.clone(),
-                    limit: input.limit,
+                    limit: Some(fetch as i64),
                     workspace_id,
                     project_id,
                 };
                 let mut result = self.client.search_transcripts(params).await?;
+                let page_heading =
+                    page_transcript_matches(&mut result, offset, page_size, input.limit);
 
                 // P1 #10 — Atlas Search Lucene enrichment. PG full-text
                 // doesn't fuzzy-match (typos miss); Atlas Search adds
@@ -6385,22 +6460,17 @@ impl MemoryTool {
                 )
                 .await;
 
-                let pg_count = collection_count(&result);
                 let atlas_count = result
                     .get("atlas_search_hits")
                     .and_then(|v| v.as_array())
                     .map(|a| a.len())
                     .unwrap_or(0);
-                let mut text = if atlas_count > 0 {
-                    format!(
-                        "Found {} matching transcripts (+{} fuzzy hit(s)).",
-                        pg_count, atlas_count
-                    )
-                } else {
-                    format!("Found {} matching transcripts.", pg_count)
-                };
+                let mut text = page_heading;
+                if atlas_count > 0 {
+                    text.push_str(&format!(" (+{atlas_count} fuzzy hit(s))"));
+                }
                 // Each match, so get_transcript can follow (#390).
-                text.push_str(&format_transcript_matches(&result, &query));
+                text.push_str(&format_transcript_matches(&result, &query, offset));
                 if let Some(cache_key) = cache_key {
                     put_transcripts_search_cache(
                         caller_cache_identity.as_deref(),

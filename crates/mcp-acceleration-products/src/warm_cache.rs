@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use mcp_client::client::loopback_api_forwarder_headers;
 use mcp_types::acceleration_layer::{
     WarmCacheError, WarmCacheHit, WarmCacheLookup, WarmCacheProvider, WarmCachePut,
     WarmCacheRebuild,
@@ -172,6 +173,7 @@ impl WarmCacheProvider for ContextStreamWarmCacheProvider {
             .lookup_client
             .post(self.endpoint("read-model/get"))
             .bearer_auth(&self.job_api_token)
+            .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
             .json(&ReadModelGetBody::from(lookup))
             .send()
             .await
@@ -207,6 +209,7 @@ impl WarmCacheProvider for ContextStreamWarmCacheProvider {
             .side_effect_client
             .post(self.endpoint("read-model/enqueue-rebuild"))
             .bearer_auth(&self.job_api_token)
+            .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
             .json(&EnqueueRebuildBody::from(rebuild))
             .send()
             .await
@@ -231,6 +234,7 @@ impl WarmCacheProvider for ContextStreamWarmCacheProvider {
             .side_effect_client
             .post(self.endpoint("read-model/put-jsonb"))
             .bearer_auth(&self.job_api_token)
+            .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
             .json(&PutReadModelJsonbBody::from(put))
             .send()
             .await

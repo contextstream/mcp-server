@@ -1063,3 +1063,53 @@ async fn notion_search_pages_reads_the_search_route() {
         .to_string()
         .contains("search_pages filters by query and database_id only"));
 }
+
+#[test]
+fn an_integration_summary_says_what_it_found() {
+    // #466: "all summary retrieved." and nothing else.
+    let all = serde_json::json!({"period_days": 7, "sources_included": ["local"], "github": null, "slack": null,
+        "combined_insights": {"total_activity_events": 0, "decisions_extracted": 0, "lessons_extracted": 0, "key_topics": []}});
+    assert_eq!(
+        format_integration_summary("all", &all),
+        "Cross-source summary, last 7 days (sources: local): 0 activity events, 0 decisions, 0 lessons; no key topics."
+    );
+    let busy = serde_json::json!({"period_days": 30, "sources_included": ["github", "slack"],
+        "github": {"total_issues": 4, "total_prs": 2, "total_releases": 1, "total_comments": 9,
+                   "top_repos": [{"repo": "org/api", "issues": 3, "prs": 2, "comments": 7}],
+                   "recent_decisions": ["Use Postgres enums"]},
+        "slack": {"total_messages": 40, "total_threads": 6, "active_users": 3,
+                  "top_channels": [{"channel": "eng", "messages": 30, "threads": 5}], "recent_decisions": []},
+        "combined_insights": {"total_activity_events": 55, "decisions_extracted": 1, "lessons_extracted": 2,
+                              "key_topics": ["billing", "search"]}});
+    let text = format_integration_summary("all", &busy);
+    assert!(text.starts_with("Cross-source summary, last 30 days (sources: github, slack): 55 activity events, 1 decisions, 2 lessons; key topics: billing, search."), "{text}");
+    assert!(text.contains("\nGitHub: 4 issues, 2 PRs, 1 releases, 9 comments.\n- org/api: 3 issues, 2 PRs, 7 comments"), "{text}");
+    assert!(
+        text.contains(
+            "\nSlack: 40 messages, 6 threads, 3 active users.\n- #eng: 30 messages, 5 threads"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("\nRecent decisions:\n- Use Postgres enums"),
+        "{text}"
+    );
+
+    let notion = serde_json::json!({"pages_synced": 3, "knowledge_extracted": 1, "summary_text": "3 pages synced, 1 knowledge item."});
+    assert_eq!(
+        format_integration_summary("notion", &notion),
+        "notion summary: 3 pages synced, 1 knowledge item."
+    );
+    let github = serde_json::json!({"period": {"days": 7, "start_date": "2026-10-23", "end_date": "2026-10-30"},
+        "overview": {"new_issues": 2, "merged_prs": 1}, "knowledge_extracted": [{"title": "Retry on 503"}]});
+    let text = format_integration_summary("github", &github);
+    assert!(text.starts_with("github summary, last 7 days: "), "{text}");
+    assert!(
+        text.contains("new issues 2") && text.contains("merged prs 1"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(".\nKnowledge extracted:\n- Retry on 503"),
+        "{text}"
+    );
+}

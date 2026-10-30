@@ -667,6 +667,8 @@ async fn hybrid_with_fast_fallback(
     .await
     {
         Ok(Ok(attempt)) => Ok((attempt, None)),
+        // A refused key refuses semantic too; say so at once (#386).
+        Ok(Err(err)) if err.is_key_refusal() => Err(err),
         Ok(Err(err)) => {
             // Server-side error: try semantic so the caller isn't empty-handed.
             tracing::warn!(
@@ -12196,6 +12198,10 @@ impl SearchTool {
                         ));
                     }
                 }
+                // A refused key is not a stale project: every candidate and
+                // the workspace retry fail the same way, and the call ended
+                // "Project not found … call init" (#386).
+                Err(err) if err.is_key_refusal() => return Err(err),
                 Err(err) if is_not_found_error(&err) || is_access_denied_error(&err) => {
                     last_candidate_error = Some((*candidate_project_id, err.to_string()));
                     continue;

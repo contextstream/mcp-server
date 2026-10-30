@@ -194,6 +194,13 @@ impl Error {
         is_non_blocking_parser_error_message(message)
     }
 
+    /// Whether the API refused the key itself (HTTP 401), not a scope or a
+    /// project. Every tool answers that the same way, ahead of any setup or
+    /// project hint (#252, #386).
+    pub fn is_key_refusal(&self) -> bool {
+        matches!(self, Self::Http { status: 401, .. })
+    }
+
     /// User-facing error text with known internal/non-blocking implementation
     /// details removed. The original error should still be sent to tracing logs
     /// before this sanitized message is returned to a client.
@@ -203,7 +210,7 @@ impl Error {
                 .to_string();
         }
         // A 401 is the key itself being refused; say what to do about it (#252).
-        if matches!(self, Self::Http { status: 401, .. }) {
+        if self.is_key_refusal() {
             return format!(
                 "{self}. ContextStream did not accept the API key (invalid, expired or revoked). \
                  Save a valid key with `contextstream-mcp setup` (or `contextstream-mcp configure \
@@ -339,6 +346,24 @@ impl fmt::Display for ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_401_is_a_key_refusal() {
+        // #386
+        let http = |status| Error::Http {
+            status,
+            message: "Unauthorized".to_string(),
+            code: ErrorCode::BadRequest,
+            source: None,
+        };
+        assert!(http(401).is_key_refusal());
+        assert!(http(401)
+            .user_facing_message()
+            .contains("ContextStream did not accept the API key"));
+        for error in [http(403), http(404), Error::Network("refused".into())] {
+            assert!(!error.is_key_refusal(), "{error}");
+        }
+    }
 
     #[test]
     fn only_reach_auth_and_server_failures_are_connection_failures() {

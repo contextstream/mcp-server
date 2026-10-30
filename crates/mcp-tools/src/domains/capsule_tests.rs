@@ -1379,3 +1379,36 @@ fn only_actions_that_read_a_scope_get_the_session_defaults() {
         assert!(!SCOPE_DEFAULTED_ACTIONS.contains(&action), "{action}");
     }
 }
+
+#[test]
+fn share_text_shows_numbers_and_times_not_debug_values() {
+    // #362: max_uses=Some(2), consumed_at=Some("…").
+    let response = ContextCapsuleShareResponse {
+        id: Uuid::nil(),
+        audience: Some("external_agent".into()),
+        single_use: false,
+        max_uses: Some(2),
+        use_count: 1,
+        consumed_at: Some("2026-10-30T10:17:10.761665Z".into()),
+        expires_at: Some("2026-10-31T10:17:04.424Z".into()),
+        token_prefix: "capsule_62d6".into(),
+        ..Default::default()
+    };
+    let text = format_share_result_text("cap_x", &response);
+    assert!(
+        text.contains("Share policy: multi-use (max_uses=2, use_count=1)"),
+        "{text}"
+    );
+    let list =
+        format_list_shares_summary(std::slice::from_ref(&response), Some("cap_x"), None, None);
+    assert!(
+        list.contains("max_uses=2 | use_count=1 | consumed_at=2026-10-30T10:17:10Z | expires_at=2026-10-31T10:17:04Z"),
+        "{list}"
+    );
+    for text in [&text, &list] {
+        assert!(!text.contains("Some("), "{text}");
+    }
+    assert_eq!(share_limit(None), "unlimited");
+    assert_eq!(share_time(None), "none");
+    assert_eq!(share_time(Some("not a time")), "not a time");
+}

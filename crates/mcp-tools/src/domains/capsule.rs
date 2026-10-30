@@ -1172,6 +1172,27 @@ fn is_stream_format(format: Option<&str>) -> bool {
     matches!(format, Some("ndjson"))
 }
 
+/// A share's use limit as text: the number, or "unlimited" (#362: the text
+/// showed `Some(2)`).
+fn share_limit(max_uses: Option<i32>) -> String {
+    max_uses.map_or_else(|| "unlimited".to_string(), |uses| uses.to_string())
+}
+
+/// A share timestamp as text, to the second in UTC; "none" when absent (#362:
+/// the text showed `Some("2026-10-30T10:17:10.761665Z")`).
+fn share_time(value: Option<&str>) -> String {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => "none".to_string(),
+        Some(value) => chrono::DateTime::parse_from_rfc3339(value)
+            .map(|time| {
+                time.with_timezone(&chrono::Utc)
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string()
+            })
+            .unwrap_or_else(|_| value.to_string()),
+    }
+}
+
 fn format_share_result_text(capsule_id: &str, response: &ContextCapsuleShareResponse) -> String {
     let audience = response.audience.as_deref().unwrap_or("unknown");
     let mut lines = vec![
@@ -1253,8 +1274,10 @@ fn format_share_result_text(capsule_id: &str, response: &ContextCapsuleShareResp
         );
     } else if response.single_use {
         lines.push(format!(
-            "Share policy: single-use (max_uses={:?}, use_count={}, consumed_at={:?})",
-            response.max_uses, response.use_count, response.consumed_at
+            "Share policy: single-use (max_uses={}, use_count={}, consumed_at={})",
+            share_limit(response.max_uses),
+            response.use_count,
+            share_time(response.consumed_at.as_deref())
         ));
         lines.push(
             "Note: the open started a one-hour viewing window; any read within it succeeds. Reads after it return 410 Gone."
@@ -1267,8 +1290,10 @@ fn format_share_result_text(capsule_id: &str, response: &ContextCapsuleShareResp
             "multi-use"
         };
         lines.push(format!(
-            "Share policy: {} (max_uses={:?}, use_count={})",
-            policy_prefix, response.max_uses, response.use_count
+            "Share policy: {} (max_uses={}, use_count={})",
+            policy_prefix,
+            share_limit(response.max_uses),
+            response.use_count
         ));
         if let Some(uses) = response.max_uses.filter(|uses| *uses > 1) {
             lines.push(format!(
@@ -2575,10 +2600,10 @@ fn format_list_shares_summary(
             s.id,
             s.audience.as_deref().unwrap_or("?"),
             policy,
-            s.max_uses,
+            share_limit(s.max_uses),
             s.use_count,
-            s.consumed_at,
-            s.expires_at,
+            share_time(s.consumed_at.as_deref()),
+            share_time(s.expires_at.as_deref()),
             s.token_prefix
         ));
     }

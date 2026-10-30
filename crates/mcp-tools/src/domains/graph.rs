@@ -1810,9 +1810,8 @@ fn freshness_recommendations(result: &Value) -> Vec<String> {
     recommendations
 }
 
-#[async_trait]
-impl ToolHandler for GraphTool {
-    async fn execute(&self, input: Value) -> Result<ToolResult> {
+impl GraphTool {
+    async fn execute_action(&self, input: Value) -> Result<ToolResult> {
         let input: GraphInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
 
@@ -1907,7 +1906,13 @@ impl ToolHandler for GraphTool {
                     .graph_ingest(scope.workspace_id, scope.project_id, input.wait)
                     .await?;
                 let status = result.get("status").and_then(|v| v.as_str()).unwrap_or("started");
-                let text = format!("Graph ingest {}.", status);
+                let mut text = format!("Graph ingest {}.", status);
+                // wait=true returned at once with the build still queued (#370).
+                if input.wait == Some(true)
+                    && result.get("wait_honored").and_then(Value::as_bool) == Some(false)
+                {
+                    text.push_str(" The build runs in the background (wait is not supported here); graph(action=\"quality_freshness\") shows when the graph is built.");
+                }
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note.as_deref() {
                     output = output.with_prefix(format!("{}\n", note));
@@ -2777,6 +2782,101 @@ impl ToolHandler for GraphTool {
             ))),
         }
     }
+}
+
+/// The analyses whose empty answer means nothing until the graph is built.
+const GRAPH_ANALYSES: &[&str] = &[
+    "dependencies",
+    "deps",
+    "impact",
+    "usages",
+    "call_path",
+    "path",
+    "circular_dependencies",
+    "unused_code",
+    "complexity_metrics",
+    "complexity",
+];
+
+/// What an analysis says while the project's code graph has not been built.
+const GRAPH_NOT_BUILT: &str = "[GRAPH NOT BUILT] This project's code graph has not been built yet, so this analysis found nothing because there is nothing to search, not because the code has no dependencies, usages, cycles or unused code. Do not treat it as low risk. Start the build with graph(action=\"ingest\"); graph(action=\"quality_freshness\") shows when it is built (a first build can take several minutes after indexing).";
+
+/// Whether an analysis answer says it found nothing, in the formatter's own
+/// words.
+fn reports_nothing(result: &ToolResult) -> bool {
+    const NOTHING: &[&str] = &[
+        "Found 0 dependencies and 0 reverse dependencies",
+        "directly affected: 0\n",
+        "Found 0 usages",
+        "No call path found from",
+        "No path links these items",
+        "No circular dependencies found",
+        "No unused code detected",
+    ];
+    result.content.iter().any(|item| match item {
+        mcp_types::tool::ContentItem::Text { text } => {
+            NOTHING.iter().any(|phrase| text.contains(phrase))
+        }
+        _ => false,
+    })
+}
+
+/// Whether the freshness answer says the graph was never built
+/// (`graph_version: "never_indexed:0"`).
+fn graph_never_built(freshness: &Value) -> bool {
+    freshness
+        .get("graph_version")
+        .and_then(Value::as_str)
+        .is_some_and(|version| version.starts_with("never_indexed"))
+}
+
+#[async_trait]
+impl ToolHandler for GraphTool {
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let raw_id = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_string);
+        let (raw_workspace, raw_project) = (raw_id("workspace_id"), raw_id("project_id"));
+        let result = self.execute_action(input).await?;
+        if result.is_error
+            || !GRAPH_ANALYSES.contains(&action.as_str())
+            || !reports_nothing(&result)
+        {
+            return Ok(result);
+        }
+        // An analysis of a graph that was never built found nothing because
+        // there is nothing to search: for minutes after setup it said "no
+        // cycles", "0 usages" and "likely low-risk" (#370).
+        let Ok(scope) = resolve_read_scope(
+            &self.client,
+            self.session.as_ref(),
+            raw_workspace.as_deref(),
+            raw_project.as_deref(),
+        )
+        .await
+        else {
+            return Ok(result);
+        };
+        let never_built = self
+            .client
+            .graph_quality_freshness(scope.workspace_id, scope.project_id)
+            .await
+            .is_ok_and(|freshness| graph_never_built(&freshness));
+        if !never_built {
+            return Ok(result);
+        }
+        let mut structured = result.structured_content.unwrap_or(Value::Null);
+        if let Some(object) = structured.as_object_mut() {
+            object.insert("graph_built".to_string(), Value::Bool(false));
+        }
+        Ok(ToolResult::with_structured(
+            GRAPH_NOT_BUILT.to_string(),
+            structured,
+        ))
+    }
 
     fn metadata(&self) -> &ToolMetadata {
         static METADATA: std::sync::OnceLock<ToolMetadata> = std::sync::OnceLock::new();
@@ -2980,3 +3080,36 @@ pub fn register_graph_tools(
 #[cfg(test)]
 #[path = "graph_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod graph_not_built_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_analysis_is_recognised_and_a_never_built_graph_is_told_apart() {
+        // #370
+        for text in [
+            "Found 0 dependencies and 0 reverse dependencies for module \"app/service.py\".",
+            "Impact analysis for \"x\":\nRisk level: Low\ndirectly affected: 0\naffected modules: 0\n",
+            "Found 0 usages of component \"slugify_title\".",
+            "No circular dependencies found.",
+            "No unused code detected.",
+        ] {
+            assert!(reports_nothing(&ToolResult::text(text)), "{text}");
+        }
+        for text in [
+            "Found 2 dependencies and 1 reverse dependencies for module \"app/service.py\".",
+            "Impact analysis for \"x\":\nRisk level: Low\ndirectly affected: 3\n",
+        ] {
+            assert!(!reports_nothing(&ToolResult::text(text)), "{text}");
+        }
+        assert!(graph_never_built(
+            &serde_json::json!({"graph_version": "never_indexed:0"})
+        ));
+        assert!(!graph_never_built(
+            &serde_json::json!({"graph_version": "2026-10-30T11:00:00Z:12"})
+        ));
+        assert!(!graph_never_built(&serde_json::json!({})));
+        assert!(GRAPH_NOT_BUILT.contains("graph(action=\"ingest\")"));
+    }
+}

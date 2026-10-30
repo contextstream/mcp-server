@@ -266,16 +266,119 @@ impl VcsTool {
         }
     }
 
+    /// The keys a VCS answer lists its items under.
+    const ITEM_KEYS: &'static [&'static str] = &[
+        "items",
+        "projects",
+        "notifications",
+        "links",
+        "automations",
+        "commits",
+        "files",
+        "comments",
+        "checks",
+        "entries",
+        "tree",
+        "results",
+        "branches",
+        "tags",
+    ];
+
+    fn result_items(value: &Value) -> Option<&Vec<Value>> {
+        value.as_array().or_else(|| {
+            Self::ITEM_KEYS
+                .iter()
+                .find_map(|key| value.get(*key).and_then(Value::as_array))
+        })
+    }
+
     fn count_results(value: &Value) -> usize {
-        if let Some(array) = value.as_array() {
-            return array.len();
+        Self::result_items(value).map_or(1, Vec::len)
+    }
+
+    /// One line per listed item (#397): its number or sha, title, kind or
+    /// state, repository, who and when, as far as the item carries them.
+    fn item_line(item: &Value) -> String {
+        let text = |key: &str| {
+            item.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        };
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(number) = item.get("number").and_then(Value::as_i64) {
+            parts.push(format!("#{number}"));
+        } else if let Some(sha) = text("sha") {
+            parts.push(sha.chars().take(10).collect());
         }
-        for key in ["items", "projects", "notifications", "links", "automations"] {
-            if let Some(array) = value.get(key).and_then(|v| v.as_array()) {
-                return array.len();
+        let title = text("title")
+            .or_else(|| text("message").and_then(|message| message.lines().next()))
+            .or_else(|| text("name"))
+            .or_else(|| text("filename"))
+            .or_else(|| text("path"))
+            .or_else(|| text("summary"))
+            .or_else(|| text("description"))
+            .or_else(|| text("body").and_then(|body| body.lines().next()));
+        if let Some(title) = title {
+            let mut title: String = title.chars().take(120).collect();
+            if let Some(line) = item.get("line").and_then(Value::as_i64) {
+                title.push_str(&format!(":{line}"));
+            }
+            parts.push(title);
+        }
+        if let Some(kind) = text("event_type")
+            .or_else(|| text("state"))
+            .or_else(|| text("status"))
+            .or_else(|| text("reason"))
+        {
+            parts.push(format!("[{kind}]"));
+        }
+        if let Some(repo) = text("repo_full_name").or_else(|| text("repository")) {
+            parts.push(format!("in {repo}"));
+        }
+        if parts.is_empty() || (item.get("number").is_none() && text("sha").is_none()) {
+            if let Some(id) = text("id") {
+                parts.push(format!("(id: {id})"));
             }
         }
-        1
+        let who = text("author_username")
+            .or_else(|| text("author_name"))
+            .or_else(|| text("actor_username"))
+            .or_else(|| text("author"))
+            .or_else(|| {
+                item.get("user")
+                    .and_then(|user| user.get("login"))
+                    .and_then(Value::as_str)
+            });
+        let when = text("committed_at")
+            .or_else(|| text("occurred_at"))
+            .or_else(|| text("updated_at"))
+            .or_else(|| text("created_at"));
+        let mut line = format!("- {}", parts.join(" "));
+        match (who, when) {
+            (Some(who), Some(when)) => line.push_str(&format!(" — {who}, {when}")),
+            (Some(who), None) => line.push_str(&format!(" — {who}")),
+            (None, Some(when)) => line.push_str(&format!(" — {when}")),
+            (None, None) => {}
+        }
+        line
+    }
+
+    /// A list answer: its heading and one line per item, at most 20 (#397).
+    fn listed(heading: String, result: &Value) -> String {
+        const SHOWN: usize = 20;
+        let Some(items) = Self::result_items(result) else {
+            return heading;
+        };
+        let mut text = heading;
+        for item in items.iter().take(SHOWN) {
+            text.push('\n');
+            text.push_str(&Self::item_line(item));
+        }
+        if items.len() > SHOWN {
+            text.push_str(&format!("\n… and {} more.", items.len() - SHOWN));
+        }
+        text
     }
 
     fn repo_base_path(workspace_id: Uuid, repo_ref: &str) -> String {
@@ -318,33 +421,44 @@ impl VcsTool {
             "get_repo" => "Repository retrieved.".to_string(),
             "sync_repo" => "Repository sync triggered.".to_string(),
             "update_repo_settings" => "Repository settings updated.".to_string(),
-            "get_repo_projects" => format!("Found {} linked projects.", count),
+            "get_repo_projects" => {
+                Self::listed(format!("Found {} linked projects.", count), result)
+            }
             "link_repo_project" => "Repository linked to project.".to_string(),
             "import_repo_project" => "Project created from repository.".to_string(),
             "ingest_repo" => "Repository ingestion triggered.".to_string(),
             "get_ingest_status" => "Repository ingest status retrieved.".to_string(),
-            "list_pulls" => format!("Found {} pull requests.", count),
+            "list_pulls" => Self::listed(format!("Found {} pull requests.", count), result),
             "get_pull" => "Pull request retrieved.".to_string(),
-            "get_pull_diff" => format!("Retrieved {} changed files.", count),
-            "get_pull_comments" => format!("Retrieved {} pull request comments.", count),
-            "get_pull_commits" => format!("Retrieved {} pull request commits.", count),
-            "get_pull_checks" => format!("Retrieved {} status checks.", count),
+            "get_pull_diff" => Self::listed(format!("Retrieved {} changed files.", count), result),
+            "get_pull_comments" => Self::listed(
+                format!("Retrieved {} pull request comments.", count),
+                result,
+            ),
+            "get_pull_commits" => {
+                Self::listed(format!("Retrieved {} pull request commits.", count), result)
+            }
+            "get_pull_checks" => {
+                Self::listed(format!("Retrieved {} status checks.", count), result)
+            }
             "get_pull_summary" => "Pull request summary retrieved.".to_string(),
             "summarize_pull" => "Pull request summary triggered.".to_string(),
-            "list_issues" => format!("Found {} issues.", count),
+            "list_issues" => Self::listed(format!("Found {} issues.", count), result),
             "get_issue" => "Issue retrieved.".to_string(),
-            "get_issue_comments" => format!("Retrieved {} issue comments.", count),
-            "list_commits" => format!("Found {} commits.", count),
+            "get_issue_comments" => {
+                Self::listed(format!("Retrieved {} issue comments.", count), result)
+            }
+            "list_commits" => Self::listed(format!("Found {} commits.", count), result),
             "get_commit" => "Commit retrieved.".to_string(),
             "get_commit_diff" => "Commit diff retrieved.".to_string(),
             "compare_refs" => "Ref comparison retrieved.".to_string(),
-            "list_branches" => format!("Found {} branches.", count),
-            "list_tags" => format!("Found {} tags.", count),
-            "get_tree" => format!("Retrieved {} tree entries.", count),
+            "list_branches" => Self::listed(format!("Found {} branches.", count), result),
+            "list_tags" => Self::listed(format!("Found {} tags.", count), result),
+            "get_tree" => Self::listed(format!("Retrieved {} tree entries.", count), result),
             "get_blob" => "File blob retrieved.".to_string(),
-            "search_code" => format!("Found {} repo code matches.", count),
-            "get_activity" => format!("Found {} activity items.", count),
-            "search_vcs" => format!("Found {} VCS search results.", count),
+            "search_code" => Self::listed(format!("Found {} repo code matches.", count), result),
+            "get_activity" => Self::listed(format!("Found {} activity items.", count), result),
+            "search_vcs" => Self::listed(format!("Found {} VCS search results.", count), result),
             "delete_repo" => "Repository disconnected.".to_string(),
             "review_pull" => "Pull request review submitted.".to_string(),
             "comment_pull" => "Pull request comment added.".to_string(),
@@ -352,13 +466,13 @@ impl VcsTool {
             "create_issue" => "Issue created.".to_string(),
             "update_issue" => "Issue updated.".to_string(),
             "comment_issue" => "Issue comment added.".to_string(),
-            "list_notifications" => format!("Found {} notifications.", count),
+            "list_notifications" => Self::listed(format!("Found {} notifications.", count), result),
             "mark_notification_read" => "Notification marked as read.".to_string(),
             "mark_all_notifications_read" => "All notifications marked as read.".to_string(),
-            "list_links" => format!("Found {} links.", count),
+            "list_links" => Self::listed(format!("Found {} links.", count), result),
             "create_link" => "Link created.".to_string(),
             "delete_link" => "Link deleted.".to_string(),
-            "list_automations" => format!("Found {} automations.", count),
+            "list_automations" => Self::listed(format!("Found {} automations.", count), result),
             "create_automation" => "Automation created.".to_string(),
             "update_automation" => "Automation updated.".to_string(),
             "delete_automation" => "Automation deleted.".to_string(),

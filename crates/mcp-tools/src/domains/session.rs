@@ -13793,13 +13793,29 @@ impl ToolHandler for SessionSmartSearchTool {
         );
 
         if let Some(results) = result.get("results").and_then(|v| v.as_array()) {
-            for (i, item) in results.iter().take(5).enumerate() {
+            // Each row with its kind, title, id and text (#394), as many as
+            // `limit` asks for (5 by default, at most 20).
+            let shown = input.limit.map_or(5, |limit| limit.clamp(1, 20) as usize);
+            for (i, item) in results.iter().take(shown).enumerate() {
                 let title = item
                     .get("title")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Untitled");
                 let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("item");
-                text.push_str(&format!("{}. [{}] {}\n", i + 1, item_type, title));
+                text.push_str(&format!("{}. [{}] **{}**", i + 1, item_type, title));
+                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                    text.push_str(&format!(" (id: {id})"));
+                }
+                text.push('\n');
+                if let Some(preview) = item.get("preview").and_then(|v| v.as_str()) {
+                    text.push_str(&format!("   {}\n", preview.replace('\n', " ")));
+                }
+            }
+            if results.len() > shown {
+                text.push_str(&format!(
+                    "\nShowing {shown} of {}. Pass limit (up to 20) to see more.\n",
+                    results.len()
+                ));
             }
         }
 

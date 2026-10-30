@@ -3491,6 +3491,7 @@ mod scope_resolution_tests {
             category: None,
             severity: None,
             limit: Some(5),
+            offset: None,
             workspace_id: None,
             project_id: None,
         };
@@ -7921,5 +7922,44 @@ mod capture_plan_text_tests {
         let clean = capture_plan_text("QA plan", "p1", 3, &[], &[]);
         assert!(!clean.contains("Plan quality warnings:\n"));
         assert!(!clean.contains("Task errors:\n"));
+    }
+}
+
+mod lesson_supersede_and_paging_tests {
+    use super::{supersede_lesson_body, SessionGetLessonsInput, SessionInput};
+    use uuid::Uuid;
+
+    #[test]
+    fn supersede_sends_superseded_by_and_reads_either_name() {
+        // #356: the API requires superseded_by.
+        let successor = Uuid::from_u128(7);
+        assert_eq!(
+            supersede_lesson_body(successor),
+            serde_json::json!({ "superseded_by": successor })
+        );
+        for name in ["successor_id", "superseded_by"] {
+            let input: SessionInput = serde_json::from_value(serde_json::json!({
+                "action": "supersede_lesson",
+                "lesson_id": "old",
+                name: successor.to_string(),
+            }))
+            .unwrap();
+            assert_eq!(input.successor_id, Some(successor.to_string()), "{name}");
+        }
+    }
+
+    #[test]
+    fn get_lessons_takes_the_offset_its_pages_name() {
+        // #357: "pass offset=1 to continue" named a parameter session did not have.
+        let input: SessionInput = serde_json::from_value(serde_json::json!({
+            "action": "get_lessons",
+            "limit": 1,
+            "offset": 1,
+        }))
+        .unwrap();
+        assert_eq!(input.offset, Some(1));
+        let lessons: SessionGetLessonsInput =
+            serde_json::from_value(serde_json::json!({ "limit": 1, "offset": 1 })).unwrap();
+        assert_eq!(lessons.offset, Some(1));
     }
 }

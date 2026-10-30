@@ -3270,7 +3270,7 @@ mod tests {
             // alternatives, scope, confidence, supersedes) plus the
             // `supersede_lesson` action value. Additive only.
             "session",
-            "ad67379553f78a0cc6b9f87060e472767a323e9fe6a7a38bb4a02fa955b3229f",
+            "22e134c49bdd7d3f63f01e197bc9373f101bf8e12dbfd971a73c31e829b8f223",
         ),
         (
             "session_capture",
@@ -3282,7 +3282,7 @@ mod tests {
         ),
         (
             "session_read",
-            "42891ac0061b62acbccbd92eb66d243d7d8027de37c03420f24f64bb2c150137",
+            "4ab66baa7145e4c203542ba4656feb79d70934cb53210f476cac1fe1c8725c05",
         ),
         (
             "session_remember",

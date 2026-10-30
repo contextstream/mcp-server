@@ -1193,12 +1193,11 @@ async fn any_other_403_asks_for_sign_in() {
 
 #[tokio::test]
 async fn transport_failures_are_pending_not_failed() {
-    // Nothing listens on this port.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    // Nothing listens on the discard port. A port bound and dropped here could
+    // be taken by another test's mock server before the request, which then
+    // answered 404 instead of failing to connect.
     let mut config = TestFixtures::test_config();
-    config.api_url = url;
+    config.api_url = "http://127.0.0.1:9".to_string();
     let coach = Coach::with_clock(ContextStreamClient::new(config), || 1_700_000_000);
     let result = coach
         .save(json!({"action": "retract_feedback", "feedback": "weekly-note#4/f1"}))

@@ -726,6 +726,67 @@ mod helper_tests {
         assert!(text.contains("No local ingest was started"));
     }
 
+    // The session's project is a default, not a claim about the folder: a project
+    // named by the caller wins over it (mcp-server#455: the first ingest made its
+    // project the session's, and every later one for another project was refused).
+    #[test]
+    fn ingest_project_id_lets_an_explicit_project_win_over_the_session_default() {
+        let explicit_project_id = Uuid::new_v4();
+        let session_project_id = Uuid::new_v4();
+
+        let resolved = reconcile_ingest_project_id(
+            "ingest_local",
+            "/work/other",
+            Some(explicit_project_id),
+            Some(session_project_id),
+            None,
+            None,
+        )
+        .expect("the session's project does not conflict with a named one")
+        .expect("resolved project");
+        assert_eq!(resolved.project_id, explicit_project_id);
+        assert_eq!(resolved.source, "explicit_project_id");
+
+        // Without a named project the session's still has to agree with the folder,
+        // and the refusal says where the session's project came from.
+        let folder_project_id = Uuid::new_v4();
+        let error = reconcile_ingest_project_id(
+            "index",
+            "/work/other",
+            None,
+            Some(session_project_id),
+            Some(folder_project_id),
+            None,
+        )
+        .expect_err("a session and a folder of different projects still disagree");
+        let text = error.to_string();
+        assert!(text.contains("project scope sources disagree"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "This session is bound to project {session_project_id}"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("pass project_id to use another project"),
+            "{text}"
+        );
+
+        // The folder's own claims must still agree with the named project.
+        let error = reconcile_ingest_project_id(
+            "index",
+            "/work/other",
+            Some(explicit_project_id),
+            Some(session_project_id),
+            Some(folder_project_id),
+            None,
+        )
+        .expect_err("a named project that the folder is not mapped to is refused");
+        assert!(error
+            .to_string()
+            .contains(&format!("folder_mapping={folder_project_id}")));
+    }
+
     #[test]
     fn ingest_project_id_rejects_folder_and_session_mapping_vs_local_index_disagreement() {
         let folder_project_id = Uuid::new_v4();
@@ -1677,6 +1738,51 @@ mod validation_tests {
         }
         let structured = result.structured_content.expect("structured content");
         assert_eq!(structured.get("joined_running_ingest"), Some(&json!(true)));
+    }
+
+    // A long-lived server indexes a second project by id and path without an
+    // `init` in between, and its session stays on the first (mcp-server#455).
+    #[tokio::test]
+    async fn test_project_tool_index_accepts_a_named_project_when_the_session_has_another() {
+        let session_project_id = Uuid::new_v4();
+        let named_project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let (client, config, server) =
+            client_with_fresh_project(project_in_workspace(named_project_id, workspace_id)).await;
+        let session = Arc::new(mcp_session::SessionManager::new(client.clone(), config));
+        let session_dir = tempdir().expect("session folder");
+        let named_dir = tempdir().expect("named folder");
+        session
+            .initialize(
+                Some(workspace_id),
+                Some(session_project_id),
+                Some(session_dir.path().to_string_lossy().to_string()),
+                None,
+            )
+            .await;
+        let tool = ProjectTool::new(client.clone(), session.clone());
+
+        let result = tool
+            .execute(json!({
+                "action": "index",
+                "project_id": named_project_id.to_string(),
+                "path": named_dir.path().to_string_lossy().to_string(),
+            }))
+            .await;
+        server.abort();
+        let result = result.expect("a named project and its folder are indexed");
+
+        assert!(!result.is_error);
+        let structured = result.structured_content.expect("structured content");
+        assert_eq!(
+            structured.get("project_id"),
+            Some(&json!(named_project_id.to_string()))
+        );
+        assert_eq!(
+            session.state().await.project_id,
+            Some(session_project_id),
+            "indexing a named project does not move the session"
+        );
     }
 
     #[tokio::test]

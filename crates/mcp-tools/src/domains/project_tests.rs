@@ -1030,8 +1030,24 @@ mod helper_tests {
             "total": 2743
         });
         assert_eq!(
-            format_project_files_text(&payload),
-            "Found 1 indexed files on this page (2743 total indexed)."
+            format_project_files_text(&payload, 0, 100, Some(2743)),
+            "Showing 1–1 of 2743 indexed files. Pass offset=1 (or page=2) for more.\n- a.rs"
+        );
+        // #441/#442: later pages, the end, past the end, and the file lines.
+        let page = json!({"files": [
+            {"path": "dir0/f0.py", "language": "python", "line_count": 5, "size_bytes": 113}
+        ]});
+        assert_eq!(
+            format_project_files_text(&page, 5, 5, Some(62)),
+            "Showing 6–6 of 62 indexed files. Pass offset=6 (or page=3) for more.\n- dir0/f0.py (python, 5 lines, 113 bytes)"
+        );
+        assert_eq!(
+            format_project_files_text(&page, 61, 1, Some(62)),
+            "Showing 62–62 of 62 indexed files (the end).\n- dir0/f0.py (python, 5 lines, 113 bytes)"
+        );
+        assert_eq!(
+            format_project_files_text(&json!({"files": []}), 300, 100, Some(250)),
+            "Page 4 is past the end: 250 indexed files, 3 pages of 100."
         );
     }
 
@@ -1042,8 +1058,8 @@ mod helper_tests {
             "total": 2
         });
         assert_eq!(
-            format_project_files_text(&payload),
-            "Found 2 indexed files."
+            format_project_files_text(&payload, 0, 100, Some(2)),
+            "Found 2 indexed files.\n- a.rs\n- b.rs"
         );
     }
 
@@ -1058,7 +1074,7 @@ mod helper_tests {
                 "matched": false,
             }
         });
-        let text = format_project_files_text(&payload);
+        let text = format_project_files_text(&payload, 0, 100, Some(1));
         assert!(text.contains("Found 1 indexed files."));
         assert!(text.contains("did not confirm this exact checkout"));
         assert!(text.contains("active worktree overlay"));

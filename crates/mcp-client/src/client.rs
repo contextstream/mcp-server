@@ -14209,11 +14209,16 @@ impl ContextStreamClient {
             .and_then(|v| v.as_str())
             .unwrap_or("Note")
             .to_string();
-        let title = existing
-            .get("summary")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Superseded node")
-            .to_string();
+        let title = params
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| {
+                replacement_title(
+                    &params.new_content,
+                    existing.get("summary").and_then(|v| v.as_str()),
+                )
+            });
 
         // Step 2: Create new replacement node with updated content
         let create_params = CreateMemoryNodeParams {
@@ -20324,6 +20329,25 @@ pub struct SupersedeMemoryNodeParams {
     pub new_content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The replacement's title (#415); the new content's first line when
+    /// absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// The title for a node that replaces another (#415): the new content's
+/// first line (at most 120 characters), and the old title only when the new
+/// content has no text. Reusing the old title kept the superseded claim
+/// ("… is Tuesday") on the node that says otherwise.
+pub fn replacement_title(new_content: &str, old_title: Option<&str>) -> String {
+    let first_line = new_content
+        .lines()
+        .map(|line| line.trim().trim_start_matches('#').trim())
+        .find(|line| !line.is_empty());
+    match first_line {
+        Some(line) => line.chars().take(120).collect(),
+        None => old_title.unwrap_or("Superseded node").to_string(),
+    }
 }
 
 /// Create task parameters.
@@ -28539,6 +28563,20 @@ mod tests {
             ContextStreamClient::map_session_capture_api_event_type("bug"),
             "ticket"
         );
+    }
+
+    #[test]
+    fn a_replacement_node_is_titled_by_its_new_content() {
+        // #415
+        assert_eq!(
+            replacement_title(
+                "phascogale141137 deploys happen every weekday.\nDetails follow.",
+                Some("The phascogale141137 deploy window is Tuesday")
+            ),
+            "phascogale141137 deploys happen every weekday."
+        );
+        assert_eq!(replacement_title("  \n", Some("Old title")), "Old title");
+        assert_eq!(replacement_title("# Heading line", None), "Heading line");
     }
 
     #[test]

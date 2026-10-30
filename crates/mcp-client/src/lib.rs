@@ -37,6 +37,7 @@ pub use client::{
     feed_source_key,
     filter_memory_events_by_type,
     infer_memory_query_node_type,
+    replacement_title,
     unsupported_entity_kind_reason,
     with_list_offset,
     // Workspace params

@@ -6036,6 +6036,44 @@ pub async fn report_setup_telemetry(
 }
 
 /// Index a project with progress tracking.
+/// How a foreground index run ended when it did not fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexRun {
+    /// This run indexed the project.
+    Finished,
+    /// Another process (setup's background index, the sync bridge) is already
+    /// indexing the project and will include these files: nothing was sent and
+    /// nothing needs retrying (mcp-server#348).
+    AlreadyRunning,
+}
+
+/// The line `index` prints when another process is already indexing the
+/// project, in the person's terms, with how far it has come when that is known.
+pub(crate) fn already_running_note(progress: Option<(i64, i64)>) -> String {
+    let mut note = "another ContextStream process is already indexing this project and will include these files, so there is nothing to retry".to_string();
+    if let Some((indexed, total)) = progress.filter(|(_, total)| *total > 0) {
+        note.push_str(&format!(" ({indexed} of {total} files indexed so far)"));
+    }
+    note
+}
+
+/// How many of the project's files are indexed so far, and how many there will
+/// be, from the API; `None` when it cannot be read.
+async fn index_progress(
+    client: &ContextStreamClient,
+    project_id: uuid::Uuid,
+) -> Option<(i64, i64)> {
+    let status = client.project_index_status(project_id).await.ok()?;
+    let data = status
+        .get("data")
+        .filter(|data| data.is_object())
+        .unwrap_or(&status);
+    Some((
+        data.get("indexed_files")?.as_i64()?,
+        data.get("total_files")?.as_i64()?,
+    ))
+}
+
 pub async fn index_project(
     client: &ContextStreamClient,
     path: &std::path::Path,
@@ -6043,7 +6081,7 @@ pub async fn index_project(
     pre_resolved_project_id: Option<uuid::Uuid>,
     include_media: bool,
     force: bool,
-) -> Result<()> {
+) -> Result<IndexRun> {
     let project_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -6054,7 +6092,7 @@ pub async fn index_project(
             info_label(),
             style(project_name).cyan()
         );
-        return Ok(());
+        return Ok(IndexRun::Finished);
     }
 
     // Single-line spinner with one steady message that lasts the whole
@@ -6161,6 +6199,18 @@ pub async fn index_project(
                 ui::say(ui::Mark::Ok, "Project indexed", left_out.as_deref());
             }
         }
+        Err(error) if mcp_client::client::is_ingest_in_progress_error(&error) => {
+            // A background index of this project (setup's, or the sync bridge's)
+            // is still sending: not a failure (#348).
+            progress_pb.finish_and_clear();
+            let progress = index_progress(client, project_id).await;
+            ui::say(
+                ui::Mark::Info,
+                "Indexing is already running",
+                Some(&already_running_note(progress)),
+            );
+            return Ok(IndexRun::AlreadyRunning);
+        }
         Err(error) => {
             progress_pb.finish_and_clear();
             eprintln!(
@@ -6175,7 +6225,7 @@ pub async fn index_project(
         }
     }
 
-    Ok(())
+    Ok(IndexRun::Finished)
 }
 
 /// What an index run left out because the files are over the size limit, as
@@ -6500,6 +6550,32 @@ fn unattended_key_check_failure(error: &mcp_types::Error, api_url: &str) -> anyh
 
 #[cfg(test)]
 mod tests {
+    // mcp-server#348: `index` typed while setup's background index is still
+    // sending said "Validation error: ingest already in progress ... coalesced"
+    // with a raw project id, and exited 1. It says what is happening instead.
+    #[test]
+    fn already_running_note_says_nothing_needs_retrying_and_how_far_it_has_come() {
+        use super::already_running_note;
+        let plain = already_running_note(None);
+        assert!(plain.contains("already indexing this project"), "{plain}");
+        assert!(plain.contains("nothing to retry"), "{plain}");
+        assert!(
+            !plain.contains("Validation") && !plain.contains("coalesced"),
+            "{plain}"
+        );
+        assert!(
+            plain.ends_with("nothing to retry"),
+            "no progress, no brackets: {plain}"
+        );
+        let far = already_running_note(Some((1820, 3001)));
+        assert!(
+            far.ends_with("(1820 of 3001 files indexed so far)"),
+            "{far}"
+        );
+        // A total of 0 is not progress.
+        assert_eq!(already_running_note(Some((0, 0))), plain);
+    }
+
     #[test]
     fn too_large_note_names_what_an_index_run_left_out() {
         use super::too_large_note;

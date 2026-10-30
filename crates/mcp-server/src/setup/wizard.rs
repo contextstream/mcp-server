@@ -1244,7 +1244,9 @@ async fn run_index(
         }
         IndexPlan::Now => {
             match super::index_project(client, path, workspace_id, project_id, false, false).await {
-                Ok(()) => {
+                // Finished, or another process is already indexing the project
+                // (index_project said so): either way it is being indexed.
+                Ok(_) => {
                     super::spawn_warmup(client, workspace_id);
                     (true, false)
                 }

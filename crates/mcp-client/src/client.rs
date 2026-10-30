@@ -495,6 +495,13 @@ impl IngestRootLayout {
     }
 }
 
+/// Whether `error` is the refusal an ingest gets while another ingest of the
+/// same project is running (a person's `index` while setup's background index or
+/// the sync bridge is sending): not a failure, and it need not be retried.
+pub fn is_ingest_in_progress_error(error: &Error) -> bool {
+    ProjectIngestLease::is_in_progress_error(error)
+}
+
 /// The largest file ingest reads: a bigger one is left out of the index (and
 /// reported, mcp-server#340). Also the cap on every bounded read below.
 const MAX_INDEXABLE_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -582,6 +589,16 @@ impl ProjectIngestLease {
             }
             Err(_) => Ok(None),
         }
+    }
+
+    /// Whether `error` is a refusal because another ingest of the project is
+    /// running, in this process or another: nothing went wrong, and that ingest
+    /// will include what this one would have sent (mcp-server#348).
+    pub fn is_in_progress_error(error: &Error) -> bool {
+        matches!(
+            error,
+            Error::Validation(message) if message.starts_with("ingest already in progress")
+        )
     }
 
     fn acquire(project_id: Uuid) -> Result<Self> {
@@ -29733,7 +29750,14 @@ mod tests {
     fn project_ingest_lease_coalesces_every_caller() {
         let project_id = Uuid::new_v4();
         let first = ProjectIngestLease::acquire(project_id).expect("first lease");
-        assert!(ProjectIngestLease::acquire(project_id).is_err());
+        let refused = ProjectIngestLease::acquire(project_id).expect_err("coalesced");
+        assert!(
+            ProjectIngestLease::is_in_progress_error(&refused),
+            "{refused}"
+        );
+        assert!(!ProjectIngestLease::is_in_progress_error(
+            &Error::Validation("Path not found: /x".to_string())
+        ));
         drop(first);
         assert!(ProjectIngestLease::acquire(project_id).is_ok());
     }
@@ -29779,6 +29803,10 @@ mod tests {
             refused
                 .to_string()
                 .contains("another ContextStream process"),
+            "{refused}"
+        );
+        assert!(
+            ProjectIngestLease::is_in_progress_error(&refused),
             "{refused}"
         );
         fs2::FileExt::unlock(&other_process).expect("the other process finishes");

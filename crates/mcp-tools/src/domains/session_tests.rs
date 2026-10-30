@@ -8079,3 +8079,46 @@ mod finished_plan_tests {
         );
     }
 }
+
+mod user_context_tests {
+    use crate::domains::session::render_user_context;
+    use serde_json::json;
+
+    #[test]
+    fn user_context_reads_as_one_line_per_preference() {
+        // #430: 3.4 KB of pretty JSON for two preferences.
+        let result = json!({"preferences": {"results": [{
+            "id": "11111111-1111-4111-8111-111111111111",
+            "metadata": {"category": "code_style", "confidence": 0.8999999761581421,
+                "details": "{\"match_existing_literal_style\":true,\"preserve_indentation\":true}",
+                "summary": "code_style: edit_style", "current_truth": {"availability": "unavailable"}},
+            "score": 0.44, "highlights": []
+        }], "total": 1, "degraded": false}, "summary": {}});
+        assert_eq!(
+            render_user_context(&result),
+            "Preferences (1 of 1):\n1. [code_style] code_style: edit_style: match existing literal style; preserve indentation (confidence 0.90) — id: 11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(
+            render_user_context(&json!({"preferences": {"results": []}})),
+            "No preferences recorded for this scope."
+        );
+    }
+}
+
+mod user_context_summary_tests {
+    use crate::domains::session::render_user_context;
+    use serde_json::json;
+
+    #[test]
+    fn the_memory_summary_drops_repeats_and_keeps_the_largest_counts() {
+        let summary = render_user_context(&json!({"preferences": {"results": []}, "summary": {
+            "events": 27641, "events_total": 27641, "retention_days": null,
+            "event_type_counts": {"chat": 9, "a": 1, "b": 2, "c": 3, "d": 4, "e": 5}}}));
+        assert!(
+            summary.ends_with(
+                "\n- event_type_counts: chat 9, e 5, d 4, c 3, b 2, +1 more\n- events: 27641"
+            ),
+            "{summary}"
+        );
+    }
+}

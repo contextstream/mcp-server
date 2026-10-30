@@ -2406,3 +2406,28 @@ fn index_status_counts_exact_search_only_files_per_reason() {
     );
     assert_eq!(format_exact_search_only(&json!({})), None);
 }
+
+#[test]
+fn a_project_page_says_where_it_sits_and_how_to_get_more() {
+    // #381: "Found 20 projects." when the workspace had more.
+    assert_eq!(
+        project_list_heading(20, Some(1), Some(20), Some(137), Some(true)),
+        "Showing 1–20 of 137 projects. Pass offset=20 (or page=2) for more.\n\n"
+    );
+    assert_eq!(
+        project_list_heading(5, Some(2), Some(5), Some(137), None),
+        "Showing 6–10 of 137 projects. Pass offset=10 (or page=3) for more.\n\n"
+    );
+    assert_eq!(
+        project_list_heading(2, Some(3), Some(5), Some(12), None),
+        "Showing 11–12 of 12 projects (the end).\n\n"
+    );
+    assert_eq!(
+        project_list_heading(3, Some(1), Some(20), Some(3), None),
+        "Found 3 projects.\n\n"
+    );
+    assert_eq!(
+        project_list_heading(3, None, None, None, None),
+        "Found 3 projects.\n\n"
+    );
+}

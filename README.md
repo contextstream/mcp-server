@@ -123,6 +123,15 @@ to pick.
   delivery, opens, clicks, bounces and complaints, or the workspace's trends). `email_send`
   goes only with your go: the client asks you when it can; otherwise the agent shows you the
   campaign and its recipient count and passes the count you agreed to.
+  `email_preview` gives a link to share that shows the email in Gmail, Outlook and Apple Mail
+  mockups (desktop, tablet and phone, light and dark, images on or off), with the inbox line
+  and what to check. `email_revise` changes a draft from plain words ("shorter subject") or
+  sets its subject and preview line; `email_duplicate` makes a draft copy. `email_contacts`
+  lists, adds (with where they agreed to hear from you) or unsubscribes contacts; erasing one
+  can't be undone, so it is the `delete` tool's (`studio.email_contact_erase`), after your go;
+  `email_unsubscribes` shows the suppression list with why and when, and takes an address off
+  it only with your go. Resend is connected in the studio, never through an agent: the tool
+  refuses anything shaped like a Resend key.
 - **Connector.** The hosted path `/studio` serves only this tool, for Claude.ai or ChatGPT
   connectors, with OAuth tokens bound to that resource (`read:studio`, `write:studio`).
 

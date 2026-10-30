@@ -736,6 +736,15 @@ impl ToolRegistry {
             || crate::domains::read_only::is_read_only_twin(name)
             || name == crate::domains::destructive::DELETE_TOOL
         {
+            // `studio` gave its contact erase to `delete`, so it is listed
+            // like the other tools that did (#330).
+            let mut metadata = metadata;
+            let mut input_schema = input_schema;
+            crate::domains::destructive::split_listing(
+                name,
+                &mut input_schema,
+                &mut metadata.annotations,
+            );
             self.tools.insert(
                 name.to_string(),
                 RegisteredTool {

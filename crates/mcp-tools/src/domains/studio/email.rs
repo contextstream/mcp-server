@@ -15,18 +15,30 @@
 //!   idempotency key, so a retried call schedules once.
 //! - `email_cancel`: unschedules, or stops a campaign that is sending.
 //! - `email_report`: a campaign's report, or the workspace's trends.
+//! - `email_preview`: a shareable link to the email in Gmail, Outlook and Apple Mail mockups
+//!   (Create's preview links), with the inbox line and what to check.
+//! - `email_revise`: changes a draft from plain words (`POST …/revise`), or sets its subject
+//!   and preview line.
+//! - `email_duplicate`: a draft copy of a campaign.
+//! - `email_contacts`: the workspace's contacts: list and search, add (with where they agreed
+//!   to hear from the team), erase one, or put one on the suppression list.
+//! - `email_unsubscribes`: the suppression list with why and when; add to it; take an address
+//!   off it, only with the person's go, as a send.
 //!
 //! Every action first reads Create's catalog: email is offered only where it has an `email`
-//! block. Agents draft; people send.
+//! block. Agents draft; people send. Resend is connected in the studio, never here: a key
+//! typed into a chat stays in its transcript, so a key-shaped value is refused unread.
 
 use mcp_client::studio::StudioAnswer;
 use mcp_types::{tool::ToolResult, Error, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::api::{unreachable, CALL_TIMEOUT};
 use super::words::{clip, credits};
-use super::{parse_id, StudioInput, StudioTool, ELICIT_TIMEOUT, MAX_PROMPT_CHARS};
+use super::{parse_id, StudioInput, StudioTool, ELICIT_TIMEOUT, MAX_PROMPT_CHARS, TOOL_NAME};
+use crate::domains::destructive::DELETE_TOOL;
 use crate::peer::{self, Elicited};
 
 /// The email actions, as `VALID_ACTIONS` lists them.
@@ -38,18 +50,40 @@ pub(crate) const EMAIL_ACTIONS: &[&str] = &[
     "email_send",
     "email_cancel",
     "email_report",
+    "email_preview",
+    "email_revise",
+    "email_duplicate",
+    "email_contacts",
+    "email_unsubscribes",
 ];
+
+/// Erasing a contact, which `delete` calls (`studio.email_contact_erase`). It cannot be
+/// undone, so it runs only through `delete` (#334's rule), never as an `email_contacts`
+/// operation, and isn't listed among the studio's actions.
+pub(crate) const ERASE_ACTION: &str = "email_contact_erase";
+/// `email_contacts` operations that would erase a contact.
+const ERASE_OPERATIONS: &[&str] = &["remove", "erase", "delete"];
 
 /// Where the studio is, for links a person can open.
 pub(crate) const STUDIO_APP: &str = "https://ctxproduct.com";
+/// Where the team connects Resend: the key, the domains and the sender.
+pub(crate) const CONNECT_URL: &str = "https://ctxproduct.com/studio/email/settings";
+/// Where a person erases a contact themselves (the ContextStudio connector has no `delete`).
+pub(crate) const AUDIENCES_URL: &str = "https://ctxproduct.com/studio/email/audiences";
 
 /// Said when email isn't offered to the caller.
 pub(crate) const NOT_OFFERED: &str = "Email isn't offered to this account yet: it opens with one-prompt making, team by team. Nothing was sent or changed.";
+/// Said when ContextStream didn't take the sign-in.
+pub(crate) const SIGN_IN: &str = "ContextStream didn't accept this sign-in: sign in again (or set a new API key), then try once more.";
+/// Said when a call holds something shaped like a Resend API key.
+pub(crate) const KEY_REFUSED: &str = "Not done: something in this call looks like a Resend API key. The studio tool never takes one, because a key typed into a chat stays in its transcript. The team connects Resend in the studio: https://ctxproduct.com/studio/email/settings. If that was a real key, rotate it in Resend now.";
 
 const CAMPAIGN_STATUSES: &[&str] = &[
     "draft",
     "scheduled",
+    "testing",
     "sending",
+    "paused",
     "sent",
     "cancelled",
     "failed",
@@ -61,6 +95,76 @@ const MAX_TEST_RECIPIENTS: usize = 5;
 const TOP_LINKS: usize = 5;
 const LISTED_BOUNCES: usize = 5;
 const STATS_DAYS_DEFAULT: i64 = 30;
+/// What `change` may say to `email_revise` (Create's limit).
+const MAX_CHANGE_CHARS: usize = 1000;
+/// A subject or preview line (Create's limit).
+const MAX_LINE_CHARS: usize = 200;
+/// The most addresses one `email_contacts` or `email_unsubscribes` add takes: the studio
+/// imports CSV files for more.
+const MAX_ADDRESSES: usize = 100;
+const LIST_LIMIT_DEFAULT: i64 = 20;
+const LIST_LIMIT_MAX: i64 = 50;
+/// A note kept with a suppression change (Create's limit).
+const MAX_NOTE_CHARS: usize = 500;
+/// A shared preview link is reused only while it has at least this long left.
+const LINK_REUSE_HOURS: i64 = 24;
+/// The subjects of an A/B test, by variant.
+const VARIANT_LABELS: [&str; 3] = ["A", "B", "C"];
+const CONTACT_OPERATIONS: &[&str] = &["list", "add", "unsubscribe"];
+const SUPPRESSION_OPERATIONS: &[&str] = &["list", "add", "remove"];
+const CONSENT_SOURCES: &[&str] = &["manual", "form", "api"];
+const SUPPRESSION_REASONS: &[&str] = &["unsubscribed", "bounced", "complained", "manual"];
+const CONTACT_STATUSES: &[&str] = &["subscribed", "suppressed"];
+
+/// Whether `text` holds something shaped like a Resend API key: `re_` at the start of a word
+/// and twenty or more key characters after it.
+pub(crate) fn looks_like_resend_key(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(found) = text[from..].find("re_") {
+        let at = from + found;
+        let starts_word =
+            at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+        let run = text[at + 3..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if starts_word && run >= 20 {
+            return true;
+        }
+        from = at + 3;
+    }
+    false
+}
+
+/// Whether any string in `value`, at any depth, looks like a Resend API key.
+pub(crate) fn holds_resend_key(value: &Value) -> bool {
+    match value {
+        Value::String(text) => looks_like_resend_key(text),
+        Value::Array(items) => items.iter().any(holds_resend_key),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| looks_like_resend_key(key) || holds_resend_key(value)),
+        _ => false,
+    }
+}
+
+/// Whether the catalog offers email to this caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offer {
+    Offered,
+    NotOffered,
+    SignedOut,
+}
+
+/// Why `/preview` couldn't be read: Create's own sentence, or `None` when Create couldn't be
+/// reached or answered with a server error.
+type PreviewRefusal = Option<String>;
+
+/// A short, stable digest of `value`, for idempotency keys.
+fn digest(value: &str) -> String {
+    hex::encode(&Sha256::digest(value.as_bytes())[..12])
+}
 
 /// What a refused email call was about, for its sentence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,16 +190,19 @@ pub(crate) fn email_refusal(answer: &StudioAnswer, topic: Topic) -> String {
     let message = answer.error_message();
     let said = message.as_deref().unwrap_or("").trim();
     match answer.status {
-        401 => "ContextStream didn't accept this sign-in: sign in again (or set a new API key), then try once more.".to_string(),
+        401 => SIGN_IN.to_string(),
         403 if said.contains("Create isn't available") => NOT_OFFERED.to_string(),
         404 if said.contains("isn't offered") => NOT_OFFERED.to_string(),
         404 if said.contains("No such workspace") => {
             "That workspace isn't one this account can use.".to_string()
         }
         404 => topic.missing().to_string(),
-        429 if said.is_empty() => "Too many requests for this workspace: try again in a minute.".to_string(),
+        429 if said.is_empty() => {
+            "Too many requests for this workspace: try again in a minute.".to_string()
+        }
         500..=599 if said.is_empty() => {
-            "Create isn't answering right now: try again in a few minutes. Nothing was sent.".to_string()
+            "Create isn't answering right now: try again in a few minutes. Nothing was sent."
+                .to_string()
         }
         _ if !said.is_empty() => said.to_string(),
         status => format!("Create refused this (HTTP {status})."),
@@ -221,6 +328,242 @@ pub(crate) fn send_key(campaign_id: Uuid, revision: i64, send_at: &str, time_zon
     format!("email-send-{campaign_id}-r{revision}-{tail}")
 }
 
+/// What the person is asked to say go to: an answer given for another campaign, revision,
+/// count or time is not taken, so a go on the stateless path can't carry over to an edited
+/// campaign.
+pub(crate) fn send_state(
+    campaign_id: Uuid,
+    revision: i64,
+    recipients: i64,
+    send_at: &str,
+    time_zone: &str,
+) -> String {
+    format!("studio-email-send:{campaign_id}:{revision}:{recipients}:{send_at}:{time_zone}")
+}
+
+/// An A/B test's subject: 0 (A, the campaign's own) to 2 (C).
+pub(crate) fn variant_of(raw: Option<i64>) -> Result<Option<i64>> {
+    match raw {
+        None => Ok(None),
+        Some(variant) if (0..VARIANT_LABELS.len() as i64).contains(&variant) => Ok(Some(variant)),
+        Some(_) => Err(Error::Validation(
+            "variant is an A/B test's subject: 0 (A, the campaign's own), 1 (B) or 2 (C)"
+                .to_string(),
+        )),
+    }
+}
+
+/// One of `allowed`, by name; `list` when none is given.
+pub(crate) fn operation_of(raw: Option<&str>, allowed: &[&str], action: &str) -> Result<String> {
+    let operation = raw
+        .map(|o| o.trim().to_lowercase())
+        .filter(|o| !o.is_empty())
+        .unwrap_or_else(|| "list".to_string());
+    if allowed.contains(&operation.as_str()) {
+        Ok(operation)
+    } else {
+        Err(Error::Validation(format!(
+            "operation for {action} is one of {}",
+            allowed.join(", ")
+        )))
+    }
+}
+
+/// An email address as Create keeps it: trimmed and lower-cased, with one `@` between a local
+/// part and a dotted domain.
+pub(crate) fn address_of(raw: &str) -> Option<String> {
+    let address = raw.trim().to_lowercase();
+    let (local, domain) = address.split_once('@')?;
+    let plausible = !local.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains('@')
+        && address.len() <= 254
+        && !address.chars().any(|c| c.is_whitespace() || c.is_control());
+    plausible.then_some(address)
+}
+
+/// The refusal for `email_contacts` asked to erase a contact, worded as #334's refusals are:
+/// it cannot be undone, so it runs only through `delete`.
+pub(crate) fn erase_refusal(input: &StudioInput) -> Option<String> {
+    let operation = input.operation.as_deref()?.trim().to_lowercase();
+    ERASE_OPERATIONS.contains(&operation.as_str()).then(|| {
+        format!(
+            "email_contacts(operation=\"{operation}\") cannot be undone, so it runs only through the `{DELETE_TOOL}` tool: \
+             call {DELETE_TOOL} with action=\"{TOOL_NAME}.{ERASE_ACTION}\" and the same email, after confirming with the person. \
+             Where there is no `{DELETE_TOOL}` tool (the ContextStudio connector), the person erases the contact in the studio: {AUDIENCES_URL}"
+        )
+    })
+}
+
+/// The one address a call is about (`email`); `call` names it.
+fn one_address(input: &StudioInput, call: &str) -> Result<String> {
+    let raw = input
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .ok_or_else(|| {
+            Error::Validation(format!(
+                "email is required for {call}: the address it is about"
+            ))
+        })?;
+    address_of(raw).ok_or_else(|| Error::Validation(format!("{raw} isn't an email address")))
+}
+
+/// A contact to add, as Create takes it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NewContact {
+    pub email: String,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// The contacts an add is about: `contacts` (addresses, or `{email, first_name, last_name,
+/// tags}`), else `email`. Repeats are dropped; addresses that aren't one are returned apart,
+/// so they can be named.
+pub(crate) fn contacts_of(input: &StudioInput) -> Result<(Vec<NewContact>, Vec<String>)> {
+    let items: Vec<Value> = match (&input.contacts, input.email.as_deref()) {
+        (Some(Value::Array(items)), _) => items.clone(),
+        (Some(Value::String(text)), _) => text
+            .split([',', ';', '\n'])
+            .map(|part| Value::String(part.to_string()))
+            .collect(),
+        (Some(Value::Null) | None, Some(email)) => vec![Value::String(email.to_string())],
+        (Some(Value::Null) | None, None) => Vec::new(),
+        (Some(_), _) => {
+            return Err(Error::Validation(
+                "contacts is a list of addresses or of {email, first_name, last_name, tags}"
+                    .to_string(),
+            ))
+        }
+    };
+    let mut contacts: Vec<NewContact> = Vec::new();
+    let mut invalid: Vec<String> = Vec::new();
+    for item in items {
+        let (raw, first_name, last_name, tags) =
+            match &item {
+                Value::String(text) => (text.clone(), None, None, Vec::new()),
+                Value::Object(map) => {
+                    let field = |key: &str| {
+                        map.get(key)
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string)
+                    };
+                    let tags = map
+                        .get("tags")
+                        .and_then(Value::as_array)
+                        .map(|tags| {
+                            tags.iter()
+                                .filter_map(Value::as_str)
+                                .map(|t| t.trim().to_string())
+                                .filter(|t| !t.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (
+                        field("email").unwrap_or_default(),
+                        field("first_name").or_else(|| field("firstName")),
+                        field("last_name").or_else(|| field("lastName")),
+                        tags,
+                    )
+                }
+                _ => return Err(Error::Validation(
+                    "contacts is a list of addresses or of {email, first_name, last_name, tags}"
+                        .to_string(),
+                )),
+            };
+        if raw.trim().is_empty() {
+            continue;
+        }
+        match address_of(&raw) {
+            Some(email) if contacts.iter().any(|c| c.email == email) => {}
+            Some(email) => contacts.push(NewContact {
+                email,
+                first_name,
+                last_name,
+                tags,
+            }),
+            None => invalid.push(raw.trim().to_string()),
+        }
+    }
+    if contacts.len() + invalid.len() > MAX_ADDRESSES {
+        return Err(Error::Validation(format!(
+            "At most {MAX_ADDRESSES} addresses a call; the studio imports CSV files for more ({STUDIO_APP}/studio/email/audiences)."
+        )));
+    }
+    Ok((contacts, invalid))
+}
+
+/// A note for a suppression change, bounded as Create keeps it.
+fn note_of(input: &StudioInput, said: &str) -> String {
+    let own = input
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+    let note = match own {
+        Some(own) => format!("{said}: {own}"),
+        None => said.to_string(),
+    };
+    note.chars().take(MAX_NOTE_CHARS).collect()
+}
+
+/// Why an address is on the suppression list, in words.
+pub(crate) fn suppression_words(suppression: &Value) -> String {
+    let reason = suppression
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let source = suppression
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let how = match (reason, source) {
+        ("unsubscribed", "one_click") => "unsubscribed with their mail client's one-click button",
+        ("unsubscribed", "page") => "unsubscribed on the unsubscribe page",
+        ("unsubscribed", _) => "unsubscribed",
+        ("bounced", _) => "hard-bounced",
+        ("complained", _) => "marked an email as spam",
+        ("manual", "api") => "added through the API",
+        ("manual", _) => "added by hand",
+        _ => "suppressed",
+    };
+    let mut words = how.to_string();
+    if let Some(at) = moment(suppression.get("createdAt").and_then(Value::as_str)) {
+        words.push_str(&format!(" on {at}"));
+    }
+    if let Some(name) = suppression
+        .pointer("/campaign/name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.trim().is_empty())
+    {
+        words.push_str(&format!(", from “{name}”"));
+    }
+    if let Some(feedback) = suppression.get("feedback").filter(|f| f.is_object()) {
+        let said = match feedback.get("reason").and_then(Value::as_str).unwrap_or("") {
+            "too_many" => "too many emails",
+            "not_relevant" => "not relevant to them",
+            "never_signed_up" => "they never signed up",
+            _ => "another reason",
+        };
+        words.push_str(&format!("; said: {said}"));
+        if let Some(comment) = text(feedback, "comment") {
+            words.push_str(&format!(" (“{}”)", clip(&comment, 140)));
+        }
+    }
+    if reason == "bounced" {
+        if let Some(detail) = text(suppression, "detail") {
+            words.push_str(&format!(": {}", clip(&detail, 140)));
+        }
+    }
+    words
+}
+
 /// "1 person", "1,200 people".
 fn people(count: i64) -> String {
     if count == 1 {
@@ -292,8 +635,8 @@ fn missing_words(missing: &Value) -> Vec<&'static str> {
 fn connection_line(connection: &Value) -> (String, Value) {
     if connection.get("connected").and_then(Value::as_bool) != Some(true) {
         return (
-            format!("Resend isn't connected yet: the team connects its own Resend key in the studio ({STUDIO_APP}/studio/email). Drafts work before then."),
-            json!({"connected": false}),
+            format!("Resend isn't connected yet: the team connects its own Resend key in the studio ({CONNECT_URL}). An agent never takes the key, which would stay in this chat. Drafts and previews work before then."),
+            json!({"connected": false, "connect_url": CONNECT_URL}),
         );
     }
     let last4 = connection
@@ -313,7 +656,7 @@ fn connection_line(connection: &Value) -> (String, Value) {
     } else {
         let words = missing_words(&missing);
         format!(
-            "Resend is connected (key ending {last4}), but campaigns can't be sent until the studio has {}: {STUDIO_APP}/studio/email.",
+            "Resend is connected (key ending {last4}), but campaigns can't be sent until the studio has {}: {CONNECT_URL}.",
             if words.is_empty() {
                 "its settings finished".to_string()
             } else {
@@ -323,7 +666,7 @@ fn connection_line(connection: &Value) -> (String, Value) {
     };
     (
         line,
-        json!({"connected": true, "ready": ready, "missing": missing, "key_last4": last4}),
+        json!({"connected": true, "ready": ready, "missing": missing, "key_last4": last4, "connect_url": CONNECT_URL}),
     )
 }
 
@@ -375,6 +718,14 @@ fn campaign_state(campaign: &Value) -> String {
             None => "scheduled".to_string(),
         },
         "sending" => format!("sending: {} of {} sent", credits(sent), credits(recipients)),
+        "testing" => match moment(campaign.pointer("/abTest/decideAt").and_then(Value::as_str)) {
+            Some(at) => format!(
+                "testing its subjects on {} people; the winner goes to the rest at {at}",
+                credits(sent)
+            ),
+            None => format!("testing its subjects on {} people", credits(sent)),
+        },
+        "paused" => format!("paused: {} of {} sent", credits(sent), credits(recipients)),
         "sent" => format!(
             "sent to {}: {} delivered, {} opened, {} clicked",
             people(sent),
@@ -394,8 +745,21 @@ fn campaign_state(campaign: &Value) -> String {
 impl StudioTool {
     /// The email actions: offered only where Create's catalog has an `email` block.
     pub(super) async fn email(&self, action: &str, input: &StudioInput) -> Result<ToolResult> {
-        if !self.email_offered().await? {
-            return Ok(ToolResult::error(NOT_OFFERED.to_string()));
+        // Erasing can't be undone, so it runs only through `delete`: refused before anything
+        // is asked of anyone.
+        if action == "email_contacts" {
+            if let Some(refusal) = erase_refusal(input) {
+                return Err(Error::Validation(refusal));
+            }
+        }
+        // Before anything is asked of anyone: a key never travels, not even to Create.
+        if serde_json::to_value(input).is_ok_and(|raw| holds_resend_key(&raw)) {
+            return Ok(ToolResult::error(KEY_REFUSED.to_string()));
+        }
+        match self.email_offer().await? {
+            Offer::Offered => {}
+            Offer::NotOffered => return Ok(ToolResult::error(NOT_OFFERED.to_string())),
+            Offer::SignedOut => return Ok(ToolResult::error(SIGN_IN.to_string())),
         }
         let (workspace_id, _) = self.scope(input).await?;
         match action {
@@ -406,20 +770,30 @@ impl StudioTool {
             "email_send" => self.email_send(workspace_id, input).await,
             "email_cancel" => self.email_cancel(workspace_id, input).await,
             "email_report" => self.email_report(workspace_id, input).await,
+            "email_preview" => self.email_preview(workspace_id, input).await,
+            "email_revise" => self.email_revise(workspace_id, input).await,
+            "email_duplicate" => self.email_duplicate(workspace_id, input).await,
+            "email_contacts" => self.email_contacts(workspace_id, input).await,
+            "email_unsubscribes" => self.email_unsubscribes(workspace_id, input).await,
+            ERASE_ACTION => self.erase_contact(workspace_id, input).await,
             other => Err(Error::Validation(format!("Unknown email action: {other}"))),
         }
     }
 
-    /// Whether Create's catalog offers email to this caller.
-    async fn email_offered(&self) -> Result<bool> {
+    /// Whether Create's catalog offers email to this caller. A 401 is a sign-in that expired
+    /// or was refused, not an account email isn't offered to.
+    async fn email_offer(&self) -> Result<Offer> {
         let answer = self
             .client
             .studio_call("GET", "/create/catalog", None, None, CALL_TIMEOUT)
             .await
             .map_err(unreachable)?;
         match answer.status {
-            200..=299 => Ok(answer.data.get("email").is_some_and(Value::is_object)),
-            401 | 403 | 404 => Ok(false),
+            200..=299 if answer.data.get("email").is_some_and(Value::is_object) => {
+                Ok(Offer::Offered)
+            }
+            200..=299 | 403 | 404 => Ok(Offer::NotOffered),
+            401 => Ok(Offer::SignedOut),
             _ => Err(Error::Network(
                 "Create isn't answering right now: try again in a few minutes. Nothing was sent."
                     .to_string(),
@@ -479,18 +853,29 @@ impl StudioTool {
         })
     }
 
-    /// The campaign as it would go: who it goes to and what to check (`/preview`).
-    async fn preview(&self, workspace_id: Uuid, campaign_id: Uuid) -> Option<Value> {
+    /// The campaign as it would go: who it goes to and what to check (`/preview`), or why it
+    /// couldn't be read.
+    async fn preview(
+        &self,
+        workspace_id: Uuid,
+        campaign_id: Uuid,
+        variant: Option<i64>,
+    ) -> std::result::Result<Value, PreviewRefusal> {
+        let mut path = format!("/campaigns/{campaign_id}/preview?workspaceId={workspace_id}");
+        if let Some(variant) = variant {
+            path.push_str(&format!("&variant={variant}"));
+        }
         let answer = self
-            .email_call(
-                "GET",
-                &format!("/campaigns/{campaign_id}/preview?workspaceId={workspace_id}"),
-                None,
-                None,
-            )
+            .email_call("GET", &path, None, None)
             .await
-            .ok()?;
-        answer.is_success().then_some(answer.data)
+            .map_err(|_| None)?;
+        if answer.is_success() {
+            Ok(answer.data)
+        } else if answer.status >= 500 {
+            Err(None)
+        } else {
+            Err(Some(email_refusal(&answer, Topic::Campaign)))
+        }
     }
 
     // ------------------------------------------------------------------------------------
@@ -640,7 +1025,7 @@ impl StudioTool {
         let campaign_id = text(&campaign, "id")
             .and_then(|id| Uuid::parse_str(&id).ok())
             .ok_or_else(|| Error::Tool("Create's draft had no id".to_string()))?;
-        let preview = self.preview(workspace_id, campaign_id).await;
+        let preview = self.preview(workspace_id, campaign_id, None).await.ok();
 
         let name = text(&campaign, "name").unwrap_or_else(|| "The draft".to_string());
         let subject = text(&campaign, "subject").unwrap_or_default();
@@ -731,7 +1116,7 @@ impl StudioTool {
         let url = campaign_url(&campaign_id.to_string());
         lines.push(format!("Edit and preview it in the studio: {url}"));
         lines.push(format!(
-            "Next: email_test with campaign_id {campaign_id} sends a test to the person; email_send only when they say go."
+            "Next, with campaign_id {campaign_id}: email_preview shows it in Gmail, Outlook and Apple Mail (a link to share); email_revise changes it from plain words; email_test sends a test to the person; email_send only when they say go."
         ));
         Ok(ToolResult::with_structured(
             lines.join("\n"),
@@ -872,6 +1257,9 @@ impl StudioTool {
         if !to.is_empty() {
             body["to"] = json!(to);
         }
+        if let Some(variant) = variant_of(input.variant)? {
+            body["variant"] = json!(variant);
+        }
         let answer = self
             .email_call(
                 "POST",
@@ -933,29 +1321,47 @@ impl StudioTool {
                     "Not sent again: “{name}” was sent. email_report shows how it did."
                 )))
             }
+            "testing" => {
+                return Ok(ToolResult::error(format!(
+                    "Not sent again: “{name}” is testing its subjects, and the rest go out with the winner on their own. email_report follows it; email_cancel stops it."
+                )))
+            }
+            "paused" => {
+                return Ok(ToolResult::error(format!(
+                    "Not sent: “{name}” is paused. The person resumes it in the studio ({}), or email_cancel stops it for good.",
+                    campaign_url(&campaign_id.to_string())
+                )))
+            }
             _ => {}
         }
         let revision = campaign
             .get("revision")
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        let preview = self.preview(workspace_id, campaign_id).await;
-        let recipients = preview
-            .as_ref()
-            .and_then(|p| p.get("recipients"))
-            .and_then(Value::as_i64);
+        let preview = match self.preview(workspace_id, campaign_id, None).await {
+            Ok(preview) => preview,
+            Err(None) => {
+                return Ok(ToolResult::error(format!(
+                    "Not sent: Create couldn't be read just now, so who “{name}” would go to can't be checked. Nothing was sent; try again in a few minutes."
+                )))
+            }
+            Err(Some(refused)) => {
+                return Ok(ToolResult::error(format!(
+                    "Not sent: Create couldn't read “{name}” as it would go: {refused}"
+                )))
+            }
+        };
+        let recipients = preview.get("recipients").and_then(Value::as_i64);
         let Some(recipients) = recipients.filter(|n| *n > 0) else {
             return Ok(ToolResult::error(format!(
                 "Not sent: “{name}” has no one to send to yet. Choose an audience with subscribed contacts in the studio: {}",
                 campaign_url(&campaign_id.to_string())
             )));
         };
-        let subject = preview
-            .as_ref()
-            .and_then(|p| text(p, "subject"))
+        let subject = text(&preview, "subject")
             .or_else(|| text(&campaign, "subject"))
             .unwrap_or_default();
-        let from = preview.as_ref().and_then(|p| text(p, "from"));
+        let from = text(&preview, "from");
         let when = when_words(&send_at, &time_zone);
         let what = format!(
             "“{name}” (subject “{subject}”{}) to {} {when}",
@@ -981,10 +1387,9 @@ impl StudioTool {
                     },
                     "required": ["confirm"]
                 });
-                // What the question is about: an answer given for another campaign, count or
-                // time is not taken.
-                let state =
-                    format!("studio-email-send:{campaign_id}:{recipients}:{send_at}:{time_zone}");
+                // What the question is about: an answer given for another campaign, revision,
+                // count or time is not taken.
+                let state = send_state(campaign_id, revision, recipients, &send_at, &time_zone);
                 match peer
                     .ask("confirm-send", &message, schema, &state, ELICIT_TIMEOUT)
                     .await
@@ -1381,6 +1786,1154 @@ impl StudioTool {
                 "suppressed": stats.get("suppressed"),
                 "by_day": stats.get("days"),
             }),
+        ))
+    }
+}
+
+/// Whether a preview link is live and has at least `LINK_REUSE_HOURS` left.
+fn link_reusable(link: &Value) -> bool {
+    let live =
+        link.get("live").and_then(Value::as_bool) == Some(true) && text(link, "url").is_some();
+    let lasting = link
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|at| {
+            at.with_timezone(&chrono::Utc)
+                > chrono::Utc::now() + chrono::Duration::hours(LINK_REUSE_HOURS)
+        });
+    live && lasting
+}
+
+/// "A “…”, B “…”": an A/B test's subjects in order.
+fn subjects_words(subjects: &[String]) -> String {
+    subjects
+        .iter()
+        .zip(VARIANT_LABELS)
+        .map(|(subject, label)| format!("{label} “{subject}”"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn strings(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl StudioTool {
+    // ------------------------------------------------------------------------------------
+    // email_preview
+    // ------------------------------------------------------------------------------------
+
+    /// The newest shared preview link with a day or more left, else a new one.
+    async fn preview_link(
+        &self,
+        workspace_id: Uuid,
+        campaign_id: Uuid,
+    ) -> std::result::Result<Value, String> {
+        let listed = self
+            .email_call(
+                "GET",
+                &format!("/campaigns/{campaign_id}/preview-links?workspaceId={workspace_id}"),
+                None,
+                None,
+            )
+            .await;
+        if let Ok(answer) = &listed {
+            if answer.is_success() {
+                if let Some(link) = answer
+                    .data
+                    .get("links")
+                    .and_then(Value::as_array)
+                    .and_then(|links| links.iter().find(|link| link_reusable(link)))
+                {
+                    return Ok(link.clone());
+                }
+            }
+        }
+        let made = self
+            .email_call(
+                "POST",
+                &format!("/campaigns/{campaign_id}/preview-links"),
+                Some(&json!({"workspaceId": workspace_id})),
+                None,
+            )
+            .await
+            .map_err(|_| "Create didn't answer.".to_string())?;
+        if made.is_success() {
+            Ok(made.data)
+        } else {
+            Err(email_refusal(&made, Topic::Campaign))
+        }
+    }
+
+    async fn email_preview(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
+        let campaign_id = Self::campaign_id(input, "email_preview")?;
+        let variant = variant_of(input.variant)?;
+        let campaign = match self.read_campaign(workspace_id, campaign_id).await? {
+            Ok(campaign) => campaign,
+            Err(refused) => return Ok(ToolResult::error(format!("No preview: {refused}"))),
+        };
+        let name = text(&campaign, "name").unwrap_or_else(|| "The campaign".to_string());
+        let preview = match self.preview(workspace_id, campaign_id, variant).await {
+            Ok(preview) => preview,
+            Err(None) => {
+                return Ok(ToolResult::error(format!(
+                    "No preview: Create couldn't be read just now for “{name}”. Try again in a few minutes."
+                )))
+            }
+            Err(Some(refused)) => return Ok(ToolResult::error(format!("No preview: {refused}"))),
+        };
+        let link = self.preview_link(workspace_id, campaign_id).await;
+
+        let subject = text(&preview, "subject").unwrap_or_default();
+        let preheader = text(&preview, "preheader").unwrap_or_default();
+        let from = text(&preview, "from");
+        let subjects = strings(preview.get("subjects"));
+        let warnings = strings(preview.get("warnings"));
+        let recipients = preview.get("recipients").and_then(Value::as_i64);
+        let mut lines = Vec::new();
+        let (url, expires_at, link_id) = match &link {
+            Ok(link) => {
+                let url = text(link, "url");
+                let expires = text(link, "expiresAt");
+                match &url {
+                    Some(url) => {
+                        lines.push(format!("Preview of “{name}”: {url}"));
+                        lines.push(format!(
+                            "It shows the email in Gmail, Outlook and Apple Mail on desktop, tablet and phone, light and dark, with images on or off. Anyone with the link can open it{}; it can be turned off in the studio.",
+                            moment(expires.as_deref()).map_or(String::new(), |at| format!(" until {at}"))
+                        ));
+                    }
+                    None => lines.push(format!(
+                        "Preview of “{name}”: Create made no link this time. The studio shows the same mockups: {}",
+                        campaign_url(&campaign_id.to_string())
+                    )),
+                }
+                (url, expires, text(link, "id"))
+            }
+            Err(refused) => {
+                lines.push(format!(
+                    "Preview of “{name}”: no shareable link ({refused}). The studio shows the same mockups: {}",
+                    campaign_url(&campaign_id.to_string())
+                ));
+                (None, None, None)
+            }
+        };
+        lines.push(format!(
+            "Inbox line: {} · “{subject}”{}",
+            from.clone()
+                .unwrap_or_else(|| format!("no sender yet (set one in the studio: {CONNECT_URL})")),
+            if preheader.is_empty() {
+                String::new()
+            } else {
+                format!(" · {preheader}")
+            }
+        ));
+        if subjects.len() > 1 {
+            lines.push(format!(
+                "A/B subjects: {}{}",
+                subjects_words(&subjects),
+                variant.map_or(String::new(), |v| format!(
+                    " (this is {})",
+                    VARIANT_LABELS[v as usize]
+                ))
+            ));
+        }
+        if let (Some(audience), Some(n)) = (
+            campaign.pointer("/audience/name").and_then(Value::as_str),
+            recipients,
+        ) {
+            lines.push(format!("To: {audience} ({}).", people(n)));
+        }
+        for warning in &warnings {
+            lines.push(format!("Check: {warning}"));
+        }
+        Ok(ToolResult::with_structured(
+            lines.join("\n"),
+            json!({
+                "campaign_id": campaign_id,
+                "name": name,
+                "preview_url": url,
+                "expires_at": expires_at,
+                "link_id": link_id,
+                "link_problem": link.as_ref().err(),
+                "from": from,
+                "from_name": preview.get("fromName"),
+                "from_email": preview.get("fromEmail"),
+                "subject": subject,
+                "preheader": preheader,
+                "subjects": subjects,
+                "variant": variant,
+                "recipients": recipients,
+                "warnings": warnings,
+                "studio_url": campaign_url(&campaign_id.to_string()),
+            }),
+        ))
+    }
+
+    // ------------------------------------------------------------------------------------
+    // email_revise
+    // ------------------------------------------------------------------------------------
+
+    async fn email_revise(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
+        let campaign_id = Self::campaign_id(input, "email_revise")?;
+        let change = input
+            .change
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+        let subject = input.subject.as_deref().map(str::trim);
+        let preheader = input.preheader.as_deref().map(str::trim);
+        if change.is_none() && subject.is_none() && preheader.is_none() {
+            return Err(Error::Validation(
+                "email_revise needs change (plain words, e.g. \"shorter subject\" or \"add a button to https://acme.com/pricing\"), or subject and/or preheader to set".to_string(),
+            ));
+        }
+        if change.is_some() && (subject.is_some() || preheader.is_some()) {
+            return Err(Error::Validation(
+                "Pass change, or subject and preheader, not both: call email_revise once for each."
+                    .to_string(),
+            ));
+        }
+        if change.is_some_and(|c| c.chars().count() > MAX_CHANGE_CHARS) {
+            return Err(Error::Validation(format!(
+                "change can be up to {MAX_CHANGE_CHARS} characters."
+            )));
+        }
+        if subject.is_some_and(|s| s.is_empty()) {
+            return Err(Error::Validation("subject can't be empty.".to_string()));
+        }
+        if subject.is_some_and(|s| s.chars().count() > MAX_LINE_CHARS)
+            || preheader.is_some_and(|p| p.chars().count() > MAX_LINE_CHARS)
+        {
+            return Err(Error::Validation(format!(
+                "A subject or preheader can be up to {MAX_LINE_CHARS} characters."
+            )));
+        }
+        let campaign = match self.read_campaign(workspace_id, campaign_id).await? {
+            Ok(campaign) => campaign,
+            Err(refused) => return Ok(ToolResult::error(format!("Not changed: {refused}"))),
+        };
+        let name = text(&campaign, "name").unwrap_or_else(|| "The campaign".to_string());
+        let status = text(&campaign, "status").unwrap_or_default();
+        if status != "draft" {
+            let how = match status.as_str() {
+                "scheduled" => "email_cancel unschedules it, and it is a draft again.",
+                "sending" | "testing" | "paused" => {
+                    "It has started sending; email_duplicate makes a draft copy to change."
+                }
+                _ => "email_duplicate makes a draft copy to change.",
+            };
+            return Ok(ToolResult::error(format!(
+                "Not changed: only a draft can be changed, and “{name}” is {status}. {how}"
+            )));
+        }
+        let revision = campaign
+            .get("revision")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let answer = match change {
+            Some(change) => {
+                let key = format!("email-revise-{campaign_id}-r{revision}-{}", digest(change));
+                self.email_call(
+                    "POST",
+                    &format!("/campaigns/{campaign_id}/revise"),
+                    Some(&json!({
+                        "workspaceId": workspace_id,
+                        "instruction": change,
+                        "revision": revision,
+                    })),
+                    Some(&key),
+                )
+                .await?
+            }
+            None => {
+                let mut body = json!({"workspaceId": workspace_id, "revision": revision});
+                if let Some(subject) = subject {
+                    body["subject"] = json!(subject);
+                }
+                if let Some(preheader) = preheader {
+                    body["preheader"] = json!(preheader);
+                }
+                self.email_call(
+                    "PATCH",
+                    &format!("/campaigns/{campaign_id}"),
+                    Some(&body),
+                    None,
+                )
+                .await?
+            }
+        };
+        if !answer.is_success() {
+            let refused = email_refusal(&answer, Topic::Campaign);
+            let refused = if answer.status == 409 {
+                format!("{refused} Read it again with email_campaigns, then change it once more.")
+            } else {
+                refused
+            };
+            return Ok(ToolResult::error(format!("Not changed: {refused}")));
+        }
+        // `/revise` answers {campaign, outline, changes}; PATCH answers the campaign.
+        let revised = answer
+            .data
+            .get("campaign")
+            .cloned()
+            .unwrap_or_else(|| answer.data.clone());
+        let changes = strings(answer.data.get("changes"));
+        let new_revision = revised.get("revision").and_then(Value::as_i64);
+        let new_subject = text(&revised, "subject").unwrap_or_default();
+        let new_preheader = text(&revised, "preheader").unwrap_or_default();
+        let blocks = outline(revised.get("content").unwrap_or(&Value::Null));
+        let mut lines = vec![format!(
+            "Changed “{name}”{}. Nothing is sent.",
+            new_revision.map_or(String::new(), |r| format!(" (revision {r})"))
+        )];
+        if change.is_some() {
+            if changes.is_empty() {
+                lines.push("The studio rewrote it as asked.".to_string());
+            }
+            for said in &changes {
+                lines.push(format!("- {said}"));
+            }
+        }
+        lines.push(format!("Subject: {new_subject}"));
+        if !new_preheader.is_empty() {
+            lines.push(format!("Preheader: {new_preheader}"));
+        }
+        if change.is_some() && !blocks.is_empty() {
+            lines.push(String::new());
+            lines.push("Outline:".to_string());
+            lines.extend(blocks.iter().cloned());
+        }
+        lines.push(format!(
+            "See it in the mail-client mockups with email_preview; edit it in the studio: {}",
+            campaign_url(&campaign_id.to_string())
+        ));
+        Ok(ToolResult::with_structured(
+            lines.join("\n"),
+            json!({
+                "campaign_id": campaign_id,
+                "revision": new_revision,
+                "subject": new_subject,
+                "preheader": new_preheader,
+                "changes": changes,
+                "outline": blocks,
+                "studio_url": campaign_url(&campaign_id.to_string()),
+            }),
+        ))
+    }
+
+    // ------------------------------------------------------------------------------------
+    // email_duplicate
+    // ------------------------------------------------------------------------------------
+
+    async fn email_duplicate(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
+        let campaign_id = Self::campaign_id(input, "email_duplicate")?;
+        let answer = self
+            .email_call(
+                "POST",
+                &format!("/campaigns/{campaign_id}/duplicate"),
+                Some(&json!({"workspaceId": workspace_id})),
+                None,
+            )
+            .await?;
+        if !answer.is_success() {
+            return Ok(ToolResult::error(format!(
+                "Not duplicated: {}",
+                email_refusal(&answer, Topic::Campaign)
+            )));
+        }
+        let copy = answer.data;
+        let copy_id = text(&copy, "id").unwrap_or_default();
+        let name = text(&copy, "name").unwrap_or_else(|| "The copy".to_string());
+        let url = campaign_url(&copy_id);
+        Ok(ToolResult::with_structured(
+            format!(
+                "Made “{name}”, a draft copy (campaign_id {copy_id}). Nothing is sent.\nSubject: {}\nChange it with email_revise, or in the studio: {url}",
+                text(&copy, "subject").unwrap_or_default()
+            ),
+            json!({
+                "campaign_id": copy_id,
+                "duplicated_from": campaign_id,
+                "name": name,
+                "status": copy.get("status"),
+                "subject": copy.get("subject"),
+                "studio_url": url,
+            }),
+        ))
+    }
+
+    // ------------------------------------------------------------------------------------
+    // email_contacts
+    // ------------------------------------------------------------------------------------
+
+    async fn email_contacts(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
+        let operation = operation_of(
+            input.operation.as_deref(),
+            CONTACT_OPERATIONS,
+            "email_contacts",
+        )?;
+        match operation.as_str() {
+            "add" => self.add_contacts(workspace_id, input).await,
+            "unsubscribe" => {
+                let email = one_address(input, "email_contacts with operation unsubscribe")?;
+                self.suppress(workspace_id, input, vec![email]).await
+            }
+            _ => self.list_contacts(workspace_id, input).await,
+        }
+    }
+
+    async fn list_contacts(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
+        let limit = input
+            .limit
+            .unwrap_or(LIST_LIMIT_DEFAULT)
+            .clamp(1, LIST_LIMIT_MAX);
+        let mut path = format!("/contacts?workspaceId={workspace_id}&limit={limit}");
+        let query = input
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty());
+        if let Some(query) = query {
+            path.push_str(&format!("&q={}", urlencoding::encode(query)));
+        }
+        if let Some(audience) = input
+            .audience_id
+            .as_deref()
+            .filter(|a| !a.trim().is_empty())
+        {
+            path.push_str(&format!(
+                "&audienceId={}",
+                parse_id(audience, "audience_id")?
+            ));
+        }
+        let status = input
+            .status
+            .as_deref()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty());
+        if let Some(status) = &status {
+            if !CONTACT_STATUSES.contains(&status.as_str()) {
+                return Err(Error::Validation(
+                    "status for email_contacts is subscribed or suppressed".to_string(),
+                ));
+            }
+            path.push_str(&format!("&status={status}"));
+        }
+        let answer = self.email_call("GET", &path, None, None).await?;
+        if !answer.is_success() {
+            return Ok(ToolResult::error(email_refusal(&answer, Topic::Audience)));
+        }
+        let contacts = answer
+            .data
+            .get("contacts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let total = answer
+            .data
+            .get("total")
+            .and_then(Value::as_i64)
+            .unwrap_or(contacts.len() as i64);
+        let audiences: Vec<Value> = self
+            .email_call(
+                "GET",
+                &format!("/audiences?workspaceId={workspace_id}"),
+                None,
+                None,
+            )
+            .await
+            .ok()
+            .filter(StudioAnswer::is_success)
+            .and_then(|answer| answer.data.as_array().cloned())
+            .unwrap_or_default();
+        let audience_name = |id: &str| {
+            audiences
+                .iter()
+                .find(|a| text(a, "id").as_deref() == Some(id))
+                .and_then(|a| text(a, "name"))
+        };
+        let scope = query.map_or(String::new(), |q| format!(" matching “{q}”"));
+        if contacts.is_empty() {
+            return Ok(ToolResult::with_structured(
+                format!(
+                    "No contacts{scope}. Add some with email_contacts operation add, or import a CSV in the studio: {STUDIO_APP}/studio/email/audiences"
+                ),
+                json!({"workspace_id": workspace_id, "contacts": [], "total": 0}),
+            ));
+        }
+        let mut lines = vec![if total > contacts.len() as i64 {
+            format!(
+                "{} contacts{scope}; the first {}:",
+                credits(total),
+                contacts.len()
+            )
+        } else {
+            format!(
+                "{} contact{}{scope}:",
+                credits(total),
+                if total == 1 { "" } else { "s" }
+            )
+        }];
+        let mut listed = Vec::new();
+        for contact in &contacts {
+            let email = text(contact, "email").unwrap_or_default();
+            let full_name = [text(contact, "firstName"), text(contact, "lastName")]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut parts = vec![if full_name.is_empty() {
+                email.clone()
+            } else {
+                format!("{email} ({full_name})")
+            }];
+            match contact.get("suppressed").filter(|s| s.is_object()) {
+                Some(suppressed) => parts.push(format!(
+                    "not sent to: {}{}",
+                    suppressed
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("suppressed"),
+                    moment(suppressed.get("at").and_then(Value::as_str))
+                        .map_or(String::new(), |at| format!(" {at}"))
+                )),
+                None => parts.push("subscribed".to_string()),
+            }
+            let names: Vec<String> = strings(contact.get("audienceIds"))
+                .iter()
+                .filter_map(|id| audience_name(id))
+                .collect();
+            if !names.is_empty() {
+                parts.push(format!("in {}", names.join(", ")));
+            }
+            let tags = strings(contact.get("tags"));
+            if !tags.is_empty() {
+                parts.push(format!("tags {}", tags.join(", ")));
+            }
+            if let Some(source) = contact.pointer("/consent/source").and_then(Value::as_str) {
+                parts.push(format!(
+                    "consent {source}{}",
+                    contact
+                        .pointer("/consent/note")
+                        .and_then(Value::as_str)
+                        .map_or(String::new(), |n| format!(": {}", clip(n, 80)))
+                ));
+            }
+            lines.push(format!("- {}", parts.join(" · ")));
+            listed.push(json!({
+                "contact_id": contact.get("id"),
+                "email": email,
+                "first_name": contact.get("firstName"),
+                "last_name": contact.get("lastName"),
+                "tags": contact.get("tags"),
+                "consent": contact.get("consent"),
+                "audience_ids": contact.get("audienceIds"),
+                "suppressed": contact.get("suppressed"),
+            }));
+        }
+        Ok(ToolResult::with_structured(
+            lines.join("\n"),
+            json!({
+                "workspace_id": workspace_id,
+                "contacts": listed,
+                "total": total,
+                "next_cursor": answer.data.get("nextCursor"),
+            }),
+        ))
+    }
+
+    async fn add_contacts(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
+        let (contacts, invalid) = contacts_of(input)?;
+        if contacts.is_empty() {
+            return Err(Error::Validation(if invalid.is_empty() {
+                "contacts (or email) is required for email_contacts with operation add".to_string()
+            } else {
+                format!("None of these is an email address: {}", invalid.join(", "))
+            }));
+        }
+        let source = input
+            .consent_source
+            .as_deref()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "consent_source is required to add contacts: manual (the person added them), form (they signed up on a form) or api".to_string(),
+                )
+            })?;
+        if !CONSENT_SOURCES.contains(&source.as_str()) {
+            return Err(Error::Validation(
+                "consent_source is manual, form or api".to_string(),
+            ));
+        }
+        let note = input
+            .consent_note
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "consent_note is required to add contacts: where these people agreed to hear from the team, e.g. \"Signed up at the Spring market\"".to_string(),
+                )
+            })?;
+        if note.chars().count() > MAX_NOTE_CHARS {
+            return Err(Error::Validation(format!(
+                "consent_note can be up to {MAX_NOTE_CHARS} characters."
+            )));
+        }
+        let mut body = json!({
+            "workspaceId": workspace_id,
+            "consentSource": source,
+            "contacts": contacts.iter().map(|contact| {
+                let mut row = json!({"email": contact.email, "consentNote": note});
+                if let Some(first) = &contact.first_name { row["firstName"] = json!(first); }
+                if let Some(last) = &contact.last_name { row["lastName"] = json!(last); }
+                if !contact.tags.is_empty() { row["tags"] = json!(contact.tags); }
+                row
+            }).collect::<Vec<_>>(),
+        });
+        if let Some(audience) = input
+            .audience_id
+            .as_deref()
+            .filter(|a| !a.trim().is_empty())
+        {
+            body["audienceId"] = json!(parse_id(audience, "audience_id")?);
+        }
+        let key = format!("email-contacts-{}", digest(&body.to_string()));
+        let answer = self
+            .email_call("POST", "/contacts", Some(&body), Some(&key))
+            .await?;
+        if !answer.is_success() {
+            return Ok(ToolResult::error(format!(
+                "Not added: {}",
+                email_refusal(&answer, Topic::Audience)
+            )));
+        }
+        let created = count(&answer.data, "/created");
+        let updated = count(&answer.data, "/updated");
+        let added = count(&answer.data, "/added");
+        let suppressed = count(&answer.data, "/suppressed");
+        let mut refused: Vec<String> = answer
+            .data
+            .get("invalid")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "{} ({})",
+                            text(item, "email").unwrap_or_default(),
+                            text(item, "reason").unwrap_or_else(|| "refused".to_string())
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        refused.extend(
+            invalid
+                .iter()
+                .map(|raw| format!("{raw} (isn't an email address)")),
+        );
+        let mut lines = vec![format!(
+            "Added {} ({} new, {} updated){}, consent {source}: “{note}”.",
+            people(created + updated),
+            credits(created),
+            credits(updated),
+            if added > 0 {
+                format!(", {} put in the audience", credits(added))
+            } else {
+                String::new()
+            }
+        )];
+        if suppressed > 0 {
+            lines.push(format!(
+                "{} on the suppression list: kept, and never sent to.",
+                if suppressed == 1 {
+                    "1 is".to_string()
+                } else {
+                    format!("{} are", credits(suppressed))
+                }
+            ));
+        }
+        if !refused.is_empty() {
+            lines.push(format!("Not added: {}", refused.join(", ")));
+        }
+        Ok(ToolResult::with_structured(
+            lines.join("\n"),
+            json!({
+                "workspace_id": workspace_id,
+                "created": created,
+                "updated": updated,
+                "added_to_audience": added,
+                "suppressed": suppressed,
+                "not_added": refused,
+            }),
+        ))
+    }
+
+    /// The contact with exactly this address, if any.
+    async fn contact_by_address(
+        &self,
+        workspace_id: Uuid,
+        email: &str,
+    ) -> Result<std::result::Result<Option<Value>, String>> {
+        let answer = self
+            .email_call(
+                "GET",
+                &format!(
+                    "/contacts?workspaceId={workspace_id}&limit=50&q={}",
+                    urlencoding::encode(email)
+                ),
+                None,
+                None,
+            )
+            .await?;
+        if !answer.is_success() {
+            return Ok(Err(email_refusal(&answer, Topic::Other)));
+        }
+        Ok(Ok(answer
+            .data
+            .get("contacts")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|c| text(c, "email").map(|e| e.to_lowercase()).as_deref() == Some(email))
+                    .cloned()
+            })))
+    }
+
+    /// Erases a contact: `delete` with `studio.email_contact_erase`, after the person's go.
+    async fn erase_contact(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
+        let email = one_address(
+            input,
+            &format!("{DELETE_TOOL}(action=\"{TOOL_NAME}.{ERASE_ACTION}\")"),
+        )?;
+        let contact = match self.contact_by_address(workspace_id, &email).await? {
+            Ok(Some(contact)) => contact,
+            Ok(None) => {
+                return Ok(ToolResult::error(format!(
+                    "Not erased: there is no contact {email} in this workspace."
+                )))
+            }
+            Err(refused) => return Ok(ToolResult::error(format!("Not erased: {refused}"))),
+        };
+        let id = text(&contact, "id").unwrap_or_default();
+        let id = parse_id(&id, "contact id")?;
+        let answer = self
+            .email_call(
+                "DELETE",
+                &format!("/contacts/{id}?workspaceId={workspace_id}"),
+                None,
+                None,
+            )
+            .await?;
+        if !answer.is_success() {
+            return Ok(ToolResult::error(format!(
+                "Not erased: {}",
+                email_refusal(&answer, Topic::Other)
+            )));
+        }
+        Ok(ToolResult::with_structured(
+            format!(
+                "Erased {email} from this workspace's contacts and audiences. If they had unsubscribed, that stays on the suppression list, so adding them again can't send to someone who said no."
+            ),
+            json!({"workspace_id": workspace_id, "erased": email, "contact_id": id}),
+        ))
+    }
+
+    /// Puts addresses on the suppression list.
+    async fn suppress(
+        &self,
+        workspace_id: Uuid,
+        input: &StudioInput,
+        emails: Vec<String>,
+    ) -> Result<ToolResult> {
+        let body = json!({
+            "workspaceId": workspace_id,
+            "emails": emails,
+            "note": note_of(input, "Added through the studio tool"),
+        });
+        let key = format!("email-suppress-{}", digest(&body.to_string()));
+        let answer = self
+            .email_call("POST", "/suppressions", Some(&body), Some(&key))
+            .await?;
+        if !answer.is_success() {
+            return Ok(ToolResult::error(format!(
+                "Not added to the suppression list: {}",
+                email_refusal(&answer, Topic::Other)
+            )));
+        }
+        let added = count(&answer.data, "/added");
+        let already = count(&answer.data, "/already");
+        let said = if emails.len() == 1 {
+            if added > 0 {
+                format!(
+                    "{} is on the suppression list now: no campaign will reach them.",
+                    emails[0]
+                )
+            } else {
+                format!("{} was already on the suppression list.", emails[0])
+            }
+        } else {
+            format!(
+                "Added {} to the suppression list{}: no campaign will reach them.",
+                credits(added),
+                if already > 0 {
+                    format!(" ({} were already on it)", credits(already))
+                } else {
+                    String::new()
+                }
+            )
+        };
+        Ok(ToolResult::with_structured(
+            said,
+            json!({"workspace_id": workspace_id, "added": added, "already": already, "emails": emails}),
+        ))
+    }
+
+    // ------------------------------------------------------------------------------------
+    // email_unsubscribes
+    // ------------------------------------------------------------------------------------
+
+    async fn email_unsubscribes(
+        &self,
+        workspace_id: Uuid,
+        input: &StudioInput,
+    ) -> Result<ToolResult> {
+        let operation = operation_of(
+            input.operation.as_deref(),
+            SUPPRESSION_OPERATIONS,
+            "email_unsubscribes",
+        )?;
+        match operation.as_str() {
+            "add" => {
+                let (contacts, invalid) = contacts_of(input)?;
+                if !invalid.is_empty() {
+                    return Err(Error::Validation(format!(
+                        "Not email addresses: {}",
+                        invalid.join(", ")
+                    )));
+                }
+                if contacts.is_empty() {
+                    return Err(Error::Validation(
+                        "contacts (addresses) or email is required for email_unsubscribes with operation add".to_string(),
+                    ));
+                }
+                let emails = contacts.into_iter().map(|c| c.email).collect();
+                self.suppress(workspace_id, input, emails).await
+            }
+            "remove" => self.unsuppress(workspace_id, input).await,
+            _ => self.list_suppressions(workspace_id, input).await,
+        }
+    }
+
+    async fn list_suppressions(
+        &self,
+        workspace_id: Uuid,
+        input: &StudioInput,
+    ) -> Result<ToolResult> {
+        let limit = input
+            .limit
+            .unwrap_or(LIST_LIMIT_DEFAULT)
+            .clamp(1, LIST_LIMIT_MAX);
+        let mut path = format!("/suppressions?workspaceId={workspace_id}&limit={limit}");
+        let query = input
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty());
+        if let Some(query) = query {
+            path.push_str(&format!("&q={}", urlencoding::encode(query)));
+        }
+        let reason = input
+            .reason
+            .as_deref()
+            .map(|r| r.trim().to_lowercase())
+            .filter(|r| !r.is_empty());
+        if let Some(reason) = &reason {
+            if !SUPPRESSION_REASONS.contains(&reason.as_str()) {
+                return Err(Error::Validation(format!(
+                    "reason is one of {}",
+                    SUPPRESSION_REASONS.join(", ")
+                )));
+            }
+            path.push_str(&format!("&reason={reason}"));
+        }
+        if let Some(campaign) = input
+            .campaign_id
+            .as_deref()
+            .filter(|c| !c.trim().is_empty())
+        {
+            path.push_str(&format!(
+                "&campaignId={}",
+                parse_id(campaign, "campaign_id")?
+            ));
+        }
+        let answer = self.email_call("GET", &path, None, None).await?;
+        if !answer.is_success() {
+            return Ok(ToolResult::error(email_refusal(&answer, Topic::Other)));
+        }
+        let days = input.days.unwrap_or(STATS_DAYS_DEFAULT).clamp(1, 365);
+        // The report is a bonus: a Create without it still lists the addresses.
+        let summary = self
+            .email_call(
+                "GET",
+                &format!("/suppressions/summary?workspaceId={workspace_id}&days={days}"),
+                None,
+                None,
+            )
+            .await
+            .ok()
+            .filter(StudioAnswer::is_success)
+            .map(|answer| answer.data);
+        let suppressions = answer
+            .data
+            .get("suppressions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let total = answer
+            .data
+            .get("total")
+            .and_then(Value::as_i64)
+            .unwrap_or(suppressions.len() as i64);
+        let scope = match (query, &reason) {
+            (Some(q), _) => format!(" matching “{q}”"),
+            (None, Some(r)) => format!(" ({r})"),
+            (None, None) => String::new(),
+        };
+        let mut lines = vec![format!(
+            "The suppression list: {} address{}{scope}, never sent to.",
+            credits(total),
+            if total == 1 { "" } else { "es" }
+        )];
+        if let Some(summary) = &summary {
+            let n = |pointer: &str| count(summary, pointer);
+            lines.push(format!(
+                "Last {days} days: {} unsubscribed, {} bounced, {} spam complaint{}, {} added by hand; {} resubscribed.",
+                credits(n("/byReason/unsubscribed")),
+                credits(n("/byReason/bounced")),
+                credits(n("/byReason/complained")),
+                if n("/byReason/complained") == 1 { "" } else { "s" },
+                credits(n("/byReason/manual")),
+                credits(n("/resubscribed"))
+            ));
+            let said: Vec<String> = [
+                ("too_many", "too many emails"),
+                ("not_relevant", "not relevant"),
+                ("never_signed_up", "never signed up"),
+                ("other", "other"),
+            ]
+            .iter()
+            .filter_map(|(key, words)| {
+                let n = count(summary, &format!("/feedback/{key}"));
+                (n > 0).then(|| format!("{words} {}", credits(n)))
+            })
+            .collect();
+            if !said.is_empty() {
+                lines.push(format!("Why they left: {}.", said.join(", ")));
+            }
+        }
+        let mut listed = Vec::new();
+        for suppression in suppressions.iter().take(limit as usize) {
+            let email = text(suppression, "email").unwrap_or_default();
+            lines.push(format!("- {email}: {}", suppression_words(suppression)));
+            listed.push(json!({
+                "email": email,
+                "reason": suppression.get("reason"),
+                "source": suppression.get("source"),
+                "campaign": suppression.get("campaign"),
+                "feedback": suppression.get("feedback"),
+                "detail": suppression.get("detail"),
+                "created_at": suppression.get("createdAt"),
+            }));
+        }
+        Ok(ToolResult::with_structured(
+            lines.join("\n"),
+            json!({
+                "workspace_id": workspace_id,
+                "suppressions": listed,
+                "total": total,
+                "summary": summary,
+                "next_cursor": answer.data.get("nextCursor"),
+            }),
+        ))
+    }
+
+    /// Takes an address off the suppression list, only with the person's go.
+    async fn unsuppress(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
+        let email = one_address(input, "email_unsubscribes with operation remove")?;
+        let answer = self
+            .email_call(
+                "GET",
+                &format!(
+                    "/suppressions?workspaceId={workspace_id}&limit=50&q={}",
+                    urlencoding::encode(&email)
+                ),
+                None,
+                None,
+            )
+            .await?;
+        if !answer.is_success() {
+            return Ok(ToolResult::error(format!(
+                "Not removed: {}",
+                email_refusal(&answer, Topic::Other)
+            )));
+        }
+        let Some(suppression) = answer
+            .data
+            .get("suppressions")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|s| {
+                        text(s, "email").map(|e| e.to_lowercase()).as_deref()
+                            == Some(email.as_str())
+                    })
+                    .cloned()
+            })
+        else {
+            return Ok(ToolResult::error(format!(
+                "Not removed: {email} isn't on the suppression list."
+            )));
+        };
+        let reason = text(&suppression, "reason").unwrap_or_default();
+        let why = suppression_words(&suppression);
+        let caution = match reason.as_str() {
+            "unsubscribed" | "complained" => {
+                " Only if they asked to hear from the team again: campaigns will reach them."
+            }
+            "bounced" => {
+                " Their address bounced: sending to it again can hurt the team's sending reputation."
+            }
+            _ => " Campaigns will reach them again.",
+        };
+        let what = format!("{email} ({why})");
+
+        let asked = match peer::current().filter(peer::CallPeer::can_elicit) {
+            Some(peer) => {
+                let message = format!("Take {what} off the suppression list?{caution}");
+                let schema = json!({
+                    "type": "object",
+                    "properties": {
+                        "confirm": {
+                            "type": "boolean",
+                            "title": "Take them off",
+                            "description": format!("Campaigns can reach {email} again."),
+                            "default": false
+                        }
+                    },
+                    "required": ["confirm"]
+                });
+                // What the question is about: an answer for another address or another
+                // suppression of it is not taken.
+                let state = format!(
+                    "studio-email-unsuppress:{email}:{reason}:{}",
+                    text(&suppression, "createdAt").unwrap_or_default()
+                );
+                match peer
+                    .ask(
+                        "confirm-unsuppress",
+                        &message,
+                        schema,
+                        &state,
+                        ELICIT_TIMEOUT,
+                    )
+                    .await
+                {
+                    Elicited::Pending => {
+                        return Ok(ToolResult::with_structured(
+                            format!(
+                                "Asking the person before {email} comes off the suppression list."
+                            ),
+                            json!({"removed": false, "email": email, "asking": true}),
+                        ))
+                    }
+                    Elicited::Accepted(content)
+                        if content.get("confirm").and_then(Value::as_bool) == Some(true) =>
+                    {
+                        Some(true)
+                    }
+                    Elicited::Accepted(_) | Elicited::Declined | Elicited::Cancelled => Some(false),
+                    Elicited::Unanswered(reason) => {
+                        tracing::debug!(%reason, "studio: the unsuppress question got no answer");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let confirmed = input.confirm_email.as_deref().and_then(address_of);
+        match (asked, confirmed) {
+            (Some(true), _) => {}
+            (Some(false), _) => {
+                return Ok(ToolResult::with_structured(
+                    format!(
+                    "Not removed: the person didn't say go. {email} stays on the suppression list."
+                ),
+                    json!({"removed": false, "email": email, "declined": true}),
+                ))
+            }
+            (None, Some(confirmed)) if confirmed == email => {}
+            (None, confirmed) => {
+                let mut said = match confirmed {
+                    Some(other) => format!("Not removed: confirm_email is {other}, not {email}."),
+                    None => "Not removed yet: the person's go is needed first.".to_string(),
+                };
+                said.push_str(&format!(
+                    " Show them: {what}.{caution} If they agree, call email_unsubscribes again with operation remove, email {email} and confirm_email {email}."
+                ));
+                return Ok(ToolResult::with_structured(
+                    said,
+                    json!({
+                        "removed": false,
+                        "email": email,
+                        "reason": reason,
+                        "confirm_with": {
+                            "action": "email_unsubscribes",
+                            "operation": "remove",
+                            "email": email,
+                            "confirm_email": email,
+                        },
+                    }),
+                ));
+            }
+        }
+        let mut body = json!({
+            "workspaceId": workspace_id,
+            "email": email,
+            "note": note_of(input, "Taken off through the studio tool, with the person's go"),
+        });
+        if matches!(reason.as_str(), "unsubscribed" | "complained") {
+            body["confirm"] = json!(true);
+        }
+        let answer = self
+            .email_call("POST", "/suppressions/remove", Some(&body), None)
+            .await?;
+        if !answer.is_success() {
+            return Ok(ToolResult::error(format!(
+                "Not removed: {}",
+                email_refusal(&answer, Topic::Other)
+            )));
+        }
+        Ok(ToolResult::with_structured(
+            format!(
+                "Took {email} off the suppression list: campaigns can reach them again. Create keeps who did it and why in the address's history."
+            ),
+            json!({"removed": true, "email": email, "was": reason}),
         ))
     }
 }

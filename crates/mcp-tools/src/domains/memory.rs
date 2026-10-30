@@ -572,6 +572,14 @@ fn format_collection(entity_name: &str, value: &Value) -> String {
             if let Some(s) = status {
                 line.push_str(&format!(" — {}", s));
             }
+            // A node another one replaced reads as current otherwise (#415).
+            if let Some(successor) = item
+                .get("superseded_by")
+                .and_then(|v| v.as_str())
+                .filter(|successor| !successor.is_empty())
+            {
+                line.push_str(&format!(" [superseded → {successor}]"));
+            }
             text.push_str(&line);
             text.push('\n');
         }
@@ -4191,6 +4199,7 @@ impl ToolHandler for MemoryTool {
                 let params = SupersedeMemoryNodeParams {
                     new_content,
                     reason: input.reason,
+                    title: input.title,
                 };
                 let result = self.client.supersede_memory_node(id, params).await?;
                 let new_id = result
@@ -6702,7 +6711,7 @@ impl ToolHandler for MemoryTool {
                 "For delete_node/delete_event: delete ALL exact-title matches of node_id/event_id in one call (bulk-remove duplicates) instead of erroring on ambiguity.",
                 false,
             )
-            .string("title", "Title (for create/update operations)", false)
+            .string("title", "Title (for create/update operations; for supersede_node, the replacement's title)", false)
             .string("content", "Content (for create/update operations; a doc holds at most about 2 MB). For update_doc prefer ops, which sends only the change.", false)
             .property("ops", super::doc_ops::doc_ops_schema(), false)
             .string(

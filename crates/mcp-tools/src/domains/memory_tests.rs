@@ -3039,3 +3039,24 @@ mod paging_footer_tests {
         );
     }
 }
+
+mod superseded_marker_tests {
+    use super::format_collection;
+    use serde_json::json;
+
+    #[test]
+    fn a_superseded_node_is_marked_in_lists() {
+        // #415: both nodes listed the same way, with no marker.
+        let nodes = json!({"items": [
+            {"id": "11111111-1111-4111-8111-111111111111", "summary": "Deploys happen every weekday.", "node_type": "fact"},
+            {"id": "22222222-2222-4222-8222-222222222222", "summary": "The deploy window is Tuesday", "node_type": "fact",
+             "superseded_by": "11111111-1111-4111-8111-111111111111"}
+        ]});
+        let text = format_collection("memory nodes", &nodes);
+        assert!(text.contains("(id: 22222222-2222-4222-8222-222222222222) [fact] [superseded → 11111111-1111-4111-8111-111111111111]"), "{text}");
+        assert!(
+            !text.contains("(id: 11111111-1111-4111-8111-111111111111) [fact] [superseded"),
+            "{text}"
+        );
+    }
+}

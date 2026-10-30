@@ -589,6 +589,22 @@ pub(crate) fn ensure_write_answered(result: &Value, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// list_nodes lists every node (a superseded one marked "[superseded → id]"):
+/// the API has no status filter for nodes, so `status`, which `decisions`
+/// takes, did nothing and every value gave the same list (#456). Only `all`,
+/// which is what it lists, is taken.
+fn list_nodes_status_problem(status: Option<&str>) -> Option<String> {
+    let status = status.map(str::trim).filter(|status| !status.is_empty())?;
+    if status.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    Some(format!(
+        "list_nodes does not filter by status (got status=\"{status}\"): it lists every node \
+         and marks a superseded one \"[superseded → <id>]\". For decisions by status use \
+         memory(action=\"decisions\", status=\"{status}\"); to list the nodes, leave status out."
+    ))
+}
+
 /// A page of a list and where it sits, or, for an empty page after the
 /// last one, that it is past the end (#452): it said "No docs found. Create
 /// one …" for a workspace with 51 docs.
@@ -4300,6 +4316,9 @@ impl MemoryTool {
                 Ok(found.tool_result(text, result))
             }
             "list_nodes" => {
+                if let Some(problem) = list_nodes_status_problem(input.status.as_deref()) {
+                    return Err(Error::Validation(problem));
+                }
                 // P0 #5 — PreferencesHot warm cache, scoped to
                 // node_type=preference or =constraint (the every-turn
                 // [PREFERENCE] injection sources). Other node_types

@@ -1914,6 +1914,13 @@ const CREDIT_BALANCE_CACHE_PREFIX: &str = "credit_balance:";
 const ACCOUNT_CONTEXT_CACHE_PREFIX: &str = "account_context:";
 const WORKSPACE_CACHE_PREFIX: &str = "workspace:";
 const PROJECT_CACHE_PREFIX: &str = "project:";
+/// A workspace's whole project list (see [`ContextStreamClient::list_all_projects`]).
+const PROJECT_CATALOG_CACHE_PREFIX: &str = "project_catalog:";
+/// Long enough for the several places one `init` reads the list, short enough that a
+/// project another process just created is seen on the next call.
+const PROJECT_CATALOG_CACHE_TTL: Duration = Duration::from_secs(10);
+/// Pages of the project list asked for at once once the first has said how many there are.
+const PROJECT_CATALOG_PAGES_IN_FLIGHT: usize = 8;
 const PROJECT_OVERVIEW_CACHE_PREFIX: &str = "project_overview:";
 const PROJECT_AGENT_MAP_CACHE_PREFIX: &str = "project_agent_map:";
 const PROJECT_INDEX_STATUS_CACHE_PREFIX: &str = "project_index_status:";
@@ -4116,6 +4123,16 @@ impl ContextStreamClient {
         )
     }
 
+    fn project_catalog_cache_key(caller_identity: &str, workspace_id: Uuid) -> CacheKey {
+        let workspace_id = workspace_id.to_string();
+        Self::caller_bound_cache_key(
+            PROJECT_CATALOG_CACHE_PREFIX,
+            "contextstream-client-project-catalog-cache-v1",
+            caller_identity,
+            &[("workspace_id", Some(workspace_id.as_bytes()))],
+        )
+    }
+
     fn project_cache_key(caller_identity: &str, project_id: Uuid) -> CacheKey {
         let project_id = project_id.to_string();
         Self::caller_bound_cache_key(
@@ -4336,6 +4353,7 @@ impl ContextStreamClient {
 
     fn invalidate_project_caches(&self) {
         self.invalidate_custom_cache_prefix(PROJECT_CACHE_PREFIX);
+        self.invalidate_custom_cache_prefix(PROJECT_CATALOG_CACHE_PREFIX);
         self.invalidate_custom_cache_prefix(PROJECT_OVERVIEW_CACHE_PREFIX);
         self.invalidate_custom_cache_prefix(PROJECT_AGENT_MAP_CACHE_PREFIX);
         self.invalidate_custom_cache_prefix(PROJECT_INDEX_STATUS_CACHE_PREFIX);
@@ -5644,6 +5662,11 @@ impl ContextStreamClient {
     /// List every accessible project in a workspace with a hard caller-owned
     /// bound. The server's pagination metadata is authoritative when present;
     /// the requested page size is the compatibility fallback for older APIs.
+    ///
+    /// The list is fetched once per caller and workspace for a few seconds
+    /// (`init` reads it from several places, and walking 1,800 projects took
+    /// 7-10 s each time, mcp-server#450), and once the first page says how many
+    /// pages there are the rest are asked for at once.
     pub async fn list_all_projects(
         &self,
         workspace_id: Option<Uuid>,
@@ -5652,14 +5675,105 @@ impl ContextStreamClient {
     ) -> Result<Vec<Project>> {
         let requested_page_size = page_size.clamp(1, 200);
         let max_projects = max_projects.max(1);
+        let cache_key = {
+            let config = self.config.read().await;
+            workspace_id.or(config.default_workspace_id)
+        }
+        .zip(current_client_cache_identity())
+        .map(|(workspace_id, caller)| Self::project_catalog_cache_key(&caller, workspace_id));
+        if let Some(projects) = self
+            .cached_response(cache_key.as_ref())
+            .and_then(|value| serde_json::from_value::<Vec<Project>>(value).ok())
+        {
+            return if projects.len() > max_projects {
+                Err(Self::project_catalog_cap_error(max_projects))
+            } else {
+                Ok(projects)
+            };
+        }
+        let projects = self
+            .fetch_all_projects(workspace_id, requested_page_size, max_projects)
+            .await?;
+        if let Ok(value) = serde_json::to_value(&projects) {
+            self.cache_response(cache_key, value, PROJECT_CATALOG_CACHE_TTL);
+        }
+        Ok(projects)
+    }
+
+    fn project_catalog_cap_error(max_projects: usize) -> Error {
+        Error::Validation(format!(
+            "Project resolution exceeded {max_projects} projects; pass an explicit project_id."
+        ))
+    }
+
+    async fn fetch_all_projects(
+        &self,
+        workspace_id: Option<Uuid>,
+        requested_page_size: i64,
+        max_projects: usize,
+    ) -> Result<Vec<Project>> {
+        use futures::StreamExt;
+
         let mut page = 1_i64;
         let mut projects = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut first_page = Some(
+            self.list_projects_page(workspace_id, Some(1), Some(requested_page_size))
+                .await?,
+        );
+
+        // The first page often says how many pages there are: ask for the rest at once
+        // (in order, in this task, so the caller's credentials apply to each).
+        if let Some(first) = first_page.as_ref() {
+            let served = first.per_page.unwrap_or(requested_page_size).max(1);
+            let total_pages = first.total_pages.or_else(|| {
+                first
+                    .total
+                    .map(|total| total.saturating_add(served - 1) / served)
+            });
+            if let Some(total_pages) = total_pages.filter(|pages| *pages > 1) {
+                let first_len = i64::try_from(first.items.len()).unwrap_or(i64::MAX);
+                // Every page before the last holds a full page: past the cap already.
+                let sure_to_exceed = (total_pages - 1).saturating_mul(served)
+                    >= max_projects as i64
+                    || first.total.is_some_and(|total| total > max_projects as i64);
+                if sure_to_exceed && first_len > 0 {
+                    return Err(Self::project_catalog_cap_error(max_projects));
+                }
+                let first = first_page.take().expect("first page");
+                for project in first.items {
+                    if seen.insert(project.id) {
+                        projects.push(project);
+                    }
+                }
+                let rest: Vec<_> = futures::stream::iter((2..=total_pages).map(|number| {
+                    self.list_projects_page(workspace_id, Some(number), Some(requested_page_size))
+                }))
+                .buffered(PROJECT_CATALOG_PAGES_IN_FLIGHT)
+                .collect()
+                .await;
+                for response in rest {
+                    for project in response?.items {
+                        if seen.insert(project.id) {
+                            projects.push(project);
+                        }
+                    }
+                }
+                if projects.len() > max_projects {
+                    return Err(Self::project_catalog_cap_error(max_projects));
+                }
+                return Ok(projects);
+            }
+        }
 
         loop {
-            let response = self
-                .list_projects_page(workspace_id, Some(page), Some(requested_page_size))
-                .await?;
+            let response = match first_page.take() {
+                Some(response) => response,
+                None => {
+                    self.list_projects_page(workspace_id, Some(page), Some(requested_page_size))
+                        .await?
+                }
+            };
             let response_count = response.items.len();
             let response_page = response.page.unwrap_or(page).max(1);
             let response_page_size = response.per_page.unwrap_or(requested_page_size).max(1);
@@ -5685,9 +5799,7 @@ impl ContextStreamClient {
             }
 
             if projects.len() > max_projects || (projects.len() == max_projects && has_more) {
-                return Err(Error::Validation(format!(
-                    "Project resolution exceeded {max_projects} projects; pass an explicit project_id."
-                )));
+                return Err(Self::project_catalog_cap_error(max_projects));
             }
             if !has_more {
                 break;
@@ -28793,6 +28905,162 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].contains("page=1"));
         assert!(requests[1].contains("page=2"));
+    }
+
+    /// A server that answers `GET /projects?page=N` for `total` projects, `per_page` to a
+    /// page, whatever order the requests arrive in. It takes `connections` requests at
+    /// once and returns them.
+    async fn client_with_project_pages(
+        total: usize,
+        per_page: usize,
+        connections: usize,
+    ) -> (ContextStreamClient, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind project pages listener");
+        let addr = listener.local_addr().expect("project pages listener addr");
+        let server = tokio::spawn(async move {
+            let mut handlers = Vec::new();
+            for _ in 0..connections {
+                let (mut socket, _) = listener.accept().await.expect("accept HTTP request");
+                handlers.push(tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 64 * 1024];
+                    let read = socket.read(&mut buffer).await.expect("read HTTP request");
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let page: usize = request
+                        .split("page=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                        .and_then(|digits| digits.parse().ok())
+                        .expect("page number in the request");
+                    let start = (page - 1) * per_page;
+                    let items: Vec<_> = (start..total.min(start + per_page))
+                        .map(|index| {
+                            serde_json::json!({
+                                "id": Uuid::from_u128(index as u128 + 1),
+                                "name": format!("project-{index}")
+                            })
+                        })
+                        .collect();
+                    let body = serde_json::json!({
+                        "items": items,
+                        "page": page,
+                        "page_size": per_page,
+                        "total": total,
+                        "total_pages": total.div_ceil(per_page),
+                        "has_next": page * per_page < total
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write HTTP response");
+                    request
+                }));
+            }
+            let mut requests = Vec::new();
+            for handler in handlers {
+                requests.push(handler.await.expect("project pages handler"));
+            }
+            requests
+        });
+
+        let mut config = Config::default();
+        config.api_url = format!("http://{addr}");
+        config.api_key = Some("test-key".to_string());
+        (ContextStreamClient::new(config), server)
+    }
+
+    // mcp-server#450: init walked the project list one page at a time, twice.
+    #[tokio::test]
+    async fn list_all_projects_asks_for_the_remaining_pages_at_once_and_keeps_their_order() {
+        let (client, server) = client_with_project_pages(450, 100, 5).await;
+
+        let projects = client
+            .list_all_projects(Some(Uuid::new_v4()), 200, 10_000)
+            .await
+            .expect("list all projects");
+        let requests = server.await.expect("project pages server");
+
+        let ids: Vec<_> = projects.iter().map(|project| project.id).collect();
+        let expected: Vec<_> = (0..450u128)
+            .map(|index| Uuid::from_u128(index + 1))
+            .collect();
+        assert_eq!(ids, expected, "every project once, in page order");
+        assert_eq!(requests.len(), 5);
+        for page in 1..=5 {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.contains(&format!("page={page}&")))
+                    .count(),
+                1,
+                "page {page} is asked for once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_all_projects_gives_up_before_fetching_pages_that_cannot_fit_the_cap() {
+        let (client, server) = client_with_project_pages(5_000, 100, 1).await;
+
+        let error = client
+            .list_all_projects(Some(Uuid::new_v4()), 200, 1_000)
+            .await
+            .expect_err("5,000 projects exceed a cap of 1,000");
+        let requests = server.await.expect("project pages server");
+
+        assert!(
+            error.to_string().contains("exceeded 1000 projects"),
+            "{error}"
+        );
+        assert_eq!(requests.len(), 1, "only the first page was fetched");
+    }
+
+    #[tokio::test]
+    async fn list_all_projects_is_reused_until_a_project_changes() {
+        let (client, server) = client_with_project_pages(250, 100, 6).await;
+        let workspace_id = Uuid::new_v4();
+
+        run_with_session_key(SessionKey::Local, || async {
+            let first = client
+                .list_all_projects(Some(workspace_id), 200, 10_000)
+                .await
+                .expect("first list");
+            // The second read (init reads the list from more than one place) costs nothing.
+            let second = client
+                .list_all_projects(Some(workspace_id), 200, 10_000)
+                .await
+                .expect("second list");
+            assert_eq!((first.len(), second.len()), (250, 250));
+            // A smaller cap is applied to the reused list too.
+            let capped = client
+                .list_all_projects(Some(workspace_id), 200, 100)
+                .await
+                .expect_err("250 projects exceed a cap of 100");
+            assert!(capped.to_string().contains("exceeded 100 projects"));
+
+            // A project created, renamed, merged or deleted drops it.
+            client.invalidate_project_caches();
+            let third = client
+                .list_all_projects(Some(workspace_id), 200, 10_000)
+                .await
+                .expect("third list");
+            assert_eq!(third.len(), 250);
+        })
+        .await;
+
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("six page requests in all: three for the first list, three after the change")
+            .expect("project pages server");
+        assert_eq!(requests.len(), 6);
     }
 
     #[tokio::test]

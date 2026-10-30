@@ -271,3 +271,41 @@ async fn list_repos_without_any_workspace_says_how_to_get_one() {
     );
     assert!(probe.request_lines().is_empty());
 }
+
+#[test]
+fn list_answers_show_each_item_not_only_the_count() {
+    // #397: "Found 1 commits." and "Found 4 activity items." with nothing else.
+    let commits = json!({"items": [{
+        "id": "44444444-4444-4444-8444-444444444444",
+        "sha": "20f690f0ebdc2e9564118f6a9854a87e6a44fedd",
+        "message": "Fix the cache\n\nLonger body.",
+        "author_name": "Dana",
+        "committed_at": "2026-10-22T16:57:16Z"
+    }], "total": 1});
+    assert_eq!(
+        VcsTool::success_text("list_commits", &commits),
+        "Found 1 commits.\n- 20f690f0eb Fix the cache — Dana, 2026-10-22T16:57:16Z"
+    );
+    let activity = json!({"items": [{
+        "repo_full_name": "acme/api",
+        "event_type": "commit.pushed",
+        "title": "c",
+        "occurred_at": "2026-10-29T15:47:01Z"
+    }]});
+    assert_eq!(
+        VcsTool::success_text("get_activity", &activity),
+        "Found 1 activity items.\n- c [commit.pushed] in acme/api — 2026-10-29T15:47:01Z"
+    );
+    let notifications = json!({"notifications": [{"id": "n1", "title": "Review requested", "reason": "review_requested"}]});
+    assert_eq!(
+        VcsTool::success_text("list_notifications", &notifications),
+        "Found 1 notifications.\n- Review requested [review_requested] (id: n1)"
+    );
+    let pulls = json!({"items": (1..=25).map(|n| json!({"number": n, "title": format!("PR {n}"), "state": "open"})).collect::<Vec<_>>()});
+    let text = VcsTool::success_text("list_pulls", &pulls);
+    assert!(
+        text.starts_with("Found 25 pull requests.\n- #1 PR 1 [open]"),
+        "{text}"
+    );
+    assert!(text.ends_with("… and 5 more."), "{text}");
+}

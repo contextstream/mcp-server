@@ -2335,6 +2335,42 @@ fn normalize_decision_status(raw: Option<&str>) -> Result<Option<String>> {
     }
 }
 
+/// The first line of a `decision_action` answer (#404). The API answers
+/// `{"id", "action", "status", "audit": {"reason", …}}`: the new state is the
+/// top-level `status`, and a status back means the action applied. An older
+/// answer may still carry `applied` and a `decision` object.
+fn decision_action_line(action: &str, decision_id: Uuid, result: &Value) -> String {
+    let decision = result.get("decision").filter(|value| value.is_object());
+    let status = decision
+        .and_then(|decision| decision_str(decision, &["status"]))
+        .or_else(|| decision_str(result, &["status"]));
+    let applied = result
+        .get("applied")
+        .and_then(Value::as_bool)
+        .or(status.map(|_| true))
+        .map_or_else(|| "unknown".to_string(), |applied| applied.to_string());
+    let title = decision
+        .map(extract_display_title)
+        .filter(|title| !title.trim().is_empty() && title != &decision_id.to_string());
+    let mut line = format!("[DECISION_ACTION] {action} applied={applied}");
+    if let Some(title) = title {
+        line.push_str(&format!(" — {title}"));
+    }
+    line.push_str(&format!(
+        " (id={decision_id}) status={}\n",
+        status.unwrap_or("unknown")
+    ));
+    if let Some(reason) = result
+        .get("audit")
+        .and_then(|audit| audit.get("reason"))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        line.push_str(&format!("   reason: {reason}\n"));
+    }
+    line
+}
+
 fn decision_str<'a>(node: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|key| {
         node.get(*key)
@@ -2933,21 +2969,7 @@ pub async fn execute_decision_action(
     };
     match client.decision_action(decision_id, params).await {
         Ok(mut result) => {
-            let applied = result
-                .get("applied")
-                .and_then(Value::as_bool)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            let decision = result.get("decision").cloned().unwrap_or(Value::Null);
-            let title = if decision.is_object() {
-                extract_display_title(&decision)
-            } else {
-                decision_id.to_string()
-            };
-            let status = decision_str(&decision, &["status"]).unwrap_or("unknown");
-            text.push_str(&format!(
-                "[DECISION_ACTION] {action} applied={applied} — {title} (id={decision_id}) status={status}\n"
-            ));
+            text.push_str(&decision_action_line(&action, decision_id, &result));
             if let Some(successor) = successor {
                 text.push_str(&format!("   successor={successor}\n"));
             }
@@ -4059,7 +4081,9 @@ impl ToolHandler for MemoryTool {
                     decision_id,
                     decision_action,
                     successor_id: input.successor_id,
-                    reason: input.reason,
+                    // `rationale` reads as the reason too; it used to be
+                    // dropped silently, leaving the default reason (#404).
+                    reason: input.reason.or(input.rationale),
                     title: input.title,
                 };
                 execute_decision_action(&self.client, self.session.as_ref(), action_input).await

@@ -14913,8 +14913,14 @@ impl ContextStreamClient {
         if let Some(b) = started_before {
             params.push(format!("started_before={}", b));
         }
-        if let Some(l) = limit {
-            params.push(format!("limit={}", l));
+        // The API reads per_page; `limit` was ignored and every page held
+        // 20 (#391).
+        let per_page = limit.map(|l| l.clamp(1, 100));
+        if let Some(per_page) = per_page {
+            params.push(format!("per_page={per_page}"));
+        }
+        if let Some(page) = list_page(per_page.unwrap_or(20)) {
+            params.push(format!("page={page}"));
         }
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));

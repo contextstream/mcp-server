@@ -491,6 +491,41 @@ fn extract_memory_result_score(item: &Value) -> i64 {
         .unwrap_or(0)
 }
 
+/// Where a page of a list sits and how to get the next one (#411). Uses
+/// the API's total when it covers what was shown, and a full page otherwise.
+fn paging_footer(result: &Value, offset: Option<i64>, limit: Option<i64>) -> String {
+    let shown = extract_collection_array(result).map_or(0, Vec::len);
+    if shown == 0 {
+        return String::new();
+    }
+    let start = usize::try_from(offset.unwrap_or(0).max(0)).unwrap_or(0);
+    let end = start + shown;
+    let total = result
+        .get("total")
+        .and_then(Value::as_u64)
+        .map(|total| total as usize)
+        .filter(|total| *total >= end);
+    let page_size = limit
+        .filter(|limit| *limit > 0)
+        .map(|limit| limit as usize)
+        .or_else(|| {
+            result
+                .get("per_page")
+                .and_then(Value::as_u64)
+                .map(|size| size as usize)
+        });
+    let full_page = page_size.is_some_and(|size| shown >= size);
+    let more = total.map_or(full_page, |total| end < total);
+    let range = format!("Showing {}–{end}", start + 1);
+    match (total, more) {
+        (Some(total), true) => format!("\n{range} of {total}. Pass offset={end} for more."),
+        (None, true) => format!("\n{range}. Pass offset={end} for more."),
+        (Some(total), false) if start > 0 => format!("\n{range} of {total} (the end)."),
+        (None, false) if start > 0 => format!("\n{range} (the end)."),
+        _ => String::new(),
+    }
+}
+
 /// Format a collection of items into a human-readable list with IDs and titles.
 /// This allows the AI to see item details (especially IDs) so it can act on them.
 fn format_collection(entity_name: &str, value: &Value) -> String {
@@ -4045,7 +4080,7 @@ impl ToolHandler for MemoryTool {
                 let preferences_cache_eligible = matches!(
                     node_type_normalised.as_deref(),
                     Some("preference") | Some("constraint")
-                );
+                ) && input.offset.unwrap_or(0) <= 0;
                 let user_scope_token = super::atlas_warm_cache::current_user_scope_token();
                 let cached_nodes = if preferences_cache_eligible {
                     if let (Some(ws), Some(nt)) = (workspace_id, node_type_normalised.as_deref()) {
@@ -4077,15 +4112,16 @@ impl ToolHandler for MemoryTool {
                 let result = if let Some(bundle) = cached_nodes {
                     bundle.payload
                 } else {
-                    let r = self
-                        .client
-                        .list_memory_nodes(
+                    let r = mcp_client::with_list_offset(
+                        input.offset,
+                        self.client.list_memory_nodes(
                             workspace_id,
                             project_id,
                             input.node_type.clone(),
                             input.limit,
-                        )
-                        .await?;
+                        ),
+                    )
+                    .await?;
                     if preferences_cache_eligible {
                         if let (Some(ws), Some(nt)) =
                             (workspace_id, node_type_normalised.as_deref())
@@ -4112,7 +4148,11 @@ impl ToolHandler for MemoryTool {
                     }
                     r
                 };
-                let text = format_collection("memory nodes", &result);
+                let text = format!(
+                    "{}{}",
+                    format_collection("memory nodes", &result),
+                    paging_footer(&result, input.offset, input.limit)
+                );
                 Ok(ToolResult::with_structured(text, result))
             }
             "supersede_node" => {
@@ -4522,9 +4562,12 @@ impl ToolHandler for MemoryTool {
                 // newest 200 events per workspace, and the handler
                 // applies caller filters in memory below).
                 let warm_workspace = workspace_id;
+                // The warm cache holds the newest events: a later page
+                // neither reads nor writes it (#411).
+                let first_page = input.offset.unwrap_or(0) <= 0;
                 let mut served_from_cache = false;
                 let mut cache_age_ms: Option<u64> = None;
-                let cached_result = if let Some(ws) = warm_workspace {
+                let cached_result = if let Some(ws) = warm_workspace.filter(|_| first_page) {
                     let scope = mcp_types::atlas_layer::AtlasFederationScope {
                         workspace_id: ws,
                         project_id,
@@ -4562,15 +4605,16 @@ impl ToolHandler for MemoryTool {
                     }
                     payload
                 } else {
-                    let primary = match self
-                        .client
-                        .list_memory_events(
+                    let primary = match mcp_client::with_list_offset(
+                        input.offset,
+                        self.client.list_memory_events(
                             workspace_id,
                             project_id,
                             input.event_type.clone(),
                             input.limit,
-                        )
-                        .await
+                        ),
+                    )
+                    .await
                     {
                         Ok(p) => p,
                         Err(err)
@@ -4586,7 +4630,7 @@ impl ToolHandler for MemoryTool {
                     };
                     // Best-effort write-back so the next pod in this
                     // region serves it from cache.
-                    if let Some(ws) = warm_workspace {
+                    if let Some(ws) = warm_workspace.filter(|_| first_page) {
                         let scope = mcp_types::atlas_layer::AtlasFederationScope {
                             workspace_id: ws,
                             project_id,
@@ -4639,7 +4683,11 @@ impl ToolHandler for MemoryTool {
                         ""
                     )
                 } else {
-                    format_collection("events", &result)
+                    format!(
+                        "{}{}",
+                        format_collection("events", &result),
+                        paging_footer(&result, input.offset, input.limit)
+                    )
                 };
                 Ok(ToolResult::with_structured(text, result))
             }
@@ -4928,11 +4976,13 @@ impl ToolHandler for MemoryTool {
                 let plan_id = input.plan_id.as_ref().and_then(|s| Uuid::parse_str(s).ok());
                 let task_status_clone = input.task_status.clone();
                 let limit_clone = input.limit;
+                let offset_clone = input.offset;
                 let filter_str = format!(
-                    "plan={};status={};limit={}",
+                    "plan={};status={};limit={};offset={}",
                     plan_id.map(|p| p.to_string()).unwrap_or_default(),
                     task_status_clone.as_deref().unwrap_or(""),
-                    limit_clone.unwrap_or(0)
+                    limit_clone.unwrap_or(0),
+                    offset_clone.unwrap_or(0)
                 );
                 let user_scope_token =
                     super::atlas_warm_cache::current_user_scope_token();
@@ -4958,9 +5008,17 @@ impl ToolHandler for MemoryTool {
                     scope_hash,
                     150,
                     || async move {
-                        client
-                            .list_tasks(workspace_id, project_id, plan_id, task_status_clone, limit_clone)
-                            .await
+                        mcp_client::with_list_offset(
+                            offset_clone,
+                            client.list_tasks(
+                                workspace_id,
+                                project_id,
+                                plan_id,
+                                task_status_clone,
+                                limit_clone,
+                            ),
+                        )
+                        .await
                     },
                 )
                 .await;
@@ -4975,7 +5033,11 @@ impl ToolHandler for MemoryTool {
                     }
                     Err(err) => return Err(err),
                 };
-                let text = format_collection("tasks", &result);
+                let text = format!(
+                    "{}{}",
+                    format_collection("tasks", &result),
+                    paging_footer(&result, input.offset, input.limit)
+                );
                 Ok(ToolResult::with_structured(text, result))
             }
             "reorder_tasks" => {
@@ -5282,17 +5344,24 @@ impl ToolHandler for MemoryTool {
                     due_before: input.due_before,
                     completed_after: input.completed_after,
                     completed_before: input.completed_before,
-                    limit: input.limit,
-                    page: None,
+                    // A later page by number: the todos API pages that way (#411).
+                    limit: input
+                        .limit
+                        .or_else(|| input.offset.filter(|offset| *offset > 0).map(|_| 20)),
+                    page: input
+                        .offset
+                        .filter(|offset| *offset > 0)
+                        .map(|offset| offset / input.limit.unwrap_or(20).max(1) + 1),
                 };
                 let filter_str = format!(
-                    "status={};priority={};personal={};scope={};query={};limit={}",
+                    "status={};priority={};personal={};scope={};query={};limit={};page={}",
                     params.status.as_deref().unwrap_or(""),
                     params.priority.as_deref().unwrap_or(""),
                     params.is_personal.map(|b| b.to_string()).unwrap_or_default(),
                     params.scope.as_deref().unwrap_or(""),
                     params.query.as_deref().unwrap_or(""),
-                    params.limit.unwrap_or(0)
+                    params.limit.unwrap_or(0),
+                    params.page.unwrap_or(0)
                 );
                 let user_scope_token =
                     super::atlas_warm_cache::current_user_scope_token();
@@ -5331,7 +5400,11 @@ impl ToolHandler for MemoryTool {
                     }
                     Err(err) => return Err(err),
                 };
-                let text = format_collection("todos", &result);
+                let text = format!(
+                    "{}{}",
+                    format_collection("todos", &result),
+                    paging_footer(&result, input.offset, input.limit)
+                );
                 Ok(ToolResult::with_structured(text, result))
             }
 
@@ -5514,19 +5587,21 @@ impl ToolHandler for MemoryTool {
                 Ok(found.tool_result(text, result))
             }
             "list_diagrams" => {
-                let result = self
-                    .client
-                    .list_diagrams(
+                let result = mcp_client::with_list_offset(
+                    input.offset,
+                    self.client.list_diagrams(
                         workspace_id,
                         project_id,
                         input.is_personal,
                         input.limit,
                         input.diagram_type,
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 let text = format!(
-                    "{}\n{}\nExamples: memory(action=\"create_diagram\", diagram_type=\"sequence\", title=\"Auth handoff\", content=\"...\") | memory(action=\"create_diagram\", diagram_type=\"er\", title=\"Billing schema\", content=\"...\")",
+                    "{}{}\n{}\nExamples: memory(action=\"create_diagram\", diagram_type=\"sequence\", title=\"Auth handoff\", content=\"...\") | memory(action=\"create_diagram\", diagram_type=\"er\", title=\"Billing schema\", content=\"...\")",
                     format_collection("diagrams", &result),
+                    paging_footer(&result, input.offset, input.limit),
                     diagram_types_help_suffix()
                 );
                 Ok(ToolResult::with_structured(text, result))
@@ -5833,17 +5908,18 @@ impl ToolHandler for MemoryTool {
                     }
                 }
 
-                let result = match self
-                    .client
-                    .list_docs(
+                let result = match mcp_client::with_list_offset(
+                    input.offset,
+                    self.client.list_docs(
                         workspace_id,
                         project_id,
                         input.doc_type,
                         input.is_personal,
                         None,
                         input.limit,
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
                     Ok(r) => r,
                     Err(err) if super::workspace_drift::is_workspace_access_error(&err) => {
@@ -5855,7 +5931,11 @@ impl ToolHandler for MemoryTool {
                     }
                     Err(err) => return Err(err),
                 };
-                let text = format_collection("docs", &result);
+                let text = format!(
+                    "{}{}",
+                    format_collection("docs", &result),
+                    paging_footer(&result, input.offset, input.limit)
+                );
                 Ok(ToolResult::with_structured(text, result))
             }
             "create_roadmap" => {

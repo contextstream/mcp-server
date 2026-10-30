@@ -686,6 +686,30 @@ pub fn runtime_self_update_disabled() -> bool {
 // ---------------------------------------------------------------------------
 
 tokio::task_local! {
+    /// Where a memory list starts (#411): set by the tool around one list
+    /// call, and sent to each list endpoint in the form it reads.
+    static LIST_OFFSET: i64;
+}
+
+/// Runs `future` with memory list calls starting at `offset` (#411). A
+/// missing or zero offset is the first page, as before.
+pub async fn with_list_offset<F: std::future::Future>(offset: Option<i64>, future: F) -> F::Output {
+    match offset.filter(|offset| *offset > 0) {
+        Some(offset) => LIST_OFFSET.scope(offset, future).await,
+        None => future.await,
+    }
+}
+
+fn list_offset() -> Option<i64> {
+    LIST_OFFSET.try_with(|offset| *offset).ok()
+}
+
+/// The page holding the list offset, for endpoints that page by number.
+fn list_page(per_page: i64) -> Option<i64> {
+    list_offset().map(|offset| offset / per_page.max(1) + 1)
+}
+
+tokio::task_local! {
     /// Per-request auth override set by the HTTP transport layer.
     /// Tools executed within the scope automatically inherit this auth context.
     static TASK_AUTH_OVERRIDE: AuthOverride;
@@ -14033,6 +14057,9 @@ impl ContextStreamClient {
         if let Some(l) = fetch_limit {
             params.push(format!("limit={}", l));
         }
+        if let Some(offset) = list_offset() {
+            params.push(format!("offset={offset}"));
+        }
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));
         }
@@ -14139,6 +14166,10 @@ impl ContextStreamClient {
         }
         if let Some(l) = limit {
             params.push(format!("limit={}", l));
+        }
+        if let Some(page) = list_page(limit.unwrap_or(20)) {
+            params.push(format!("page_size={}", limit.unwrap_or(20)));
+            params.push(format!("page={page}"));
         }
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));
@@ -14287,6 +14318,9 @@ impl ContextStreamClient {
         }
         if let Some(l) = limit {
             params.push(format!("limit={}", l));
+        }
+        if let Some(offset) = list_offset() {
+            params.push(format!("offset={offset}"));
         }
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));
@@ -14487,8 +14521,15 @@ impl ContextStreamClient {
         if let Some(p) = is_personal {
             params.push(format!("is_personal={}", p));
         }
+        // The API reads per_page; `limit` was ignored (#411).
         if let Some(l) = limit {
-            params.push(format!("limit={}", l));
+            params.push(format!("per_page={}", l.clamp(1, 100)));
+        }
+        if let Some(page) = list_page(limit.unwrap_or(30)) {
+            if limit.is_none() {
+                params.push("per_page=30".to_string());
+            }
+            params.push(format!("page={page}"));
         }
         if let Some(ref dt) = diagram_type {
             params.push(format!("diagram_type={}", dt));
@@ -14593,18 +14634,29 @@ impl ContextStreamClient {
         let (ws_id, proj_id) = scope_ids_with_defaults(workspace_id, project_id, &config);
         drop(config);
 
-        let cache_key = current_client_cache_identity().map(|caller| {
-            Self::docs_list_cache_key(
-                &caller,
-                ws_id,
-                proj_id,
-                doc_type.as_deref(),
-                is_personal,
-                query.as_deref(),
-                limit,
-            )
-        });
-        let path = Self::build_docs_path(ws_id, proj_id, doc_type, is_personal, query, limit);
+        // A later page is not the cached first page (#411).
+        let cache_key = current_client_cache_identity()
+            .filter(|_| list_offset().is_none())
+            .map(|caller| {
+                Self::docs_list_cache_key(
+                    &caller,
+                    ws_id,
+                    proj_id,
+                    doc_type.as_deref(),
+                    is_personal,
+                    query.as_deref(),
+                    limit,
+                )
+            });
+        let mut path = Self::build_docs_path(ws_id, proj_id, doc_type, is_personal, query, limit);
+        if let Some(page) = list_page(limit.unwrap_or(20)) {
+            let separator = if path.contains('?') { '&' } else { '?' };
+            path.push(separator);
+            if limit.is_none() {
+                path.push_str("per_page=20&");
+            }
+            path.push_str(&format!("page={page}"));
+        }
         if let Some(cached) = self.cached_response(cache_key.as_ref()) {
             return Ok(cached);
         }

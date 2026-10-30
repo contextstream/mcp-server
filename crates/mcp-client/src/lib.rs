@@ -38,6 +38,7 @@ pub use client::{
     filter_memory_events_by_type,
     infer_memory_query_node_type,
     unsupported_entity_kind_reason,
+    with_list_offset,
     // Workspace params
     BootstrapWorkspaceParams,
     CallPathParams,

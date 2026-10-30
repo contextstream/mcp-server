@@ -515,6 +515,40 @@ pub fn is_ingest_in_progress_error(error: &Error) -> bool {
     ProjectIngestLease::is_in_progress_error(error)
 }
 
+/// Whether an ingest of `project_id` is running in this process now. A request to
+/// index a project in that state only joins the run (see
+/// [`is_ingest_in_progress_error`]), and the caller can say so instead of
+/// reporting that it started one (mcp-server#455). A run in another process
+/// holds a file lock instead; probing it would take that lock for a moment and
+/// could make the other process's own ingest refuse, so it is not asked here.
+pub fn project_ingest_running_here(project_id: Uuid) -> bool {
+    PROJECT_INGESTS_IN_FLIGHT
+        .get()
+        .and_then(|in_flight| {
+            in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&project_id)
+                .then_some(())
+        })
+        .is_some()
+}
+
+/// Holds a project's ingest lease until dropped, so a test of a caller can stand
+/// for an ingest that is already running. Not for product code: an ingest takes
+/// its lease itself.
+#[doc(hidden)]
+pub struct HeldProjectIngest {
+    _lease: ProjectIngestLease,
+}
+
+#[doc(hidden)]
+pub fn hold_project_ingest_for_test(project_id: Uuid) -> Result<HeldProjectIngest> {
+    Ok(HeldProjectIngest {
+        _lease: ProjectIngestLease::acquire(project_id)?,
+    })
+}
+
 /// The largest file ingest reads: a bigger one is left out of the index (and
 /// reported, mcp-server#340). Also the cap on every bounded read below.
 const MAX_INDEXABLE_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -31255,7 +31289,10 @@ mod tests {
         assert!(!ProjectIngestLease::is_in_progress_error(
             &Error::Validation("Path not found: /x".to_string())
         ));
+        assert!(project_ingest_running_here(project_id));
+        assert!(!project_ingest_running_here(Uuid::new_v4()));
         drop(first);
+        assert!(!project_ingest_running_here(project_id));
         assert!(ProjectIngestLease::acquire(project_id).is_ok());
     }
 

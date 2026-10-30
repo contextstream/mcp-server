@@ -2155,6 +2155,12 @@ impl ProjectTool {
 
         ContextStreamClient::write_indexing_started(&path, project_id);
 
+        // An ingest of this project already running here is not started a second
+        // time: the task below is refused and ends, so say that this request joins
+        // it (mcp-server#455: "Updating index in background" for a run that was
+        // never started, and nothing uploaded for it).
+        let joins_running_ingest = mcp_client::client::project_ingest_running_here(project_id);
+
         let client = self.client.clone();
         let path_for_log = path.clone();
         let path_for_success = path.clone();
@@ -2200,9 +2206,10 @@ impl ProjectTool {
                 // Another ingest of the project is already running: it does the
                 // work, and nothing failed (#367).
                 Err(e) if mcp_client::client::is_ingest_in_progress_error(&e) => {
-                    tracing::debug!(
-                        "ingest_local for {} joined an ingest already running for the project",
-                        path_for_log
+                    tracing::info!(
+                        "ingest_local for {} joined an ingest already running for the project ({})",
+                        path_for_log,
+                        e
                     );
                 }
                 Err(e) => {
@@ -2218,7 +2225,17 @@ impl ProjectTool {
             ""
         };
 
-        let main_msg = if context.auto_created {
+        let main_msg = if joins_running_ingest {
+            format!(
+                "An index of this project is already running in this process: this request joins it and does not start a second one{}. For directory: {}.",
+                if force.unwrap_or(false) {
+                    " (force is not applied to the run already going; ask again when it ends)"
+                } else {
+                    ""
+                },
+                context.path
+            )
+        } else if context.auto_created {
             let pname = context
                 .resolved_project_name
                 .as_deref()
@@ -2251,6 +2268,7 @@ impl ProjectTool {
             "auto_created": context.auto_created,
             "workspace_id": context.workspace_id.map(|id| id.to_string()),
             "note": note,
+            "joined_running_ingest": joins_running_ingest,
         });
 
         if let Some(original_project_id) = context.original_project_id {

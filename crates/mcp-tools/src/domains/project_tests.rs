@@ -1635,6 +1635,50 @@ mod validation_tests {
         );
     }
 
+    // An index asked for while another run of the project is going here only joins
+    // it. It was answered "Updating index in background" as if one had started,
+    // and nothing was uploaded for it (mcp-server#455).
+    #[tokio::test]
+    async fn test_project_tool_index_says_when_it_only_joins_a_running_index() {
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let (client, config, server) =
+            client_with_fresh_project(project_in_workspace(project_id, workspace_id)).await;
+        let session = Arc::new(mcp_session::SessionManager::new(client.clone(), config));
+        let tempdir = tempdir().expect("tempdir");
+        session
+            .initialize(
+                Some(workspace_id),
+                Some(project_id),
+                Some(tempdir.path().to_string_lossy().to_string()),
+                None,
+            )
+            .await;
+        let tool = ProjectTool::new(client.clone(), session);
+
+        let running = mcp_client::client::hold_project_ingest_for_test(project_id)
+            .expect("an ingest of the project is running");
+        let result = tool
+            .execute(json!({ "action": "index", "force": true }))
+            .await;
+        drop(running);
+        server.abort();
+        let result = result.expect("index answers while another run is going");
+
+        assert!(!result.is_error);
+        match result.content.first() {
+            Some(ContentItem::Text { text }) => {
+                assert!(text.contains("already running"), "{text}");
+                assert!(text.contains("joins it"), "{text}");
+                assert!(text.contains("force is not applied"), "{text}");
+                assert!(!text.contains("Updating index in background"), "{text}");
+            }
+            other => panic!("expected text content, got {:?}", other),
+        }
+        let structured = result.structured_content.expect("structured content");
+        assert_eq!(structured.get("joined_running_ingest"), Some(&json!(true)));
+    }
+
     #[tokio::test]
     async fn test_project_tool_index_prefers_initialized_session_scope_over_task_auth() {
         let session_project_id = Uuid::new_v4();

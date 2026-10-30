@@ -13886,11 +13886,32 @@ fn trace_decisions(result: &Value) -> Vec<Value> {
         .or_else(|| payload.get("decisions"))
         .and_then(Value::as_array)
     {
-        return list.clone();
+        return list.iter().map(unnest_trace_decision).collect();
     }
     match payload.get("decision") {
         Some(decision) if decision.is_object() => vec![decision.clone()],
         _ => Vec::new(),
+    }
+}
+
+/// A trace item nests its decision one level down (`{"decision": {...},
+/// "superseded_chain": [...], "code_refs": [...]}`). Read only at the top,
+/// every row was "Untitled — status=unknown () id=unknown" and no follow-up
+/// trace could be fetched (#403).
+fn unnest_trace_decision(item: &Value) -> Value {
+    match item.get("decision") {
+        Some(Value::Object(decision)) => {
+            let mut merged = decision.clone();
+            if let Some(outer) = item.as_object() {
+                for (key, value) in outer {
+                    if key != "decision" {
+                        merged.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+            }
+            Value::Object(merged)
+        }
+        _ => item.clone(),
     }
 }
 
@@ -13922,14 +13943,29 @@ pub(crate) fn render_decision_trace(query: &str, result: &Value) -> String {
             .or_else(|| decision.get("summary"))
             .and_then(Value::as_str)
             .unwrap_or("Untitled");
-        let date = decision
-            .get("created_at")
-            .and_then(Value::as_str)
+        let text_of = |key: &str| {
+            decision
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        };
+        let date = text_of("created_at")
+            .or_else(|| text_of("valid_from"))
             .unwrap_or("");
-        let status = decision
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
+        // Knowledge-node decisions carry no status: their supersession and
+        // end date say whether they still hold.
+        let status = match (
+            text_of("status"),
+            text_of("superseded_by"),
+            text_of("valid_until"),
+        ) {
+            (Some(status), _, _) => status.to_string(),
+            (None, Some(successor), _) => format!("superseded by {successor}"),
+            (None, None, Some(until)) => format!("ended {until}"),
+            // Current only when the decision says how long it holds.
+            (None, None, None) if decision.get("valid_from").is_some() => "current".to_string(),
+            (None, None, None) => "unknown".to_string(),
+        };
         let id = decision
             .get("id")
             .and_then(Value::as_str)
@@ -13942,6 +13978,7 @@ pub(crate) fn render_decision_trace(query: &str, result: &Value) -> String {
             .get("structured")
             .and_then(|value| value.get("rationale"))
             .and_then(Value::as_str)
+            .or_else(|| text_of("details"))
             .filter(|value| !value.trim().is_empty())
         {
             let preview: String = rationale.chars().take(160).collect();

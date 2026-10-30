@@ -66,6 +66,36 @@ pub struct ProjectsListInput {
     pub page_size: Option<i64>,
 }
 
+/// What an empty project list means. The API lists no projects for a
+/// workspace that does not exist or that these credentials cannot access, so
+/// an empty list for a named workspace is checked against the workspace itself:
+/// a missing or inaccessible one is an error (`Err`), as `workspace`, `memory`
+/// and `agents` report it, and an empty one says how to create a project with a
+/// tool that exists (#342).
+async fn empty_project_list(
+    client: &ContextStreamClient,
+    workspace_id: Option<Uuid>,
+) -> std::result::Result<String, String> {
+    const CREATE: &str = "Create one with project(action=\"create\", name=\"...\").";
+    let Some(id) = workspace_id else {
+        return Ok(format!("No projects found. {CREATE}"));
+    };
+    match client.get_workspace(id).await {
+        Ok(workspace) => Ok(format!(
+            "Workspace {} ({}) has no projects yet. {CREATE}",
+            workspace.name, workspace.id
+        )),
+        Err(error) => match error.code() {
+            mcp_types::ErrorCode::NotFound | mcp_types::ErrorCode::Forbidden => Err(format!(
+                "Workspace {id} was not found, or these credentials cannot access it ({error}). \
+                 workspace(action=\"list\") shows the workspaces you can use."
+            )),
+            // The workspace could not be checked; say only what is known.
+            _ => Ok(format!("No projects found in workspace {id}. {CREATE}")),
+        },
+    }
+}
+
 /// Projects list tool handler.
 pub struct ProjectsListTool {
     client: ContextStreamClient,
@@ -83,10 +113,22 @@ impl ToolHandler for ProjectsListTool {
         let input: ProjectsListInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
 
-        let workspace_id = input
+        // A workspace_id that is not a UUID was dropped, and the list fell back
+        // to the default workspace: another workspace's projects (#342).
+        let workspace_id = match input
             .workspace_id
-            .as_ref()
-            .and_then(|s| Uuid::parse_str(s).ok());
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            None => None,
+            Some(raw) => Some(Uuid::parse_str(raw).map_err(|_| {
+                Error::Validation(format!(
+                    "workspace_id \"{raw}\" is not a workspace ID (a UUID). \
+                     workspace(action=\"list\") shows yours."
+                ))
+            })?),
+        };
 
         let projects = self
             .client
@@ -96,7 +138,10 @@ impl ToolHandler for ProjectsListTool {
         let mut text = String::new();
 
         if projects.is_empty() {
-            text.push_str("No projects found. Create one with projects_create(name=\"...\").");
+            match empty_project_list(&self.client, workspace_id).await {
+                Ok(empty) => text.push_str(&empty),
+                Err(unreachable) => return Ok(ToolResult::error(unreachable)),
+            }
         } else {
             text.push_str(&format!("Found {} projects.\n\n", projects.len()));
 

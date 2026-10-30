@@ -6529,7 +6529,12 @@ fn parse_setup_ingest_job_progress(
 /// so "nothing was changed" was not quite true (#338). Offline, a timeout, a
 /// 5xx or a rate limit says nothing about the key; only a refusal does (#248).
 fn unattended_key_check_failure(error: &mcp_types::Error, api_url: &str) -> anyhow::Error {
-    if error.is_retryable() {
+    if let Some(refusal) = error.tls_refusal(api_url) {
+        anyhow::anyhow!(
+            "Could not verify the API key: {refusal}. {} No editor or saved credential was changed.",
+            mcp_types::error::TLS_HINT
+        )
+    } else if error.is_retryable() {
         anyhow::anyhow!(
             "Could not verify the API key: {api_url} did not answer ({error}). Check the \
              connection and re-run; no editor or saved credential was changed."

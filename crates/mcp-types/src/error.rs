@@ -222,6 +222,9 @@ impl Error {
     pub fn reach_message(&self, api_url: &str) -> String {
         const CHECK: &str =
             "Check the network connection, and CONTEXTSTREAM_API_URL if you set it.";
+        if let Some(refusal) = self.tls_refusal(api_url) {
+            return format!("{refusal}. {TLS_HINT}");
+        }
         match self {
             Self::Network(_) => {
                 format!("Could not reach ContextStream at {api_url} ({self}). {CHECK}")
@@ -231,6 +234,38 @@ impl Error {
             }
             _ => self.user_facing_message(),
         }
+    }
+}
+
+/// What usually makes a machine refuse ContextStream's TLS certificate (#369).
+pub const TLS_HINT: &str =
+    "An HTTPS-inspecting proxy or firewall, or a wrong CONTEXTSTREAM_API_URL, usually causes this.";
+
+impl Error {
+    /// "ContextStream at <url> answered with a TLS certificate this machine
+    /// does not accept (<why>)" when that is why a request failed. The server
+    /// answered, so "could not reach" sent people to check their network
+    /// connection (#369).
+    pub fn tls_refusal(&self, api_url: &str) -> Option<String> {
+        let Self::Network(message) = self else {
+            return None;
+        };
+        let (_, detail) = message.split_once("invalid peer certificate: ")?;
+        let detail = detail.trim();
+        let why = if detail.starts_with("certificate expired") {
+            "the certificate has expired".to_string()
+        } else if detail.starts_with("UnknownIssuer") {
+            "it is not signed by an authority this machine trusts".to_string()
+        } else if detail.starts_with("certificate not valid for name") {
+            "it is for another host name".to_string()
+        } else if detail.starts_with("certificate not valid yet") {
+            "the certificate is not valid yet".to_string()
+        } else {
+            detail.to_string()
+        };
+        Some(format!(
+            "ContextStream at {api_url} answered with a TLS certificate this machine does not accept ({why})"
+        ))
     }
 }
 
@@ -413,5 +448,40 @@ mod tests {
 
         assert!(!err.is_non_blocking_parser_error());
         assert_eq!(err.user_facing_message(), err.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tls_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_certificate_is_named_not_reported_as_unreachable() {
+        // #369: the server answered; "could not reach" sent people to their network.
+        let network = |detail: &str| {
+            Error::Network(format!(
+                "Connection failed: error sending request for url (https://x/api/v1/auth/me): invalid peer certificate: {detail}"
+            ))
+        };
+        let url = "https://api.example";
+        for (detail, why) in [
+            ("certificate expired: verification time 1 (UNIX), but certificate is not valid after 0 (1 seconds ago)", "the certificate has expired"),
+            ("UnknownIssuer", "it is not signed by an authority this machine trusts"),
+            ("certificate not valid for name \"x\"; certificate is only valid for DnsName(\"y\")", "it is for another host name"),
+        ] {
+            let error = network(detail);
+            assert_eq!(
+                error.tls_refusal(url).as_deref(),
+                Some(format!("ContextStream at {url} answered with a TLS certificate this machine does not accept ({why})").as_str())
+            );
+            let message = error.reach_message(url);
+            assert!(message.ends_with(TLS_HINT), "{message}");
+            assert!(!message.contains("Could not reach"), "{message}");
+        }
+        let refused = Error::Network("Connection failed: error sending request for url (http://127.0.0.1:9/): Connection refused (os error 111)".into());
+        assert_eq!(refused.tls_refusal(url), None);
+        assert!(refused
+            .reach_message(url)
+            .starts_with("Could not reach ContextStream at"));
     }
 }

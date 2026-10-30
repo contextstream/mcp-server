@@ -4369,8 +4369,13 @@ impl ContextStreamClient {
                 tokio::time::sleep(delay).await;
             }
 
+            // A request builder that holds an error (an API URL that does not
+            // parse) cannot be cloned; unwrapping it panicked (#369).
+            let Some(attempt_request) = req.try_clone() else {
+                return Err(unbuildable_request_error(&config.api_url, req));
+            };
             let attempt_started = std::time::Instant::now();
-            let sent = req.try_clone().unwrap().send().await;
+            let sent = attempt_request.send().await;
             record_api_attempt(attempt_started.elapsed());
             let response = match sent {
                 Ok(resp) => {
@@ -22682,6 +22687,19 @@ mod path_ingest_gate_tests {
     }
 }
 
+/// Why a request could not be built: almost always an API URL that does not
+/// parse (#369).
+fn unbuildable_request_error(api_url: &str, request: reqwest::RequestBuilder) -> Error {
+    let reason = request
+        .build()
+        .err()
+        .map(|error| describe_transport_error(&error))
+        .unwrap_or_else(|| "the request could not be prepared".to_string());
+    Error::Config(format!(
+        "the API URL \"{api_url}\" is not a valid URL ({reason}). Set CONTEXTSTREAM_API_URL to an http(s) URL such as https://api.contextstream.io, or unset it."
+    ))
+}
+
 /// A failed connection's text (#338).
 fn connect_failure(error: &reqwest::Error) -> String {
     format!("Connection failed: {}", describe_transport_error(error))
@@ -22711,6 +22729,23 @@ mod tests {
     #![allow(clippy::field_reassign_with_default)]
     use super::*;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn an_api_url_that_does_not_parse_is_an_error_not_a_panic() {
+        // #369: CONTEXTSTREAM_API_URL=not-a-url aborted the process.
+        let mut config = Config::default();
+        config.api_url = "not-a-url".to_string();
+        config.api_key = Some("cs_placeholder".to_string());
+        let error = ContextStreamClient::new(config)
+            .me()
+            .await
+            .expect_err("a URL that does not parse");
+        let message = error.to_string();
+        assert!(
+            message.contains("the API URL \"not-a-url\" is not a valid URL"),
+            "{message}"
+        );
+    }
 
     #[tokio::test]
     async fn list_tasks_rejects_missing_workspace_before_an_http_request() {

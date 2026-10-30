@@ -10412,6 +10412,7 @@ impl ToolHandler for SessionCaptureTool {
                 self.client.session_capture(params).await?
             }
         };
+        crate::domains::memory::ensure_write_answered(&result, "event")?;
         attach_scope_recovery_metadata(&mut result, &scope);
         let event_id = result
             .get("id")
@@ -12366,6 +12367,7 @@ impl ToolHandler for SessionCaptureLessonTool {
                 self.client.create_lesson(retry).await?
             }
         };
+        crate::domains::memory::ensure_write_answered(&result, "lesson")?;
         attach_scope_recovery_metadata(&mut result, &scope);
         if let (Some(_), Some(obj)) = (partial_note, result.as_object_mut()) {
             obj.insert(
@@ -13381,6 +13383,7 @@ impl ToolHandler for SessionRememberTool {
                 self.client.session_remember(params).await?
             }
         };
+        crate::domains::memory::ensure_write_answered(&result, "memory item")?;
         attach_scope_recovery_metadata(&mut result, &scope);
         let remember_id = result
             .get("id")

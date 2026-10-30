@@ -3169,3 +3169,27 @@ mod stored_text_tests {
         );
     }
 }
+
+mod unanswered_write_tests {
+    use super::ensure_write_answered;
+    use serde_json::json;
+
+    #[test]
+    fn an_empty_answer_to_a_create_is_not_a_confirmation() {
+        // #420: an empty 200 or {} read as "Node created (ID: unknown)".
+        for empty in [json!(null), json!({})] {
+            let error = ensure_write_answered(&empty, "node").expect_err("refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("nothing confirms the node was saved"),
+                "{error}"
+            );
+        }
+        assert!(ensure_write_answered(
+            &json!({"id": "11111111-1111-4111-8111-111111111111"}),
+            "node"
+        )
+        .is_ok());
+    }
+}

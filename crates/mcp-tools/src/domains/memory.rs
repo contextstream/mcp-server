@@ -570,6 +570,25 @@ fn format_transcript_matches(result: &Value, query: &str) -> String {
     text
 }
 
+/// A create the server answered with nothing (an empty body, `{}` or null)
+/// is not confirmed: a wrong API URL or a proxy can answer 200 to anything,
+/// and "created (ID: unknown)" read as saved (#420).
+pub(crate) fn ensure_write_answered(result: &Value, what: &str) -> Result<()> {
+    let empty = match result {
+        Value::Null => true,
+        Value::Object(fields) => fields.is_empty(),
+        _ => false,
+    };
+    if empty {
+        return Err(Error::Tool(format!(
+            "The server answered with nothing (no {what} id), so nothing confirms the \
+             {what} was saved. Check CONTEXTSTREAM_API_URL and any proxy in between, and list \
+             the {what}s before retrying."
+        )));
+    }
+    Ok(())
+}
+
 /// Format a collection of items into a human-readable list with IDs and titles.
 /// This allows the AI to see item details (especially IDs) so it can act on them.
 fn format_collection(entity_name: &str, value: &Value) -> String {
@@ -3019,6 +3038,7 @@ pub async fn execute_create_decision(
 
     match client.create_decision(params).await {
         Ok(mut result) => {
+            ensure_write_answered(&result, "decision")?;
             let id = result
                 .get("id")
                 .and_then(Value::as_str)
@@ -3103,6 +3123,7 @@ pub async fn execute_create_decision(
                     ..Default::default()
                 })
                 .await?;
+            ensure_write_answered(&capture, "decision")?;
             let event_id = capture
                 .get("id")
                 .and_then(Value::as_str)
@@ -3994,6 +4015,7 @@ impl ToolHandler for MemoryTool {
                     |client, params| async move { client.create_memory_node(params).await },
                 )
                 .await?;
+                ensure_write_answered(&result, "node")?;
                 attach_scope_recovery_metadata(&mut result, &scope);
                 let node_id = result
                     .get("id")
@@ -4898,6 +4920,7 @@ impl ToolHandler for MemoryTool {
                     |client, params| async move { client.create_task(params).await },
                 )
                 .await?;
+                ensure_write_answered(&result, "task")?;
                 attach_scope_recovery_metadata(&mut result, &scope);
                 let task_id = result
                     .get("id")
@@ -5252,6 +5275,7 @@ impl ToolHandler for MemoryTool {
                     |client, params| async move { client.create_todo(params).await },
                 )
                 .await?;
+                ensure_write_answered(&result, "todo")?;
                 attach_scope_recovery_metadata(&mut result, &scope);
                 let todo_id = result
                     .get("id")
@@ -5602,6 +5626,7 @@ impl ToolHandler for MemoryTool {
                     |client, params| async move { client.create_diagram(params).await },
                 )
                 .await?;
+                ensure_write_answered(&result, "diagram")?;
                 attach_scope_recovery_metadata(&mut result, &scope);
                 let diagram_id = result
                     .get("id")
@@ -5803,6 +5828,7 @@ impl ToolHandler for MemoryTool {
                     |client, params| async move { client.create_doc(params).await },
                 )
                 .await?;
+                ensure_write_answered(&result, "doc")?;
                 attach_scope_recovery_metadata(&mut result, &scope);
                 let doc_id = result
                     .get("id")
@@ -6131,6 +6157,7 @@ impl ToolHandler for MemoryTool {
                     |client, params| async move { client.create_roadmap(params).await },
                 )
                 .await?;
+                ensure_write_answered(&result, "roadmap")?;
                 attach_scope_recovery_metadata(&mut result, &scope);
                 let roadmap_id = result
                     .get("id")

@@ -10,8 +10,8 @@ use mcp_types::{
     has_stateless_protocol_metadata, legacy_initialize_instructions, stateless_discovery_teaching,
     tool::ToolAnnotations, validate_stateless_jsonrpc_envelope, validate_stateless_method_params,
     validate_stateless_request, Config, HarnessId, McpCacheScope, McpProtocolError,
-    ReadinessEvidenceSource, SessionKey, StatelessMcpConformance, MCP_PROTOCOL_2024_11_05,
-    MCP_PROTOCOL_2026_07_28, MCP_TOOLS_LIST_TTL_MS,
+    ReadinessEvidenceSource, SessionKey, StatelessMcpConformance, MCP_PROTOCOL_2026_07_28,
+    MCP_TOOLS_LIST_TTL_MS,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -1120,7 +1120,13 @@ async fn run_stdio_transport(
         }
         if legacy_initialize {
             client_can_elicit = mcp_tools::peer::CallPeer::client_can_elicit(&params);
-            client_protocol = mcp_tools::peer::CallPeer::initialize_protocol(&params);
+            // The revision both sides now speak, not just the one asked for.
+            client_protocol = Some(
+                mcp_types::negotiate_legacy_protocol_version(
+                    mcp_tools::peer::CallPeer::initialize_protocol(&params).as_deref(),
+                )
+                .to_string(),
+            );
         }
 
         let wire_observation = mcp_tools::wire_tokens::WireTokenObservation::default();
@@ -1368,11 +1374,12 @@ fn is_workflow_help_call(tool_name: &str, arguments: &serde_json::Value) -> bool
             .is_some_and(|action| action.eq_ignore_ascii_case("workflow"))
 }
 
-/// Build a legacy initialize result without overstating protocol support.
+/// Build an initialize-era result for `protocol_version`.
 ///
-/// Runtime callers pass [`MCP_PROTOCOL_2024_11_05`], for which `instructions`
-/// is intentionally absent. Newer legacy revisions may use this builder only
-/// after their complete transport behavior is implemented and negotiated.
+/// Runtime callers pass the revision `mcp_types::negotiate_legacy_protocol_version`
+/// chose, one this server implements (`MCP_LEGACY_SUPPORTED_VERSIONS`).
+/// `instructions` is sent only for a revision that defines it, and only while
+/// the protocol-teaching gate is on.
 pub(crate) fn build_legacy_initialize_result(
     registry: &ToolRegistry,
     protocol_version: &str,
@@ -1607,13 +1614,23 @@ async fn handle_request(
     request: serde_json::Value,
     wire_observation: mcp_tools::wire_tokens::WireTokenObservation,
 ) -> String {
+    if let Some(batch) = request.as_array() {
+        return handle_batch(
+            registry,
+            client,
+            session,
+            telemetry,
+            batch,
+            wire_observation,
+        )
+        .await;
+    }
     let Some(message) = request.as_object() else {
-        let reason = if request.is_array() {
-            "batches are not supported; send one JSON-RPC message per line"
-        } else {
-            "a message must be a JSON-RPC object"
-        };
-        return json_rpc_error(None, -32600, &format!("Invalid Request: {reason}"));
+        return json_rpc_error(
+            None,
+            -32600,
+            "Invalid Request: a message must be a JSON-RPC object",
+        );
     };
     let id = message.get("id").cloned();
     let method = message.get("method").cloned();
@@ -1665,6 +1682,82 @@ async fn handle_request(
         (_, None) => String::new(),
         (Some(_), id) => json_rpc_error(id, -32600, "Invalid Request: \"method\" must be a string"),
         (None, id) => json_rpc_error(id, -32600, "Invalid Request: missing \"method\""),
+    }
+}
+
+/// Why a batch member is refused: a batch holds initialize-era requests,
+/// notifications and responses only (2025-03-26: initialize "MUST NOT be part
+/// of a JSON-RPC batch"; the stateless revision has no batches).
+pub(crate) fn batch_member_refusal(member: &serde_json::Value) -> Option<&'static str> {
+    let Some(message) = member.as_object() else {
+        return Some("Invalid Request: a batch holds JSON-RPC message objects");
+    };
+    let method = message.get("method").and_then(serde_json::Value::as_str);
+    if method == Some("initialize") {
+        return Some("Invalid Request: initialize cannot be part of a batch; send it alone");
+    }
+    if method == Some("server/discover")
+        || message
+            .get("params")
+            .is_some_and(has_stateless_protocol_metadata)
+    {
+        return Some(
+            "Invalid Request: a stateless (2026-07-28) request cannot be part of a batch; send it alone",
+        );
+    }
+    None
+}
+
+/// One stdio JSON-RPC batch. MCP 2025-03-26 requires receiving batches and
+/// 2025-06-18 removed them; stdio carries no header that tells the two apart,
+/// so any initialize-era batch is taken. Each member is answered as if it came
+/// alone and the answers go back as one array, or nothing when every member
+/// was a notification or a response (JSON-RPC 2.0 section 6).
+async fn handle_batch(
+    registry: &Arc<ToolRegistry>,
+    client: &Arc<ContextStreamClient>,
+    session: &Arc<SessionManager>,
+    telemetry: &AgenticTelemetry,
+    batch: &[serde_json::Value],
+    wire_observation: mcp_tools::wire_tokens::WireTokenObservation,
+) -> String {
+    if batch.is_empty() {
+        return json_rpc_error(
+            None,
+            -32600,
+            "Invalid Request: an empty batch; send at least one JSON-RPC message",
+        );
+    }
+    let mut answers = Vec::new();
+    for member in batch {
+        let answer = match batch_member_refusal(member) {
+            Some(reason) => json_rpc_error(member.get("id").cloned(), -32600, reason),
+            // A client's response to a server request needs no answer.
+            None if member.get("method").is_none()
+                && (member.get("result").is_some() || member.get("error").is_some()) =>
+            {
+                String::new()
+            }
+            None => {
+                Box::pin(handle_request(
+                    registry,
+                    client,
+                    session,
+                    telemetry,
+                    member.clone(),
+                    wire_observation.clone(),
+                ))
+                .await
+            }
+        };
+        if !answer.is_empty() {
+            answers.push(answer);
+        }
+    }
+    if answers.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]", answers.join(","))
     }
 }
 
@@ -1853,8 +1946,12 @@ async fn handle_request_dispatch(
             registry
                 .apply_initialize_surface_profile(surface_profile_from_initialize_params(&params));
             telemetry.update_initialize_hints(&params).await;
-            let mut result =
-                build_legacy_initialize_result(registry, MCP_PROTOCOL_2024_11_05, &params);
+            let protocol_version = mcp_types::negotiate_legacy_protocol_version(
+                params
+                    .get("protocolVersion")
+                    .and_then(serde_json::Value::as_str),
+            );
+            let mut result = build_legacy_initialize_result(registry, protocol_version, &params);
             // Stdio can tell the client when the Slipstream listing changes (see
             // `slipstream_list_changed_notice`); read the catalog now so the tools/list that
             // follows finds it ready.
@@ -2843,6 +2940,7 @@ async fn handle_router_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp_types::MCP_PROTOCOL_2024_11_05;
 
     fn test_registry(mut config: Config) -> ToolRegistry {
         config.api_key = Some("test-api-key".to_string());
@@ -4072,8 +4170,6 @@ mod tests {
             assert_eq!(response, "", "{notification}");
         }
 
-        let batch =
-            "Invalid Request: batches are not supported; send one JSON-RPC message per line";
         let no_name = "Invalid params: tools/call requires \"name\", the tool to run";
         for (message, id, code, reason) in [
             (
@@ -4092,13 +4188,7 @@ mod tests {
                 serde_json::json!([]),
                 serde_json::Value::Null,
                 -32600,
-                batch,
-            ),
-            (
-                serde_json::json!([{"jsonrpc": "2.0", "id": 32, "method": "ping"}]),
-                serde_json::Value::Null,
-                -32600,
-                batch,
+                "Invalid Request: an empty batch; send at least one JSON-RPC message",
             ),
             (
                 serde_json::json!("just a string"),
@@ -4134,6 +4224,106 @@ mod tests {
             assert_eq!(response["error"]["code"], code, "{message}");
             assert_eq!(response["error"]["message"], reason, "{message}");
         }
+    }
+
+    async fn stdio_answer(message: serde_json::Value) -> String {
+        let (registry, client, session, telemetry) = protocol_test_runtime();
+        handle_request(
+            &registry,
+            &client,
+            &session,
+            &telemetry,
+            message,
+            mcp_tools::wire_tokens::WireTokenObservation::default(),
+        )
+        .await
+    }
+
+    // #316: initialize answered 2024-11-05 whatever the client asked for.
+    #[tokio::test]
+    async fn stdio_initialize_answers_the_asked_revision_or_the_newest() {
+        for (asked, answered) in [
+            (Some("2024-11-05"), "2024-11-05"),
+            (Some("2025-03-26"), "2025-03-26"),
+            (Some("2025-06-18"), "2025-06-18"),
+            (Some("2025-11-25"), "2025-11-25"),
+            (Some("2099-01-01"), "2025-11-25"),
+            (Some("2024-10-07"), "2025-11-25"),
+            (None, "2024-11-05"),
+        ] {
+            let mut params = serde_json::json!({
+                "capabilities": {},
+                "clientInfo": {"name": "negotiation-test", "version": "1.0.0"}
+            });
+            if let Some(asked) = asked {
+                params["protocolVersion"] = serde_json::json!(asked);
+            }
+            let answer: serde_json::Value = serde_json::from_str(
+                &stdio_answer(serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params
+                }))
+                .await,
+            )
+            .unwrap();
+            assert_eq!(answer["result"]["protocolVersion"], answered, "{asked:?}");
+            // The teaching gate is off: no revision adds instructions.
+            assert!(answer["result"].get("instructions").is_none(), "{asked:?}");
+        }
+    }
+
+    // MCP 2025-03-26 requires receiving JSON-RPC batches.
+    #[tokio::test]
+    async fn stdio_answers_a_batch_member_by_member() {
+        let answer = stdio_answer(serde_json::json!([
+            {"jsonrpc": "2.0", "id": 32, "method": "ping"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 9, "result": {}},
+            {"jsonrpc": "2.0", "id": "b", "method": "ping"},
+            {"jsonrpc": "2.0", "id": 33, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
+            {"jsonrpc": "2.0", "id": 34, "method": "server/discover"},
+            [{"jsonrpc": "2.0", "id": 35, "method": "ping"}],
+            {"jsonrpc": "2.0", "id": 36}
+        ]))
+        .await;
+        let answers: Vec<serde_json::Value> = serde_json::from_str(&answer).unwrap();
+        let ids: Vec<_> = answers.iter().map(|answer| answer["id"].clone()).collect();
+        assert_eq!(
+            ids,
+            [
+                serde_json::json!(32),
+                serde_json::json!("b"),
+                serde_json::json!(33),
+                serde_json::json!(34),
+                serde_json::Value::Null,
+                serde_json::json!(36)
+            ]
+        );
+        assert_eq!(answers[0]["result"], serde_json::json!({}));
+        assert_eq!(answers[1]["result"], serde_json::json!({}));
+        for (answer, says) in [
+            (&answers[2], "initialize cannot be part of a batch"),
+            (
+                &answers[3],
+                "a stateless (2026-07-28) request cannot be part of a batch",
+            ),
+            (&answers[4], "a batch holds JSON-RPC message objects"),
+            (&answers[5], "missing \"method\""),
+        ] {
+            assert_eq!(answer["error"]["code"], -32600, "{answer}");
+            assert!(
+                answer["error"]["message"].as_str().unwrap().contains(says),
+                "{answer}"
+            );
+        }
+        // Notifications and responses only: nothing to answer.
+        assert_eq!(
+            stdio_answer(serde_json::json!([
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 9, "result": {}}
+            ]))
+            .await,
+            ""
+        );
     }
 
     #[tokio::test]

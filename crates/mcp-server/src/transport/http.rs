@@ -132,7 +132,7 @@ pub struct ListParams {
 }
 
 /// Query parameters for MCP streamable endpoint.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct McpQueryParams {
     pub default_context_mode: Option<String>,
 }
@@ -142,8 +142,6 @@ const DEFAULT_PUBLIC_API_ORIGIN: &str = "https://api.contextstream.io";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const MCP_METHOD_HEADER: &str = "mcp-method";
 const MCP_NAME_HEADER: &str = "mcp-name";
-const LEGACY_HTTP_PROTOCOL_VERSIONS: &[&str] =
-    &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 const DEFAULT_ALLOWED_MCP_CLIENT_ORIGINS: &[&str] = &[
     "https://contextstream.io",
     "https://www.contextstream.io",
@@ -226,7 +224,7 @@ fn plain_routing_header_is_valid(value: &str) -> bool {
 
 fn protocol_header_uses_stateless_contract(headers: &HeaderMap) -> bool {
     header_value(headers, MCP_PROTOCOL_VERSION_HEADER)
-        .is_some_and(|version| !LEGACY_HTTP_PROTOCOL_VERSIONS.contains(&version))
+        .is_some_and(|version| !mcp_types::MCP_LEGACY_SUPPORTED_VERSIONS.contains(&version))
 }
 
 fn uses_stateless_http_contract(headers: &HeaderMap, request: &JsonRpcRequest) -> bool {
@@ -446,6 +444,9 @@ enum IncomingMcpMessage {
     /// The client's answer to a server request. Nothing waits for one, so it
     /// is accepted with no body.
     Response,
+    /// A JSON-RPC batch from a client of MCP 2025-03-26 or older; its members
+    /// are read one by one (`serve_mcp_batch`).
+    Batch(Vec<Value>),
 }
 
 /// Why a POST body is not one usable JSON-RPC message, answered as a
@@ -544,6 +545,30 @@ fn incoming_mcp_message(
             format!("Parse error: {err}"),
         )
     })?;
+    if let Value::Array(batch) = value {
+        if batch.is_empty() {
+            return Err(MalformedMessage::new(
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+                JSONRPC_INVALID_REQUEST,
+                "Invalid Request: an empty batch; send at least one JSON-RPC message",
+            ));
+        }
+        // 2025-03-26 requires receiving batches; 2025-06-18 removed them.
+        let version = header_value(headers, MCP_PROTOCOL_VERSION_HEADER);
+        if !mcp_types::legacy_protocol_takes_batches(version) {
+            return Err(MalformedMessage::new(
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+                JSONRPC_INVALID_REQUEST,
+                format!(
+                    "Invalid Request: MCP {} has no batches; send one JSON-RPC message per request",
+                    version.unwrap_or_default()
+                ),
+            ));
+        }
+        return Ok(IncomingMcpMessage::Batch(batch));
+    }
     jsonrpc_message_from_value(value).map_err(|(id, reason)| {
         MalformedMessage::new(
             StatusCode::BAD_REQUEST,
@@ -559,12 +584,7 @@ fn incoming_mcp_message(
 fn jsonrpc_message_from_value(value: Value) -> Result<IncomingMcpMessage, (Value, &'static str)> {
     let mut message = match value {
         Value::Object(message) => message,
-        Value::Array(_) => {
-            return Err((
-                Value::Null,
-                "batches are not supported; send one JSON-RPC message per request",
-            ))
-        }
+        Value::Array(_) => return Err((Value::Null, "a batch holds JSON-RPC message objects")),
         _ => return Err((Value::Null, "the body must be one JSON-RPC message object")),
     };
     let id = match message.remove("id") {
@@ -994,7 +1014,9 @@ async fn handle_jsonrpc(
 /// - Supports both initialize-era clients and the stateless 2026-07-28 contract
 /// - Returns `Mcp-Session-Id` only for legacy initialize
 /// - Notifications (no `id`) and client responses get 202 Accepted
-/// - A body that is not one JSON-RPC message gets a JSON-RPC error
+/// - A JSON-RPC batch from a 2025-03-26 or older client is answered member by
+///   member (`serve_mcp_batch`)
+/// - A body that is not a JSON-RPC message gets a JSON-RPC error
 async fn handle_mcp_streamable(
     State(state): State<HttpState>,
     Query(query): Query<McpQueryParams>,
@@ -1002,11 +1024,87 @@ async fn handle_mcp_streamable(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let request = match incoming_mcp_message(&headers, body) {
-        Ok(IncomingMcpMessage::Request(request)) => request,
-        Ok(IncomingMcpMessage::Response) => return StatusCode::ACCEPTED.into_response(),
-        Err(malformed) => return malformed.into_response(),
+    match incoming_mcp_message(&headers, body) {
+        Ok(IncomingMcpMessage::Request(request)) => {
+            serve_mcp_message(state, query, matched_path, headers, request).await
+        }
+        Ok(IncomingMcpMessage::Response) => StatusCode::ACCEPTED.into_response(),
+        Ok(IncomingMcpMessage::Batch(batch)) => {
+            serve_mcp_batch(state, query, matched_path, headers, batch).await
+        }
+        Err(malformed) => malformed.into_response(),
+    }
+}
+
+/// A JSON-RPC batch (MCP 2025-03-26). Each member takes the path a message
+/// sent alone takes, and the answers go back as one JSON array, or 202 when no
+/// member needed one. initialize and stateless requests are refused inside a
+/// batch. A member refused at the HTTP level (a disallowed Origin, a missing
+/// Accept) refuses the whole batch the same way.
+async fn serve_mcp_batch(
+    state: HttpState,
+    query: McpQueryParams,
+    matched_path: Option<MatchedPath>,
+    headers: HeaderMap,
+    batch: Vec<Value>,
+) -> Response {
+    let refused = |id: Value, message: String| {
+        json!({"jsonrpc": "2.0", "id": id,
+               "error": {"code": JSONRPC_INVALID_REQUEST, "message": message}})
     };
+    let mut answers = Vec::new();
+    for member in batch {
+        if let Some(reason) = crate::server::batch_member_refusal(&member) {
+            let id = member.get("id").cloned().unwrap_or(Value::Null);
+            answers.push(refused(id, reason.to_string()));
+            continue;
+        }
+        let request = match jsonrpc_message_from_value(member) {
+            Ok(IncomingMcpMessage::Request(request)) => request,
+            Ok(_) => continue,
+            Err((id, reason)) => {
+                answers.push(refused(id, format!("Invalid Request: {reason}")));
+                continue;
+            }
+        };
+        let response = serve_mcp_message(
+            state.clone(),
+            query.clone(),
+            matched_path.clone(),
+            headers.clone(),
+            request,
+        )
+        .await;
+        match response.status() {
+            StatusCode::ACCEPTED => {}
+            StatusCode::OK => {
+                let answer = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                match answer {
+                    Some(answer) => answers.push(answer),
+                    None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }
+            _ => return response,
+        }
+    }
+    if answers.is_empty() {
+        StatusCode::ACCEPTED.into_response()
+    } else {
+        Json(Value::Array(answers)).into_response()
+    }
+}
+
+/// One JSON-RPC request or notification at a Streamable HTTP path.
+async fn serve_mcp_message(
+    state: HttpState,
+    query: McpQueryParams,
+    matched_path: Option<MatchedPath>,
+    headers: HeaderMap,
+    request: JsonRpcRequest,
+) -> Response {
     // Integration-specific endpoints (/chatgpt, /claude, /client) must expose
     // the full ContextStream tool surface regardless of client auto-detection,
     // so the app/plugin has complete parity with the local MCP tool; /coach
@@ -2622,9 +2720,12 @@ async fn handle_initialize_method(
 ) -> Result<Value, JsonRpcError> {
     log_unrecognized_client(params);
     let registry = effective_registry(state).await;
+    let protocol_version = mcp_types::negotiate_legacy_protocol_version(
+        params.get("protocolVersion").and_then(Value::as_str),
+    );
     Ok(build_legacy_initialize_result(
         &registry,
-        mcp_types::MCP_PROTOCOL_2024_11_05,
+        protocol_version,
         params,
     ))
 }
@@ -4357,6 +4458,137 @@ mod tests {
         assert!(response["result"].get("resultType").is_none());
     }
 
+    async fn post_mcp(body: Value, protocol_header: Option<&str>) -> Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(version) = protocol_header {
+            request = request.header("mcp-protocol-version", version);
+        }
+        create_router(create_protocol_test_state())
+            .oneshot(
+                request
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    // #316: initialize answered 2024-11-05 whatever the client asked for.
+    #[tokio::test]
+    async fn http_initialize_answers_the_asked_revision_or_the_newest() {
+        for (asked, answered) in [
+            ("2024-11-05", "2024-11-05"),
+            ("2025-03-26", "2025-03-26"),
+            ("2025-06-18", "2025-06-18"),
+            ("2025-11-25", "2025-11-25"),
+            ("2099-01-01", "2025-11-25"),
+        ] {
+            let response = post_mcp(
+                json!({"jsonrpc": "2.0", "id": "init", "method": "initialize", "params": {
+                    "protocolVersion": asked, "capabilities": {},
+                    "clientInfo": {"name": "negotiation-test", "version": "1.0.0"}}}),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{asked}");
+            assert!(response.headers().contains_key("mcp-session-id"), "{asked}");
+            let response = json_response(response).await;
+            assert_eq!(response["result"]["protocolVersion"], answered, "{asked}");
+            assert!(response["result"].get("instructions").is_none(), "{asked}");
+        }
+        // The negotiated revision then rides every request in its header and
+        // is served as initialize-era, never as the stateless contract.
+        for version in mcp_types::MCP_LEGACY_SUPPORTED_VERSIONS {
+            let response = post_mcp(
+                json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+                Some(version),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{version}");
+            assert_eq!(
+                json_response(response).await["result"],
+                json!({}),
+                "{version}"
+            );
+        }
+        // An unsupported one is refused with 400 (2025-06-18, transports).
+        let response = post_mcp(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+            Some("2099-01-01"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // MCP 2025-03-26 requires receiving JSON-RPC batches; 2025-06-18 removed them.
+    #[tokio::test]
+    async fn http_answers_a_batch_from_a_2025_03_26_client_and_refuses_one_after() {
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 5, "method": "ping"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 7, "result": {}},
+            {"jsonrpc": "2.0", "id": "six", "method": "ping"},
+            {"jsonrpc": "2.0", "id": 8, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
+            [{"jsonrpc": "2.0", "id": 9, "method": "ping"}],
+            {"jsonrpc": "2.0", "id": 10}
+        ]);
+        for header in [None, Some("2025-03-26"), Some("2024-11-05")] {
+            let response = post_mcp(batch.clone(), header).await;
+            assert_eq!(response.status(), StatusCode::OK, "{header:?}");
+            let answers = json_response(response).await;
+            let answers = answers
+                .as_array()
+                .expect("a batch is answered with an array");
+            let ids: Vec<_> = answers.iter().map(|answer| answer["id"].clone()).collect();
+            assert_eq!(
+                ids,
+                [json!(5), json!("six"), json!(8), Value::Null, json!(10)],
+                "{header:?}"
+            );
+            assert_eq!(answers[0]["result"], json!({}));
+            assert_eq!(answers[1]["result"], json!({}));
+            for (answer, says) in [
+                (&answers[2], "initialize cannot be part of a batch"),
+                (&answers[3], "a batch holds JSON-RPC message objects"),
+                (&answers[4], "missing \"method\""),
+            ] {
+                assert_eq!(answer["error"]["code"], -32600, "{answer}");
+                assert!(
+                    answer["error"]["message"].as_str().unwrap().contains(says),
+                    "{answer}"
+                );
+            }
+        }
+        // Notifications and responses only: 202 with no body.
+        let response = post_mcp(
+            json!([
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 7, "result": {}}
+            ]),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        // A client of 2025-06-18 or later has no batches.
+        for version in ["2025-06-18", "2025-11-25"] {
+            let response = post_mcp(batch.clone(), Some(version)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{version}");
+            let body = json_response(response).await;
+            assert_eq!(body["error"]["code"], -32600);
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("has no batches"),
+                "{body}"
+            );
+        }
+    }
+
     // #287: a body that is not one JSON-RPC request gets a JSON-RPC error with
     // a short reason, never framework text, and a client's response gets 202.
     #[tokio::test]
@@ -4423,16 +4655,12 @@ mod tests {
         .await;
 
         let (id, code, message) = error_of(
-            post(
-                "application/json",
-                r#"[{"jsonrpc":"2.0","id":5,"method":"ping"},{"jsonrpc":"2.0","id":6,"method":"ping"}]"#,
-            )
-            .await,
+            post("application/json", "[]").await,
             StatusCode::BAD_REQUEST,
         )
         .await;
         assert_eq!((id, code), (Value::Null, -32600));
-        assert!(message.contains("batches are not supported"), "{message}");
+        assert!(message.contains("an empty batch"), "{message}");
 
         let (id, code, message) = error_of(
             post("application/json", "{nope").await,

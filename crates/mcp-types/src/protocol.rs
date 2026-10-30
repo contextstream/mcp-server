@@ -7,7 +7,10 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::harness_teaching::MCP_PROTOCOL_2026_07_28;
+use crate::harness_teaching::{
+    MCP_PROTOCOL_2024_11_05, MCP_PROTOCOL_2025_03_26, MCP_PROTOCOL_2025_06_18,
+    MCP_PROTOCOL_2025_11_25, MCP_PROTOCOL_2026_07_28,
+};
 
 pub const MCP_META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 pub const MCP_META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
@@ -22,6 +25,47 @@ pub const MCP_DISCOVERY_TTL_MS: u64 = 300_000;
 pub const MCP_TOOLS_LIST_TTL_MS: u64 = 60_000;
 
 pub const MCP_STATELESS_SUPPORTED_VERSIONS: &[&str] = &[MCP_PROTOCOL_2026_07_28];
+
+/// The initialize-era revisions this server implements, newest first. Each is
+/// claimed only for what its server side requires: 2025-03-26 receiving
+/// JSON-RPC batches, 2025-06-18 refusing them and answering an unsupported
+/// `MCP-Protocol-Version` with 400, 2025-11-25 answering a disallowed `Origin`
+/// with 403. The rest of those revisions is optional or the client's.
+pub const MCP_LEGACY_SUPPORTED_VERSIONS: &[&str] = &[
+    MCP_PROTOCOL_2025_11_25,
+    MCP_PROTOCOL_2025_06_18,
+    MCP_PROTOCOL_2025_03_26,
+    MCP_PROTOCOL_2024_11_05,
+];
+
+/// The revision an `initialize` answers with, from the one its client asked
+/// for: that one when it is supported, else the newest supported one (MCP
+/// lifecycle, version negotiation). A client that names none predates the
+/// negotiation and gets the oldest. It always answered 2024-11-05, whatever
+/// was asked (mcp-server#316).
+pub fn negotiate_legacy_protocol_version(requested: Option<&str>) -> &'static str {
+    match requested
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+    {
+        None => MCP_PROTOCOL_2024_11_05,
+        Some(requested) => MCP_LEGACY_SUPPORTED_VERSIONS
+            .iter()
+            .copied()
+            .find(|version| *version == requested)
+            .unwrap_or(MCP_LEGACY_SUPPORTED_VERSIONS[0]),
+    }
+}
+
+/// Whether a request that names `version` in `MCP-Protocol-Version` may be a
+/// JSON-RPC batch. 2025-03-26 requires receiving batches, 2025-06-18 removed
+/// them, and a client of 2025-03-26 or older sends no header at all (`None`).
+pub fn legacy_protocol_takes_batches(version: Option<&str>) -> bool {
+    matches!(
+        version,
+        None | Some(MCP_PROTOCOL_2024_11_05 | MCP_PROTOCOL_2025_03_26)
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpCacheScope {
@@ -336,6 +380,54 @@ pub fn build_stateless_discover_result(instructions: Option<String>) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn initialize_answers_the_asked_revision_when_supported_and_the_newest_otherwise() {
+        for version in MCP_LEGACY_SUPPORTED_VERSIONS {
+            assert_eq!(negotiate_legacy_protocol_version(Some(version)), *version);
+        }
+        for unsupported in [
+            "2099-01-01",
+            "2024-10-07",
+            "2025-01-01",
+            "2026-07-28",
+            "latest",
+        ] {
+            assert_eq!(
+                negotiate_legacy_protocol_version(Some(unsupported)),
+                MCP_PROTOCOL_2025_11_25,
+                "{unsupported}"
+            );
+        }
+        assert_eq!(
+            negotiate_legacy_protocol_version(None),
+            MCP_PROTOCOL_2024_11_05
+        );
+        assert_eq!(
+            negotiate_legacy_protocol_version(Some(" ")),
+            MCP_PROTOCOL_2024_11_05
+        );
+        // Newest first, so the fallback is the newest.
+        let mut sorted = MCP_LEGACY_SUPPORTED_VERSIONS.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(sorted, MCP_LEGACY_SUPPORTED_VERSIONS);
+    }
+
+    #[test]
+    fn batches_are_taken_up_to_2025_03_26_only() {
+        assert!(legacy_protocol_takes_batches(None));
+        assert!(legacy_protocol_takes_batches(Some(MCP_PROTOCOL_2024_11_05)));
+        assert!(legacy_protocol_takes_batches(Some(MCP_PROTOCOL_2025_03_26)));
+        assert!(!legacy_protocol_takes_batches(Some(
+            MCP_PROTOCOL_2025_06_18
+        )));
+        assert!(!legacy_protocol_takes_batches(Some(
+            MCP_PROTOCOL_2025_11_25
+        )));
+        assert!(!legacy_protocol_takes_batches(Some(
+            MCP_PROTOCOL_2026_07_28
+        )));
+    }
+
     use super::*;
 
     fn params(version: &str) -> Value {

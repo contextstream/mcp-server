@@ -102,6 +102,59 @@ pub struct SkillInput {
     pub folder_path: Option<String>,
 }
 
+/// The formats `import` reads.
+const IMPORT_FORMATS: &[&str] = &[
+    "auto",
+    "json",
+    "markdown",
+    "skills_md",
+    "cursorrules",
+    "claude_md",
+    "aider",
+    "zip",
+];
+
+/// What an import did (#399): the counts (duplicates apart from skills the
+/// quality check refused), the skills created, and that drafts do not
+/// trigger until activated.
+fn import_result_text(result: &Value) -> String {
+    let count = |key: &str| result.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let (imported, skipped, rejected) = (count("imported"), count("skipped"), count("rejected"));
+    let mut text = format!("Import complete: {imported} imported, {skipped} skipped as duplicates");
+    if rejected > 0 {
+        text.push_str(&format!(", {rejected} refused by the quality check"));
+    }
+    text.push('.');
+    let skills = result
+        .get("skills")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut drafts = Vec::new();
+    for skill in skills.iter().take(20) {
+        let name = skill.get("name").and_then(Value::as_str).unwrap_or("?");
+        let status = skill
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("active");
+        text.push_str(&format!("\n- {name} ({status})"));
+        if status.eq_ignore_ascii_case("draft") {
+            drafts.push(name);
+        }
+    }
+    if let Some(first) = drafts.first() {
+        text.push_str(&format!(
+            "\nDrafts do not trigger until activated: skill(action=\"update\", name=\"{first}\", status=\"active\")."
+        ));
+    }
+    if imported == 0 && skipped == 0 && rejected == 0 {
+        text.push_str(
+            "\nNo skill could be read from the content. Markdown makes one skill per \"## \" section; json takes {\"skills\": [...]}.",
+        );
+    }
+    text
+}
+
 /// Skill tool handler.
 pub struct SkillTool {
     client: ContextStreamClient,
@@ -952,12 +1005,22 @@ impl SkillTool {
                 "Either 'content' or 'file_path' is required for import".to_string(),
             ));
         };
+        // Nothing to import, and a format outside the list, are refused
+        // rather than answered "Import complete: 0 imported" (#399).
+        if content.trim().is_empty() {
+            return Err(Error::Validation(
+                "The content to import is empty: there is nothing to import.".to_string(),
+            ));
+        }
+        let format =
+            crate::input_shape::enum_argument("format", input.format.clone(), IMPORT_FORMATS)
+                .map_err(Error::Validation)?;
 
         let result = self
             .client
             .import_skills(ImportSkillParams {
                 content,
-                format: input.format.clone(),
+                format,
                 source_tool: input.source_tool.clone(),
                 source_file: input.source_file.clone().or(input.file_path.clone()),
                 scope: input.scope.clone(),
@@ -965,13 +1028,10 @@ impl SkillTool {
             })
             .await?;
 
-        let imported = result.get("imported").and_then(|v| v.as_u64()).unwrap_or(0);
-        let skipped = result.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0);
-
-        Ok(ToolResult::text(format!(
-            "Import complete: {} imported, {} skipped (duplicates).",
-            imported, skipped
-        )))
+        Ok(ToolResult::with_structured(
+            import_result_text(&result),
+            result,
+        ))
     }
 
     async fn handle_export(&self, input: &SkillInput) -> Result<ToolResult> {
@@ -2266,5 +2326,35 @@ mod tests {
             None
         );
         assert_eq!(untouched, "Execution: completed");
+    }
+}
+
+#[cfg(test)]
+mod import_result_tests {
+    use super::import_result_text;
+    use serde_json::json;
+
+    #[test]
+    fn an_import_names_what_it_created_and_how_to_activate_drafts() {
+        // #399: "Import complete: 0 imported, 0 skipped (duplicates)." and nothing else.
+        let result = json!({"imported": 1, "skipped": 0, "rejected": 1,
+            "skills": [{"name": "always-run-koala-unit-tests", "status": "draft"}]});
+        let text = import_result_text(&result);
+        assert!(text.starts_with("Import complete: 1 imported, 0 skipped as duplicates, 1 refused by the quality check."), "{text}");
+        assert!(
+            text.contains("\n- always-run-koala-unit-tests (draft)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "skill(action=\"update\", name=\"always-run-koala-unit-tests\", status=\"active\")"
+            ),
+            "{text}"
+        );
+        let nothing = import_result_text(&json!({"imported": 0, "skipped": 0}));
+        assert!(
+            nothing.contains("No skill could be read from the content."),
+            "{nothing}"
+        );
     }
 }

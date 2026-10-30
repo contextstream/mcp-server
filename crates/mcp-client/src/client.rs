@@ -22173,67 +22173,42 @@ fn normalize_smart_search_result_item(item: &mut serde_json::Value) {
         return;
     };
 
-    let title = obj
-        .get("title")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            obj.get("name")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            obj.get("summary")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            obj.get("content_preview")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            obj.get("content")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| value.chars().take(80).collect::<String>())
-        });
+    // Memory search rows keep their title, text and kind under `metadata`
+    // (`summary`, `details`, `node_type`). Read only at the top level, every
+    // row came out "[KnowledgeNode] Untitled" (#394).
+    let field = |key: &str| -> Option<String> {
+        obj.get(key)
+            .or_else(|| obj.get("metadata").and_then(|metadata| metadata.get(key)))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let title = field("title")
+        .or_else(|| field("name"))
+        .or_else(|| field("summary"))
+        .or_else(|| field("content_preview"))
+        .or_else(|| field("content").map(|value| value.chars().take(80).collect::<String>()));
+    let item_type = field("type")
+        .or_else(|| field("node_type"))
+        .or_else(|| field("event_type"))
+        .or_else(|| field("doc_type"))
+        .or_else(|| field("result_type"));
+    let preview = field("preview")
+        .or_else(|| field("details"))
+        .or_else(|| field("content_preview"))
+        .or_else(|| field("content"))
+        .filter(|preview| Some(preview) != title.as_ref())
+        .map(|preview| preview.chars().take(200).collect::<String>());
 
     if let Some(title) = title {
         obj.insert("title".to_string(), serde_json::Value::String(title));
     }
-
-    let item_type = obj
-        .get("type")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            obj.get("node_type")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            obj.get("event_type")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            obj.get("result_type")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-        });
-
     if let Some(item_type) = item_type {
         obj.insert("type".to_string(), serde_json::Value::String(item_type));
+    }
+    if let Some(preview) = preview {
+        obj.insert("preview".to_string(), serde_json::Value::String(preview));
     }
 }
 
@@ -28352,6 +28327,29 @@ mod tests {
             None
         );
         assert_eq!(infer_memory_query_node_type("auth rollout status"), None);
+    }
+
+    #[test]
+    fn smart_search_rows_take_title_kind_and_preview_from_metadata() {
+        // #394: every row read "[KnowledgeNode] Untitled".
+        let normalized = normalize_session_smart_search_response(serde_json::json!({
+            "memory_results": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "result_type": "KnowledgeNode",
+                "metadata": {
+                    "node_type": "decision",
+                    "summary": "The bilby cache uses Redis",
+                    "details": "We decided the bilby cache uses Redis with a 5 minute TTL."
+                }
+            }]
+        }));
+        let row = &normalized["results"][0];
+        assert_eq!(row["title"], "The bilby cache uses Redis");
+        assert_eq!(row["type"], "decision");
+        assert_eq!(
+            row["preview"],
+            "We decided the bilby cache uses Redis with a 5 minute TTL."
+        );
     }
 
     #[test]

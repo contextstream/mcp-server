@@ -9269,8 +9269,8 @@ async fn run_search_for_mode(
                 attempt,
                 SearchMode::Keyword,
                 Some(
-                    "fuzzy mode is only available on hosted/remote deployments; \
-                     fell back to keyword search."
+                    "fuzzy search is not available on this deployment, so these are \
+                     keyword results."
                         .to_string(),
                 ),
             )
@@ -9282,8 +9282,8 @@ async fn run_search_for_mode(
                 attempt,
                 SearchMode::Semantic,
                 Some(
-                    "vector mode is only available on hosted/remote deployments; \
-                     fell back to semantic search."
+                    "filtered vector search is not available on this deployment, so \
+                     these are semantic results."
                         .to_string(),
                 ),
             )
@@ -11519,8 +11519,10 @@ impl SearchTool {
 
         // Fuzzy mode short-circuit: route directly to the atlas product
         // layer's fuzzy-search provider when available. Falls through to keyword
-        // search with a degradation note when the compatibility layer is absent.
-        if matches!(requested_mode, SearchMode::Fuzzy) {
+        // search with a degradation note when the compatibility layer is absent
+        // (it answered an empty page saying fuzzy is "only available on hosted"
+        // on the hosted gateway, #374).
+        if matches!(requested_mode, SearchMode::Fuzzy) && self.atlas_layer.search().is_some() {
             let workspace_id = input
                 .workspace_id
                 .as_ref()
@@ -11539,8 +11541,9 @@ impl SearchTool {
         }
 
         // Vector mode short-circuit: route to the legacy vector provider with
-        // metadata filters parsed out of the query.
-        if matches!(requested_mode, SearchMode::Vector) {
+        // metadata filters parsed out of the query. Without one, semantic
+        // search answers instead (#374).
+        if matches!(requested_mode, SearchMode::Vector) && self.atlas_layer.vector().is_some() {
             let workspace_id = input
                 .workspace_id
                 .as_ref()
@@ -14317,8 +14320,16 @@ impl SearchTool {
         // This is deliberately the first operation at the public handler
         // boundary: JSON decoding and every subsequent prework await count.
         let handler_started = Instant::now();
-        let input: SearchInput =
+        let mut input: SearchInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
+        // An output_format the API cannot read came back as its raw
+        // "Failed to deserialize the JSON body" 400 (#374).
+        input.output_format = crate::input_shape::enum_argument(
+            "output_format",
+            input.output_format.take(),
+            &["full", "paths", "minimal", "count"],
+        )
+        .map_err(Error::Validation)?;
         let explicitly_guided = input
             .mode
             .as_deref()

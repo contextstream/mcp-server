@@ -24,6 +24,12 @@ use crate::schema::SchemaBuilder;
 pub struct WorkspacesListInput {
     pub page: Option<i64>,
     pub page_size: Option<i64>,
+    /// The paging every other list takes (#454): they were dropped, so
+    /// limit=5 listed 20 and offset=500 listed page 1.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 /// "Found 3 workspaces:" when the page holds them all; otherwise how many of
@@ -88,10 +94,14 @@ impl ToolHandler for WorkspacesListTool {
         let input: WorkspacesListInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
 
-        let listed = self
-            .client
-            .list_workspaces_page(input.page, input.page_size)
-            .await?;
+        let (page, page_size) = super::project::requested_page(
+            input.page,
+            input.page_size,
+            input.limit,
+            input.offset,
+            20,
+        );
+        let listed = self.client.list_workspaces_page(page, page_size).await?;
         let workspaces = &listed.items;
 
         let mut text = String::new();
@@ -146,6 +156,8 @@ impl ToolHandler for WorkspacesListTool {
             .description("List workspaces")
             .integer("page", "Page number", false)
             .integer("page_size", "Results per page", false)
+            .integer("limit", "Results per page (same as page_size)", false)
+            .integer("offset", "Where the page starts, with limit", false)
             .build()
     }
 }
@@ -241,6 +253,11 @@ pub struct WorkspaceInput {
     pub workspace_id: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
+    /// list: the paging every other list takes (#454).
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
     // Associate fields
     pub folder_path: Option<String>,
     // Bootstrap fields
@@ -278,6 +295,8 @@ impl ToolHandler for WorkspaceTool {
                 let list_input = WorkspacesListInput {
                     page: input.page,
                     page_size: input.page_size,
+                    limit: input.limit,
+                    offset: input.offset,
                 };
                 let tool = WorkspacesListTool::new(self.client.clone());
                 tool.execute(serde_json::to_value(&list_input).unwrap()).await
@@ -497,6 +516,16 @@ impl ToolHandler for WorkspaceTool {
             .integer(
                 "page_size",
                 "Results per page (for list/team_members)",
+                false,
+            )
+            .integer(
+                "limit",
+                "Results per page (for list; same as page_size)",
+                false,
+            )
+            .integer(
+                "offset",
+                "Where the page starts, with limit (for list)",
                 false,
             )
             // Associate fields

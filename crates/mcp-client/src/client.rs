@@ -14282,6 +14282,27 @@ impl ContextStreamClient {
         status: Option<String>,
         limit: Option<i64>,
     ) -> Result<serde_json::Value> {
+        self.list_tasks_filtered(
+            workspace_id,
+            project_id,
+            plan_id,
+            status,
+            limit,
+            &TaskListFilters::default(),
+        )
+        .await
+    }
+
+    /// List tasks with date filters (#412).
+    pub async fn list_tasks_filtered(
+        &self,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        plan_id: Option<Uuid>,
+        status: Option<String>,
+        limit: Option<i64>,
+        filters: &TaskListFilters,
+    ) -> Result<serde_json::Value> {
         let config = self.config.read().await;
         let ws_id = workspace_id.or(config.default_workspace_id).ok_or_else(|| {
             Error::Validation(
@@ -14308,6 +14329,18 @@ impl ContextStreamClient {
         }
         if let Some(offset) = list_offset() {
             params.push(format!("offset={offset}"));
+        }
+        for (key, value) in [
+            ("created_after", &filters.created_after),
+            ("created_before", &filters.created_before),
+            ("completed_after", &filters.completed_after),
+            ("completed_before", &filters.completed_before),
+            ("due_after", &filters.due_after),
+            ("due_before", &filters.due_before),
+        ] {
+            if let Some(value) = value.as_deref().filter(|value| !value.trim().is_empty()) {
+                params.push(format!("{key}={}", urlencoding::encode(value.trim())));
+            }
         }
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));
@@ -20380,6 +20413,17 @@ impl CreateTaskParams {
             "project_id": project_id,
         }))
     }
+}
+
+/// Date filters for listing tasks (#412): RFC 3339 times, sent as given.
+#[derive(Debug, Clone, Default)]
+pub struct TaskListFilters {
+    pub created_after: Option<String>,
+    pub created_before: Option<String>,
+    pub completed_after: Option<String>,
+    pub completed_before: Option<String>,
+    pub due_after: Option<String>,
+    pub due_before: Option<String>,
 }
 
 /// Update task parameters.

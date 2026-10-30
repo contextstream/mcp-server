@@ -31,6 +31,7 @@ pub mod ticket;
 pub use cache::{Cache, CacheKey};
 pub use client::resolve_capsule_share_token_str;
 pub use client::SessionRefreshHook;
+pub use client::TaskListFilters;
 pub use client::MEDIA_INDEX_MAX_BYTES;
 pub use client::{
     entity_kind_to_path,

@@ -3060,3 +3060,17 @@ mod superseded_marker_tests {
         );
     }
 }
+
+mod blocked_reason_tests {
+    use super::{format_collection, format_task_detail};
+    use serde_json::json;
+
+    #[test]
+    fn a_blocked_task_shows_why() {
+        // #413: get_task and list_tasks never showed the reason.
+        let task = json!({"id": "t1", "title": "Ship release", "status": "blocked", "priority": "medium", "blocked_reason": "waiting on QA"});
+        assert!(format_task_detail(&task).contains("\nBlocked: waiting on QA"));
+        let list = json!([task]);
+        assert!(format_collection("tasks", &list).contains("— blocked (waiting on QA)"));
+    }
+}

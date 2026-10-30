@@ -37,7 +37,8 @@ use uuid::Uuid;
 
 use super::api::{unreachable, CALL_TIMEOUT};
 use super::words::{clip, credits};
-use super::{parse_id, StudioInput, StudioTool, ELICIT_TIMEOUT, MAX_PROMPT_CHARS};
+use super::{parse_id, StudioInput, StudioTool, ELICIT_TIMEOUT, MAX_PROMPT_CHARS, TOOL_NAME};
+use crate::domains::destructive::DELETE_TOOL;
 use crate::peer::{self, Elicited};
 
 /// The email actions, as `VALID_ACTIONS` lists them.
@@ -56,10 +57,19 @@ pub(crate) const EMAIL_ACTIONS: &[&str] = &[
     "email_unsubscribes",
 ];
 
+/// Erasing a contact, which `delete` calls (`studio.email_contact_erase`). It cannot be
+/// undone, so it runs only through `delete` (#334's rule), never as an `email_contacts`
+/// operation, and isn't listed among the studio's actions.
+pub(crate) const ERASE_ACTION: &str = "email_contact_erase";
+/// `email_contacts` operations that would erase a contact.
+const ERASE_OPERATIONS: &[&str] = &["remove", "erase", "delete"];
+
 /// Where the studio is, for links a person can open.
 pub(crate) const STUDIO_APP: &str = "https://ctxproduct.com";
 /// Where the team connects Resend: the key, the domains and the sender.
 pub(crate) const CONNECT_URL: &str = "https://ctxproduct.com/studio/email/settings";
+/// Where a person erases a contact themselves (the ContextStudio connector has no `delete`).
+pub(crate) const AUDIENCES_URL: &str = "https://ctxproduct.com/studio/email/audiences";
 
 /// Said when email isn't offered to the caller.
 pub(crate) const NOT_OFFERED: &str = "Email isn't offered to this account yet: it opens with one-prompt making, team by team. Nothing was sent or changed.";
@@ -100,7 +110,7 @@ const MAX_NOTE_CHARS: usize = 500;
 const LINK_REUSE_HOURS: i64 = 24;
 /// The subjects of an A/B test, by variant.
 const VARIANT_LABELS: [&str; 3] = ["A", "B", "C"];
-const CONTACT_OPERATIONS: &[&str] = &["list", "add", "remove", "unsubscribe"];
+const CONTACT_OPERATIONS: &[&str] = &["list", "add", "unsubscribe"];
 const SUPPRESSION_OPERATIONS: &[&str] = &["list", "add", "remove"];
 const CONSENT_SOURCES: &[&str] = &["manual", "form", "api"];
 const SUPPRESSION_REASONS: &[&str] = &["unsubscribed", "bounced", "complained", "manual"];
@@ -374,8 +384,21 @@ pub(crate) fn address_of(raw: &str) -> Option<String> {
     plausible.then_some(address)
 }
 
-/// The one address an operation is about (`email`).
-fn one_address(input: &StudioInput, action: &str, operation: &str) -> Result<String> {
+/// The refusal for `email_contacts` asked to erase a contact, worded as #334's refusals are:
+/// it cannot be undone, so it runs only through `delete`.
+pub(crate) fn erase_refusal(input: &StudioInput) -> Option<String> {
+    let operation = input.operation.as_deref()?.trim().to_lowercase();
+    ERASE_OPERATIONS.contains(&operation.as_str()).then(|| {
+        format!(
+            "email_contacts(operation=\"{operation}\") cannot be undone, so it runs only through the `{DELETE_TOOL}` tool: \
+             call {DELETE_TOOL} with action=\"{TOOL_NAME}.{ERASE_ACTION}\" and the same email, after confirming with the person. \
+             Where there is no `{DELETE_TOOL}` tool (the ContextStudio connector), the person erases the contact in the studio: {AUDIENCES_URL}"
+        )
+    })
+}
+
+/// The one address a call is about (`email`); `call` names it.
+fn one_address(input: &StudioInput, call: &str) -> Result<String> {
     let raw = input
         .email
         .as_deref()
@@ -383,7 +406,7 @@ fn one_address(input: &StudioInput, action: &str, operation: &str) -> Result<Str
         .filter(|e| !e.is_empty())
         .ok_or_else(|| {
             Error::Validation(format!(
-                "email is required for {action} with operation {operation}: the address it is about"
+                "email is required for {call}: the address it is about"
             ))
         })?;
     address_of(raw).ok_or_else(|| Error::Validation(format!("{raw} isn't an email address")))
@@ -722,6 +745,13 @@ fn campaign_state(campaign: &Value) -> String {
 impl StudioTool {
     /// The email actions: offered only where Create's catalog has an `email` block.
     pub(super) async fn email(&self, action: &str, input: &StudioInput) -> Result<ToolResult> {
+        // Erasing can't be undone, so it runs only through `delete`: refused before anything
+        // is asked of anyone.
+        if action == "email_contacts" {
+            if let Some(refusal) = erase_refusal(input) {
+                return Err(Error::Validation(refusal));
+            }
+        }
         // Before anything is asked of anyone: a key never travels, not even to Create.
         if serde_json::to_value(input).is_ok_and(|raw| holds_resend_key(&raw)) {
             return Ok(ToolResult::error(KEY_REFUSED.to_string()));
@@ -745,6 +775,7 @@ impl StudioTool {
             "email_duplicate" => self.email_duplicate(workspace_id, input).await,
             "email_contacts" => self.email_contacts(workspace_id, input).await,
             "email_unsubscribes" => self.email_unsubscribes(workspace_id, input).await,
+            ERASE_ACTION => self.erase_contact(workspace_id, input).await,
             other => Err(Error::Validation(format!("Unknown email action: {other}"))),
         }
     }
@@ -2153,9 +2184,8 @@ impl StudioTool {
         )?;
         match operation.as_str() {
             "add" => self.add_contacts(workspace_id, input).await,
-            "remove" => self.erase_contact(workspace_id, input).await,
             "unsubscribe" => {
-                let email = one_address(input, "email_contacts", "unsubscribe")?;
+                let email = one_address(input, "email_contacts with operation unsubscribe")?;
                 self.suppress(workspace_id, input, vec![email]).await
             }
             _ => self.list_contacts(workspace_id, input).await,
@@ -2484,16 +2514,20 @@ impl StudioTool {
             })))
     }
 
+    /// Erases a contact: `delete` with `studio.email_contact_erase`, after the person's go.
     async fn erase_contact(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
-        let email = one_address(input, "email_contacts", "remove")?;
+        let email = one_address(
+            input,
+            &format!("{DELETE_TOOL}(action=\"{TOOL_NAME}.{ERASE_ACTION}\")"),
+        )?;
         let contact = match self.contact_by_address(workspace_id, &email).await? {
             Ok(Some(contact)) => contact,
             Ok(None) => {
                 return Ok(ToolResult::error(format!(
-                    "Not removed: there is no contact {email} in this workspace."
+                    "Not erased: there is no contact {email} in this workspace."
                 )))
             }
-            Err(refused) => return Ok(ToolResult::error(format!("Not removed: {refused}"))),
+            Err(refused) => return Ok(ToolResult::error(format!("Not erased: {refused}"))),
         };
         let id = text(&contact, "id").unwrap_or_default();
         let id = parse_id(&id, "contact id")?;
@@ -2507,7 +2541,7 @@ impl StudioTool {
             .await?;
         if !answer.is_success() {
             return Ok(ToolResult::error(format!(
-                "Not removed: {}",
+                "Not erased: {}",
                 email_refusal(&answer, Topic::Other)
             )));
         }
@@ -2740,7 +2774,7 @@ impl StudioTool {
 
     /// Takes an address off the suppression list, only with the person's go.
     async fn unsuppress(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
-        let email = one_address(input, "email_unsubscribes", "remove")?;
+        let email = one_address(input, "email_unsubscribes with operation remove")?;
         let answer = self
             .email_call(
                 "GET",

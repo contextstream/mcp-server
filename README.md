@@ -127,7 +127,8 @@ to pick.
   mockups (desktop, tablet and phone, light and dark, images on or off), with the inbox line
   and what to check. `email_revise` changes a draft from plain words ("shorter subject") or
   sets its subject and preview line; `email_duplicate` makes a draft copy. `email_contacts`
-  lists, adds (with where they agreed to hear from you), erases or unsubscribes contacts;
+  lists, adds (with where they agreed to hear from you) or unsubscribes contacts; erasing one
+  can't be undone, so it is the `delete` tool's (`studio.email_contact_erase`), after your go;
   `email_unsubscribes` shows the suppression list with why and when, and takes an address off
   it only with your go. Resend is connected in the studio, never through an agent: the tool
   refuses anything shaped like a Resend key.

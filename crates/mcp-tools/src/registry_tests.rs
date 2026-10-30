@@ -1514,4 +1514,27 @@ mod destructive_split_tests {
             .unwrap();
         assert!(text_of(&listed).contains("Executed workspace"));
     }
+
+    #[test]
+    fn a_tool_listed_per_caller_does_not_bring_delete_by_itself() {
+        // #335 review: in router mode only `studio` is a direct tool, and the
+        // router surface stays as it was.
+        let config = create_complete_config();
+        let mut registry = ToolRegistry::new(&config);
+        registry.register("studio", Arc::new(MockTool::new("studio")));
+        crate::domains::destructive::register_delete_tool(&mut registry);
+        assert!(registry.get("delete").is_none());
+
+        registry.register("workspace", Arc::new(MockTool::new("workspace")));
+        crate::domains::destructive::register_delete_tool(&mut registry);
+        let listed = &registry.get("delete").unwrap().input_schema["properties"]["action"]["enum"];
+        assert!(listed
+            .as_array()
+            .unwrap()
+            .contains(&json!("studio.email_contact_erase")));
+        assert!(listed
+            .as_array()
+            .unwrap()
+            .contains(&json!("workspace.delete")));
+    }
 }

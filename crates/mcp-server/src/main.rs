@@ -1178,6 +1178,8 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
         }
 
         Some(Commands::VerifyKey { json }) => {
+            // Checking a key writes no installation state (#341).
+            mcp_client::activation::set_installation_state_persistence_enabled(false);
             run_verify_key(json).await?;
         }
 

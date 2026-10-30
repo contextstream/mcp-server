@@ -236,7 +236,10 @@ mod validation_tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("workspace_id \"invalid-uuid\" is not a workspace ID (a UUID)"));
     }
 
     #[tokio::test]
@@ -373,7 +376,10 @@ mod validation_tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("workspace_id \"invalid-uuid\" is not a workspace ID (a UUID)"));
     }
 }
 

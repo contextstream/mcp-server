@@ -753,10 +753,8 @@ mod helper_tests {
         let err = missing_project_scope_error("ingest_local", None, Some("/tmp/example"));
         let text = err.to_string();
 
-        assert!(text.contains("workspace_id is required"));
-        assert!(text.contains("project_id is required"));
-        assert!(text.contains("ingest_local"));
-        assert!(text.contains("No active workspace scope"));
+        assert!(text.contains("project_id is required for ingest_local."));
+        assert!(text.contains("No workspace is in scope either"));
         assert!(text.contains("init(folder_path=\"/tmp/example\")"));
     }
 
@@ -1160,6 +1158,41 @@ mod metadata_tests {
         assert_eq!(metadata.name, "projects_index");
         assert_eq!(metadata.title, "Index Project");
         assert_eq!(metadata.category, ToolCategory::Project);
+    }
+
+    #[tokio::test]
+    async fn a_project_or_workspace_id_that_is_not_one_is_refused_not_dropped() {
+        // #372: it was dropped and the call fell back to the session's scope.
+        let client = create_mock_client();
+        let session = create_mock_session(&client);
+        let tool = ProjectTool::new(client, session);
+        for (args, expected) in [
+            (
+                serde_json::json!({"action": "get", "project_id": "x"}),
+                "project_id \"x\" is not a project ID (a UUID). project(action=\"list\") shows yours.",
+            ),
+            (
+                serde_json::json!({"action": "overview", "workspace_id": "not-a-uuid"}),
+                "workspace_id \"not-a-uuid\" is not a workspace ID (a UUID). workspace(action=\"list\") shows yours.",
+            ),
+        ] {
+            let message = tool
+                .execute(args.clone())
+                .await
+                .expect_err(&args.to_string())
+                .to_string();
+            assert!(message.contains(expected), "{args}: {message}");
+        }
+        // A placeholder is still read as no id.
+        if let Err(error) = tool
+            .execute(serde_json::json!({"action": "get", "project_id": "<current_project_id>"}))
+            .await
+        {
+            assert!(
+                !error.to_string().contains("is not a project ID"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1830,7 +1863,7 @@ mod validation_tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Invalid project_id"));
+            .contains("project_id \"not-a-uuid\" is not a project ID (a UUID)"));
     }
 
     #[tokio::test]
@@ -2042,11 +2075,11 @@ mod validation_tests {
     }
 
     #[tokio::test]
-    async fn test_project_tool_get_invalid_uuid_treated_as_missing() {
+    async fn test_project_tool_get_invalid_uuid_is_refused_not_treated_as_missing() {
         let tool = make_project_tool();
 
-        // Note: Invalid UUIDs are silently ignored (and_then with .ok()),
-        // so they're treated as missing, triggering "required" error
+        // #372: an invalid UUID was dropped and the call fell back to the
+        // session's scope; it is refused, naming the value.
         let result = tool
             .execute(json!({
                 "action": "get",
@@ -2055,11 +2088,10 @@ mod validation_tests {
             .await;
 
         assert!(result.is_err());
-        // Invalid UUID is treated as None, so we get "required" error
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("project_id is required"));
+            .contains("project_id \"not-a-uuid\" is not a project ID (a UUID)"));
     }
 }
 

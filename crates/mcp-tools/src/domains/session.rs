@@ -4,8 +4,8 @@
 mod recall_supplements;
 
 use crate::domains::scope_resolution::{
-    self, classify_scope_id_arg, with_scope_repair, ScopeIdArg, ScopeRepair, UnmatchedFolderScope,
-    SCOPE_REPAIRS_KEY,
+    self, classify_scope_id_arg, refuse_malformed_scope_id, with_scope_repair, ScopeRepair,
+    UnmatchedFolderScope, SCOPE_REPAIRS_KEY,
 };
 use async_trait::async_trait;
 use mcp_client::{
@@ -1394,19 +1394,6 @@ fn resolve_init_project_name(result: &Value, local_project_name: Option<String>)
 // ============================================================================
 // Init Tool
 // ============================================================================
-
-/// Text sent as an id that is neither an id nor a placeholder. init used to
-/// drop it and bind the session to the account's default workspace without a
-/// word (#353; #342 was the same for project list), so it is refused before
-/// anything is bound.
-fn refuse_malformed_scope_id(field: &str, kind: &str, arg: &ScopeIdArg) -> Result<()> {
-    match arg {
-        ScopeIdArg::Malformed(raw) => Err(Error::Validation(format!(
-            "{field} \"{raw}\" is not a {kind} ID (a UUID). {kind}(action=\"list\") shows yours."
-        ))),
-        _ => Ok(()),
-    }
-}
 
 /// The body `POST /lessons/:id/supersede` takes: the existing lesson that
 /// replaces this one. The server read `successor_id` as nothing and answered

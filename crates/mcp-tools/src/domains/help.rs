@@ -262,6 +262,53 @@ fn value_string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Makes the catalog the session's own (#352): the catalog's entries for the
+/// tools the session lists, and an entry from each other listed tool's own
+/// metadata, so `delete`, the read-only twins and the per-action tools are in
+/// it, and a tool the session does not have is not. `category` filters the
+/// added entries as the catalog filters its own.
+fn match_listed_tools(
+    result: &mut Value,
+    listed: &[crate::registry::ListedTool],
+    category: Option<&str>,
+) {
+    let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let tool_name = |tool: &Value| tool.get("name").and_then(Value::as_str).map(str::to_owned);
+    tools.retain(|tool| {
+        tool_name(tool).is_some_and(|name| listed.iter().any(|listed| listed.name == name))
+    });
+    let described: Vec<String> = tools.iter().filter_map(tool_name).collect();
+    let category = category.map(str::trim).filter(|value| !value.is_empty());
+    for tool in listed {
+        if described.contains(&tool.name) || category.is_some_and(|c| c != tool.category) {
+            continue;
+        }
+        tools.push(serde_json::json!({
+            "name": tool.name,
+            "category": tool.category,
+            "description": first_sentence(&tool.description),
+        }));
+    }
+}
+
+/// The first sentence (or line) of a tool description, at most 200 characters.
+fn first_sentence(text: &str) -> String {
+    let text = text.trim();
+    let end = [text.find(". ").map(|at| at + 1), text.find('\n')]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(text.len());
+    let sentence = text[..end].trim();
+    if sentence.chars().count() <= 200 {
+        return sentence.to_string();
+    }
+    let cut: String = sentence.chars().take(199).collect();
+    format!("{}…", cut.trim_end())
+}
+
 fn render_tool_catalog(result: &Value, format: &str) -> String {
     let tools = result
         .get("tools")
@@ -432,10 +479,13 @@ impl ToolHandler for HelpTool {
 
         match action.as_str() {
             "tools" => {
-                let result = self
+                let mut result = self
                     .client
                     .help_tools(input.category.as_deref(), input.format.as_deref())
                     .await?;
+                if let Some(listed) = crate::registry::listed_tools() {
+                    match_listed_tools(&mut result, &listed, input.category.as_deref());
+                }
                 let format = input.format.as_deref().unwrap_or("grouped");
                 Ok(ToolResult::with_structured(
                     render_tool_catalog(&result, format),

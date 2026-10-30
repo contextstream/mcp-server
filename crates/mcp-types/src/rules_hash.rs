@@ -277,6 +277,34 @@ pub fn canonical_rules_hash() -> Option<&'static str> {
     Some(CANONICAL_RULES_HASH.get_or_init(provider).as_str())
 }
 
+/// What `help(action="editor_rules")` asks the rules generator to preview.
+#[derive(Debug, Clone, Default)]
+pub struct EditorRulesPreviewRequest {
+    /// Editor ids (`claude`, `cursor`, …); empty or `all` means every editor.
+    pub editors: Vec<String>,
+    /// The checkout whose project rules are previewed as well.
+    pub folder_path: Option<String>,
+    pub workspace_id: Option<String>,
+    pub workspace_name: Option<String>,
+    pub project_name: Option<String>,
+}
+
+static EDITOR_RULES_PREVIEWER: OnceLock<fn(&EditorRulesPreviewRequest) -> String> = OnceLock::new();
+
+/// Register the editor-rules previewer. The rules generator lives in
+/// `mcp-server` (setup), so it registers this at startup next to the hash
+/// provider, and `mcp-tools` reads it through [`preview_editor_rules`] (#393).
+pub fn set_editor_rules_previewer(previewer: fn(&EditorRulesPreviewRequest) -> String) {
+    let _ = EDITOR_RULES_PREVIEWER.set(previewer);
+}
+
+/// The preview text, or `None` when no previewer is registered.
+pub fn preview_editor_rules(request: &EditorRulesPreviewRequest) -> Option<String> {
+    EDITOR_RULES_PREVIEWER
+        .get()
+        .map(|previewer| previewer(request))
+}
+
 /// Scan `project_root` for the first known rules file that carries an
 /// embedded `<!-- contextstream-rules-hash: ... -->` marker, and return
 /// the hash. Returns `None` when no rules file is present, or when the

@@ -555,6 +555,13 @@ impl ToolHandler for HelpTool {
 
             "editor_rules" => {
                 let workspace_id = Self::parse_workspace_id(&input.workspace_id)?;
+                let preview_request = mcp_types::rules_hash::EditorRulesPreviewRequest {
+                    editors: input.editors.clone().unwrap_or_default(),
+                    folder_path: input.folder_path.clone(),
+                    workspace_id: workspace_id.map(|id| id.to_string()),
+                    workspace_name: input.workspace_name.clone(),
+                    project_name: input.project_name.clone(),
+                };
                 let params = EditorRulesParams {
                     editors: input.editors,
                     mode: input.mode,
@@ -568,12 +575,19 @@ impl ToolHandler for HelpTool {
                     include_pre_compact: input.include_pre_compact,
                     include_post_write: input.include_post_write,
                 };
-                let result = self.client.help_editor_rules(params).await?;
-
-                Ok(ToolResult::with_structured(
-                    "Editor rules preview generated; no files or hooks were changed.".to_string(),
-                    result,
-                ))
+                let mut result = self.client.help_editor_rules(params).await?;
+                // The preview itself (#393): it said "preview generated" and
+                // showed nothing.
+                let text = match mcp_types::rules_hash::preview_editor_rules(&preview_request) {
+                    Some(preview) => {
+                        if let Some(object) = result.as_object_mut() {
+                            object.insert("preview".to_string(), Value::String(preview.clone()));
+                        }
+                        preview
+                    }
+                    None => "No editor rules preview is available in this process; no files or hooks were changed. `contextstream-mcp update-rules` writes the rules.".to_string(),
+                };
+                Ok(ToolResult::with_structured(text, result))
             }
 
             "enable_bundle" => {

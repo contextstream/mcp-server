@@ -11,7 +11,7 @@ use anyhow::Result;
 use mcp_types::{build_harness_teaching, HarnessTeachingDelivery, HARNESS_TEACHING_VERSION};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -811,6 +811,187 @@ fn record_taught_evidence(editor: &Editor) {
 /// every reader observes the identical value an eager install produced.
 pub fn install_canonical_rules_hash() {
     mcp_types::rules_hash::set_canonical_rules_hash_provider(owned_canonical_rules_bundle_hash);
+    mcp_types::rules_hash::set_editor_rules_previewer(preview_editor_rules);
+}
+
+/// The `help(action="editor_rules")` preview (#393): for each requested
+/// editor, the file its rules go to and what `update-rules` would do there,
+/// and, when one editor is asked for, the block itself. On the hosted gateway
+/// (local files denied) installed files are not read: they would be the
+/// gateway's, not the caller's.
+fn preview_editor_rules(request: &mcp_types::rules_hash::EditorRulesPreviewRequest) -> String {
+    let read_installed = !mcp_client::local_files_denied();
+    let wants_all = request.editors.is_empty()
+        || request
+            .editors
+            .iter()
+            .any(|editor| editor.trim().eq_ignore_ascii_case("all"));
+    let mut editors: Vec<Editor> = Vec::new();
+    let mut unknown: Vec<&str> = Vec::new();
+    if wants_all {
+        editors.extend(Editor::all().iter().copied());
+    } else {
+        for name in &request.editors {
+            match Editor::from_id(name.trim()) {
+                Some(editor) if !editors.contains(&editor) => editors.push(editor),
+                Some(_) => {}
+                None => unknown.push(name.as_str()),
+            }
+        }
+    }
+    let project = request.folder_path.as_deref().map(Path::new);
+    // The checkout's own binding names its workspace and project, as
+    // `update-rules --scope project` would use it, when the call does not.
+    let bound = project
+        .filter(|_| read_installed)
+        .and_then(|project| super::read_project_config(project).ok().flatten());
+    let workspace_id = request.workspace_id.clone().or_else(|| {
+        bound
+            .as_ref()
+            .and_then(|config| config.workspace_id.clone())
+    });
+    let workspace_name = request.workspace_name.clone().or_else(|| {
+        bound
+            .as_ref()
+            .and_then(|config| config.workspace_name.clone())
+    });
+    let project_name = request.project_name.clone().or_else(|| {
+        bound
+            .as_ref()
+            .and_then(|config| config.project_name.clone())
+    });
+    let mut lines = Vec::new();
+    let mut shown_block: Option<(String, String)> = None;
+    for editor in &editors {
+        let mut targets = Vec::new();
+        if let Some(path) = editor.all_rules_paths(None).into_iter().next() {
+            targets.push(("global", path, global_rules_content(editor)));
+        }
+        if let Some(project) = project {
+            if let Some(path) = editor.all_rules_paths(Some(project)).into_iter().next() {
+                let content = project_rules_content(
+                    editor,
+                    workspace_id.as_deref(),
+                    workspace_name.as_deref(),
+                    project_name.as_deref(),
+                );
+                targets.push(("project", path, content));
+            }
+        }
+        for (scope, path, content) in targets {
+            let block = stamp_block_with_canonical_rules_hash(&content);
+            let path = if read_installed {
+                resolve_rules_file_path(&path)
+            } else {
+                path
+            };
+            let state = if read_installed {
+                installed_rules_state(&path, &block)
+            } else {
+                format!(
+                    "update-rules writes a {}-character block here",
+                    block.chars().count()
+                )
+            };
+            let shown_path = home_relative(&path);
+            lines.push(format!(
+                "- {} ({scope}): {shown_path} — {state}",
+                editor.display_name()
+            ));
+            if editors.len() == 1 && (shown_block.is_none() || scope == "project") {
+                shown_block = Some((shown_path, block));
+            }
+        }
+    }
+
+    let mut text = if read_installed {
+        String::from(
+            "Editor rules preview: no files or hooks were changed. `contextstream-mcp update-rules` writes these (add `--scope project` for the checkout's files); restart the editor afterwards.\n",
+        )
+    } else {
+        String::from(
+            "Editor rules preview from the hosted gateway (no files or hooks were changed), which cannot see your files: this is what `contextstream-mcp update-rules` writes, not a comparison with what is installed. Run it on your machine to update them.\n",
+        )
+    };
+    if lines.is_empty() && unknown.is_empty() {
+        text.push_str("No editor rules files to preview.\n");
+    }
+    for line in &lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    if !unknown.is_empty() {
+        text.push_str(&format!(
+            "Unknown editor(s): {}. Known: {}.\n",
+            unknown.join(", "),
+            Editor::all()
+                .iter()
+                .map(Editor::id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    match shown_block {
+        Some((path, block)) => text.push_str(&format!(
+            "\nThe block for {path} ({} characters):\n\n{block}",
+            block.chars().count()
+        )),
+        None if editors.len() > 1 => {
+            text.push_str("\nPass editors=[\"<id>\"] (one editor) to see the block itself.")
+        }
+        None => {}
+    }
+    text
+}
+
+/// What `update-rules` would do to the rules file at `path`, given the block
+/// it writes: nothing, add it, or change the installed block (by how many
+/// lines).
+fn installed_rules_state(path: &Path, block: &str) -> String {
+    let size = block.chars().count();
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return format!("not installed; update-rules would add a {size}-character block");
+    };
+    if find_contextstream_block_bounds(&existing).is_none() {
+        return format!(
+            "no ContextStream block yet; update-rules would add a {size}-character block"
+        );
+    }
+    match render_contextstream_block_for_path(path, &existing, block) {
+        Ok(updated) if updated == existing => "up to date".to_string(),
+        Ok(updated) => {
+            let (added, removed) = line_changes(&existing, &updated);
+            format!(
+                "out of date; update-rules would change the block (+{added} −{removed} lines, {} → {} characters in the file)",
+                existing.chars().count(),
+                updated.chars().count()
+            )
+        }
+        Err(error) => format!("cannot be updated as it stands: {error}"),
+    }
+}
+
+/// Lines `after` adds and `before` loses, counted as multisets: a summary of
+/// the change, not a diff.
+fn line_changes(before: &str, after: &str) -> (usize, usize) {
+    let mut counts: HashMap<&str, isize> = HashMap::new();
+    for line in before.lines() {
+        *counts.entry(line).or_default() -= 1;
+    }
+    for line in after.lines() {
+        *counts.entry(line).or_default() += 1;
+    }
+    let added = counts.values().filter(|count| **count > 0).sum::<isize>();
+    let removed = -counts.values().filter(|count| **count < 0).sum::<isize>();
+    (added as usize, removed as usize)
+}
+
+/// `path` with the home directory shown as `~`.
+fn home_relative(path: &Path) -> String {
+    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf)) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 fn owned_canonical_rules_bundle_hash() -> String {
@@ -2740,6 +2921,35 @@ fn try_restore_exact_rules_backup(path: &Path, current: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_editor_rules_preview_says_what_update_rules_would_do() {
+        // #393: help(action="editor_rules") said "preview generated" and showed nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        let block =
+            stamp_block_with_canonical_rules_hash(&wrap_with_markers("Rule one.\nRule two.\n"));
+        assert!(installed_rules_state(&path, &block)
+            .starts_with("not installed; update-rules would add a"));
+
+        std::fs::write(&path, "# My notes\n").unwrap();
+        assert!(installed_rules_state(&path, &block).starts_with("no ContextStream block yet"));
+
+        let current = render_contextstream_block_for_path(&path, "# My notes\n", &block).unwrap();
+        std::fs::write(&path, &current).unwrap();
+        assert_eq!(installed_rules_state(&path, &block), "up to date");
+
+        let older =
+            stamp_block_with_canonical_rules_hash(&wrap_with_markers("Rule one.\nOld rule.\n"));
+        let stale = render_contextstream_block_for_path(&path, "# My notes\n", &older).unwrap();
+        std::fs::write(&path, &stale).unwrap();
+        let state = installed_rules_state(&path, &block);
+        assert!(
+            state.starts_with("out of date; update-rules would change the block (+1 −1 lines"),
+            "{state}"
+        );
+        assert_eq!(line_changes("a\nb\nb\n", "a\nb\nc\n"), (1, 1));
+    }
 
     #[test]
     fn editors_sharing_a_rules_file_render_identical_content() {

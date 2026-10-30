@@ -221,7 +221,20 @@ struct LocalFileFingerprint {
     device: u64,
     inode: u64,
     mode: u32,
+    /// Which content policy the file was last read under (see
+    /// [`SCAN_POLICY_EPOCH`]). A manifest written before the field existed
+    /// reads 0, so its files are read once more and checked against the
+    /// current policy instead of being trusted as unchanged (mcp-server#425).
+    #[serde(default)]
+    policy: u8,
 }
+
+/// Bump when a scan starts withholding files it used to send, so that files an
+/// older release already indexed and has not seen change since are read again
+/// once. An unchanged file is otherwise never re-read, and one that a newer
+/// content check would withhold (a private key in `notes.txt`) would stay in the
+/// index, searchable, until it was edited.
+const SCAN_POLICY_EPOCH: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScannedLocalFileFingerprint {
@@ -10874,6 +10887,7 @@ impl ContextStreamClient {
             device: metadata.dev(),
             inode: metadata.ino(),
             mode: metadata.mode(),
+            policy: SCAN_POLICY_EPOCH,
         })
     }
 
@@ -25753,6 +25767,7 @@ mod tests {
                     device: 1,
                     inode: 2,
                     mode: 0o100644,
+                    policy: SCAN_POLICY_EPOCH,
                 },
             )]),
         };
@@ -29782,6 +29797,38 @@ mod tests {
         Ok(())
     }
 
+    // mcp-server#425: a file an older release indexed and has not seen change
+    // since is read again once, so a content check added later can withhold it.
+    #[test]
+    fn a_fingerprint_from_before_the_content_policy_epoch_is_never_current(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let old: LocalFileFingerprint = serde_json::from_str(
+            r#"{"size":1,"modified_seconds":2,"modified_nanoseconds":3,"changed_seconds":4,"changed_nanoseconds":5,"device":6,"inode":7,"mode":33188}"#,
+        )?;
+        assert_eq!(old.policy, 0, "a manifest written before the field reads 0");
+        assert_ne!(old.policy, SCAN_POLICY_EPOCH);
+
+        let dir = std::env::temp_dir().join(format!("mcp-client-policy-epoch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "hello\n")?;
+        if let Some(current) =
+            ContextStreamClient::local_file_fingerprint(&std::fs::metadata(&file)?)
+        {
+            assert_eq!(current.policy, SCAN_POLICY_EPOCH);
+            let stale = LocalFileFingerprint {
+                policy: 0,
+                ..current.clone()
+            };
+            assert_ne!(
+                stale, current,
+                "the same file under an older policy is not the fingerprint a scan trusts"
+            );
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     // mcp-server#425: secret files that the name filter missed were uploaded.
     #[test]
     fn common_secret_files_are_skipped_by_name_and_their_templates_are_not() {
@@ -31104,6 +31151,7 @@ mod tests {
             device: 1,
             inode: 2,
             mode: 0o100644,
+            policy: SCAN_POLICY_EPOCH,
         };
         assert!(stable.timestamps_are_closed(cutoff));
         assert!(!stable.timestamps_are_closed(None));
@@ -31130,6 +31178,7 @@ mod tests {
             device: 1,
             inode: 2,
             mode: 0o100644,
+            policy: SCAN_POLICY_EPOCH,
         };
         let mut destination = std::collections::HashMap::from([
             ("visited.rs".to_string(), fingerprint.clone()),
@@ -31930,6 +31979,7 @@ mod tests {
             device: 1,
             inode: 2,
             mode: 0o100644,
+            policy: SCAN_POLICY_EPOCH,
         };
         let base_manifest = HashManifestData {
             hashes: std::collections::HashMap::from([

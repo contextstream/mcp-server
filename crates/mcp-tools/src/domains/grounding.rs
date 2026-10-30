@@ -647,6 +647,12 @@ fn classify_kind(item: &Value) -> String {
     if let Some(et) = event_type(item) {
         return et;
     }
+    // Knowledge nodes keep their type (preference, constraint, fact, …)
+    // under metadata.node_type; the result type labelled them all
+    // "knowledgenode", so a constraint read like any search hit (#414).
+    if let Some(node_type) = metadata_str(item, "node_type") {
+        return node_type.to_ascii_lowercase();
+    }
     item.get("kind")
         .or_else(|| item.get("type"))
         .or_else(|| item.get("source_type"))
@@ -1275,6 +1281,18 @@ pub fn parse_recall_results_normalized(mut recall: Value) -> Vec<GroundingHit> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_knowledge_node_is_labelled_by_its_node_type() {
+        // #414: preference, constraint and fact nodes all read "[knowledgenode]".
+        let hit = serde_json::json!({
+            "result_type": "KnowledgeNode",
+            "metadata": {"node_type": "constraint", "summary": "Never call the billing API directly"}
+        });
+        assert_eq!(super::classify_kind(&hit), "constraint");
+        let bare = serde_json::json!({"result_type": "KnowledgeNode"});
+        assert_eq!(super::classify_kind(&bare), "knowledgenode");
+    }
+
     use super::*;
     use serde_json::json;
 

@@ -92,6 +92,48 @@ pub struct ProjectsListInput {
     pub offset: Option<i64>,
 }
 
+/// A project as get shows it (#435): name and id, then the description,
+/// where its code lives and when it changed. The rest was only in
+/// structuredContent, which stdio clients often do not show.
+fn format_project_detail(project: &mcp_types::api::Project) -> String {
+    let one_line = crate::domains::display_title::one_line;
+    let mut text = format!("Project {} ({})", one_line(&project.name), project.id);
+    let set = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(one_line)
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(description) = set(&project.description) {
+        text.push_str(&format!("\n{description}"));
+    }
+    if let Some(url) = set(&project.repository_url) {
+        match set(&project.repository_type) {
+            Some(kind) => text.push_str(&format!("\nRepository: {url} ({kind})")),
+            None => text.push_str(&format!("\nRepository: {url}")),
+        }
+    }
+    if let Some(path) = set(&project.path) {
+        text.push_str(&format!("\nPath: {path}"));
+    }
+    if let Some(workspace_id) = project.workspace_id {
+        text.push_str(&format!("\nWorkspace: {workspace_id}"));
+    }
+    for (label, value) in [
+        ("Created", &project.created_at),
+        ("Updated", &project.updated_at),
+        ("Indexed", &project.indexed_at),
+    ] {
+        if let Some(value) = set(value) {
+            text.push_str(&format!("\n{label}: {value}"));
+        }
+    }
+    if let Some(files) = project.file_count {
+        text.push_str(&format!("\nFiles: {files}"));
+    }
+    text
+}
+
 /// A project overview as text (#429): it said only "Project overview loaded."
 fn format_project_overview(result: &Value) -> String {
     let one_line = crate::domains::display_title::one_line;
@@ -2330,7 +2372,7 @@ impl ToolHandler for ProjectTool {
                 )
                 .await?;
                 let project = resolved.project;
-                let text = format!("Project loaded: {} ({})", project.name, project.id);
+                let text = format_project_detail(&project);
                 Ok(ToolResult::with_structured(text, serde_json::to_value(&project).unwrap_or_default()))
             }
             "create" => {

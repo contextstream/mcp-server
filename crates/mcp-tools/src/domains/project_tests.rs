@@ -2450,3 +2450,19 @@ fn project_overview_and_statistics_read_as_text() {
         "Project statistics: 62 files, 306 lines, 77 indexed chunks; 0 decisions, 0 lessons.\nLast indexed: 2026-10-30T14:53:58Z"
     );
 }
+
+#[test]
+fn project_get_reads_as_text() {
+    // #435: "Project loaded: <name> (<id>)" and nothing else.
+    let project: mcp_types::api::Project = serde_json::from_value(json!({
+        "id": "11111111-1111-4111-8111-111111111111", "name": "ov175516",
+        "description": "Overview retest description", "repository_url": "",
+        "workspace_id": "22222222-2222-4222-8222-222222222222", "path": "/tmp/ov",
+        "created_at": "2026-10-30T17:55:16Z", "updated_at": "2026-10-30T17:55:17Z"
+    }))
+    .unwrap();
+    assert_eq!(
+        format_project_detail(&project),
+        "Project ov175516 (11111111-1111-4111-8111-111111111111)\nOverview retest description\nPath: /tmp/ov\nWorkspace: 22222222-2222-4222-8222-222222222222\nCreated: 2026-10-30T17:55:16Z\nUpdated: 2026-10-30T17:55:17Z"
+    );
+}

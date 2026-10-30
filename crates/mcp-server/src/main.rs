@@ -895,6 +895,7 @@ fn main() -> Result<()> {
 
     setup_logging(cli.verbose, cli.quiet);
     restore_default_sigpipe(&cli.command);
+    exit_on_unwritable_output(&cli.command);
     silence_stdout_when_quiet(cli.quiet, &cli.command);
 
     // Register the process-global teaching-bundle fingerprint so request
@@ -946,6 +947,44 @@ fn restore_default_sigpipe(command: &Option<Commands>) {
 
 #[cfg(not(unix))]
 fn restore_default_sigpipe(_command: &Option<Commands>) {}
+
+/// The message to print when a panic is `println!` failing to write, as
+/// `contextstream-mcp doctor > report.txt` does on a full disk (#422): a person
+/// needs the reason and a plain exit status, not a backtrace hint and SIGABRT
+/// (exit 134). `None` for any other panic.
+fn unwritable_output_message(panic_message: &str) -> Option<String> {
+    let rest = panic_message.strip_prefix("failed printing to ")?;
+    let (stream, reason) = rest.split_once(": ")?;
+    matches!(stream, "stdout" | "stderr")
+        .then(|| format!("contextstream-mcp: cannot write to {stream}: {reason}"))
+}
+
+/// One-shot commands print with `println!`, which panics when the write fails.
+/// Turn that one panic into a message on stderr and exit status 1, as the stdio
+/// server already does; every other panic reaches the previous hook unchanged.
+/// The server, the HTTP gateway, the sync bridge and editor hooks own their
+/// output and are left alone (the same set as `restore_default_sigpipe`).
+fn exit_on_unwritable_output(command: &Option<Commands>) {
+    let owns_output = matches!(
+        command,
+        None | Some(Commands::Http { .. } | Commands::Hook { .. } | Commands::Watch)
+    );
+    if owns_output {
+        return;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        match info.payload_as_str().and_then(unwritable_output_message) {
+            Some(message) => {
+                use std::io::Write;
+                // stderr may be the stream that failed: say nothing then.
+                let _ = writeln!(std::io::stderr(), "{message}");
+                std::process::exit(1);
+            }
+            None => previous(info),
+        }
+    }));
+}
 
 /// `-q` / `--quiet` ("errors only", #255) for one-shot commands: progress and
 /// confirmation lines on stderr are silenced (`setup::ui::is_quiet`), and
@@ -4346,6 +4385,30 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_failed_print_is_reported_as_unwritable_output() {
+        assert_eq!(
+            unwritable_output_message(
+                "failed printing to stdout: No space left on device (os error 28)"
+            ),
+            Some(
+                "contextstream-mcp: cannot write to stdout: No space left on device (os error 28)"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            unwritable_output_message("failed printing to stderr: Broken pipe (os error 32)"),
+            Some(
+                "contextstream-mcp: cannot write to stderr: Broken pipe (os error 32)".to_string()
+            )
+        );
+        assert_eq!(
+            unwritable_output_message("failed printing to a file: x"),
+            None
+        );
+        assert_eq!(unwritable_output_message("index out of bounds"), None);
+    }
+
     // #343
     #[test]
     fn a_version_check_is_not_told_to_reinstall() {

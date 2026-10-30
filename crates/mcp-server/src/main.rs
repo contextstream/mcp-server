@@ -2292,19 +2292,23 @@ fn run_git_hooks(path: Option<String>, uninstall: bool) {
     }
 }
 
+/// `verify-key`: whether ContextStream accepts the configured credential.
+/// A server that cannot be reached has not refused the key: the key is not
+/// checked, and the message says where it tried and why that failed (#338).
 async fn run_verify_key(json_output: bool) -> Result<()> {
-    let config = match load_config() {
-        Ok(c) => c,
-        Err(e) => {
-            if json_output {
-                println!(r#"{{"valid": false, "error": "{}"}}"#, e);
-            } else {
-                eprintln!("Error: {}", e);
-            }
-            std::process::exit(1);
+    fn fail(json_output: bool, message: String, reachable: Option<bool>) -> ! {
+        if json_output {
+            println!("{}", verify_key_failure_json(&message, reachable));
+        } else {
+            eprintln!("{message}");
         }
+        std::process::exit(1);
+    }
+    let config = match load_config() {
+        Ok(config) => config,
+        Err(e) => fail(json_output, format!("Error: {e}"), None),
     };
-
+    let api_url = config.api_url.clone();
     let client = mcp_client::ContextStreamClient::new(config);
 
     match client.me().await {
@@ -2317,21 +2321,64 @@ async fn run_verify_key(json_output: bool) -> Result<()> {
                         "user": user
                     }))?
                 );
-            } else {
+            } else if !setup::ui::is_quiet() {
                 eprintln!("API key is valid!");
-                eprintln!("User: {} ({})", user.name.unwrap_or_default(), user.email);
+                eprintln!(
+                    "{}",
+                    verify_key_user_line(user.name.as_deref(), &user.email)
+                );
             }
             Ok(())
         }
         Err(e) => {
-            if json_output {
-                println!(r#"{{"valid": false, "error": "{}"}}"#, e);
-            } else {
-                eprintln!("API key verification failed: {}", e);
-            }
-            std::process::exit(1);
+            let (message, reachable) = verify_key_failure(&e, &api_url);
+            fail(json_output, message, reachable)
         }
     }
+}
+
+/// "User: Ada (ada@example.com)", or "User: ada@example.com" with no name.
+fn verify_key_user_line(name: Option<&str>, email: &str) -> String {
+    match name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("User: {name} ({email})"),
+        None => format!("User: {email}"),
+    }
+}
+
+/// What `verify-key` says when the check fails, and whether the server was
+/// reached (`None` when the failure says nothing about it).
+fn verify_key_failure(error: &mcp_types::Error, api_url: &str) -> (String, Option<bool>) {
+    match error {
+        mcp_types::Error::Network(_) => (
+            format!(
+                "Could not reach ContextStream at {api_url}, so the API key was not checked ({error}). \
+                 Check the network connection, and CONTEXTSTREAM_API_URL if you set it."
+            ),
+            Some(false),
+        ),
+        mcp_types::Error::Timeout(seconds) => (
+            format!(
+                "ContextStream at {api_url} did not answer within {seconds} s, so the API key was \
+                 not checked. Check the network connection, and CONTEXTSTREAM_API_URL if you set it."
+            ),
+            Some(false),
+        ),
+        // A refused key says how to replace it (`user_facing_message`, #252).
+        error => (
+            format!("API key verification failed: {}", error.user_facing_message()),
+            Some(true),
+        ),
+    }
+}
+
+/// The `--json` failure object, serialized: a message holding a quote or a
+/// backslash broke the hand-built one.
+fn verify_key_failure_json(message: &str, reachable: Option<bool>) -> String {
+    let mut object = serde_json::json!({"valid": false, "error": message});
+    if let Some(reachable) = reachable {
+        object["reachable"] = serde_json::Value::Bool(reachable);
+    }
+    object.to_string()
 }
 
 async fn run_about() {
@@ -4142,6 +4189,75 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // #338
+    #[test]
+    fn verify_key_names_the_user_without_an_empty_name() {
+        assert_eq!(
+            verify_key_user_line(Some("Ada"), "ada@example.com"),
+            "User: Ada (ada@example.com)"
+        );
+        assert_eq!(
+            verify_key_user_line(Some(" "), "qa@example.com"),
+            "User: qa@example.com"
+        );
+        assert_eq!(
+            verify_key_user_line(None, "qa@example.com"),
+            "User: qa@example.com"
+        );
+    }
+
+    #[test]
+    fn verify_key_says_an_unreachable_server_left_the_key_unchecked() {
+        let url = "http://127.0.0.1:9";
+        let (message, reachable) = verify_key_failure(
+            &mcp_types::Error::Network(
+                "Connection failed: error sending request: Connection refused".into(),
+            ),
+            url,
+        );
+        assert_eq!(reachable, Some(false));
+        assert!(message.starts_with("Could not reach ContextStream at http://127.0.0.1:9, so the API key was not checked"), "{message}");
+        assert!(message.contains("Connection refused"), "{message}");
+        assert!(message.contains("CONTEXTSTREAM_API_URL"), "{message}");
+        assert!(!message.contains("verification failed"), "{message}");
+
+        let (message, reachable) = verify_key_failure(&mcp_types::Error::Timeout(30), url);
+        assert_eq!(reachable, Some(false));
+        assert!(
+            message.contains("did not answer within 30 s, so the API key was not checked"),
+            "{message}"
+        );
+
+        let (message, reachable) =
+            verify_key_failure(&mcp_types::Error::http(401, "Unauthorized"), url);
+        assert_eq!(reachable, Some(true));
+        assert!(
+            message.starts_with("API key verification failed: HTTP error (401): Unauthorized."),
+            "{message}"
+        );
+        assert!(message.contains("did not accept the API key"), "{message}");
+        assert!(message.contains("contextstream-mcp setup"), "{message}");
+    }
+
+    #[test]
+    fn verify_key_json_failure_is_valid_json_whatever_the_message() {
+        for message in [
+            "plain",
+            r#"a "quoted" word"#,
+            r"a back\slash",
+            "line\nbreak",
+        ] {
+            let json: serde_json::Value =
+                serde_json::from_str(&verify_key_failure_json(message, Some(false))).unwrap();
+            assert_eq!(json["valid"], false);
+            assert_eq!(json["error"], message);
+            assert_eq!(json["reachable"], false);
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&verify_key_failure_json("Error: missing", None)).unwrap();
+        assert!(json.get("reachable").is_none());
+    }
+
     use super::*;
     use tempfile::tempdir;
 

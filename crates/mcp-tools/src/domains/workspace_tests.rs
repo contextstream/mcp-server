@@ -532,3 +532,61 @@ mod registration_tests {
         assert_eq!(all_actions.len(), 8);
     }
 }
+
+mod list_heading_tests {
+    use super::workspace_list_heading;
+    use serde_json::json;
+
+    fn listed(
+        names: &[&str],
+        total: i64,
+        page: i64,
+        total_pages: i64,
+    ) -> mcp_client::client::PaginatedResponse<mcp_types::api::Workspace> {
+        let items: Vec<_> = names
+            .iter()
+            .map(|name| {
+                json!({
+                    "id": uuid::Uuid::new_v4(),
+                    "name": name,
+                    "created_at": "2026-10-30T00:00:00Z",
+                    "updated_at": "2026-10-30T00:00:00Z"
+                })
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": 20,
+            "total_pages": total_pages
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_partial_page_says_how_many_there_are_and_which_page_is_next() {
+        // #381: 20 of 21 read as the whole list.
+        let twenty = vec!["ws"; 20];
+        assert_eq!(
+            workspace_list_heading(&listed(&twenty, 21, 1, 2)),
+            "Showing 20 of 21 workspaces (page 1 of 2). Pass page=2 for the rest.\n\n"
+        );
+        assert_eq!(
+            workspace_list_heading(&listed(&twenty, 45, 1, 3)),
+            "Showing 20 of 45 workspaces (page 1 of 3). Pass page=2 for the next page.\n\n"
+        );
+        assert_eq!(
+            workspace_list_heading(&listed(&["Demos"], 21, 2, 2)),
+            "Showing 1 of 21 workspaces (page 2 of 2).\n\n"
+        );
+        assert_eq!(
+            workspace_list_heading(&listed(&["a", "b"], 2, 1, 1)),
+            "Found 2 workspaces:\n\n"
+        );
+        assert_eq!(
+            workspace_list_heading(&listed(&["a"], 1, 1, 1)),
+            "Found 1 workspace:\n\n"
+        );
+    }
+}

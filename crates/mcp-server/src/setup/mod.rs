@@ -3379,7 +3379,7 @@ async fn resolve_workspace_noninteractive(
     } else {
         read_project_config(cwd)?
     };
-    let workspaces = client.list_workspaces(None, None).await?;
+    let workspaces = client.list_all_workspaces().await?;
 
     if let Some(prev_id) = previous.and_then(|cfg| cfg.workspace_id) {
         if let Some(ws) = workspaces.iter().find(|w| w.id.to_string() == prev_id) {
@@ -4670,7 +4670,7 @@ async fn setup_workspace_for_path(
     let previous_config = project_path.and_then(|path| read_project_config(path).ok().flatten());
 
     // List existing workspaces
-    let workspaces = client.list_workspaces(None, None).await?;
+    let workspaces = client.list_all_workspaces().await?;
 
     if workspaces.is_empty() {
         // No workspaces - create one

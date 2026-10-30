@@ -774,7 +774,7 @@ async fn resolve_profile_workspace(
 ) -> Result<Option<WorkspaceInfo>> {
     if let Some(ref id) = profile.workspace_id {
         let workspaces = client
-            .list_workspaces(None, None)
+            .list_all_workspaces()
             .await
             .context("validating the profile workspace")?;
         let matching = workspaces

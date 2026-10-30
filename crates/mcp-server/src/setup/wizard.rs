@@ -671,7 +671,7 @@ async fn choose_workspace(
     let previous = project_path
         .filter(|_| !account_only)
         .and_then(|path| super::read_project_config(path).ok().flatten());
-    let workspaces = ui::spin("Loading workspaces", client.list_workspaces(None, None)).await?;
+    let workspaces = ui::spin("Loading workspaces", client.list_all_workspaces()).await?;
 
     if auto {
         if account_only {

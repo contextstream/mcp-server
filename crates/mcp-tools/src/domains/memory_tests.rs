@@ -3074,3 +3074,24 @@ mod blocked_reason_tests {
         assert!(format_collection("tasks", &list).contains("— blocked (waiting on QA)"));
     }
 }
+
+mod doc_body_match_tests {
+    use super::keep_server_body_matches;
+    use serde_json::json;
+
+    #[test]
+    fn a_doc_the_server_matched_by_its_body_is_kept() {
+        // #416: a runbook was found only by words in its title.
+        let mut ranked = vec![json!({"id": "a", "title": "Database failover"})];
+        let server = vec![
+            json!({"id": "a", "title": "Database failover"}),
+            json!({"id": "b", "title": "Storage notes"}),
+        ];
+        keep_server_body_matches(&mut ranked, server, 10);
+        let ids: Vec<&str> = ranked.iter().filter_map(|doc| doc["id"].as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        let mut full = vec![json!({"id": "a"})];
+        keep_server_body_matches(&mut full, vec![json!({"id": "b"})], 1);
+        assert_eq!(full.len(), 1);
+    }
+}

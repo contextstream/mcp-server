@@ -821,7 +821,10 @@ mod collection_count_tests {
 }
 
 mod format_doc_detail_tests {
-    use super::{check_doc_content_size, format_doc_detail, show_doc, DocWindow};
+    use super::{
+        check_doc_content_size, format_diagram_detail, format_doc_detail, format_node_detail,
+        show_doc, DocWindow,
+    };
     use serde_json::json;
 
     #[test]
@@ -916,6 +919,45 @@ mod format_doc_detail_tests {
         );
         // Escaping counts: quotes and newlines grow in JSON.
         assert!(check_doc_content_size(&"\n".repeat(1_100_000)).is_err());
+    }
+
+    #[test]
+    fn a_node_and_a_diagram_show_their_bodies() {
+        // #396: get_node showed no content, get_diagram only "Diagram retrieved."
+        let node = json!({
+            "id": "22222222-2222-4222-8222-222222222222",
+            "node_type": "fact",
+            "summary": "QA node 132429",
+            "details": "The numbat-132429 service runs on port 8080.",
+            "tags": ["ports"],
+            "updated_at": "2026-10-30T13:24:00Z"
+        });
+        let text = format_node_detail(&node);
+        assert!(
+            text.starts_with("[fact] QA node 132429\nID: 22222222-2222-4222-8222-222222222222"),
+            "{text}"
+        );
+        assert!(text.contains("Tags: ports"), "{text}");
+        assert!(
+            text.ends_with("The numbat-132429 service runs on port 8080."),
+            "{text}"
+        );
+
+        let diagram = json!({"data": {
+            "id": "33333333-3333-4333-8333-333333333333",
+            "title": "QA diagram 132429",
+            "diagram_type": "flowchart",
+            "content": "graph TD; A[Client]-->B[API]"
+        }});
+        let text = format_diagram_detail(&diagram);
+        assert!(
+            text.starts_with("**QA diagram 132429** (flowchart)"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("```mermaid\ngraph TD; A[Client]-->B[API]\n```"),
+            "{text}"
+        );
     }
 
     #[test]

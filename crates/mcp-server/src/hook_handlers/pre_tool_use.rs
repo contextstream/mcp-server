@@ -146,6 +146,28 @@ fn is_discovery_path(file_path: &str) -> bool {
         || p.contains("*/*")
 }
 
+/// [`is_discovery_path`], and also true when `file_path` names the project root
+/// (`cwd`) or a folder inside it, spelled however the agent likes: an absolute
+/// path to the root is the same repo-wide search as `.`, and a folder is a broad
+/// one. A path to one file, to something that does not exist, or outside the
+/// project is a targeted search and passes (mcp-server#371).
+fn is_discovery_path_in(file_path: &str, cwd: &str) -> bool {
+    if is_discovery_path(file_path) {
+        return true;
+    }
+    let path = Path::new(file_path.trim());
+    let root = Path::new(cwd);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    match (root.canonicalize(), candidate.canonicalize()) {
+        (Ok(root), Ok(target)) => target.starts_with(&root) && target.is_dir(),
+        _ => false,
+    }
+}
+
 /// Check if a query is likely a code identifier/symbol.
 fn is_identifier_query(query: &str) -> bool {
     let trimmed = query.trim();
@@ -3276,8 +3298,9 @@ pub async fn handle() -> Result<()> {
                 .unwrap_or("")
                 .trim();
 
-            // Targeted Grep on a known file/scoped path: allow.
-            if !path.is_empty() && !is_discovery_path(path) {
+            // Targeted Grep on a known file/scoped path: allow. The project
+            // root, however it is spelled, and a folder are broad (#371).
+            if !path.is_empty() && !is_discovery_path_in(path, &cwd) {
                 HookDecision::Allow
             } else if !pattern.is_empty() {
                 let suggestion = grep_tool_suggestion(&tool_input);
@@ -3340,10 +3363,10 @@ pub async fn handle() -> Result<()> {
                 .trim();
 
             // Targeted: allow.
-            if !path.is_empty() && !is_discovery_path(path) {
+            if !path.is_empty() && !is_discovery_path_in(path, &cwd) {
                 HookDecision::Allow
             } else if in_explore
-                && (is_discovery_path(path) || path.is_empty())
+                && (is_discovery_path_in(path, &cwd) || path.is_empty())
                 && !pattern.is_empty()
             {
                 let (mode, _) = recommend_search_mode(pattern);
@@ -3356,7 +3379,7 @@ pub async fn handle() -> Result<()> {
                     ),
                     stale_index_local_fallback_message(&editor, &call, &tool),
                 )
-            } else if is_discovery_path(path) && !pattern.is_empty() {
+            } else if is_discovery_path_in(path, &cwd) && !pattern.is_empty() {
                 let (mode, reason) = recommend_search_mode(pattern);
                 let call = search_call(&editor, mode, pattern);
                 search_first_redirect_decision(
@@ -3588,6 +3611,45 @@ pub async fn handle() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // mcp-server#371: a Grep whose path is the project root was let through
+    // because only "", ".", "*" and globs counted as repo-wide.
+    #[test]
+    fn a_path_naming_the_project_root_or_a_folder_in_it_is_a_broad_search() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().to_str().unwrap().to_string();
+        std::fs::create_dir_all(project.path().join("dir0")).unwrap();
+        std::fs::write(project.path().join("dir0/f5.ts"), "x\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // Spelled however the agent likes.
+        for path in [
+            root.as_str(),
+            &format!("{root}/"),
+            &format!("{root}/dir0"),
+            &format!("{root}/dir0/"),
+            &format!("{root}/dir0/.."),
+            "dir0",
+            "./dir0",
+            ".",
+            "",
+        ] {
+            assert!(is_discovery_path_in(path, &root), "{path:?} is broad");
+        }
+        // One file, something that does not exist, and somewhere else are targeted.
+        for path in [
+            &format!("{root}/dir0/f5.ts"),
+            "dir0/f5.ts",
+            &format!("{root}/nope"),
+            "nope/",
+            outside.path().to_str().unwrap(),
+        ] {
+            assert!(!is_discovery_path_in(path, &root), "{path:?} is targeted");
+        }
+        // The old cases still hold.
+        assert!(is_discovery_path_in("**/*.rs", &root));
+        assert!(is_discovery_path_in("*", &root));
+    }
 
     #[test]
     fn predrain_fires_only_for_contextstream_search_and_context() {

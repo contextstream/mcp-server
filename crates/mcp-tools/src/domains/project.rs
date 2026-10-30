@@ -92,6 +92,94 @@ pub struct ProjectsListInput {
     pub offset: Option<i64>,
 }
 
+/// A project overview as text (#429): it said only "Project overview loaded."
+fn format_project_overview(result: &Value) -> String {
+    let one_line = crate::domains::display_title::one_line;
+    let text_of = |key: &str| {
+        result
+            .get(key)
+            .and_then(Value::as_str)
+            .map(one_line)
+            .filter(|text| !text.is_empty())
+    };
+    let mut text = format!(
+        "Project {} ({})",
+        text_of("name").unwrap_or_else(|| "(unnamed)".to_string()),
+        text_of("id").unwrap_or_else(|| "unknown".to_string())
+    );
+    if let Some(brief) = text_of("brief") {
+        text.push_str(&format!("\n{brief}"));
+    }
+    let summary = result.get("content_summary");
+    let total = summary
+        .and_then(|summary| summary.get("total_items"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut by_type: Vec<(String, u64)> = summary
+        .and_then(|summary| summary.get("by_type"))
+        .and_then(Value::as_object)
+        .map(|types| {
+            types
+                .iter()
+                .filter_map(|(kind, count)| count.as_u64().map(|count| (one_line(kind), count)))
+                .collect()
+        })
+        .unwrap_or_default();
+    by_type.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    text.push_str(&format!("\nMemory items: {total}"));
+    if !by_type.is_empty() {
+        let kinds: Vec<String> = by_type
+            .iter()
+            .map(|(kind, count)| format!("{kind} {count}"))
+            .collect();
+        text.push_str(&format!(" ({})", kinds.join(", ")));
+    }
+    let tags: Vec<String> = result
+        .get("top_tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tag| {
+            tag.as_str()
+                .or_else(|| tag.get("tag").and_then(Value::as_str))
+        })
+        .map(one_line)
+        .collect();
+    if !tags.is_empty() {
+        text.push_str(&format!("\nTop tags: {}", tags.join(", ")));
+    }
+    if let Some(updated) = text_of("updated_at") {
+        text.push_str(&format!("\nUpdated: {updated}"));
+    }
+    text
+}
+
+/// Project statistics as text (#429): it said only "Project statistics loaded."
+fn format_project_statistics(result: &Value) -> String {
+    let count = |key: &str| {
+        result
+            .get(key)
+            .and_then(Value::as_u64)
+            .map_or_else(|| "?".to_string(), |count| count.to_string())
+    };
+    let mut text = format!(
+        "Project statistics: {} files, {} lines, {} indexed chunks; {} decisions, {} lessons.",
+        count("file_count"),
+        count("total_lines"),
+        count("chunk_count"),
+        count("decision_count"),
+        count("lesson_count"),
+    );
+    match result.get("last_indexed").and_then(Value::as_str) {
+        Some(indexed) => text.push_str(&format!(
+            "\nLast indexed: {}",
+            crate::domains::display_title::one_line(indexed)
+        )),
+        None => text.push_str("\nNot indexed yet."),
+    }
+    text
+}
+
 /// Where a page of projects sits in the whole and how to get the next one
 /// (#381): "Found 20 projects." looked complete when the workspace had more.
 fn project_list_heading(
@@ -2534,7 +2622,7 @@ impl ToolHandler for ProjectTool {
                 .await?
                 .project_id;
                 let result = self.client.project_overview(id).await?;
-                Ok(ToolResult::with_structured("Project overview loaded.".to_string(), result))
+                Ok(ToolResult::with_structured(format_project_overview(&result), result))
             }
             "statistics" => {
                 let id = resolve_read_project(
@@ -2549,7 +2637,7 @@ impl ToolHandler for ProjectTool {
                 .await?
                 .project_id;
                 let result = self.client.project_statistics(id).await?;
-                Ok(ToolResult::with_structured("Project statistics loaded.".to_string(), result))
+                Ok(ToolResult::with_structured(format_project_statistics(&result), result))
             }
             "files" => {
                 let id = resolve_read_project(

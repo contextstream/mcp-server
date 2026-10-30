@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.43
+
+- ContextAgents start on their own when a workspace turns on automatic runs for MCP (`auto_run.mcp`, off by
+  default). Claude Code, Codex and other clients start the fitting agent, such as Dependency Upgrader, Security
+  Audit or Release Notes, in the background without being asked. A request that says not to starts nothing,
+  and an automatic run shows no price.
+- Tools are ready for directory review (#330, #334). Reads and writes are separate tools for every client, and
+  every tool has a title and read-only and destructive annotations. Irreversible actions moved into one
+  `delete` tool; an old action name is refused with the exact `delete` call to make instead.
+- Gemini app: read-only tools, so it no longer asks Allow on nearly every call (#315), and its client is no
+  longer taken for the Gemini CLI (#317).
+- Hosted gateway: `/mcp` serves its own OAuth protected-resource metadata (#329), a stateless connection counts
+  as ready (#328), and a refused key also fails `server/discover` and `tools/list` (#252, #303).
+- Antigravity: the public plugin repository is generated from setup's code, and its hooks claim a connection
+  only where there is a key (#331).
+- Search and tools: paging follows the server's next offset and totals (#324); `project_read` no longer offers
+  `recent_changes` (#325); `index_status` of an index being built gives its counts (#326).
+- Setup and CLI: uninstall leaves a person's own `.aider.conf.yml` as it was (#322, #327), `update` output is
+  shorter (#302), a share named for an agent reaches it (#301), unknown config values are reported, and
+  `CONTEXTSTREAM_ACCOUNT_MODE` can no longer stop the server (#319).
+
 ## 1.0.42
 
 - Antigravity uses ContextStream. Setup and `update` install a ContextStream plugin in

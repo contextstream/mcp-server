@@ -8384,8 +8384,42 @@ mod scope_widening_tests {
             .await
             .unwrap();
         let text = text_of(&result);
-        assert!(text.contains("Showing 10 of 124."), "{text}");
+        // #460: a later page says which rows it holds, numbered by position.
+        assert!(text.contains("Showing 91\u{2013}100 of 124."), "{text}");
+        assert!(text.contains("91. src/loyalty_0.rs"), "{text}");
         assert!(!text.contains("Pass offset="), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_past_the_end_says_so_instead_of_blaming_the_output_format() {
+        // #460: offset=500 over 61 matches printed "Server returned compact
+        // output … Rerun with output_format=full" for a full request.
+        let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+        let server = RoutedServer::spawn(Box::new(move |line, _| {
+            if line.contains("/search/") {
+                return (200, json!({"results": [], "paths": [], "total": 61, "project_index_state": "ready"}).to_string());
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            (404, json!({"error":"not found"}).to_string())
+        }));
+        let (tool, session) = gateway_tool(&server.base_url);
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        for format in ["full", "paths"] {
+            let result = tool
+                .execute(json!({"query":"zebrafin_","mode":"exhaustive","limit":5,"offset":500,"output_format":format}))
+                .await
+                .unwrap();
+            let text = text_of(&result);
+            assert!(
+                text.contains("Offset 500 is past the end of the 61 results; pass an offset below 61. The last page of 5 starts at offset=60."),
+                "{format}: {text}"
+            );
+            assert!(!text.contains("compact output"), "{format}: {text}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

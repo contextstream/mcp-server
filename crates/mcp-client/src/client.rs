@@ -130,6 +130,10 @@ struct ScanDeclaration {
     checkout_files: Option<usize>,
     /// This scan covered only part of the checkout; another follows.
     more_follows: bool,
+    /// Files this scan left out for size (over [`MAX_INDEXABLE_FILE_BYTES`]),
+    /// said with every batch of a scan that walked the whole checkout, 0 included,
+    /// so the server can show it and clear it (mcp-server#340).
+    left_out_files: Option<usize>,
 }
 
 impl ScanDeclaration {
@@ -158,6 +162,12 @@ impl ScanDeclaration {
             headers.push((
                 "x-contextstream-ingest-scan-more".to_string(),
                 "1".to_string(),
+            ));
+        }
+        if let Some(files) = self.left_out_files {
+            headers.push((
+                "x-contextstream-ingest-scan-left-out".to_string(),
+                files.to_string(),
             ));
         }
         headers
@@ -7620,6 +7630,11 @@ impl ContextStreamClient {
             .whole_checkout
             .then(|| total_files.saturating_sub(deferred_due_to_payload));
         let more_follows = !scan.complete;
+        // Only a scan that walked the whole checkout can say none were left
+        // out; a capped page says so only when it found some (it never lowers
+        // the count another page raised).
+        let left_out_files =
+            (scan.whole_checkout || !scan.too_large.is_empty()).then_some(scan.too_large.len());
         let scan_for_batch = |sent_before: usize| {
             (scan_total > 0).then_some(ScanDeclaration {
                 id: scan_id,
@@ -7627,6 +7642,7 @@ impl ContextStreamClient {
                 sent_before,
                 checkout_files,
                 more_follows,
+                left_out_files,
             })
         };
         let mut deleted_paths_payload = if deleted_paths.is_empty() {
@@ -25861,6 +25877,9 @@ mod tests {
                 request_header(post, "x-contextstream-ingest-scan-more"),
                 None
             );
+            // Nothing was over the size limit; the batch says so (0 clears an
+            // older count on the server).
+            assert_eq!(header(post, "x-contextstream-ingest-scan-left-out"), "0");
         }
     }
 
@@ -25886,6 +25905,12 @@ mod tests {
             );
             assert_eq!(
                 request_header(post, "x-contextstream-ingest-scan-checkout"),
+                None
+            );
+            // A capped page that found nothing over the limit cannot say none
+            // was left out.
+            assert_eq!(
+                request_header(post, "x-contextstream-ingest-scan-left-out"),
                 None
             );
         }

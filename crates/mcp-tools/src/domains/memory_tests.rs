@@ -3282,3 +3282,53 @@ async fn a_read_leaves_out_a_project_id_that_names_no_project() {
     let (unchanged, note) = drop_unknown_read_project(&client, unscoped.clone()).await;
     assert_eq!((unchanged, note), (unscoped, None));
 }
+
+#[test]
+fn a_page_past_the_end_of_a_list_says_so() {
+    // #452: "No docs found. Create one …" for a workspace with 51 docs.
+    let empty = json!({"items": [], "total": 51});
+    assert_eq!(
+        format_collection_page("docs", &empty, Some(100), Some(20)),
+        "Offset 100 is past the end: there are 51 docs. Pass a smaller offset (offset=0 for the first page)."
+    );
+    assert_eq!(
+        format_collection_page("diagrams", &json!({"items": []}), Some(100), None),
+        "No diagrams at offset 100: the list ends before it. Pass a smaller offset (offset=0 for the first page)."
+    );
+    assert!(
+        format_collection_page("docs", &json!({"items": []}), None, None)
+            .starts_with("No docs found. Create one")
+    );
+    let page = json!({"items": [{"id": "d1", "title": "Runbook"}], "total": 51});
+    let text = format_collection_page("docs", &page, Some(40), Some(1));
+    assert!(text.contains("**Runbook**"));
+    assert!(text.ends_with("Showing 41–41 of 51. Pass offset=41 for more."));
+}
+
+#[test]
+fn decisions_say_at_least_when_the_api_read_part_of_the_list() {
+    // #452: "20 of 81", "20 of 161", … for one list of 1,888 decisions.
+    let page = json!({
+        "items": [{"id": "d1", "title": "Use Postgres", "status": "active"}],
+        "total": 81,
+        "total_is_lower_bound": true,
+        "next_offset": 1,
+    });
+    let text = render_decisions_envelope(&page, None, None, Some(0));
+    assert!(
+        text.starts_with("[DECISIONS] 1 of at least 81 decision(s)"),
+        "{text}"
+    );
+    assert!(text.contains("pass offset=1 to continue"));
+
+    let past = json!({"items": [], "total": 994});
+    assert!(
+        render_decisions_envelope(&past, None, None, Some(1000)).starts_with(
+            "No decisions at offset 1000 (status=active): the list has 994. Pass a smaller offset"
+        )
+    );
+    assert!(
+        render_decisions_envelope(&json!({"items": [], "total": 0}), None, None, None)
+            .starts_with("No decisions recorded yet (status=active).")
+    );
+}

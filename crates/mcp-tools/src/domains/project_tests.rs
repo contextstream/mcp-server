@@ -331,6 +331,55 @@ async fn index_status_of_an_index_being_built_gives_its_counts_and_is_not_ready(
     drop(server);
 }
 
+// mcp-server#340: the API says how many files the client left out for size, and
+// the tool's text must not read "ready" as "all of it".
+#[test]
+fn files_left_out_for_size_are_named_in_the_index_status_text() {
+    assert_eq!(format_left_out_for_size(&json!({})), None);
+    assert_eq!(
+        format_left_out_for_size(&json!({"files_left_out_for_size": 0})),
+        None
+    );
+    assert_eq!(
+        format_left_out_for_size(&json!({"files_left_out_for_size": 1})).as_deref(),
+        Some(" 1 file over 5 MiB is not indexed, so searches do not cover it.")
+    );
+    assert_eq!(
+        format_left_out_for_size(&json!({"files_left_out_for_size": 2})).as_deref(),
+        Some(" 2 files over 5 MiB are not indexed, so searches do not cover them.")
+    );
+}
+
+#[tokio::test]
+async fn index_status_says_when_files_over_the_size_limit_are_not_indexed() {
+    let project_id = uuid::Uuid::new_v4();
+    let last_updated = chrono::Utc::now().to_rfc3339();
+    let (tool, server) = project_tool_with_http_sequence(vec![(
+        "200 OK",
+        json!({
+            "indexed": true,
+            "indexed_file_count": 1,
+            "project_index_state": "ready",
+            "files_left_out_for_size": 2,
+            "last_updated": last_updated
+        })
+        .to_string(),
+    )])
+    .await;
+
+    let result = tool
+        .execute(json!({"action": "index_status", "project_id": project_id}))
+        .await
+        .expect("index status");
+    let text = tool_result_text(&result);
+    assert!(text.contains("Project index is ready"), "{text}");
+    assert!(
+        text.contains("2 files over 5 MiB are not indexed, so searches do not cover them."),
+        "{text}"
+    );
+    drop(server);
+}
+
 #[tokio::test]
 async fn index_status_preserves_canonical_readiness_when_checkout_is_unconfirmed() {
     let project_id = uuid::Uuid::new_v4();

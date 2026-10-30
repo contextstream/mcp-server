@@ -37,7 +37,7 @@ const VALID_FEEDBACK_SIGNALS: &[&str] = &[
     "promote_to_universal_rule",
 ];
 
-const TOOL_DESCRIPTION: &str = "Ask ContextStream a natural-language question across the user's authorized context and receive one current, evidence-backed answer. Use receipt to recover an already-executed request without replay, and feedback to record an explicit receipt-bound signal; feedback acknowledgement means recorded_only. Use search instead for exact code/file discovery. Requested logical scope never grants authority: ContextStream resolves fresh effective authority server-side. Every Answer API request is sent exactly once with no transparent retry or replay.";
+const TOOL_DESCRIPTION: &str = "Ask ContextStream a natural-language question across the user's authorized context and receive one current, evidence-backed answer. Use receipt to recover an already-executed request without replay, and feedback to record an explicit receipt-bound signal; feedback acknowledgement means recorded_only. Use search instead for exact code/file discovery. It answers only the question types and scopes its execution lane supports so far: when it refuses, or asks which scope to use without offering any, use session(action=\"recall\") or memory(action=\"search\") for saved decisions and history, and search for code. Requested logical scope never grants authority: ContextStream resolves fresh effective authority server-side. Every Answer API request is sent exactly once with no transparent retry or replay.";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -610,6 +610,16 @@ fn format_response(response: &AnswerResponseV1) -> String {
             }
             lines.join("\n")
         }
+        // With no candidate scope there is nothing to choose, even when the
+        // scope was given, so say what to use instead (#388).
+        AnswerResponseV1::ClarificationRequired {
+            request_id,
+            clarification,
+            ..
+        } if clarification.candidate_scopes.is_empty() => format!(
+            "Clarification required: {}\n\nCandidate scopes: 0 · Request: {}\n\nNo scope was offered to choose from, so naming one again will not help. {ANSWER_FALLBACK_HINT}",
+            clarification.prompt, request_id,
+        ),
         AnswerResponseV1::ClarificationRequired {
             request_id,
             clarification,
@@ -661,6 +671,8 @@ fn is_unanswerable_request(status: u16, message: &str) -> bool {
         403 => message.contains("requested scope is not authorized"),
         409 => message.contains("Answer authority changed"),
         422 => message.contains("Answer execution lane"),
+        // Not retryable: the API marks this refusal final (#388).
+        503 => message.contains("Canonical Answer execution is not available"),
         _ => false,
     }
 }
@@ -693,6 +705,7 @@ mod tests {
                 422,
                 "The resolved scope is not supported by the active Answer execution lane",
             ),
+            (503, "Canonical Answer execution is not available"),
         ] {
             let error = explain_unanswerable_request(Error::http(status, message));
             let text = error.to_string();
@@ -707,6 +720,7 @@ mod tests {
         for error in [
             Error::http(403, "Forbidden: plan does not include this feature"),
             Error::http(500, "Answer execution lane crashed"),
+            Error::http(503, "Answer execution is temporarily busy"),
             Error::Validation("question is required".to_owned()),
         ] {
             let before = error.to_string();

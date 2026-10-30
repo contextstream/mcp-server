@@ -98,6 +98,29 @@ pub(crate) fn classify_scope_id_arg(value: Option<&str>) -> ScopeIdArg {
     }
 }
 
+/// The error for text sent as an id that is not one, in #342's wording: what
+/// was sent, and where the real ids are listed (#353, #372).
+pub(crate) fn not_an_id(field: &str, kind: &str, raw: &str) -> mcp_types::Error {
+    mcp_types::Error::Validation(format!(
+        "{field} \"{}\" is not a {kind} ID (a UUID). {kind}(action=\"list\") shows yours.",
+        raw.trim()
+    ))
+}
+
+/// Refuse an id argument that is neither an id nor a placeholder, before
+/// anything falls back to the session's scope: init bound the default
+/// workspace (#353), and project loaded the session's project (#372).
+pub(crate) fn refuse_malformed_scope_id(
+    field: &str,
+    kind: &str,
+    arg: &ScopeIdArg,
+) -> mcp_types::Result<()> {
+    match arg {
+        ScopeIdArg::Malformed(raw) => Err(not_an_id(field, kind, raw)),
+        _ => Ok(()),
+    }
+}
+
 /// Remove placeholder `workspace_id` / `project_id` arguments from a tool call
 /// so a handler sees "no id" and resolves scope itself. Real ids, and text that
 /// is wrong but not a placeholder, are left alone so the caller still gets a

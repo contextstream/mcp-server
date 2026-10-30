@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::domains::scope_resolution::not_an_id;
 use crate::registry::ToolHandler;
 use crate::schema::SchemaBuilder;
 
@@ -228,8 +229,8 @@ impl ToolHandler for WorkspaceTool {
             "get" => {
                 let workspace_id = input.workspace_id
                     .ok_or_else(|| Error::Validation("workspace_id is required for get".to_string()))?;
-                let id = Uuid::parse_str(&workspace_id)
-                    .map_err(|_| Error::Validation("Invalid workspace_id".to_string()))?;
+                let id = Uuid::parse_str(workspace_id.trim())
+                    .map_err(|_| not_an_id("workspace_id", "workspace", &workspace_id))?;
 
                 match self.client.get_workspace(id).await {
                     Ok(workspace) => {
@@ -287,8 +288,8 @@ impl ToolHandler for WorkspaceTool {
             "delete" => {
                 let workspace_id = input.workspace_id
                     .ok_or_else(|| Error::Validation("workspace_id is required for delete".to_string()))?;
-                let id = Uuid::parse_str(&workspace_id)
-                    .map_err(|_| Error::Validation("Invalid workspace_id".to_string()))?;
+                let id = Uuid::parse_str(workspace_id.trim())
+                    .map_err(|_| not_an_id("workspace_id", "workspace", &workspace_id))?;
 
                 let result = self.client.delete_workspace(id).await?;
                 Ok(ToolResult::with_structured(
@@ -301,8 +302,8 @@ impl ToolHandler for WorkspaceTool {
                     .ok_or_else(|| Error::Validation("workspace_id is required for associate".to_string()))?;
                 let folder_path = input.folder_path
                     .ok_or_else(|| Error::Validation("folder_path is required for associate".to_string()))?;
-                let id = Uuid::parse_str(&workspace_id)
-                    .map_err(|_| Error::Validation("Invalid workspace_id".to_string()))?;
+                let id = Uuid::parse_str(workspace_id.trim())
+                    .map_err(|_| not_an_id("workspace_id", "workspace", &workspace_id))?;
 
                 match self.client.associate_workspace(id, &folder_path).await {
                     Ok(result) => Ok(ToolResult::with_structured(
@@ -342,8 +343,8 @@ impl ToolHandler for WorkspaceTool {
             "team_members" => {
                 let workspace_id = input.workspace_id
                     .ok_or_else(|| Error::Validation("workspace_id is required for team_members".to_string()))?;
-                let id = Uuid::parse_str(&workspace_id)
-                    .map_err(|_| Error::Validation("Invalid workspace_id".to_string()))?;
+                let id = Uuid::parse_str(workspace_id.trim())
+                    .map_err(|_| not_an_id("workspace_id", "workspace", &workspace_id))?;
 
                 let result = self.client.workspace_team_members(id, input.page, input.page_size).await?;
                 let count = result.as_array().map(|a| a.len()).unwrap_or(0);
@@ -352,8 +353,8 @@ impl ToolHandler for WorkspaceTool {
             "index_settings" => {
                 let workspace_id = input.workspace_id
                     .ok_or_else(|| Error::Validation("workspace_id is required for index_settings".to_string()))?;
-                let id = Uuid::parse_str(&workspace_id)
-                    .map_err(|_| Error::Validation("Invalid workspace_id".to_string()))?;
+                let id = Uuid::parse_str(workspace_id.trim())
+                    .map_err(|_| not_an_id("workspace_id", "workspace", &workspace_id))?;
 
                 // If any settings are provided, update; otherwise get
                 let has_updates = input.auto_sync_enabled.is_some()

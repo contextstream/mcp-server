@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::domains::scope_resolution::{classify_scope_id_arg, refuse_malformed_scope_id};
 use crate::registry::ToolHandler;
 
 /// One clause for the files the API keeps for exact search only (minified or generated
@@ -530,20 +531,16 @@ fn missing_project_scope_error(
         (None, None) => "init(folder_path=\"<your_project_path>\")".to_string(),
     };
 
-    let requirement = if workspace_id.is_some() {
-        "project_id is required"
-    } else {
-        "workspace_id is required before project_id is required"
-    };
+    // "workspace_id is required before project_id is required for get" did
+    // not parse (#372).
     let scope = if workspace_id.is_some() {
         "No active project scope — workspace-only fallback may be active."
     } else {
-        "No active workspace scope is available, so a project cannot be created or resolved safely."
+        "No workspace is in scope either, so a project cannot be created or resolved safely."
     };
 
     Error::Validation(format!(
-        "{} for {}. {} Next step: {}",
-        requirement, action, scope, next_step
+        "project_id is required for {action}. {scope} Next step: {next_step}"
     ))
 }
 
@@ -2108,6 +2105,18 @@ impl ToolHandler for ProjectTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let input: ProjectInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
+        // Text that is not an id was dropped and the call fell back to the
+        // session's scope: get loaded the session's project (#372).
+        refuse_malformed_scope_id(
+            "workspace_id",
+            "workspace",
+            &classify_scope_id_arg(input.workspace_id.as_deref()),
+        )?;
+        refuse_malformed_scope_id(
+            "project_id",
+            "project",
+            &classify_scope_id_arg(input.project_id.as_deref()),
+        )?;
 
         // Auto-resolve workspace/project from session if not provided
         let state = self.session.state().await;

@@ -1072,26 +1072,76 @@ fn extract_pending_file_paths(result: &Value) -> Vec<String> {
     vec![]
 }
 
-fn format_project_files_text(result: &Value) -> String {
+/// A page of a project's files as text (#441, #442): where the page sits
+/// in the project's count, how to get the next one, and one line per file.
+/// `total` is the count the caller trusts: the API's own is exact on the
+/// first page only.
+fn format_project_files_text(
+    result: &Value,
+    offset: usize,
+    page_size: usize,
+    total: Option<usize>,
+) -> String {
+    let one_line = crate::domains::display_title::one_line;
     let page_count = project_files_page_count(result);
-    let total_count = result.get("total").and_then(|v| v.as_i64());
-    let mut text = if let Some(total) = total_count {
-        if total as usize == page_count {
-            format!("Found {} indexed files.", page_count)
-        } else {
-            format!(
-                "Found {} indexed files on this page ({} total indexed).",
-                page_count, total
-            )
+    let end = offset + page_count;
+    let page = offset / page_size.max(1) + 1;
+    let more = total.map_or_else(
+        || result.get("has_more").and_then(Value::as_bool) == Some(true),
+        |total| end < total,
+    );
+    let next = format!(" Pass offset={end} (or page={}) for more.", page + 1);
+    let mut text = match total {
+        Some(total) if page_count == 0 && offset > 0 => format!(
+            "Page {page} is past the end: {total} indexed files, {} pages of {page_size}.",
+            total.div_ceil(page_size.max(1))
+        ),
+        Some(total) if offset == 0 && total <= page_count => {
+            format!("Found {page_count} indexed files.")
         }
-    } else {
-        format!("Found {} indexed files.", page_count)
+        Some(total) if more => format!(
+            "Showing {}–{end} of {total} indexed files.{next}",
+            offset + 1
+        ),
+        Some(total) => format!(
+            "Showing {}–{end} of {total} indexed files (the end).",
+            offset + 1
+        ),
+        None if more => format!("Showing {}–{end} indexed files.{next}", offset + 1),
+        None => format!("Found {page_count} indexed files."),
     };
+    let files = result.get("files").and_then(Value::as_array);
+    let paths = result.get("paths").and_then(Value::as_array);
+    for file in files.into_iter().flatten() {
+        let path = file
+            .get("path")
+            .or_else(|| file.get("file_path"))
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let mut details = Vec::new();
+        if let Some(language) = file.get("language").and_then(Value::as_str) {
+            details.push(one_line(language));
+        }
+        if let Some(lines) = file.get("line_count").and_then(Value::as_i64) {
+            details.push(format!("{lines} lines"));
+        }
+        if let Some(bytes) = file.get("size_bytes").and_then(Value::as_i64) {
+            details.push(format!("{bytes} bytes"));
+        }
+        if details.is_empty() {
+            text.push_str(&format!("\n- {}", one_line(path)));
+        } else {
+            text.push_str(&format!("\n- {} ({})", one_line(path), details.join(", ")));
+        }
+    }
+    for path in paths.into_iter().flatten().filter_map(Value::as_str) {
+        text.push_str(&format!("\n- {}", one_line(path)));
+    }
     if ContextStreamClient::project_index_status_is_checkout_scoped(result)
         && !ContextStreamClient::project_index_status_matches_checkout(result)
     {
         text.push_str(
-            " The hosted service did not confirm this exact checkout; this may be the canonical project file list rather than the active worktree overlay.",
+            "\nThe hosted service did not confirm this exact checkout; this may be the canonical project file list rather than the active worktree overlay.",
         );
     }
     text
@@ -2693,19 +2743,54 @@ impl ToolHandler for ProjectTool {
                 )
                 .await?
                 .project_id;
+                // limit/offset page like every other list (#442): the size
+                // and the page that holds offset, unless page/page_size say.
+                let (page, page_size) = match (input.page, input.page_size) {
+                    (None, None) if input.limit.is_some() || input.offset.is_some() => {
+                        let size = input.limit.unwrap_or(100).clamp(1, 100);
+                        (Some(input.offset.unwrap_or(0).max(0) / size + 1), Some(size))
+                    }
+                    given => given,
+                };
+                let size = page_size.unwrap_or(100).max(1);
+                let offset = (page.unwrap_or(1).max(1) - 1) * size;
                 let result = self
                     .client
                     .project_files_for_checkout(
                         id,
-                        input.page,
-                        input.page_size,
+                        page,
+                        page_size,
                         input.path_pattern.as_deref(),
                         input.sort_by.as_deref(),
                         input.sort_order.as_deref(),
                         folder,
                     )
                     .await?;
-                let text = format_project_files_text(&result);
+                // The API counts the files on the first page only; a later
+                // page's `total` was the offset plus its rows (#442).
+                let total = if offset == 0 {
+                    result.get("total").and_then(Value::as_u64)
+                } else {
+                    self.client
+                        .project_files_for_checkout(
+                            id,
+                            Some(1),
+                            Some(1),
+                            input.path_pattern.as_deref(),
+                            input.sort_by.as_deref(),
+                            input.sort_order.as_deref(),
+                            folder,
+                        )
+                        .await
+                        .ok()
+                        .and_then(|first| first.get("total").and_then(Value::as_u64))
+                };
+                let text = format_project_files_text(
+                    &result,
+                    usize::try_from(offset).unwrap_or(0),
+                    usize::try_from(size).unwrap_or(100),
+                    total.map(|total| total as usize),
+                );
                 Ok(ToolResult::with_structured(text, result))
             }
             "index_status" => {

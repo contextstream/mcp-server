@@ -19,8 +19,11 @@ const SCOPE_ID_ARGS: [&str; 2] = ["workspace_id", "project_id"];
 /// Structured-result key listing the ids init set aside.
 pub(crate) const SCOPE_REPAIRS_KEY: &str = "scope_repairs";
 
-/// The most projects read when looking for near-name candidates.
-const MAX_CATALOG_PROJECTS: usize = 1_000;
+/// The most projects read when looking for near-name candidates, or for the project
+/// `target_project` names. A workspace past 1,000 projects resolved no name at all
+/// (mcp-server#450); the list is fetched a page-batch at a time and reused, so a few
+/// thousand are cheap.
+pub(crate) const MAX_CATALOG_PROJECTS: usize = 10_000;
 
 /// Words that say nothing about which project a folder belongs to.
 const GENERIC_NAME_TOKENS: [&str; 11] = [

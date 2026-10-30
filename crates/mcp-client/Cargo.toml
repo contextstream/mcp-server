@@ -27,6 +27,7 @@ sha2 = "0.11"
 hex = "0.4"
 ignore = { workspace = true }
 fs2 = { workspace = true }
+futures = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -226,10 +226,15 @@ impl EntityTool {
             return Ok(target.to_string());
         }
         let projects = self.workspace_projects(workspace_id).await.map_err(|err| {
+            let reason = match &err {
+                Error::Validation(message) => message.clone(),
+                other => other.to_string(),
+            };
             Error::Validation(format!(
                 "Could not list this workspace's projects to resolve target_project '{}': {}. \
                  Pass project_id instead.",
-                target, err
+                target,
+                reason.trim_end_matches('.')
             ))
         })?;
         let key = project_name_key(target);
@@ -253,7 +258,11 @@ impl EntityTool {
                 )
             })?;
         self.client
-            .list_all_projects(Some(workspace_id), 200, 1000)
+            .list_all_projects(
+                Some(workspace_id),
+                200,
+                super::scope_resolution::MAX_CATALOG_PROJECTS,
+            )
             .await
     }
 

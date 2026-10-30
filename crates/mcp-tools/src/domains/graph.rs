@@ -2837,6 +2837,8 @@ fn reports_nothing(result: &ToolResult) -> bool {
         "No path links these items",
         "No circular dependencies found",
         "No unused code detected",
+        "Complexity metrics: 0 complex functions, 0 long functions",
+        "Complexity metrics: 0 complex functions and 0 long functions",
     ];
     result.content.iter().any(|item| match item {
         mcp_types::tool::ContentItem::Text { text } => {
@@ -3132,12 +3134,15 @@ mod graph_not_built_tests {
             "Found 0 usages of component \"slugify_title\".",
             "No circular dependencies found.",
             "No unused code detected.",
+            "Complexity metrics: 0 complex functions, 0 long functions, average complexity 0.00.",
+            "Complexity metrics: 0 complex functions and 0 long functions.",
         ] {
             assert!(reports_nothing(&ToolResult::text(text)), "{text}");
         }
         for text in [
             "Found 2 dependencies and 1 reverse dependencies for module \"app/service.py\".",
             "Impact analysis for \"x\":\nRisk level: Low\ndirectly affected: 3\n",
+            "Complexity metrics: 0 complex functions, 2 long functions, average complexity 3.10.",
         ] {
             assert!(!reports_nothing(&ToolResult::text(text)), "{text}");
         }

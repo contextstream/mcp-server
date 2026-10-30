@@ -116,6 +116,13 @@ to pick.
 - **Revising.** `revise` starts from a made image or sound: a `variation` (more like it), a
   `revision` (it, changed as you say) or a `resize` (an image in new `sizes`). Also `stop`,
   `library`, `brand` and `products`.
+- **Email, where Create offers it.** Campaigns sent through your team's own Resend account.
+  `email_draft` writes one in your brand from a prompt ("announce our winter sale to
+  customers") and sends nothing; `email_audiences`, `email_campaigns`, `email_test` (to your
+  own address or Resend's test addresses), `email_cancel` and `email_report` (a campaign's
+  delivery, opens, clicks, bounces and complaints, or the workspace's trends). `email_send`
+  goes only with your go: the client asks you when it can; otherwise the agent shows you the
+  campaign and its recipient count and passes the count you agreed to.
 - **Connector.** The hosted path `/studio` serves only this tool, for Claude.ai or ChatGPT
   connectors, with OAuth tokens bound to that resource (`read:studio`, `write:studio`).
 

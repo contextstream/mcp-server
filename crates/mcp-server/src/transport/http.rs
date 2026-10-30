@@ -2558,6 +2558,15 @@ fn tool_error_class(message: &str) -> String {
             "scope_required"
         } else if rest.contains("Project not found for current context") {
             "scope_unresolved"
+        } else if rest.contains("needs an action") {
+            "missing_action"
+        } else if rest.contains("only reads (actions:")
+            || rest.contains(" has no action ")
+            || rest.contains(" has no `")
+        {
+            "unknown_action"
+        } else if rest.contains(" is required") {
+            "missing_argument"
         } else {
             "other"
         };
@@ -7048,6 +7057,19 @@ mod tests {
                 "Validation error: Project not found for current context. Call init(...) in this folder or pass a valid project_id explicitly.",
                 "validation:scope_unresolved",
             ),
+            (
+                "Validation error: `memory_read` needs an action: one of search, decisions.",
+                "validation:missing_action",
+            ),
+            (
+                "Validation error: `memory_read` has no action `search_docs`. Did you mean `search`?",
+                "validation:unknown_action",
+            ),
+            (
+                "Validation error: `memory_read` only reads (actions: search). Use `memory` for `create_doc`.",
+                "validation:unknown_action",
+            ),
+            ("Validation error: query is required for search", "validation:missing_argument"),
             ("HTTP error (403): workspace not accessible", "http:403"),
             ("Request timeout after 10 seconds", "timeout"),
             ("Invalid UUID: abc", "invalid_uuid"),

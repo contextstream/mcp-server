@@ -419,6 +419,12 @@ fn write_observation_labels(name: &str, input: &Value) -> Option<(&'static str, 
 /// timing log and telemetry: the hot-read label, else the write label, else
 /// `other`. Never echoes arbitrary input.
 pub fn tool_call_action_label(name: &str, input: &Value) -> &'static str {
+    // A read-only twin's call is labelled as its tool's action: every
+    // memory_read call was "other" (2026-10-30).
+    let name = crate::domains::read_only::READ_ONLY_TWINS
+        .iter()
+        .find(|twin| twin.name == name)
+        .map_or(name, |twin| twin.tool);
     acceleration_observation_action(name, input)
         .or_else(|| write_observation_labels(name, input).map(|(_, action)| action))
         .unwrap_or("other")

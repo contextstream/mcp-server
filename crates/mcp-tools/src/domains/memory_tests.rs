@@ -2975,3 +2975,33 @@ mod decision_action_line_tests {
             .starts_with("[DECISION_ACTION] verify applied=true — Use Redis (id="));
     }
 }
+
+mod timeline_and_summary_tests {
+    use super::{format_memory_summary, format_memory_timeline};
+    use serde_json::json;
+
+    #[test]
+    fn timeline_and_summary_render_their_data() {
+        // #407: "Timeline retrieved." / "Summary retrieved." and nothing else.
+        let timeline = json!([
+            {"date": "Oct 01", "events": 1030, "nodes": 40},
+            {"date": "Oct 30", "events": 812, "nodes": 7},
+            {"date": "Sep 30", "events": 400, "nodes": 38}
+        ]);
+        assert_eq!(
+            format_memory_timeline(&timeline, Some(2)),
+            "Memory timeline, newest first (2 of 3 days):\n- Oct 30: 812 events, 7 nodes\n- Oct 01: 1,030 events, 40 nodes\nPass limit for more days."
+        );
+        let wrap = json!([{"date": "Dec 31", "events": 1, "nodes": 0}, {"date": "Jan 01", "events": 2, "nodes": 0}]);
+        assert!(format_memory_timeline(&wrap, None).contains("\n- Jan 01: 2 events"));
+        let summary = json!({
+            "events_total": 27594, "nodes_total": 8339, "decisions_total": 1878, "facts_total": 5495,
+            "last_activity_total": "2026-10-30T13:59:26Z",
+            "event_type_counts_total": {"insight": 4066, "session_snapshot": 3949, "decision": 181}
+        });
+        assert_eq!(
+            format_memory_summary(&summary),
+            "Memory summary: 27,594 events, 8,339 nodes (1,878 decisions, 5,495 facts). Last activity: 2026-10-30T13:59:26Z.\nTop event types: insight 4,066, session_snapshot 3,949, decision 181."
+        );
+    }
+}

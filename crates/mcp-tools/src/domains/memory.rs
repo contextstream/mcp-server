@@ -835,6 +835,109 @@ fn format_diagram_detail(value: &Value) -> String {
     text
 }
 
+/// The memory timeline as text (#407): one line per day, newest first, as
+/// many days as `limit` asks for. The API labels days "Oct 01" with no year
+/// and returns them in label order, so they are put in date order here.
+fn format_memory_timeline(value: &Value, limit: Option<i64>) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let items = value
+        .as_array()
+        .or_else(|| value.get("items").and_then(Value::as_array))
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if items.is_empty() {
+        return "No memory activity in the timeline.".to_string();
+    }
+    let month_day = |item: &Value| {
+        let label = item.get("date").and_then(Value::as_str).unwrap_or("");
+        let (month, day) = label.split_once(' ').unwrap_or((label, ""));
+        (
+            MONTHS.iter().position(|name| *name == month).unwrap_or(0),
+            day.trim().parse::<u32>().unwrap_or(0),
+        )
+    };
+    let wraps_year = items.iter().any(|item| month_day(item).0 == 11)
+        && items.iter().any(|item| month_day(item).0 == 0);
+    let mut days: Vec<&Value> = items.iter().collect();
+    days.sort_by_key(|item| {
+        let (month, day) = month_day(item);
+        let month = if wraps_year && month < 6 {
+            month + 12
+        } else {
+            month
+        };
+        std::cmp::Reverse((month, day))
+    });
+    let shown = limit.map_or(days.len(), |limit| (limit.max(1) as usize).min(days.len()));
+    let count =
+        |item: &Value, key: &str| item.get(key).and_then(Value::as_u64).unwrap_or(0) as usize;
+    let mut text = format!(
+        "Memory timeline, newest first ({shown} of {} days):",
+        days.len()
+    );
+    for item in days.iter().take(shown) {
+        text.push_str(&format!(
+            "\n- {}: {} events, {} nodes",
+            item.get("date").and_then(Value::as_str).unwrap_or("?"),
+            group_digits(count(item, "events")),
+            group_digits(count(item, "nodes"))
+        ));
+    }
+    if shown < days.len() {
+        text.push_str("\nPass limit for more days.");
+    }
+    text
+}
+
+/// The memory summary as text (#407): totals, decisions and facts, the last
+/// activity, and the most frequent event types.
+fn format_memory_summary(value: &Value) -> String {
+    let number = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| value.get(*key).and_then(Value::as_u64))
+            .map(|count| group_digits(count as usize))
+    };
+    let mut text = format!(
+        "Memory summary: {} events, {} nodes ({} decisions, {} facts).",
+        number(&["events_total", "events"]).unwrap_or_else(|| "?".to_string()),
+        number(&["nodes_total", "nodes"]).unwrap_or_else(|| "?".to_string()),
+        number(&["decisions_total", "decisions"]).unwrap_or_else(|| "?".to_string()),
+        number(&["facts_total", "facts"]).unwrap_or_else(|| "?".to_string()),
+    );
+    if let Some(last) = value
+        .get("last_activity_total")
+        .or_else(|| value.get("last_activity"))
+        .and_then(Value::as_str)
+    {
+        text.push_str(&format!(" Last activity: {last}."));
+    }
+    if let Some(days) = value.get("retention_days").and_then(Value::as_u64) {
+        text.push_str(&format!(" Retention: {days} days."));
+    }
+    if let Some(types) = value
+        .get("event_type_counts_total")
+        .or_else(|| value.get("event_type_counts"))
+        .and_then(Value::as_object)
+    {
+        let mut counts: Vec<(&String, u64)> = types
+            .iter()
+            .filter_map(|(name, count)| count.as_u64().map(|count| (name, count)))
+            .collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        if !counts.is_empty() {
+            let top: Vec<String> = counts
+                .iter()
+                .take(8)
+                .map(|(name, count)| format!("{name} {}", group_digits(*count as usize)))
+                .collect();
+            text.push_str(&format!("\nTop event types: {}.", top.join(", ")));
+        }
+    }
+    text
+}
+
 fn format_event_detail(value: &Value) -> String {
     let event = extract_primary_object(value, &["id", "title", "content"]);
     let id = event.get("id").and_then(|v| v.as_str()).unwrap_or("—");
@@ -6188,17 +6291,13 @@ impl ToolHandler for MemoryTool {
             // === Timeline & Summary ===
             "timeline" => {
                 let result = self.client.memory_timeline(workspace_id).await?;
-                Ok(ToolResult::with_structured(
-                    "Timeline retrieved.".to_string(),
-                    result,
-                ))
+                let text = format_memory_timeline(&result, input.limit);
+                Ok(ToolResult::with_structured(text, result))
             }
             "summary" => {
                 let result = self.client.memory_summary(workspace_id).await?;
-                Ok(ToolResult::with_structured(
-                    "Summary retrieved.".to_string(),
-                    result,
-                ))
+                let text = format_memory_summary(&result);
+                Ok(ToolResult::with_structured(text, result))
             }
 
             // === Team Actions ===

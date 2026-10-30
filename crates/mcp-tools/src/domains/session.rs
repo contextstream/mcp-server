@@ -14272,6 +14272,36 @@ fn validate_capture_plan_input(input: &CapturePlanInput) -> Result<()> {
     Ok(())
 }
 
+/// What capture_plan says. Each warning and task error is listed under its
+/// count: the counts alone told a client that shows only text (stdio sends no
+/// structured content) that the plan had problems, not which (#355).
+fn capture_plan_text(
+    title: &str,
+    plan_id: &str,
+    created_count: usize,
+    warnings: &[String],
+    task_errors: &[String],
+) -> String {
+    let mut text = format!(
+        "Plan created: {title} (ID: {plan_id})\nLinked tasks created: {created_count}. Task errors: {}. Plan quality warnings: {}.",
+        task_errors.len(),
+        warnings.len()
+    );
+    for (heading, items) in [
+        ("Plan quality warnings", warnings),
+        ("Task errors", task_errors),
+    ] {
+        if !items.is_empty() {
+            text.push_str(&format!("\n{heading}:"));
+            for item in items {
+                text.push_str(&format!("\n- {item}"));
+            }
+        }
+    }
+    text.push_str("\nLinked refs: use linked_items with kinds doc|diagram|runbook|handoff (indexed kind+id refs).\nProgress: completed.");
+    text
+}
+
 fn capture_plan_quality_warnings(input: &CapturePlanInput) -> Vec<String> {
     let mut warnings = Vec::new();
     if !text_has_detail(input.description.as_deref(), 10, 80) {
@@ -14742,25 +14772,12 @@ impl ToolHandler for CapturePlanTool {
             );
         }
         attach_scope_recovery_metadata(&mut result, &scope);
-        let created_count = result
-            .get("linked_task_creation")
-            .and_then(|value| value.get("created_count"))
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        let error_count = result
-            .get("linked_task_creation")
-            .and_then(|value| value.get("errors"))
-            .and_then(|value| value.as_array())
-            .map(Vec::len)
-            .unwrap_or(0);
-        let warning_count = result
-            .get("plan_quality_warnings")
-            .and_then(|value| value.as_array())
-            .map(Vec::len)
-            .unwrap_or(0);
-        let text = format!(
-            "Plan created: {} (ID: {})\nLinked tasks created: {}. Task errors: {}. Plan quality warnings: {}.\nLinked refs: use linked_items with kinds doc|diagram|runbook|handoff (indexed kind+id refs).\nProgress: completed.",
-            input.title, plan_id, created_count, error_count, warning_count
+        let text = capture_plan_text(
+            &input.title,
+            &plan_id,
+            created_tasks.len(),
+            &plan_quality_warnings,
+            &task_creation_errors,
         );
         let mut output = ToolResult::with_structured(text, result);
         if let Some(note) = scope.note {

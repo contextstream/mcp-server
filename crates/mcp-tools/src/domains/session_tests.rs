@@ -7903,3 +7903,23 @@ mod plan_task_batch_tests {
         assert!(errors[0].starts_with("Task plan-step-2: "), "{errors:?}");
     }
 }
+
+mod capture_plan_text_tests {
+    use super::capture_plan_text;
+
+    #[test]
+    fn capture_plan_lists_each_warning_and_task_error_under_its_count() {
+        // #355: over stdio the counts were all a model saw.
+        let warnings = vec!["Step plan-step-1 description is thin.".to_string()];
+        let errors = vec!["Task 2: 422 title too long".to_string()];
+        let text = capture_plan_text("QA plan", "p1", 1, &warnings, &errors);
+        assert!(text.starts_with("Plan created: QA plan (ID: p1)\nLinked tasks created: 1. Task errors: 1. Plan quality warnings: 1."));
+        assert!(text.contains("\nPlan quality warnings:\n- Step plan-step-1 description is thin."));
+        assert!(text.contains("\nTask errors:\n- Task 2: 422 title too long"));
+        assert!(text.ends_with("Progress: completed."));
+
+        let clean = capture_plan_text("QA plan", "p1", 3, &[], &[]);
+        assert!(!clean.contains("Plan quality warnings:\n"));
+        assert!(!clean.contains("Task errors:\n"));
+    }
+}

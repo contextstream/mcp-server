@@ -2844,9 +2844,93 @@ impl ContextStreamClient {
     ) -> std::result::Result<String, BoundedTextReadError> {
         let bytes = Self::read_bounded_bytes_beneath(root, relative, max_bytes)
             .map_err(|()| BoundedTextReadError::Transient)?;
-        String::from_utf8(bytes).map_err(|error| BoundedTextReadError::InvalidUtf8 {
-            bytes_read: error.as_bytes().len(),
-        })
+        Self::text_from_file_bytes(bytes)
+    }
+
+    /// The text a file's bytes hold, or `InvalidUtf8` when they are not text at all
+    /// (mcp-server#448). UTF-8 is read as it is. UTF-16 with a byte order mark
+    /// (PowerShell output, `.reg`, some `.sql` and `.csv`) is decoded. Any other
+    /// bytes that are not valid UTF-8 but look like text (Latin-1, Windows-1252:
+    /// legacy Java, PHP and Windows sources) are read as Windows-1252, so the file
+    /// is searchable instead of silently left out of the index. Bytes with NULs or
+    /// a high share of control characters are binary and stay excluded.
+    fn text_from_file_bytes(bytes: Vec<u8>) -> std::result::Result<String, BoundedTextReadError> {
+        let not_text = |bytes_read: usize| BoundedTextReadError::InvalidUtf8 { bytes_read };
+        if let Some(text) = Self::utf16_text(&bytes) {
+            return if Self::looks_binary(text.bytes()) {
+                Err(not_text(bytes.len()))
+            } else {
+                Ok(text)
+            };
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(text),
+            Err(error) => {
+                let bytes = error.into_bytes();
+                if Self::looks_binary(bytes.iter().copied()) {
+                    Err(not_text(bytes.len()))
+                } else {
+                    Ok(Self::decode_windows_1252(&bytes))
+                }
+            }
+        }
+    }
+
+    /// The text of UTF-16 bytes that start with a byte order mark; `None` without one.
+    /// UTF-32 starts the same way, but its NULs make it read as binary.
+    fn utf16_text(bytes: &[u8]) -> Option<String> {
+        let (big_endian, body) = match bytes {
+            [0xFF, 0xFE, rest @ ..] => (false, rest),
+            [0xFE, 0xFF, rest @ ..] => (true, rest),
+            _ => return None,
+        };
+        let units: Vec<u16> = body
+            .chunks_exact(2)
+            .map(|pair| {
+                if big_endian {
+                    u16::from_be_bytes([pair[0], pair[1]])
+                } else {
+                    u16::from_le_bytes([pair[0], pair[1]])
+                }
+            })
+            .collect();
+        Some(String::from_utf16_lossy(&units))
+    }
+
+    /// Whether bytes are binary data rather than text: any NUL, or more than 2% control
+    /// characters other than tab, line breaks, form feed and escape.
+    fn looks_binary(bytes: impl Iterator<Item = u8>) -> bool {
+        let (mut total, mut controls) = (0usize, 0usize);
+        for byte in bytes {
+            total += 1;
+            if byte == 0 {
+                return true;
+            }
+            if (byte < 0x20 && !matches!(byte, b'\t' | b'\n' | b'\r' | 0x0c | 0x1b)) || byte == 0x7f
+            {
+                controls += 1;
+            }
+        }
+        controls * 50 > total
+    }
+
+    /// Windows-1252 bytes as text: ASCII and 0xA0-0xFF are the same code points as in
+    /// Latin-1, and 0x80-0x9F are the printable characters Windows put there.
+    fn decode_windows_1252(bytes: &[u8]) -> String {
+        const HIGH: [char; 32] = [
+            '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+            '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{008D}',
+            '\u{017D}', '\u{008F}', '\u{0090}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+            '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
+            '\u{0153}', '\u{009D}', '\u{017E}', '\u{0178}',
+        ];
+        bytes
+            .iter()
+            .map(|&byte| match byte {
+                0x80..=0x9F => HIGH[usize::from(byte - 0x80)],
+                _ => char::from(byte),
+            })
+            .collect()
     }
 
     fn git_common_dir_for_checkout(root: &Path) -> Result<Option<std::path::PathBuf>> {
@@ -29805,6 +29889,125 @@ mod tests {
         Ok(())
     }
 
+    // mcp-server#448: Latin-1, Windows-1252 and UTF-16 text was left out of the index
+    // without a word ("Project indexed"), so exhaustive search said "No literal matches".
+    #[test]
+    fn text_in_other_encodings_is_read_and_binary_is_not() {
+        let text = |bytes: &[u8]| ContextStreamClient::text_from_file_bytes(bytes.to_vec());
+
+        // Latin-1 and Windows-1252 (smart quotes, euro) read as Windows-1252.
+        assert_eq!(
+            text(b"caf\xe9 d\xe9j\xe0 vu\nLATIN1TOKEN here").as_deref(),
+            Ok("caf\u{e9} d\u{e9}j\u{e0} vu\nLATIN1TOKEN here")
+        );
+        assert_eq!(
+            text(b"smart \x93quotes\x94 \x80 CP1252TOKEN").as_deref(),
+            Ok("smart \u{201c}quotes\u{201d} \u{20ac} CP1252TOKEN")
+        );
+        // Bytes that are not valid UTF-8 but look like text.
+        assert_eq!(text(&[0xC3, 0x28]).as_deref(), Ok("\u{c3}("));
+
+        // UTF-16 with a byte order mark, little and big endian.
+        let utf16 = |text: &str, big_endian: bool| {
+            let mut bytes = if big_endian {
+                vec![0xFE, 0xFF]
+            } else {
+                vec![0xFF, 0xFE]
+            };
+            for unit in text.encode_utf16() {
+                bytes.extend(if big_endian {
+                    unit.to_be_bytes()
+                } else {
+                    unit.to_le_bytes()
+                });
+            }
+            bytes
+        };
+        assert_eq!(
+            text(&utf16("UTF16TOKEN hello\r\n", false)).as_deref(),
+            Ok("UTF16TOKEN hello\r\n")
+        );
+        assert_eq!(
+            text(&utf16("UTF16TOKEN h\u{e9}llo", true)).as_deref(),
+            Ok("UTF16TOKEN h\u{e9}llo")
+        );
+        assert_eq!(
+            text(&[0xFF, 0xFE]).as_deref(),
+            Ok(""),
+            "a byte order mark alone is an empty file"
+        );
+
+        // UTF-8, with or without a byte order mark, is unchanged.
+        assert_eq!(
+            text("BOMTOKEN h\u{e9}llo".as_bytes()).as_deref(),
+            Ok("BOMTOKEN h\u{e9}llo")
+        );
+        assert_eq!(
+            text(b"\xEF\xBB\xBFBOMTOKEN").as_deref(),
+            Ok("\u{feff}BOMTOKEN")
+        );
+
+        // Binary stays out: a NUL, UTF-32, and data with many control bytes.
+        let binary = BoundedTextReadError::InvalidUtf8 { bytes_read: 0 };
+        for bytes in [
+            &[0x00u8, 0xff, 0xfe, 0xfd][..],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00][..],
+            &[0xFF, 0xFE, 0x00, 0x00, b'a', 0x00, 0x00, 0x00][..],
+            // Control characters with no NUL, and a high byte so it is not valid UTF-8.
+            &std::iter::once(0x80u8)
+                .chain((1u8..32).cycle().take(512))
+                .collect::<Vec<_>>(),
+        ] {
+            let error = text(bytes).expect_err("binary is not text");
+            assert!(
+                matches!(error, BoundedTextReadError::InvalidUtf8 { .. }),
+                "{bytes:?}: {error:?} (expected {binary:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scan_sends_text_in_other_encodings_decoded_and_withholds_binary(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("mcp-client-encodings-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("ok.py"), "OKTOKEN = 1\n")?;
+        std::fs::write(
+            root.join("latin1.txt"),
+            b"caf\xe9 d\xe9j\xe0 vu\nLATIN1TOKEN here\n",
+        )?;
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "UTF16TOKEN hello\n".encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        std::fs::write(root.join("utf16.txt"), utf16)?;
+        std::fs::write(root.join("blob.dat"), [0x00, 0x01, 0x02, 0xff, 0xfe, 0x00])?;
+
+        let client = ContextStreamClient::new(Config::default());
+        let scan = client.read_local_files(root.to_string_lossy().as_ref(), usize::MAX, false)?;
+        let content = |path: &str| {
+            scan.files
+                .iter()
+                .find(|file| file["path"] == path)
+                .and_then(|file| file["content"].as_str().map(str::to_string))
+        };
+        assert_eq!(content("ok.py").as_deref(), Some("OKTOKEN = 1\n"));
+        assert_eq!(
+            content("latin1.txt").as_deref(),
+            Some("caf\u{e9} d\u{e9}j\u{e0} vu\nLATIN1TOKEN here\n")
+        );
+        assert_eq!(content("utf16.txt").as_deref(), Some("UTF16TOKEN hello\n"));
+        assert_eq!(content("blob.dat"), None, "binary is not sent");
+        assert!(scan
+            .policy_deleted_paths
+            .iter()
+            .any(|path| path == "blob.dat"));
+        assert!(scan.complete);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     // mcp-server#425: a file an older release indexed and has not seen change
     // since is read again once, so a content check added later can withhold it.
     #[test]
@@ -30365,7 +30568,8 @@ mod tests {
             root.join("private/ignored.rs"),
             "const SECRET: &str = \"x\";\n",
         )?;
-        std::fs::write(root.join("invalid.rs"), [0xff, 0xfe, 0xfd])?;
+        // Binary (a NUL): not text in any encoding, so it stays out of the index.
+        std::fs::write(root.join("invalid.rs"), [0x00, 0xff, 0xfe, 0xfd])?;
         std::fs::write(root.join("normal.rs"), "pub fn normal() {}\n")?;
         // Git metadata is never source. Use a valid directory here; malformed
         // linked-worktree metadata intentionally makes targeted policy reject.

@@ -1711,6 +1711,14 @@ async fn run_exclude(
         Some(p) => std::path::PathBuf::from(p),
         None => std::env::current_dir()?,
     };
+    if !matches!(action, ExcludeAction::Info) {
+        if !project_dir.exists() {
+            anyhow::bail!("Path does not exist: {}", project_dir.display());
+        }
+        if !project_dir.is_dir() {
+            anyhow::bail!("Path must be a directory: {}", project_dir.display());
+        }
+    }
 
     let ignore_path = project_dir.join(CONTEXTIGNORE_FILE);
 
@@ -1723,7 +1731,7 @@ async fn run_exclude(
             );
             eprintln!();
 
-            let current = read_contextignore(&ignore_path);
+            let current = read_contextignore(&ignore_path)?.lines;
             if current.is_empty() {
                 eprintln!(
                     "  {}No .contextignore file found. Using server defaults only.",
@@ -1769,13 +1777,15 @@ async fn run_exclude(
                 anyhow::bail!("No patterns specified. Usage: contextstream-mcp exclude add <pattern> [pattern...]");
             }
 
-            let mut current = read_contextignore(&ignore_path);
-            let active: std::collections::HashSet<String> = current.iter().cloned().collect();
+            let patterns = normalize_exclude_patterns(&patterns, true)?;
+            let mut file = read_contextignore(&ignore_path)?;
+            let mut active: std::collections::HashSet<String> =
+                file.lines.iter().cloned().collect();
             let mut added = Vec::new();
 
             for pattern in &patterns {
-                if !active.contains(pattern) {
-                    current.push(pattern.clone());
+                if active.insert(pattern.clone()) {
+                    file.lines.push(pattern.clone());
                     added.push(pattern.as_str());
                 }
             }
@@ -1786,7 +1796,7 @@ async fn run_exclude(
                     style("ℹ  ").blue()
                 );
             } else {
-                write_contextignore(&ignore_path, &current)?;
+                write_contextignore(&ignore_path, &file.lines, file.line_ending)?;
                 eprintln!(
                     "\n{} Added {} pattern(s) to .contextignore:",
                     style("✓").green(),
@@ -1803,8 +1813,9 @@ async fn run_exclude(
                 anyhow::bail!("No patterns specified. Usage: contextstream-mcp exclude remove <pattern> [pattern...]");
             }
 
-            let current = read_contextignore(&ignore_path);
-            if current.is_empty() {
+            let patterns = normalize_exclude_patterns(&patterns, false)?;
+            let file = read_contextignore(&ignore_path)?;
+            if file.lines.is_empty() {
                 eprintln!("  {}No .contextignore file found.", style("ℹ  ").blue());
                 return Ok(());
             }
@@ -1813,10 +1824,13 @@ async fn run_exclude(
                 patterns.iter().map(|s| s.as_str()).collect();
             let mut removed = Vec::new();
 
-            let filtered: Vec<String> = current
+            let filtered: Vec<String> = file
+                .lines
                 .into_iter()
                 .filter(|p| {
-                    if to_remove.contains(p.as_str()) {
+                    // A line an older version stored with surrounding spaces
+                    // still matches the pattern as typed.
+                    if to_remove.contains(p.as_str()) || to_remove.contains(p.trim()) {
                         removed.push(p.clone());
                         false
                     } else {
@@ -1831,7 +1845,7 @@ async fn run_exclude(
                     style("ℹ  ").blue()
                 );
             } else {
-                write_contextignore(&ignore_path, &filtered)?;
+                write_contextignore(&ignore_path, &filtered, file.line_ending)?;
                 eprintln!(
                     "\n{} Removed {} pattern(s) from .contextignore:",
                     style("✓").green(),
@@ -1855,7 +1869,7 @@ async fn run_exclude(
                 lines.push(pattern.to_string());
             }
 
-            write_contextignore(&ignore_path, &lines)?;
+            write_contextignore(&ignore_path, &lines, "\n")?;
             eprintln!(
                 "\n{} Reset .contextignore to default patterns ({} patterns)",
                 style("✓").green(),
@@ -1932,22 +1946,72 @@ async fn run_exclude(
     Ok(())
 }
 
-fn read_contextignore(path: &std::path::Path) -> Vec<String> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => content.lines().map(|l| l.to_string()).collect(),
-        Err(_) => Vec::new(),
-    }
+/// A `.contextignore` as `exclude` reads it: its lines and the line ending it
+/// uses, so a rewrite keeps the person's CRLF.
+struct ContextIgnoreFile {
+    lines: Vec<String>,
+    line_ending: &'static str,
 }
 
-fn write_contextignore(path: &std::path::Path, lines: &[String]) -> Result<()> {
-    let content = lines.join("\n");
-    let content = if content.ends_with('\n') {
-        content
-    } else {
-        format!("{}\n", content)
+/// The patterns in `path`. A file that is not there is an empty list; one that
+/// is there and cannot be read (not UTF-8, no permission, a folder) is an error,
+/// so no action treats the person's patterns as absent and writes over them.
+fn read_contextignore(path: &std::path::Path) -> Result<ContextIgnoreFile> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ContextIgnoreFile {
+                lines: Vec::new(),
+                line_ending: "\n",
+            });
+        }
+        Err(error) => anyhow::bail!(
+            "Could not read {}: {}. The file was left unchanged.",
+            path.display(),
+            error
+        ),
     };
-    std::fs::write(path, content)?;
-    Ok(())
+    let text = String::from_utf8(bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "Could not read {}: it is not valid UTF-8. The file was left unchanged; fix or remove it and run this again.",
+            path.display()
+        )
+    })?;
+    Ok(ContextIgnoreFile {
+        line_ending: if text.contains("\r\n") { "\r\n" } else { "\n" },
+        lines: text.lines().map(|l| l.to_string()).collect(),
+    })
+}
+
+fn write_contextignore(path: &std::path::Path, lines: &[String], line_ending: &str) -> Result<()> {
+    let mut content = lines.join(line_ending);
+    if !content.ends_with('\n') {
+        content.push_str(line_ending);
+    }
+    std::fs::write(path, content)
+        .map_err(|error| anyhow::anyhow!("Could not write {}: {}", path.display(), error))
+}
+
+/// The patterns as typed, trimmed (gitignore drops a trailing space and nobody
+/// means a leading one), refusing what could not exclude anything: an empty
+/// pattern, and when adding one that starts with `#`, which is a comment line.
+fn normalize_exclude_patterns(patterns: &[String], adding: bool) -> Result<Vec<String>> {
+    let mut normalized = Vec::with_capacity(patterns.len());
+    for pattern in patterns {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!(
+                "Empty pattern. Pass a gitignore-style pattern such as 'dist/' or '*.log'."
+            );
+        }
+        if adding && trimmed.starts_with('#') {
+            anyhow::bail!(
+                "'{trimmed}' starts with # and would be a comment in .contextignore, so it would exclude nothing. Write \\{trimmed} to exclude a file whose name starts with #."
+            );
+        }
+        normalized.push(trimmed.to_string());
+    }
+    Ok(normalized)
 }
 
 /// The binary an update just installed, once `run_update` has located it.

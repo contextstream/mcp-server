@@ -589,6 +589,38 @@ pub(crate) fn ensure_write_answered(result: &Value, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// A page of a list and where it sits, or, for an empty page after the
+/// last one, that it is past the end (#452): it said "No docs found. Create
+/// one …" for a workspace with 51 docs.
+fn format_collection_page(
+    entity_name: &str,
+    result: &Value,
+    offset: Option<i64>,
+    limit: Option<i64>,
+) -> String {
+    let start = offset.unwrap_or(0).max(0);
+    let shown = extract_collection_array(result).map_or(0, Vec::len);
+    if shown == 0 && start > 0 {
+        let total = result
+            .get("total")
+            .and_then(Value::as_u64)
+            .filter(|total| *total > 0);
+        return match total {
+            Some(total) => format!(
+                "Offset {start} is past the end: there are {total} {entity_name}. Pass a smaller offset (offset=0 for the first page)."
+            ),
+            None => format!(
+                "No {entity_name} at offset {start}: the list ends before it. Pass a smaller offset (offset=0 for the first page)."
+            ),
+        };
+    }
+    format!(
+        "{}{}",
+        format_collection(entity_name, result),
+        paging_footer(result, offset, limit)
+    )
+}
+
 /// Format a collection of items into a human-readable list with IDs and titles.
 /// This allows the AI to see item details (especially IDs) so it can act on them.
 fn format_collection(entity_name: &str, value: &Value) -> String {
@@ -2699,6 +2731,7 @@ pub(crate) fn render_decisions_envelope(
     envelope: &Value,
     requested_sort: Option<&str>,
     requested_status: Option<&str>,
+    offset: Option<i64>,
 ) -> String {
     let items = envelope
         .get("items")
@@ -2716,17 +2749,33 @@ pub(crate) fn render_decisions_envelope(
         .or(requested_sort)
         .unwrap_or("relevance");
     let status_filter = requested_status.unwrap_or("active");
+    // The API read only part of a long list: its total counts what it read
+    // (#452), and the "of N" grew with the offset.
+    let total_text = if envelope
+        .get("total_is_lower_bound")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        format!("at least {total}")
+    } else {
+        total.to_string()
+    };
+    let start = offset.unwrap_or(0).max(0);
     let mut text = String::new();
 
-    if items.is_empty() {
+    if items.is_empty() && start > 0 {
+        // A page past the end is not an empty decision log (#452).
+        text.push_str(&format!(
+            "No decisions at offset {start} (status={status_filter}): the list has {total_text}. Pass a smaller offset (offset=0 for the first page).\n"
+        ));
+    } else if items.is_empty() {
         text.push_str(&format!(
             "No decisions recorded yet (status={status_filter}).\n"
         ));
     } else {
         text.push_str(&format!(
-            "[DECISIONS] {} of {} decision(s) (sort={sort}, status={status_filter}):\n\n",
-            items.len(),
-            total
+            "[DECISIONS] {} of {total_text} decision(s) (sort={sort}, status={status_filter}):\n\n",
+            items.len()
         ));
         for (index, node) in items.iter().enumerate() {
             let title = extract_display_title(node);
@@ -3456,7 +3505,7 @@ impl ToolHandler for MemoryDecisionsTool {
             envelope
         };
 
-        let text = render_decisions_envelope(&envelope, sort.as_deref(), status.as_deref());
+        let text = render_decisions_envelope(&envelope, sort.as_deref(), status.as_deref(), offset);
         let mut output = ToolResult::with_structured(text, envelope);
         if let Some(note) = scope.note.as_deref() {
             output = output.with_prefix(format!("{}\n", note));
@@ -4332,11 +4381,7 @@ impl MemoryTool {
                     }
                     r
                 };
-                let text = format!(
-                    "{}{}",
-                    format_collection("memory nodes", &result),
-                    paging_footer(&result, input.offset, input.limit)
-                );
+                let text = format_collection_page("memory nodes", &result, input.offset, input.limit);
                 Ok(ToolResult::with_structured(text, result))
             }
             "supersede_node" => {
@@ -4884,11 +4929,7 @@ impl MemoryTool {
                         ""
                     )
                 } else {
-                    format!(
-                        "{}{}",
-                        format_collection("events", &result),
-                        paging_footer(&result, input.offset, input.limit)
-                    )
+                    format_collection_page("events", &result, input.offset, input.limit)
                 };
                 Ok(ToolResult::with_structured(text, result))
             }
@@ -5274,11 +5315,7 @@ impl MemoryTool {
                     }
                     Err(err) => return Err(err),
                 };
-                let text = format!(
-                    "{}{}",
-                    format_collection("tasks", &result),
-                    paging_footer(&result, input.offset, input.limit)
-                );
+                let text = format_collection_page("tasks", &result, input.offset, input.limit);
                 Ok(ToolResult::with_structured(text, result))
             }
             "reorder_tasks" => {
@@ -5642,11 +5679,7 @@ impl MemoryTool {
                     }
                     Err(err) => return Err(err),
                 };
-                let text = format!(
-                    "{}{}",
-                    format_collection("todos", &result),
-                    paging_footer(&result, input.offset, input.limit)
-                );
+                let text = format_collection_page("todos", &result, input.offset, input.limit);
                 Ok(ToolResult::with_structured(text, result))
             }
 
@@ -5842,9 +5875,8 @@ impl MemoryTool {
                 )
                 .await?;
                 let text = format!(
-                    "{}{}\n{}\nExamples: memory(action=\"create_diagram\", diagram_type=\"sequence\", title=\"Auth handoff\", content=\"...\") | memory(action=\"create_diagram\", diagram_type=\"er\", title=\"Billing schema\", content=\"...\")",
-                    format_collection("diagrams", &result),
-                    paging_footer(&result, input.offset, input.limit),
+                    "{}\n{}\nExamples: memory(action=\"create_diagram\", diagram_type=\"sequence\", title=\"Auth handoff\", content=\"...\") | memory(action=\"create_diagram\", diagram_type=\"er\", title=\"Billing schema\", content=\"...\")",
+                    format_collection_page("diagrams", &result, input.offset, input.limit),
                     diagram_types_help_suffix()
                 );
                 Ok(ToolResult::with_structured(text, result))
@@ -6175,11 +6207,7 @@ impl MemoryTool {
                     }
                     Err(err) => return Err(err),
                 };
-                let text = format!(
-                    "{}{}",
-                    format_collection("docs", &result),
-                    paging_footer(&result, input.offset, input.limit)
-                );
+                let text = format_collection_page("docs", &result, input.offset, input.limit);
                 Ok(ToolResult::with_structured(text, result))
             }
             "create_roadmap" => {
@@ -6261,11 +6289,7 @@ impl MemoryTool {
                     ),
                 )
                 .await?;
-                let text = format!(
-                    "{}{}",
-                    format_collection("transcripts", &result),
-                    paging_footer(&result, input.offset, input.limit)
-                );
+                let text = format_collection_page("transcripts", &result, input.offset, input.limit);
                 Ok(ToolResult::with_structured(text, result))
             }
             "get_transcript" => {

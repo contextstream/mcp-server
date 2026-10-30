@@ -6148,14 +6148,17 @@ pub async fn index_project(
                 .and_then(|v| v.as_i64())
                 .map(|n| n > 0)
                 .unwrap_or(false);
+            // Files over the size limit are never indexed; say so, so a
+            // search for text in one is not taken for an absence (#340).
+            let left_out = too_large_note(&value);
             if degraded_shown || still_indexing {
-                ui::say(
-                    ui::Mark::Ok,
-                    "Project linked",
-                    Some("indexing continues in the background"),
-                );
+                let tail = match &left_out {
+                    Some(note) => format!("indexing continues in the background; {note}"),
+                    None => "indexing continues in the background".to_string(),
+                };
+                ui::say(ui::Mark::Ok, "Project linked", Some(&tail));
             } else {
-                ui::say(ui::Mark::Ok, "Project indexed", None);
+                ui::say(ui::Mark::Ok, "Project indexed", left_out.as_deref());
             }
         }
         Err(error) => {
@@ -6173,6 +6176,38 @@ pub async fn index_project(
     }
 
     Ok(())
+}
+
+/// What an index run left out because the files are over the size limit, as
+/// one line for the person: "2 files over 5 MiB are not indexed: a.txt, b.txt".
+/// `None` when nothing was left out.
+pub(crate) fn too_large_note(result: &serde_json::Value) -> Option<String> {
+    let count = result
+        .get("files_too_large")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    if count <= 0 {
+        return None;
+    }
+    let names: Vec<&str> = result
+        .get("files_too_large_examples")
+        .and_then(|value| value.as_array())
+        .map(|paths| paths.iter().filter_map(|path| path.as_str()).collect())
+        .unwrap_or_default();
+    let more = (count as usize).saturating_sub(names.len());
+    let list = if names.is_empty() {
+        String::new()
+    } else if more > 0 {
+        format!(": {} and {more} more", names.join(", "))
+    } else {
+        format!(": {}", names.join(", "))
+    };
+    Some(format!(
+        "{count} file{} over 5 MiB {} not indexed, so searches do not cover {}{list}",
+        if count == 1 { "" } else { "s" },
+        if count == 1 { "is" } else { "are" },
+        if count == 1 { "it" } else { "them" },
+    ))
 }
 
 #[allow(dead_code)] // kept around for the unit tests at the bottom of this
@@ -6294,6 +6329,8 @@ pub struct BackgroundIndexOutcome {
     pub committed: bool,
     pub scan_complete: bool,
     pub files_deferred: usize,
+    /// Files over 5 MiB, which are never indexed.
+    pub files_too_large: usize,
 }
 
 pub async fn index_project_background(
@@ -6363,6 +6400,11 @@ pub async fn index_project_background(
         committed: ContextStreamClient::ingest_result_committed(&result),
         scan_complete: ContextStreamClient::ingest_scan_complete(&result),
         files_deferred,
+        files_too_large: result
+            .get("files_too_large")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0)
+            .max(0) as usize,
     })
 }
 
@@ -6458,6 +6500,35 @@ fn unattended_key_check_failure(error: &mcp_types::Error, api_url: &str) -> anyh
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn too_large_note_names_what_an_index_run_left_out() {
+        use super::too_large_note;
+        use serde_json::json;
+        assert_eq!(too_large_note(&json!({})), None);
+        assert_eq!(too_large_note(&json!({"files_too_large": 0})), None);
+        assert_eq!(
+            too_large_note(&json!({
+                "files_too_large": 1,
+                "files_too_large_examples": ["big.txt"]
+            }))
+            .as_deref(),
+            Some("1 file over 5 MiB is not indexed, so searches do not cover it: big.txt")
+        );
+        assert_eq!(
+            too_large_note(&json!({
+                "files_too_large": 7,
+                "files_too_large_examples": ["a", "b", "c", "d", "e"]
+            }))
+            .as_deref(),
+            Some("7 files over 5 MiB are not indexed, so searches do not cover them: a, b, c, d, e and 2 more")
+        );
+        // A count with no names (an older client's result shape) still says it.
+        assert_eq!(
+            too_large_note(&json!({"files_too_large": 2})).as_deref(),
+            Some("2 files over 5 MiB are not indexed, so searches do not cover them")
+        );
+    }
+
     // #338
     #[test]
     fn unattended_setup_names_the_api_key_and_what_was_left_alone() {

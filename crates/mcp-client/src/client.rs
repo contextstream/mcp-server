@@ -21197,6 +21197,28 @@ fn with_api_forwarder_header(req: reqwest::RequestBuilder) -> reqwest::RequestBu
     }
 }
 
+/// The API's forwarder secret for a request to `url`, as headers to merge in:
+/// present only when one is configured and `url`'s host is loopback. That is
+/// the gateway embedded beside the API, whose origin gate answers 403 without
+/// it, and it covers the requests that do not go through the three builders
+/// above (the acceleration providers' own clients). A request to any other
+/// host goes through the edge, which adds its own, so the secret never leaves
+/// the machine.
+pub fn loopback_api_forwarder_headers(url: &str) -> reqwest::header::HeaderMap {
+    loopback_forwarder_headers(api_forwarder_secret(), url)
+}
+
+fn loopback_forwarder_headers(
+    secret: Option<&reqwest::header::HeaderValue>,
+    url: &str,
+) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(secret) = secret.filter(|_| api_url_host_is_loopback(url)) {
+        headers.insert(API_FORWARDER_SECRET_HEADER, secret.clone());
+    }
+    headers
+}
+
 /// Forward what the edge knew about the caller's location, when the transport
 /// scoped it. The API keeps only the canonical values, so this never carries
 /// arbitrary caller text.
@@ -22161,7 +22183,8 @@ fn api_url_host_is_loopback(api_url: &str) -> bool {
 #[cfg(test)]
 mod api_forwarder_secret_tests {
     use super::{
-        parse_api_forwarder_secret, with_api_forwarder_header, API_FORWARDER_SECRET_HEADER,
+        loopback_api_forwarder_headers, loopback_forwarder_headers, parse_api_forwarder_secret,
+        with_api_forwarder_header, API_FORWARDER_SECRET_HEADER,
     };
 
     #[test]
@@ -22197,6 +22220,44 @@ mod api_forwarder_secret_tests {
             .build()
             .unwrap();
         assert!(request.headers().get(API_FORWARDER_SECRET_HEADER).is_none());
+    }
+
+    #[test]
+    fn a_loopback_url_gets_the_secret_and_any_other_host_none() {
+        let secret = parse_api_forwarder_secret(Some("a-forwarder-secret-of-32-chars-ok"));
+        for url in [
+            "http://127.0.0.1:8080/api/v1/acceleration",
+            "http://localhost:8080/api/v1/acceleration",
+            "http://[::1]:8080/api/v1/acceleration",
+        ] {
+            let headers = loopback_forwarder_headers(secret.as_ref(), url);
+            let value = headers.get(API_FORWARDER_SECRET_HEADER).expect(url);
+            assert_eq!(value.as_bytes(), b"a-forwarder-secret-of-32-chars-ok");
+            assert!(value.is_sensitive());
+        }
+        for url in [
+            "https://api.contextstream.io/api/v1/acceleration",
+            "http://10.0.0.5:8080/api/v1/acceleration",
+            "https://127.0.0.1.example.com/api/v1/acceleration",
+            "",
+        ] {
+            assert!(
+                loopback_forwarder_headers(secret.as_ref(), url).is_empty(),
+                "{url:?}"
+            );
+        }
+        assert!(
+            loopback_forwarder_headers(None, "http://127.0.0.1:8080/api/v1/acceleration")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn without_the_variable_a_loopback_url_gets_no_header() {
+        // The test process does not set CONTEXTSTREAM_API_FORWARDER_SECRET.
+        assert!(
+            loopback_api_forwarder_headers("http://127.0.0.1:8080/api/v1/acceleration").is_empty()
+        );
     }
 }
 

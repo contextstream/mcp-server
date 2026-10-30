@@ -9,6 +9,7 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::warm_cache::normalize_acceleration_api_url;
+use mcp_client::client::loopback_api_forwarder_headers;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -114,6 +115,7 @@ impl ArchiveProvider for ContextStreamArchiveProvider {
             .client
             .post(self.endpoint("archive/search"))
             .bearer_auth(&self.job_api_token)
+            .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
             .json(&ArchiveSearchBody::from_scope(query, scope, limit))
             .send()
             .await

@@ -14008,9 +14008,7 @@ impl ContextStreamClient {
         let requested = event_type
             .as_deref()
             .map(|t| Self::normalize_session_capture_original_type(Some(t)));
-        let api_type = requested
-            .as_deref()
-            .map(Self::map_session_capture_api_event_type);
+        let api_type = event_type.as_deref().map(list_filter_api_type);
         let fetch_limit = match (&requested, limit) {
             (Some(_), limit) => Some(limit.unwrap_or(20).max(1).saturating_mul(4).min(200)),
             (None, limit) => limit,
@@ -22333,6 +22331,23 @@ pub fn delta_since(
     })
 }
 
+/// The type to ask the events API for (#410): bug and feature are stored as
+/// ticket and conversation as chat, "general" is not a type it knows, and
+/// every other type is asked for as given (standup is stored as standup; the
+/// note-like types it maps to manual_note itself).
+fn list_filter_api_type(requested: &str) -> String {
+    let lowered = requested
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    match lowered.as_str() {
+        "bug" | "feature" => "ticket".to_string(),
+        "conversation" => "chat".to_string(),
+        "general" | "" => "note".to_string(),
+        _ => lowered,
+    }
+}
+
 /// Keep the events captured as `requested` (the type a caller passed to
 /// create_event), at most `limit` (#410). A captured event records it in
 /// `metadata.original_type`; an event without one is matched on its own type.
@@ -22341,15 +22356,29 @@ pub fn filter_memory_events_by_type(
     requested: &str,
     limit: Option<i64>,
 ) {
-    let wanted = ContextStreamClient::normalize_session_capture_original_type(Some(requested));
+    let normalize =
+        |kind: &str| ContextStreamClient::normalize_session_capture_original_type(Some(kind));
+    let wanted = normalize(requested);
+    let queried = list_filter_api_type(requested);
     let keep = |event: &serde_json::Value| {
         let original = event
             .get("metadata")
             .and_then(|metadata| metadata.get("original_type"))
-            .and_then(serde_json::Value::as_str);
-        let own = original.or_else(|| event.get("event_type").and_then(serde_json::Value::as_str));
-        own.map(|own| ContextStreamClient::normalize_session_capture_original_type(Some(own)))
-            .is_some_and(|own| own == wanted)
+            .and_then(serde_json::Value::as_str)
+            .filter(|original| !original.trim().is_empty());
+        match original {
+            // The type the event was created as, when it says.
+            Some(original) => normalize(original) == wanted,
+            // Otherwise its stored type: the one asked for (standup is stored
+            // as standup), or the one it is stored under (a bug created
+            // before original_type was recorded is a ticket) (#410).
+            None => event
+                .get("event_type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|stored| {
+                    normalize(stored) == wanted || stored.eq_ignore_ascii_case(&queried)
+                }),
+        }
     };
     let list = if result.is_array() {
         result.as_array_mut()
@@ -28581,6 +28610,32 @@ mod tests {
         filter_memory_events_by_type(&mut notes, "manual_note", None);
         assert_eq!(notes["items"].as_array().unwrap().len(), 1);
         assert_eq!(notes["items"][0]["id"], "4");
+        let mut standups = serde_json::json!({"items": [
+            {"id": "6", "event_type": "standup"},
+            {"id": "7", "event_type": "manual_note"}
+        ]});
+        filter_memory_events_by_type(&mut standups, "standup", None);
+        assert_eq!(
+            standups["items"].as_array().unwrap().len(),
+            1,
+            "a standup is stored as itself"
+        );
+        let mut old_bug = serde_json::json!({"items": [{"id": "8", "event_type": "ticket"}]});
+        filter_memory_events_by_type(&mut old_bug, "bug", None);
+        assert_eq!(
+            old_bug["items"].as_array().unwrap().len(),
+            1,
+            "a bug with no original_type is a ticket"
+        );
+        let mut note = serde_json::json!({"items": [{"id": "9", "event_type": "manual_note", "metadata": {"original_type": "note"}}]});
+        filter_memory_events_by_type(&mut note, "note", None);
+        assert_eq!(
+            note["items"].as_array().unwrap().len(),
+            1,
+            "note is in the uncategorized family"
+        );
+        assert_eq!(list_filter_api_type("Status-Update"), "status_update");
+        assert_eq!(list_filter_api_type("feature"), "ticket");
         filter_memory_events_by_type(&mut result, "Implementation", Some(5));
         assert_eq!(result["items"][0]["id"], "3");
         assert_eq!(

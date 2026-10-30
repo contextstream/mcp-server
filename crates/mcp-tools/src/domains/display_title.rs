@@ -13,6 +13,62 @@ pub fn is_placeholder_title(raw: &str) -> bool {
     PLACEHOLDER_TITLES.contains(&trimmed.to_ascii_lowercase().as_str())
 }
 
+/// Stored text (a title, name or snippet) as one line of a tool's answer
+/// (#419): each run of whitespace, line breaks included, becomes one space
+/// and control characters are dropped, so the text cannot start a line of
+/// its own, such as a forged `[LESSONS_WARNING]` line or result row.
+pub fn one_line(text: &str) -> String {
+    let mut line = String::with_capacity(text.len());
+    let mut gap = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            gap = !line.is_empty();
+        } else if !c.is_control() {
+            if gap {
+                line.push(' ');
+                gap = false;
+            }
+            line.push(c);
+        }
+    }
+    line
+}
+
+/// A stored body (node details, doc content) on its own lines (#419):
+/// control characters other than tabs are dropped, and a line that would
+/// begin with a notice marker such as `[LESSONS_WARNING]` is quoted, so the
+/// body cannot pass for the tool's own notices.
+pub fn quoted_body(text: &str) -> String {
+    text.replace(['\u{2028}', '\u{2029}'], "\n")
+        .lines()
+        .map(|line| {
+            let line: String = line
+                .chars()
+                .filter(|c| *c == '\t' || !c.is_control())
+                .collect();
+            if starts_with_marker(line.trim_start()) {
+                format!("> {}", line.trim_start())
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `[LESSONS_WARNING]`, `[DECISIONS]`, `[GROUNDING]`: an upper-case tag in
+/// brackets, the shape of the notices tools print.
+fn starts_with_marker(line: &str) -> bool {
+    let Some((tag, _)) = line.strip_prefix('[').and_then(|rest| rest.split_once(']')) else {
+        return false;
+    };
+    tag.len() >= 2
+        && tag.chars().any(|c| c.is_ascii_uppercase())
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == ' ')
+}
+
 fn extract_metadata_str<'a>(item: &'a Value, field: &str) -> Option<&'a str> {
     item.get("metadata")
         .and_then(|value| value.get(field))
@@ -102,8 +158,13 @@ fn short_id_label(item: &Value, kind: &str) -> String {
     }
 }
 
-/// Extract a human-readable title from a memory/recall search result.
+/// Extract a human-readable title from a memory/recall search result, on
+/// one line (#419).
 pub fn extract_display_title(item: &Value) -> String {
+    one_line(&display_title_as_stored(item))
+}
+
+fn display_title_as_stored(item: &Value) -> String {
     for field in ["title", "summary", "name"] {
         if let Some(raw) = item.get(field).and_then(|v| v.as_str()) {
             if let Some(title) = take_non_placeholder_str(raw) {

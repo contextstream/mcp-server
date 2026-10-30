@@ -20,6 +20,7 @@ use std::time::Duration;
 use tracing;
 use uuid::Uuid;
 
+use crate::domains::display_title::{one_line, quoted_body};
 use crate::domains::lookup::{
     self, Lookup, LookupAction, LookupCandidate, LookupContext, RecordKind,
 };
@@ -535,7 +536,7 @@ fn format_transcript_matches(result: &Value, query: &str) -> String {
     let needle = query.trim().to_lowercase();
     let mut text = String::new();
     for (i, item) in items.iter().take(20).enumerate() {
-        let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
+        let field = |key: &str| one_line(item.get(key).and_then(Value::as_str).unwrap_or(""));
         text.push_str(&format!(
             "\n{}. **{}** (id: {}) — {}, {}, {} messages",
             i + 1,
@@ -560,7 +561,7 @@ fn format_transcript_matches(result: &Value, query: &str) -> String {
                     before.char_indices().rev().nth(40).map_or(0, |(i, _)| i)
                 });
                 let excerpt: String = content[start..].chars().take(160).collect();
-                Some(excerpt.replace('\n', " "))
+                Some(one_line(&excerpt))
             });
         if let Some(snippet) = snippet {
             text.push_str(&format!("\n   …{}…", snippet.trim()));
@@ -608,19 +609,19 @@ fn format_collection(entity_name: &str, value: &Value) -> String {
                 .and_then(|v| v.as_str());
             let status = item.get("status").and_then(|v| v.as_str());
 
-            let mut line = format!("{}. **{}** (id: {})", i + 1, title, id);
+            let mut line = format!("{}. **{}** (id: {})", i + 1, title, one_line(id));
             if let Some(t) = item_type {
-                line.push_str(&format!(" [{}]", t));
+                line.push_str(&format!(" [{}]", one_line(t)));
             }
             if let Some(s) = status {
-                line.push_str(&format!(" — {}", s));
+                line.push_str(&format!(" — {}", one_line(s)));
             }
             if let Some(reason) = item
                 .get("blocked_reason")
                 .and_then(|v| v.as_str())
                 .filter(|reason| !reason.trim().is_empty())
             {
-                line.push_str(&format!(" ({})", reason.trim()));
+                line.push_str(&format!(" ({})", one_line(reason)));
             }
             // A node another one replaced reads as current otherwise (#415).
             if let Some(successor) = item
@@ -837,7 +838,12 @@ fn format_doc_detail(value: &Value) -> String {
         .unwrap_or("")
         .trim();
 
-    let mut text = format!("**{}**\nID: {}\nType: {}", title, id, doc_type);
+    let mut text = format!(
+        "**{}**\nID: {}\nType: {}",
+        one_line(title),
+        one_line(id),
+        one_line(doc_type)
+    );
     if created_at != "—" {
         text.push_str(&format!("\nCreated: {}", created_at));
     }
@@ -849,7 +855,7 @@ fn format_doc_detail(value: &Value) -> String {
     if content.is_empty() {
         text.push_str("Content is empty.");
     } else {
-        text.push_str(content);
+        text.push_str(&quoted_body(content));
     }
 
     text
@@ -870,11 +876,13 @@ fn format_node_detail(value: &Value) -> String {
         .unwrap_or("Untitled");
     let mut text = format!(
         "[{}] {}\nID: {}",
-        text_of("node_type")
-            .or_else(|| text_of("type"))
-            .unwrap_or("unknown"),
-        title,
-        text_of("id").unwrap_or("unknown")
+        one_line(
+            text_of("node_type")
+                .or_else(|| text_of("type"))
+                .unwrap_or("unknown")
+        ),
+        one_line(title),
+        one_line(text_of("id").unwrap_or("unknown"))
     );
     if let Some(successor) = text_of("superseded_by") {
         text.push_str(&format!("\nSuperseded by: {successor}"));
@@ -885,7 +893,7 @@ fn format_node_detail(value: &Value) -> String {
         .map(|tags| tags.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
     if !tags.is_empty() {
-        text.push_str(&format!("\nTags: {}", tags.join(", ")));
+        text.push_str(&format!("\nTags: {}", one_line(&tags.join(", "))));
     }
     if let Some(updated) = text_of("updated_at") {
         text.push_str(&format!("\nUpdated: {updated}"));
@@ -893,7 +901,7 @@ fn format_node_detail(value: &Value) -> String {
     match text_of("details").or_else(|| text_of("content")) {
         Some(content) if content != title => {
             text.push_str("\n\n");
-            text.push_str(content);
+            text.push_str(&quoted_body(content));
         }
         Some(_) => {}
         None => text.push_str("\n\nThe node has no content beyond its title."),
@@ -1064,7 +1072,12 @@ fn format_event_detail(value: &Value) -> String {
         .unwrap_or("")
         .trim();
 
-    let mut text = format!("**{}**\nID: {}\nType: {}", title, id, event_type);
+    let mut text = format!(
+        "**{}**\nID: {}\nType: {}",
+        one_line(title),
+        one_line(id),
+        one_line(event_type)
+    );
     // The type the caller asked for, when the store keeps it under another
     // (bug as ticket, implementation as manual_note, …) (#410).
     if let Some(original) = event
@@ -1075,7 +1088,7 @@ fn format_event_detail(value: &Value) -> String {
             !original.is_empty() && *original != event_type && *original != "uncategorized"
         })
     {
-        text.push_str(&format!(" (captured as {original})"));
+        text.push_str(&format!(" (captured as {})", one_line(original)));
     }
     if let Some(ts) = occurred_at {
         text.push_str(&format!("\nOccurred: {}", ts));
@@ -1084,13 +1097,13 @@ fn format_event_detail(value: &Value) -> String {
         text.push_str(&format!("\nUpdated: {}", ts));
     }
     if let Some(t) = tags {
-        text.push_str(&format!("\nTags: {}", t));
+        text.push_str(&format!("\nTags: {}", one_line(&t)));
     }
     text.push_str("\n\n");
     if content.is_empty() {
         text.push_str("Content is empty.");
     } else {
-        text.push_str(content);
+        text.push_str(&quoted_body(content));
     }
     text
 }
@@ -1146,7 +1159,10 @@ fn format_task_detail(value: &Value) -> String {
 
     let mut text = format!(
         "**{}**\nID: {}\nStatus: {}\nPriority: {}",
-        title, id, task_status, priority
+        one_line(title),
+        one_line(id),
+        one_line(&task_status),
+        one_line(&priority)
     );
     if let Some(pid) = plan_id {
         text.push_str(&format!("\nPlan: {}", pid));
@@ -1165,13 +1181,13 @@ fn format_task_detail(value: &Value) -> String {
     }
     // Why a task is blocked, when it says (#413).
     if let Some(reason) = pick("blocked_reason").filter(|reason| !reason.trim().is_empty()) {
-        text.push_str(&format!("\nBlocked: {}", reason.trim()));
+        text.push_str(&format!("\nBlocked: {}", one_line(&reason)));
     }
     text.push_str("\n\n");
     if description.is_empty() {
         text.push_str("Description is empty.");
     } else {
-        text.push_str(description);
+        text.push_str(&quoted_body(description));
     }
     text
 }
@@ -1205,7 +1221,10 @@ fn format_todo_detail(value: &Value) -> String {
 
     let mut text = format!(
         "**{}**\nID: {}\nStatus: {}\nPriority: {}",
-        title, id, status, priority
+        one_line(title),
+        one_line(id),
+        one_line(status),
+        one_line(priority)
     );
     if let Some(ts) = due_at {
         text.push_str(&format!("\nDue: {}", ts));
@@ -1220,7 +1239,7 @@ fn format_todo_detail(value: &Value) -> String {
     if content.is_empty() {
         text.push_str("Content is empty.");
     } else {
-        text.push_str(content);
+        text.push_str(&quoted_body(content));
     }
     text
 }
@@ -2016,14 +2035,14 @@ fn format_hybrid_search_results(query: &str, results: &[Value]) -> String {
         text.push_str(&format!(
             "{}. [{}] **{}** (id: {})\n",
             i + 1,
-            label,
-            title,
-            id
+            one_line(&label),
+            one_line(title),
+            one_line(id)
         ));
 
         if let Some(preview) = item.get("preview").and_then(|v| v.as_str()) {
             if !preview.trim().is_empty() {
-                text.push_str(&format!("   {}\n", preview));
+                text.push_str(&format!("   {}\n", one_line(preview)));
             }
         }
 
@@ -2682,10 +2701,12 @@ pub(crate) fn render_decisions_envelope(
         ));
         for (index, node) in items.iter().enumerate() {
             let title = extract_display_title(node);
-            let status = decision_str(node, &["status"]).unwrap_or("unknown");
-            let freshness = decision_str(node, &["freshness"]).unwrap_or("unknown");
-            let category = decision_str(node, &["category"]).unwrap_or("none");
-            let id = decision_str(node, &["id", "node_id", "decision_id"]).unwrap_or("unknown");
+            let status = one_line(decision_str(node, &["status"]).unwrap_or("unknown"));
+            let freshness = one_line(decision_str(node, &["freshness"]).unwrap_or("unknown"));
+            let category = one_line(decision_str(node, &["category"]).unwrap_or("none"));
+            let id = one_line(
+                decision_str(node, &["id", "node_id", "decision_id"]).unwrap_or("unknown"),
+            );
             text.push_str(&format!(
                 "{}. [DECISION] {title} — status={status} freshness={freshness} category={category} id={id}\n",
                 index + 1
@@ -2697,7 +2718,7 @@ pub(crate) fn render_decisions_envelope(
                 .and_then(Value::as_str)
             {
                 let preview: String = content.chars().take(200).collect();
-                text.push_str(&format!("   {}\n", preview.replace('\n', " ")));
+                text.push_str(&format!("   {}\n", one_line(&preview)));
             }
             if let Some(rationale) = node
                 .get("structured")
@@ -4442,7 +4463,7 @@ impl ToolHandler for MemoryTool {
                 }
                 let text = format!(
                     "Event created: {} (ID: {}).\nProgress: completed.",
-                    title_for_user, event_id
+                    one_line(&title_for_user), event_id
                 );
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note {
@@ -4914,7 +4935,7 @@ impl ToolHandler for MemoryTool {
                         };
                         match self.client.update_task(id, update).await {
                             Ok(_) => {
-                                reason_line = format!("\nBlocked: {reason}");
+                                reason_line = format!("\nBlocked: {}", one_line(&reason));
                                 if let Some(obj) = result.as_object_mut() {
                                     obj.insert("blocked_reason".to_string(), serde_json::json!(reason));
                                 }
@@ -4929,7 +4950,7 @@ impl ToolHandler for MemoryTool {
                 }
                 let text = format!(
                     "Task created: {} (ID: {}).{}\nProgress: completed.",
-                    title_for_user, task_id, reason_line
+                    one_line(&title_for_user), task_id, reason_line
                 );
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note {
@@ -5255,7 +5276,7 @@ impl ToolHandler for MemoryTool {
                 }
                 let text = format!(
                     "Todo created: {} (ID: {}).\nProgress: completed.",
-                    title_for_user, todo_id
+                    one_line(&title_for_user), todo_id
                 );
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note {
@@ -5605,7 +5626,7 @@ impl ToolHandler for MemoryTool {
                 }
                 let text = format!(
                     "Diagram created: {} (ID: {}).\nProgress: completed.",
-                    title_for_user, diagram_id
+                    one_line(&title_for_user), diagram_id
                 );
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note {
@@ -5806,7 +5827,7 @@ impl ToolHandler for MemoryTool {
                 }
                 let text = format!(
                     "Doc created: {} (ID: {}).\nProgress: completed.",
-                    title_for_user, doc_id
+                    one_line(&title_for_user), doc_id
                 );
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note {
@@ -6134,7 +6155,7 @@ impl ToolHandler for MemoryTool {
                 }
                 let text = format!(
                     "Roadmap created: {} (ID: {}).\nProgress: completed.",
-                    roadmap_title, roadmap_id
+                    one_line(&roadmap_title), roadmap_id
                 );
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note {

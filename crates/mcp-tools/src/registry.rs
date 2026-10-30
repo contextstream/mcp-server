@@ -665,6 +665,21 @@ pub struct ToolRegistry {
     activation_client: Option<ContextStreamClient>,
 }
 
+/// Answers carry stored text as stored, and terminal control bytes in it
+/// (ESC, BEL, a bare carriage return) must not reach a client (#419). Line
+/// breaks and tabs stay.
+fn drop_control_characters(mut result: ToolResult) -> ToolResult {
+    let unwanted = |c: char| c.is_control() && c != '\n' && c != '\t';
+    for item in &mut result.content {
+        if let mcp_types::tool::ContentItem::Text { text } = item {
+            if text.contains(unwanted) {
+                text.retain(|c| !unwanted(c));
+            }
+        }
+    }
+    result
+}
+
 impl ToolRegistry {
     /// Create a new tool registry.
     pub fn new(config: &Config) -> Self {
@@ -963,7 +978,7 @@ impl ToolRegistry {
         record_write_timing(write_timing, outcome.as_ref());
         self.report_activation_outcome(name, tool.metadata.category.as_str(), outcome.as_ref())
             .await;
-        outcome
+        outcome.map(drop_control_characters)
     }
 
     fn report_acceleration_observation(
@@ -1304,7 +1319,7 @@ impl ToolRegistry {
             outcome.as_ref(),
         )
         .await;
-        outcome
+        outcome.map(drop_control_characters)
     }
 
     /// Get operation count (router mode).

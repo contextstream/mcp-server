@@ -12952,28 +12952,64 @@ fn is_lesson_result(item: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// What an empty lessons page says (#461): past the lessons one request
+/// reads, past the end, or nothing matched.
+fn lessons_empty_page_text(offset: usize, total: usize, lower_bound: bool) -> String {
+    if offset > 0 && lower_bound {
+        format!(
+            "Offset {offset} is past the {total} lessons one request reads, and more may exist. \
+             Narrow the list with query, category or severity, or use a smaller offset."
+        )
+    } else if offset > 0 && total > 0 && offset >= total {
+        format!("Offset {offset} is past the end of the {total} lesson(s); pass an offset below {total}.")
+    } else {
+        "No lessons found matching your criteria.".to_string()
+    }
+}
+
 /// Session get lessons tool handler.
 ///
 /// Every-turn lesson warnings use a short-lived warm cache. Post-fetch
 /// severity, category, and deduplication filters remain request-local, so the
 /// cache key contains only `(workspace, project, query)`.
 /// Render a `lessons.v1` envelope from `GET /lessons` as a typed list.
-fn render_typed_lessons_result(envelope: Value, scope_note: Option<String>) -> ToolResult {
+fn render_typed_lessons_result(
+    envelope: Value,
+    scope_note: Option<String>,
+    offset: usize,
+) -> ToolResult {
     let items = extract_result_items(&envelope);
     let total = envelope
         .get("total")
         .and_then(Value::as_u64)
         .map(|value| value as usize)
         .unwrap_or(items.len());
+    // A full scan counts only the lessons it read (#461).
+    let lower_bound = envelope
+        .get("total_is_lower_bound")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let counted = if lower_bound {
+        format!("at least {total}")
+    } else {
+        total.to_string()
+    };
     let mut text = String::new();
     if items.is_empty() {
-        text.push_str("No lessons found matching your criteria.");
+        text.push_str(&lessons_empty_page_text(offset, total, lower_bound));
     } else {
-        text.push_str(&format!(
-            "Found {} of {} lesson(s).\n\n",
-            items.len(),
-            total
-        ));
+        if offset > 0 {
+            text.push_str(&format!(
+                "Showing lessons {}\u{2013}{} of {counted}.\n\n",
+                offset + 1,
+                offset + items.len()
+            ));
+        } else {
+            text.push_str(&format!(
+                "Found {} of {counted} lesson(s).\n\n",
+                items.len()
+            ));
+        }
         for (index, lesson) in items.iter().enumerate() {
             let title = extract_lesson_title(lesson);
             let severity = extract_lesson_severity(lesson);
@@ -13005,7 +13041,7 @@ fn render_typed_lessons_result(envelope: Value, scope_note: Option<String>) -> T
                 .unwrap_or_default();
             text.push_str(&format!(
                 "{}. [{}] {} {}\n   {}\n",
-                index + 1,
+                offset + index + 1,
                 one_line(&severity).to_uppercase(),
                 one_line(&title),
                 one_line(&labels),
@@ -13110,7 +13146,12 @@ impl ToolHandler for SessionGetLessonsTool {
         };
         let legacy_note: Option<&str> = match self.client.list_lessons(typed_params).await {
             Ok(envelope) => {
-                return Ok(render_typed_lessons_result(envelope, scope.note.clone()));
+                let offset = input.offset.unwrap_or(0).max(0) as usize;
+                return Ok(render_typed_lessons_result(
+                    envelope,
+                    scope.note.clone(),
+                    offset,
+                ));
             }
             Err(err) if is_not_found_error(&err) => Some(LESSONS_LIST_PARTIAL),
             Err(err) => return Err(err),

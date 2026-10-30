@@ -8150,3 +8150,52 @@ fn a_page_of_plans_says_where_it_sits() {
     let hundred = Value::Array((0..100).map(|i| json!({"id": i.to_string()})).collect());
     assert!(take_plan_page(hundred, 100).1);
 }
+
+#[test]
+fn a_lessons_page_from_a_full_scan_says_at_least_and_where_it_is() {
+    // #461: the total was the scan window ("of 50" on page 1, "of 1000" at
+    // offset 300), and an offset past it said "No lessons found".
+    let lesson = |id: &str| {
+        json!({"id": id, "title": format!("Lesson {}", &id[..4]), "severity": "medium",
+               "prevention": ["Check first."]})
+    };
+    let page = json!({"items": [lesson("11111111-1111-4111-8111-111111111111"),
+                                lesson("22222222-2222-4222-8222-222222222222")],
+                      "total": 1000, "total_is_lower_bound": true, "next_offset": 302,
+                      "degraded": [], "schema_version": "lessons.v1"});
+    let text = result_text(&render_typed_lessons_result(page.clone(), None, 0));
+    assert!(
+        text.starts_with("Found 2 of at least 1000 lesson(s)."),
+        "{text}"
+    );
+
+    let text = result_text(&render_typed_lessons_result(page, None, 300));
+    assert!(
+        text.starts_with("Showing lessons 301\u{2013}302 of at least 1000."),
+        "{text}"
+    );
+    assert!(text.contains("\n301. [MEDIUM] Lesson 1111"), "{text}");
+    assert!(text.contains("pass offset=302 to continue"), "{text}");
+
+    let empty = |total: u64, lower_bound: bool| {
+        json!({"items": [], "total": total, "total_is_lower_bound": lower_bound,
+               "degraded": [], "schema_version": "lessons.v1"})
+    };
+    let text = result_text(&render_typed_lessons_result(empty(4000, true), None, 4200));
+    assert!(
+        text.starts_with(
+            "Offset 4200 is past the 4000 lessons one request reads, and more may exist."
+        ),
+        "{text}"
+    );
+    let text = result_text(&render_typed_lessons_result(empty(12, false), None, 40));
+    assert!(
+        text.starts_with("Offset 40 is past the end of the 12 lesson(s); pass an offset below 12."),
+        "{text}"
+    );
+    let text = result_text(&render_typed_lessons_result(empty(0, false), None, 0));
+    assert!(
+        text.starts_with("No lessons found matching your criteria."),
+        "{text}"
+    );
+}

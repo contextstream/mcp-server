@@ -115,7 +115,44 @@ fn push_unique_project_candidate(candidates: &mut Vec<Uuid>, candidate: Option<U
     }
 }
 
-fn is_not_found_error(err: &Error) -> bool {
+/// The note for a read's explicit project_id that names no project of its
+/// workspace (#449): the one `resolve_read_scope` gives, so every read that
+/// leaves such an id out says so the same way. None when the project is
+/// there, or when it could not be checked.
+pub(crate) async fn unknown_project_note(
+    client: &ContextStreamClient,
+    workspace_id: Option<Uuid>,
+    project_id: Uuid,
+) -> Option<String> {
+    match client.get_project(project_id).await {
+        Ok(project) => match (workspace_id, project.workspace_id) {
+            (Some(asked), Some(owner)) if asked != owner => {
+                Some(foreign_project_ignored_note(project_id))
+            }
+            _ => None,
+        },
+        Err(error) if is_not_found_error(&error) || is_project_scope_error(&error) => {
+            Some(missing_project_ignored_note(project_id))
+        }
+        Err(_) => None,
+    }
+}
+
+/// What a read says when it leaves out a project_id that names no project.
+pub(crate) fn missing_project_ignored_note(project_id: Uuid) -> String {
+    format!(
+        "project_id {project_id} no longer exists and was ignored. Do NOT pass this project_id again — omit it and let the session resolve the correct project scope automatically."
+    )
+}
+
+/// What a read says when it leaves out another workspace's project_id.
+pub(crate) fn foreign_project_ignored_note(project_id: Uuid) -> String {
+    format!(
+        "project_id {project_id} belongs to a different workspace and was ignored. Do NOT pass this project_id again — omit it and let the session resolve the correct project scope automatically."
+    )
+}
+
+pub(crate) fn is_not_found_error(err: &Error) -> bool {
     matches!(
         err,
         Error::Http {
@@ -724,10 +761,7 @@ pub async fn resolve_read_scope(
                 if let Some(project_ws) = project.workspace_id {
                     match workspace_id {
                         Some(active_ws) if active_ws != project_ws => {
-                            note = Some(format!(
-                                "project_id {} belongs to a different workspace and was ignored. Do NOT pass this project_id again — omit it and let the session resolve the correct project scope automatically.",
-                                explicit_id
-                            ));
+                            note = Some(foreign_project_ignored_note(explicit_id));
                             explicit_project_id = None;
                         }
                         None => workspace_id = Some(project_ws),
@@ -736,10 +770,7 @@ pub async fn resolve_read_scope(
                 }
             }
             Err(err) if is_not_found_error(&err) || is_project_scope_error(&err) => {
-                note = Some(format!(
-                    "project_id {} no longer exists and was ignored. Do NOT pass this project_id again — omit it and let the session resolve the correct project scope automatically.",
-                    explicit_id
-                ));
+                note = Some(missing_project_ignored_note(explicit_id));
                 explicit_project_id = None;
             }
             Err(err) => return Err(err),

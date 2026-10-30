@@ -478,7 +478,7 @@ impl IntegrationTool {
                     .integration_summary(&provider, workspace_id, input.days, input.max_tokens)
                     .await?;
                 Ok(ToolResult::with_structured(
-                    format!("{} summary retrieved.", provider),
+                    format_integration_summary(&provider, &result),
                     result,
                 ))
             }
@@ -1077,3 +1077,152 @@ mod apps;
 #[cfg(test)]
 #[path = "integrations_tests.rs"]
 mod tests;
+
+/// The summary as text (#466): "all summary retrieved." was all an agent
+/// saw over stdio, with the period, sources, counts and topics only in the
+/// structured content.
+fn format_integration_summary(provider: &str, result: &Value) -> String {
+    let one_line = crate::domains::display_title::one_line;
+    let data = result
+        .get("data")
+        .filter(|data| data.is_object())
+        .unwrap_or(result);
+    let int = |value: &Value, key: &str| value.get(key).and_then(Value::as_i64).unwrap_or(0);
+    let strings = |value: &Value, key: &str| -> Vec<String> {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(one_line)
+            .collect()
+    };
+    if let Some(text) = data.get("summary_text").and_then(Value::as_str) {
+        return format!("{provider} summary: {}", one_line(text.trim()));
+    }
+    if let Some(insights) = data.get("combined_insights") {
+        let sources = strings(data, "sources_included");
+        let topics = strings(insights, "key_topics");
+        let mut text = format!(
+            "Cross-source summary, last {} days (sources: {}): {} activity events, {} decisions, {} lessons; {}.",
+            int(data, "period_days"),
+            if sources.is_empty() { "none".to_string() } else { sources.join(", ") },
+            int(insights, "total_activity_events"),
+            int(insights, "decisions_extracted"),
+            int(insights, "lessons_extracted"),
+            if topics.is_empty() {
+                "no key topics".to_string()
+            } else {
+                format!("key topics: {}", topics.join(", "))
+            },
+        );
+        if let Some(github) = data.get("github").filter(|section| section.is_object()) {
+            text.push_str(&format!(
+                "\nGitHub: {} issues, {} PRs, {} releases, {} comments.",
+                int(github, "total_issues"),
+                int(github, "total_prs"),
+                int(github, "total_releases"),
+                int(github, "total_comments"),
+            ));
+            for repo in github
+                .get("top_repos")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(5)
+            {
+                text.push_str(&format!(
+                    "\n- {}: {} issues, {} PRs, {} comments",
+                    one_line(repo.get("repo").and_then(Value::as_str).unwrap_or("?")),
+                    int(repo, "issues"),
+                    int(repo, "prs"),
+                    int(repo, "comments"),
+                ));
+            }
+        }
+        if let Some(slack) = data.get("slack").filter(|section| section.is_object()) {
+            text.push_str(&format!(
+                "\nSlack: {} messages, {} threads, {} active users.",
+                int(slack, "total_messages"),
+                int(slack, "total_threads"),
+                int(slack, "active_users"),
+            ));
+            for channel in slack
+                .get("top_channels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(5)
+            {
+                text.push_str(&format!(
+                    "\n- #{}: {} messages, {} threads",
+                    one_line(
+                        channel
+                            .get("channel")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                    ),
+                    int(channel, "messages"),
+                    int(channel, "threads"),
+                ));
+            }
+        }
+        let decisions: Vec<String> = ["github", "slack"]
+            .iter()
+            .filter_map(|key| data.get(*key))
+            .flat_map(|section| strings(section, "recent_decisions"))
+            .take(5)
+            .collect();
+        if !decisions.is_empty() {
+            text.push_str("\nRecent decisions:");
+            for decision in decisions {
+                text.push_str(&format!("\n- {decision}"));
+            }
+        }
+        return text;
+    }
+    if let Some(overview) = data.get("overview").and_then(Value::as_object) {
+        let period = data.get("period");
+        let days = period
+            .and_then(|period| period.get("days"))
+            .and_then(Value::as_i64);
+        let counts: Vec<String> = overview
+            .iter()
+            .filter_map(|(key, value)| {
+                value
+                    .as_i64()
+                    .map(|count| format!("{} {count}", key.replace('_', " ")))
+            })
+            .collect();
+        let mut text = match days {
+            Some(days) => format!("{provider} summary, last {days} days: "),
+            None => format!("{provider} summary: "),
+        };
+        text.push_str(&if counts.is_empty() {
+            "no counts".to_string()
+        } else {
+            counts.join(", ")
+        });
+        text.push('.');
+        let highlights = data
+            .get("knowledge_extracted")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("title").and_then(Value::as_str))
+            .map(one_line)
+            .take(5)
+            .collect::<Vec<_>>();
+        if !highlights.is_empty() {
+            text.push_str("\nKnowledge extracted:");
+            for title in highlights {
+                text.push_str(&format!("\n- {title}"));
+            }
+        }
+        return text;
+    }
+    format!("{provider} summary retrieved.")
+}

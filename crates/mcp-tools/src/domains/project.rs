@@ -92,6 +92,95 @@ pub struct ProjectsListInput {
     pub offset: Option<i64>,
 }
 
+/// What a Project Brief fact and command look like, for the shape errors.
+const BRIEF_FACT_SHAPE: &str = r#"{"text": "...", "evidence": "<file or source it comes from>"}"#;
+const BRIEF_COMMAND_SHAPE: &str =
+    r#"{"kind": "build|test|run|lint", "command": "...", "evidence": "<file it comes from>"}"#;
+const BRIEF_FACT_LISTS: &[&str] = &[
+    "stack",
+    "entry_points",
+    "guardrails",
+    "docs",
+    "recent_commits",
+];
+
+/// The first part of brief_update's `sections` that is not the shape the API
+/// takes, said in terms of the call (#437). The API answered with its
+/// deserializer's text: Rust type names and a column in a body the caller
+/// never wrote.
+fn brief_sections_problem(sections: &Value) -> Option<String> {
+    fn kind(value: &Value) -> &'static str {
+        match value {
+            Value::Null => "null",
+            Value::Bool(_) => "a boolean",
+            Value::Number(_) => "a number",
+            Value::String(_) => "a string",
+            Value::Array(_) => "a list",
+            Value::Object(_) => "an object",
+        }
+    }
+    fn fact(at: &str, value: &Value) -> Option<String> {
+        let text = value.get("text").and_then(Value::as_str);
+        (!value.is_object() || text.is_none()).then(|| {
+            let got = if value.is_object() {
+                "an object without \"text\"".to_string()
+            } else {
+                kind(value).to_string()
+            };
+            format!("{at} must be {BRIEF_FACT_SHAPE}; got {got}")
+        })
+    }
+    fn command(at: &str, value: &Value) -> Option<String> {
+        let has = |key: &str| value.get(key).and_then(Value::as_str).is_some();
+        (!value.is_object() || !has("kind") || !has("command")).then(|| {
+            let got = if value.is_object() {
+                "an object without \"kind\" and \"command\"".to_string()
+            } else {
+                kind(value).to_string()
+            };
+            format!("{at} must be {BRIEF_COMMAND_SHAPE}; got {got}")
+        })
+    }
+    fn list(
+        at: &str,
+        value: &Value,
+        item_shape: &str,
+        check: fn(&str, &Value) -> Option<String>,
+    ) -> Option<String> {
+        let Some(items) = value.as_array() else {
+            return Some(format!(
+                "{at} must be a list of {item_shape}; got {}",
+                kind(value)
+            ));
+        };
+        items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| check(&format!("{at}[{index}]"), item))
+    }
+    let fields = sections.as_object()?;
+    for (key, value) in fields {
+        let at = format!("sections.{key}");
+        let problem = match key.as_str() {
+            "schema" => None,
+            "what" => fact(&at, value),
+            "commands" => list(&at, value, BRIEF_COMMAND_SHAPE, command),
+            "evidence" => {
+                (!value.is_array()).then(|| format!("{at} must be a list; got {}", kind(value)))
+            }
+            other if BRIEF_FACT_LISTS.contains(&other) => list(&at, value, BRIEF_FACT_SHAPE, fact),
+            _ => Some(format!(
+                "{at} is not a brief section; the sections are what, stack, entry_points, \
+                 commands, guardrails, docs and recent_commits"
+            )),
+        };
+        if problem.is_some() {
+            return problem;
+        }
+    }
+    None
+}
+
 /// A project as get shows it (#435): name and id, then the description,
 /// where its code lives and when it changed. The rest was only in
 /// structuredContent, which stdio clients often do not show.
@@ -1632,6 +1721,9 @@ impl ProjectTool {
                                     .to_string(),
                             )
                         })?;
+                if let Some(problem) = brief_sections_problem(&sections) {
+                    return Err(Error::Validation(problem));
+                }
                 let mut body = serde_json::json!({
                     "expected_version": expected_version,
                     "origin": "agent",

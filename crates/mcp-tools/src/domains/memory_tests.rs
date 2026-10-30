@@ -2951,3 +2951,27 @@ mod registration_tests {
         );
     }
 }
+
+mod decision_action_line_tests {
+    use super::decision_action_line;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    #[test]
+    fn the_new_status_and_reason_come_from_the_api_answer() {
+        // #404: "applied=unknown … status=unknown" though the action applied.
+        let id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let answer = json!({
+            "id": id.to_string(), "action": "dispute", "status": "disputed", "degraded": [],
+            "audit": {"action": "dispute", "origin": "user", "reason": "qa shape probe reason"}
+        });
+        assert_eq!(
+            decision_action_line("dispute", id, &answer),
+            "[DECISION_ACTION] dispute applied=true (id=11111111-1111-4111-8111-111111111111) status=disputed\n   reason: qa shape probe reason\n"
+        );
+        let older =
+            json!({"applied": true, "decision": {"title": "Use Redis", "status": "verified"}});
+        assert!(decision_action_line("verify", id, &older)
+            .starts_with("[DECISION_ACTION] verify applied=true — Use Redis (id="));
+    }
+}

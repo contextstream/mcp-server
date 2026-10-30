@@ -6523,6 +6523,22 @@ mod typed_item_formatting_tests {
     }
 
     #[test]
+    fn a_doc_item_keeps_its_body_in_the_concise_view() {
+        // #416: the runbook surfaced as "M:doc Database failover [runbook] -
+        // # Failover" and its body, the answer, was dropped as noise.
+        let input = "[CTX]\nM:doc Database failover [runbook] - # Failover\n\nIf the primary is down, promote replica-b1 with `pg_ctl promote`.\nW:Testing\nC:src/lib.rs fn main()\n    let x = 1;\n[/CTX]";
+        let result = condense_context_for_concise(input);
+        assert_eq!(
+            result,
+            "[CTX]\nM:doc Database failover [runbook] - # Failover If the primary is down, promote replica-b1 with `pg_ctl promote`.\nW:Testing\n[/CTX]"
+        );
+        let long = format!("[CTX]\nM:doc Big - start\n{}\n[/CTX]", "word ".repeat(200));
+        let result = condense_context_for_concise(&long);
+        let kept = result.lines().nth(1).unwrap();
+        assert!(kept.chars().count() <= 400, "{}", kept.len());
+    }
+
+    #[test]
     fn condense_context_also_preserves_preference_tag() {
         let input = "[PREFERENCE] Use dark mode\nrandom line";
         let result = condense_context_for_concise(input);

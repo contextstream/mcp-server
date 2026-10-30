@@ -3074,14 +3074,8 @@ async fn run_setup_noninteractive(
         return Ok(false);
     }
 
-    print_welcome_banner();
-    print_data_collection_disclosure(true);
-    ui::say(
-        ui::Mark::Info,
-        "Unattended setup",
-        Some("saved sign-in · detected editors · background index"),
-    );
-
+    // The key comes first: without one the banner announced an unattended
+    // setup that then stopped on the next line (#379).
     let api_key = get_api_key_result()?.ok_or_else(|| {
         anyhow::anyhow!(
             "--yes requires an API key. Set CONTEXTSTREAM_API_KEY, save one with \
@@ -3089,6 +3083,14 @@ async fn run_setup_noninteractive(
              interactively once."
         )
     })?;
+
+    print_welcome_banner();
+    print_data_collection_disclosure(true);
+    ui::say(
+        ui::Mark::Info,
+        "Unattended setup",
+        Some("saved sign-in · detected editors · background index"),
+    );
 
     let config = setup_client_config(&api_key);
     let api_url = config.api_url.clone();

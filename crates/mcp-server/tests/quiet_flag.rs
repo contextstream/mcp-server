@@ -56,10 +56,18 @@ fn quiet_silences_stdout_and_keeps_the_exit_status() {
         );
     }
 
-    let loud = run(&["setup", "--yes", "--dry-run", "--editors=claude"], "");
-    let quiet = run(
+    // A placeholder key gets setup past its key check to the banner; the
+    // unreachable API then fails both runs alike.
+    let key = [("CONTEXTSTREAM_API_KEY", "cs_quiet_flag_placeholder")];
+    let loud = run_with(
+        &["setup", "--yes", "--dry-run", "--editors=claude"],
+        "",
+        &key,
+    );
+    let quiet = run_with(
         &["-q", "setup", "--yes", "--dry-run", "--editors=claude"],
         "",
+        &key,
     );
     assert!(!loud.stdout.is_empty());
     assert!(
@@ -205,5 +213,22 @@ fn quiet_exclude_keeps_its_listing_on_stdout_and_drops_confirmations() {
     assert!(
         text(&failed.stderr).contains("No patterns specified"),
         "an exclude error stays visible under -q"
+    );
+}
+
+#[test]
+fn setup_yes_without_a_key_says_so_before_any_banner() {
+    // #379: the banner and disclosure came first, then the refusal.
+    let out = run(&["setup", "--yes", "--dry-run", "--editors=claude"], "");
+    assert!(!out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "printed before the refusal:\n{}",
+        text(&out.stdout)
+    );
+    assert!(
+        text(&out.stderr).contains("--yes requires an API key"),
+        "{}",
+        text(&out.stderr)
     );
 }

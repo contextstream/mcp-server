@@ -3188,7 +3188,7 @@ mod tests {
             // #335 review: `studio.email_contact_erase` (with `email`) joined
             // the irreversible actions.
             "delete",
-            "d55fd3f46723e1c7a15fb08f49243302f4167e9cc5becee4fc3bd88593d8767c",
+            "7428355e4acf40066e4bf878df9237967a360febfd007ab24abf2a442fdfdfdd",
         ),
         (
             // Advanced for tickets 2c0e695e and 9e5c9232: `target_project`

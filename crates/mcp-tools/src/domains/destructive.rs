@@ -125,6 +125,7 @@ pub const SEPARATED_ACTIONS: &[SeparatedAction] = &[
         &["feed_id", "expected_revision", "workspace_id", "project_id"],
     ),
     removal("feed", "unshare", &["share_id", "feed_id"]),
+    removal("reminder", "delete", &["reminder_id"]),
     removal(
         "instruct",
         "clear",
@@ -177,7 +178,6 @@ pub const SEPARATED_ACTIONS: &[SeparatedAction] = &[
 pub const NO_LONGER_DESTRUCTIVE: &[&str] = &[
     "coordination",
     "integration",
-    "reminder",
     "memory_update_doc",
     "memory_update_task",
 ];

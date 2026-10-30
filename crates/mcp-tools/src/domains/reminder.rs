@@ -19,7 +19,9 @@ use crate::schema::SchemaBuilder;
 // ============================================================================
 
 /// Valid actions.
-const VALID_ACTIONS: &[&str] = &["list", "active", "create", "snooze", "complete", "dismiss"];
+const VALID_ACTIONS: &[&str] = &[
+    "list", "active", "create", "snooze", "complete", "dismiss", "delete",
+];
 
 /// Valid statuses.
 const VALID_STATUSES: &[&str] = &["pending", "completed", "dismissed", "snoozed"];
@@ -126,9 +128,15 @@ impl ToolHandler for ReminderTool {
                     project_id,
                     status: input.status,
                     context: input.context,
+                    priority: input.priority.clone(),
                     limit: input.limit,
                 };
-                let result = self.client.list_reminders(params).await?;
+                let mut result = self.client.list_reminders(params).await?;
+                keep_matching_reminders(
+                    &mut result,
+                    input.keywords.as_deref(),
+                    input.priority.as_deref(),
+                );
                 Ok(ToolResult::with_structured(
                     format_reminder_list(&result, false),
                     result,
@@ -136,7 +144,7 @@ impl ToolHandler for ReminderTool {
             }
 
             "active" => {
-                let result = self
+                let mut result = self
                     .client
                     .active_reminders(
                         workspace_id,
@@ -145,6 +153,11 @@ impl ToolHandler for ReminderTool {
                         input.limit,
                     )
                     .await?;
+                keep_matching_reminders(
+                    &mut result,
+                    input.keywords.as_deref(),
+                    input.priority.as_deref(),
+                );
                 Ok(ToolResult::with_structured(
                     format_reminder_list(&result, true),
                     result,
@@ -212,6 +225,15 @@ impl ToolHandler for ReminderTool {
                 ))
             }
 
+            "delete" => {
+                let reminder_id = Self::parse_reminder_id(&input.reminder_id)?;
+                let result = self.client.delete_reminder(reminder_id).await?;
+                Ok(ToolResult::with_structured(
+                    format!("Reminder {} deleted.", reminder_id),
+                    result,
+                ))
+            }
+
             _ => Err(Error::Validation(format!(
                 "Unknown action: {}. Available actions: {}",
                 action,
@@ -225,7 +247,7 @@ impl ToolHandler for ReminderTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "reminder".to_string(),
             title: "Reminder Operations".to_string(),
-            description: "Reminder management. Actions: list (all reminders), active (pending/overdue), create (new reminder), snooze, complete, dismiss.".to_string(),
+            description: "Reminder management. Actions: list (all reminders), active (pending/overdue), create (new reminder), snooze, complete, dismiss. list and active narrow by priority and by keywords (any of them in the title, content or keywords). context() answers do not include reminders: call active to see the ones due.".to_string(),
             category: ToolCategory::Reminders,
             annotations: ToolAnnotations::destructive(),
             is_pro: false,
@@ -252,13 +274,23 @@ impl ToolHandler for ReminderTool {
                 false,
             )
             .string("remind_at", "When to remind (ISO 8601 datetime)", false)
-            .string_enum("priority", "Reminder priority", VALID_PRIORITIES, false)
+            .string_enum(
+                "priority",
+                "Reminder priority (create), or only reminders of this priority (list/active)",
+                VALID_PRIORITIES,
+                false,
+            )
             .string_enum("recurrence", "Recurrence pattern", VALID_RECURRENCE, false)
-            .array("keywords", "Keywords for matching", "string", false)
+            .array(
+                "keywords",
+                "Keywords for matching (create), or only reminders with any of them in the title, content or keywords (list/active)",
+                "string",
+                false,
+            )
             // Snooze/complete/dismiss fields
             .uuid(
                 "reminder_id",
-                "Reminder ID (for snooze/complete/dismiss)",
+                "Reminder ID (for snooze/complete/dismiss/delete)",
                 false,
             )
             .string("until", "Snooze until (ISO 8601 datetime)", false)
@@ -325,6 +357,57 @@ fn reminder_items(result: &Value) -> Vec<&Value> {
         }
     }
     Vec::new()
+}
+
+/// Keep the reminders that match `keywords` (any of them in the title,
+/// content, keywords or context tags, ignoring case) and `priority` (#426).
+/// The API filters neither on `active`, and not keywords on `list`.
+fn keep_matching_reminders(
+    result: &mut Value,
+    keywords: Option<&[String]>,
+    priority: Option<&str>,
+) {
+    let keywords: Vec<String> = keywords
+        .unwrap_or(&[])
+        .iter()
+        .map(|keyword| keyword.trim().to_lowercase())
+        .filter(|keyword| !keyword.is_empty())
+        .collect();
+    if keywords.is_empty() && priority.is_none() {
+        return;
+    }
+    let keep = |reminder: &Value| {
+        let priority_matches = priority.is_none_or(|wanted| {
+            reminder_field(reminder, "priority").is_some_and(|got| got.eq_ignore_ascii_case(wanted))
+        });
+        let mut text = String::new();
+        for field in ["title", "content"] {
+            text.push_str(&reminder_field(reminder, field).unwrap_or("").to_lowercase());
+            text.push('\n');
+        }
+        for field in ["keywords", "context_tags"] {
+            for value in reminder
+                .get(field)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                text.push_str(&value.as_str().unwrap_or("").to_lowercase());
+                text.push('\n');
+            }
+        }
+        priority_matches && (keywords.is_empty() || keywords.iter().any(|k| text.contains(k)))
+    };
+    if let Some(items) = result.as_array_mut() {
+        items.retain(keep);
+        return;
+    }
+    for key in ["items", "reminders", "data"] {
+        if let Some(items) = result.get_mut(key).and_then(Value::as_array_mut) {
+            items.retain(keep);
+            return;
+        }
+    }
 }
 
 /// Render a reminder list/active result as numbered lines, each carrying its id.

@@ -613,3 +613,25 @@ fn index_settings_are_shown_with_what_zero_and_empty_mean() {
         "{text}"
     );
 }
+
+#[test]
+fn workspace_list_takes_limit_and_offset() {
+    // #454: limit=5 listed 20 workspaces and offset=500 listed page 1.
+    let input: WorkspacesListInput =
+        serde_json::from_value(serde_json::json!({"limit": 5, "offset": 10})).unwrap();
+    assert_eq!((input.limit, input.offset), (Some(5), Some(10)));
+    assert_eq!(
+        crate::domains::project::requested_page(
+            input.page,
+            input.page_size,
+            input.limit,
+            input.offset,
+            20
+        ),
+        (Some(3), Some(5))
+    );
+    let workspace: WorkspaceInput =
+        serde_json::from_value(serde_json::json!({"action": "list", "limit": 5, "offset": 500}))
+            .unwrap();
+    assert_eq!((workspace.limit, workspace.offset), (Some(5), Some(500)));
+}

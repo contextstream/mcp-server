@@ -349,7 +349,7 @@ fn project_list_heading(
 /// from page_size, else limit; the page from page, else the one that holds
 /// offset. With limit=100, page=2 is rows 101-200, as the "(or page=N)" hint
 /// says; it was rows 21-40. Nothing given leaves both to the API.
-fn requested_page(
+pub(crate) fn requested_page(
     page: Option<i64>,
     page_size: Option<i64>,
     limit: Option<i64>,

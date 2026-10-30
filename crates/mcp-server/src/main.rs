@@ -2446,6 +2446,15 @@ fn verify_key_user_line(name: Option<&str>, email: &str) -> String {
 /// What `verify-key` says when the check fails, and whether the server was
 /// reached (`None` when the failure says nothing about it).
 fn verify_key_failure(error: &mcp_types::Error, api_url: &str) -> (String, Option<bool>) {
+    if let Some(refusal) = error.tls_refusal(api_url) {
+        return (
+            format!(
+                "{refusal}, so the API key was not checked. {}",
+                mcp_types::error::TLS_HINT
+            ),
+            Some(false),
+        );
+    }
     match error {
         mcp_types::Error::Network(_) => (
             format!(
@@ -2854,7 +2863,12 @@ async fn run_configure_api_key_from_stdin() -> Result<()> {
         .map_err(|e| {
             // Offline, a timeout, a 5xx or a rate limit says nothing about the
             // key; only a refusal does (#248).
-            if e.is_retryable() {
+            if let Some(refusal) = e.tls_refusal(&api_url) {
+                anyhow::anyhow!(
+                    "Could not verify the API key: {refusal}. {} Nothing was saved.",
+                    mcp_types::error::TLS_HINT
+                )
+            } else if e.is_retryable() {
                 anyhow::anyhow!(
                     "Could not verify the API key: {api_url} did not answer ({e}). Check the \
                      connection and re-run; nothing was saved."

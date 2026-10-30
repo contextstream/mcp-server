@@ -7220,9 +7220,24 @@ fn response_text_contains_project_routing(response: &mcp_types::api::ContextResp
             .is_some_and(|value| value.contains("[PROJECT_ROUTING]"))
 }
 
+/// How much of a memory or doc item's following lines the concise view folds
+/// into its `M:` line (#416).
+const CONCISE_MEMORY_LINE_MAX_CHARS: usize = 400;
+
+/// A `[CTX]` item line starts with its kind tag: `M:`, `W:`, `TN:`, `VC:`.
+fn is_ctx_item_line(line: &str) -> bool {
+    line.split_once(':').is_some_and(|(tag, _)| {
+        (1..=3).contains(&tag.len()) && tag.chars().all(|ch| ch.is_ascii_uppercase())
+    })
+}
+
 fn condense_context_for_concise(raw: &str) -> String {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let mut in_ctx_block = false;
+    // The `M:` line a memory or doc item's body lines belong to: a runbook's
+    // first line is its title, and "promote replica-… with pg_ctl promote"
+    // was dropped as noise (#416).
+    let mut memory_line: Option<usize> = None;
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -7231,11 +7246,13 @@ fn condense_context_for_concise(raw: &str) -> String {
 
         if trimmed == "[CTX]" {
             in_ctx_block = true;
+            memory_line = None;
             out.push("[CTX]".to_string());
             continue;
         }
         if trimmed == "[/CTX]" {
             in_ctx_block = false;
+            memory_line = None;
             out.push("[/CTX]".to_string());
             continue;
         }
@@ -7243,7 +7260,17 @@ fn condense_context_for_concise(raw: &str) -> String {
         if in_ctx_block {
             // Keep only high-signal scope lines; drop noisy code snippet lines.
             if trimmed.starts_with("W:") || trimmed.starts_with("P:") || trimmed.starts_with("M:") {
+                memory_line = trimmed.starts_with("M:").then_some(out.len());
                 out.push(trimmed.to_string());
+            } else if is_ctx_item_line(trimmed) {
+                memory_line = None;
+            } else if let Some(index) = memory_line {
+                let kept = &mut out[index];
+                let room = CONCISE_MEMORY_LINE_MAX_CHARS.saturating_sub(kept.chars().count());
+                if room > 1 {
+                    kept.push(' ');
+                    kept.extend(trimmed.chars().take(room - 1));
+                }
             }
             continue;
         }

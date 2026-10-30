@@ -489,15 +489,69 @@ impl IngestRootLayout {
 ///
 /// A project UUID is globally unique and is the correct key even when a
 /// re-root operation changes the checkout path while work is in flight.
+///
+/// The set only covers this process. `setup` indexes a project in its own
+/// process while the sync bridge (`contextstream-mcp watch`) runs another, and
+/// each held its own lease: for a repository that takes more than two minutes
+/// to index, the bridge's catch-up scan started in the middle of setup's and
+/// sent every file again (302 requests for 3,001 files, mcp-server#339). So the
+/// lease is also an exclusive lock on a file next to the other machine-local
+/// ingest state ([`ProjectIngestLease::lock_path`]); the operating system drops
+/// it when its holder exits, however it exits.
 static PROJECT_INGESTS_IN_FLIGHT: OnceLock<Mutex<std::collections::HashSet<Uuid>>> =
     OnceLock::new();
 
 #[derive(Debug)]
 struct ProjectIngestLease {
     project_id: Uuid,
+    /// Holds the cross-process lock until the lease is dropped.
+    _lock: Option<std::fs::File>,
 }
 
 impl ProjectIngestLease {
+    /// Where the project's cross-process lock lives: `~/.contextstream/
+    /// ingest-leases/<project id>.lock`. `None` when there is no home.
+    fn lock_path(project_id: Uuid) -> Option<std::path::PathBuf> {
+        Some(
+            crate::credit_hold::default_dir()?
+                .join("ingest-leases")
+                .join(format!("{project_id}.lock")),
+        )
+    }
+
+    /// Take the cross-process lock: `Ok(Some(file))` when it is ours,
+    /// `Ok(None)` when it cannot be used here (no home, a read-only or network
+    /// folder that does not lock) and the in-process lease stands alone as
+    /// before, and `Err` when another process holds it.
+    fn lock_across_processes(project_id: Uuid) -> std::result::Result<Option<std::fs::File>, ()> {
+        use fs2::FileExt as _;
+
+        let Some(path) = Self::lock_path(project_id) else {
+            return Ok(None);
+        };
+        let opened = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&path)
+            });
+        let Ok(file) = opened else {
+            return Ok(None);
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(file)),
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                Err(())
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     fn acquire(project_id: Uuid) -> Result<Self> {
         let in_flight =
             PROJECT_INGESTS_IN_FLIGHT.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
@@ -510,7 +564,19 @@ impl ProjectIngestLease {
                 project_id
             )));
         }
-        Ok(Self { project_id })
+        match Self::lock_across_processes(project_id) {
+            Ok(lock) => Ok(Self {
+                project_id,
+                _lock: lock,
+            }),
+            Err(()) => {
+                guard.remove(&project_id);
+                Err(Error::Validation(format!(
+                    "ingest already in progress for project {} in another ContextStream process; concurrent refresh was coalesced",
+                    project_id
+                )))
+            }
+        }
     }
 }
 
@@ -29459,6 +29525,72 @@ mod tests {
         assert!(ProjectIngestLease::acquire(project_id).is_err());
         drop(first);
         assert!(ProjectIngestLease::acquire(project_id).is_ok());
+    }
+
+    // `setup` and the sync bridge are two processes: for a repository that takes
+    // minutes to index, the bridge's catch-up scan started in the middle of
+    // setup's and sent every file again (mcp-server#339). A lock taken through a
+    // second handle on the same file stands for the other process.
+    #[test]
+    fn project_ingest_lease_is_held_across_processes() {
+        use fs2::FileExt as _;
+
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-lease-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let path = ProjectIngestLease::lock_path(project_id).expect("a lock path");
+        assert!(path.starts_with(&temp_home), "{path:?}");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("lock folder");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .expect("open the lock file")
+        };
+
+        // Another process is indexing the project: this one is refused, and the
+        // refusal leaves nothing behind in this process.
+        let other_process = open();
+        other_process
+            .try_lock_exclusive()
+            .expect("the other process locks");
+        let refused = ProjectIngestLease::acquire(project_id).expect_err("held elsewhere");
+        assert!(
+            refused
+                .to_string()
+                .contains("another ContextStream process"),
+            "{refused}"
+        );
+        fs2::FileExt::unlock(&other_process).expect("the other process finishes");
+        drop(other_process);
+
+        // Free again: this process takes it, and then keeps others out until the
+        // lease is dropped, however the holder ends.
+        let lease = ProjectIngestLease::acquire(project_id).expect("free again");
+        let rival = open();
+        assert!(rival.try_lock_exclusive().is_err(), "held by this lease");
+        drop(lease);
+        assert!(
+            rival.try_lock_exclusive().is_ok(),
+            "released with the lease"
+        );
+
+        // A folder that cannot hold the lock leaves the in-process lease alone.
+        let blocked_home = temp_home.join("blocked");
+        std::fs::write(&blocked_home, "a file where the home folder should be").unwrap();
+        std::env::set_var("HOME", &blocked_home);
+        let alone = ProjectIngestLease::acquire(Uuid::new_v4()).expect("fails open");
+        drop(alone);
+        let _ = std::fs::remove_dir_all(&temp_home);
     }
 
     #[test]

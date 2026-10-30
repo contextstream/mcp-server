@@ -2579,12 +2579,30 @@ fn format_audit_summary(
     if kinds.is_empty() {
         format!("Found 0 ContextCapsule audit event(s) for {}.", target)
     } else {
-        format!(
+        let mut text = format!(
             "Found {} ContextCapsule audit event(s) for {}.\nDistinct event_kind values: {}.\n(Common kinds include chunk, stream, share, consumed, revoke_share, render_markdown, render_text.)",
             events.len(),
             target,
             kinds.join(", ")
-        )
+        );
+        // The events themselves: when, what, and which share or capsule (#377).
+        for event in events.iter().take(20) {
+            text.push_str(&format!(
+                "\n- {} {}",
+                event.created_at.as_deref().unwrap_or("?"),
+                event.event_kind
+            ));
+            if let Some(share_id) = event.share_id {
+                text.push_str(&format!(" share={share_id}"));
+            }
+            if let Some(capsule_id) = event.capsule_id.as_deref() {
+                text.push_str(&format!(" capsule={capsule_id}"));
+            }
+        }
+        if events.len() > 20 {
+            text.push_str(&format!("\n… and {} more.", events.len() - 20));
+        }
+        text
     }
 }
 

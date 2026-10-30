@@ -569,7 +569,52 @@ fn format_inbox(result: &Value) -> String {
         text.push('\n');
         text.push_str(rendered.trim_end());
     }
+    // The items themselves: over stdio the count was all an agent saw (#377).
+    let item_lines = coordination_item_lines(data);
+    if !item_lines.is_empty() {
+        text.push_str("\nItems:\n");
+        text.push_str(&item_lines);
+    }
     text
+}
+
+/// One line per coordination item (the first 20): id, kind, title, summary
+/// and who shared it (#377).
+fn coordination_item_lines(data: &Value) -> String {
+    const SHOWN: usize = 20;
+    let Some(items) = data.get("items").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let field = |item: &Value, key: &str| {
+        item.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let mut lines: Vec<String> = items
+        .iter()
+        .take(SHOWN)
+        .map(|item| {
+            let mut line = format!(
+                "- {} [{}] {}",
+                field(item, "id").unwrap_or_else(|| "?".to_string()),
+                field(item, "kind").unwrap_or_else(|| "item".to_string()),
+                one_line(&field(item, "title").unwrap_or_default(), 120)
+            );
+            if let Some(summary) = field(item, "summary") {
+                line.push_str(&format!(" — {}", one_line(&summary, 200)));
+            }
+            if let Some(from) = field(item, "created_by") {
+                line.push_str(&format!(" (from {from})"));
+            }
+            line
+        })
+        .collect();
+    if items.len() > SHOWN {
+        lines.push(format!("… and {} more.", items.len() - SHOWN));
+    }
+    lines.join("\n")
 }
 
 fn format_share(result: &Value, title: &str) -> String {
@@ -978,5 +1023,37 @@ mod tests {
         let body = captured.lock().await.clone().expect("captured body");
         assert_eq!(body["to"], "cc-qa");
         assert_eq!(body["session_id"], "sender-session");
+    }
+}
+
+/// `text` on one line, cut to `max` characters.
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
+#[cfg(test)]
+mod coordination_item_line_tests {
+    use super::*;
+
+    #[test]
+    fn inbox_items_are_listed_not_only_counted() {
+        let result = serde_json::json!({"items": [
+            {"id": "247b1040", "kind": "decision", "title": "To mcp-eng: #365 is yours",
+             "summary": "The first tool call re-stamps associated_at.", "created_by": "coordinator"},
+        ], "notices": []});
+        let text = format_inbox(&result);
+        assert!(
+            text.contains("Coordination inbox: 0 notice(s), 1 item(s)."),
+            "{text}"
+        );
+        assert!(
+            text.contains("- 247b1040 [decision] To mcp-eng: #365 is yours — The first tool call re-stamps associated_at. (from coordinator)"),
+            "{text}"
+        );
     }
 }

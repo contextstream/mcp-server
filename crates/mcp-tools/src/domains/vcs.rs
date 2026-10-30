@@ -293,7 +293,28 @@ impl VcsTool {
     fn success_text(action: &str, result: &Value) -> String {
         let count = Self::count_results(result);
         match action {
-            "list_repos" => format!("Found {} repositories.", count),
+            // Each repository, not only the count (#377).
+            "list_repos" => {
+                let mut text = format!("Found {} repositories.", count);
+                for repo in result
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .take(30)
+                {
+                    let field = |key: &str| repo.get(key).and_then(Value::as_str).unwrap_or("?");
+                    text.push_str(&format!(
+                        "\n- {} {} {}",
+                        field("id"),
+                        field("provider"),
+                        repo.get("full_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_else(|| field("name"))
+                    ));
+                }
+                text
+            }
             "get_repo" => "Repository retrieved.".to_string(),
             "sync_repo" => "Repository sync triggered.".to_string(),
             "update_repo_settings" => "Repository settings updated.".to_string(),

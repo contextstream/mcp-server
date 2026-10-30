@@ -526,3 +526,41 @@ async fn create_without_content_sends_the_title_as_content() {
     let sent = server.await.unwrap();
     assert_eq!(sent["content"], "QA reminder");
 }
+
+mod enum_argument_tests {
+    use super::{create_mock_client, json, ReminderTool, ToolHandler};
+
+    #[tokio::test]
+    async fn a_recurrence_status_or_priority_outside_its_enum_is_refused() {
+        // #350. The mock client reaches no server, so these refusals come first.
+        let tool = ReminderTool::new(create_mock_client());
+        for (args, expected) in [
+            (
+                json!({"action": "create", "title": "t", "remind_at": "2026-10-30T13:07:45Z", "recurrence": "every blue moon"}),
+                "recurrence \"every blue moon\" is not one of: daily, weekly, monthly.",
+            ),
+            (
+                json!({"action": "list", "status": "sleeping"}),
+                "status \"sleeping\" is not one of: pending, completed, dismissed, snoozed.",
+            ),
+            (
+                json!({"action": "create", "title": "t", "remind_at": "2026-10-30T13:07:45Z", "priority": "ultra"}),
+                "priority \"ultra\" is not one of: low, normal, high, urgent.",
+            ),
+        ] {
+            let message = tool
+                .execute(args.clone())
+                .await
+                .expect_err(&args.to_string())
+                .to_string();
+            assert!(message.contains(expected), "{args}: {message}");
+        }
+        // An advertised value in another case passes the check.
+        if let Err(error) = tool
+            .execute(json!({"action": "list", "status": "Pending"}))
+            .await
+        {
+            assert!(!error.to_string().contains("is not one of"), "{error}");
+        }
+    }
+}

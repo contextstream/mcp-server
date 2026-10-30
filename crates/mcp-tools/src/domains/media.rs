@@ -373,6 +373,16 @@ impl MediaTool {
             "{}. {} (content_id={}, type={}",
             index, filename, content_id, content_type
         );
+        let failure_reason = (status.as_deref() == Some("failed"))
+            .then(|| {
+                item.get("failure_reason")
+                    .or_else(|| item.get("metadata").and_then(|m| m.get("failure_reason")))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .map(str::to_string)
+            })
+            .flatten();
         if let Some(status) = status {
             line.push_str(&format!(", status={}", status));
         }
@@ -397,6 +407,13 @@ impl MediaTool {
             line.push_str(&format!(
                 "\n   match: {}",
                 Self::truncate_for_summary(&match_text, 180)
+            ));
+        }
+        // A failed file says why: the status said only "failed" (#375).
+        if let Some(reason) = failure_reason {
+            line.push_str(&format!(
+                "\n   failed: {}",
+                Self::truncate_for_summary(&reason, 240)
             ));
         }
         if let Some(url) = url {

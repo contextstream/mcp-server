@@ -305,9 +305,8 @@ fn fill_scope_defaults(
     }
 }
 
-#[async_trait]
-impl ToolHandler for CapsuleTool {
-    async fn execute(&self, input: Value) -> Result<ToolResult> {
+impl CapsuleTool {
+    async fn execute_action(&self, input: Value) -> Result<ToolResult> {
         let mut input: CapsuleInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
         let action = input.action.to_lowercase();
@@ -967,6 +966,28 @@ impl ToolHandler for CapsuleTool {
                 VALID_ACTIONS.join(", ")
             ))),
         }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for CapsuleTool {
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        // By-id capsule calls name the workspace (else project) they are made
+        // in, so the API routes them to its region (#361).
+        let named = |key: &str| {
+            input
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id.trim()).ok())
+        };
+        let (workspace_id, project_id) = match (named("workspace_id"), named("project_id")) {
+            (None, None) => {
+                super::scope::read_scope_defaults(&self.client, self.session.as_deref()).await
+            }
+            named => named,
+        };
+        mcp_client::run_with_capsule_scope(workspace_id, project_id, || self.execute_action(input))
+            .await
     }
 
     fn metadata(&self) -> &ToolMetadata {
@@ -2596,7 +2617,7 @@ fn format_list_shares_summary(
             "multi-use"
         };
         lines.push(format!(
-            "- id={} | audience={} | policy={} | max_uses={:?} | use_count={} | consumed_at={:?} | expires_at={:?} | token_prefix={}",
+            "- id={} | audience={} | policy={} | max_uses={} | use_count={} | consumed_at={} | expires_at={} | token_prefix={}",
             s.id,
             s.audience.as_deref().unwrap_or("?"),
             policy,

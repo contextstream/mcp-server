@@ -87,9 +87,13 @@ fn run_hook_with_env(
     }
     let mut child = cmd.spawn().expect("spawn hook");
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(serde_json::to_string(stdin_payload).unwrap().as_bytes())
-            .expect("write hook stdin");
+        // A disabled hook exits without reading its input, and may do so
+        // before this write: a closed pipe is then its answer, not a failure.
+        match stdin.write_all(serde_json::to_string(stdin_payload).unwrap().as_bytes()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(error) => panic!("write hook stdin: {error}"),
+        }
     }
     child.wait_with_output().expect("wait hook")
 }

@@ -8053,3 +8053,29 @@ mod lesson_supersede_and_paging_tests {
         assert_eq!(lessons.offset, Some(1));
     }
 }
+
+mod finished_plan_tests {
+    use crate::domains::session::{format_plan_text, plan_id, select_latest_actionable_plan};
+    use serde_json::json;
+
+    #[test]
+    fn a_finished_plan_nobody_closed_is_not_the_actionable_one() {
+        // #428: a draft at 100% was offered as the "Latest actionable plan".
+        let plans = json!([
+            {"id": "11111111-1111-4111-8111-111111111111", "title": "Working",
+             "status": "active", "progress": 50.0, "updated_at": "2026-10-29T12:00:00Z"},
+            {"id": "22222222-2222-4222-8222-222222222222", "title": "Done",
+             "status": "draft", "progress": 100.0, "updated_at": "2026-10-30T12:00:00Z"}
+        ]);
+        let selected = select_latest_actionable_plan(&plans).expect("a plan");
+        assert_eq!(
+            plan_id(&selected),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+        let text = format_plan_text(&plans[1]);
+        assert!(
+            text.contains("All of its tasks are complete; close it with session(action=\"update_plan\", plan_id=\"22222222-2222-4222-8222-222222222222\", status=\"completed\")."),
+            "{text}"
+        );
+    }
+}

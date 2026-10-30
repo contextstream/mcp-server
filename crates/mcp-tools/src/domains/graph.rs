@@ -1814,6 +1814,11 @@ impl GraphTool {
     async fn execute_action(&self, input: Value) -> Result<ToolResult> {
         let input: GraphInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
+        // An unknown target_type was read as a function and answered "Found 0
+        // dependencies … for banana" (#374).
+        if let Some(target_type) = input.target_type.as_deref() {
+            check_graph_target_type(target_type)?;
+        }
 
         match input.action.to_lowercase().as_str() {
             "related" => {
@@ -2784,6 +2789,21 @@ impl GraphTool {
     }
 }
 
+/// A graph target_type is one of module, function, type or variable, or a
+/// spelling the client reads as one (file, path, var, const) (#374).
+fn check_graph_target_type(target_type: &str) -> Result<()> {
+    const READ: &[&str] = &[
+        "module", "file", "path", "function", "type", "variable", "var", "const",
+    ];
+    let typed = target_type.trim();
+    if typed.is_empty() || READ.contains(&typed.to_ascii_lowercase().as_str()) {
+        return Ok(());
+    }
+    Err(Error::Validation(format!(
+        "target_type \"{typed}\" is not one of: module, function, type, variable."
+    )))
+}
+
 /// The analyses whose empty answer means nothing until the graph is built.
 const GRAPH_ANALYSES: &[&str] = &[
     "dependencies",
@@ -3111,5 +3131,20 @@ mod graph_not_built_tests {
         ));
         assert!(!graph_never_built(&serde_json::json!({})));
         assert!(GRAPH_NOT_BUILT.contains("graph(action=\"ingest\")"));
+    }
+
+    #[test]
+    fn a_target_type_outside_the_four_is_refused() {
+        // #374: "banana" was read as a function.
+        for typed in ["module", "Function", "file", "var", " type "] {
+            assert!(check_graph_target_type(typed).is_ok(), "{typed}");
+        }
+        let error = check_graph_target_type("banana").unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "target_type \"banana\" is not one of: module, function, type, variable."
+            ),
+            "{error}"
+        );
     }
 }

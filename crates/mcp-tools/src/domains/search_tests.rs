@@ -9216,3 +9216,21 @@ mod exhaustive_without_a_project {
         assert!(guard < first_search);
     }
 }
+
+#[tokio::test]
+async fn an_output_format_outside_the_four_is_refused_before_any_request() {
+    // #374: "xml" came back as the API's raw deserialize 400.
+    let client = create_mock_client();
+    let session = create_mock_session(&client);
+    let ik = create_mock_index_keeper(&client, &session);
+    let tool = SearchTool::new(client, session, ik, mcp_types::atlas_layer::noop_layer());
+    let error = tool
+        .execute(serde_json::json!({"query": "x", "output_format": "xml"}))
+        .await
+        .expect_err("xml is not an output format")
+        .to_string();
+    assert!(
+        error.contains("output_format \"xml\" is not one of: full, paths, minimal, count."),
+        "{error}"
+    );
+}

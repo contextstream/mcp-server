@@ -9247,3 +9247,20 @@ async fn an_output_format_outside_the_four_is_refused_before_any_request() {
         "{error}"
     );
 }
+
+#[test]
+fn a_hit_past_the_end_of_a_shortened_file_keeps_its_indexed_snippet() {
+    // #443: the indexed hit was on line 55, the file on disk now has one line,
+    // and slicing from the old line panicked (abort in release builds).
+    let content = "# shortened locally\n";
+    assert_eq!(
+        local_match_line_index(content, "ZEBRATOKEN_QA", Some(55)),
+        None
+    );
+    assert_eq!(extract_local_match_snippet(content, 70, 2, 200), "");
+    assert_eq!(
+        local_match_line_index(content, "shortened", Some(55)),
+        Some(0)
+    );
+    assert_eq!(local_match_line_index(content, "absent", None), Some(0));
+}

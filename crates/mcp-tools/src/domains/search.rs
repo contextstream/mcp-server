@@ -8249,7 +8249,10 @@ fn extract_local_match_snippet(
     max_chars: usize,
 ) -> String {
     let lines: Vec<&str> = content.lines().collect();
-    if lines.is_empty() {
+    // A line past the end of the file (the file is shorter on disk than when
+    // it was indexed) has no local snippet; slicing past it panicked and a
+    // release build aborted the server (#443).
+    if match_line_index >= lines.len() {
         return String::new();
     }
 
@@ -8344,9 +8347,15 @@ fn local_match_line_index(
         }
     }
 
-    fallback_start_line
-        .and_then(|line| (line > 0).then_some((line - 1) as usize))
-        .or(Some(0))
+    // The indexed line only where the local file still has it (#443): a
+    // shorter file keeps the indexed snippet instead.
+    match fallback_start_line {
+        Some(line) if line > 0 => {
+            let index = (line - 1) as usize;
+            (index < content.lines().count()).then_some(index)
+        }
+        _ => Some(0),
+    }
 }
 
 fn mark_local_overlay(item: &mut mcp_types::api::SearchResult) {

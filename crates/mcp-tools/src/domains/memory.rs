@@ -572,6 +572,13 @@ fn format_collection(entity_name: &str, value: &Value) -> String {
             if let Some(s) = status {
                 line.push_str(&format!(" — {}", s));
             }
+            if let Some(reason) = item
+                .get("blocked_reason")
+                .and_then(|v| v.as_str())
+                .filter(|reason| !reason.trim().is_empty())
+            {
+                line.push_str(&format!(" ({})", reason.trim()));
+            }
             // A node another one replaced reads as current otherwise (#415).
             if let Some(successor) = item
                 .get("superseded_by")
@@ -1112,6 +1119,10 @@ fn format_task_detail(value: &Value) -> String {
     }
     if let Some(ts) = completed_at {
         text.push_str(&format!("\nCompleted: {}", ts));
+    }
+    // Why a task is blocked, when it says (#413).
+    if let Some(reason) = pick("blocked_reason").filter(|reason| !reason.trim().is_empty()) {
+        text.push_str(&format!("\nBlocked: {}", reason.trim()));
     }
     text.push_str("\n\n");
     if description.is_empty() {
@@ -4805,9 +4816,37 @@ impl ToolHandler for MemoryTool {
                         }),
                     );
                 }
+                // The create endpoint takes no blocked reason and dropped it;
+                // set it right after, as update_task does (#413).
+                let mut reason_line = String::new();
+                if let Some(reason) = input
+                    .blocked_reason
+                    .clone()
+                    .filter(|reason| !reason.trim().is_empty())
+                {
+                    if let Ok(id) = Uuid::parse_str(&task_id) {
+                        let update = mcp_client::UpdateTaskParams {
+                            blocked_reason: Some(reason.clone()),
+                            ..Default::default()
+                        };
+                        match self.client.update_task(id, update).await {
+                            Ok(_) => {
+                                reason_line = format!("\nBlocked: {reason}");
+                                if let Some(obj) = result.as_object_mut() {
+                                    obj.insert("blocked_reason".to_string(), serde_json::json!(reason));
+                                }
+                            }
+                            Err(error) => {
+                                reason_line = format!(
+                                    "\nThe blocked reason was not saved ({error}); set it with update_task."
+                                );
+                            }
+                        }
+                    }
+                }
                 let text = format!(
-                    "Task created: {} (ID: {}).\nProgress: completed.",
-                    title_for_user, task_id
+                    "Task created: {} (ID: {}).{}\nProgress: completed.",
+                    title_for_user, task_id, reason_line
                 );
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note {
@@ -4986,12 +5025,22 @@ impl ToolHandler for MemoryTool {
                 let task_status_clone = input.task_status.clone();
                 let limit_clone = input.limit;
                 let offset_clone = input.offset;
+                // The date filters the schema advertises reach the API (#412).
+                let date_filters = mcp_client::TaskListFilters {
+                    created_after: input.created_after.clone(),
+                    created_before: input.created_before.clone(),
+                    completed_after: input.completed_after.clone(),
+                    completed_before: input.completed_before.clone(),
+                    due_after: input.due_after.clone(),
+                    due_before: input.due_before.clone(),
+                };
                 let filter_str = format!(
-                    "plan={};status={};limit={};offset={}",
+                    "plan={};status={};limit={};offset={};dates={:?}",
                     plan_id.map(|p| p.to_string()).unwrap_or_default(),
                     task_status_clone.as_deref().unwrap_or(""),
                     limit_clone.unwrap_or(0),
-                    offset_clone.unwrap_or(0)
+                    offset_clone.unwrap_or(0),
+                    date_filters
                 );
                 let user_scope_token =
                     super::atlas_warm_cache::current_user_scope_token();
@@ -5019,12 +5068,13 @@ impl ToolHandler for MemoryTool {
                     || async move {
                         mcp_client::with_list_offset(
                             offset_clone,
-                            client.list_tasks(
+                            client.list_tasks_filtered(
                                 workspace_id,
                                 project_id,
                                 plan_id,
                                 task_status_clone,
                                 limit_clone,
+                                &date_filters,
                             ),
                         )
                         .await

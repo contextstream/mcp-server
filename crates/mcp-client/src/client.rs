@@ -43,6 +43,10 @@ struct LocalFileScan {
     /// a file cap, walk error, metadata error, or read error made the scan
     /// partial.
     complete: bool,
+    /// True when this one pass walked the whole checkout, so `fingerprints` is
+    /// the checkout's size. A capped page, and the last page of a paged epoch,
+    /// walk only a part of it (they are `complete` or not, but never this).
+    whole_checkout: bool,
     /// Every indexable path observed across the completed bounded scan epoch.
     /// Present only when `complete` is true. A finite scan accumulates this in
     /// an append-only epoch journal so the last page can safely infer absence
@@ -107,17 +111,27 @@ struct HashManifestScope {
 /// thousands of files still to come (mcp-server#326). With the scan's size and
 /// how much of it came before, the server can count the files not yet sent.
 /// `sent_before` rather than a running total makes a retried batch idempotent.
+///
+/// Two more facts let the server keep saying "indexing" between scans of one
+/// project (the second retest of #326): `checkout_files`, how many indexable
+/// files the checkout holds, said only by a scan that walked all of it (a
+/// capped page of a large checkout cannot know), and `more_follows`, said by a
+/// scan that covered only part of the checkout, so the next page is coming.
 #[derive(Debug, Clone, Copy)]
 struct ScanDeclaration {
     id: Uuid,
     total_files: usize,
     /// Files of the scan sent before the request that carries this.
     sent_before: usize,
+    /// Indexable files in the checkout, when this scan walked all of it.
+    checkout_files: Option<usize>,
+    /// This scan covered only part of the checkout; another follows.
+    more_follows: bool,
 }
 
 impl ScanDeclaration {
-    fn headers(&self) -> [(String, String); 3] {
-        [
+    fn headers(&self) -> Vec<(String, String)> {
+        let mut headers = vec![
             (
                 "x-contextstream-ingest-scan".to_string(),
                 self.id.to_string(),
@@ -130,7 +144,20 @@ impl ScanDeclaration {
                 "x-contextstream-ingest-scan-sent".to_string(),
                 self.sent_before.to_string(),
             ),
-        ]
+        ];
+        if let Some(files) = self.checkout_files.filter(|files| *files > 0) {
+            headers.push((
+                "x-contextstream-ingest-scan-checkout".to_string(),
+                files.to_string(),
+            ));
+        }
+        if self.more_follows {
+            headers.push((
+                "x-contextstream-ingest-scan-more".to_string(),
+                "1".to_string(),
+            ));
+        }
+        headers
     }
 }
 
@@ -7488,11 +7515,20 @@ impl ContextStreamClient {
         let scan_id = Uuid::new_v4();
         let scan_total = changed_files.len();
         let mut files_sent = 0usize;
+        // A scan that walked the whole checkout in one pass knows its size (the
+        // files the client keeps, not the ones it defers for size); a capped
+        // page does not, and says another is coming.
+        let checkout_files = scan
+            .whole_checkout
+            .then(|| total_files.saturating_sub(deferred_due_to_payload));
+        let more_follows = !scan.complete;
         let scan_for_batch = |sent_before: usize| {
             (scan_total > 0).then_some(ScanDeclaration {
                 id: scan_id,
                 total_files: scan_total,
                 sent_before,
+                checkout_files,
+                more_follows,
             })
         };
         let mut deleted_paths_payload = if deleted_paths.is_empty() {
@@ -11477,6 +11513,7 @@ impl ContextStreamClient {
             }
         };
 
+        let whole_checkout = complete && (max_files == usize::MAX || existing_epoch.is_none());
         Ok(LocalFileScan {
             files,
             fingerprints,
@@ -11485,6 +11522,7 @@ impl ContextStreamClient {
             reused_files,
             policy_deleted_paths,
             complete,
+            whole_checkout,
             observed_paths,
             cursor_update,
         })
@@ -25615,6 +25653,18 @@ mod tests {
         extra_files: usize,
         responses: Vec<(&'static str, String)>,
     ) -> Vec<String> {
+        scan_posts_capped(label, extra_files, responses, None).await
+    }
+
+    /// [`scan_posts`] with the scan cut to `max_files` files, as the keep-warm
+    /// daemon's incremental pages are.
+    #[allow(clippy::await_holding_lock)]
+    async fn scan_posts_capped(
+        label: &str,
+        extra_files: usize,
+        responses: Vec<(&'static str, String)>,
+        max_files: Option<usize>,
+    ) -> Vec<String> {
         let _guard = env_test_mutex()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -25646,6 +25696,7 @@ mod tests {
                 project_id: Some(project_id),
                 force: Some(false),
                 include_media: Some(false),
+                max_files,
                 ..Default::default()
             }),
         )
@@ -25700,6 +25751,40 @@ mod tests {
             assert_eq!(
                 header(post, "x-contextstream-ingest-scan-sent"),
                 sent_before
+            );
+            // The scan walked the whole checkout (the 44 files and `lib.rs`),
+            // so it says how big the checkout is, and nothing follows it.
+            assert_eq!(header(post, "x-contextstream-ingest-scan-checkout"), "45");
+            assert_eq!(
+                request_header(post, "x-contextstream-ingest-scan-more"),
+                None
+            );
+        }
+    }
+
+    // A page of a large checkout, cut to a few files, cannot know the checkout's
+    // size; it says another page follows, so the server keeps reporting the
+    // project as being indexed between pages (second retest of mcp-server#326).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_capped_scan_says_more_follows_and_not_how_big_the_checkout_is() {
+        let posts = scan_posts_capped(
+            "scan-declaration-capped",
+            44,
+            vec![accepted_batch(1), accepted_batch(2), accepted_batch(3)],
+            Some(30),
+        )
+        .await;
+        assert!(!posts.is_empty(), "the page sends its files");
+        for post in &posts {
+            assert!(request_header(post, "x-contextstream-ingest-scan").is_some());
+            assert_eq!(
+                request_header(post, "x-contextstream-ingest-scan-more"),
+                Some("1")
+            );
+            assert_eq!(
+                request_header(post, "x-contextstream-ingest-scan-checkout"),
+                None
             );
         }
     }

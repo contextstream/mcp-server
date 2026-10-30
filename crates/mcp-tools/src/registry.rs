@@ -71,6 +71,25 @@ fn refuse_negative_counts(tool: &str, input: &Value) -> Result<()> {
     }
 }
 
+/// A misspelled argument would be dropped and the call would do something
+/// else than asked (a todo without its priority, the default page), so it is
+/// refused before anything runs (#423).
+fn refuse_mistyped_arguments(tool: &str, schema: &Value, input: &Value) -> Result<()> {
+    let mistyped = crate::input_shape::mistyped_arguments(schema, input);
+    if mistyped.is_empty() {
+        return Ok(());
+    }
+    let noun = if mistyped.len() == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
+    Err(Error::Validation(format!(
+        "{tool}: unknown {noun} {}. Nothing was run; send the argument names tools/list gives for {tool}.",
+        mistyped.join(", ")
+    )))
+}
+
 /// A handler's argument-parsing error, made actionable: the tool, the fields
 /// whose type still differs from the schema, and what to send instead.
 fn explain_input_error(
@@ -940,6 +959,7 @@ impl ToolRegistry {
         }
         let mismatches = normalize_input_shape(name, &tool.input_schema, &mut input);
         refuse_negative_counts(name, &input)?;
+        refuse_mistyped_arguments(name, &tool.input_schema, &input)?;
         ignore_placeholder_scope_ids(name, &mut input);
 
         // Attribute downstream server-side compliance events to the agent's
@@ -1302,6 +1322,7 @@ impl ToolRegistry {
         }
         let mismatches = normalize_input_shape(name, &operation.input_schema, &mut input);
         refuse_negative_counts(name, &input)?;
+        refuse_mistyped_arguments(name, &operation.input_schema, &input)?;
         ignore_placeholder_scope_ids(name, &mut input);
 
         let observation =

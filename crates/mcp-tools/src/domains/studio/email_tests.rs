@@ -3,8 +3,10 @@
 //! test-send recipients, reports and refusals.
 
 use super::email::{
-    email_refusal, is_resend_test_address, outline, percent, send_at_of, send_key, test_recipients,
-    time_zone_of, when_words, Topic, EMAIL_ACTIONS, NOT_OFFERED,
+    address_of, contacts_of, email_refusal, holds_resend_key, is_resend_test_address,
+    looks_like_resend_key, operation_of, outline, percent, send_at_of, send_key, send_state,
+    suppression_words, test_recipients, time_zone_of, variant_of, when_words, Topic, CONNECT_URL,
+    EMAIL_ACTIONS, KEY_REFUSED, NOT_OFFERED, SIGN_IN,
 };
 use super::*;
 use crate::peer::{run_with_call_peer, CallPeer, PeerChannel};
@@ -18,6 +20,9 @@ const PROJECT: &str = "22222222-2222-4222-8222-222222222222";
 const CAMPAIGN: &str = "77777777-7777-4777-8777-777777777777";
 const AUDIENCE: &str = "88888888-8888-4888-8888-888888888888";
 const SEGMENT: &str = "99999999-9999-4999-8999-999999999999";
+const COPY: &str = "66666666-6666-4666-8666-666666666666";
+const CONTACT: &str = "55555555-5555-4555-8555-555555555555";
+const LINK: &str = "44444444-4444-4444-8444-444444444444";
 
 // ============================================================================
 // A stub of Create's email routes
@@ -260,13 +265,93 @@ fn api(status: Arc<Mutex<String>>, recipients: i64) -> Responder {
             ])),
             ("GET", p) if p == campaign_path => Answer::ok(campaign(&status.lock().unwrap())),
             ("GET", p) if p == format!("{campaign_path}/preview") => Answer::ok(json!({
-                "subject": "Our winter sale starts today",
+                "subject": if request.query.contains("variant=1") { "Twenty percent off, this week only" } else { "Our winter sale starts today" },
+                "subjects": ["Our winter sale starts today", "Twenty percent off, this week only"],
+                "variant": if request.query.contains("variant=1") { 1 } else { 0 },
                 "preheader": "Twenty percent off everything until Sunday.",
                 "from": "Northwind <hello@news.northwind.example>",
+                "fromName": "Northwind", "fromEmail": "hello@news.northwind.example",
                 "html": "<html></html>", "text": "",
                 "warnings": ["The image “Beans in the snow” has no link."],
                 "recipients": recipients
             })),
+            ("GET", p) if p == format!("{campaign_path}/preview-links") => Answer::ok(json!({
+                "links": [link(LINK, 72)]
+            })),
+            ("POST", p) if p == format!("{campaign_path}/preview-links") => {
+                Answer::status(201, link("33333333-3333-4333-8333-333333333333", 168))
+            }
+            ("POST", p) if p == format!("{campaign_path}/revise") => {
+                let mut revised = campaign("draft");
+                revised["revision"] = json!(5);
+                revised["subject"] = json!("Winter sale: 20% off");
+                Answer::ok(json!({
+                    "campaign": revised,
+                    "outline": [{"type": "heading", "text": "Winter is here"}],
+                    "changes": ["Shortened the subject to 20 characters."]
+                }))
+            }
+            ("PATCH", p) if p == campaign_path => {
+                let mut changed = campaign("draft");
+                changed["revision"] = json!(5);
+                if let Some(subject) = request.body.get("subject") {
+                    changed["subject"] = subject.clone();
+                }
+                if let Some(preheader) = request.body.get("preheader") {
+                    changed["preheader"] = preheader.clone();
+                }
+                Answer::ok(changed)
+            }
+            ("POST", p) if p == format!("{campaign_path}/duplicate") => {
+                let mut copy = campaign("draft");
+                copy["id"] = json!(COPY);
+                copy["name"] = json!("Copy of Winter sale");
+                Answer::status(201, copy)
+            }
+            ("GET", "/create/email/contacts") => Answer::ok(json!({
+                "contacts": [
+                    {"id": CONTACT, "email": "ada@northwind.example", "firstName": "Ada", "lastName": "Lovelace",
+                     "tags": ["vip"], "attributes": {}, "consent": {"source": "manual", "note": "Met at the Spring market", "at": "2026-10-01T10:00:00Z"},
+                     "audienceIds": [AUDIENCE], "suppressed": null},
+                    {"id": "40404040-4040-4040-8040-404040404040", "email": "grace@northwind.example", "firstName": null, "lastName": null,
+                     "tags": [], "attributes": {}, "consent": {"source": "import", "note": null, "at": "2026-10-01T10:00:00Z"},
+                     "audienceIds": [AUDIENCE], "suppressed": {"reason": "unsubscribed", "at": "2026-10-20T08:00:00Z"}}
+                ],
+                "nextCursor": null, "total": 2
+            })),
+            ("POST", "/create/email/contacts") => {
+                let n = request.body["contacts"].as_array().map_or(0, Vec::len);
+                Answer::ok(
+                    json!({"created": n, "updated": 0, "added": n, "invalid": [], "suppressed": 0}),
+                )
+            }
+            ("DELETE", p) if p == format!("/create/email/contacts/{CONTACT}") => {
+                Answer::ok(json!({"deleted": true}))
+            }
+            ("GET", "/create/email/suppressions") => Answer::ok(json!({
+                "suppressions": [
+                    {"email": "grace@northwind.example", "reason": "unsubscribed", "source": "one_click",
+                     "campaignId": CAMPAIGN, "campaign": {"id": CAMPAIGN, "name": "Winter sale"},
+                     "feedback": {"reason": "too_many", "comment": "Weekly is plenty", "at": "2026-10-20T08:01:00Z"},
+                     "detail": null, "createdAt": "2026-10-20T08:00:00Z"},
+                    {"email": "bounced@resend.dev", "reason": "bounced", "source": "webhook",
+                     "campaignId": CAMPAIGN, "campaign": {"id": CAMPAIGN, "name": "Winter sale"},
+                     "feedback": null, "detail": "550 5.1.1 Unknown user", "createdAt": "2026-10-19T08:00:00Z"}
+                ],
+                "nextCursor": null, "total": 2
+            })),
+            ("GET", "/create/email/suppressions/summary") => Answer::ok(json!({
+                "days": 30, "total": 2,
+                "byReason": {"unsubscribed": 1, "bounced": 1, "complained": 0, "manual": 0},
+                "bySource": {"one_click": 1, "page": 0, "webhook": 1, "manual": 0, "api": 0},
+                "feedback": {"too_many": 1, "not_relevant": 0, "never_signed_up": 0, "other": 0, "none": 1},
+                "series": [], "campaigns": [], "resubscribed": 1
+            })),
+            ("POST", "/create/email/suppressions") => {
+                let n = request.body["emails"].as_array().map_or(0, Vec::len);
+                Answer::ok(json!({"added": n, "already": 0}))
+            }
+            ("POST", "/create/email/suppressions/remove") => Answer::ok(json!({"removed": true})),
             ("POST", p) if p == format!("{campaign_path}/test") => {
                 let to = request
                     .body
@@ -316,6 +401,16 @@ fn api(status: Arc<Mutex<String>>, recipients: i64) -> Responder {
             })),
             _ => Answer::error(404, "NOT_FOUND", "Not found: nothing here"),
         }
+    })
+}
+
+/// A preview link that is live for `hours` more.
+fn link(id: &str, hours: i64) -> Value {
+    let expires = chrono::Utc::now() + chrono::Duration::hours(hours);
+    json!({
+        "id": id, "url": format!("https://ctxproduct.com/email-preview#t=token-{id}"),
+        "createdAt": "2026-10-30T01:00:00Z", "expiresAt": expires.to_rfc3339(),
+        "revokedAt": null, "live": true, "opens": 0, "lastOpenedAt": null, "createdBy": "u"
     })
 }
 
@@ -390,10 +485,26 @@ fn every_email_action_is_listed_described_and_in_the_schema() {
         "to",
         "status",
         "days",
+        "variant",
+        "subject",
+        "preheader",
+        "operation",
+        "email",
+        "contacts",
+        "consent_source",
+        "consent_note",
+        "query",
+        "reason",
+        "note",
+        "confirm_email",
     ] {
         assert!(properties.contains_key(field), "{field}");
     }
     assert!(!properties.keys().any(|k| k.contains("model")));
+    // No parameter takes a Resend key, and the reference says where it goes instead.
+    assert!(!properties.keys().any(|k| k.contains("key")));
+    assert!(TOOL_REFERENCE.contains(CONNECT_URL));
+    assert!(TOOL_REFERENCE.contains("never ask for or pass an API key"));
 }
 
 #[tokio::test]
@@ -676,7 +787,7 @@ async fn a_stateless_client_is_asked_through_the_calls_result() {
     );
     let question = first.take_input_required().expect("input_required");
     let state = question["requestState"].as_str().unwrap().to_string();
-    assert_eq!(state, format!("studio-email-send:{CAMPAIGN}:37:now:UTC"));
+    assert_eq!(state, format!("studio-email-send:{CAMPAIGN}:4:37:now:UTC"));
     assert!(stub
         .calls_to(
             "POST",
@@ -1060,5 +1171,652 @@ fn rates_and_outlines_read_at_a_glance() {
             "4. Image: Beans in the snow",
             "5. Divider",
         ]
+    );
+}
+
+// ============================================================================
+// Round 2: #332's follow-ups
+// ============================================================================
+
+#[tokio::test]
+async fn a_go_given_for_an_older_revision_isnt_taken() {
+    let revision = Arc::new(Mutex::new(4i64));
+    let current = revision.clone();
+    let stub = Stub::start(Arc::new(move |request: &Recorded| {
+        let answer = (usual())(request);
+        if request.method == "GET" && request.path == format!("/create/email/campaigns/{CAMPAIGN}")
+        {
+            let mut campaign = campaign("draft");
+            campaign["revision"] = json!(*current.lock().unwrap());
+            return Answer::ok(campaign);
+        }
+        answer
+    }))
+    .await;
+    let tool = stub.tool();
+    let client = Arc::new(FakeClient::default());
+    let first = CallPeer::new(client.clone(), None, false).with_inline_input(&json!({}));
+    run_with_call_peer(
+        first.clone(),
+        tool.execute(json!({"action": "email_send", "campaign_id": CAMPAIGN})),
+    )
+    .await
+    .unwrap();
+    let state = first.take_input_required().unwrap()["requestState"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        state,
+        send_state(Uuid::parse_str(CAMPAIGN).unwrap(), 4, 37, "now", "UTC")
+    );
+
+    // The campaign is edited while the person is asked: their go was for revision 4.
+    *revision.lock().unwrap() = 5;
+    let stale = CallPeer::new(client, None, false).with_inline_input(&json!({
+        "inputResponses": {"confirm-send": {"action": "accept", "content": {"confirm": true}}},
+        "requestState": state,
+    }));
+    let result = run_with_call_peer(
+        stale.clone(),
+        tool.execute(json!({"action": "email_send", "campaign_id": CAMPAIGN})),
+    )
+    .await
+    .unwrap();
+    assert!(
+        text_of(&result).starts_with("Asking the person"),
+        "{}",
+        text_of(&result)
+    );
+    let asked_again = stale.take_input_required().unwrap();
+    assert_eq!(
+        asked_again["requestState"],
+        format!("studio-email-send:{CAMPAIGN}:5:37:now:UTC")
+    );
+    assert!(stub
+        .calls_to(
+            "POST",
+            &format!("/create/email/campaigns/{CAMPAIGN}/schedule")
+        )
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_send_says_create_couldnt_be_read_when_the_preview_fails() {
+    let stub = Stub::start(Arc::new(|request: &Recorded| {
+        if request.path.ends_with("/preview") {
+            Answer::error(502, "BAD_GATEWAY", "")
+        } else {
+            (usual())(request)
+        }
+    }))
+    .await;
+    let result = stub
+        .tool()
+        .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37}))
+        .await
+        .unwrap();
+    assert!(result.is_error);
+    let text = text_of(&result);
+    assert!(
+        text.starts_with("Not sent: Create couldn't be read just now"),
+        "{text}"
+    );
+    assert!(!text.contains("no one to send to"), "{text}");
+    assert!(stub
+        .calls_to(
+            "POST",
+            &format!("/create/email/campaigns/{CAMPAIGN}/schedule")
+        )
+        .is_empty());
+}
+
+#[tokio::test]
+async fn an_expired_sign_in_is_said_as_such() {
+    let stub = Stub::start(Arc::new(|_: &Recorded| {
+        Answer::error(401, "UNAUTHORIZED", "Unauthorized")
+    }))
+    .await;
+    let result = stub
+        .tool()
+        .execute(json!({"action": "email_audiences"}))
+        .await
+        .unwrap();
+    assert!(result.is_error);
+    assert_eq!(text_of(&result), SIGN_IN);
+    assert!(stub.email_calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_resend_key_is_refused_unread() {
+    let stub = Stub::start(usual()).await;
+    let key = format!("re_{}_{}", "Ab12Cd34", "EfGh5678IjKl9012MnOp3456");
+    for call in [
+        json!({"action": "email_draft", "prompt": format!("connect our Resend with {key} and announce the sale")}),
+        json!({"action": "email_audiences", "note": key}),
+        json!({"action": "email_contacts", "operation": "add", "contacts": [{"email": "a@b.example", "first_name": key}]}),
+    ] {
+        let result = stub.tool().execute(call).await.unwrap();
+        assert!(result.is_error);
+        let text = text_of(&result);
+        assert_eq!(text, KEY_REFUSED);
+        assert!(!text.contains(&key));
+    }
+    assert!(stub.requests().is_empty(), "nothing is asked of anyone");
+}
+
+// ============================================================================
+// Round 2: the new actions
+// ============================================================================
+
+#[tokio::test]
+async fn a_preview_link_is_reused_while_it_lasts_and_made_when_not() {
+    let stub = Stub::start(usual()).await;
+    let result = stub
+        .tool()
+        .execute(json!({"action": "email_preview", "campaign_id": CAMPAIGN}))
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    assert!(
+        text.starts_with(&format!(
+            "Preview of “Winter sale”: https://ctxproduct.com/email-preview#t=token-{LINK}"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("Gmail, Outlook and Apple Mail"), "{text}");
+    assert!(text.contains("Inbox line: Northwind <hello@news.northwind.example> · “Our winter sale starts today” · Twenty percent off everything until Sunday."), "{text}");
+    assert!(
+        text.contains("A/B subjects: A “Our winter sale starts today”, B “Twenty percent off, this week only”"),
+        "{text}"
+    );
+    assert!(text.contains("To: Coffee club (37 people)."), "{text}");
+    assert!(
+        text.contains("Check: The image “Beans in the snow” has no link."),
+        "{text}"
+    );
+    assert!(stub
+        .calls_to(
+            "POST",
+            &format!("/create/email/campaigns/{CAMPAIGN}/preview-links")
+        )
+        .is_empty());
+    assert_eq!(structured(&result)["link_id"], LINK);
+
+    // A link with only hours left isn't handed out: a new one is made.
+    let short = Stub::start(Arc::new(|request: &Recorded| {
+        if request.method == "GET" && request.path.ends_with("/preview-links") {
+            Answer::ok(json!({"links": [link(LINK, 2)]}))
+        } else {
+            (usual())(request)
+        }
+    }))
+    .await;
+    let made = short
+        .tool()
+        .execute(json!({"action": "email_preview", "campaign_id": CAMPAIGN, "variant": 1}))
+        .await
+        .unwrap();
+    let text = text_of(&made);
+    assert!(
+        text.contains("token-33333333-3333-4333-8333-333333333333"),
+        "{text}"
+    );
+    assert!(
+        text.contains("“Twenty percent off, this week only”"),
+        "{text}"
+    );
+    assert!(text.contains("(this is B)"), "{text}");
+    let posts = short.calls_to(
+        "POST",
+        &format!("/create/email/campaigns/{CAMPAIGN}/preview-links"),
+    );
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["workspaceId"], WORKSPACE);
+    let previews = short.calls_to(
+        "GET",
+        &format!("/create/email/campaigns/{CAMPAIGN}/preview"),
+    );
+    assert!(
+        previews[0].query.contains("variant=1"),
+        "{}",
+        previews[0].query
+    );
+
+    let bad = short
+        .tool()
+        .execute(json!({"action": "email_preview", "campaign_id": CAMPAIGN, "variant": 3}))
+        .await;
+    assert!(matches!(bad, Err(Error::Validation(_))));
+}
+
+#[tokio::test]
+async fn a_draft_is_revised_from_plain_words_or_given_lines() {
+    let stub = Stub::start(usual()).await;
+    let tool = stub.tool();
+    let result = tool
+        .execute(
+            json!({"action": "email_revise", "campaign_id": CAMPAIGN, "change": "shorter subject"}),
+        )
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    assert!(
+        text.starts_with("Changed “Winter sale” (revision 5). Nothing is sent."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Shortened the subject to 20 characters."),
+        "{text}"
+    );
+    assert!(text.contains("Subject: Winter sale: 20% off"), "{text}");
+    assert!(text.contains("1. Heading: Winter is here"), "{text}");
+    let revises = stub.calls_to(
+        "POST",
+        &format!("/create/email/campaigns/{CAMPAIGN}/revise"),
+    );
+    assert_eq!(revises.len(), 1);
+    assert_eq!(revises[0].body["instruction"], "shorter subject");
+    assert_eq!(revises[0].body["revision"], 4);
+    assert!(revises[0]
+        .header("idempotency-key")
+        .is_some_and(|k| k.starts_with(&format!("email-revise-{CAMPAIGN}-r4-"))));
+    assert_eq!(structured(&result)["revision"], 5);
+
+    let set = tool
+        .execute(json!({"action": "email_revise", "campaign_id": CAMPAIGN, "subject": "Warm up with 20% off", "preheader": ""}))
+        .await
+        .unwrap();
+    assert!(!set.is_error, "{}", text_of(&set));
+    let patches = stub.calls_to("PATCH", &format!("/create/email/campaigns/{CAMPAIGN}"));
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["subject"], "Warm up with 20% off");
+    assert_eq!(patches[0].body["preheader"], "");
+    assert_eq!(patches[0].body["revision"], 4);
+    assert!(text_of(&set).contains("Subject: Warm up with 20% off"));
+
+    for wrong in [
+        json!({"action": "email_revise", "campaign_id": CAMPAIGN}),
+        json!({"action": "email_revise", "campaign_id": CAMPAIGN, "change": "warmer", "subject": "x"}),
+        json!({"action": "email_revise", "campaign_id": CAMPAIGN, "subject": " "}),
+        json!({"action": "email_revise", "campaign_id": CAMPAIGN, "change": "x".repeat(1001)}),
+    ] {
+        assert!(matches!(
+            tool.execute(wrong).await,
+            Err(Error::Validation(_))
+        ));
+    }
+
+    // Only a draft changes.
+    let scheduled = Stub::start(api(Arc::new(Mutex::new("scheduled".to_string())), 37)).await;
+    let refused = scheduled
+        .tool()
+        .execute(json!({"action": "email_revise", "campaign_id": CAMPAIGN, "change": "warmer"}))
+        .await
+        .unwrap();
+    assert!(refused.is_error);
+    assert!(
+        text_of(&refused).contains("only a draft can be changed, and “Winter sale” is scheduled. email_cancel unschedules it"),
+        "{}",
+        text_of(&refused)
+    );
+    assert!(scheduled
+        .calls_to(
+            "POST",
+            &format!("/create/email/campaigns/{CAMPAIGN}/revise")
+        )
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_campaign_is_duplicated_as_a_draft() {
+    let stub = Stub::start(usual()).await;
+    let result = stub
+        .tool()
+        .execute(json!({"action": "email_duplicate", "campaign_id": CAMPAIGN}))
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    assert!(
+        text.starts_with(&format!(
+            "Made “Copy of Winter sale”, a draft copy (campaign_id {COPY}). Nothing is sent."
+        )),
+        "{text}"
+    );
+    assert_eq!(structured(&result)["campaign_id"], COPY);
+    assert_eq!(
+        stub.calls_to(
+            "POST",
+            &format!("/create/email/campaigns/{CAMPAIGN}/duplicate")
+        )
+        .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn contacts_are_listed_added_erased_and_unsubscribed() {
+    let stub = Stub::start(usual()).await;
+    let tool = stub.tool();
+
+    let list = tool
+        .execute(json!({"action": "email_contacts", "query": "northwind", "status": "subscribed"}))
+        .await
+        .unwrap();
+    let text = text_of(&list);
+    assert!(!list.is_error, "{text}");
+    assert!(
+        text.starts_with("2 contacts matching “northwind”:"),
+        "{text}"
+    );
+    assert!(text.contains("- ada@northwind.example (Ada Lovelace) · subscribed · in Coffee club · tags vip · consent manual: Met at the Spring market"), "{text}");
+    assert!(
+        text.contains("- grace@northwind.example · not sent to: unsubscribed 2026-10-20 08:00 UTC"),
+        "{text}"
+    );
+    let gets = stub.calls_to("GET", "/create/email/contacts");
+    assert!(gets[0].query.contains("q=northwind"), "{}", gets[0].query);
+    assert!(
+        gets[0].query.contains("status=subscribed"),
+        "{}",
+        gets[0].query
+    );
+
+    // Adding needs where they agreed to hear from the team.
+    let no_consent = tool
+        .execute(json!({"action": "email_contacts", "operation": "add", "contacts": ["new@northwind.example"]}))
+        .await;
+    assert!(matches!(no_consent, Err(Error::Validation(m)) if m.contains("consent_source")));
+    let no_note = tool
+        .execute(json!({"action": "email_contacts", "operation": "add", "contacts": ["new@northwind.example"], "consent_source": "form"}))
+        .await;
+    assert!(matches!(no_note, Err(Error::Validation(m)) if m.contains("consent_note")));
+    let added = tool
+        .execute(json!({
+            "action": "email_contacts", "operation": "add", "audience_id": AUDIENCE,
+            "consent_source": "form", "consent_note": "Signed up at the Spring market",
+            "contacts": ["New@Northwind.example", {"email": "lin@northwind.example", "first_name": "Lin", "tags": ["vip"]}, "new@northwind.example", "not-an-address"],
+        }))
+        .await
+        .unwrap();
+    let text = text_of(&added);
+    assert!(!added.is_error, "{text}");
+    assert!(text.starts_with("Added 2 people (2 new, 0 updated), 2 put in the audience, consent form: “Signed up at the Spring market”."), "{text}");
+    assert!(
+        text.contains("Not added: not-an-address (isn't an email address)"),
+        "{text}"
+    );
+    let posts = stub.calls_to("POST", "/create/email/contacts");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["consentSource"], "form");
+    assert_eq!(posts[0].body["audienceId"], AUDIENCE);
+    assert_eq!(
+        posts[0].body["contacts"][0]["email"],
+        "new@northwind.example"
+    );
+    assert_eq!(
+        posts[0].body["contacts"][0]["consentNote"],
+        "Signed up at the Spring market"
+    );
+    assert_eq!(posts[0].body["contacts"][1]["firstName"], "Lin");
+    assert!(posts[0]
+        .header("idempotency-key")
+        .is_some_and(|k| k.starts_with("email-contacts-")));
+
+    let erased = tool
+        .execute(json!({"action": "email_contacts", "operation": "remove", "email": "ADA@northwind.example"}))
+        .await
+        .unwrap();
+    assert!(!erased.is_error, "{}", text_of(&erased));
+    assert!(text_of(&erased).starts_with("Erased ada@northwind.example"));
+    assert_eq!(
+        stub.calls_to("DELETE", &format!("/create/email/contacts/{CONTACT}"))
+            .len(),
+        1
+    );
+    let unknown = tool
+        .execute(json!({"action": "email_contacts", "operation": "remove", "email": "nobody@northwind.example"}))
+        .await
+        .unwrap();
+    assert!(unknown.is_error);
+    assert!(text_of(&unknown).contains("there is no contact nobody@northwind.example"));
+
+    let unsubscribed = tool
+        .execute(json!({"action": "email_contacts", "operation": "unsubscribe", "email": "lin@northwind.example", "note": "Asked on the phone"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        text_of(&unsubscribed),
+        "lin@northwind.example is on the suppression list now: no campaign will reach them."
+    );
+    let suppressions = stub.calls_to("POST", "/create/email/suppressions");
+    assert_eq!(
+        suppressions[0].body["emails"],
+        json!(["lin@northwind.example"])
+    );
+    assert_eq!(
+        suppressions[0].body["note"],
+        "Added through the studio tool: Asked on the phone"
+    );
+
+    let bad = tool
+        .execute(json!({"action": "email_contacts", "operation": "export"}))
+        .await;
+    assert!(matches!(bad, Err(Error::Validation(_))));
+}
+
+#[tokio::test]
+async fn unsubscribes_are_listed_with_why_and_a_remove_needs_the_persons_go() {
+    let stub = Stub::start(usual()).await;
+    let tool = stub.tool();
+    let list = tool
+        .execute(json!({"action": "email_unsubscribes"}))
+        .await
+        .unwrap();
+    let text = text_of(&list);
+    assert!(!list.is_error, "{text}");
+    assert!(
+        text.starts_with("The suppression list: 2 addresses, never sent to."),
+        "{text}"
+    );
+    assert!(text.contains("Last 30 days: 1 unsubscribed, 1 bounced, 0 spam complaints, 0 added by hand; 1 resubscribed."), "{text}");
+    assert!(text.contains("Why they left: too many emails 1."), "{text}");
+    assert!(text.contains("- grace@northwind.example: unsubscribed with their mail client's one-click button on 2026-10-20 08:00 UTC, from “Winter sale”; said: too many emails (“Weekly is plenty”)"), "{text}");
+    assert!(text.contains("- bounced@resend.dev: hard-bounced on 2026-10-19 08:00 UTC, from “Winter sale”: 550 5.1.1 Unknown user"), "{text}");
+
+    let remove = "/create/email/suppressions/remove".to_string();
+    // No go: nothing comes off, and the agent is told what to show.
+    let unasked = tool
+        .execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example"}))
+        .await
+        .unwrap();
+    let text = text_of(&unasked);
+    assert!(
+        text.starts_with("Not removed yet: the person's go is needed first."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Only if they asked to hear from the team again"),
+        "{text}"
+    );
+    assert!(
+        text.contains("confirm_email grace@northwind.example"),
+        "{text}"
+    );
+    let wrong = tool
+        .execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example", "confirm_email": "ada@northwind.example"}))
+        .await
+        .unwrap();
+    assert!(text_of(&wrong).starts_with("Not removed: confirm_email is ada@northwind.example"));
+    assert!(stub.calls_to("POST", &remove).is_empty());
+
+    // Through the client: a no keeps them on the list, a yes takes them off.
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));
+    let declined = run_with_call_peer(
+        CallPeer::new(client.clone(), None, true),
+        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example", "confirm_email": "grace@northwind.example"})),
+    )
+    .await
+    .unwrap();
+    assert!(text_of(&declined).starts_with("Not removed: the person didn't say go."));
+    assert!(stub.calls_to("POST", &remove).is_empty());
+    let message = client.sent.lock().unwrap()[0].1["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        message.starts_with("Take grace@northwind.example (unsubscribed"),
+        "{message}"
+    );
+
+    *client.answer.lock().unwrap() =
+        Some(json!({"action": "accept", "content": {"confirm": true}}));
+    let removed = run_with_call_peer(
+        CallPeer::new(client, None, true),
+        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example", "note": "She wrote to ask"})),
+    )
+    .await
+    .unwrap();
+    assert!(!removed.is_error, "{}", text_of(&removed));
+    let posts = stub.calls_to("POST", &remove);
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["email"], "grace@northwind.example");
+    assert_eq!(posts[0].body["confirm"], true);
+    assert_eq!(
+        posts[0].body["note"],
+        "Taken off through the studio tool, with the person's go: She wrote to ask"
+    );
+
+    // Without a client to ask, the confirmed address is the go; a bounce needs no confirm flag.
+    let bounced = tool
+        .execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "bounced@resend.dev", "confirm_email": "Bounced@resend.dev"}))
+        .await
+        .unwrap();
+    assert!(!bounced.is_error, "{}", text_of(&bounced));
+    let posts = stub.calls_to("POST", &remove);
+    assert_eq!(posts.len(), 2);
+    assert!(posts[1].body.get("confirm").is_none());
+
+    let absent = tool
+        .execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "ada@northwind.example", "confirm_email": "ada@northwind.example"}))
+        .await
+        .unwrap();
+    assert!(text_of(&absent).contains("isn't on the suppression list"));
+
+    let added = tool
+        .execute(json!({"action": "email_unsubscribes", "operation": "add", "contacts": "a@northwind.example, b@northwind.example"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        text_of(&added),
+        "Added 2 to the suppression list: no campaign will reach them."
+    );
+    let bad_reason = tool
+        .execute(json!({"action": "email_unsubscribes", "reason": "bored"}))
+        .await;
+    assert!(matches!(bad_reason, Err(Error::Validation(_))));
+}
+
+#[tokio::test]
+async fn the_connection_is_made_in_the_studio_never_here() {
+    let stub = Stub::start(Arc::new(|request: &Recorded| {
+        if request.path == "/create/email/connection" {
+            Answer::ok(json!({"connected": false}))
+        } else {
+            (usual())(request)
+        }
+    }))
+    .await;
+    let result = stub
+        .tool()
+        .execute(json!({"action": "email_audiences"}))
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    assert!(text.contains(&format!("Resend isn't connected yet: the team connects its own Resend key in the studio ({CONNECT_URL}). An agent never takes the key")), "{text}");
+    assert_eq!(
+        structured(&result)["connection"]["connect_url"],
+        CONNECT_URL
+    );
+}
+
+// ============================================================================
+// Round 2: words and parsing
+// ============================================================================
+
+#[test]
+fn resend_keys_are_recognised_without_false_alarms() {
+    assert!(looks_like_resend_key(
+        "re_Ab12Cd34_EfGh5678IjKl9012MnOp3456"
+    ));
+    assert!(looks_like_resend_key(
+        "the key is re_Ab12Cd34EfGh5678IjKl9012 ok"
+    ));
+    for fine in [
+        "re_short",
+        "pre_existing_condition_values_that_run_long",
+        "store_everything_in_one_place_for_now",
+        "Re: our winter sale",
+        "",
+    ] {
+        assert!(!looks_like_resend_key(fine), "{fine}");
+    }
+    assert!(holds_resend_key(
+        &json!({"a": [{"b": "re_Ab12Cd34_EfGh5678IjKl9012MnOp3456"}]})
+    ));
+    assert!(!holds_resend_key(&json!({"a": [1, null, "fine"]})));
+}
+
+#[test]
+fn addresses_contacts_and_operations_read_plainly() {
+    assert_eq!(
+        address_of(" Ada@Example.COM ").as_deref(),
+        Some("ada@example.com")
+    );
+    for no in [
+        "ada",
+        "ada@",
+        "@example.com",
+        "ada@example",
+        "ada@.com",
+        "a da@example.com",
+    ] {
+        assert!(address_of(no).is_none(), "{no}");
+    }
+    let input = StudioInput {
+        contacts: Some(
+            json!(["a@x.example", {"email": "B@x.example", "firstName": "Bea"}, "a@x.example", "nope"]),
+        ),
+        ..StudioInput::default()
+    };
+    let (contacts, invalid) = contacts_of(&input).unwrap();
+    assert_eq!(contacts.len(), 2);
+    assert_eq!(contacts[1].email, "b@x.example");
+    assert_eq!(contacts[1].first_name.as_deref(), Some("Bea"));
+    assert_eq!(invalid, vec!["nope"]);
+    let many = StudioInput {
+        contacts: Some(json!((0..101)
+            .map(|i| format!("p{i}@x.example"))
+            .collect::<Vec<_>>())),
+        ..StudioInput::default()
+    };
+    assert!(contacts_of(&many).is_err());
+    assert_eq!(operation_of(None, &["list", "add"], "x").unwrap(), "list");
+    assert_eq!(
+        operation_of(Some(" ADD "), &["list", "add"], "x").unwrap(),
+        "add"
+    );
+    assert!(operation_of(Some("drop"), &["list", "add"], "x").is_err());
+    assert_eq!(variant_of(Some(2)).unwrap(), Some(2));
+    assert!(variant_of(Some(-1)).is_err());
+    assert_eq!(
+        suppression_words(
+            &json!({"email": "x@y.example", "reason": "manual", "source": "api", "createdAt": "2026-10-20T08:00:00Z"})
+        ),
+        "added through the API on 2026-10-20 08:00 UTC"
     );
 }

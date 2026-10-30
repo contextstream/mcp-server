@@ -1835,6 +1835,11 @@ async fn search_docs_by_title(
     Ok(ranked)
 }
 
+/// What a doc the server matched by its body scores in memory search: as
+/// much as the best memory hit (scores run 0-300), so memory hits no longer
+/// push it out of the answer (#416).
+const DOC_SERVER_BODY_SCORE: i64 = 300;
+
 /// The server's doc search reads bodies too; a doc it returned for the query
 /// with no title word in common scored 0 here and was dropped, so a runbook
 /// was found only by its title words (#416). Such docs follow the title
@@ -1851,6 +1856,11 @@ fn keep_server_body_matches(ranked: &mut Vec<Value>, server_matches: Vec<Value>,
             .iter()
             .any(|kept| kept.get("id").and_then(Value::as_str) == Some(id))
         {
+            let mut doc = doc;
+            if let Some(fields) = doc.as_object_mut() {
+                fields.insert("match_score".into(), DOC_SERVER_BODY_SCORE.into());
+                fields.insert("match_source".into(), "server_body".into());
+            }
             ranked.push(doc);
         }
     }

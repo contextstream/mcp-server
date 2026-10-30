@@ -3193,3 +3193,31 @@ mod unanswered_write_tests {
         .is_ok());
     }
 }
+
+mod server_body_doc_tests {
+    use super::{build_hybrid_search_results, keep_server_body_matches};
+    use serde_json::json;
+
+    #[test]
+    fn a_doc_the_server_matched_by_its_body_is_not_pushed_out_by_memory_hits() {
+        // #416: "how do I promote replica-…" found the runbook on the server,
+        // but ten memory hits took every slot of the answer.
+        let mut ranked = Vec::new();
+        keep_server_body_matches(
+            &mut ranked,
+            vec![
+                json!({"id": "11111111-1111-4111-8111-111111111111", "title": "Database failover", "doc_type": "runbook"}),
+            ],
+            10,
+        );
+        let memory: Vec<_> = (0..10)
+            .map(|i| json!({"id": format!("m{i}"), "title": format!("memory {i}"), "score": 0.6}))
+            .collect();
+        let results = build_hybrid_search_results(&memory, &ranked, 10);
+        assert_eq!(results.len(), 10);
+        assert_eq!(
+            results[0]["id"], "11111111-1111-4111-8111-111111111111",
+            "{results:?}"
+        );
+    }
+}

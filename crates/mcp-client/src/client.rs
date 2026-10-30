@@ -3427,7 +3427,9 @@ impl ContextStreamClient {
             }
             Err(BoundedTextReadError::Transient) => return TargetedFileDecision::Reject,
         };
-        if Self::is_managed_rules_content(name, &content) {
+        if Self::is_managed_rules_content(name, &content)
+            || Self::secret_content_reason(&content).is_some()
+        {
             return TargetedFileDecision::Delete(relative);
         }
         let content = Self::content_for_index(name, content);
@@ -11713,6 +11715,18 @@ impl ContextStreamClient {
                     Path::new(&relative_path),
                     5 * 1024 * 1024,
                 ) {
+                    Ok(content) if Self::secret_content_reason(&content).is_some() => {
+                        content_files_read += 1;
+                        content_bytes_read =
+                            content_bytes_read.saturating_add(content.len() as u64);
+                        // A credential under an ordinary name (#425): a stable
+                        // policy exclusion like invalid UTF-8, so one tombstone
+                        // removes an older indexed copy and capped scans move
+                        // past it.
+                        policy_deleted_paths.push(relative_path.clone());
+                        page_observed_paths.push(relative_path.clone());
+                        policy_excluded_after_read = true;
+                    }
                     Ok(content) => {
                         let content = Self::content_for_index(name, content);
                         content_files_read += 1;
@@ -12001,6 +12015,74 @@ impl ContextStreamClient {
         }
     }
 
+    /// What a text file holds that is a credential whatever it is called, or
+    /// `None`. Only strong signals, so ordinary source is not withheld: a
+    /// private-key block that starts a line and is followed by its base64 body
+    /// (not the header quoted inside a string or a doc), a service-account JSON
+    /// that carries its `private_key`, and an AWS access key id next to a
+    /// `secret` (an id alone is an identifier, and AWS's documented
+    /// `...EXAMPLE` ids are not keys). The filename list cannot see these (#425).
+    fn secret_content_reason(content: &str) -> Option<&'static str> {
+        if Self::has_private_key_block(content) {
+            return Some("a private key");
+        }
+        if content.trim_start().starts_with('{')
+            && content.contains("\"service_account\"")
+            && content.contains("\"private_key\"")
+        {
+            return Some("a service-account key");
+        }
+        if Self::has_aws_access_key_pair(content) {
+            return Some("an AWS access key");
+        }
+        None
+    }
+
+    fn has_private_key_block(content: &str) -> bool {
+        if !content.contains("PRIVATE KEY") {
+            return false;
+        }
+        let is_base64_line = |line: &str| {
+            line.len() >= 16
+                && line
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        };
+        let mut lines = content.lines().map(str::trim);
+        while let Some(line) = lines.next() {
+            if line.starts_with("-----BEGIN ")
+                && line.contains("PRIVATE KEY")
+                && line.ends_with("-----")
+            {
+                let body = lines.clone().find(|next| !next.is_empty());
+                if body.is_some_and(|next| next.starts_with("Proc-Type:") || is_base64_line(next)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn has_aws_access_key_pair(content: &str) -> bool {
+        if !content.contains("AKIA") || !content.to_ascii_lowercase().contains("secret") {
+            return false;
+        }
+        let bytes = content.as_bytes();
+        content.match_indices("AKIA").any(|(at, _)| {
+            let end = at + 20;
+            let Some(id) = bytes.get(at..end) else {
+                return false;
+            };
+            let boundary =
+                |byte: Option<&u8>| byte.is_none_or(|byte| !byte.is_ascii_alphanumeric());
+            id.iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                && !id.ends_with(b"EXAMPLE")
+                && boundary(at.checked_sub(1).and_then(|before| bytes.get(before)))
+                && boundary(bytes.get(end))
+        })
+    }
+
     /// [`Self::is_managed_rules_content`] for a file on disk. Anything that
     /// cannot be read, or is too large to be what `setup` wrote (its block is
     /// tens of KB), is not managed-only.
@@ -12063,6 +12145,18 @@ impl ContextStreamClient {
                 | "known_hosts"
                 | "credentials.json"
                 | "serviceaccountkey.json"
+                // Kubernetes and Docker credentials, and htpasswd files (#425).
+                | "kubeconfig"
+                | ".kubeconfig"
+                | ".dockercfg"
+                | ".htpasswd"
+                // Secret manifests and secret stores.
+                | "secrets.yaml"
+                | "secrets.yml"
+                | "secret.yaml"
+                | "secret.yml"
+                | "secrets.json"
+                | "secrets.toml"
                 // Project-scoped MCP/editor configs can contain the literal
                 // ContextStream API key written by setup. They must never be
                 // indexed back into the service that credential authorizes.
@@ -12070,6 +12164,26 @@ impl ContextStreamClient {
                 | "mcp.json"
                 | "opencode.json"
         ) {
+            return true;
+        }
+
+        // Terraform state holds every resource's secrets in plaintext, and
+        // `.tfvars` files are where they are usually passed in (#425).
+        if [".tfstate", ".tfstate.backup", ".tfvars", ".tfvars.json"]
+            .iter()
+            .any(|ext| name_lower.ends_with(ext))
+        {
+            return true;
+        }
+
+        // A cloud service-account key under any of its common spellings
+        // (`service-account.json`, `my_serviceaccount_key.json`, ...); only
+        // `serviceaccountkey.json` was listed (#425).
+        if name_lower.ends_with(".json")
+            && ["service-account", "service_account", "serviceaccount"]
+                .iter()
+                .any(|spelling| name_lower.contains(spelling))
+        {
             return true;
         }
 
@@ -29568,6 +29682,139 @@ mod tests {
             &layout,
             "src/deleted.rs",
         ));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    // mcp-server#425: secret files that the name filter missed were uploaded.
+    #[test]
+    fn common_secret_files_are_skipped_by_name_and_their_templates_are_not() {
+        for name in [
+            "service-account.json",
+            "my_service_account_key.json",
+            "Prod-ServiceAccount.json",
+            "terraform.tfstate",
+            "terraform.tfstate.backup",
+            "prod.tfvars",
+            "terraform.tfvars.json",
+            "secrets.yaml",
+            "secrets.yml",
+            "Secret.yaml",
+            "kubeconfig",
+            ".kubeconfig",
+            ".dockercfg",
+            ".htpasswd",
+        ] {
+            assert!(
+                ContextStreamClient::should_skip_file(name, true),
+                "{name} should be skipped as a secret"
+            );
+        }
+        for name in [
+            ".env.example",
+            "main.tf",
+            "variables.tf",
+            "terraform.tfvars.example",
+            "serviceaccount.go",
+            "service-accounts.md",
+            "secrets.rs",
+            "secret_santa.py",
+            "config.yaml",
+        ] {
+            assert!(
+                !ContextStreamClient::should_skip_file(name, true),
+                "{name} is ordinary and must stay indexable"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_content_is_recognised_under_any_name_and_ordinary_text_is_not() {
+        let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\n-----END OPENSSH PRIVATE KEY-----\n";
+        assert_eq!(
+            ContextStreamClient::secret_content_reason(key),
+            Some("a private key")
+        );
+        assert_eq!(
+            ContextStreamClient::secret_content_reason(
+                "  -----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,AB\n"
+            ),
+            Some("a private key")
+        );
+        let account = r#"{"type": "service_account", "private_key": "x", "client_email": "a@b"}"#;
+        assert_eq!(
+            ContextStreamClient::secret_content_reason(account),
+            Some("a service-account key")
+        );
+        assert_eq!(
+            ContextStreamClient::secret_content_reason(
+                "[default]\naws_access_key_id = AKIAABCDEFGHIJKLMNOP\naws_secret_access_key = x\n"
+            ),
+            Some("an AWS access key")
+        );
+
+        for ordinary in [
+            // The header quoted in code or prose is not a key.
+            "let pem = \"-----BEGIN PRIVATE KEY-----\\nMIIE\";\n",
+            "Put your key here:\n-----BEGIN PRIVATE KEY-----\n<paste it>\n-----END PRIVATE KEY-----\n",
+            "fn private_key() {}\n",
+            // A certificate and a public key are not secrets.
+            "-----BEGIN CERTIFICATE-----\nMIIDdzCCAl+gAwIBAgIEAgAAuTANBgkqhkiG9w0BAQUFADBa\n",
+            "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu1SU\n",
+            // A service-account type without a key, and a key without the type.
+            r#"{"type": "service_account", "client_email": "a@b"}"#,
+            r#"{"private_key": "x"}"#,
+            // AWS's documented example id, an id with no secret, a longer token.
+            "AKIAIOSFODNN7EXAMPLE and a secret word\n",
+            "id = AKIAABCDEFGHIJKLMNOP\n",
+            "token = XAKIAABCDEFGHIJKLMNOP and a secret\n",
+            "fn main() {}\n",
+        ] {
+            assert_eq!(
+                ContextStreamClient::secret_content_reason(ordinary),
+                None,
+                "{ordinary:?} is not a credential"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scan_withholds_a_credential_under_an_ordinary_name_and_names_the_rest(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("mcp-client-secret-scan-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("deploy"))?;
+        std::fs::write(root.join("main.rs"), "fn main() {}\n")?;
+        std::fs::write(
+            root.join("deploy/notes.txt"),
+            "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\n",
+        )?;
+        std::fs::write(root.join("service-account.json"), r#"{"private_key": "x"}"#)?;
+        std::fs::write(root.join("terraform.tfstate"), r#"{"secret": "x"}"#)?;
+
+        let client = ContextStreamClient::new(Config::default());
+        let scan = client.read_local_files(root.to_string_lossy().as_ref(), usize::MAX, false)?;
+        let sent: Vec<&str> = scan
+            .files
+            .iter()
+            .filter_map(|file| file.get("path").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(sent, ["main.rs"], "only the ordinary file is sent");
+        let mut removed = scan.policy_deleted_paths.clone();
+        removed.sort();
+        assert_eq!(
+            removed,
+            [
+                "deploy/notes.txt",
+                "service-account.json",
+                "terraform.tfstate"
+            ],
+            "an older indexed copy of each is removed"
+        );
+        assert!(
+            scan.complete,
+            "a stable policy exclusion is not a partial scan"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())

@@ -22511,7 +22511,10 @@ fn list_filter_api_type(requested: &str) -> String {
     match lowered.as_str() {
         "bug" | "feature" => "ticket".to_string(),
         "conversation" => "chat".to_string(),
-        "general" | "" => "note".to_string(),
+        // The API answers "note" with the events created as note only; a
+        // general event is stored as manual_note (#410).
+        "general" => "manual_note".to_string(),
+        "" => "note".to_string(),
         _ => lowered,
     }
 }
@@ -22547,6 +22550,15 @@ pub fn filter_memory_events_by_type(
         |kind: &str| ContextStreamClient::normalize_session_capture_original_type(Some(kind));
     let wanted = normalize(requested);
     let queried = list_filter_api_type(requested);
+    let exact = |kind: &str| kind.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    let requested_exact = exact(requested);
+    // The note-like types share one stored type and one normalized form;
+    // asked for by name, only the events created as that name match, so
+    // general does not list the note events (#410).
+    let by_name = matches!(
+        requested_exact.as_str(),
+        "note" | "general" | "uncategorized" | "memory"
+    );
     let keep = |event: &serde_json::Value| {
         let original = event
             .get("metadata")
@@ -22555,6 +22567,7 @@ pub fn filter_memory_events_by_type(
             .filter(|original| !original.trim().is_empty());
         match original {
             // The type the event was created as, when it says.
+            Some(original) if by_name => exact(original) == requested_exact,
             Some(original) => normalize(original) == wanted,
             // Otherwise its stored type: the one asked for (standup is stored
             // as standup), or the one it is stored under (a bug created
@@ -28821,6 +28834,23 @@ mod tests {
             1,
             "note is in the uncategorized family"
         );
+        // general lists the events created as general, not the note ones.
+        let mut note_like = serde_json::json!({"items": [
+            {"id": "10", "event_type": "manual_note", "metadata": {"original_type": "note"}},
+            {"id": "11", "event_type": "manual_note", "metadata": {"original_type": "general"}},
+            {"id": "12", "event_type": "manual_note", "metadata": {"original_type": "uncategorized"}}
+        ]});
+        let mut general = note_like.clone();
+        filter_memory_events_by_type(&mut general, "general", None);
+        assert_eq!(general["items"].as_array().unwrap().len(), 1);
+        assert_eq!(general["items"][0]["id"], "11");
+        filter_memory_events_by_type(&mut note_like, "manual_note", None);
+        assert_eq!(
+            note_like["items"].as_array().unwrap().len(),
+            3,
+            "manual_note lists every note-like event"
+        );
+        assert_eq!(list_filter_api_type("general"), "manual_note");
         assert_eq!(list_filter_api_type("Status-Update"), "status_update");
         assert_eq!(list_filter_api_type("feature"), "ticket");
         filter_memory_events_by_type(&mut result, "Implementation", Some(5));

@@ -1162,6 +1162,110 @@ fn index_history_entry_count(result: &Value) -> usize {
     result.as_array().map(|a| a.len()).unwrap_or(0)
 }
 
+/// The index history as text (#465): a count was all an agent saw over
+/// stdio, with no file, time, machine, branch or commit, and no total.
+fn format_index_history_text(result: &Value, offset: usize, page_size: usize) -> String {
+    let one_line = crate::domains::display_title::one_line;
+    let field = |value: &Value, key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(one_line)
+    };
+    let count = index_history_entry_count(result);
+    let total = result
+        .get("pagination")
+        .and_then(|pagination| pagination.get("total_count"))
+        .and_then(Value::as_u64)
+        .map(|total| total as usize);
+    let end = offset + count;
+    let page = offset / page_size.max(1) + 1;
+    let more = total.is_some_and(|total| end < total);
+    let next = format!(" Pass offset={end} (or page={}) for more.", page + 1);
+    let found = if count == 1 {
+        "Found 1 index history entry.".to_string()
+    } else {
+        format!("Found {count} index history entries.")
+    };
+    let mut text = match total {
+        Some(total) if count == 0 && offset > 0 => format!(
+            "Page {page} is past the end: {total} index history entries, {} pages of {page_size}.",
+            total.div_ceil(page_size.max(1))
+        ),
+        Some(total) if offset == 0 && total <= count => found,
+        Some(total) if more => format!(
+            "Showing {}\u{2013}{end} of {total} index history entries.{next}",
+            offset + 1
+        ),
+        Some(total) => format!(
+            "Showing {}\u{2013}{end} of {total} index history entries (the end).",
+            offset + 1
+        ),
+        None => found,
+    };
+    let entries = result
+        .get("entries")
+        .or_else(|| result.get("history"))
+        .and_then(Value::as_array);
+    for entry in entries.into_iter().flatten() {
+        let path = field(entry, "file_path")
+            .or_else(|| field(entry, "path"))
+            .unwrap_or_else(|| "?".to_string());
+        let mut line = format!("\n- {path}");
+        if let Some(at) = field(entry, "last_indexed") {
+            line.push_str(&format!(" \u{2014} indexed {at}"));
+        }
+        if let Some(machine) = field(entry, "indexed_by_machine") {
+            line.push_str(&format!(" by {machine}"));
+        }
+        let branch = field(entry, "git_branch");
+        let commit =
+            field(entry, "git_commit_sha").map(|sha| sha.chars().take(9).collect::<String>());
+        match (branch, commit) {
+            (Some(branch), Some(commit)) => line.push_str(&format!(" on {branch} @ {commit}")),
+            (Some(branch), None) => line.push_str(&format!(" on {branch}")),
+            (None, Some(commit)) => line.push_str(&format!(" @ {commit}")),
+            (None, None) => {}
+        }
+        let mut details = Vec::new();
+        if let Some(language) = field(entry, "language") {
+            details.push(language);
+        }
+        if let Some(bytes) = entry.get("size_bytes").and_then(Value::as_i64) {
+            details.push(format!("{bytes} bytes"));
+        }
+        if !details.is_empty() {
+            line.push_str(&format!(" ({})", details.join(", ")));
+        }
+        text.push_str(&line);
+    }
+    // The latest index state changes, so "when did the index last move" has
+    // an answer on the first page.
+    let changes = result.get("state_history").and_then(Value::as_array);
+    let changes: Vec<&Value> = changes.into_iter().flatten().take(5).collect();
+    if offset == 0 && !changes.is_empty() {
+        text.push_str("\nIndex state changes (latest first):");
+        for change in changes {
+            let mut line = format!(
+                "\n- {}: {} \u{2192} {}",
+                field(change, "transitioned_at").unwrap_or_else(|| "?".to_string()),
+                field(change, "from_state").unwrap_or_else(|| "none".to_string()),
+                field(change, "to_state").unwrap_or_else(|| "?".to_string()),
+            );
+            if let Some(generation) = change.get("generation").and_then(Value::as_i64) {
+                line.push_str(&format!(", generation {generation}"));
+            }
+            if let Some(files) = change.get("file_count").and_then(Value::as_i64) {
+                line.push_str(&format!(", {files} files"));
+            }
+            text.push_str(&line);
+        }
+    }
+    text
+}
+
 fn project_files_page_count(result: &Value) -> usize {
     result
         .get("files")
@@ -3330,20 +3434,31 @@ impl ToolHandler for ProjectTool {
                 )
                 .await?
                 .project_id;
+                // limit/offset/page like `files` (#465).
+                let (page, page_size) =
+                    requested_page(input.page, input.page_size, input.limit, input.offset, 50);
+                let size = page_size.unwrap_or(50).max(1);
+                let offset = (page.unwrap_or(1).max(1) - 1) * size;
                 let mut result = self.client.project_index_history(
                     id,
-                    input.page,
-                    input.page_size,
+                    page,
+                    page_size,
                     input.since.as_deref(),
                     input.until.as_deref(),
                     input.machine_id.as_deref(),
                     input.branch.as_deref(),
+                    input.path_pattern.as_deref(),
                 ).await?;
                 let count = index_history_entry_count(&result);
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert("entries_count".to_string(), serde_json::json!(count));
                 }
-                Ok(ToolResult::with_structured(format!("Found {} index history entries.", count), result))
+                let text = format_index_history_text(
+                    &result,
+                    usize::try_from(offset).unwrap_or(0),
+                    usize::try_from(size).unwrap_or(50),
+                );
+                Ok(ToolResult::with_structured(text, result))
             }
             "ingest_local" => {
                 let context = self

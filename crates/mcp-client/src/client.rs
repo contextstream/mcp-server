@@ -7355,6 +7355,7 @@ impl ContextStreamClient {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_project_index_history_path(
         id: Uuid,
         page: Option<i64>,
@@ -7363,6 +7364,7 @@ impl ContextStreamClient {
         until: Option<&str>,
         machine_id: Option<&str>,
         branch: Option<&str>,
+        path_pattern: Option<&str>,
     ) -> String {
         let mut path = format!("/projects/{}/index/history", id);
         let mut params = vec![];
@@ -7385,6 +7387,10 @@ impl ContextStreamClient {
         if let Some(b) = branch {
             params.push(format!("branch={}", Self::url_encode(b)));
         }
+        // The API filters entries by a path substring (#465).
+        if let Some(pattern) = path_pattern.map(str::trim).filter(|p| !p.is_empty()) {
+            params.push(format!("path_pattern={}", Self::url_encode(pattern)));
+        }
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));
         }
@@ -7392,6 +7398,7 @@ impl ContextStreamClient {
     }
 
     /// Get project index history.
+    #[allow(clippy::too_many_arguments)]
     pub async fn project_index_history(
         &self,
         id: Uuid,
@@ -7401,9 +7408,17 @@ impl ContextStreamClient {
         until: Option<&str>,
         machine_id: Option<&str>,
         branch: Option<&str>,
+        path_pattern: Option<&str>,
     ) -> Result<serde_json::Value> {
         let path = Self::build_project_index_history_path(
-            id, page, page_size, since, until, machine_id, branch,
+            id,
+            page,
+            page_size,
+            since,
+            until,
+            machine_id,
+            branch,
+            path_pattern,
         );
         self.get(&path).await
     }
@@ -28861,9 +28876,11 @@ mod tests {
             None,
             Some("machine/a"),
             Some("feature/foo"),
+            Some("src/a b"),
         );
 
         assert!(path.starts_with("/projects/00000000-0000-0000-0000-000000000000/index/history?"));
+        assert!(path.contains("path_pattern=src%2Fa%20b"), "{path}");
         assert!(path.contains("page=2"));
         assert!(path.contains("limit=1"));
         assert!(path.contains("since=2026-01-01T00%3A00%3A00Z"));

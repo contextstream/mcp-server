@@ -13505,26 +13505,8 @@ impl ContextStreamClient {
         let (ws_id, proj_id) = scope_ids_with_defaults(workspace_id, project_id, &config);
         drop(config);
 
-        if let Some(node_type) = infer_memory_query_node_type(&query) {
-            let result = self
-                .search_memory(MemorySearchParams {
-                    query: query.clone(),
-                    workspace_id: ws_id,
-                    project_id: proj_id,
-                    node_type: Some(node_type.clone()),
-                    limit,
-                    ..Default::default()
-                })
-                .await?;
-
-            return Ok(build_smart_search_response_from_memory_search(
-                &query,
-                include_related,
-                include_decisions,
-                &node_type,
-                result,
-            ));
-        }
+        // No node type is guessed from the query: one hid every other type
+        // that matched, with nothing saying so (#408, #417).
 
         let body = strip_nulls(serde_json::json!({
             "query": query,
@@ -22379,43 +22361,6 @@ fn normalize_smart_search_result_item(item: &mut serde_json::Value) {
     }
 }
 
-fn build_smart_search_response_from_memory_search(
-    query: &str,
-    include_related: Option<bool>,
-    include_decisions: Option<bool>,
-    applied_node_type: &str,
-    mut result: serde_json::Value,
-) -> serde_json::Value {
-    if let Some(obj) = result.as_object_mut() {
-        let results = obj
-            .get("results")
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::Array(vec![]));
-        let total = obj.get("total").cloned().unwrap_or_else(|| match &results {
-            serde_json::Value::Array(items) => serde_json::json!(items.len() as i64),
-            _ => serde_json::json!(0),
-        });
-
-        obj.insert("query".to_string(), serde_json::json!(query));
-        obj.insert("memory_results".to_string(), results);
-        obj.insert("memory_total".to_string(), total);
-        obj.insert(
-            "include_decisions".to_string(),
-            serde_json::json!(include_decisions.unwrap_or(true)),
-        );
-        obj.insert(
-            "include_related".to_string(),
-            serde_json::json!(include_related.unwrap_or(true)),
-        );
-        obj.insert(
-            "smart_search_filter".to_string(),
-            serde_json::json!(applied_node_type),
-        );
-    }
-
-    normalize_session_smart_search_response(result)
-}
-
 fn infer_workspace_id_from_path(path: &str) -> Option<Uuid> {
     // Try query param
     if let Some(idx) = path.find('?') {
@@ -28814,38 +28759,6 @@ mod tests {
             assert!(!low.contains("glm"), "leaks 'glm': {}", desc);
             assert!(!low.contains("zai-org"), "leaks 'zai-org': {}", desc);
         }
-    }
-
-    #[test]
-    fn build_smart_search_response_from_memory_search_adds_session_shape() {
-        let normalized = build_smart_search_response_from_memory_search(
-            "architecture decisions",
-            Some(false),
-            Some(true),
-            "decision",
-            serde_json::json!({
-                "results": [{"id": "1", "title": "Use edge cache"}],
-                "total": 1
-            }),
-        );
-
-        assert_eq!(
-            normalized.get("memory_results"),
-            Some(&serde_json::json!([{"id": "1", "title": "Use edge cache"}]))
-        );
-        assert_eq!(normalized.get("memory_total"), Some(&serde_json::json!(1)));
-        assert_eq!(
-            normalized.get("smart_search_filter"),
-            Some(&serde_json::json!("decision"))
-        );
-        assert_eq!(
-            normalized.get("include_related"),
-            Some(&serde_json::json!(false))
-        );
-        assert_eq!(
-            normalized.get("include_decisions"),
-            Some(&serde_json::json!(true))
-        );
     }
 
     #[tokio::test]

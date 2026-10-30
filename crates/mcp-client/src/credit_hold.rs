@@ -242,6 +242,33 @@ pub fn active_hold(project_id: Uuid) -> Option<CreditHold> {
     active_hold_at(&default_dir()?, project_id, Utc::now())
 }
 
+/// A person's own index run is about to ask the server: lift the local block so
+/// it (and anything automatic that follows) may ask now. The hold stays on
+/// record, with its streak and "told once" mark: an accepted ingest clears it
+/// (`clear`), and a refusal starts the next wait from the streak again
+/// (`record_refusal`). Returns whether the project had a hold that was waiting.
+pub fn allow_recheck_at(dir: &Path, project_id: Uuid, now: DateTime<Utc>) -> bool {
+    // Cheap miss on the common path: no holds file, no lock.
+    if !file_path(dir).exists() {
+        return false;
+    }
+    with_holds(dir, now, |file| {
+        let mut lifted = false;
+        for hold in file.holds.iter_mut() {
+            if hold.project_id == project_id && hold.retry_after > now {
+                hold.retry_after = now;
+                lifted = true;
+            }
+        }
+        lifted
+    })
+    .unwrap_or(false)
+}
+
+pub fn allow_recheck(project_id: Uuid) -> bool {
+    default_dir().is_some_and(|dir| allow_recheck_at(&dir, project_id, Utc::now()))
+}
+
 /// Whether any project on this machine has a hold on record. One `stat`, for
 /// hot paths that only need to know there is nothing to look at.
 pub fn any_holds() -> bool {
@@ -444,6 +471,44 @@ mod tests {
         assert!(clear_at(dir.path(), project));
         record_refusal_at(dir.path(), project, None, Some(20), Some(0), now).unwrap();
         assert!(take_unshown_notice_at(dir.path(), Some(project), now).is_some());
+    }
+
+    #[test]
+    fn a_persons_run_lifts_the_wait_but_keeps_the_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        // Real time: `clear_at` prunes by the wall clock.
+        let t0 = Utc::now();
+        record_refusal_at(dir.path(), project, None, Some(20), Some(3), t0).unwrap();
+        record_refusal_at(dir.path(), other, None, Some(20), Some(3), t0).unwrap();
+        assert!(active_hold_at(dir.path(), project, t0).is_some());
+
+        let now = t0 + chrono::Duration::minutes(1);
+        assert!(allow_recheck_at(dir.path(), project, now));
+        assert!(
+            active_hold_at(dir.path(), project, now).is_none(),
+            "nothing is blocked locally any more"
+        );
+        assert!(
+            active_hold_at(dir.path(), other, now).is_some(),
+            "another project stays held"
+        );
+        // Nothing waiting: a second call changes nothing.
+        assert!(!allow_recheck_at(dir.path(), project, now));
+
+        // A refusal after that starts the next wait from the streak: 10 minutes.
+        let (hold, fresh) =
+            record_refusal_at(dir.path(), project, None, Some(20), Some(3), now).unwrap();
+        assert!(!fresh);
+        assert_eq!(hold.streak, 2);
+        assert_eq!(hold.retry_after, now + chrono::Duration::minutes(10));
+
+        // An accepted ingest clears it as before.
+        assert!(allow_recheck_at(dir.path(), project, now));
+        assert!(clear_at(dir.path(), project));
+        assert!(active_hold_at(dir.path(), project, now).is_none());
+        assert!(!allow_recheck_at(dir.path(), project, now));
     }
 
     #[test]

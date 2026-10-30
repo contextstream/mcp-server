@@ -6107,6 +6107,10 @@ pub async fn index_project(
             .await?
             .id
     };
+    // A person's own run asks the server even while automatic indexing is held
+    // for credits (mcp_client::credit_hold): their credits may be back, and an
+    // accepted ingest clears the hold.
+    mcp_client::credit_hold::allow_recheck(project_id);
     let ingest_params = IngestLocalParams {
         path: path.to_string_lossy().to_string(),
         workspace_id: workspace_id.and_then(|value| uuid::Uuid::parse_str(value).ok()),
@@ -6332,6 +6336,10 @@ pub async fn index_project_background(
             .await?
             .id
     };
+    // A person's own run asks the server even while automatic indexing is held
+    // for credits (mcp_client::credit_hold): their credits may be back, and an
+    // accepted ingest clears the hold.
+    mcp_client::credit_hold::allow_recheck(project_id);
     let result = client
         .ingest_local(IngestLocalParams {
             path: path.to_string_lossy().to_string(),

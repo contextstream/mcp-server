@@ -23131,6 +23131,37 @@ mod tests {
             !matches!(error, Error::InsufficientCredits { .. }),
             "{error:?}"
         );
+
+        // `index` and `ingest` typed by a person also run with `background:
+        // true` (the async fast path, no credit charge), so the hold cannot tell
+        // them from the bridge by that flag. They lift the wait first
+        // (mcp-server#337), which lets them ask.
+        assert!(crate::credit_hold::active_hold(project_id).is_some());
+        assert!(crate::credit_hold::allow_recheck(project_id));
+        let (client, _server) =
+            client_with_raw_responses(Vec::new(), Duration::from_millis(200)).await;
+        let error = client
+            .ingest_local(IngestLocalParams {
+                path: temp_home
+                    .join("does-not-exist")
+                    .to_string_lossy()
+                    .to_string(),
+                workspace_id: Some(workspace_id),
+                project_id: Some(project_id),
+                force: None,
+                generate_editor_rules: None,
+                include_media: None,
+                max_files: None,
+                background: Some(true),
+                origin: Some("setup_wizard".to_string()),
+                reroot: None,
+            })
+            .await
+            .expect_err("missing folder");
+        assert!(
+            !matches!(error, Error::InsufficientCredits { .. }),
+            "a person's run, after lifting the wait, gets past the hold: {error:?}"
+        );
         let _ = std::fs::remove_dir_all(&temp_home);
     }
 

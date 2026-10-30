@@ -34,6 +34,7 @@ pub use client::SessionRefreshHook;
 pub use client::TaskListFilters;
 pub use client::MEDIA_INDEX_MAX_BYTES;
 pub use client::{
+    delta_since,
     entity_kind_to_path,
     feed_source_key,
     filter_memory_events_by_type,

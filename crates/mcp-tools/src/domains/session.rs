@@ -13692,13 +13692,7 @@ impl ToolHandler for SessionDeltaTool {
 
         let result = self.client.session_delta(params).await?;
 
-        let changes = result
-            .get("changes")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.len())
-            .unwrap_or(0);
-
-        let text = format!("{} changes since {}", changes, input.since);
+        let text = delta_text(&result, &input.since);
         Ok(ToolResult::with_structured(text, result))
     }
 
@@ -13997,6 +13991,42 @@ pub(crate) fn render_decision_trace(query: &str, result: &Value) -> String {
     }
     text.push_str(&crate::domains::memory::render_degraded_lines(result));
     text.push_str(crate::notices::DECISION_TRACE_HINT);
+    text
+}
+
+/// What `delta` says (#395): how many events since the time, decisions
+/// apart, then each listed change.
+fn delta_text(result: &Value, since: &str) -> String {
+    let count = |key: &str| result.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let complete = result
+        .get("complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut text = format!(
+        "{}{} changes since {since}: {} decisions, {} other memory events.",
+        if complete { "" } else { "At least " },
+        count("count"),
+        count("new_decisions"),
+        count("new_memory")
+    );
+    for change in result
+        .get("changes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let field = |key: &str| change.get(key).and_then(Value::as_str).unwrap_or("");
+        text.push_str(&format!(
+            "\n- [{}] {} ({}) id={}",
+            field("event_type"),
+            field("title"),
+            field("created_at"),
+            field("id")
+        ));
+    }
+    if !complete {
+        text.push_str("\nOnly the newest 100 events were read; use memory(action=\"list_events\", offset=…) for older ones.");
+    }
     text
 }
 

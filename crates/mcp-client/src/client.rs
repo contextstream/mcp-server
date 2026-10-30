@@ -5270,6 +5270,41 @@ impl ContextStreamClient {
         page: Option<i64>,
         page_size: Option<i64>,
     ) -> Result<Vec<Workspace>> {
+        Ok(self.list_workspaces_page(page, page_size).await?.items)
+    }
+
+    /// Every workspace the account can see, page by page. Setup looks a
+    /// linked workspace up by id and offers the whole list, and the API's
+    /// first page holds only 20 (#381).
+    pub async fn list_all_workspaces(&self) -> Result<Vec<Workspace>> {
+        const PAGE_SIZE: i64 = 100;
+        const MAX_PAGES: i64 = 50;
+        let mut all = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let listed = self
+                .list_workspaces_page(Some(page), Some(PAGE_SIZE))
+                .await?;
+            let count = listed.items.len();
+            all.extend(listed.items);
+            let more = match (listed.has_next, listed.total_pages, listed.total) {
+                (Some(has_next), _, _) => has_next,
+                (_, Some(pages), _) => page < pages,
+                (_, _, Some(total)) => (all.len() as i64) < total,
+                _ => count as i64 >= PAGE_SIZE,
+            };
+            if !more || count == 0 {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    /// One page of workspaces, with the API's total and page count.
+    pub async fn list_workspaces_page(
+        &self,
+        page: Option<i64>,
+        page_size: Option<i64>,
+    ) -> Result<PaginatedResponse<Workspace>> {
         let mut path = "/workspaces".to_string();
         let mut params = vec![];
         if let Some(p) = page {
@@ -5281,8 +5316,7 @@ impl ContextStreamClient {
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));
         }
-        let response: PaginatedResponse<Workspace> = self.get(&path).await?;
-        Ok(response.items)
+        self.get(&path).await
     }
 
     /// Create a workspace.

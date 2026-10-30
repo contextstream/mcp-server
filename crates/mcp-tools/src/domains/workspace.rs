@@ -26,6 +26,51 @@ pub struct WorkspacesListInput {
     pub page_size: Option<i64>,
 }
 
+/// "Found 3 workspaces:" when the page holds them all; otherwise how many of
+/// the total this page shows and which page to ask for next (#381).
+fn workspace_list_heading(
+    listed: &mcp_client::client::PaginatedResponse<mcp_types::api::Workspace>,
+) -> String {
+    let shown = listed.items.len();
+    let noun = |count: usize| {
+        if count == 1 {
+            "workspace"
+        } else {
+            "workspaces"
+        }
+    };
+    let total = listed
+        .total
+        .and_then(|total| usize::try_from(total).ok())
+        .unwrap_or(shown);
+    if total <= shown {
+        return format!("Found {shown} {}:\n\n", noun(shown));
+    }
+    let page = listed.page.unwrap_or(1).max(1);
+    let per_page = listed
+        .per_page
+        .filter(|size| *size > 0)
+        .unwrap_or(shown.max(1) as i64);
+    let pages = listed
+        .total_pages
+        .filter(|pages| *pages > 0)
+        .unwrap_or_else(|| (total as i64 + per_page - 1) / per_page);
+    let mut heading = format!(
+        "Showing {shown} of {total} {} (page {page} of {pages}).",
+        noun(total)
+    );
+    if page < pages {
+        let next = page + 1;
+        if next == pages {
+            heading.push_str(&format!(" Pass page={next} for the rest."));
+        } else {
+            heading.push_str(&format!(" Pass page={next} for the next page."));
+        }
+    }
+    heading.push_str("\n\n");
+    heading
+}
+
 /// Workspaces list tool handler.
 pub struct WorkspacesListTool {
     client: ContextStreamClient,
@@ -43,20 +88,31 @@ impl ToolHandler for WorkspacesListTool {
         let input: WorkspacesListInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
 
-        let workspaces = self
+        let listed = self
             .client
-            .list_workspaces(input.page, input.page_size)
+            .list_workspaces_page(input.page, input.page_size)
             .await?;
+        let workspaces = &listed.items;
 
         let mut text = String::new();
 
-        if workspaces.is_empty() {
+        let total = listed.total.unwrap_or(0);
+        if workspaces.is_empty() && total > 0 {
+            text.push_str(&format!(
+                "Page {} is past the last page: there are {total} workspaces.",
+                listed.page.unwrap_or(1)
+            ));
+        } else if workspaces.is_empty() {
             text.push_str("No workspaces found. Create one with workspaces_create.");
         } else {
-            text.push_str(&format!("Found {} workspaces:\n\n", workspaces.len()));
+            text.push_str(&workspace_list_heading(&listed));
 
+            // Numbered across pages, so page 2 goes on from page 1.
+            let page = listed.page.unwrap_or(1).max(1);
+            let per_page = listed.per_page.unwrap_or(0).max(0);
+            let first = usize::try_from((page - 1) * per_page).unwrap_or(0);
             for (i, ws) in workspaces.iter().enumerate() {
-                text.push_str(&format!("{}. **{}** ({})\n", i + 1, ws.name, ws.id));
+                text.push_str(&format!("{}. **{}** ({})\n", first + i + 1, ws.name, ws.id));
 
                 if let Some(ref desc) = ws.description {
                     if !desc.is_empty() {
@@ -68,7 +124,7 @@ impl ToolHandler for WorkspacesListTool {
 
         Ok(ToolResult::with_structured(
             text,
-            serde_json::to_value(&workspaces).unwrap_or_default(),
+            serde_json::to_value(workspaces).unwrap_or_default(),
         ))
     }
 

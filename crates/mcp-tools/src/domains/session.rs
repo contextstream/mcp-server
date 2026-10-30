@@ -11783,6 +11783,9 @@ fn build_recall_cache_key(
         "include_decisions",
         include_decisions.as_deref(),
     );
+    // A memory write by this caller changes the key (#464).
+    let generation = mcp_client::memory_write_generation();
+    append_context_cache_field(&mut canonical, "memory_writes", Some(&generation));
     format!(
         "recall-local:v3:{}",
         super::search::sha256_hex_bytes(&canonical)

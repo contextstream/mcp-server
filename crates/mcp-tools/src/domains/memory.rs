@@ -116,6 +116,10 @@ fn build_memory_search_cache_key(
     append_memory_cache_key_field(&mut canonical, "query", Some(query));
     append_memory_cache_key_field(&mut canonical, "node_type", node_type);
     append_memory_cache_key_field(&mut canonical, "limit", limit.as_deref());
+    // A write by this caller changes the key: the search made before it is
+    // not replayed after it (#464).
+    let generation = mcp_client::memory_write_generation();
+    append_memory_cache_key_field(&mut canonical, "memory_writes", Some(&generation));
     format!(
         "memory-search-local:v2:{}",
         super::search::sha256_hex_bytes(&canonical)

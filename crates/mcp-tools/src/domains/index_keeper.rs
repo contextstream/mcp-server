@@ -550,6 +550,15 @@ impl IndexKeeper {
                             path_for_log
                         );
                     }
+                    // Another refresh of the project is already running: nothing
+                    // failed, it does the work (#367).
+                    Err(e) if mcp_client::client::is_ingest_in_progress_error(&e) => {
+                        tracing::debug!(
+                            "index-keeper {} refresh for {} joined a refresh already running",
+                            reason,
+                            path_for_log
+                        );
+                    }
                     Err(e) => {
                         tracing::error!(
                             "index-keeper {} refresh failed for {}: {}",
@@ -788,6 +797,13 @@ impl IndexKeeper {
                         tracing::info!(
                             "index-keeper scope repair completed: {} files indexed from {}",
                             files,
+                            path_for_log
+                        );
+                    }
+                    // A refresh already running does the work; nothing to roll back.
+                    Err(err) if mcp_client::client::is_ingest_in_progress_error(&err) => {
+                        tracing::debug!(
+                            "index-keeper scope repair for {} joined a refresh already running",
                             path_for_log
                         );
                     }

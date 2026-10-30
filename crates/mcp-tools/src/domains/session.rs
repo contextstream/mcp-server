@@ -695,6 +695,14 @@ fn spawn_init_background_ingest(
                     path_for_log
                 );
             }
+            // Another refresh of the project is already running (this process's,
+            // or the sync bridge's): nothing failed, it does the work (#367).
+            Err(e) if mcp_client::client::is_ingest_in_progress_error(&e) => {
+                tracing::debug!(
+                    "auto-index for {} joined a refresh already running for the project",
+                    path_for_log
+                );
+            }
             Err(e) => {
                 tracing::error!("auto-index failed for {}: {}", path_for_log, e);
                 ContextStreamClient::clear_index_status(&path_for_rollback);

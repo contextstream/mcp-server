@@ -21,6 +21,25 @@ use crate::registry::ToolHandler;
 /// One clause for the files the API keeps for exact search only (minified or generated
 /// bundles: searched by their exact text, no semantic vectors), with the count per reason.
 /// `None` when there are none.
+/// What `index_status` says when the API reports files the client left out of
+/// the index for being over 5 MiB (mcp-server#340): they are never indexed, so no
+/// search covers them, and a person or agent would otherwise read "ready" as "all
+/// of it".
+fn format_left_out_for_size(result: &Value) -> Option<String> {
+    let files = result
+        .get("files_left_out_for_size")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    (files > 0).then(|| {
+        format!(
+            " {files} file{} over 5 MiB {} not indexed, so searches do not cover {}.",
+            if files == 1 { "" } else { "s" },
+            if files == 1 { "is" } else { "are" },
+            if files == 1 { "it" } else { "them" },
+        )
+    })
+}
+
 fn format_exact_search_only(result: &Value) -> Option<String> {
     let summary = result.get("exact_search_only")?;
     let files = summary.get("files").and_then(Value::as_i64).unwrap_or(0);
@@ -1804,6 +1823,14 @@ impl ProjectTool {
                         path_for_log
                     );
                 }
+                // Another ingest of the project is already running: it does the
+                // work, and nothing failed (#367).
+                Err(e) if mcp_client::client::is_ingest_in_progress_error(&e) => {
+                    tracing::debug!(
+                        "ingest_local for {} joined an ingest already running for the project",
+                        path_for_log
+                    );
+                }
                 Err(e) => {
                     tracing::error!("ingest_local failed for {}: {}", path_for_log, e);
                     ContextStreamClient::clear_index_status(&path_for_rollback);
@@ -2808,6 +2835,9 @@ impl ToolHandler for ProjectTool {
                 }
                 if let Some(exact_only) = format_exact_search_only(&result) {
                     text.push_str(&exact_only);
+                }
+                if let Some(left_out) = format_left_out_for_size(&result) {
+                    text.push_str(&left_out);
                 }
                 if confidence != "high" {
                     text.push_str(&format!(

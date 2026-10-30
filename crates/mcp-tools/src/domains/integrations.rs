@@ -233,12 +233,78 @@ impl IntegrationTool {
 const INTEGRATION_TOOL_DESCRIPTION: &str = "Integration operations for Slack, GitHub, Notion, Linear, Jira and Figma, and for the apps a person connected: Microsoft 365, Google Workspace, Dropbox, Box, Slack, Notion, Linear and Figma. Provider: slack, github, notion, linear, jira, figma, microsoft, google_workspace, dropbox, box, all.\n\nConnected apps: apps (what is connected and whether agents may edit), find (search items by name across apps), read (an attached item by reference_id, or an item find returned), capabilities (an app's operations and their arguments), edit (change an item; applies when the person allows agent edits; on a conflict read again and retry).\n\nOther actions: status, search, stats, activity, contributors, knowledge, summary, connected, channels, discussions, repos, issues, files, Notion pages and databases (create_page, get_page, update_page, search_pages, query_database, create_database, list_databases), team_activity, team_search. Full action reference, with each action's fields and filters: the `action` parameter.";
 
 /// Complete tool reference, advertised on the main parameter; see
+/// The connected-apps actions, which answer through the integration runtime
+/// with their own errors.
+const APP_ACTIONS: &[&str] = &["apps", "find", "read", "capabilities", "edit"];
+
+/// The providers the API routes each generic read action for (#458): any
+/// other pair answered a bare "HTTP 404 error". `all` reads activity by
+/// fanning out, and summary and knowledge from the cross-source routes.
+const GENERIC_ACTION_PROVIDERS: &[(&str, &[&str])] = &[
+    (
+        "stats",
+        &["slack", "github", "notion", "linear", "jira", "figma"],
+    ),
+    (
+        "activity",
+        &[
+            "slack", "github", "notion", "linear", "jira", "figma", "all",
+        ],
+    ),
+    ("contributors", &["slack", "github"]),
+    ("knowledge", &["slack", "github", "notion", "all"]),
+    ("summary", &["slack", "github", "notion", "all"]),
+];
+
+/// "<action> is not available for <provider>" for a known provider that the
+/// API does not route the action for, as `repos` and `files` already say.
+fn generic_action_problem(provider: &str, action: &str) -> Option<String> {
+    let (_, providers) = GENERIC_ACTION_PROVIDERS
+        .iter()
+        .find(|(name, _)| *name == action)?;
+    if !VALID_PROVIDERS.contains(&provider) || providers.contains(&provider) {
+        return None;
+    }
+    Some(format!(
+        "{action} is not available for {provider}; it is available for {}.",
+        providers.join(", ")
+    ))
+}
+
+/// A provider that is not connected, or not enabled, is an answer in words,
+/// not an HTTP status (#458): "HTTP error (503): GitHub integration is not
+/// connected …" after 7 s of retries, "HTTP error (404): Notion integration
+/// not found", "HTTP error (403): External integrations are not enabled yet".
+fn integration_unavailable_text(provider: &str, error: &Error) -> Option<String> {
+    let Error::Http {
+        status, message, ..
+    } = error
+    else {
+        return None;
+    };
+    let lower = message.to_ascii_lowercase();
+    let name = if provider.is_empty() {
+        "This integration"
+    } else {
+        provider
+    };
+    match status {
+        503 if lower.contains("is not connected") => Some(message.trim().to_string()),
+        404 if lower.contains("integration not found") => Some(format!(
+            "{name} is not connected for this workspace. Connect it in the dashboard (Settings > Integrations)."
+        )),
+        403 if lower.contains("not enabled yet") => Some(format!(
+            "{name} is not available yet: external integrations are not enabled for this account."
+        )),
+        _ => None,
+    }
+}
+
 /// [`crate::schema::with_full_reference`].
 const INTEGRATION_TOOL_REFERENCE: &str = "Integration operations for Slack, GitHub, Notion, Linear, Jira, and Figma, plus connected apps (Microsoft 365 Word/Excel/OneDrive, Google Workspace Docs/Sheets/Drive, Dropbox, Box, Slack, Notion, Linear, Figma). Provider: slack, github, notion, linear, jira, figma, microsoft, google_workspace, dropbox, box, all. Connected apps: apps (what is connected and whether agents may edit), find (live search by name; query), read (reference_id from an attached item, or connection_id + resource_id with the resource_type/mime_type/container find returned, or connection_id + operation + arguments), capabilities (operations and their arguments; connection_id), edit (connection_id + operation + arguments + session_id, the id init returned when the client keeps no state between calls; applies when the person allows agent edits and returns a receipt; on a conflict read again and retry). Actions: status, search, stats, activity, contributors, knowledge, summary, connected (list connected integrations), channels (slack), discussions (slack), repos (github), issues (github/linear/jira), files (figma), create_page (notion), create_database (notion), list_databases (notion), search_pages (notion), get_page (notion), query_database (notion), update_page (notion), team_activity (team-only), team_search (team-only cross-provider search). Linear filters: team_id, status, priority, assignee. Jira filters: project_key, status, priority, issue_type, assignee. Figma filters: figma_project_id.";
 
-#[async_trait]
-impl ToolHandler for IntegrationTool {
-    async fn execute(&self, input: Value) -> Result<ToolResult> {
+impl IntegrationTool {
+    async fn execute_action(&self, input: Value) -> Result<ToolResult> {
         let input: IntegrationInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
 
@@ -633,6 +699,26 @@ impl ToolHandler for IntegrationTool {
                         "search_pages action is only for Notion".to_string(),
                     ));
                 }
+                // The API searches pages by text and database only (#458).
+                let unsupported = [
+                    ("event_type", input.event_type.is_some()),
+                    ("status", input.status.is_some()),
+                    ("priority", input.priority.is_some()),
+                    ("has_due_date", input.has_due_date.is_some()),
+                    ("tags", input.tags.is_some()),
+                ]
+                .iter()
+                .filter(|(_, given)| *given)
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>();
+                if !unsupported.is_empty() {
+                    return Err(Error::Validation(format!(
+                        "search_pages filters by query and database_id only; {} {} not supported. \
+                         Use query_database with a database_id to filter by its properties.",
+                        unsupported.join(", "),
+                        if unsupported.len() == 1 { "is" } else { "are" }
+                    )));
+                }
                 let params = NotionSearchPagesParams {
                     query: input.query,
                     database_id: input.database_id,
@@ -814,6 +900,33 @@ impl ToolHandler for IntegrationTool {
                 action,
                 VALID_ACTIONS.join(", ")
             ))),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for IntegrationTool {
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let field = |key: &str| {
+            input
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|value| value.trim().to_ascii_lowercase())
+                .unwrap_or_default()
+        };
+        let (provider, action) = (field("provider"), field("action"));
+        if let Some(problem) = generic_action_problem(&provider, &action) {
+            return Err(Error::Validation(problem));
+        }
+        if APP_ACTIONS.contains(&action.as_str()) {
+            return self.execute_action(input).await;
+        }
+        match self.execute_action(input).await {
+            Err(error) => match integration_unavailable_text(&provider, &error) {
+                Some(text) => Ok(ToolResult::error(text)),
+                None => Err(error),
+            },
+            answer => answer,
         }
     }
 

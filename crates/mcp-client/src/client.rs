@@ -1817,6 +1817,17 @@ fn retry_permitted(is_write: bool, failure: AttemptFailure, idempotency_supporte
     }
 }
 
+/// A 503 that says what is missing (an integration that "is not connected")
+/// is an answer, not an outage: it cannot change in the seconds a retry
+/// waits, and retrying it took 7 s per call (#458).
+fn error_reports_a_lasting_state(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Http { status: 503, message, .. }
+            if message.to_ascii_lowercase().contains("is not connected")
+    )
+}
+
 fn status_attempt_failure(status: u16) -> AttemptFailure {
     match status {
         429 | 503 => AttemptFailure::Refused,
@@ -4640,6 +4651,7 @@ impl ContextStreamClient {
             if is_retryable_status(status.as_u16())
                 && attempt < max_retries
                 && !response_is_replay
+                && !error_reports_a_lasting_state(&error)
                 && retry_permitted(
                     is_write,
                     status_attempt_failure(status.as_u16()),
@@ -16137,6 +16149,26 @@ impl ContextStreamClient {
         let ws_id = workspace_id.or(config.default_workspace_id);
         drop(config);
 
+        // "all" is the cross-source route; there is no per-provider "all"
+        // route, and it answered a bare 404 (#458).
+        if provider == "all" {
+            let mut params = Vec::new();
+            if let Some(id) = ws_id {
+                params.push(format!("workspace_id={id}"));
+            }
+            if let Some(nt) = node_type {
+                params.push(format!("knowledge_type={}", Self::url_encode(nt)));
+            }
+            if let Some(l) = limit {
+                params.push(format!("limit={l}"));
+            }
+            let query = if params.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", params.join("&"))
+            };
+            return self.get(&format!("/integrations/knowledge{query}")).await;
+        }
         let mut path = if let Some(id) = ws_id {
             format!("/integrations/workspaces/{}/{}/knowledge", id, provider)
         } else {
@@ -16167,6 +16199,21 @@ impl ContextStreamClient {
         let ws_id = workspace_id.or(config.default_workspace_id);
         drop(config);
 
+        if provider == "all" {
+            let mut params = Vec::new();
+            if let Some(id) = ws_id {
+                params.push(format!("workspace_id={id}"));
+            }
+            if let Some(d) = days {
+                params.push(format!("days={d}"));
+            }
+            let query = if params.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", params.join("&"))
+            };
+            return self.get(&format!("/integrations/summary{query}")).await;
+        }
         let mut path = if let Some(id) = ws_id {
             format!("/integrations/workspaces/{}/{}/summary", id, provider)
         } else {
@@ -16475,14 +16522,33 @@ impl ContextStreamClient {
     ) -> Result<serde_json::Value> {
         let config = self.config.read().await;
         let ws_id = params.workspace_id.or(config.default_workspace_id);
-        let body = params.with_defaults(&config);
         drop(config);
-        let path = if let Some(id) = ws_id {
-            format!("/integrations/workspaces/{}/notion/pages", id)
-        } else {
-            "/integrations/notion/search_pages".to_string()
-        };
-        self.post(&path, &body).await
+        // The search is the GET on the pages route; the POST there creates a
+        // page, and answered every search with "Failed to deserialize the
+        // JSON body" (#458).
+        let ws_id = ws_id.ok_or_else(|| {
+            Error::Validation("workspace_id is required to search Notion pages".to_string())
+        })?;
+        let mut query = Vec::new();
+        if let Some(text) = params
+            .query
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            query.push(format!("query={}", Self::url_encode(text.trim())));
+        }
+        if let Some(database_id) = params.database_id.as_deref() {
+            query.push(format!("database_id={}", Self::url_encode(database_id)));
+        }
+        if let Some(limit) = params.limit {
+            query.push(format!("limit={limit}"));
+        }
+        let mut path = format!("/integrations/workspaces/{ws_id}/notion/pages");
+        if !query.is_empty() {
+            path.push('?');
+            path.push_str(&query.join("&"));
+        }
+        self.get(&path).await
     }
 
     /// Create Notion database.
@@ -34014,6 +34080,29 @@ mod caller_bound_response_cache_tests {
                 workspace_id,
             ),
         ]
+    }
+
+    #[test]
+    fn a_503_that_says_not_connected_is_not_retried() {
+        // #458: "GitHub integration is not connected" was retried for 7 s.
+        let http = |status: u16, message: &str| Error::Http {
+            status,
+            message: message.to_string(),
+            code: ErrorCode::ServiceUnavailable,
+            source: None,
+        };
+        assert!(error_reports_a_lasting_state(&http(
+            503,
+            "GitHub integration is not connected for this workspace."
+        )));
+        assert!(!error_reports_a_lasting_state(&http(
+            503,
+            "Service unavailable"
+        )));
+        assert!(!error_reports_a_lasting_state(&http(
+            500,
+            "is not connected"
+        )));
     }
 
     #[tokio::test]

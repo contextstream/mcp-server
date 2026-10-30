@@ -950,3 +950,116 @@ fn status_says_each_providers_state_and_which_are_not_connected() {
         "slack integration status: not connected."
     );
 }
+
+#[test]
+fn a_generic_action_the_api_does_not_route_is_refused_in_words() {
+    // #458: these pairs answered a bare "HTTP error (404): HTTP 404 error".
+    assert_eq!(
+        generic_action_problem("figma", "summary").as_deref(),
+        Some("summary is not available for figma; it is available for slack, github, notion, all.")
+    );
+    assert_eq!(
+        generic_action_problem("microsoft", "contributors").as_deref(),
+        Some("contributors is not available for microsoft; it is available for slack, github.")
+    );
+    assert!(generic_action_problem("all", "stats").is_some());
+    assert_eq!(generic_action_problem("github", "stats"), None);
+    assert_eq!(generic_action_problem("all", "activity"), None);
+    assert_eq!(generic_action_problem("all", "summary"), None);
+    assert_eq!(generic_action_problem("github", "repos"), None);
+    assert_eq!(generic_action_problem("not-a-provider", "stats"), None);
+}
+
+#[test]
+fn an_unconnected_or_disabled_provider_is_an_answer_in_words() {
+    let http = |status: u16, message: &str| Error::Http {
+        status,
+        message: message.to_string(),
+        code: mcp_types::ErrorCode::UnknownError,
+        source: None,
+    };
+    let not_connected = http(
+        503,
+        "GitHub integration is not connected for this workspace. Connect it in the dashboard.",
+    );
+    assert_eq!(
+        integration_unavailable_text("github", &not_connected).as_deref(),
+        Some(
+            "GitHub integration is not connected for this workspace. Connect it in the dashboard."
+        )
+    );
+    assert!(integration_unavailable_text(
+        "notion",
+        &http(404, "Not found: Notion integration not found")
+    )
+    .is_some_and(|text| text.starts_with("notion is not connected for this workspace")));
+    assert!(integration_unavailable_text(
+        "box",
+        &http(403, "Forbidden: External integrations are not enabled yet")
+    )
+    .is_some_and(|text| text.starts_with("box is not available yet")));
+    assert_eq!(
+        integration_unavailable_text("github", &http(503, "upstream down")),
+        None
+    );
+    assert_eq!(
+        integration_unavailable_text("github", &http(500, "is not connected")),
+        None
+    );
+}
+
+#[tokio::test]
+async fn notion_search_pages_reads_the_search_route() {
+    // #458: it POSTed to the create-page route and got "Failed to deserialize
+    // the JSON body" on every call.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = vec![0_u8; 16 * 1024];
+        let count = socket.read(&mut buffer).await.unwrap();
+        let body = r#"{"success":true,"data":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        String::from_utf8_lossy(&buffer[..count]).to_string()
+    });
+    let mut config = TestFixtures::test_config();
+    config.api_url = format!("http://{address}");
+    let client = ContextStreamClient::new(config);
+    let tool = IntegrationTool::new(client.clone(), create_test_session(&client));
+    let result = tool
+        .execute(json!({
+            "action": "search_pages",
+            "provider": "notion",
+            "workspace_id": "11111111-1111-4111-8111-111111111111",
+            "query": "release notes",
+            "limit": 3,
+        }))
+        .await
+        .expect("search answered");
+    assert!(!result.is_error);
+    let request = server.await.unwrap();
+    assert!(
+        request.starts_with(
+            "GET /api/v1/integrations/workspaces/11111111-1111-4111-8111-111111111111/notion/pages?query=release%20notes&limit=3 "
+        ),
+        "{}",
+        request.lines().next().unwrap_or_default()
+    );
+
+    let refused = tool
+        .execute(
+            json!({"action": "search_pages", "provider": "notion", "query": "x", "status": "done"}),
+        )
+        .await
+        .expect_err("an unsupported filter is refused");
+    assert!(refused
+        .to_string()
+        .contains("search_pages filters by query and database_id only"));
+}

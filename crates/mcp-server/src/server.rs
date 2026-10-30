@@ -3045,8 +3045,10 @@ mod tests {
             "e2d3e012ea534f68d5064054920b3f0f1ce6383745002a2d164ab63e55c0fda8",
         ),
         (
+            // #335 review: `studio.email_contact_erase` (with `email`) joined
+            // the irreversible actions.
             "delete",
-            "285fea941b0d4ad6f47098adc32c87174419ff9761fc8ee2aa6e563a045322e5",
+            "d55fd3f46723e1c7a15fb08f49243302f4167e9cc5becee4fc3bd88593d8767c",
         ),
         (
             // Advanced for tickets 2c0e695e and 9e5c9232: `target_project`
@@ -3674,7 +3676,13 @@ mod tests {
     #[test]
     fn mixed_action_tools_advertise_worst_case_safety() {
         let registry = test_registry(Config::default());
-        let tools = contextstream_tools_list(&registry, None);
+        let mut tools = contextstream_tools_list(&registry, None);
+        // `studio` is listed per caller (`studio_listing_entry`), as this entry.
+        tools.extend(
+            registry
+                .get(domains::studio::TOOL_NAME)
+                .map(contextstream_tool_list_entry),
+        );
 
         let init = tool_by_name(&tools, "init");
         assert_eq!(init["annotations"]["readOnlyHint"], false);
@@ -3709,6 +3717,7 @@ mod tests {
             "reminder",
             "session",
             "skill",
+            "studio",
             "vcs",
             "workspace",
         ] {
@@ -3828,8 +3837,23 @@ mod tests {
                     ..Config::default()
                 },
             ),
+            (
+                "studio",
+                Config {
+                    tool_surface_profile: ToolSurfaceProfile::Studio,
+                    ..Config::default()
+                },
+            ),
         ] {
-            let tools = contextstream_tools_list(&test_registry(config), None);
+            let registry = test_registry(config);
+            let mut tools = contextstream_tools_list(&registry, None);
+            // `studio` is listed per caller (`studio_listing_entry`), as this
+            // entry, wherever it is served.
+            tools.extend(
+                registry
+                    .get(domains::studio::TOOL_NAME)
+                    .map(contextstream_tool_list_entry),
+            );
             assert!(!tools.is_empty(), "{profile_name} advertised no tools");
 
             println!("\n=== {profile_name} ({} tools) ===", tools.len());

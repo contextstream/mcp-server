@@ -3,10 +3,10 @@
 //! test-send recipients, reports and refusals.
 
 use super::email::{
-    address_of, contacts_of, email_refusal, holds_resend_key, is_resend_test_address,
-    looks_like_resend_key, operation_of, outline, percent, send_at_of, send_key, send_state,
-    suppression_words, test_recipients, time_zone_of, variant_of, when_words, Topic, CONNECT_URL,
-    EMAIL_ACTIONS, KEY_REFUSED, NOT_OFFERED, SIGN_IN,
+    address_of, contacts_of, email_refusal, erase_refusal, holds_resend_key,
+    is_resend_test_address, looks_like_resend_key, operation_of, outline, percent, send_at_of,
+    send_key, send_state, suppression_words, test_recipients, time_zone_of, variant_of, when_words,
+    Topic, CONNECT_URL, EMAIL_ACTIONS, KEY_REFUSED, NOT_OFFERED, SIGN_IN,
 };
 use super::*;
 use crate::peer::{run_with_call_peer, CallPeer, PeerChannel};
@@ -1497,8 +1497,152 @@ async fn a_campaign_is_duplicated_as_a_draft() {
     );
 }
 
+/// A tool that gave `delete` an action, as every full surface has one.
+struct Bystander(ToolMetadata);
+
+impl Bystander {
+    fn workspace() -> Self {
+        Self(ToolMetadata {
+            name: "workspace".to_string(),
+            title: "Workspace".to_string(),
+            description: "test".to_string(),
+            category: ToolCategory::Workspace,
+            annotations: ToolAnnotations::destructive(),
+            is_pro: false,
+            required_tier: None,
+        })
+    }
+}
+
+#[async_trait]
+impl crate::registry::ToolHandler for Bystander {
+    async fn execute(&self, _input: Value) -> Result<ToolResult> {
+        Ok(ToolResult::text("ran"))
+    }
+    fn metadata(&self) -> &ToolMetadata {
+        &self.0
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+}
+
+#[test]
+fn erasing_a_contact_is_refused_with_the_call_to_make() {
+    let asked = |operation: &str| StudioInput {
+        action: "email_contacts".to_string(),
+        operation: Some(operation.to_string()),
+        ..StudioInput::default()
+    };
+    assert_eq!(
+        erase_refusal(&asked(" Remove ")).as_deref(),
+        Some("email_contacts(operation=\"remove\") cannot be undone, so it runs only through the `delete` tool: call delete with action=\"studio.email_contact_erase\" and the same email, after confirming with the person. Where there is no `delete` tool (the ContextStudio connector), the person erases the contact in the studio: https://ctxproduct.com/studio/email/audiences")
+    );
+    for spelling in ["remove", "REMOVE", "erase", "Delete"] {
+        assert!(erase_refusal(&asked(spelling)).is_some(), "{spelling}");
+    }
+    for operation in ["list", "add", "unsubscribe"] {
+        assert_eq!(erase_refusal(&asked(operation)), None, "{operation}");
+    }
+    assert_eq!(erase_refusal(&StudioInput::default()), None);
+}
+
 #[tokio::test]
-async fn contacts_are_listed_added_erased_and_unsubscribed() {
+async fn erasing_a_contact_runs_only_through_delete() {
+    // #335 review: an erase can't be undone, so it runs only through `delete`, whose
+    // listing says it destroys (#334's rule); `studio` says it doesn't.
+    let stub = Stub::start(usual()).await;
+    let mut registry = crate::registry::ToolRegistry::new(&TestFixtures::test_config());
+    registry.register(TOOL_NAME, Arc::new(stub.tool()));
+    // `studio` alone doesn't bring `delete` (it is listed per caller); a full surface has
+    // the other tools that gave it actions.
+    registry.register("workspace", Arc::new(Bystander::workspace()));
+    crate::domains::destructive::register_delete_tool(&mut registry);
+
+    let studio = registry.get(TOOL_NAME).unwrap();
+    assert!(!studio.metadata.annotations.destructive);
+    assert!(studio.metadata.annotations.requires_confirmation);
+    let delete = registry.get("delete").unwrap();
+    assert!(delete.metadata.annotations.destructive);
+    assert!(delete.input_schema["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("studio.email_contact_erase")));
+    for param in ["email", "workspace_id", "project_id"] {
+        assert!(
+            delete.input_schema["properties"][param].is_object(),
+            "{param}"
+        );
+    }
+
+    // Asked of `studio`, it is refused before anything runs: not even the catalog is read.
+    for (input, call) in [
+        (
+            json!({"action": "email_contacts", "operation": "remove", "email": "ada@northwind.example"}),
+            "email_contacts(operation=\"remove\")",
+        ),
+        (
+            json!({"action": "email_contacts", "operation": "ERASE", "email": "ada@northwind.example"}),
+            "email_contacts(operation=\"erase\")",
+        ),
+        (
+            json!({"action": "email_contact_erase", "email": "ada@northwind.example"}),
+            "studio(action=\"email_contact_erase\")",
+        ),
+    ] {
+        let refused = registry.execute(TOOL_NAME, input).await.unwrap_err();
+        let message = refused.to_string();
+        assert!(message.contains(call), "{message}");
+        assert!(
+            message.contains("cannot be undone, so it runs only through the `delete` tool: call delete with action=\"studio.email_contact_erase\""),
+            "{message}"
+        );
+    }
+    assert!(stub.requests().is_empty(), "{:?}", stub.requests());
+
+    // Through `delete`, it erases.
+    let erased = registry
+        .execute(
+            "delete",
+            json!({"action": "studio.email_contact_erase", "email": "ADA@northwind.example"}),
+        )
+        .await
+        .unwrap();
+    assert!(!erased.is_error, "{}", text_of(&erased));
+    assert!(text_of(&erased).starts_with("Erased ada@northwind.example"));
+    assert_eq!(
+        stub.calls_to("DELETE", &format!("/create/email/contacts/{CONTACT}"))
+            .len(),
+        1
+    );
+    let unknown = registry
+        .execute(
+            "delete",
+            json!({"action": "studio.email_contact_erase", "email": "nobody@northwind.example"}),
+        )
+        .await
+        .unwrap();
+    assert!(unknown.is_error);
+    assert!(text_of(&unknown).contains("Not erased: there is no contact nobody@northwind.example"));
+    let no_address = registry
+        .execute("delete", json!({"action": "studio.email_contact_erase"}))
+        .await
+        .unwrap_err();
+    assert!(
+        no_address
+            .to_string()
+            .contains("email is required for delete(action=\"studio.email_contact_erase\")"),
+        "{no_address}"
+    );
+    assert_eq!(
+        stub.calls_to("DELETE", &format!("/create/email/contacts/{CONTACT}"))
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn contacts_are_listed_added_and_unsubscribed() {
     let stub = Stub::start(usual()).await;
     let tool = stub.tool();
 
@@ -1565,24 +1709,6 @@ async fn contacts_are_listed_added_erased_and_unsubscribed() {
     assert!(posts[0]
         .header("idempotency-key")
         .is_some_and(|k| k.starts_with("email-contacts-")));
-
-    let erased = tool
-        .execute(json!({"action": "email_contacts", "operation": "remove", "email": "ADA@northwind.example"}))
-        .await
-        .unwrap();
-    assert!(!erased.is_error, "{}", text_of(&erased));
-    assert!(text_of(&erased).starts_with("Erased ada@northwind.example"));
-    assert_eq!(
-        stub.calls_to("DELETE", &format!("/create/email/contacts/{CONTACT}"))
-            .len(),
-        1
-    );
-    let unknown = tool
-        .execute(json!({"action": "email_contacts", "operation": "remove", "email": "nobody@northwind.example"}))
-        .await
-        .unwrap();
-    assert!(unknown.is_error);
-    assert!(text_of(&unknown).contains("there is no contact nobody@northwind.example"));
 
     let unsubscribed = tool
         .execute(json!({"action": "email_contacts", "operation": "unsubscribe", "email": "lin@northwind.example", "note": "Asked on the phone"}))

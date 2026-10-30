@@ -52,8 +52,8 @@ const fn removal(
 }
 
 /// Every irreversible action: it removes something (delete, purge, merge or
-/// combine a project away, remove indexed paths) or withdraws something others
-/// rely on (revoke or unshare a share, archive a feed, unregister a webhook,
+/// combine a project away, remove indexed paths, erase an email contact) or
+/// withdraws something others rely on (revoke or unshare a share, archive a feed, unregister a webhook,
 /// clear pushed instructions).
 pub const SEPARATED_ACTIONS: &[SeparatedAction] = &[
     removal(
@@ -164,6 +164,11 @@ pub const SEPARATED_ACTIONS: &[SeparatedAction] = &[
         &["automation_id", "workspace_id"],
     ),
     removal("workspace", "delete", &["workspace_id"]),
+    removal(
+        "studio",
+        "email_contact_erase",
+        &["email", "workspace_id", "project_id"],
+    ),
 ];
 
 /// Tools that claimed `destructiveHint` without an irreversible action: their
@@ -289,7 +294,13 @@ pub fn register_delete_tool(registry: &mut ToolRegistry) {
         }
         actions.push((moved, tool.handler.clone()));
     }
-    if actions.is_empty() {
+    // A tool listed per caller (`studio`) doesn't bring `delete` to a surface
+    // by itself: where no other tool gave it an action (router mode, `/studio`),
+    // `studio` refuses an erase with the studio's own page for it.
+    if actions
+        .iter()
+        .all(|(moved, _)| crate::registry::is_listed_per_caller(moved.tool))
+    {
         return;
     }
     let names: Vec<String> = actions
@@ -342,7 +353,8 @@ const ACTION_GUIDE: &str = "<tool>.<action> to run. Ids by action: memory.delete
     session_id; project.* project_id (remove_paths also paths; merge and combine also \
     source_project_id, the project merged away); vcs.delete_repo and vcs.unregister_webhook \
     owner and repo; vcs.delete_link link_id; vcs.delete_automation automation_id; \
-    workspace.delete workspace_id.";
+    workspace.delete workspace_id; studio.email_contact_erase email (the contact's address; an \
+    unsubscribe stays on the suppression list).";
 
 struct DeleteTool {
     actions: Vec<(&'static SeparatedAction, Arc<dyn ToolHandler>)>,

@@ -2,11 +2,11 @@
 
 use async_trait::async_trait;
 use mcp_client::{
-    infer_memory_query_node_type, ContextStreamClient, CreateDiagramParams, CreateDocParams,
-    CreateMemoryNodeParams, CreateRoadmapParams, CreateTaskParams, CreateTodoParams,
-    ImportMemoryEventsParams, ListTodosParams, MemorySearchParams, RoadmapMilestone,
-    SearchTranscriptsParams, SupersedeMemoryNodeParams, UpdateDiagramParams, UpdateDocParams,
-    UpdateMemoryEventParams, UpdateMemoryNodeParams, UpdateTaskParams, UpdateTodoParams,
+    ContextStreamClient, CreateDiagramParams, CreateDocParams, CreateMemoryNodeParams,
+    CreateRoadmapParams, CreateTaskParams, CreateTodoParams, ImportMemoryEventsParams,
+    ListTodosParams, MemorySearchParams, RoadmapMilestone, SearchTranscriptsParams,
+    SupersedeMemoryNodeParams, UpdateDiagramParams, UpdateDocParams, UpdateMemoryEventParams,
+    UpdateMemoryNodeParams, UpdateTaskParams, UpdateTodoParams,
 };
 use mcp_types::{
     tool::{ToolAnnotations, ToolCategory, ToolMetadata, ToolResult},
@@ -1912,10 +1912,11 @@ impl ToolHandler for MemorySearchTool {
 
         let query = input.query.clone();
         let limit = input.limit;
-        let effective_node_type = input
-            .node_type
-            .clone()
-            .or_else(|| infer_memory_query_node_type(&input.query));
+        // Only a type the caller names filters. One guessed from the query's
+        // words ("what does", "risk", "goal", "prefer") hid every other
+        // type that matched, with nothing saying so (#408); the API ranks
+        // the closest rows first without it.
+        let effective_node_type = input.node_type.clone();
         let caller_cache_identity = current_memory_cache_identity();
 
         // Cache check: identical scope + query + node_type + limit in the

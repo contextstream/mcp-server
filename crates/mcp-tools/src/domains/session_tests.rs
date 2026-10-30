@@ -3565,6 +3565,38 @@ mod schema_tests {
         );
     }
 
+    // mcp-server#387: a truncated config.json made init bind the account's
+    // default workspace without a word.
+    #[tokio::test]
+    async fn init_refuses_a_folder_whose_config_cannot_be_read_and_binds_nothing() {
+        let folder = std::env::temp_dir().join(format!("mcp-init-broken-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(folder.join(".git")).unwrap();
+        std::fs::create_dir_all(folder.join(".contextstream")).unwrap();
+        std::fs::write(
+            folder.join(".contextstream/config.json"),
+            "{\n  \"workspace_id\": \"b5dc5d5c-",
+        )
+        .unwrap();
+        let client = create_mock_client();
+        let session = create_mock_session();
+        let tool = InitTool::new(client, session.clone());
+
+        let message = tool
+            .execute(serde_json::json!({"folder_path": folder.to_string_lossy()}))
+            .await
+            .expect_err("an unreadable config must not fall back to a default workspace")
+            .to_string();
+        assert!(message.contains("config.json cannot be read"), "{message}");
+        assert!(message.contains("it is not valid JSON"), "{message}");
+        assert!(
+            message.contains("did not bind the account's default workspace"),
+            "{message}"
+        );
+        assert!(message.contains("contextstream-mcp setup"), "{message}");
+        assert!(!session.is_initialized().await);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
     #[test]
     fn test_context_tool_schema() {
         let client = create_mock_client();

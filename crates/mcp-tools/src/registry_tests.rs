@@ -1538,3 +1538,42 @@ mod destructive_split_tests {
             .contains(&json!("workspace.delete")));
     }
 }
+
+mod help_listing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn help_tools_describes_the_tools_this_registry_lists() {
+        // #352: help named 24 tools from a fixed catalog while tools/list had 42.
+        let mut registry = ToolRegistry::new(&create_complete_config());
+        let client = ContextStreamClient::new(crate::testing::TestFixtures::test_config());
+        registry.register(
+            "help",
+            Arc::new(crate::domains::help::HelpTool::new(client)),
+        );
+        registry.register(
+            "zz_listed",
+            Arc::new(MockTool::with_details(
+                "zz_listed",
+                "Listed",
+                "Lists itself. More detail.",
+            )),
+        );
+
+        let result = registry
+            .execute("help", json!({"action": "tools"}))
+            .await
+            .expect("help tools");
+        let structured = result.structured_content.expect("catalog");
+        let names: Vec<&str> = structured["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&"help"), "{names:?}");
+        assert!(names.contains(&"zz_listed"), "{names:?}");
+        assert!(!names.contains(&"init"), "not registered here: {names:?}");
+        assert!(crate::registry::listed_tools().is_none());
+    }
+}

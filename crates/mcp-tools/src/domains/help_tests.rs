@@ -346,6 +346,39 @@ mod validation_tests {
         assert!(!text.contains("Found 20 tools"));
     }
 
+    #[test]
+    fn the_catalog_becomes_the_tools_the_session_lists() {
+        use crate::registry::ListedTool;
+        let listed = |name: &str, category: &'static str, description: &str| ListedTool {
+            name: name.to_string(),
+            category,
+            description: description.to_string(),
+        };
+        let session_tools = vec![
+            listed("delete", "memory", "Delete a record. Irreversible."),
+            listed("help", "utility", "Help."),
+            listed("memory_read", "memory", "Read memory\nwithout writing."),
+        ];
+        let mut catalog = json!({"tools": [
+            {"name": "help", "category": "utility", "description": "Discover tools."},
+            {"name": "agents", "category": "ai", "description": "Not in this session."},
+        ]});
+
+        super::match_listed_tools(&mut catalog, &session_tools, None);
+        let tools = catalog["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, ["help", "delete", "memory_read"]);
+        assert_eq!(tools[0]["description"], "Discover tools.");
+        assert_eq!(tools[1]["description"], "Delete a record.");
+        assert_eq!(tools[2]["description"], "Read memory");
+
+        let mut utility = json!({"tools": [
+            {"name": "help", "category": "utility", "description": "Discover tools."},
+        ]});
+        super::match_listed_tools(&mut utility, &session_tools, Some("utility"));
+        assert_eq!(utility["tools"].as_array().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn test_help_tools_full_is_self_describing_and_filterable() {
         let tool = HelpTool::new(create_mock_client());

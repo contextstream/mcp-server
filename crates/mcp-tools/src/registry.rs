@@ -875,6 +875,21 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// [`Self::list`] by name, as `help` describes it.
+    fn listed_tools(&self) -> Vec<ListedTool> {
+        let mut tools: Vec<ListedTool> = self
+            .list()
+            .into_iter()
+            .map(|tool| ListedTool {
+                name: tool.metadata.name.clone(),
+                category: tool.metadata.category.as_str(),
+                description: tool.metadata.description.clone(),
+            })
+            .collect();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools
+    }
+
     /// List tool names. Like [`Self::list`], back-compat aliases and tools
     /// listed per caller are filtered out so each canonical name appears
     /// exactly once.
@@ -926,11 +941,19 @@ impl ToolRegistry {
             acceleration_observation_request(name, &input).map(|request| (request, Instant::now()));
         let write_timing = write_timing_start(name, &input, observation.is_some());
 
-        let outcome = match model_id {
-            Some(model_id) => {
-                mcp_client::run_with_model_id(model_id, || tool.handler.execute(input)).await
+        // `help` describes the tools this registry lists, not a fixed catalog (#352).
+        let listed = (name == "help").then(|| Arc::new(self.listed_tools()));
+        let call = async move {
+            match model_id {
+                Some(model_id) => {
+                    mcp_client::run_with_model_id(model_id, || tool.handler.execute(input)).await
+                }
+                None => tool.handler.execute(input).await,
             }
-            None => tool.handler.execute(input).await,
+        };
+        let outcome = match listed {
+            Some(listed) => LISTED_TOOLS.scope(listed, call).await,
+            None => call.await,
         };
         let outcome = explain_input_error(name, &mismatches, outcome);
 
@@ -1955,6 +1978,27 @@ const LISTED_PER_CALLER: &[&str] = &[
 /// Whether `name` is listed per caller rather than from the registry.
 pub fn is_listed_per_caller(name: &str) -> bool {
     LISTED_PER_CALLER.contains(&name)
+}
+
+/// A tool as the session making a call lists it, for `help(action="tools")`
+/// (#352).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedTool {
+    pub name: String,
+    pub category: &'static str,
+    pub description: String,
+}
+
+tokio::task_local! {
+    /// The tools the registry running the current `help` call lists.
+    static LISTED_TOOLS: Arc<Vec<ListedTool>>;
+}
+
+/// The tools the session making the current call has: [`ToolRegistry::list`],
+/// the set `tools/list` shows it apart from the few listed per caller. Set for
+/// `help` calls only; `None` elsewhere.
+pub fn listed_tools() -> Option<Arc<Vec<ListedTool>>> {
+    LISTED_TOOLS.try_with(Arc::clone).ok()
 }
 
 /// Check if tool is a router direct tool (exposed in router mode).

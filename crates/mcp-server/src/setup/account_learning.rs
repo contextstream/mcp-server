@@ -413,6 +413,22 @@ pub fn open_browser_consent_prompt() {
     let _ = open_privacy_page_if_supported();
 }
 
+/// The status when the consent state could not be read: a refused key says so
+/// and how to fix it, and an unreachable server is named. Both read the same
+/// before (#343).
+fn unverified_status(failure: Option<&mcp_types::Error>, api_url: &str) -> String {
+    let reason = match failure {
+        Some(error @ mcp_types::Error::Http { status: 401, .. }) => error.user_facing_message(),
+        Some(error) => error.reach_message(api_url),
+        None => "The answer could not be read.".to_string(),
+    };
+    format!(
+        "Deep project learning: unavailable (could not verify current consent state)
+{reason}
+Privacy page: {PRIVACY_URL}"
+    )
+}
+
 /// Inspect and print the current deep project learning consent state without
 /// mutating anything or opening a browser (`configure --account-learning [status]`).
 pub async fn show_status() -> Result<()> {
@@ -424,11 +440,18 @@ pub async fn show_status() -> Result<()> {
             return Ok(());
         }
     };
+    let api_url = config.api_url.clone();
     let client = ContextStreamClient::new(config);
-    let status = tokio::time::timeout(Duration::from_secs(5), client.account_learning_status())
-        .await
-        .ok()
-        .and_then(Result::ok);
+    let (status, failure) = match tokio::time::timeout(
+        Duration::from_secs(5),
+        client.account_learning_status(),
+    )
+    .await
+    {
+        Ok(Ok(status)) => (Some(status), None),
+        Ok(Err(error)) => (None, Some(error)),
+        Err(_) => (None, Some(mcp_types::Error::Timeout(5))),
+    };
 
     match status.as_ref().and_then(parse_server_consent) {
         Some(parsed) if parsed.enabled && !parsed.requires_reconsent => {
@@ -445,10 +468,7 @@ pub async fn show_status() -> Result<()> {
             println!("Turn on in a signed-in browser: `{ENABLE_COMMAND}`");
             println!("Privacy page: {PRIVACY_URL}");
         }
-        None => {
-            println!("Deep project learning: unavailable (could not verify current consent state)");
-            println!("Privacy page: {PRIVACY_URL}");
-        }
+        None => println!("{}", unverified_status(failure.as_ref(), &api_url)),
     }
     Ok(())
 }
@@ -780,6 +800,38 @@ mod tests {
             assert!(!should_open_browser_with(|_| false));
             assert!(should_open_browser_with(|k| k == "DISPLAY"));
             assert!(should_open_browser_with(|k| k == "WAYLAND_DISPLAY"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod unverified_status_tests {
+    use super::*;
+
+    // #343: a refused key read exactly like an offline run.
+    #[test]
+    fn a_refused_key_and_an_unreachable_server_each_say_what_happened() {
+        let url = "http://127.0.0.1:9";
+        let refused = unverified_status(Some(&mcp_types::Error::http(401, "Unauthorized")), url);
+        assert!(refused.contains("did not accept the API key"), "{refused}");
+        assert!(refused.contains("contextstream-mcp setup"), "{refused}");
+        let offline = unverified_status(
+            Some(&mcp_types::Error::Network(
+                "Connection failed: refused".into(),
+            )),
+            url,
+        );
+        assert!(
+            offline.contains("Could not reach ContextStream at http://127.0.0.1:9"),
+            "{offline}"
+        );
+        assert_ne!(refused, offline);
+        for status in [&refused, &offline] {
+            assert!(
+                status.starts_with("Deep project learning: unavailable"),
+                "{status}"
+            );
+            assert!(status.ends_with(PRIVACY_URL), "{status}");
         }
     }
 }

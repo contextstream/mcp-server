@@ -598,13 +598,26 @@ fn print_outcome(outcome: &LinkOutcome) {
 }
 
 /// Run `contextstream-mcp link`. Returns whether every folder ended up
-/// correctly linked.
+/// correctly linked. With `--json`, a failure is a JSON object on stdout too
+/// (`{"error": …}`), and the command exits 1 (#343).
 pub async fn run(command: LinkCommand) -> Result<bool> {
+    let json = command.json;
+    match run_checked(command).await {
+        Err(error) if json => {
+            println!("{}", serde_json::json!({ "error": error.to_string() }));
+            Ok(false)
+        }
+        result => result,
+    }
+}
+
+async fn run_checked(command: LinkCommand) -> Result<bool> {
     let config = crate::config::load_config().map_err(|error| {
         anyhow::anyhow!(
             "no ContextStream credentials ({error}); run `contextstream-mcp setup` first"
         )
     })?;
+    let api_url = config.api_url.clone();
     let client = ContextStreamClient::new(config);
     let folders = if command.all {
         known_folders()
@@ -615,7 +628,9 @@ pub async fn run(command: LinkCommand) -> Result<bool> {
         };
         vec![path]
     };
-    let candidates = load_candidates(&client).await?;
+    let candidates = load_candidates(&client)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.reach_message(&api_url)))?;
     let mode = if command.fix || command.project_id.is_some() {
         RepairMode::Confident
     } else {

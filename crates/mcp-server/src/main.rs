@@ -3257,6 +3257,18 @@ fn query_binary_version(binary_path: &str) -> Option<String> {
     }
 }
 
+/// Why `update` stopped when the latest version could not be read. A check
+/// only asked whether there is a newer version, so it is not told to
+/// reinstall with --force (#343).
+fn unknown_latest_version(check_only: bool) -> &'static str {
+    if check_only {
+        "Could not check for a newer version. Check the network connection and try again."
+    } else {
+        "Could not determine the latest version. Check the network connection and try again, \
+         or use --force to reinstall anyway."
+    }
+}
+
 async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
     const LATEST_VERSION_URL: &str =
         "https://pub-68429b9f7857416c9484b75bf1887b96.r2.dev/mcp/latest/version.json";
@@ -3304,7 +3316,10 @@ async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
             None
         }
         Err(e) => {
-            update_warn(format!("Could not check latest version: {}", e));
+            update_warn(format!(
+                "Could not check the latest version: the release server did not answer ({}).",
+                mcp_client::client::describe_transport_error(&e)
+            ));
             None
         }
     };
@@ -3319,9 +3334,7 @@ async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
                 update_warn("Could not determine latest version; proceeding with --force");
                 String::new()
             } else {
-                anyhow::bail!(
-                    "Could not determine latest version. Use --force to reinstall anyway."
-                );
+                anyhow::bail!(unknown_latest_version(check_only));
             }
         }
     };
@@ -4191,6 +4204,14 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // #343
+    #[test]
+    fn a_version_check_is_not_told_to_reinstall() {
+        assert!(!unknown_latest_version(true).contains("--force"));
+        assert!(unknown_latest_version(true).contains("Check the network connection"));
+        assert!(unknown_latest_version(false).contains("--force"));
+    }
+
     // #338
     #[test]
     fn verify_key_names_the_user_without_an_empty_name() {

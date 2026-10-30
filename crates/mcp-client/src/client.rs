@@ -22402,10 +22402,16 @@ mod path_ingest_gate_tests {
     }
 }
 
-/// A failed connection's text. reqwest's own names only the URL ("error
-/// sending request for url (…)"); why it failed (connection refused, a host
-/// name that did not resolve) is at the end of its source chain (#338).
+/// A failed connection's text (#338).
 fn connect_failure(error: &reqwest::Error) -> String {
+    format!("Connection failed: {}", describe_transport_error(error))
+}
+
+/// A reqwest failure with its cause. reqwest's own text names only the URL
+/// ("error sending request for url (…)"); why it failed (connection refused, a
+/// host name that did not resolve, a timeout) is at the end of its source
+/// chain (#338, #343).
+pub fn describe_transport_error(error: &reqwest::Error) -> String {
     let mut cause = None;
     let mut source = std::error::Error::source(error);
     while let Some(next) = source {
@@ -22413,8 +22419,8 @@ fn connect_failure(error: &reqwest::Error) -> String {
         source = next.source();
     }
     match cause.filter(|cause| !cause.is_empty()) {
-        Some(cause) => format!("Connection failed: {error}: {cause}"),
-        None => format!("Connection failed: {error}"),
+        Some(cause) => format!("{error}: {cause}"),
+        None => error.to_string(),
     }
 }
 

@@ -214,6 +214,24 @@ impl Error {
 
         self.to_string()
     }
+
+    /// What a command says when its request to ContextStream at `api_url`
+    /// failed. A server that did not answer has not refused the key, so it
+    /// says where it tried, why that failed, and what to check. A refusal gets
+    /// [`Self::user_facing_message`] (#338, #343).
+    pub fn reach_message(&self, api_url: &str) -> String {
+        const CHECK: &str =
+            "Check the network connection, and CONTEXTSTREAM_API_URL if you set it.";
+        match self {
+            Self::Network(_) => {
+                format!("Could not reach ContextStream at {api_url} ({self}). {CHECK}")
+            }
+            Self::Timeout(seconds) => {
+                format!("ContextStream at {api_url} did not answer within {seconds} s. {CHECK}")
+            }
+            _ => self.user_facing_message(),
+        }
+    }
 }
 
 /// Error codes matching the TypeScript implementation.
@@ -349,6 +367,30 @@ mod tests {
         assert!(!err
             .user_facing_message()
             .contains("non-blocking status code"));
+    }
+
+    #[test]
+    fn an_unreachable_server_is_named_and_a_refusal_keeps_its_fix() {
+        let url = "http://127.0.0.1:9";
+        let offline =
+            Error::Network("Connection failed: error sending request: Connection refused".into())
+                .reach_message(url);
+        assert!(
+            offline.starts_with("Could not reach ContextStream at http://127.0.0.1:9 ("),
+            "{offline}"
+        );
+        assert!(offline.contains("Connection refused"), "{offline}");
+        assert!(
+            offline.ends_with("CONTEXTSTREAM_API_URL if you set it."),
+            "{offline}"
+        );
+        let slow = Error::Timeout(5).reach_message(url);
+        assert!(
+            slow.starts_with("ContextStream at http://127.0.0.1:9 did not answer within 5 s."),
+            "{slow}"
+        );
+        let refused = Error::http(401, "Unauthorized");
+        assert_eq!(refused.reach_message(url), refused.user_facing_message());
     }
 
     #[test]

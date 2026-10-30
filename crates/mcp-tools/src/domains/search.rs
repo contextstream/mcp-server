@@ -4159,7 +4159,11 @@ fn suggest_output_format(query: &str, mode: SearchMode) -> Option<&'static str> 
 
     if is_identifier_query(query) {
         return match mode {
-            SearchMode::Refactor | SearchMode::Exhaustive => Some("paths"),
+            SearchMode::Refactor => Some("paths"),
+            // Exhaustive promises every matching line with its true line
+            // number; "paths" made the API answer one bare path per file
+            // (#382). "minimal" keeps rows small and keeps `path:line`.
+            SearchMode::Exhaustive => Some("minimal"),
             SearchMode::Keyword => Some("full"),
             _ => None,
         };
@@ -4181,7 +4185,8 @@ fn resolve_output_preferences(
     // Refactor and Exhaustive return one row per match-site across the entire
     // codebase — emitting full content per row blows past the MCP response
     // ceiling (200k chars) on any broadly-used symbol like `ApiError`. For
-    // those modes default to paths-only and only honor an explicit caller opt-in.
+    // those modes default to compact rows (refactor: paths; exhaustive: path:line)
+    // and only honor an explicit caller opt-in for full content.
     // Other modes (semantic, hybrid, keyword, pattern) keep the snippet default
     // because their result count is naturally bounded.
     let mode_defaults_to_content = !matches!(

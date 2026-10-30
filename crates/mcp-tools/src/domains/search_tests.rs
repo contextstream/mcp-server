@@ -8391,6 +8391,57 @@ mod scope_widening_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_answer_is_not_replayed_from_the_cache() {
+        // #463: "the scan is incomplete … nothing was searched" was cached for
+        // 30 s, so the same search after indexing kept answering it.
+        let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+        let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = searches.clone();
+        let server = RoutedServer::spawn(Box::new(move |line, _| {
+            if line.contains("/search/") {
+                let call = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = if call == 0 {
+                    json!({"results": [], "total": 0, "project_index_state": "indexing",
+                           "literal_match": {"complete": false, "found": false,
+                               "statement": "The scan is incomplete: the project has no committed index generation yet, so nothing was searched."}})
+                } else {
+                    json!({"results": [{"id": "r1", "file_path": "src/cach.rs", "start_line": 2,
+                               "content": "CACH_5 token", "score": 0.9}],
+                           "total": 1, "project_index_state": "ready",
+                           "literal_match": {"complete": true, "found": true,
+                               "statement": "Every committed indexed file was checked."}})
+                };
+                return (200, body.to_string());
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            (404, json!({"error":"not found"}).to_string())
+        }));
+        let (tool, session) = gateway_tool(&server.base_url);
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        let query = format!("CACH_5_{}", Uuid::new_v4().simple());
+        let input = json!({"query": query, "mode": "keyword"});
+        let run = |input: Value| {
+            let tool = &tool;
+            mcp_client::run_with_session_key(mcp_types::SessionKey::Local, move || async move {
+                text_of(&tool.execute(input).await.unwrap())
+            })
+        };
+        let first = run(input.clone()).await;
+        assert!(first.contains("The scan is incomplete"), "{first}");
+        let second = run(input.clone()).await;
+        assert!(!second.contains("[SEARCH_CACHED]"), "{second}");
+        assert!(second.contains("src/cach.rs"), "{second}");
+        // A complete answer with rows is still cached.
+        let third = run(input).await;
+        assert!(third.contains("[SEARCH_CACHED]"), "{third}");
+        assert_eq!(searches.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_page_past_the_end_says_so_instead_of_blaming_the_output_format() {
         // #460: offset=500 over 61 matches printed "Server returned compact
         // output … Rerun with output_format=full" for a full request.

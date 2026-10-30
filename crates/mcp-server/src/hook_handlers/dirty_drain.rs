@@ -96,6 +96,9 @@ const WATCH_FULL_SCAN_THRESHOLD: usize = MAX_DIRTY_FILES_PER_WORKSPACE;
 /// stay present and a full repair is required before they can be cleared.
 const PENDING_SUBMISSION_RETENTION_HOURS: i64 = 24;
 const PENDING_RESERVATION_RETENTION_MINUTES: i64 = 5;
+/// A queued job that failed for credits longer ago than this does not start a
+/// credit hold when its receipt is read: credits may have been added since.
+const CREDIT_FAILURE_RECENT_MINUTES: i64 = 30;
 
 fn dirty_file_version(value: &Value) -> Option<&str> {
     value
@@ -1556,6 +1559,7 @@ async fn reconcile_pending_submissions(
                                 JobTerminalState::Completed => {}
                                 JobTerminalState::Failed | JobTerminalState::Unknown => {
                                     terminal_failure = true;
+                                    note_credit_failed_job(&progress, project_id, workspace_id);
                                 }
                                 JobTerminalState::Pending => all_completed = false,
                             },
@@ -1617,6 +1621,34 @@ async fn reconcile_pending_submissions(
     }
 
     summary
+}
+
+/// A job that failed because the payer could not pay is the same refusal as a
+/// 402 at admission: record it so every automatic sender holds this project
+/// instead of re-queuing the same files. A failure older than
+/// `CREDIT_FAILURE_RECENT` is not recorded: credits may have been added since,
+/// and the retry that follows will find out.
+fn note_credit_failed_job(progress: &Value, project_id: Uuid, workspace_id: Uuid) {
+    if !mcp_client::credit_hold::job_failed_for_credits(progress) {
+        return;
+    }
+    let recent = progress
+        .get("completed_at")
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .is_none_or(|at| {
+            Utc::now().signed_duration_since(at.with_timezone(&Utc))
+                < ChronoDuration::minutes(CREDIT_FAILURE_RECENT_MINUTES)
+        });
+    if !recent {
+        return;
+    }
+    let message = progress
+        .get("error_message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (required, available) = mcp_client::credit_hold::parse_credit_amounts(message);
+    mcp_client::credit_hold::record_refusal(project_id, Some(workspace_id), required, available);
 }
 
 pub(crate) async fn reconcile_watch_submissions(
@@ -1740,6 +1772,11 @@ async fn drain_tracked_roots(root_filter: Option<&Path>, force_sync: bool) {
         )
         .await;
         if has_pending_submission_for_scope(&root, fresh_cfg.project_id, fresh_cfg.workspace_id) {
+            continue;
+        }
+        // Out of credits: the edits stay in the ledger and are sent when the
+        // hold's recheck comes (the client would refuse the request anyway).
+        if mcp_client::credit_hold::active_hold(fresh_cfg.project_id).is_some() {
             continue;
         }
 

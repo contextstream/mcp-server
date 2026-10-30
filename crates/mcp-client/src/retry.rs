@@ -88,6 +88,14 @@ pub enum IngestFailure {
     Unauthorized,
     /// 429: the server asked for a pause, in seconds when it said how long.
     RateLimited { retry_after: Option<u64> },
+    /// 402: the payer is out of credits, at admission or as the reason a queued
+    /// ingest job failed. Sending the same files again only fails again, and
+    /// credits can be added at any time, so the project is held and rechecked
+    /// on `credit_hold`'s schedule (5 minutes growing to 30), not on the
+    /// transient backoff. A 503 `CREDITS_TEMPORARILY_RESERVED` is not this: the
+    /// balance covers the request and the holds on queued work settle by
+    /// themselves, so it stays `Transient`.
+    OutOfCredits,
     /// Timeouts, network failures, 5xx and anything else.
     Transient,
 }
@@ -101,6 +109,9 @@ impl IngestFailure {
                 retry_after: *retry_after,
             },
             Error::Http { status: 429, .. } => Self::RateLimited { retry_after: None },
+            Error::InsufficientCredits { .. } | Error::Http { status: 402, .. } => {
+                Self::OutOfCredits
+            }
             _ => Self::Transient,
         }
     }
@@ -192,6 +203,29 @@ mod tests {
         assert!(IngestFailure::Denied.halts_project());
         assert!(IngestFailure::Unauthorized.halts_project());
         assert!(IngestFailure::RateLimited { retry_after: None }.halts_project());
+    }
+
+    #[test]
+    fn a_credit_refusal_halts_the_project_and_is_not_retried_as_transient() {
+        let refused = Error::InsufficientCredits {
+            message: "You've run out of credits.".into(),
+            required: Some(20),
+            available: Some(3),
+        };
+        assert_eq!(
+            IngestFailure::classify(&refused),
+            IngestFailure::OutOfCredits
+        );
+        assert_eq!(
+            IngestFailure::classify(&Error::http(402, "payment required")),
+            IngestFailure::OutOfCredits
+        );
+        assert!(IngestFailure::OutOfCredits.halts_project());
+        // Credits held for work already queued settle on their own: that is a
+        // 503 and keeps the short transient backoff.
+        let reserved = Error::http(503, "Credits temporarily reserved");
+        assert_eq!(IngestFailure::classify(&reserved), IngestFailure::Transient);
+        assert!(!IngestFailure::classify(&reserved).halts_project());
     }
 
     #[test]

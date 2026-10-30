@@ -3242,7 +3242,7 @@ mod tests {
             // successor_id) plus the `create_decision` / `decision_action`
             // enum values. Every earlier field and action still accepted.
             "memory",
-            "1300eb376fb4c63b1cbdcf6f09ff2312ebc6114529094aa085dabf8a7901ccbc",
+            "3a98162c010172f711e88f34f095ef16b68c49bdfe61856c3386ad6a21cab27d",
         ),
         (
             "memory_complete_todo",
@@ -3277,7 +3277,7 @@ mod tests {
         (
             // New rows for #330: the read-only twins are listed for every client.
             "memory_read",
-            "a5b10ba8778b8dba4243d47a396200d9713b8b4bdce4fed7590bbbeda6d5bd3d",
+            "602c6fe50fa5be9bbb6a31fd6b08db20912815fbd337e61905df39f82d805efd",
         ),
         (
             "memory_update_doc",

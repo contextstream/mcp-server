@@ -699,6 +699,7 @@ mod read_scope_resolution_tests {
             status: None,
             since: None,
             offset: None,
+            max_chars: None,
             source: None,
             rationale: None,
             alternatives: None,
@@ -820,7 +821,7 @@ mod collection_count_tests {
 }
 
 mod format_doc_detail_tests {
-    use super::format_doc_detail;
+    use super::{check_doc_content_size, format_doc_detail, show_doc, DocWindow};
     use serde_json::json;
 
     #[test]
@@ -858,6 +859,63 @@ mod format_doc_detail_tests {
         assert!(text.contains("Wrapped Doc"));
         assert!(text.contains("Type: general"));
         assert!(text.contains("Wrapped content"));
+    }
+
+    #[test]
+    fn a_large_doc_is_shown_in_parts_with_the_way_to_read_on() {
+        // #384: get_doc returned 600 KB in one result.
+        let body = format!("{}END", "x".repeat(99_997));
+        let mut value = json!({"data": {"id": "doc-big", "title": "Big", "doc_type": "general", "content": body}});
+        let text = show_doc(&mut value, None, None);
+        assert!(text.contains("[OUTPUT_BUDGET] Showing characters 0–40,000 of 100,000. Pass offset=40000 for the next part"), "{text}");
+        assert!(!text.contains("END"));
+        assert_eq!(value["data"]["content"].as_str().unwrap().len(), 40_000);
+        assert_eq!(value["data"]["content_window"]["next_offset"], 40_000);
+
+        let mut value = json!({"id": "doc-big", "title": "Big", "content": body});
+        let text = show_doc(&mut value, Some(90_000), Some(500_000));
+        assert!(
+            text.contains("Showing characters 90,000–100,000 of 100,000 (the end)."),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "END\n\n[OUTPUT_BUDGET] Showing characters 90,000–100,000 of 100,000 (the end)."
+            ),
+            "{text}"
+        );
+
+        let mut value = json!({"id": "doc-big", "title": "Big", "content": body});
+        let text = show_doc(&mut value, Some(200_000), None);
+        assert!(
+            text.contains("offset=200000 is past the end: the content has 100,000 characters."),
+            "{text}"
+        );
+
+        // A doc that fits shows whole, as before.
+        let mut value = json!({"id": "doc-small", "title": "Small", "content": "short"});
+        let text = show_doc(&mut value, None, None);
+        assert!(text.ends_with("short"), "{text}");
+        assert!(value.get("content_window").is_none());
+        // Windows count characters, not bytes.
+        let window = DocWindow::new("ééé", Some(1), Some(1));
+        assert_eq!(window.slice("ééé"), "é");
+    }
+
+    #[test]
+    fn doc_content_over_the_request_limit_is_refused_before_sending() {
+        // #385: the API answered a bare "HTTP 413 … length limit exceeded".
+        assert!(check_doc_content_size(&"y".repeat(600_000)).is_ok());
+        let error = check_doc_content_size(&"y".repeat(2_100_000))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("content is 2.1 MB (2,100,002 bytes as sent); a doc can hold at most 2,080,000 bytes"), "{error}");
+        assert!(
+            error.contains("Split the text into several docs"),
+            "{error}"
+        );
+        // Escaping counts: quotes and newlines grow in JSON.
+        assert!(check_doc_content_size(&"\n".repeat(1_100_000)).is_err());
     }
 
     #[test]

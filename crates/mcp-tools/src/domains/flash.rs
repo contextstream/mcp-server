@@ -420,14 +420,22 @@ impl ToolHandler for FlashTool {
                             .unwrap_or(0);
                         attach_bootstrap_note(&mut result, bootstrap_note.as_deref());
                         attach_workspace_only_note(&mut result, project_id);
+                        let headline = if project_id.is_none() {
+                            format!(
+                                "Loaded {} workspace/global instruction entries. Project-scoped entries were intentionally withheld because project_id was omitted.",
+                                count
+                            )
+                        } else {
+                            format!("Loaded {} instruction entries.", count)
+                        };
+                        // The entries themselves, so a client that shows only
+                        // text (stdio) can follow them and ack their ids (#376).
+                        let entries = instruction_entry_lines(&result);
                         let text = compose_text(
-                            if project_id.is_none() {
-                                format!(
-                                    "Loaded {} workspace/global instruction entries. Project-scoped entries were intentionally withheld because project_id was omitted.",
-                                    count
-                                )
+                            if entries.is_empty() {
+                                headline
                             } else {
-                                format!("Loaded {} instruction entries.", count)
+                                format!("{headline}\n{entries}")
                             },
                             bootstrap_note.as_deref(),
                         );
@@ -1169,5 +1177,59 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Unknown action"), "{}", err);
+    }
+}
+
+/// `text` on one line, cut to `max` characters.
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// One line per instruction entry: `1. [critical] <id>: <text>` (#376).
+fn instruction_entry_lines(result: &Value) -> String {
+    let Some(entries) = result.get("entries").and_then(Value::as_array) else {
+        return String::new();
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let id = entry.get("id").and_then(Value::as_str).unwrap_or("?");
+            let text = entry.get("text").and_then(Value::as_str).unwrap_or("");
+            let critical = entry.get("critical").and_then(Value::as_bool) == Some(true);
+            format!(
+                "{}. {}{id}: {}",
+                index + 1,
+                if critical { "[critical] " } else { "" },
+                one_line(text, 500)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod instruction_entry_line_tests {
+    use super::*;
+
+    #[test]
+    fn each_entry_is_listed_with_its_id_and_whether_it_is_critical() {
+        let result = serde_json::json!({"entries": [
+            {"id": "e1-120310", "text": "Always run the gate before pushing", "critical": true},
+            {"id": "e2-120310", "text": "Prefer small commits"},
+        ]});
+        assert_eq!(
+            instruction_entry_lines(&result),
+            "1. [critical] e1-120310: Always run the gate before pushing\n2. e2-120310: Prefer small commits"
+        );
+        assert_eq!(
+            instruction_entry_lines(&serde_json::json!({"entries": []})),
+            ""
+        );
     }
 }

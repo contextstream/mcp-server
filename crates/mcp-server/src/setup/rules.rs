@@ -2271,19 +2271,38 @@ pub fn wrap_with_markers(content: &str) -> String {
 fn find_block_start(content: &str) -> Option<(usize, &'static str)> {
     [CONTEXTSTREAM_START, LEGACY_START]
         .into_iter()
-        .filter_map(|marker| content.find(marker).map(|pos| (pos, marker)))
+        .filter_map(|marker| find_marker(content, marker, 0).map(|pos| (pos, marker)))
         .min_by_key(|(pos, _)| *pos)
+}
+
+/// Whether the marker at `pos` stands on a line of its own: only whitespace and
+/// comment punctuation (`# `, `<!-- `, `// `) before it and after it. The blocks
+/// setup writes are like that, in a YAML file commented out line by line too; a
+/// sentence that merely names the tag is the person's text, and taking it for a
+/// block made `update-rules` refuse and nothing install (#366).
+fn marker_stands_alone(content: &str, pos: usize, marker: &str) -> bool {
+    let line_start = content[..pos].rfind('\n').map_or(0, |at| at + 1);
+    let after = pos + marker.len();
+    let line_end = content[after..]
+        .find('\n')
+        .map_or(content.len(), |at| after + at);
+    let punctuation_only = |text: &str| !text.chars().any(char::is_alphanumeric);
+    punctuation_only(&content[line_start..pos]) && punctuation_only(&content[after..line_end])
+}
+
+/// The first place at or after `from` where `marker` stands on a line of its own.
+fn find_marker(content: &str, marker: &str, from: usize) -> Option<usize> {
+    content[from..]
+        .match_indices(marker)
+        .map(|(relative, _)| from + relative)
+        .find(|pos| marker_stands_alone(content, *pos, marker))
 }
 
 /// Find the first ContextStream block end marker after `search_from`.
 fn find_block_end(content: &str, search_from: usize) -> Option<(usize, &'static str)> {
     [CONTEXTSTREAM_END, LEGACY_END]
         .into_iter()
-        .filter_map(|marker| {
-            content[search_from..]
-                .find(marker)
-                .map(|rel_pos| (search_from + rel_pos, marker))
-        })
+        .filter_map(|marker| find_marker(content, marker, search_from).map(|pos| (pos, marker)))
         .min_by_key(|(pos, _)| *pos)
 }
 
@@ -2302,8 +2321,8 @@ fn find_contextstream_block_bounds(content: &str) -> Option<(usize, usize)> {
     } else {
         LEGACY_END
     };
-    if let Some(rel_pos) = content[search_from..].find(preferred_end) {
-        return Some((start_pos, search_from + rel_pos + preferred_end.len()));
+    if let Some(end_pos) = find_marker(content, preferred_end, search_from) {
+        return Some((start_pos, end_pos + preferred_end.len()));
     }
 
     if let Some((end_pos, end_marker)) = find_block_end(content, search_from) {
@@ -3198,6 +3217,66 @@ mod tests {
             replace_contextstream_block(&existing, "replacement").expect("replace managed block");
 
         assert_eq!(result, format!("{before}replacement{after}"));
+    }
+
+    // #366: a sentence that names the tags is the person's text, not a block.
+    #[test]
+    fn a_tag_named_inside_a_sentence_is_not_a_block_but_a_tag_on_its_own_line_is() {
+        let prose = "We document the <contextstream> tag, and the closing </contextstream> too.\n";
+        assert_eq!(find_contextstream_block_bounds(prose), None);
+        assert_eq!(
+            find_contextstream_block_bounds(
+                "see <!-- BEGIN ContextStream --> and <!-- END ContextStream -->"
+            ),
+            None
+        );
+
+        // On a line of its own, bare or after comment punctuation, it is one.
+        for (text, opening) in [
+            (
+                "a\n<contextstream>\nx\n</contextstream>\nb\n",
+                "<contextstream>",
+            ),
+            (
+                "a\n  <contextstream>\nx\n  </contextstream>\nb\n",
+                "<contextstream>",
+            ),
+            (
+                "a\n# <contextstream>\n# x\n# </contextstream>\nb\n",
+                "<contextstream>",
+            ),
+            (
+                "a\n<!-- BEGIN ContextStream -->\nx\n<!-- END ContextStream -->\nb\n",
+                "<!-- BEGIN ContextStream -->",
+            ),
+        ] {
+            let (start, end) = find_contextstream_block_bounds(text)
+                .unwrap_or_else(|| panic!("no block found in {text:?}"));
+            assert!(text[start..].starts_with(opening), "{text:?}");
+            let before = text[..start].trim_end_matches(' ');
+            assert!(before.ends_with("a\n") || before.ends_with('#'), "{text:?}");
+            assert!(
+                text[end..].starts_with('\n') && text[end..].contains('b'),
+                "{text:?}"
+            );
+        }
+
+        // A real block after a sentence that names the tags: the block is found,
+        // not the sentence.
+        let both = format!("{prose}\n<contextstream>\nmanaged\n</contextstream>\n");
+        let (start, end) = find_contextstream_block_bounds(&both).expect("the real block");
+        assert_eq!(
+            &both[start..end],
+            "<contextstream>\nmanaged\n</contextstream>"
+        );
+
+        // Installing next to the sentence keeps the sentence and adds the block
+        // (the real-binary test covers the second install and uninstall).
+        let installed =
+            replace_contextstream_block(prose, "<contextstream>\nmanaged\n</contextstream>\n")
+                .expect("the sentence is not a block");
+        assert!(installed.contains(prose), "{installed:?}");
+        assert!(installed.contains("<contextstream>\nmanaged\n</contextstream>"));
     }
 
     #[test]

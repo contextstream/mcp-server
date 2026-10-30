@@ -4,7 +4,7 @@
 mod recall_supplements;
 
 use crate::domains::scope_resolution::{
-    self, classify_scope_id_arg, with_scope_repair, ScopeRepair, UnmatchedFolderScope,
+    self, classify_scope_id_arg, with_scope_repair, ScopeIdArg, ScopeRepair, UnmatchedFolderScope,
     SCOPE_REPAIRS_KEY,
 };
 use async_trait::async_trait;
@@ -1387,6 +1387,19 @@ fn resolve_init_project_name(result: &Value, local_project_name: Option<String>)
 // Init Tool
 // ============================================================================
 
+/// Text sent as an id that is neither an id nor a placeholder. init used to
+/// drop it and bind the session to the account's default workspace without a
+/// word (#353; #342 was the same for project list), so it is refused before
+/// anything is bound.
+fn refuse_malformed_scope_id(field: &str, kind: &str, arg: &ScopeIdArg) -> Result<()> {
+    match arg {
+        ScopeIdArg::Malformed(raw) => Err(Error::Validation(format!(
+            "{field} \"{raw}\" is not a {kind} ID (a UUID). {kind}(action=\"list\") shows yours."
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Input for the init tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitInput {
@@ -2430,6 +2443,8 @@ impl ToolHandler for InitTool {
         // so in the response.
         let workspace_arg = classify_scope_id_arg(input.workspace_id.as_deref());
         let project_arg = classify_scope_id_arg(input.project_id.as_deref());
+        refuse_malformed_scope_id("workspace_id", "workspace", &workspace_arg)?;
+        refuse_malformed_scope_id("project_id", "project", &project_arg)?;
         let placeholder_repair = ScopeRepair::placeholders(&workspace_arg, &project_arg);
         let explicit_workspace = workspace_arg.is_explicit();
         let explicit_project = project_arg.is_explicit();

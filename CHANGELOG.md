@@ -1,5 +1,54 @@
 # Changelog
 
+## 1.0.46
+
+- Indexing:
+  - A new session no longer re-uploads an unchanged checkout. The checkout guard stopped hashing config.json, which every session re-stamped (#365).
+  - The first complete scan reconciles the index, so files deleted while the manifest was lost leave it (#373).
+  - One scan per project runs across processes, so setup and the bridge stop sending every file twice (#339).
+  - `index` while another process is indexing says so and doesn't fail (#348).
+- Files over 5 MiB that a scan leaves out are named, in the scan and in `project(action="index_status")`, instead of "Project indexed" (#340, #367).
+- `memory_read`:
+  - takes the same action spellings as `memory`;
+  - a bare query searches;
+  - a wrong action says what to call instead.
+  This fixes a customer's failed call on 2026-10-30.
+- Tools now show their data instead of only a count or nothing:
+  - memory timeline, summary, get_node and get_diagram;
+  - decision_trace and decision_action;
+  - vcs lists, session smart_search and integration status;
+  - instruct get, coordination inbox/list and capsule audit;
+  - entity get and capture_plan;
+  - help editor_rules;
+  - media status and list (which also say why a file failed);
+  - capsule share text (#362, #375–#377, #393, #394, #396–#398, #403, #404, #407).
+- Search:
+  - Memory search no longer narrows to a node type guessed from the query (#408).
+  - Fuzzy and vector search fall back instead of answering nothing (#374).
+  - Exhaustive rows keep their line numbers (#382).
+- Arguments are checked:
+  - Values outside an advertised enum or range are refused with the list (#350).
+  - A workspace_id or project_id that isn't an id is refused instead of falling back to the default workspace, in init, project and answer (#351, #353, #372).
+  - An unreadable checkout config is named (#387).
+- Skills, lessons and docs:
+  - Skill export takes a name, run shows the instructions, and create refuses a name in use (#358–#360).
+  - supersede_lesson works, and get_lessons pages (#356, #357).
+  - get_doc shows a large doc in parts (#384, #385).
+  - [LESSONS_WARNING] lines show the stored severity, most severe first (#380).
+- Capsules: by-id calls reach their workspace's region (#361), and capped share links document their viewing window (#344, #345).
+- Graph analysis of a graph that was never built says so, instead of "no cycles" (#370).
+- Protocol:
+  - an unknown tool is -32602;
+  - "jsonrpc" must be "2.0";
+  - a null-id request is answered (#368).
+- CLI:
+  - an unparseable API URL is an error, not a panic, and a refused TLS certificate is named (#369);
+  - `setup --yes` without a key refuses up front (#379);
+  - `-q` keeps `update --check` silent (#354);
+  - workspace lists page (#381);
+  - update-rules no longer misreads a tag inside a sentence (#366).
+- `help(action="tools")` lists this session's tools (#352). A refused API key reads the same everywhere (#386). Answer says what to use when it can't answer (#388). list_events finds events by their type (#410). supersede_node and import_batch send the scope the API reads (#405, #406). A Grep on the project root counts as broad however the path is spelled (#371). The data-handling doc names the right purge action (#401).
+
 ## 1.0.45
 
 - `search(mode="exhaustive")` with no project in scope no longer fails. With one project in the workspace it searches

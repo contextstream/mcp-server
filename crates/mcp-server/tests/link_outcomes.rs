@@ -398,6 +398,32 @@ async fn link_unknown_project_id_fails_nonzero_and_preserves_existing_link() {
         "{bad_unlinked_stdout}"
     );
 
+    // 3. Under -q the report is not on stdout, so a folder that is not linked
+    // says why on stderr and the command still exits 1 (#354).
+    let quiet_home = home.clone();
+    let quiet_path = unlinked_dir.clone();
+    let quiet_url = api_url.clone();
+    let quiet = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+            .args(["-q", "link"])
+            .env("HOME", &quiet_home)
+            .env("USERPROFILE", &quiet_home)
+            .env("CONTEXTSTREAM_API_URL", &quiet_url)
+            .env("NO_COLOR", "1")
+            .current_dir(&quiet_path)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert_eq!(quiet.status.code(), Some(1), "{quiet_stderr}");
+    assert!(quiet.stdout.is_empty(), "-q link printed on stdout");
+    assert!(
+        quiet_stderr.contains("not linked") && quiet_stderr.contains("--project-id <id>"),
+        "-q link says why on stderr:\n{quiet_stderr}"
+    );
+
     server.abort();
 }
 

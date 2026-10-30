@@ -591,9 +591,24 @@ fn format_outcome_lines(outcome: &LinkOutcome) -> Vec<String> {
     lines
 }
 
+/// Whether `outcome`'s folder ended up correctly linked.
+fn ends_linked(outcome: &LinkOutcome) -> bool {
+    outcome.error.is_none()
+        && (outcome.relinked_to.is_some()
+            || matches!(outcome.assessment.status, LinkStatus::Correct))
+}
+
+/// Print `outcome` on stdout. Under `-q` stdout is discarded, so a folder that
+/// is not linked correctly reports on stderr: the command exits 1 for it and
+/// says why (#354).
 fn print_outcome(outcome: &LinkOutcome) {
+    let to_stderr = crate::setup::ui::is_quiet() && !ends_linked(outcome);
     for line in format_outcome_lines(outcome) {
-        println!("{line}");
+        if to_stderr {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
     }
 }
 
@@ -693,11 +708,7 @@ async fn run_checked(command: LinkCommand) -> Result<bool> {
     if outcomes.iter().any(|outcome| outcome.relinked_to.is_some()) {
         let _ = crate::watch::request_sync_bridge_reload();
     }
-    Ok(outcomes.iter().all(|outcome| {
-        outcome.error.is_none()
-            && (outcome.relinked_to.is_some()
-                || matches!(outcome.assessment.status, LinkStatus::Correct))
-    }))
+    Ok(outcomes.iter().all(ends_linked))
 }
 
 #[cfg(test)]

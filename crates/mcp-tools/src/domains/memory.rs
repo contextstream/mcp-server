@@ -4339,13 +4339,29 @@ impl ToolHandler for MemoryTool {
                     .filter(|title| !title.trim().is_empty())
                     .ok_or_else(|| Error::Validation("title is required".to_string()))?;
                 let title_for_user = title.clone();
+                // The API stores some types under another (bug and feature as
+                // ticket, conversation as chat) and records nothing of the
+                // type asked for; record it, so list_events and get_event can
+                // tell them apart (#410).
+                let metadata = match input.metadata {
+                    Some(Value::Object(mut fields)) => {
+                        fields
+                            .entry("original_type".to_string())
+                            .or_insert_with(|| Value::String(event_type.trim().to_ascii_lowercase()));
+                        Some(Value::Object(fields))
+                    }
+                    None => Some(serde_json::json!({
+                        "original_type": event_type.trim().to_ascii_lowercase()
+                    })),
+                    other => other,
+                };
                 let params = mcp_client::CreateMemoryEventParams {
                     event_type,
                     title,
                     content: input.content,
                     workspace_id: None,
                     project_id: None,
-                    metadata: input.metadata,
+                    metadata,
                     is_personal: input.is_personal,
                 };
                 let (created, scope) = execute_write_with_scope_recovery(

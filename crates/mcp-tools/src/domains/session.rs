@@ -10380,6 +10380,20 @@ impl ToolHandler for SessionCaptureTool {
             provenance: input.provenance,
             code_refs: input.code_refs,
         };
+        // A snapshot taken without a session_id belongs to the session init
+        // started, so `resume` with that id finds it, as the rules describe
+        // (#389: it answered "Nothing to resume").
+        if params
+            .session_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+            && params
+                .event_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("session_snapshot"))
+        {
+            params.session_id = self.session.state().await.session_id;
+        }
         let mut result = match self.client.session_capture(params.clone()).await {
             Ok(result) => result,
             Err(err) => {

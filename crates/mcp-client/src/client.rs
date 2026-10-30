@@ -519,6 +519,14 @@ pub fn is_ingest_in_progress_error(error: &Error) -> bool {
 /// reported, mcp-server#340). Also the cap on every bounded read below.
 const MAX_INDEXABLE_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
+/// The most one file's JSON may take before it is compacted to its prefix,
+/// symbols and suffix for upload: room for any indexable file (5 MiB) with
+/// its JSON escaping. It was 896 KB, so a file over about 850 KB was stored
+/// as its first and last ~300 KB, and exhaustive search said "no match" for
+/// everything between (#432). A file this large goes in a request of its own;
+/// the API takes ingest bodies up to 50 MB.
+const INGEST_SINGLE_FILE_PAYLOAD_BYTES: usize = 12 * 1024 * 1024;
+
 /// How many left-out files the result names.
 const TOO_LARGE_EXAMPLES: usize = 5;
 
@@ -7480,7 +7488,7 @@ impl ContextStreamClient {
         // deleted-path metadata in the first batch.
         const MAX_BATCH_BYTES: usize = 1024 * 1024;
         const MAX_BATCH_FILES: usize = 20;
-        const MAX_SINGLE_FILE_PAYLOAD_BYTES: usize = MAX_BATCH_BYTES - (128 * 1024);
+        const MAX_SINGLE_FILE_PAYLOAD_BYTES: usize = INGEST_SINGLE_FILE_PAYLOAD_BYTES;
 
         let prepared_changed_files =
             Self::prepare_changed_file_payloads(changed_files, MAX_SINGLE_FILE_PAYLOAD_BYTES);
@@ -32366,6 +32374,25 @@ mod tests {
         assert!(compacted_content.contains("important_middle_symbol"));
         assert!(compacted_content.contains("--- FILE PREFIX ---"));
         assert!(compacted_content.contains("--- FILE SUFFIX ---"));
+    }
+
+    #[test]
+    fn an_indexable_file_uploads_whole() {
+        // #432: a 1 MB file was stored as its first and last ~300 KB.
+        let content = "MARKER line with \"quotes\" and \\ slashes\n".repeat(110_000);
+        assert!(content.len() as u64 <= MAX_INDEXABLE_FILE_BYTES);
+        let file =
+            serde_json::json!({"path": "data/big.txt", "language": "text", "content": content});
+        let prepared = ContextStreamClient::prepare_changed_file_payloads(
+            vec![&file],
+            INGEST_SINGLE_FILE_PAYLOAD_BYTES,
+        );
+        assert_eq!(prepared.compacted_files, 0);
+        assert!(prepared.deferred_paths.is_empty());
+        assert_eq!(
+            prepared.files[0].as_ref()["content"].as_str(),
+            Some(content.as_str())
+        );
     }
 
     #[test]

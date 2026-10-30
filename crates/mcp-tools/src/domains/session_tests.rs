@@ -3532,6 +3532,38 @@ mod schema_tests {
         assert!(props.contains_key("is_post_compact"));
     }
 
+    #[tokio::test]
+    async fn init_refuses_an_id_that_is_not_one_and_binds_nothing() {
+        // #353: "not-a-uuid" was dropped and the session bound to the
+        // account's default workspace. A placeholder is still read as no id.
+        let client = create_mock_client();
+        let session = create_mock_session();
+        let tool = InitTool::new(client, session.clone());
+        for (args, expected) in [
+            (
+                serde_json::json!({"workspace_id": "not-a-uuid"}),
+                "workspace_id \"not-a-uuid\" is not a workspace ID (a UUID). workspace(action=\"list\") shows yours.",
+            ),
+            (
+                serde_json::json!({"project_id": "e3c8e528"}),
+                "project_id \"e3c8e528\" is not a project ID (a UUID). project(action=\"list\") shows yours.",
+            ),
+        ] {
+            let message = tool
+                .execute(args.clone())
+                .await
+                .expect_err(&args.to_string())
+                .to_string();
+            assert!(message.contains(expected), "{args}: {message}");
+        }
+        assert!(!session.is_initialized().await);
+        assert!(
+            crate::domains::scope_resolution::classify_scope_id_arg(Some("<current_workspace_id>"))
+                .placeholder()
+                .is_some()
+        );
+    }
+
     #[test]
     fn test_context_tool_schema() {
         let client = create_mock_client();

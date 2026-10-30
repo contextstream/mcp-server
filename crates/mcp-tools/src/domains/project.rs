@@ -345,6 +345,51 @@ fn project_list_heading(
     }
 }
 
+/// The page and page size a list call asks for (#381, #442, #451): the size
+/// from page_size, else limit; the page from page, else the one that holds
+/// offset. With limit=100, page=2 is rows 101-200, as the "(or page=N)" hint
+/// says; it was rows 21-40. Nothing given leaves both to the API.
+fn requested_page(
+    page: Option<i64>,
+    page_size: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    default_size: i64,
+) -> (Option<i64>, Option<i64>) {
+    let size = page_size
+        .map(|size| size.max(1))
+        .or_else(|| limit.map(|limit| limit.clamp(1, 100)));
+    if page.is_none() && size.is_none() && offset.is_none() {
+        return (None, None);
+    }
+    let size = size.unwrap_or(default_size);
+    let page = page
+        .unwrap_or_else(|| offset.unwrap_or(0).max(0) / size + 1)
+        .max(1);
+    (Some(page), Some(size))
+}
+
+/// An empty page after the last one, in a workspace that has projects (#451):
+/// it said the workspace had no projects yet.
+fn project_list_past_end(
+    page: Option<i64>,
+    per_page: Option<i64>,
+    total: Option<i64>,
+) -> Option<String> {
+    let page = page.unwrap_or(1).max(1);
+    match total.filter(|total| *total > 0) {
+        Some(total) => {
+            let per_page = per_page.filter(|size| *size > 0).unwrap_or(20);
+            Some(format!(
+                "Page {page} is past the end: {total} projects, {} pages of {per_page}.",
+                (total + per_page - 1) / per_page
+            ))
+        }
+        None if page > 1 => Some(format!("Page {page} is past the end of the project list.")),
+        None => None,
+    }
+}
+
 /// What an empty project list means. The API lists no projects for a
 /// workspace that does not exist or that these credentials cannot access, so
 /// an empty list for a named workspace is checked against the workspace itself:
@@ -409,16 +454,8 @@ impl ToolHandler for ProjectsListTool {
             })?),
         };
 
-        let (page, page_size) = match (input.page, input.page_size) {
-            (None, None) if input.limit.is_some() || input.offset.is_some() => {
-                let size = input.limit.unwrap_or(20).clamp(1, 100);
-                (
-                    Some(input.offset.unwrap_or(0).max(0) / size + 1),
-                    Some(size),
-                )
-            }
-            given => given,
-        };
+        let (page, page_size) =
+            requested_page(input.page, input.page_size, input.limit, input.offset, 20);
         let listed = self
             .client
             .list_projects_page(workspace_id, page, page_size)
@@ -430,14 +467,23 @@ impl ToolHandler for ProjectsListTool {
             listed.total,
             listed.has_next,
         );
+        let past_end = project_list_past_end(
+            listed.page.or(page),
+            listed.per_page.or(page_size),
+            listed.total,
+        );
         let projects = listed.items;
 
         let mut text = String::new();
 
         if projects.is_empty() {
-            match empty_project_list(&self.client, workspace_id).await {
-                Ok(empty) => text.push_str(&empty),
-                Err(unreachable) => return Ok(ToolResult::error(unreachable)),
+            if let Some(past_end) = past_end {
+                text.push_str(&past_end);
+            } else {
+                match empty_project_list(&self.client, workspace_id).await {
+                    Ok(empty) => text.push_str(&empty),
+                    Err(unreachable) => return Ok(ToolResult::error(unreachable)),
+                }
             }
         } else {
             text.push_str(&heading);
@@ -2835,15 +2881,10 @@ impl ToolHandler for ProjectTool {
                 )
                 .await?
                 .project_id;
-                // limit/offset page like every other list (#442): the size
-                // and the page that holds offset, unless page/page_size say.
-                let (page, page_size) = match (input.page, input.page_size) {
-                    (None, None) if input.limit.is_some() || input.offset.is_some() => {
-                        let size = input.limit.unwrap_or(100).clamp(1, 100);
-                        (Some(input.offset.unwrap_or(0).max(0) / size + 1), Some(size))
-                    }
-                    given => given,
-                };
+                // limit/offset page like every other list (#442), and page
+                // takes limit's size (#451).
+                let (page, page_size) =
+                    requested_page(input.page, input.page_size, input.limit, input.offset, 100);
                 let size = page_size.unwrap_or(100).max(1);
                 let offset = (page.unwrap_or(1).max(1) - 1) * size;
                 let result = self

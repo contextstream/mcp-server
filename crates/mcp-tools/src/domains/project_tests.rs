@@ -2449,6 +2449,47 @@ fn a_project_page_says_where_it_sits_and_how_to_get_more() {
 }
 
 #[test]
+fn page_takes_limits_size_and_a_page_past_the_end_says_so() {
+    // #451: limit=100, page=2 listed rows 21-40, not the 101-200 the hint meant.
+    assert_eq!(
+        requested_page(Some(2), None, Some(100), None, 20),
+        (Some(2), Some(100))
+    );
+    assert_eq!(
+        requested_page(Some(2), None, Some(10), None, 20),
+        (Some(2), Some(10))
+    );
+    assert_eq!(
+        requested_page(None, None, Some(10), Some(10), 20),
+        (Some(2), Some(10))
+    );
+    assert_eq!(
+        requested_page(Some(5), None, Some(10), Some(10), 20),
+        (Some(5), Some(10))
+    );
+    assert_eq!(
+        requested_page(Some(2), Some(5), Some(100), None, 100),
+        (Some(2), Some(5))
+    );
+    assert_eq!(
+        requested_page(Some(2), None, None, None, 100),
+        (Some(2), Some(100))
+    );
+    assert_eq!(requested_page(None, None, None, None, 20), (None, None));
+
+    assert_eq!(
+        project_list_past_end(Some(93), Some(20), Some(1836)).as_deref(),
+        Some("Page 93 is past the end: 1836 projects, 92 pages of 20.")
+    );
+    assert_eq!(
+        project_list_past_end(Some(999), None, None).as_deref(),
+        Some("Page 999 is past the end of the project list.")
+    );
+    assert_eq!(project_list_past_end(Some(1), Some(20), Some(0)), None);
+    assert_eq!(project_list_past_end(None, None, None), None);
+}
+
+#[test]
 fn project_overview_and_statistics_read_as_text() {
     // #429: "Project overview loaded." / "Project statistics loaded."
     let overview = json!({"id": "11111111-1111-4111-8111-111111111111", "name": "sxproj",

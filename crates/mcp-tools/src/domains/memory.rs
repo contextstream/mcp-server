@@ -2963,7 +2963,7 @@ impl ToolHandler for MemoryDecisionsTool {
 /// with recurring-signal + product/design event types: `standup`,
 /// `status_update`, `question`, `approval`, `feedback` (customer-facing —
 /// distinct from internal `frustration`), `discovery`, `achievement`.
-const VALID_EVENT_TYPES: &[&str] = &[
+pub(crate) const VALID_EVENT_TYPES: &[&str] = &[
     "decision",
     "preference",
     "insight",
@@ -2992,6 +2992,39 @@ const VALID_EVENT_TYPES: &[&str] = &[
     "discovery",
     "achievement",
 ];
+
+/// Refuses a doc, event or diagram type outside the advertised enum on the
+/// actions that store it, and spells an accepted one the way the enum does
+/// (#350). Filters are left alone: stored records can carry older types.
+fn check_stored_types(action: &str, input: &mut MemoryInput) -> Result<()> {
+    use crate::input_shape::enum_argument;
+    match action {
+        "create_doc" | "update_doc" => {
+            input.doc_type = enum_argument("doc_type", input.doc_type.take(), VALID_DOC_TYPES)
+                .map_err(Error::Validation)?;
+        }
+        "create_event" | "update_event"
+            if !input
+                .event_type
+                .as_deref()
+                .is_some_and(is_reserved_plan_event_type) =>
+        {
+            input.event_type =
+                enum_argument("event_type", input.event_type.take(), VALID_EVENT_TYPES)
+                    .map_err(Error::Validation)?;
+        }
+        "create_diagram" | "update_diagram" => {
+            input.diagram_type = enum_argument(
+                "diagram_type",
+                input.diagram_type.take(),
+                VALID_DIAGRAM_TYPES,
+            )
+            .map_err(Error::Validation)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 fn is_reserved_plan_event_type(event_type: &str) -> bool {
     event_type.trim().eq_ignore_ascii_case("plan")
@@ -3339,6 +3372,7 @@ impl ToolHandler for MemoryTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let mut input: MemoryInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
+        check_stored_types(&input.action.to_ascii_lowercase(), &mut input)?;
 
         if input
             .project_id
@@ -3849,6 +3883,7 @@ impl ToolHandler for MemoryTool {
                 }
                 let title = input
                     .title
+                    .filter(|title| !title.trim().is_empty())
                     .ok_or_else(|| Error::Validation("title is required".to_string()))?;
                 let title_for_user = title.clone();
                 let params = mcp_client::CreateMemoryEventParams {
@@ -5125,6 +5160,7 @@ impl ToolHandler for MemoryTool {
             "create_doc" => {
                 let title = input
                     .title
+                    .filter(|title| !title.trim().is_empty())
                     .ok_or_else(|| Error::Validation("title is required".to_string()))?;
                 let content = input
                     .content

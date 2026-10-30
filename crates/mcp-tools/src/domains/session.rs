@@ -5684,6 +5684,9 @@ fn overlay_has_new_dynamic_content(hook_ctx: &str) -> bool {
     hook_ctx.contains("[FLASH]") || hook_ctx.contains("[ACTION_REQUIRED]")
 }
 
+/// The modes `context` advertises; leaving `mode` out is adaptive routing.
+const CONTEXT_MODES: &[&str] = &["standard", "pack", "fast"];
+
 /// Context tool handler.
 pub struct ContextTool {
     client: ContextStreamClient,
@@ -7937,8 +7940,11 @@ impl ContextTool {
 #[async_trait]
 impl ToolHandler for ContextTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
-        let input: ContextInput =
+        let mut input: ContextInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
+        // A mode outside the three is refused, not read as adaptive (#350).
+        input.mode = crate::input_shape::enum_argument("mode", input.mode.take(), CONTEXT_MODES)
+            .map_err(Error::Validation)?;
         let concise_text = concise_tool_text_enabled();
         let wire_budget_tokens = input
             .max_tokens
@@ -10159,7 +10165,7 @@ impl ToolHandler for ContextTool {
             .string_enum(
                 "mode",
                 "Context mode: omit for guarded adaptive routing; standard/pack force full grounding; fast explicitly requests the Redis-cached hook",
-                &["standard", "pack", "fast"],
+                CONTEXT_MODES,
                 false,
             )
             .boolean("distill", "Use distillation for context pack", false)
@@ -10222,6 +10228,18 @@ pub struct SessionCaptureInput {
     pub code_refs: Option<Vec<Value>>,
 }
 
+/// `event_type` as one of the event types memory advertises, `default` when
+/// it is blank; anything else is refused with the list (#350).
+fn checked_event_type(event_type: Option<String>, default: &str) -> Result<String> {
+    Ok(crate::input_shape::enum_argument(
+        "event_type",
+        event_type,
+        crate::domains::memory::VALID_EVENT_TYPES,
+    )
+    .map_err(Error::Validation)?
+    .unwrap_or_else(|| default.to_string()))
+}
+
 fn is_reserved_plan_event_type(event_type: Option<&str>) -> bool {
     event_type
         .map(str::trim)
@@ -10251,12 +10269,19 @@ impl SessionCaptureTool {
 #[async_trait]
 impl ToolHandler for SessionCaptureTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
-        let input: SessionCaptureInput =
+        let mut input: SessionCaptureInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
 
         if is_reserved_plan_event_type(input.event_type.as_deref()) {
             return Err(reserved_plan_event_error());
         }
+        if input.title.trim().is_empty() {
+            return Err(Error::Validation("title is required".to_string()));
+        }
+        input.event_type = Some(checked_event_type(
+            input.event_type.take(),
+            "uncategorized",
+        )?);
 
         let mut scope = resolve_write_scope(
             &self.client,
@@ -10381,28 +10406,7 @@ impl ToolHandler for SessionCaptureTool {
             .string_enum(
                 "event_type",
                 "Event type",
-                &[
-                    "decision",
-                    "preference",
-                    "insight",
-                    "uncategorized",
-                    "note",
-                    "general",
-                    "manual_note",
-                    "implementation",
-                    "operation",
-                    "command_execution",
-                    "file_operation",
-                    "task",
-                    "bug",
-                    "feature",
-                    "correction",
-                    "lesson",
-                    "warning",
-                    "frustration",
-                    "conversation",
-                    "session_snapshot",
-                ],
+                crate::domains::memory::VALID_EVENT_TYPES,
                 false,
             )
             .string("title", "Short descriptive title", true)
@@ -16651,12 +16655,10 @@ impl ToolHandler for SessionTool {
 
         match input.action.to_lowercase().as_str() {
             "capture" => {
-                let event_type = input
-                    .event_type
-                    .unwrap_or_else(|| "uncategorized".to_string());
-                if is_reserved_plan_event_type(Some(&event_type)) {
+                if is_reserved_plan_event_type(input.event_type.as_deref()) {
                     return Err(reserved_plan_event_error());
                 }
+                let event_type = checked_event_type(input.event_type, "uncategorized")?;
                 // A decision with structured fields is a typed decision:
                 // route it to memory(create_decision) (typed endpoint first,
                 // events fallback on 404 with a [PARTIAL] line).
@@ -16694,6 +16696,7 @@ impl ToolHandler for SessionTool {
                 }
                 let title = input
                     .title
+                    .filter(|title| !title.trim().is_empty())
                     .ok_or_else(|| Error::Validation("title is required".to_string()))?;
                 let content = input
                     .content
@@ -16715,10 +16718,10 @@ impl ToolHandler for SessionTool {
                     .await
             }
             "retro_capture" | "capture_retroactive" | "retroactive_capture" => {
-                let event_type = input.event_type.clone().unwrap_or_else(|| "note".to_string());
-                if is_reserved_plan_event_type(Some(&event_type)) {
+                if is_reserved_plan_event_type(input.event_type.as_deref()) {
                     return Err(reserved_plan_event_error());
                 }
+                let event_type = checked_event_type(input.event_type.clone(), "note")?;
 
                 let title = input
                     .title
@@ -17680,28 +17683,7 @@ impl ToolHandler for SessionTool {
             .string_enum(
                 "event_type",
                 "Event type (for capture)",
-                &[
-                    "decision",
-                    "preference",
-                    "insight",
-                    "uncategorized",
-                    "note",
-                    "general",
-                    "manual_note",
-                    "implementation",
-                    "operation",
-                    "command_execution",
-                    "file_operation",
-                    "task",
-                    "bug",
-                    "feature",
-                    "correction",
-                    "lesson",
-                    "warning",
-                    "frustration",
-                    "conversation",
-                    "session_snapshot",
-                ],
+                crate::domains::memory::VALID_EVENT_TYPES,
                 false,
             )
             .string_enum(

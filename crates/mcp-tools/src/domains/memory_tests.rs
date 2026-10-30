@@ -1918,6 +1918,67 @@ mod validation_tests {
     }
 
     #[tokio::test]
+    async fn memory_refuses_a_type_outside_its_enum_and_a_blank_title() {
+        // #350. The mock client reaches no server, so a call that passes the
+        // checks fails on the request instead.
+        let client = create_mock_client();
+        let session = create_mock_session(&client);
+        let tool = MemoryTool::new(client, session, mcp_types::atlas_layer::noop_layer());
+
+        for (args, expected) in [
+            (
+                json!({"action": "create_doc", "title": "t", "content": "x", "doc_type": "bogus_type"}),
+                "doc_type \"bogus_type\" is not one of: roadmap, spec, runbook,",
+            ),
+            (
+                json!({"action": "update_doc", "doc_id": "d", "doc_type": "notes"}),
+                "doc_type \"notes\" is not one of:",
+            ),
+            (
+                json!({"action": "create_event", "event_type": "notes", "title": "t", "content": "c"}),
+                "Did you mean \"note\"?",
+            ),
+            (
+                json!({"action": "create_diagram", "diagram_type": "graph", "title": "t", "content": "c"}),
+                "diagram_type \"graph\" is not one of: flowchart,",
+            ),
+            (
+                json!({"action": "create_doc", "title": "  ", "content": "x", "doc_type": "general"}),
+                "title is required",
+            ),
+            (
+                json!({"action": "create_event", "event_type": "note", "title": "", "content": "c"}),
+                "title is required",
+            ),
+            (
+                json!({"action": "create_event", "event_type": "plan", "title": "t"}),
+                "reserved",
+            ),
+        ] {
+            let message = tool
+                .execute(args.clone())
+                .await
+                .expect_err(&args.to_string())
+                .to_string();
+            assert!(message.contains(expected), "{args}: {message}");
+        }
+
+        // A spelling of an advertised value passes the check; filters are not checked.
+        for args in [
+            json!({"action": "create_doc", "title": "t", "content": "x", "doc_type": "Release-Notes"}),
+            json!({"action": "list_docs", "doc_type": "older_type"}),
+            json!({"action": "list_events", "event_type": "older_type"}),
+        ] {
+            if let Err(error) = tool.execute(args.clone()).await {
+                assert!(
+                    !error.to_string().contains("is not one of"),
+                    "{args}: {error}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_memory_tool_get_event_requires_event_id() {
         let client = create_mock_client();
         let session = create_mock_session(&client);

@@ -367,10 +367,81 @@ pub fn tools_call_arguments_error(tool: &str, arguments: Option<&Value>) -> Opti
     ))
 }
 
+/// `value` as one of the values a schema enum advertises for `field`, for the
+/// arguments that store it (#350). Case, surrounding space, and `-` or a space
+/// for `_` do not matter, so `"Release-Notes"` is `release_notes`; a blank
+/// value is no value. Anything else is refused with the advertised values, and
+/// the one that starts the other when there is exactly one (`notes` → `note`).
+pub fn enum_argument(
+    field: &str,
+    value: Option<String>,
+    allowed: &[&str],
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let typed = value.trim();
+    if typed.is_empty() {
+        return Ok(None);
+    }
+    let wanted: String = typed
+        .chars()
+        .map(|c| match c {
+            '-' | ' ' => '_',
+            c => c.to_ascii_lowercase(),
+        })
+        .collect();
+    if let Some(found) = allowed.iter().find(|candidate| **candidate == wanted) {
+        return Ok(Some((*found).to_string()));
+    }
+    let mut message = format!("{field} \"{typed}\" is not one of: {}.", allowed.join(", "));
+    let close: Vec<&str> = allowed
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.starts_with(&wanted) || wanted.starts_with(candidate))
+        .collect();
+    if let [only] = close.as_slice() {
+        message.push_str(&format!(" Did you mean \"{only}\"?"));
+    }
+    Err(message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_enum_argument_is_one_of_the_advertised_values_or_refused_with_them() {
+        const TYPES: &[&str] = &["note", "release_notes", "general"];
+        let check = |value: Option<&str>| enum_argument("doc_type", value.map(String::from), TYPES);
+
+        assert_eq!(check(None), Ok(None));
+        assert_eq!(check(Some("  ")), Ok(None));
+        assert_eq!(check(Some("general")), Ok(Some("general".to_string())));
+        assert_eq!(
+            check(Some(" Release-Notes ")),
+            Ok(Some("release_notes".to_string()))
+        );
+        assert_eq!(
+            check(Some("release notes")),
+            Ok(Some("release_notes".to_string()))
+        );
+        assert_eq!(
+            check(Some("bogus_type")),
+            Err("doc_type \"bogus_type\" is not one of: note, release_notes, general.".to_string())
+        );
+        assert_eq!(
+            check(Some("notes")),
+            Err("doc_type \"notes\" is not one of: note, release_notes, general. Did you mean \"note\"?"
+                .to_string())
+        );
+        assert_eq!(
+            check(Some("gen")),
+            Err("doc_type \"gen\" is not one of: note, release_notes, general. Did you mean \"general\"?"
+                .to_string())
+        );
+    }
 
     fn init_schema() -> Value {
         json!({

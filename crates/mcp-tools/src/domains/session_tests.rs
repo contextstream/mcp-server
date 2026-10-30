@@ -3806,8 +3806,8 @@ mod validation_tests {
     };
     use super::{
         CapturePlanInput, CapturePlanTool, ContextTool, GetPlanTool, SessionCaptureLessonTool,
-        SessionCompressTool, SessionDecisionTraceTool, SessionDeltaTool, SessionRememberTool,
-        SessionSmartSearchTool, SessionTool, TestFixtures, UpdatePlanTool,
+        SessionCaptureTool, SessionCompressTool, SessionDecisionTraceTool, SessionDeltaTool,
+        SessionRememberTool, SessionSmartSearchTool, SessionTool, TestFixtures, UpdatePlanTool,
     };
     use crate::domains::lookup::{MatchGrade, Unresolved};
 
@@ -5151,6 +5151,72 @@ mod validation_tests {
         let message = result.unwrap_err().to_string();
         assert!(message.contains("reserved"));
         assert!(message.contains("capture_plan"));
+    }
+
+    #[tokio::test]
+    async fn captures_and_context_refuse_values_outside_their_enums() {
+        // #350. The mock client reaches no server, so these refusals come first.
+        let client = create_mock_client();
+        let session = create_mock_session();
+        let tool = SessionTool::new(
+            client.clone(),
+            session.clone(),
+            mcp_types::atlas_layer::noop_layer(),
+        );
+        for (args, expected) in [
+            (
+                json!({"action": "capture", "event_type": "bogus", "title": "t", "content": "c"}),
+                "event_type \"bogus\" is not one of: decision, preference,",
+            ),
+            (
+                json!({"action": "retro_capture", "event_type": "bogus", "title": "t", "content": "c"}),
+                "event_type \"bogus\" is not one of:",
+            ),
+            (
+                json!({"action": "capture", "event_type": "note", "title": " ", "content": "c"}),
+                "title is required",
+            ),
+        ] {
+            let message = tool
+                .execute(args.clone())
+                .await
+                .expect_err(&args.to_string())
+                .to_string();
+            assert!(message.contains(expected), "{args}: {message}");
+        }
+
+        let capture = SessionCaptureTool::new(client.clone(), session.clone());
+        let message = capture
+            .execute(json!({"event_type": "bogus", "title": "t", "content": "c"}))
+            .await
+            .expect_err("bogus event_type")
+            .to_string();
+        assert!(
+            message.contains("event_type \"bogus\" is not one of:"),
+            "{message}"
+        );
+        // A capture may log a memory-only type such as standup, as memory does.
+        let schema = capture.input_schema();
+        let advertised = schema["properties"]["event_type"]["enum"]
+            .as_array()
+            .expect("event_type enum");
+        assert!(advertised.iter().any(|value| value == "standup"));
+
+        let context = ContextTool::new(
+            client,
+            session,
+            create_mock_index_keeper(),
+            mcp_types::atlas_layer::noop_layer(),
+        );
+        let message = context
+            .execute(json!({"user_message": "hello", "mode": "bogus"}))
+            .await
+            .expect_err("bogus mode")
+            .to_string();
+        assert!(
+            message.contains("mode \"bogus\" is not one of: standard, pack, fast."),
+            "{message}"
+        );
     }
 
     #[tokio::test]

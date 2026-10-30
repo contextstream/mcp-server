@@ -8115,6 +8115,7 @@ impl ContextStreamClient {
         let authoritative_snapshot = if Self::authoritative_snapshot_eligible(
             force,
             origin.as_deref(),
+            manifest_base_data.hashes.is_empty(),
             effective_scan_complete,
             total_failed,
             wait_summary.pending_jobs,
@@ -8258,19 +8259,28 @@ impl ContextStreamClient {
         files_uploaded > 0 || deleted_paths > 0 || committed_batch || authoritative_snapshot_sent
     }
 
-    /// Whether a finished scan may send an authoritative snapshot: only a
-    /// forced or hosted refresh whose scan was complete (uncapped, nothing
-    /// deferred), whose every file committed, and with no job still pending.
-    /// Anything less is not this checkout's whole inventory, and the server
-    /// deletes every row of this checkout that the snapshot does not name.
+    /// Whether a finished scan may send an authoritative snapshot: a forced
+    /// or hosted refresh, or a scan with no manifest to diff against (the first
+    /// scan under a checkout guard, or after the manifest was lost), whose scan
+    /// was complete (uncapped, nothing deferred), whose every file committed,
+    /// and with no job still pending. Anything less is not this checkout's whole
+    /// inventory, and the server deletes every row of this checkout that the
+    /// snapshot does not name.
+    ///
+    /// Without a manifest the client cannot tell which indexed paths are gone:
+    /// deletions are the paths the last manifest held that the walk no longer
+    /// finds. Files deleted or renamed while an earlier version lost its manifest
+    /// every session stayed in the index for good, and exhaustive search kept
+    /// listing them (mcp-server#373).
     fn authoritative_snapshot_eligible(
         force: bool,
         origin: Option<&str>,
+        no_prior_manifest: bool,
         scan_complete: bool,
         files_failed: i64,
         pending_jobs: i64,
     ) -> bool {
-        (force || origin == Some("hosted_refresh"))
+        (force || origin == Some("hosted_refresh") || no_prior_manifest)
             && scan_complete
             && files_failed == 0
             && pending_jobs == 0
@@ -8429,6 +8439,12 @@ impl ContextStreamClient {
                 "sent": true,
                 "file_count": file_count,
                 "job_id": result.get("job_id").cloned().unwrap_or(serde_json::Value::Null),
+                // How many indexed rows of this checkout the walk no longer holds,
+                // which the server removed.
+                "reconciled_stale_paths": result
+                    .get("reconciled_stale_paths")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
             }),
             Err(error) => {
                 tracing::warn!(
@@ -26265,26 +26281,114 @@ mod tests {
     // The server deletes every row of this checkout a snapshot does not name,
     // so anything short of a whole, committed inventory must never send one.
     #[test]
-    fn only_a_complete_committed_forced_or_hosted_refresh_sends_a_snapshot() {
+    fn only_a_complete_committed_forced_hosted_or_manifestless_scan_sends_a_snapshot() {
         let eligible = ContextStreamClient::authoritative_snapshot_eligible;
-        assert!(eligible(true, None, true, 0, 0));
-        assert!(eligible(false, Some("hosted_refresh"), true, 0, 0));
+        assert!(eligible(true, None, false, true, 0, 0));
+        assert!(eligible(false, Some("hosted_refresh"), false, true, 0, 0));
+        // No manifest to diff against: any caller's complete, committed scan
+        // reconciles once (mcp-server#373).
+        assert!(eligible(false, None, true, true, 0, 0));
+        assert!(eligible(false, Some("watch"), true, true, 0, 0));
         for (case, ok) in [
-            ("partial or capped scan", eligible(true, None, false, 0, 0)),
-            ("a failed file", eligible(true, None, true, 1, 0)),
-            ("a job still pending", eligible(true, None, true, 0, 1)),
+            (
+                "partial or capped scan",
+                eligible(true, None, false, false, 0, 0),
+            ),
+            ("a failed file", eligible(true, None, false, true, 1, 0)),
+            (
+                "a job still pending",
+                eligible(true, None, false, true, 0, 1),
+            ),
             (
                 "keep_warm",
-                eligible(false, Some("keep_warm_daemon"), true, 0, 0),
+                eligible(false, Some("keep_warm_daemon"), false, true, 0, 0),
             ),
-            ("watch", eligible(false, Some("watch"), true, 0, 0)),
+            ("watch", eligible(false, Some("watch"), false, true, 0, 0)),
             (
                 "explicit ingest without force",
-                eligible(false, None, true, 0, 0),
+                eligible(false, None, false, true, 0, 0),
+            ),
+            (
+                "no manifest but a capped scan",
+                eligible(false, None, true, false, 0, 0),
+            ),
+            (
+                "no manifest but a failed file",
+                eligible(false, None, true, true, 1, 0),
+            ),
+            (
+                "no manifest but a job still pending",
+                eligible(false, None, true, true, 0, 1),
             ),
         ] {
             assert!(!ok, "{case} must not send a snapshot");
         }
+    }
+
+    // mcp-server#373: with no manifest the client cannot know which indexed paths
+    // are gone, so the first complete scan under a guard sends its snapshot and the
+    // server removes this checkout's rows that the walk no longer holds.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_scan_with_no_manifest_sends_a_snapshot_and_reports_what_was_removed() {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home = std::env::temp_dir().join(format!(
+            "contextstream-snapshot-nomanifest-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_home).expect("create temp home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let root = initialize_bound_ingest_fixture(&temp_home, project_id, workspace_id)
+            .expect("initialize checkout");
+        // The manifest the fixture seeded is gone, as after a changed guard.
+        let _ = std::fs::remove_dir_all(temp_home.join(".contextstream").join("file-hashes"));
+        let committed = serde_json::json!({ "files_indexed": 1, "committed": true }).to_string();
+        let status = primary_attestation_fixture(project_id, workspace_id, 44, 'd').to_string();
+        let reconciled = serde_json::json!({
+            "files_indexed": 0,
+            "committed": true,
+            "reconciled_stale_paths": 2,
+        })
+        .to_string();
+        let (client, server) = client_with_http_sequence(vec![
+            ("200 OK", committed),
+            ("200 OK", status),
+            ("200 OK", reconciled),
+        ])
+        .await;
+        let result = client
+            .ingest_local(IngestLocalParams {
+                path: root.to_string_lossy().to_string(),
+                workspace_id: Some(workspace_id),
+                project_id: Some(project_id),
+                force: Some(false),
+                include_media: Some(false),
+                ..Default::default()
+            })
+            .await
+            .expect("a first scan under this guard");
+        assert_eq!(result["authoritative_snapshot"]["sent"], true, "{result}");
+        assert_eq!(
+            result["authoritative_snapshot"]["reconciled_stale_paths"], 2,
+            "{result}"
+        );
+        let requests = server.await.expect("HTTP sequence task");
+        let ingests = requests
+            .iter()
+            .filter(|request| {
+                request.starts_with(&format!("POST /api/v1/projects/{project_id}/files/ingest "))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ingests.len(), 2, "{requests:?}");
+        let snapshot = &request_body(ingests[1])["authoritative_snapshot"];
+        assert_eq!(snapshot["paths"], serde_json::json!(["lib.rs"]));
+
+        let _ = std::fs::remove_dir_all(temp_home);
     }
 
     // A watch scan that changed nothing asked for a graph build anyway, and the server charged

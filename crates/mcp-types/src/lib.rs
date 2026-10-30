@@ -58,15 +58,16 @@ pub use harness_teaching::{
     HarnessTeachingContract, HarnessTeachingDelivery, HarnessTeachingStep, HarnessTeachingStepId,
     StatelessMcpConformance, HARNESS_TEACHING_SCHEMA_VERSION, HARNESS_TEACHING_VERSION,
     MCP_PROTOCOL_2024_11_05, MCP_PROTOCOL_2025_03_26, MCP_PROTOCOL_2025_06_18,
-    MCP_PROTOCOL_2026_07_28,
+    MCP_PROTOCOL_2025_11_25, MCP_PROTOCOL_2026_07_28,
 };
 pub use protocol::{
     build_stateless_discover_result, decorate_stateless_cacheable_result,
-    decorate_stateless_result, has_stateless_protocol_metadata, stateless_protocol_version,
+    decorate_stateless_result, has_stateless_protocol_metadata, legacy_protocol_takes_batches,
+    negotiate_legacy_protocol_version, stateless_protocol_version,
     validate_stateless_jsonrpc_envelope, validate_stateless_method_params,
     validate_stateless_request, McpCacheScope, McpProtocolError, StatelessRequestMetadata,
     MCP_DISCOVERY_TTL_MS, MCP_ERROR_HEADER_MISMATCH, MCP_ERROR_MISSING_REQUIRED_CLIENT_CAPABILITY,
-    MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION, MCP_META_CLIENT_CAPABILITIES, MCP_META_CLIENT_INFO,
-    MCP_META_PROTOCOL_VERSION, MCP_META_SERVER_INFO, MCP_STATELESS_SUPPORTED_VERSIONS,
-    MCP_TOOLS_LIST_TTL_MS,
+    MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION, MCP_LEGACY_SUPPORTED_VERSIONS,
+    MCP_META_CLIENT_CAPABILITIES, MCP_META_CLIENT_INFO, MCP_META_PROTOCOL_VERSION,
+    MCP_META_SERVER_INFO, MCP_STATELESS_SUPPORTED_VERSIONS, MCP_TOOLS_LIST_TTL_MS,
 };

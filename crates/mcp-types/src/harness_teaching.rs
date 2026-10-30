@@ -18,12 +18,14 @@ pub const HARNESS_TEACHING_VERSION: &str = "harness_teaching_v4";
 /// Schema version for the structured teaching response.
 pub const HARNESS_TEACHING_SCHEMA_VERSION: u16 = 3;
 
-/// The only legacy MCP revision this server currently advertises.
+/// The oldest initialize-era MCP revision, and the answer to a client that
+/// names none (see `negotiate_legacy_protocol_version`).
 pub const MCP_PROTOCOL_2024_11_05: &str = "2024-11-05";
 
-/// Legacy MCP revisions whose initialize result supports `instructions`.
+/// Initialize-era MCP revisions whose initialize result supports `instructions`.
 pub const MCP_PROTOCOL_2025_03_26: &str = "2025-03-26";
 pub const MCP_PROTOCOL_2025_06_18: &str = "2025-06-18";
+pub const MCP_PROTOCOL_2025_11_25: &str = "2025-11-25";
 
 /// Breaking stateless protocol revision. It is not a legacy initialize variant.
 pub const MCP_PROTOCOL_2026_07_28: &str = "2026-07-28";
@@ -431,12 +433,12 @@ pub fn build_harness_teaching(
 pub fn legacy_protocol_supports_instructions(protocol_version: &str) -> bool {
     matches!(
         protocol_version,
-        MCP_PROTOCOL_2025_03_26 | MCP_PROTOCOL_2025_06_18
+        MCP_PROTOCOL_2025_03_26 | MCP_PROTOCOL_2025_06_18 | MCP_PROTOCOL_2025_11_25
     )
 }
 
 /// Render initialize instructions only for a protocol revision that defines
-/// the field. The currently advertised 2024 revision therefore returns None.
+/// the field. The 2024 revision therefore returns None.
 pub fn legacy_initialize_instructions(
     protocol_version: &str,
     harness_id: Option<HarnessId>,
@@ -801,7 +803,11 @@ mod tests {
             legacy_initialize_instructions(MCP_PROTOCOL_2024_11_05, Some(HarnessId::Codex))
                 .is_none()
         );
-        for version in [MCP_PROTOCOL_2025_03_26, MCP_PROTOCOL_2025_06_18] {
+        for version in [
+            MCP_PROTOCOL_2025_03_26,
+            MCP_PROTOCOL_2025_06_18,
+            MCP_PROTOCOL_2025_11_25,
+        ] {
             let instructions = legacy_initialize_instructions(version, Some(HarnessId::Codex))
                 .expect("supported legacy instructions");
             assert!(instructions.contains(HARNESS_TEACHING_VERSION));

@@ -1723,6 +1723,7 @@ async fn search_docs_by_title(
     let mut docs = extract_collection_array(&server_docs)
         .cloned()
         .unwrap_or_default();
+    let server_matches = docs.clone();
 
     let ranked_server_docs = rank_docs_for_query(docs.clone(), query, return_limit);
     let best_server_score = ranked_server_docs
@@ -1748,7 +1749,30 @@ async fn search_docs_by_title(
         );
     }
 
-    Ok(rank_docs_for_query(dedupe_docs(docs), query, return_limit))
+    let mut ranked = rank_docs_for_query(dedupe_docs(docs), query, return_limit);
+    keep_server_body_matches(&mut ranked, server_matches, return_limit);
+    Ok(ranked)
+}
+
+/// The server's doc search reads bodies too; a doc it returned for the query
+/// with no title word in common scored 0 here and was dropped, so a runbook
+/// was found only by its title words (#416). Such docs follow the title
+/// matches, in the server's order.
+fn keep_server_body_matches(ranked: &mut Vec<Value>, server_matches: Vec<Value>, limit: usize) {
+    for doc in server_matches {
+        if ranked.len() >= limit {
+            break;
+        }
+        let Some(id) = doc.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !ranked
+            .iter()
+            .any(|kept| kept.get("id").and_then(Value::as_str) == Some(id))
+        {
+            ranked.push(doc);
+        }
+    }
 }
 
 fn format_doc_matches(query: &str, docs: &[Value]) -> String {

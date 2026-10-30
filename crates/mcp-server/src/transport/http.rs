@@ -587,14 +587,16 @@ fn jsonrpc_message_from_value(value: Value) -> Result<IncomingMcpMessage, (Value
         Value::Array(_) => return Err((Value::Null, "a batch holds JSON-RPC message objects")),
         _ => return Err((Value::Null, "the body must be one JSON-RPC message object")),
     };
+    let null_id = matches!(message.get("id"), Some(Value::Null));
     let id = match message.remove("id") {
         None | Some(Value::Null) => None,
         Some(id @ (Value::String(_) | Value::Number(_))) => Some(id),
         Some(_) => return Err((Value::Null, "\"id\" must be a string or a number")),
     };
     let error_id = id.clone().unwrap_or(Value::Null);
+    // "1.0" was taken as 2.0 while a missing version was refused (#368).
     let jsonrpc = match message.remove("jsonrpc") {
-        Some(Value::String(jsonrpc)) => jsonrpc,
+        Some(Value::String(jsonrpc)) if jsonrpc == "2.0" => jsonrpc,
         _ => return Err((error_id, "\"jsonrpc\" must be \"2.0\"")),
     };
     let method = match message.remove("method") {
@@ -605,6 +607,15 @@ fn jsonrpc_message_from_value(value: Value) -> Result<IncomingMcpMessage, (Value
         }
         None => return Err((error_id, "missing \"method\"")),
     };
+    // MCP: a request's id "MUST NOT be null". One was taken for a notification
+    // and never answered while the client waited (#368); a notification sent
+    // with `"id": null` is still read as one.
+    if null_id && !method.starts_with("notifications/") {
+        return Err((
+            Value::Null,
+            "\"id\" must not be null; a request needs a string or number id, and a notification has no \"id\"",
+        ));
+    }
     Ok(IncomingMcpMessage::Request(JsonRpcRequest {
         jsonrpc,
         id,
@@ -2808,7 +2819,7 @@ async fn handle_call_tool_method(
         .and_then(|n| n.as_str())
         .ok_or_else(|| JsonRpcError {
             code: -32602,
-            message: "Missing 'name' parameter".to_string(),
+            message: "Invalid params: tools/call requires \"name\", the tool to run".to_string(),
             data: None,
         })?;
 
@@ -2923,10 +2934,12 @@ async fn handle_call_tool_method(
         }
     }
 
-    if strict_protocol_errors && registry.get(name).is_none() {
+    // MCP lists an unknown tool as a protocol error (-32602), on every
+    // transport; it answered a failed tool result outside strict mode (#368).
+    if registry.get(name).is_none() {
         return Err(JsonRpcError {
             code: -32602,
-            message: format!("Unknown tool: {name}"),
+            message: crate::server::unknown_tool_message(&registry, name),
             data: None,
         });
     }
@@ -8279,5 +8292,42 @@ mod tool_call_error_tests {
             tool_call_error_response(mcp_types::Error::http(409, "Conflict"), true, None, "◎")
                 .expect("a tool result");
         assert_eq!(response["isError"], true);
+    }
+}
+
+#[cfg(test)]
+mod jsonrpc_envelope_tests {
+    use super::*;
+
+    #[test]
+    fn a_request_needs_version_2_0_and_an_id_that_is_not_null() {
+        // #368: "1.0" was served, and an id of null was read as a notification.
+        let refused = |message: Value| {
+            jsonrpc_message_from_value(message)
+                .err()
+                .map(|(_, why)| why)
+        };
+        assert_eq!(
+            refused(serde_json::json!({"jsonrpc": "1.0", "id": 9, "method": "ping"})),
+            Some("\"jsonrpc\" must be \"2.0\"")
+        );
+        assert!(
+            refused(serde_json::json!({"jsonrpc": "2.0", "id": null, "method": "ping"}))
+                .is_some_and(|why| why.contains("must not be null"))
+        );
+        match jsonrpc_message_from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": null, "method": "notifications/initialized"
+        })) {
+            Ok(IncomingMcpMessage::Request(request)) => assert!(request.id.is_none()),
+            _ => panic!("a notification sent with a null id is still a notification"),
+        }
+        match jsonrpc_message_from_value(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+        ) {
+            Ok(IncomingMcpMessage::Request(request)) => {
+                assert_eq!(request.id, Some(serde_json::json!(1)))
+            }
+            _ => panic!("a 2.0 request is a request"),
+        }
     }
 }

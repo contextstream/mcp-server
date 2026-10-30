@@ -1607,6 +1607,62 @@ fn current_client_cache_identity() -> Option<String> {
     client_cache_identity_for_session_key(get_task_session_key())
 }
 
+/// How many memory writes each caller has made in this process (#464).
+/// Result caches above the client put it in their keys, so an answer read
+/// before a caller's write is never replayed to that caller after it.
+static MEMORY_WRITE_GENERATIONS: OnceLock<Mutex<MemoryWriteGenerations>> = OnceLock::new();
+
+/// Bounded: when it holds `MAX_CALLERS` callers it starts a new epoch, which
+/// changes every caller's generation (a cache miss, never a stale hit).
+#[derive(Default)]
+struct MemoryWriteGenerations {
+    epoch: u64,
+    by_caller: std::collections::HashMap<String, u64>,
+}
+
+impl MemoryWriteGenerations {
+    const MAX_CALLERS: usize = 4096;
+
+    fn bump(&mut self, caller: String) {
+        if self.by_caller.len() >= Self::MAX_CALLERS && !self.by_caller.contains_key(&caller) {
+            self.by_caller.clear();
+            self.epoch += 1;
+        }
+        *self.by_caller.entry(caller).or_insert(0) += 1;
+    }
+
+    fn get(&self, caller: &str) -> String {
+        format!(
+            "{}.{}",
+            self.epoch,
+            self.by_caller.get(caller).copied().unwrap_or(0)
+        )
+    }
+}
+
+fn bump_memory_write_generation() {
+    let Some(caller) = current_client_cache_identity() else {
+        return;
+    };
+    if let Ok(mut generations) = MEMORY_WRITE_GENERATIONS
+        .get_or_init(Default::default)
+        .lock()
+    {
+        generations.bump(caller);
+    }
+}
+
+/// The current caller's memory write generation, for result-cache keys
+/// (#464). It changes after every memory write this caller makes.
+pub fn memory_write_generation() -> String {
+    let caller = current_client_cache_identity().unwrap_or_default();
+    MEMORY_WRITE_GENERATIONS
+        .get_or_init(Default::default)
+        .lock()
+        .map(|generations| generations.get(&caller))
+        .unwrap_or_default()
+}
+
 fn client_cache_identity_for_session_key(session_key: Option<SessionKey>) -> Option<String> {
     match session_key {
         None | Some(SessionKey::AnonymousHttp(_)) => None,
@@ -4387,6 +4443,8 @@ impl ContextStreamClient {
     }
 
     pub(crate) fn invalidate_memory_read_caches(&self) {
+        // Tool-level result caches key on this (#464).
+        bump_memory_write_generation();
         self.invalidate_custom_cache_prefix(MEMORY_SEARCH_CACHE_PREFIX);
         self.invalidate_custom_cache_prefix(SESSION_RECALL_CACHE_PREFIX);
         // The overview counts the memory just written (#453).
@@ -4394,6 +4452,8 @@ impl ContextStreamClient {
     }
 
     fn invalidate_doc_caches(&self) {
+        // Memory search lists docs too (#464).
+        bump_memory_write_generation();
         self.invalidate_custom_cache_prefix(DOCS_LIST_CACHE_PREFIX);
         self.invalidate_custom_cache_prefix(DOCS_GET_CACHE_PREFIX);
         self.invalidate_custom_cache_prefix(PROJECT_OVERVIEW_CACHE_PREFIX);
@@ -29947,6 +30007,52 @@ mod tests {
             2,
             "degraded success responses must not enter the client cache"
         );
+    }
+
+    #[tokio::test]
+    async fn a_memory_write_moves_the_callers_write_generation() {
+        // #464: tool-level result caches key on the generation, so a memory
+        // search made before a write is not replayed to that caller after it.
+        let created = serde_json::json!({
+            "success": true,
+            "data": {"id": "11111111-1111-4111-8111-111111111111"}
+        });
+        let (client, server) =
+            client_with_http_sequence(vec![("200 OK", created.to_string())]).await;
+        let (before, after) = run_with_session_key(SessionKey::Local, || async {
+            let before = memory_write_generation();
+            client
+                .create_memory_node(CreateMemoryNodeParams {
+                    node_type: "fact".to_string(),
+                    title: "WR node".to_string(),
+                    content: Some("body".to_string()),
+                    workspace_id: Some(Uuid::from_u128(1)),
+                    project_id: None,
+                    metadata: None,
+                })
+                .await
+                .expect("create node");
+            (before, memory_write_generation())
+        })
+        .await;
+        assert_ne!(before, after);
+        server.await.expect("create-node server task");
+    }
+
+    #[test]
+    fn write_generations_are_bounded_and_never_repeat_a_value() {
+        let mut generations = MemoryWriteGenerations::default();
+        generations.bump("a".to_string());
+        assert_eq!(generations.get("a"), "0.1");
+        assert_eq!(generations.get("b"), "0.0");
+        for i in 0..MemoryWriteGenerations::MAX_CALLERS {
+            generations.bump(format!("c{i}"));
+        }
+        // The cap started a new epoch, so no caller reads a value it read
+        // before the reset.
+        assert_eq!(generations.epoch, 1);
+        assert_eq!(generations.get("a"), "1.0");
+        assert!(generations.by_caller.len() <= MemoryWriteGenerations::MAX_CALLERS);
     }
 
     #[test]

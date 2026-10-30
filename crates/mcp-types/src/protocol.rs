@@ -57,6 +57,25 @@ pub fn negotiate_legacy_protocol_version(requested: Option<&str>) -> &'static st
     }
 }
 
+/// The most messages one JSON-RPC batch may hold (#421). Each member is a
+/// call of its own, so an uncapped batch let one request carry thousands.
+pub const MAX_BATCH_MESSAGES: usize = 20;
+
+/// Why a batch of `len` messages is refused: it is empty, or it holds more
+/// than [`MAX_BATCH_MESSAGES`].
+pub fn batch_size_refusal(len: usize) -> Option<String> {
+    if len == 0 {
+        Some("Invalid Request: an empty batch; send at least one JSON-RPC message".to_string())
+    } else if len > MAX_BATCH_MESSAGES {
+        Some(format!(
+            "Invalid Request: a batch holds at most {MAX_BATCH_MESSAGES} messages and this one \
+             holds {len}; send the rest in further requests"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Whether a request that names `version` in `MCP-Protocol-Version` may be a
 /// JSON-RPC batch. 2025-03-26 requires receiving batches, 2025-06-18 removed
 /// them, and a client of 2025-03-26 or older sends no header at all (`None`).
@@ -380,6 +399,23 @@ pub fn build_stateless_discover_result(instructions: Option<String>) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_batch_holds_one_to_twenty_messages() {
+        // #421: 40,000 pings in one request were all answered.
+        assert!(
+            super::batch_size_refusal(0).is_some_and(|refusal| refusal.contains("an empty batch"))
+        );
+        assert_eq!(super::batch_size_refusal(1), None);
+        assert_eq!(super::batch_size_refusal(super::MAX_BATCH_MESSAGES), None);
+        assert_eq!(
+            super::batch_size_refusal(21).as_deref(),
+            Some(
+                "Invalid Request: a batch holds at most 20 messages and this one holds 21; \
+                 send the rest in further requests"
+            )
+        );
+    }
+
     #[test]
     fn initialize_answers_the_asked_revision_when_supported_and_the_newest_otherwise() {
         for version in MCP_LEGACY_SUPPORTED_VERSIONS {

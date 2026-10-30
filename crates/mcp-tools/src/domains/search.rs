@@ -3860,6 +3860,40 @@ fn scores_follow_order(rows: &[&mcp_types::api::SearchResult]) -> bool {
     shown.windows(2).all(|pair| pair[0] >= pair[1])
 }
 
+/// What an empty page past the last result says (#460). The header counts
+/// every match, so an offset at or past that count gets where the last page
+/// starts, not advice to change the output format.
+fn search_page_past_end_note(offset: i64, total: i64, limit: Option<i64>) -> Option<String> {
+    if total <= 0 || offset < total {
+        return None;
+    }
+    let last_page = limit
+        .filter(|limit| *limit > 0)
+        .map(|limit| {
+            format!(
+                " The last page of {limit} starts at offset={}.",
+                (total - 1) / limit * limit
+            )
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "Offset {offset} is past the end of the {total} results; pass an offset below {total}.{last_page}\n"
+    ))
+}
+
+/// The page footer: which rows a later page holds, not only how many (#460).
+fn search_page_shown_line(offset: i64, shown: i64, total: i64) -> String {
+    if offset > 0 && shown > 0 {
+        format!(
+            "Showing {}\u{2013}{} of {total}.",
+            offset + 1,
+            offset + shown
+        )
+    } else {
+        format!("Showing {shown} of {total}.")
+    }
+}
+
 #[cfg(test)]
 mod score_display_tests {
     use super::*;
@@ -13670,14 +13704,27 @@ impl SearchTool {
                 }
             }
 
+            // Result rows are numbered by their place in the whole result, so a
+            // later page continues the numbering (#460). Paths are not: the
+            // offset counts rows, and one file can hold several.
+            let page_offset = resolved_offset.unwrap_or(0).max(0);
+            let past_end_note = search_page_past_end_note(page_offset, total, resolved_limit);
             if requested_paths_output {
                 for (idx, path) in result.paths.iter().enumerate() {
                     text.push_str(&format!("{}. {}\n", idx + 1, path));
                 }
+                if result.paths.is_empty() {
+                    if let Some(note) = &past_end_note {
+                        text.push_str(note);
+                    }
+                }
             } else if result.results.is_empty() {
-                text.push_str(
-                    "Server returned compact output (count/paths). Rerun with output_format=\"full\" for detailed result rows.\n\n",
-                );
+                match &past_end_note {
+                    Some(note) => text.push_str(note),
+                    None => text.push_str(
+                        "Server returned compact output (count/paths). Rerun with output_format=\"full\" for detailed result rows.\n\n",
+                    ),
+                }
             } else {
                 let (code_results, memory_results): (Vec<_>, Vec<_>) = result
                     .results
@@ -13718,12 +13765,13 @@ impl SearchTool {
                         break;
                     }
                     idx += 1;
+                    let position = page_offset as usize + idx;
                     let line = if show_scores {
-                        format_result_line(idx, item, show_content)
+                        format_result_line(position, item, show_content)
                     } else {
                         let mut unscored = (*item).clone();
                         unscored.score = None;
-                        format_result_line(idx, &unscored, show_content)
+                        format_result_line(position, &unscored, show_content)
                     };
                     text.push_str(&label_widened_scope_row(
                         line,
@@ -13740,10 +13788,10 @@ impl SearchTool {
                     // The header counts every match: say when fewer are listed
                     // (#313). Only the server knows where its next page starts,
                     // so the offset comes from its next_offset (#324).
-                    let offset = resolved_offset.unwrap_or(0).max(0);
+                    let offset = page_offset;
                     let shown = idx as i64;
                     if shown < total - offset {
-                        text.push_str(&format!("Showing {shown} of {total}."));
+                        text.push_str(&search_page_shown_line(offset, shown, total));
                         if let Some(next) = result.next_offset.filter(|next| *next > offset) {
                             text.push_str(&format!(" Pass offset={next} for the next page."));
                         }
@@ -13759,7 +13807,11 @@ impl SearchTool {
                             break;
                         }
                         idx += 1;
-                        text.push_str(&format_result_line(idx, item, show_content));
+                        text.push_str(&format_result_line(
+                            page_offset as usize + idx,
+                            item,
+                            show_content,
+                        ));
                     }
                 }
             }

@@ -100,6 +100,40 @@ struct HashManifestScope {
 
 /// Credential-free provenance for one validated checkout or folder snapshot.
 ///
+/// What a batch of a multi-batch scan tells the server about the scan it
+/// belongs to. A large first index is sent as batch after batch, and reading
+/// and posting one is slower than indexing it, so between two batches the
+/// server holds nothing for the project and a status read says "ready" with
+/// thousands of files still to come (mcp-server#326). With the scan's size and
+/// how much of it came before, the server can count the files not yet sent.
+/// `sent_before` rather than a running total makes a retried batch idempotent.
+#[derive(Debug, Clone, Copy)]
+struct ScanDeclaration {
+    id: Uuid,
+    total_files: usize,
+    /// Files of the scan sent before the request that carries this.
+    sent_before: usize,
+}
+
+impl ScanDeclaration {
+    fn headers(&self) -> [(String, String); 3] {
+        [
+            (
+                "x-contextstream-ingest-scan".to_string(),
+                self.id.to_string(),
+            ),
+            (
+                "x-contextstream-ingest-scan-files".to_string(),
+                self.total_files.to_string(),
+            ),
+            (
+                "x-contextstream-ingest-scan-sent".to_string(),
+                self.sent_before.to_string(),
+            ),
+        ]
+    }
+}
+
 /// This accompanies every local-root ingest both as a batch object and as
 /// compatible flat per-file fields. It intentionally contains no hostname or
 /// absolute local path; those remain installation-local routing details.
@@ -7425,6 +7459,18 @@ impl ContextStreamClient {
         let mut uploaded_batches: Vec<BatchUploadResult> = Vec::new();
         let mut current_batch: Vec<&serde_json::Value> = Vec::new();
         let mut current_batch_size: usize = 0;
+        // The size of this scan, told to the server with every batch so a
+        // status read between two batches counts the files not sent yet.
+        let scan_id = Uuid::new_v4();
+        let scan_total = changed_files.len();
+        let mut files_sent = 0usize;
+        let scan_for_batch = |sent_before: usize| {
+            (scan_total > 0).then_some(ScanDeclaration {
+                id: scan_id,
+                total_files: scan_total,
+                sent_before,
+            })
+        };
         let mut deleted_paths_payload = if deleted_paths.is_empty() {
             None
         } else {
@@ -7453,6 +7499,7 @@ impl ContextStreamClient {
                             .map(|snapshot| &snapshot.provenance),
                         reroot,
                         false,
+                        scan_for_batch(files_sent),
                     )
                     .await
                 {
@@ -7475,6 +7522,7 @@ impl ContextStreamClient {
                         }
                     }
                 }
+                files_sent += current_batch.len();
                 current_batch.clear();
                 current_batch_size = 0;
                 if halted.is_some() {
@@ -7504,6 +7552,7 @@ impl ContextStreamClient {
                         .map(|snapshot| &snapshot.provenance),
                     reroot,
                     false,
+                    scan_for_batch(files_sent),
                 )
                 .await
             {
@@ -7549,6 +7598,7 @@ impl ContextStreamClient {
                         .map(|snapshot| &snapshot.provenance),
                     reroot,
                     false,
+                    None,
                 )
                 .await
             {
@@ -8222,6 +8272,7 @@ impl ContextStreamClient {
                 None,
                 false,
                 wait_committed,
+                None,
             )
             .await?;
 
@@ -8327,6 +8378,7 @@ impl ContextStreamClient {
                     .map(|snapshot| &snapshot.provenance),
                 reroot,
                 wait_committed,
+                None,
             )
             .await?;
 
@@ -8534,6 +8586,7 @@ impl ContextStreamClient {
         checkout: Option<&CheckoutProvenance>,
         reroot: bool,
         wait_committed: bool,
+        scan: Option<ScanDeclaration>,
     ) -> Result<BatchUploadResult> {
         let file_paths = files
             .iter()
@@ -8560,6 +8613,9 @@ impl ContextStreamClient {
                 "x-contextstream-ingest-origin".to_string(),
                 origin.to_string(),
             ));
+        }
+        if let Some(scan) = scan {
+            extra_headers.extend(scan.headers());
         }
         // Force the backend's synchronous commit lane: a 2xx then means the
         // files are committed + searchable now (no async 202 job), even on the
@@ -8608,10 +8664,14 @@ impl ContextStreamClient {
         checkout: Option<&CheckoutProvenance>,
         reroot: bool,
         wait_committed: bool,
+        scan: Option<ScanDeclaration>,
     ) -> Result<Vec<BatchUploadResult>> {
         let mut pending: Vec<(Vec<&serde_json::Value>, Option<Vec<String>>)> =
             vec![(files.to_vec(), deleted_paths.map(|paths| paths.to_vec()))];
         let mut uploaded = Vec::new();
+        // A batch the server refuses as too large is sent again as two halves:
+        // the second half follows the files the first one carried.
+        let mut sent_in_call = 0usize;
 
         while let Some((batch_files, deleted)) = pending.pop() {
             match self
@@ -8625,10 +8685,17 @@ impl ContextStreamClient {
                     checkout,
                     reroot,
                     wait_committed,
+                    scan.map(|scan| ScanDeclaration {
+                        sent_before: scan.sent_before + sent_in_call,
+                        ..scan
+                    }),
                 )
                 .await
             {
-                Ok(batch) => uploaded.push(batch),
+                Ok(batch) => {
+                    sent_in_call += batch_files.len();
+                    uploaded.push(batch)
+                }
                 Err(err) if Self::is_payload_too_large_error(&err) && batch_files.len() > 1 => {
                     let mid = batch_files.len() / 2;
                     let left = batch_files[..mid].to_vec();
@@ -25093,6 +25160,138 @@ mod tests {
         assert!(ContextStreamClient::read_hash_manifest(&scope).is_empty());
 
         let _ = std::fs::remove_dir_all(temp_home);
+    }
+
+    /// Runs one scan of a fixture checkout holding `extra_files` files besides
+    /// `lib.rs` against `responses`, and returns the POSTs it made to
+    /// `files/ingest`. The scan is cut off after a few seconds: the fixture
+    /// server has no answers for the polling that follows an accepted batch.
+    #[allow(clippy::await_holding_lock)]
+    async fn scan_posts(
+        label: &str,
+        extra_files: usize,
+        responses: Vec<(&'static str, String)>,
+    ) -> Vec<String> {
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _home_guard = HomeEnvGuard(std::env::var_os("HOME"));
+        let temp_home =
+            std::env::temp_dir().join(format!("contextstream-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("create temp home");
+        std::env::set_var("HOME", &temp_home);
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let root = initialize_bound_ingest_fixture(&temp_home, project_id, workspace_id)
+            .expect("initialize checkout");
+        for index in 0..extra_files {
+            std::fs::write(
+                root.join(format!("file_{index:02}.rs")),
+                format!("pub fn f{index}() {{}}\n"),
+            )
+            .expect("write file");
+        }
+        let status = primary_attestation_fixture(project_id, workspace_id, 99, 'b').to_string();
+        let mut sequence = vec![("200 OK", status)];
+        sequence.extend(responses);
+        let (client, server) = client_with_http_sequence(sequence).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.ingest_local(IngestLocalParams {
+                path: root.to_string_lossy().to_string(),
+                workspace_id: Some(workspace_id),
+                project_id: Some(project_id),
+                force: Some(false),
+                include_media: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let requests = server.await.expect("HTTP sequence task");
+        let _ = std::fs::remove_dir_all(temp_home);
+        requests
+            .into_iter()
+            .filter(|request| {
+                request.starts_with(&format!("POST /api/v1/projects/{project_id}/files/ingest "))
+            })
+            .collect()
+    }
+
+    fn accepted_batch(job: u128) -> (&'static str, String) {
+        (
+            "202 Accepted",
+            serde_json::json!({
+                "files_indexed": 0,
+                "committed": false,
+                "job_id": Uuid::from_u128(job),
+            })
+            .to_string(),
+        )
+    }
+
+    // A first index is sent as batch after batch, and the server holds nothing
+    // for the project between two of them. Each batch says how big the scan
+    // is and how many files came before it, so a status read in between counts
+    // the files not sent yet (mcp-server#326).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_batch_scan_declares_its_size_with_every_batch() {
+        let posts = scan_posts(
+            "scan-declaration",
+            44,
+            vec![accepted_batch(1), accepted_batch(2), accepted_batch(3)],
+        )
+        .await;
+        // `lib.rs` is already in the manifest, so the scan sends the 44 others.
+        assert_eq!(posts.len(), 3, "44 files go in batches of 20, 20 and 4");
+        let header = |post: &String, name: &str| {
+            request_header(post, name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .to_string()
+        };
+        let scan = header(&posts[0], "x-contextstream-ingest-scan");
+        Uuid::parse_str(&scan).expect("the scan id is a UUID");
+        for (post, sent_before) in posts.iter().zip(["0", "20", "40"]) {
+            assert_eq!(header(post, "x-contextstream-ingest-scan"), scan);
+            assert_eq!(header(post, "x-contextstream-ingest-scan-files"), "44");
+            assert_eq!(
+                header(post, "x-contextstream-ingest-scan-sent"),
+                sent_before
+            );
+        }
+    }
+
+    // A batch the server refuses as too large is sent again as two halves; the
+    // second half follows the files the first carried, so the server's count of
+    // files received stays exact.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_split_after_a_payload_refusal_keeps_the_scan_offsets() {
+        let posts = scan_posts(
+            "scan-declaration-split",
+            19,
+            vec![
+                (
+                    "413 Payload Too Large",
+                    r#"{"error":"payload too large"}"#.to_string(),
+                ),
+                accepted_batch(1),
+                accepted_batch(2),
+            ],
+        )
+        .await;
+        assert_eq!(posts.len(), 3, "the refused batch and its two halves");
+        let sent: Vec<&str> = posts
+            .iter()
+            .map(|post| {
+                assert_eq!(
+                    request_header(post, "x-contextstream-ingest-scan-files"),
+                    Some("19")
+                );
+                request_header(post, "x-contextstream-ingest-scan-sent").expect("sent")
+            })
+            .collect();
+        assert_eq!(sent, ["0", "0", "9"], "halves of 9 and 10 files");
     }
 
     // The watcher sends only content the committed manifest does not record.

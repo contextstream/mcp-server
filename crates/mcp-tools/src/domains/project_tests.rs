@@ -2698,3 +2698,43 @@ fn a_wrongly_shaped_brief_section_is_named_with_the_shape_it_takes() {
         None
     );
 }
+
+#[test]
+fn index_history_lists_each_entry_and_where_the_page_is() {
+    // #465: "Found 50 index history entries." and nothing else.
+    let page = json!({
+        "entries": [
+            {"file_path": "src/a.rs", "language": "rust", "size_bytes": 120,
+             "last_indexed": "2026-10-30T22:40:00Z", "indexed_by_machine": "dbx-p5",
+             "git_branch": "main", "git_commit_sha": "605d302bc10547d84838668b67323f8aa49c4ea6"},
+            {"file_path": "docs/b.md"}
+        ],
+        "state_history": [{"transitioned_at": "2026-10-30T22:39:58Z", "from_state": "indexing",
+                           "to_state": "ready", "generation": 3, "file_count": 61}],
+        "pagination": {"page": 1, "limit": 2, "total_count": 61, "total_pages": 31, "has_next": true}
+    });
+    let text = format_index_history_text(&page, 0, 2);
+    assert!(
+        text.starts_with(
+            "Showing 1\u{2013}2 of 61 index history entries. Pass offset=2 (or page=2) for more."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n- src/a.rs \u{2014} indexed 2026-10-30T22:40:00Z by dbx-p5 on main @ 605d302bc (rust, 120 bytes)"),
+        "{text}"
+    );
+    assert!(text.contains("\n- docs/b.md"), "{text}");
+    assert!(
+        text.contains("\n- 2026-10-30T22:39:58Z: indexing \u{2192} ready, generation 3, 61 files"),
+        "{text}"
+    );
+
+    let past = json!({"entries": [], "pagination": {"total_count": 61}});
+    assert_eq!(
+        format_index_history_text(&past, 100, 50),
+        "Page 3 is past the end: 61 index history entries, 2 pages of 50."
+    );
+    let all = json!({"entries": [{"file_path": "a"}], "pagination": {"total_count": 1}});
+    assert!(format_index_history_text(&all, 0, 50).starts_with("Found 1 index history entry."));
+}

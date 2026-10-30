@@ -6367,6 +6367,33 @@ mod typed_item_formatting_tests {
     }
 
     #[test]
+    fn decision_trace_reads_the_nested_decision() {
+        // #403: every row was "Untitled — status=unknown () id=unknown".
+        let result = serde_json::json!({"decisions": [{
+            "source_type": "knowledge_node",
+            "decision": {
+                "id": "11111111-1111-4111-8111-111111111111",
+                "summary": "Shape probe bilby134651",
+                "details": "Probe (bilby134651).",
+                "valid_from": "2026-10-30T13:46:00Z",
+                "valid_until": null,
+                "superseded_by": null
+            },
+            "superseded_chain": [],
+            "code_refs": []
+        }]});
+        let text = crate::domains::session::render_decision_trace("bilby134651", &result);
+        assert!(text.contains("1. Shape probe bilby134651 — status=current (2026-10-30T13:46:00Z) id=11111111-1111-4111-8111-111111111111"), "{text}");
+        assert!(text.contains("rationale: Probe (bilby134651)."), "{text}");
+        assert_eq!(
+            crate::domains::session::first_decision_id(&result)
+                .map(|id| id.to_string())
+                .as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+    }
+
+    #[test]
     fn typed_lessons_show_the_api_severity_once_marked_and_most_severe_first() {
         // #380: the API's text carries its own marker and no severity.
         let mut low = make_item(

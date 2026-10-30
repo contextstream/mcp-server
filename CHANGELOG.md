@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.44
+
+- Studio email, on the team's own Resend account, where Create offers it (#332, #335). `email_draft` writes a
+  campaign in the team's brand from one prompt and sends nothing. `email_preview` gives a link that shows it in
+  Gmail, Outlook and Apple Mail on desktop, tablet and phone, light and dark, with images on or off. Also
+  `email_audiences`, `email_campaigns`, `email_revise` (in plain words), `email_duplicate`, `email_test` (to your
+  own address or Resend's test addresses), `email_contacts`, `email_unsubscribes`, `email_report` and
+  `email_cancel`. `email_send` goes only with the person's go: the client asks them, or the agent passes the
+  recipient count they agreed to. Erasing a contact can't be undone, so it runs only through `delete`
+  (`studio.email_contact_erase`). The tool never asks for or accepts a Resend key.
+- Ingest stops resending when the account is out of credits (#234). Indexing for that project pauses, edits stay
+  queued on the machine, the person is told once where to add credits, and indexing resumes by itself when they
+  do.
+- The acceleration calls (tool telemetry, warm cache, jobs, archive, analytics) send the API forwarder secret when
+  they reach the API on loopback, so they work again beside the hosted gateway (#235).
+- Each batch of a scan tells the server how big the scan is (#326, client half).
+- `doctor` judges hooks that run `contextstream-mcp` from the PATH by the PATH (#331).
+
 ## 1.0.43
 
 - ContextAgents start on their own when a workspace turns on automatic runs for MCP (`auto_run.mcp`, off by

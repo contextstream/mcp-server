@@ -8252,6 +8252,9 @@ impl ToolHandler for ContextTool {
                             ));
                         }
                     }
+                    // A refused key is not missing setup: init cannot fix it,
+                    // and [SETUP_REQUIRED] sent agents back to init (#386).
+                    Err(setup_error) if setup_error.is_key_refusal() => return Err(setup_error),
                     Err(setup_error) => {
                         // If we still have no scope at all, fail fast with guidance.
                         // Otherwise continue with the partially-resolved scope.
@@ -9080,6 +9083,7 @@ impl ToolHandler for ContextTool {
                                     setup_refreshed = true;
                                 }
                             }
+                            Err(err) if err.is_key_refusal() => return Err(err),
                             Err(err) => {
                                 setup_error = Some(err.to_string());
                             }

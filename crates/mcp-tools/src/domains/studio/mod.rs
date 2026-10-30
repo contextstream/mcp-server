@@ -21,7 +21,8 @@
 //! - `stop`, `library`, `brand`, `products`.
 //! - Email, where Create offers it (`email`): `email_audiences`, `email_draft`,
 //!   `email_campaigns`, `email_test`, `email_send` (only with the person's go),
-//!   `email_cancel`, `email_report`.
+//!   `email_cancel`, `email_report`, `email_preview`, `email_revise`, `email_duplicate`,
+//!   `email_contacts`, `email_unsubscribes` (a remove only with the person's go).
 
 pub(crate) mod api;
 mod email;
@@ -75,6 +76,11 @@ const VALID_ACTIONS: &[&str] = &[
     "email_send",
     "email_cancel",
     "email_report",
+    "email_preview",
+    "email_revise",
+    "email_duplicate",
+    "email_contacts",
+    "email_unsubscribes",
 ];
 
 /// The longest prompt Create takes.
@@ -109,9 +115,9 @@ const LIBRARY_LIMIT_MAX: i64 = 50;
 /// How long a listing waits for the catalog before leaving the tool out.
 pub const LISTING_BUDGET: Duration = Duration::from_millis(2500);
 
-const DESCRIPTION: &str = "ContextStudio: films, explainers, brand images and brand sounds from one plain request, made from the team's brand and knowledge. No models to pick.\n\nBrand images (social sets in each network's size, ad sets, hero and product shots, posters and flyers with print PDFs, email headers, brand graphics) and brand sounds (sonic logos, music beds, loops, effect packs, voice-overs, podcast intros and outros): form, with sizes or voice, makes it exact.\n\nFlow: plan -> show the person its price -> make with their go-ahead -> status -> result: downloadable files with alt text and captions. revise a made piece: variation, revision or resize. Also stop, library, brand, products.\n\nMoney: plan is free; make spends at most the plan's price, only with the person's go-ahead (the client asks, or pass accepted_price_credits).\n\nEmail, where offered (the team's own Resend): email_draft from one prompt in the brand, email_audiences, email_campaigns, email_test, email_send (only with the person's go), email_cancel, email_report.";
+const DESCRIPTION: &str = "ContextStudio: films, explainers, brand images and brand sounds from one plain request, made from the team's brand and knowledge. No models to pick.\n\nBrand images (social sets in each network's size, ad sets, hero and product shots, posters and flyers with print PDFs, email headers, brand graphics) and brand sounds (sonic logos, music beds, loops, effect packs, voice-overs, podcast intros and outros): form, with sizes or voice, makes it exact.\n\nFlow: plan -> show the person its price -> make with their go-ahead -> status -> result: downloadable files with alt text and captions. revise a made piece: variation, revision or resize. Also stop, library, brand, products.\n\nMoney: plan is free; make spends at most the plan's price, only with the person's go-ahead (the client asks, or pass accepted_price_credits).\n\nEmail on the team's own Resend, where offered: email_* actions draft, revise, preview in mail-client mockups, test, send (only with the person's go), report, contacts, unsubscribes.";
 
-const TOOL_REFERENCE: &str = "ContextStudio makes finished pieces (films, product explainers filmed from the team's connected product, brand images, brand sounds, music) from a plain request, in the team's brand. Never choose a model: describe what is needed and who it is for. For brand work, name its form for an exact plan.\n\nBrand images: social-set (one post in each network's size), ad-set, hero, product-shot, email-header, brand-graphic, and poster and flyer (printed sheets with a print-ready PDF). An image is made once, as one idea, and delivered in each of its sizes (at most 6; the first is the master shape) as PNG, JPG and WebP with a ZIP of the set, with alt text and a caption, and checked (type inside each network's safe area, contrast, the mark).\nBrand sounds: sonic-logo, music-bed, loop, sfx-pack, voice-over, podcast-intro, podcast-outro. A sound comes as WAV and MP3 at -16 LUFS for the web, a -23 LUFS broadcast master and its stems (a pack: each sound, and a ZIP), with loudness checks.\n\nActions:\n- plan: prompt (plain words, at most 4000 characters). form: brand work by name (optional). sizes: image size ids for an image form other than poster or flyer (default: the form's own). voice: for voice-over, podcast-intro or podcast-outro. context: what you know that the workspace may not (the change you just made, release notes, the doc you have open), as [{title, text}] or one string; at most 4 notes, 6000 characters each. attachments: images [{path (a local PNG, JPEG or WebP; stdio only) or content_id, role: subject|product|style|logo}]. Returns the plan: each piece with its sizes, files and voice, why, one price (up to N credits, likely about M), the balance, plan_id. Spends nothing. plan_id alone reads a plan again. wait_seconds (default 90, up to 100).\n- make: plan_id. Show the person the plan and its price first. If the client can ask them, it does; otherwise pass accepted_price_credits (the price they accepted, at least the plan's). Returns make_id.\n- status: make_id (default: the latest making), wait_seconds (default 50, up to 100). Each piece's state, with progress reported while it waits; call again until it has ended.\n- result: make_id, piece (index or id, optional). Images inline, video and sound as signed links (valid about 15 minutes), each piece's placard. Brand work: each file as its own signed link (each size's PNG, the set ZIP or the print PDF; the web MP3, the broadcast WAV, the stems or the pack's ZIP; up to 12 a piece), its alt text and caption (use them when posting it), and any check that didn't pass.\n- revise: make_id, piece, mode, change, sizes. From a made image or sound: mode variation (more like it; change optional), revision (it, changed as change says) or resize (an image in new sizes: pass sizes; not a poster or flyer). Default: revision with a change, resize with only sizes, else variation. A made film: another like it, with the change. A piece that wasn't made: that piece again. Make the new plan like any plan.\n- stop: make_id. Stops a making; the hold is released and nothing undelivered is charged.\n- library: recent makings here, newest first (limit, at most 50).\n- brand: the workspace's brand kit, which everything is made from.\n- products: connected products and their maps; ask plan for an explainer of something in one, and it is filmed from the real product.\n\nEmail (offered where Create's catalog has email; the team sends through its own Resend account):\n- email_audiences: the audiences and their segments with how many each reaches, and whether Resend is connected and ready.\n- email_draft: prompt (\"announce our winter sale to customers\"), optional audience_id or segment_id. Writes a draft campaign in the brand: campaign_id, subject and preheader with alternatives, an outline, who it goes to, a studio link. Sends nothing; free.\n- email_campaigns: campaigns and where each stands (status: draft|scheduled|sending|sent|cancelled|failed; limit).\n- email_test: campaign_id, to (optional: the person's own address, the default, or delivered@resend.dev, bounced@resend.dev, complained@resend.dev). Subject marked [Test].\n- email_send: campaign_id, send_at (\"now\", the default, or a local time 2026-11-02T09:00), time_zone (IANA, e.g. Europe/London; needed with a local time). Needs the person's go: the client asks them when it can; otherwise show them the campaign, its sender and recipient count, then pass confirm_recipients with that count. Scheduling again moves it.\n- email_cancel: campaign_id. Unschedules a scheduled campaign, or stops one that is sending.\n- email_report: campaign_id for its report (delivered, opened, clicked, bounces, complaints, unsubscribes, top links); without it, the workspace's trends (days, default 30).";
+const TOOL_REFERENCE: &str = "ContextStudio makes finished pieces (films, product explainers filmed from the team's connected product, brand images, brand sounds, music) from a plain request, in the team's brand. Never choose a model: describe what is needed and who it is for. For brand work, name its form for an exact plan.\n\nBrand images: social-set (one post in each network's size), ad-set, hero, product-shot, email-header, brand-graphic, and poster and flyer (printed sheets with a print-ready PDF). An image is made once, as one idea, and delivered in each of its sizes (at most 6; the first is the master shape) as PNG, JPG and WebP with a ZIP of the set, with alt text and a caption, and checked (type inside each network's safe area, contrast, the mark).\nBrand sounds: sonic-logo, music-bed, loop, sfx-pack, voice-over, podcast-intro, podcast-outro. A sound comes as WAV and MP3 at -16 LUFS for the web, a -23 LUFS broadcast master and its stems (a pack: each sound, and a ZIP), with loudness checks.\n\nActions:\n- plan: prompt (plain words, at most 4000 characters). form: brand work by name (optional). sizes: image size ids for an image form other than poster or flyer (default: the form's own). voice: for voice-over, podcast-intro or podcast-outro. context: what you know that the workspace may not (the change you just made, release notes, the doc you have open), as [{title, text}] or one string; at most 4 notes, 6000 characters each. attachments: images [{path (a local PNG, JPEG or WebP; stdio only) or content_id, role: subject|product|style|logo}]. Returns the plan: each piece with its sizes, files and voice, why, one price (up to N credits, likely about M), the balance, plan_id. Spends nothing. plan_id alone reads a plan again. wait_seconds (default 90, up to 100).\n- make: plan_id. Show the person the plan and its price first. If the client can ask them, it does; otherwise pass accepted_price_credits (the price they accepted, at least the plan's). Returns make_id.\n- status: make_id (default: the latest making), wait_seconds (default 50, up to 100). Each piece's state, with progress reported while it waits; call again until it has ended.\n- result: make_id, piece (index or id, optional). Images inline, video and sound as signed links (valid about 15 minutes), each piece's placard. Brand work: each file as its own signed link (each size's PNG, the set ZIP or the print PDF; the web MP3, the broadcast WAV, the stems or the pack's ZIP; up to 12 a piece), its alt text and caption (use them when posting it), and any check that didn't pass.\n- revise: make_id, piece, mode, change, sizes. From a made image or sound: mode variation (more like it; change optional), revision (it, changed as change says) or resize (an image in new sizes: pass sizes; not a poster or flyer). Default: revision with a change, resize with only sizes, else variation. A made film: another like it, with the change. A piece that wasn't made: that piece again. Make the new plan like any plan.\n- stop: make_id. Stops a making; the hold is released and nothing undelivered is charged.\n- library: recent makings here, newest first (limit, at most 50).\n- brand: the workspace's brand kit, which everything is made from.\n- products: connected products and their maps; ask plan for an explainer of something in one, and it is filmed from the real product.\n\nEmail (offered where Create's catalog has email; the team sends through its own Resend account):\n- email_audiences: the audiences and their segments with how many each reaches, and whether Resend is connected and ready.\n- email_draft: prompt (\"announce our winter sale to customers\"), optional audience_id or segment_id. Writes a draft campaign in the brand: campaign_id, subject and preheader with alternatives, an outline, who it goes to, a studio link. Sends nothing; free.\n- email_campaigns: campaigns and where each stands (status: draft|scheduled|testing|sending|paused|sent|cancelled|failed; limit).\n- email_test: campaign_id, to (optional: the person's own address, the default, or delivered@resend.dev, bounced@resend.dev, complained@resend.dev), variant (an A/B subject, optional). Subject marked [Test].\n- email_send: campaign_id, send_at (\"now\", the default, or a local time 2026-11-02T09:00), time_zone (IANA, e.g. Europe/London; needed with a local time). Needs the person's go: the client asks them when it can; otherwise show them the campaign, its sender and recipient count, then pass confirm_recipients with that count. Scheduling again moves it.\n- email_cancel: campaign_id. Unschedules a scheduled campaign, or stops one that is sending, testing or paused.\n- email_report: campaign_id for its report (delivered, opened, clicked, bounces, complaints, unsubscribes, top links); without it, the workspace's trends (days, default 30).\n- email_preview: campaign_id, variant (an A/B subject: 0 A, 1 B, 2 C; optional). A link to share that shows the email in Gmail, Outlook and Apple Mail mockups on desktop, tablet and phone, light and dark, images on or off (it expires; the studio turns it off), plus the inbox line (from, subject, preheader), who it goes to and what to check.\n- email_revise: campaign_id and change (plain words: \"shorter subject\", \"add a button to https://acme.com/pricing\"), or subject and/or preheader to set. Drafts only. Returns the new revision, what changed and the outline.\n- email_duplicate: campaign_id. A draft copy to change and send again.\n- email_contacts: operation list (default; query, audience_id, status subscribed|suppressed, limit), add (contacts: addresses or [{email, first_name, last_name, tags}], at most 100; consent_source manual|form|api and consent_note, both required; audience_id optional), remove (email: erases the contact; an opt-out stays) or unsubscribe (email: onto the suppression list).\n- email_unsubscribes: operation list (default; the suppression list with why, how, when and from which campaign, and the last days' report: query, reason unsubscribed|bounced|complained|manual, campaign_id, days, limit), add (contacts or email; note) or remove (email, note). A remove needs the person's go: the client asks them when it can; otherwise show them who and why, then pass confirm_email with the address.\n\nResend is connected in the studio (https://ctxproduct.com/studio/email/settings), never through this tool: never ask for or pass an API key.";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StudioInput {
@@ -143,6 +149,18 @@ pub struct StudioInput {
     pub to: Option<Value>,
     pub status: Option<String>,
     pub days: Option<i64>,
+    pub variant: Option<i64>,
+    pub subject: Option<String>,
+    pub preheader: Option<String>,
+    pub operation: Option<String>,
+    pub email: Option<String>,
+    pub contacts: Option<Value>,
+    pub consent_source: Option<String>,
+    pub consent_note: Option<String>,
+    pub query: Option<String>,
+    pub reason: Option<String>,
+    pub note: Option<String>,
+    pub confirm_email: Option<String>,
 }
 
 /// The project each plan was made in, so `make` sends the same one (Create checks it).
@@ -2192,7 +2210,7 @@ pub(crate) fn input_schema() -> Value {
         .string("piece", "A piece of the making, by index (0-based) or id (result, revise)", false)
         .string(
             "change",
-            "What to do differently (revise): for a revision, the change itself (\"warmer light, no people\"); optional for a variation or a resize",
+            "What to do differently (revise): for a revision, the change itself (\"warmer light, no people\"); optional for a variation or a resize. For email_revise, the change to the draft in plain words (\"shorter subject\")",
             false,
         )
         .string_enum("form", &forms::form_description(), &forms::form_ids(), false)
@@ -2209,8 +2227,8 @@ pub(crate) fn input_schema() -> Value {
             "How long to wait: plan (default 90, up to 100), status (default 50, up to 100)",
             false,
         )
-        .integer("limit", "How many makings (library) or campaigns (email_campaigns), at most 50", false)
-        .uuid("campaign_id", "The email campaign (email_draft returns it; email_test, email_send, email_cancel, email_report take it)", false)
+        .integer("limit", "How many makings (library), campaigns (email_campaigns), contacts (email_contacts) or suppressions (email_unsubscribes), at most 50", false)
+        .uuid("campaign_id", "The email campaign (email_draft returns it; the other email actions take it)", false)
         .uuid("audience_id", "The audience an email draft goes to (email_audiences lists them)", false)
         .uuid("segment_id", "A segment of the audience instead (email_draft)", false)
         .string("send_at", "When email_send sends: \"now\" (default) or a local time like 2026-11-02T09:00, read in time_zone", false)
@@ -2231,8 +2249,53 @@ pub(crate) fn input_schema() -> Value {
             }),
             false,
         )
-        .string("status", "Only campaigns with this status (email_campaigns): draft, scheduled, sending, sent, cancelled or failed", false)
-        .integer("days", "How many days of trends (email_report without campaign_id), 7 to 365, default 30", false)
+        .string("status", "Only campaigns with this status (email_campaigns): draft, scheduled, testing, sending, paused, sent, cancelled or failed; or contacts that are subscribed or suppressed (email_contacts)", false)
+        .integer("days", "How many days of trends (email_report without campaign_id, 7 to 365) or of the unsubscribe report (email_unsubscribes, 1 to 365); default 30", false)
+        .integer("variant", "An A/B test's subject to preview (email_preview): 0 (A, the campaign's own), 1 (B) or 2 (C)", false)
+        .string("subject", "A new subject for a draft (email_revise), up to 200 characters", false)
+        .string("preheader", "A new preview line for a draft (email_revise), up to 200 characters", false)
+        .string_enum(
+            "operation",
+            "What email_contacts does (list, add, remove, unsubscribe) or email_unsubscribes does (list, add, remove); default list",
+            &["list", "add", "remove", "unsubscribe"],
+            false,
+        )
+        .string("email", "The address an operation is about (email_contacts remove or unsubscribe, email_unsubscribes remove), or one to add", false)
+        .property(
+            "contacts",
+            json!({
+                "description": "Who to add (email_contacts add, email_unsubscribes add): addresses, or objects with email, first_name, last_name and tags; at most 100",
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"anyOf": [
+                        {"type": "string"},
+                        {"type": "object", "properties": {
+                            "email": {"type": "string"},
+                            "first_name": {"type": "string"},
+                            "last_name": {"type": "string"},
+                            "tags": {"type": "array", "items": {"type": "string"}}
+                        }, "required": ["email"]}
+                    ]}}
+                ]
+            }),
+            false,
+        )
+        .string_enum(
+            "consent_source",
+            "How added contacts agreed to hear from the team (email_contacts add): manual (the person added them), form or api",
+            &["manual", "form", "api"],
+            false,
+        )
+        .string("consent_note", "Where added contacts agreed to hear from the team (email_contacts add), e.g. \"Signed up at the Spring market\"", false)
+        .string("query", "Search words: part of an address or name (email_contacts, email_unsubscribes)", false)
+        .string_enum(
+            "reason",
+            "Only suppressions with this reason (email_unsubscribes)",
+            &["unsubscribed", "bounced", "complained", "manual"],
+            false,
+        )
+        .string("note", "Why, kept with a suppression change (email_unsubscribes add or remove, email_contacts unsubscribe)", false)
+        .string("confirm_email", "The address the person agreed to take off the suppression list (email_unsubscribes remove): needed when the client can't ask them", false)
         .uuid("workspace_id", "Workspace (defaults to the session's)", false)
         .uuid("project_id", "Project (defaults to the session's)", false)
         .build()

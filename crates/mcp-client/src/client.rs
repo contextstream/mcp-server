@@ -1922,6 +1922,10 @@ const PROJECT_CATALOG_CACHE_TTL: Duration = Duration::from_secs(10);
 /// Pages of the project list asked for at once once the first has said how many there are.
 const PROJECT_CATALOG_PAGES_IN_FLIGHT: usize = 8;
 const PROJECT_OVERVIEW_CACHE_PREFIX: &str = "project_overview:";
+/// A project overview counts the project's memory, which any write changes
+/// (#453): it was kept for `ttl::PROJECT`, five minutes. This process's own
+/// memory and doc writes drop it at once; this bounds the rest.
+const PROJECT_OVERVIEW_CACHE_TTL: Duration = Duration::from_secs(15);
 const PROJECT_AGENT_MAP_CACHE_PREFIX: &str = "project_agent_map:";
 const PROJECT_INDEX_STATUS_CACHE_PREFIX: &str = "project_index_status:";
 const MEMORY_SEARCH_CACHE_PREFIX: &str = "memory_search:";
@@ -4340,11 +4344,14 @@ impl ContextStreamClient {
     pub(crate) fn invalidate_memory_read_caches(&self) {
         self.invalidate_custom_cache_prefix(MEMORY_SEARCH_CACHE_PREFIX);
         self.invalidate_custom_cache_prefix(SESSION_RECALL_CACHE_PREFIX);
+        // The overview counts the memory just written (#453).
+        self.invalidate_custom_cache_prefix(PROJECT_OVERVIEW_CACHE_PREFIX);
     }
 
     fn invalidate_doc_caches(&self) {
         self.invalidate_custom_cache_prefix(DOCS_LIST_CACHE_PREFIX);
         self.invalidate_custom_cache_prefix(DOCS_GET_CACHE_PREFIX);
+        self.invalidate_custom_cache_prefix(PROJECT_OVERVIEW_CACHE_PREFIX);
     }
 
     fn invalidate_workspace_caches(&self) {
@@ -6410,7 +6417,7 @@ impl ContextStreamClient {
             return Ok(cached);
         }
         let result: serde_json::Value = self.get(&format!("/projects/{}/overview", id)).await?;
-        self.cache_response(cache_key, result.clone(), ttl::PROJECT);
+        self.cache_response(cache_key, result.clone(), PROJECT_OVERVIEW_CACHE_TTL);
         Ok(result)
     }
 
@@ -33970,6 +33977,33 @@ mod caller_bound_response_cache_tests {
                 workspace_id,
             ),
         ]
+    }
+
+    #[tokio::test]
+    async fn a_memory_or_doc_write_drops_cached_project_overviews() {
+        // #453: the overview counts the project's memory; a decision this
+        // process recorded left the old counts cached for five minutes.
+        let client = ContextStreamClient::new(Config::default());
+        let project_id = Uuid::new_v4();
+        run_with_session_key(SessionKey::Local, || async {
+            let caller = current_client_cache_identity().expect("stdio caller is cacheable");
+            let key = ContextStreamClient::project_overview_cache_key(&caller, project_id);
+            let writes: [fn(&ContextStreamClient); 2] = [
+                ContextStreamClient::invalidate_memory_read_caches,
+                ContextStreamClient::invalidate_doc_caches,
+            ];
+            for write in writes {
+                client.cache_response(
+                    Some(key.clone()),
+                    serde_json::json!({"content_summary": {"total_items": 0}}),
+                    PROJECT_OVERVIEW_CACHE_TTL,
+                );
+                assert!(client.cached_response(Some(&key)).is_some());
+                write(&client);
+                assert!(client.cached_response(Some(&key)).is_none());
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

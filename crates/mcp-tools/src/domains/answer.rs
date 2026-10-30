@@ -48,6 +48,11 @@ pub struct AnswerInput {
     pub account_id: Option<String>,
     pub workspace_ids: Option<Vec<String>>,
     pub project_ids: Option<Vec<String>>,
+    /// One requested workspace, as every other tool takes it (#351); joins
+    /// `workspace_ids`.
+    pub workspace_id: Option<String>,
+    /// One requested project; joins `project_ids`.
+    pub project_id: Option<String>,
     pub visibility: Option<String>,
     pub timezone: Option<String>,
     pub current_workspace_id: Option<String>,
@@ -186,6 +191,8 @@ impl ToolHandler for AnswerTool {
                 uuid_array("Requested project IDs; empty means all currently authorized projects in the requested workspaces"),
                 false,
             )
+            .uuid("workspace_id", "One requested workspace; the same as workspace_ids: [id]", false)
+            .uuid("project_id", "One requested project; the same as project_ids: [id]", false)
             .string_enum(
                 "visibility",
                 "Requested visibility; inferred from supplied IDs and otherwise defaults to account",
@@ -373,6 +380,8 @@ fn has_query_fields(input: &AnswerInput) -> bool {
         || input.account_id.is_some()
         || input.workspace_ids.is_some()
         || input.project_ids.is_some()
+        || input.workspace_id.is_some()
+        || input.project_id.is_some()
         || input.visibility.is_some()
         || input.timezone.is_some()
         || input.current_workspace_id.is_some()
@@ -469,8 +478,10 @@ fn build_request(input: AnswerInput) -> Result<AnswerRequestV1> {
             )))
         }
     };
-    let workspace_ids = parse_uuid_set(input.workspace_ids, "workspace_ids")?;
-    let project_ids = parse_uuid_set(input.project_ids, "project_ids")?;
+    let mut workspace_ids = parse_uuid_set(input.workspace_ids, "workspace_ids")?;
+    workspace_ids.extend(parse_uuid(input.workspace_id, "workspace_id")?);
+    let mut project_ids = parse_uuid_set(input.project_ids, "project_ids")?;
+    project_ids.extend(parse_uuid(input.project_id, "project_id")?);
     let visibility = match input.visibility.as_deref().map(str::trim) {
         Some("personal") => AnswerVisibilityV1::Personal,
         Some("project") => AnswerVisibilityV1::Project,
@@ -728,6 +739,8 @@ mod tests {
             "account_id",
             "workspace_ids",
             "project_ids",
+            "workspace_id",
+            "project_id",
             "visibility",
             "timezone",
             "response_mode",
@@ -767,6 +780,51 @@ mod tests {
         ] {
             assert!(wire.get(forbidden).is_none());
         }
+    }
+
+    #[test]
+    fn a_single_workspace_id_or_project_id_joins_the_requested_scope() {
+        let workspace = Uuid::from_u128(21);
+        let other = Uuid::from_u128(22);
+        let project = Uuid::from_u128(23);
+        let request = build_request(
+            serde_json::from_value(json!({
+                "question": "what is this project about?",
+                "workspace_id": workspace.to_string(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(wire["requested_scope"]["workspace_ids"], json!([workspace]));
+        assert_eq!(wire["requested_scope"]["visibility"], "workspace");
+
+        let request = build_request(
+            serde_json::from_value(json!({
+                "question": "q",
+                "workspace_id": workspace.to_string(),
+                "workspace_ids": [other.to_string(), workspace.to_string()],
+                "project_id": project.to_string(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            wire["requested_scope"]["workspace_ids"],
+            json!([workspace, other])
+        );
+        assert_eq!(wire["requested_scope"]["project_ids"], json!([project]));
+        assert_eq!(wire["requested_scope"]["visibility"], "project");
+
+        let error = build_request(
+            serde_json::from_value(json!({"question": "q", "workspace_id": "not-a-uuid"})).unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("workspace_id must be a UUID"),
+            "{error}"
+        );
     }
 
     #[test]

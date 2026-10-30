@@ -3333,7 +3333,7 @@ mod tests {
         ),
         (
             "skill",
-            "692ed0723cb1765b05a3c32fb3d09e98b979623df17fec8ab33595f735c83d47",
+            "34721b108bf4f8c4a19912de3374c61d3d223df713e1d723ed0f8a0751381083",
         ),
         (
             "vcs",

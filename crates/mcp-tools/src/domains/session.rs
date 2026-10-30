@@ -16184,7 +16184,53 @@ pub struct ListPlansInput {
     pub query: Option<String>,
     pub status: Option<String>,
     pub limit: Option<i64>,
+    /// Where the page starts (#452): it was ignored, so offset=20 listed the
+    /// first 20 plans again.
+    #[serde(default)]
+    pub offset: Option<i64>,
     pub include_tasks: Option<bool>,
+}
+
+/// How a page of plans reads (#452): "Found 20 plans." said nothing of the
+/// 34 more, and an offset past the end read as an empty list.
+fn plan_page_heading(shown: usize, offset: i64, next: Option<i64>, query: Option<&str>) -> String {
+    let matching = query
+        .map(|query| format!(" matching '{query}'"))
+        .unwrap_or_default();
+    let start = offset.max(0);
+    let end = start + shown as i64;
+    match (shown, next) {
+        (0, _) if start > 0 => {
+            format!("Offset {start} is past the end of the plan list{matching}. Pass a smaller offset (offset=0 for the first page).\n\n")
+        }
+        (_, Some(next)) => format!(
+            "Showing plans {}–{end}{matching}. Pass offset={next} for more.\n\n",
+            start + 1
+        ),
+        (_, None) if start > 0 => {
+            format!("Showing plans {}–{end}{matching} (the end).\n\n", start + 1)
+        }
+        (_, None) => format!("Found {shown} plans{matching}.\n\n"),
+    }
+}
+
+/// The plans in a list response, and whether more follow: it held more than
+/// `size` (it was asked for one more to tell), or, at the API's most of 100
+/// where it cannot be asked for one more, a full page. The list is cut to
+/// `size`.
+fn take_plan_page(mut listed: Value, size: i64) -> (Value, bool) {
+    let size = usize::try_from(size.max(1)).unwrap_or(1);
+    let items = if listed.is_array() {
+        listed.as_array_mut()
+    } else {
+        listed.get_mut("items").and_then(Value::as_array_mut)
+    };
+    let mut more = false;
+    if let Some(items) = items {
+        more = items.len() > size || (size >= 100 && items.len() >= size);
+        items.truncate(size);
+    }
+    (listed, more)
 }
 
 /// List plans tool handler.
@@ -16248,11 +16294,21 @@ impl ToolHandler for ListPlansTool {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        // A page asks for one plan more than it shows, to tell whether more
+        // follow (#452). The API returns at most 100.
+        let page_size = input
+            .limit
+            .filter(|limit| *limit > 0)
+            .unwrap_or(50)
+            .min(100);
+        let fetch_limit = Some((page_size + 1).min(100));
+        let offset = input.offset.unwrap_or(0).max(0);
         let filters_key = format!(
-            "query={};status={};limit={}",
+            "query={};status={};limit={};offset={}",
             query.unwrap_or(""),
             status.unwrap_or(""),
-            input.limit.map(|v| v.to_string()).unwrap_or_default()
+            page_size,
+            offset
         );
 
         // P1 #6 — MemoryPlansHot warm cache. 60 s TTL.
@@ -16268,7 +16324,22 @@ impl ToolHandler for ListPlansTool {
         let user_scope_for_fetch = user_scope_token.clone();
         let query_for_fetch = query.map(str::to_string);
         let status_for_fetch = status.map(str::to_string);
-        let limit_for_fetch = input.limit;
+        let limit_for_fetch = fetch_limit;
+        let explicit_project_requested = input
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some();
+        // A later page reads one list from its offset: the named project's,
+        // or else the workspace's, which holds the session project's too.
+        let offset_for_fetch = (offset > 0).then_some(offset);
+        let scoped_project_for_fetch = if offset > 0 && !explicit_project_requested {
+            None
+        } else {
+            project_id
+        };
+        let workspace_only_page = offset > 0 && !explicit_project_requested;
         let result = super::atlas_warm_cache::fetch_or_cache(
             &self.atlas_layer,
             mcp_types::atlas_layer::AtlasWarmCacheKind::MemoryPlansHot,
@@ -16278,38 +16349,55 @@ impl ToolHandler for ListPlansTool {
             scope_hash,
             150,
             || async move {
-                client
-                    .list_plans_filtered(
-                        Some(workspace_id),
-                        project_id,
-                        query_for_fetch.as_deref(),
-                        status_for_fetch.as_deref(),
-                        limit_for_fetch,
-                    )
-                    .await
+                if workspace_only_page {
+                    client
+                        .list_workspace_plans_filtered_at(
+                            Some(workspace_id),
+                            query_for_fetch.as_deref(),
+                            status_for_fetch.as_deref(),
+                            limit_for_fetch,
+                            offset_for_fetch,
+                        )
+                        .await
+                } else {
+                    client
+                        .list_plans_filtered_at(
+                            Some(workspace_id),
+                            scoped_project_for_fetch,
+                            query_for_fetch.as_deref(),
+                            status_for_fetch.as_deref(),
+                            limit_for_fetch,
+                            offset_for_fetch,
+                        )
+                        .await
+                }
             },
         )
         .await?;
-        let explicit_project_requested = input
-            .project_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some();
-        let workspace_result = if !explicit_project_requested {
+        let (result, scoped_more) = take_plan_page(result, page_size);
+        let workspace_result = if !explicit_project_requested && offset == 0 {
             self.client
-                .list_workspace_plans_filtered(Some(workspace_id), query, status, input.limit)
+                .list_workspace_plans_filtered(Some(workspace_id), query, status, fetch_limit)
                 .await
                 .ok()
+                .map(|listed| take_plan_page(listed, page_size))
         } else {
             None
         };
+        let more = workspace_result
+            .as_ref()
+            .map_or(scoped_more, |(_, more)| *more);
+        let workspace_result = workspace_result.map(|(listed, _)| listed);
+        let next_offset = more.then_some(offset + page_size);
         let combined_plans = if let Some(workspace_result) = workspace_result.as_ref() {
             Value::Array(collect_unique_plan_candidates(&[&result, workspace_result]))
         } else {
             result.clone()
         };
-        let latest_plan_summary = if let Some(query) = query {
+        let latest_plan_summary = if offset > 0 {
+            // A later page lists plans; the latest one is on the first.
+            None
+        } else if let Some(query) = query {
             match select_named_plan_from_sets(&[&combined_plans], query) {
                 NamedPlan::Found { plan, .. } => Some(plan),
                 // The query names no single plan: the list below is the answer.
@@ -16334,11 +16422,7 @@ impl ToolHandler for ListPlansTool {
         };
 
         let plans = combined_plans.as_array().map(|arr| arr.len()).unwrap_or(0);
-        let mut text = if let Some(query) = query {
-            format!("Found {} plans matching '{}'.\n\n", plans, query)
-        } else {
-            format!("Found {} plans.\n\n", plans)
-        };
+        let mut text = plan_page_heading(plans, offset, next_offset, query);
 
         if let Some(plan) = latest_plan.as_ref().or(latest_plan_summary.as_ref()) {
             if plan_is_finished(plan) {
@@ -16370,8 +16454,11 @@ impl ToolHandler for ListPlansTool {
         }
 
         if let Some(arr) = combined_plans.as_array() {
-            text.push_str("Plans:\n");
-            for (i, plan) in arr.iter().take(10).enumerate() {
+            if !arr.is_empty() {
+                text.push_str("Plans:\n");
+            }
+            // The whole page: only the first 10 were listed (#452).
+            for (i, plan) in arr.iter().enumerate() {
                 let id = plan.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
                 let raw_title = plan
                     .get("title")
@@ -16392,7 +16479,7 @@ impl ToolHandler for ListPlansTool {
                 let progress = plan.get("progress").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 text.push_str(&format!(
                     "{}. {} [{}] ({:.1}%) — id: {}{}\n",
-                    i + 1,
+                    offset as usize + i + 1,
                     one_line(title),
                     one_line(status),
                     progress,
@@ -17938,6 +18025,7 @@ impl ToolHandler for SessionTool {
                     }
                 }
                 let list_input = ListPlansInput {
+                    offset: input.offset,
                     workspace_id: input.workspace_id,
                     project_id,
                     query: input.query,

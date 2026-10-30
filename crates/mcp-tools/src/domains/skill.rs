@@ -99,6 +99,10 @@ pub struct SkillInput {
     pub query: Option<String>,
     pub category: Option<String>,
     pub limit: Option<i64>,
+    /// Where a `list` page starts (#452): offset, page and cursor were all
+    /// ignored, so every page was the first.
+    #[serde(default)]
+    pub offset: Option<i64>,
     pub folder_path: Option<String>,
 }
 
@@ -609,13 +613,14 @@ impl SkillTool {
         // cached value can serve multiple format requests.
         if let Some(ws) = workspace_id {
             let filter_str = format!(
-                "scope={};status={};category={};query={};personal={};limit={};target={}",
+                "scope={};status={};category={};query={};personal={};limit={};offset={};target={}",
                 input.scope.as_deref().unwrap_or(""),
                 input.status.as_deref().unwrap_or(""),
                 input.category.as_deref().unwrap_or(""),
                 input.query.as_deref().unwrap_or(""),
                 input.is_personal.map(|b| b.to_string()).unwrap_or_default(),
                 input.limit.unwrap_or(0),
+                input.offset.unwrap_or(0),
                 input.target_project.as_deref().unwrap_or(""),
             );
             let user_scope_token = super::atlas_warm_cache::current_user_scope_token();
@@ -644,9 +649,17 @@ impl SkillTool {
             }
         }
 
+        // A page of `limit` skills (#452). Later pages are the list's own;
+        // the account and matcher skills are merged into the first.
+        let page_size = input
+            .limit
+            .filter(|limit| *limit > 0)
+            .unwrap_or(50)
+            .min(100);
+        let page = input.offset.unwrap_or(0).max(0) / page_size + 1;
         let mut result = self
             .client
-            .list_skills(
+            .list_skills_page(
                 workspace_id,
                 project_id,
                 input.scope.clone(),
@@ -654,14 +667,20 @@ impl SkillTool {
                 input.category.clone(),
                 input.query.clone(),
                 input.is_personal,
-                input.limit,
+                Some(page_size),
+                Some(page),
             )
             .await?;
+        let listed_total = result.get("total").and_then(Value::as_u64);
+        let listed_shown = result
+            .get("items")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
 
         // Agents often pass the current project_id as ambient scope, but skills
         // are portable by default. Merge account-level skills so a project-scoped
         // list cannot hide personal/team operational skills.
-        if project_id.is_some() && input.target_project.is_none() {
+        if page == 1 && project_id.is_some() && input.target_project.is_none() {
             let account_result = self
                 .client
                 .list_skills(
@@ -686,6 +705,7 @@ impl SkillTool {
             .as_deref()
             .map(str::trim)
             .filter(|query| !query.is_empty())
+            .filter(|_| page == 1)
         {
             if let Some(workspace_id) = workspace_id {
                 let match_limit = input
@@ -706,6 +726,16 @@ impl SkillTool {
             .and_then(|i| i.as_array())
             .map(|a| a.len())
             .unwrap_or(0);
+        if let (Some(total), Some(object)) = (listed_total, result.as_object_mut()) {
+            object.insert(
+                "paging".to_string(),
+                serde_json::json!({
+                    "start": (page - 1) * page_size,
+                    "listed": listed_shown,
+                    "total": total,
+                }),
+            );
+        }
 
         // P1 #7 — write-back: deposit the assembled result for the
         // next caller. Same scope_hash as the lookup above. The
@@ -713,13 +743,14 @@ impl SkillTool {
         // the format on hit.
         if let Some(ws) = workspace_id {
             let filter_str = format!(
-                "scope={};status={};category={};query={};personal={};limit={};target={}",
+                "scope={};status={};category={};query={};personal={};limit={};offset={};target={}",
                 input.scope.as_deref().unwrap_or(""),
                 input.status.as_deref().unwrap_or(""),
                 input.category.as_deref().unwrap_or(""),
                 input.query.as_deref().unwrap_or(""),
                 input.is_personal.map(|b| b.to_string()).unwrap_or_default(),
                 input.limit.unwrap_or(0),
+                input.offset.unwrap_or(0),
                 input.target_project.as_deref().unwrap_or(""),
             );
             let user_scope_token = super::atlas_warm_cache::current_user_scope_token();
@@ -1613,6 +1644,11 @@ impl ToolHandler for SkillTool {
             .string("query", "Search query", false)
             .string("category", "Filter by category tag", false)
             .integer("limit", "Max results to return", false)
+            .integer(
+                "offset",
+                "list: where the page starts, with limit (a page of `limit` skills)",
+                false,
+            )
             .build()
     }
 }
@@ -1630,7 +1666,7 @@ fn format_skills_list_result(result: &Value) -> ToolResult {
         .and_then(|v| v.as_array())
         .map(|a| a.len())
         .unwrap_or(0);
-    let mut text = format!("Found {} skill(s).\n", count);
+    let mut text = skills_page_heading(count, result.get("paging"));
     if let Some(items) = result.get("items").and_then(|i| i.as_array()) {
         for item in items {
             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1649,6 +1685,37 @@ fn format_skills_list_result(result: &Value) -> ToolResult {
         "Tip: team sharing uses skill(action=\"share\", scope=\"team\"|\"public\"); prefer governance fields when choosing shared skills.\n",
     );
     ToolResult::text(text)
+}
+
+/// Where a page of skills sits (#452): "Found 20 skill(s)." said nothing of
+/// the 14 more, and an offset past the end read as no skills.
+fn skills_page_heading(count: usize, paging: Option<&Value>) -> String {
+    let number = |key: &str| {
+        paging
+            .and_then(|paging| paging.get(key))
+            .and_then(Value::as_u64)
+    };
+    let (Some(start), Some(listed), Some(total)) =
+        (number("start"), number("listed"), number("total"))
+    else {
+        return format!("Found {count} skill(s).\n");
+    };
+    let next = start + listed;
+    let more = next < total;
+    match (count, start, more) {
+        (0, 1.., _) => format!(
+            "Offset {start} is past the end: there are {total} skill(s). Pass a smaller offset (offset=0 for the first page).\n"
+        ),
+        (_, 0, true) => format!(
+            "Found {count} skill(s); the list has {total}. Pass offset={next} for more.\n"
+        ),
+        (_, 0, false) => format!("Found {count} skill(s).\n"),
+        (_, _, true) => format!(
+            "Showing {}–{next} of {total} skill(s). Pass offset={next} for more.\n",
+            start + 1
+        ),
+        (_, _, false) => format!("Showing {}–{next} of {total} skill(s) (the end).\n", start + 1),
+    }
 }
 
 fn format_skill_governance(skill: &Value) -> String {
@@ -2356,5 +2423,25 @@ mod import_result_tests {
             nothing.contains("No skill could be read from the content."),
             "{nothing}"
         );
+    }
+
+    #[test]
+    fn a_page_of_skills_says_where_it_sits() {
+        use crate::domains::skill::skills_page_heading;
+        // #452: "Found 20 skill(s)." for 34, and offset/page were ignored.
+        let paging = |start: u64, listed: u64, total: u64| serde_json::json!({"start": start, "listed": listed, "total": total});
+        assert_eq!(
+            skills_page_heading(20, Some(&paging(0, 20, 34))),
+            "Found 20 skill(s); the list has 34. Pass offset=20 for more.\n"
+        );
+        assert_eq!(
+            skills_page_heading(14, Some(&paging(20, 14, 34))),
+            "Showing 21–34 of 34 skill(s) (the end).\n"
+        );
+        assert_eq!(
+            skills_page_heading(0, Some(&paging(100, 0, 34))),
+            "Offset 100 is past the end: there are 34 skill(s). Pass a smaller offset (offset=0 for the first page).\n"
+        );
+        assert_eq!(skills_page_heading(5, None), "Found 5 skill(s).\n");
     }
 }

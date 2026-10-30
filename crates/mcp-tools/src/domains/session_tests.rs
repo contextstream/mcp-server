@@ -8122,3 +8122,31 @@ mod user_context_summary_tests {
         );
     }
 }
+
+#[test]
+fn a_page_of_plans_says_where_it_sits() {
+    // #452: "Found 20 plans." for 54, and offset=20 listed the first 20 again.
+    assert_eq!(
+        plan_page_heading(20, 0, Some(20), None),
+        "Showing plans 1–20. Pass offset=20 for more.\n\n"
+    );
+    assert_eq!(
+        plan_page_heading(14, 40, None, None),
+        "Showing plans 41–54 (the end).\n\n"
+    );
+    assert_eq!(
+        plan_page_heading(0, 100, None, Some("recap")),
+        "Offset 100 is past the end of the plan list matching 'recap'. Pass a smaller offset (offset=0 for the first page).\n\n"
+    );
+    assert_eq!(plan_page_heading(3, 0, None, None), "Found 3 plans.\n\n");
+
+    let (page, more) = take_plan_page(json!([{"id": "1"}, {"id": "2"}, {"id": "3"}]), 2);
+    assert!(more);
+    assert_eq!(page.as_array().map(Vec::len), Some(2));
+    let (page, more) = take_plan_page(json!({"items": [{"id": "1"}]}), 2);
+    assert!(!more);
+    assert_eq!(page["items"].as_array().map(Vec::len), Some(1));
+    // At the API's most of 100 a full page may have more.
+    let hundred = Value::Array((0..100).map(|i| json!({"id": i.to_string()})).collect());
+    assert!(take_plan_page(hundred, 100).1);
+}

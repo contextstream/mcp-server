@@ -61,7 +61,7 @@ pub use harness_teaching::{
     MCP_PROTOCOL_2025_11_25, MCP_PROTOCOL_2026_07_28,
 };
 pub use protocol::{
-    build_stateless_discover_result, decorate_stateless_cacheable_result,
+    batch_size_refusal, build_stateless_discover_result, decorate_stateless_cacheable_result,
     decorate_stateless_result, has_stateless_protocol_metadata, legacy_protocol_takes_batches,
     negotiate_legacy_protocol_version, stateless_protocol_version,
     validate_stateless_jsonrpc_envelope, validate_stateless_method_params,

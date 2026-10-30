@@ -1721,12 +1721,8 @@ async fn handle_batch(
     batch: &[serde_json::Value],
     wire_observation: mcp_tools::wire_tokens::WireTokenObservation,
 ) -> String {
-    if batch.is_empty() {
-        return json_rpc_error(
-            None,
-            -32600,
-            "Invalid Request: an empty batch; send at least one JSON-RPC message",
-        );
+    if let Some(refusal) = mcp_types::batch_size_refusal(batch.len()) {
+        return json_rpc_error(None, -32600, &refusal);
     }
     let mut answers = Vec::new();
     for member in batch {

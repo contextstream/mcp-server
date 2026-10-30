@@ -546,12 +546,12 @@ fn incoming_mcp_message(
         )
     })?;
     if let Value::Array(batch) = value {
-        if batch.is_empty() {
+        if let Some(refusal) = mcp_types::batch_size_refusal(batch.len()) {
             return Err(MalformedMessage::new(
                 StatusCode::BAD_REQUEST,
                 Value::Null,
                 JSONRPC_INVALID_REQUEST,
-                "Invalid Request: an empty batch; send at least one JSON-RPC message",
+                refusal,
             ));
         }
         // 2025-03-26 requires receiving batches; 2025-06-18 removed them.
@@ -4694,6 +4694,18 @@ mod tests {
         .await;
         assert_eq!((id, code), (Value::Null, -32600));
         assert!(message.contains("an empty batch"), "{message}");
+
+        // #421: at most 20 messages in one batch.
+        let pings: Vec<String> = (0..21)
+            .map(|id| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#))
+            .collect();
+        let (id, code, message) = error_of(
+            post("application/json", format!("[{}]", pings.join(","))).await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!((id, code), (Value::Null, -32600));
+        assert!(message.contains("at most 20 messages"), "{message}");
 
         let (id, code, message) = error_of(
             post("application/json", "{nope").await,

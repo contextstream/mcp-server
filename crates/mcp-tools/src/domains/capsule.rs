@@ -1012,7 +1012,7 @@ impl ToolHandler for CapsuleTool {
             )
             .boolean(
                 "multi_use",
-                "Allow the share to be opened multiple times until expires_at. Defaults to true for team links and false for external_agent/public_link/support links. Single-use links have a ~120s grace window after first open so parallel summary+markdown reads can finish; reads after the grace return 410 Gone.",
+                "Allow the share to be opened multiple times until expires_at. Defaults to true for team links and false for external_agent/public_link/support links. Each open of a capped link starts a one-hour viewing window: reads within it count as that open, so the reader can follow the capsule's links. A read after the last open's window returns 410 Gone.",
                 false,
             )
             .boolean("include_personal", "Include personal artifacts", false)
@@ -1068,7 +1068,7 @@ impl ToolHandler for CapsuleTool {
             )
             .integer(
                 "max_uses",
-                "Burn-after-N-reads cap for action=share. Team links default to no max-use cap; token-gated single-use links default to max_uses=1 with a ~120s grace window after first open.",
+                "How many times the link can be opened, for action=share; each open starts a one-hour viewing window whose reads count as that open. Team links default to no cap; token-gated links default to max_uses=1.",
                 false,
             )
             .integer(
@@ -1248,7 +1248,7 @@ fn format_share_result_text(capsule_id: &str, response: &ContextCapsuleShareResp
     if response.single_use && response.max_uses == Some(1) && response.use_count == 0 {
         lines.push("Share policy: single-use, unread (burn-after-first-open).".to_string());
         lines.push(
-            "Note: ~120s grace window starts on first open — within the window any read succeeds (lets the dashboard viewer fetch summary + markdown in parallel). Reads after the grace return 410 Gone."
+            "Note: the first open starts a one-hour viewing window; any read within it succeeds (the viewer fetches summary and markdown in parallel, and the reader can follow links). Reads after it return 410 Gone."
                 .to_string(),
         );
     } else if response.single_use {
@@ -1257,7 +1257,7 @@ fn format_share_result_text(capsule_id: &str, response: &ContextCapsuleShareResp
             response.max_uses, response.use_count, response.consumed_at
         ));
         lines.push(
-            "Note: ~120s grace window starts on first open — within the window any read succeeds. Reads after the grace return 410 Gone."
+            "Note: the open started a one-hour viewing window; any read within it succeeds. Reads after it return 410 Gone."
                 .to_string(),
         );
     } else {
@@ -1270,6 +1270,11 @@ fn format_share_result_text(capsule_id: &str, response: &ContextCapsuleShareResp
             "Share policy: {} (max_uses={:?}, use_count={})",
             policy_prefix, response.max_uses, response.use_count
         ));
+        if let Some(uses) = response.max_uses.filter(|uses| *uses > 1) {
+            lines.push(format!(
+                "Note: each of the {uses} opens starts a one-hour viewing window, and reads within it count as that open. After the last open's window, reads return 410 Gone."
+            ));
+        }
     }
     lines.push(format!(
         "Warnings: {}",
@@ -1555,7 +1560,7 @@ fn apply_safe_share_defaults(mut params: CapsuleShareParams) -> CapsuleSharePara
         }
         if params.multi_use.is_none() {
             // Token-gated links default to single-use (burn-after-read)
-            // with a ~120s grace window for parallel reads. Callers can
+            // with a one-hour viewing window per open. Callers can
             // pass multi_use=true to opt out.
             params.multi_use = Some(false);
         }

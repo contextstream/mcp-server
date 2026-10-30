@@ -1954,6 +1954,14 @@ mod validation_tests {
                 json!({"action": "create_event", "event_type": "plan", "title": "t"}),
                 "reserved",
             ),
+            (
+                json!({"action": "create_todo", "title": "t", "todo_priority": "whenever"}),
+                "todo_priority \"whenever\" is not one of: low, medium, high, urgent.",
+            ),
+            (
+                json!({"action": "create_todo", "title": "", "todo_priority": "high"}),
+                "title is required",
+            ),
         ] {
             let message = tool
                 .execute(args.clone())

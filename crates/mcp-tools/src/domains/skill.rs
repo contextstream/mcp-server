@@ -1250,6 +1250,9 @@ fn skill_candidates_from_items(value: &Value) -> Vec<RankedSkillCandidate> {
 /// retires the skill.
 const OPEN_SKILL_STATUSES: &[&str] = &["active", "draft"];
 
+/// The statuses a skill can have.
+const SKILL_STATUSES: &[&str] = &["active", "draft", "archived"];
+
 /// The skills a reference may name: each answers to its title and to its
 /// name, and is shown with its name, scope and status.
 fn skill_lookup_candidates(result: &Value) -> Vec<LookupCandidate> {
@@ -1278,7 +1281,7 @@ fn skill_lookup_candidates(result: &Value) -> Vec<LookupCandidate> {
 #[async_trait]
 impl ToolHandler for SkillTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
-        let input: SkillInput =
+        let mut input: SkillInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
 
         let action = input.action.to_lowercase();
@@ -1287,6 +1290,19 @@ impl ToolHandler for SkillTool {
                 "Invalid action: '{}'. Valid actions: {}",
                 action,
                 VALID_ACTIONS.join(", ")
+            )));
+        }
+        // A status outside the enum was saved as active (a typo for draft
+        // published the skill), and any priority was stored (#350).
+        input.status =
+            crate::input_shape::enum_argument("status", input.status.take(), SKILL_STATUSES)
+                .map_err(Error::Validation)?;
+        if let Some(priority) = input
+            .priority
+            .filter(|priority| !(0..=100).contains(priority))
+        {
+            return Err(Error::Validation(format!(
+                "priority must be 0-100 (got {priority})."
             )));
         }
 
@@ -1383,7 +1399,7 @@ impl ToolHandler for SkillTool {
             .string_enum(
                 "status",
                 "Skill status. Defaults to 'active' on create when omitted; pass 'draft' to save as a draft.",
-                &["active", "draft", "archived"],
+                SKILL_STATUSES,
                 false,
             )
             .string(
@@ -2094,5 +2110,35 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(!err.contains("requires init from a multi-project parent folder first"));
         assert!(!err.contains("Unknown target_project"));
+    }
+
+    #[tokio::test]
+    async fn a_status_outside_the_enum_or_a_priority_outside_0_to_100_is_refused() {
+        // #350: "sleeping" was saved as active, and priority 9999 was stored.
+        let config = mcp_types::Config::default();
+        let client = mcp_client::ContextStreamClient::new(config.clone());
+        let session = Arc::new(mcp_session::SessionManager::new(client.clone(), config));
+        let tool = SkillTool::new(client, session);
+        for (input, expected) in [
+            (
+                serde_json::json!({"action": "create", "name": "s", "instruction_body": "b", "status": "sleeping"}),
+                "status \"sleeping\" is not one of: active, draft, archived.",
+            ),
+            (
+                serde_json::json!({"action": "create", "name": "s", "instruction_body": "b", "priority": 9999}),
+                "priority must be 0-100 (got 9999).",
+            ),
+            (
+                serde_json::json!({"action": "update", "name": "s", "priority": -1}),
+                "priority must be 0-100 (got -1).",
+            ),
+        ] {
+            let message = tool
+                .execute(input.clone())
+                .await
+                .expect_err(&input.to_string())
+                .to_string();
+            assert!(message.contains(expected), "{input}: {message}");
+        }
     }
 }

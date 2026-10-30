@@ -102,8 +102,18 @@ impl ReminderTool {
 #[async_trait]
 impl ToolHandler for ReminderTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
-        let input: ReminderInput =
+        let mut input: ReminderInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
+        // A value outside the advertised enum is refused with the list (#350):
+        // the API stored any recurrence as written, and a status filter it does
+        // not know listed nothing.
+        use crate::input_shape::enum_argument;
+        input.status = enum_argument("status", input.status.take(), VALID_STATUSES)
+            .map_err(Error::Validation)?;
+        input.recurrence = enum_argument("recurrence", input.recurrence.take(), VALID_RECURRENCE)
+            .map_err(Error::Validation)?;
+        input.priority = enum_argument("priority", input.priority.take(), VALID_PRIORITIES)
+            .map_err(Error::Validation)?;
 
         let action = input.action.to_lowercase();
         let workspace_id = Self::parse_workspace_id(&input.workspace_id)?;

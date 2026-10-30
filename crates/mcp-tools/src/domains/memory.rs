@@ -2993,7 +2993,7 @@ pub(crate) const VALID_EVENT_TYPES: &[&str] = &[
     "achievement",
 ];
 
-/// Refuses a doc, event or diagram type outside the advertised enum on the
+/// Refuses a doc, event or diagram type or a todo priority outside the advertised enum on the
 /// actions that store it, and spells an accepted one the way the enum does
 /// (#350). Filters are left alone: stored records can carry older types.
 fn check_stored_types(action: &str, input: &mut MemoryInput) -> Result<()> {
@@ -3012,6 +3012,14 @@ fn check_stored_types(action: &str, input: &mut MemoryInput) -> Result<()> {
             input.event_type =
                 enum_argument("event_type", input.event_type.take(), VALID_EVENT_TYPES)
                     .map_err(Error::Validation)?;
+        }
+        "create_todo" | "update_todo" => {
+            input.todo_priority = enum_argument(
+                "todo_priority",
+                input.todo_priority.take(),
+                VALID_TODO_PRIORITIES,
+            )
+            .map_err(Error::Validation)?;
         }
         "create_diagram" | "update_diagram" => {
             input.diagram_type = enum_argument(
@@ -4627,6 +4635,7 @@ impl ToolHandler for MemoryTool {
             "create_todo" => {
                 let title = input
                     .title
+                    .filter(|title| !title.trim().is_empty())
                     .ok_or_else(|| Error::Validation("title is required".to_string()))?;
                 let title_for_user = title.clone();
                 let params = CreateTodoParams {

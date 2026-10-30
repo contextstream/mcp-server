@@ -791,32 +791,92 @@ mod memory_decisions_setup_tests {
     }
 }
 
-mod collection_count_tests {
-    use super::collection_count;
-    use serde_json::json;
+mod transcript_page_tests {
+    use super::{extract_collection_array_mut, page_transcript_matches, TRANSCRIPT_SEARCH_MAX};
+    use serde_json::{json, Value};
 
     #[test]
-    fn counts_root_array() {
-        let value = json!([{"id": 1}, {"id": 2}, {"id": 3}]);
-        assert_eq!(collection_count(&value), 3);
+    fn finds_root_wrapped_and_nested_arrays_for_editing() {
+        let mut root = json!([{"id": 1}, {"id": 2}, {"id": 3}]);
+        assert_eq!(
+            extract_collection_array_mut(&mut root).map(|a| a.len()),
+            Some(3)
+        );
+        let mut wrapped = json!({"items": [{"id": 1}, {"id": 2}]});
+        assert_eq!(
+            extract_collection_array_mut(&mut wrapped).map(|a| a.len()),
+            Some(2)
+        );
+        let mut nested = json!({"data": {"results": [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]}});
+        assert_eq!(
+            extract_collection_array_mut(&mut nested).map(|a| a.len()),
+            Some(4)
+        );
+    }
+
+    fn matches(count: usize) -> Value {
+        let items: Vec<Value> = (0..count).map(|i| json!({"id": format!("t{i}")})).collect();
+        json!({"success": true, "data": {"items": items, "total": count}})
+    }
+
+    fn ids(result: &Value) -> Vec<String> {
+        result["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect()
     }
 
     #[test]
-    fn counts_wrapped_items_array() {
-        let value = json!({
-            "items": [{"id": 1}, {"id": 2}]
-        });
-        assert_eq!(collection_count(&value), 2);
+    fn offset_pages_through_the_matches() {
+        // #462: offset=2 returned page 1 again.
+        let mut first = matches(3);
+        assert_eq!(
+            page_transcript_matches(&mut first, 0, 2, Some(2)),
+            "Showing matches 1\u{2013}2. Pass offset=2 for more."
+        );
+        assert_eq!(ids(&first), ["t0", "t1"]);
+
+        let mut second = matches(5);
+        assert_eq!(
+            page_transcript_matches(&mut second, 2, 2, Some(2)),
+            "Showing matches 3\u{2013}4. Pass offset=4 for more."
+        );
+        assert_eq!(ids(&second), ["t2", "t3"]);
+
+        let mut last = matches(5);
+        assert_eq!(
+            page_transcript_matches(&mut last, 4, 2, Some(2)),
+            "Showing matches 5\u{2013}5 of 5."
+        );
+        assert_eq!(ids(&last), ["t4"]);
+
+        let mut all = matches(3);
+        assert_eq!(
+            page_transcript_matches(&mut all, 0, 10, None),
+            "Found 3 matching transcripts."
+        );
     }
 
     #[test]
-    fn counts_nested_data_results_array() {
-        let value = json!({
-            "data": {
-                "results": [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
-            }
-        });
-        assert_eq!(collection_count(&value), 4);
+    fn the_end_and_the_fifty_match_ceiling_are_named() {
+        let mut past = matches(3);
+        assert_eq!(
+            page_transcript_matches(&mut past, 7, 2, Some(2)),
+            "Offset 7 is past the end of the 3 matching transcripts; pass an offset below 3."
+        );
+        let mut capped = matches(TRANSCRIPT_SEARCH_MAX);
+        assert_eq!(
+            page_transcript_matches(&mut capped, 60, 2, Some(2)),
+            "Offset 60 is past the 50 best matches the transcript search returns. Narrow the query to reach others."
+        );
+        let mut big = matches(TRANSCRIPT_SEARCH_MAX);
+        assert_eq!(
+            page_transcript_matches(&mut big, 0, 50, Some(80)),
+            "Found 50 matching transcripts. The search returns its 50 best matches; narrow the query to reach others. limit is at most 50 here."
+        );
+        assert_eq!(ids(&big).len(), 50);
     }
 }
 
@@ -3111,7 +3171,7 @@ mod transcript_match_tests {
             "message_count": 2,
             "messages": [{"role": "user", "content": "Please Create the t4 directory now."}]
         }]});
-        let text = format_transcript_matches(&result, "create");
+        let text = format_transcript_matches(&result, "create", 0);
         assert!(text.contains("1. **Create t4 directory and count hostname bytes** (id: 11111111-1111-4111-8111-111111111111) — contextcode, 2026-10-28T18:56:15Z, 2 messages"), "{text}");
         assert!(
             text.contains("…Please Create the t4 directory now.…"),

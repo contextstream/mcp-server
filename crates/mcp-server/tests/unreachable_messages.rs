@@ -59,6 +59,8 @@ fn an_unreachable_server_is_named_with_its_cause() {
         &["configure", "--account-learning", "status"],
     );
     let stdout = String::from_utf8_lossy(&status.stdout);
+    // "Could not check" exits 1, as link and update --check do; "off" exits 0.
+    assert_eq!(status.status.code(), Some(1), "{stdout}");
     assert!(
         stdout.contains("Deep project learning: unavailable"),
         "{stdout}"

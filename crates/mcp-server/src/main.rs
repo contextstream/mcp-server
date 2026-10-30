@@ -1377,7 +1377,9 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             if let Some(action) = account_learning {
                 match action {
                     AccountLearningAction::Status => {
-                        setup::account_learning::show_status().await?;
+                        if !setup::account_learning::show_status().await? {
+                            std::process::exit(1);
+                        }
                     }
                     AccountLearningAction::On => {
                         setup::account_learning::configure(true).await?;
@@ -2678,7 +2680,8 @@ enum ConfigureOutcome {
 async fn run_configure_account_learning_flow() -> Result<()> {
     use dialoguer::Select;
 
-    setup::account_learning::show_status().await?;
+    // The menu goes on either way: its choices still work.
+    let _ = setup::account_learning::show_status().await?;
     let options = [
         "Open privacy page in browser to review/enable consent",
         "Turn off — withdraw consent and queue learned-data deletion",

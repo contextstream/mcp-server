@@ -431,13 +431,15 @@ Privacy page: {PRIVACY_URL}"
 
 /// Inspect and print the current deep project learning consent state without
 /// mutating anything or opening a browser (`configure --account-learning [status]`).
-pub async fn show_status() -> Result<()> {
+/// Returns whether the state could be read: a script can then tell "off" from
+/// "could not check" by the exit status (#343).
+pub async fn show_status() -> Result<bool> {
     let config = match super::doctor::doctor_client_config() {
         Ok(config) => config,
         Err(_) => {
             println!("Deep project learning: unavailable (not signed in)");
             println!("Run `contextstream-mcp setup` first, or visit {PRIVACY_URL}");
-            return Ok(());
+            return Ok(false);
         }
     };
     let api_url = config.api_url.clone();
@@ -468,9 +470,12 @@ pub async fn show_status() -> Result<()> {
             println!("Turn on in a signed-in browser: `{ENABLE_COMMAND}`");
             println!("Privacy page: {PRIVACY_URL}");
         }
-        None => println!("{}", unverified_status(failure.as_ref(), &api_url)),
+        None => {
+            println!("{}", unverified_status(failure.as_ref(), &api_url));
+            return Ok(false);
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 pub async fn configure(enabled: bool) -> Result<()> {

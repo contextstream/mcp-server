@@ -3286,14 +3286,15 @@ mod tests {
         (
             // Additive: action=working_set with `add`, `remove` and `clear`
             // (related projects for cross-project work). Every earlier field
-            // and action still accepted.
+            // and action still accepted. Additive: `offset` for list (#381).
             "project",
-            "1606c71bedf5fbb8572a3e4a1fae79eebb6af702ba8e563ff113381ec9b0b613",
+            "9cbec6447e03f50e67f9b84fe3590dd4506cce905859d6198fc7390f9bb55d6d",
         ),
         (
             // #325: without `recent_changes`, which the hosted gateway refuses.
+            // Additive: `offset` for list (#381).
             "project_read",
-            "df87f1730d34ae918ff23c2b293d57bb14ef7824f0291a5729bdc291211afaf8",
+            "0ff0c97b3a5b7cc9d81e7f7d6b31efb9d0cb79886fa85ff96531d59731105e45",
         ),
         (
             "qa",

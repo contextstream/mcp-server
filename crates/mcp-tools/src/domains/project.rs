@@ -84,6 +84,46 @@ pub struct ProjectsListInput {
     pub workspace_id: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
+    /// The paging every other list takes (#381): page_size and the page
+    /// that holds offset, when page and page_size are not given.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+/// Where a page of projects sits in the whole and how to get the next one
+/// (#381): "Found 20 projects." looked complete when the workspace had more.
+fn project_list_heading(
+    shown: usize,
+    page: Option<i64>,
+    per_page: Option<i64>,
+    total: Option<i64>,
+    has_next: Option<bool>,
+) -> String {
+    let page = page.unwrap_or(1).max(1);
+    let per_page = per_page
+        .filter(|size| *size > 0)
+        .unwrap_or(shown.max(1) as i64);
+    let start = usize::try_from((page - 1) * per_page).unwrap_or(0);
+    let end = start + shown;
+    let total = total
+        .and_then(|total| usize::try_from(total).ok())
+        .filter(|total| *total >= end);
+    let more = total.map_or(has_next == Some(true), |total| end < total);
+    let next = format!(" Pass offset={end} (or page={}) for more.", page + 1);
+    match (total, more) {
+        (Some(total), _) if start == 0 && total <= shown => format!("Found {shown} projects.\n\n"),
+        (Some(total), true) => {
+            format!("Showing {}–{end} of {total} projects.{next}\n\n", start + 1)
+        }
+        (Some(total), false) => format!(
+            "Showing {}–{end} of {total} projects (the end).\n\n",
+            start + 1
+        ),
+        (None, true) => format!("Showing {}–{end} projects.{next}\n\n", start + 1),
+        (None, false) => format!("Found {shown} projects.\n\n"),
+    }
 }
 
 /// What an empty project list means. The API lists no projects for a
@@ -150,10 +190,28 @@ impl ToolHandler for ProjectsListTool {
             })?),
         };
 
-        let projects = self
+        let (page, page_size) = match (input.page, input.page_size) {
+            (None, None) if input.limit.is_some() || input.offset.is_some() => {
+                let size = input.limit.unwrap_or(20).clamp(1, 100);
+                (
+                    Some(input.offset.unwrap_or(0).max(0) / size + 1),
+                    Some(size),
+                )
+            }
+            given => given,
+        };
+        let listed = self
             .client
-            .list_projects(workspace_id, input.page, input.page_size)
+            .list_projects_page(workspace_id, page, page_size)
             .await?;
+        let heading = project_list_heading(
+            listed.items.len(),
+            listed.page.or(page),
+            listed.per_page.or(page_size),
+            listed.total,
+            listed.has_next,
+        );
+        let projects = listed.items;
 
         let mut text = String::new();
 
@@ -163,7 +221,7 @@ impl ToolHandler for ProjectsListTool {
                 Err(unreachable) => return Ok(ToolResult::error(unreachable)),
             }
         } else {
-            text.push_str(&format!("Found {} projects.\n\n", projects.len()));
+            text.push_str(&heading);
 
             for (i, proj) in projects.iter().enumerate() {
                 text.push_str(&format!("{}. **{}** ({})\n", i + 1, proj.name, proj.id));
@@ -1081,8 +1139,9 @@ pub struct ProjectInput {
     pub until: Option<String>,
     pub machine_id: Option<String>,
     pub branch: Option<String>,
-    // Recent changes fields
+    // Recent changes fields; also list paging with offset
     pub limit: Option<i64>,
+    pub offset: Option<i64>,
     // Ingest local fields
     pub path: Option<String>,
     pub folder_path: Option<String>,
@@ -2165,6 +2224,8 @@ impl ToolHandler for ProjectTool {
                     workspace_id: input.workspace_id,
                     page: input.page,
                     page_size: input.page_size,
+                    limit: input.limit,
+                    offset: input.offset,
                 };
                 let tool = ProjectsListTool::new(self.client.clone());
                 tool.execute(serde_json::to_value(&list_input).unwrap()).await
@@ -3193,7 +3254,12 @@ impl ToolHandler for ProjectTool {
             // Recent changes fields
             .integer(
                 "limit",
-                "Maximum commits to return (for recent_changes, default: 10, max: 50)",
+                "Maximum commits to return (for recent_changes, default: 10, max: 50), or projects per page (for list, default: 20, max: 100)",
+                false,
+            )
+            .integer(
+                "offset",
+                "Projects to skip (for list; with limit)",
                 false,
             )
             // Working set fields

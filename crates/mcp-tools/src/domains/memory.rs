@@ -563,6 +563,165 @@ fn extract_primary_object<'a>(value: &'a Value, keys: &[&str]) -> &'a Value {
     current
 }
 
+/// The most doc content one request may carry once JSON-encoded. The API
+/// takes at most 2 MiB per request (axum's default body limit, which the doc
+/// routes keep), and a create or update sends the whole doc, so this is also
+/// the most a doc can hold; the rest of the 2 MiB is room for the other
+/// fields (#385).
+const DOC_CONTENT_MAX_BYTES: usize = 2_080_000;
+
+/// Refuses doc content the API would turn away with a bare 413, before
+/// anything is sent.
+fn check_doc_content_size(content: &str) -> Result<()> {
+    let encoded = serde_json::to_string(content).map_or(content.len(), |encoded| encoded.len());
+    if encoded <= DOC_CONTENT_MAX_BYTES {
+        return Ok(());
+    }
+    Err(Error::Validation(format!(
+        "content is {:.1} MB ({} bytes as sent); a doc can hold at most {} bytes (about 2 MB), because each create or update sends the whole doc and the API accepts at most 2 MB per request. Nothing was saved. Split the text into several docs, for example \"<title> (part 1)\" and \"<title> (part 2)\".",
+        encoded as f64 / 1_000_000.0,
+        group_digits(encoded),
+        group_digits(DOC_CONTENT_MAX_BYTES)
+    )))
+}
+
+/// How much of a doc's content one `get_doc` shows when `max_chars` is not
+/// given: about 10k tokens (#384).
+const DOC_CONTENT_DEFAULT_CHARS: usize = 40_000;
+/// The most `max_chars` may ask for at once.
+const DOC_CONTENT_MAX_CHARS: usize = 200_000;
+
+/// The part of a doc's content one `get_doc` shows, in characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DocWindow {
+    requested: usize,
+    start: usize,
+    end: usize,
+    total: usize,
+}
+
+impl DocWindow {
+    fn new(content: &str, offset: Option<i64>, max_chars: Option<i64>) -> Self {
+        let total = content.chars().count();
+        let requested = usize::try_from(offset.unwrap_or(0).max(0)).unwrap_or(usize::MAX);
+        let size = max_chars
+            .filter(|size| *size > 0)
+            .and_then(|size| usize::try_from(size).ok())
+            .map_or(DOC_CONTENT_DEFAULT_CHARS, |size| {
+                size.min(DOC_CONTENT_MAX_CHARS)
+            });
+        let start = requested.min(total);
+        Self {
+            requested,
+            start,
+            end: start.saturating_add(size).min(total),
+            total,
+        }
+    }
+
+    fn is_whole(&self) -> bool {
+        self.start == 0 && self.end == self.total
+    }
+
+    fn slice<'a>(&self, content: &'a str) -> &'a str {
+        let byte_at = |chars: usize| {
+            content
+                .char_indices()
+                .nth(chars)
+                .map_or(content.len(), |(at, _)| at)
+        };
+        &content[byte_at(self.start)..byte_at(self.end)]
+    }
+
+    /// What was left out and how to read on; `None` when all of it shows.
+    fn note(&self) -> Option<String> {
+        if self.is_whole() {
+            return None;
+        }
+        if self.requested >= self.total {
+            return Some(format!(
+                "[OUTPUT_BUDGET] offset={} is past the end: the content has {} characters.",
+                self.requested,
+                group_digits(self.total)
+            ));
+        }
+        let range = format!(
+            "Showing characters {}–{} of {}",
+            group_digits(self.start),
+            group_digits(self.end),
+            group_digits(self.total)
+        );
+        if self.end == self.total {
+            return Some(format!("[OUTPUT_BUDGET] {range} (the end)."));
+        }
+        Some(format!(
+            "[OUTPUT_BUDGET] {range}. Pass offset={} for the next part (max_chars sets how many, up to {}), or use memory(action=\"search\") to find the part you need.",
+            self.end,
+            group_digits(DOC_CONTENT_MAX_CHARS)
+        ))
+    }
+}
+
+/// 600007 -> "600,007".
+fn group_digits(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (at, digit) in digits.chars().enumerate() {
+        if at > 0 && (digits.len() - at).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// The object in a doc response that holds `content` (top level, or under
+/// one or two `data` wrappers).
+fn doc_object_mut(value: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    if value.get("content").is_some() {
+        return value.as_object_mut();
+    }
+    let data = value.get_mut("data")?;
+    if data.get("content").is_some() {
+        return data.as_object_mut();
+    }
+    data.get_mut("data").and_then(Value::as_object_mut)
+}
+
+/// A doc as `get_doc` shows it: the header and at most one window of the
+/// content (#384). The structured copy gets the same window, with where it
+/// sits in the whole, so neither copy carries a large doc in full.
+fn show_doc(value: &mut Value, offset: Option<i64>, max_chars: Option<i64>) -> String {
+    let content = extract_primary_object(value, &["id", "title", "content"])
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let window = DocWindow::new(&content, offset, max_chars);
+    if window.is_whole() {
+        return format_doc_detail(value);
+    }
+    let shown = window.slice(&content);
+    if let Some(doc) = doc_object_mut(value) {
+        doc.insert("content".to_string(), Value::String(shown.to_string()));
+        doc.insert(
+            "content_window".to_string(),
+            serde_json::json!({
+                "offset": window.start,
+                "chars": window.end - window.start,
+                "total_chars": window.total,
+                "next_offset": (window.end < window.total).then_some(window.end),
+            }),
+        );
+    }
+    let mut text = format_doc_detail(value);
+    if let Some(note) = window.note() {
+        text.push_str("\n\n");
+        text.push_str(&note);
+    }
+    text
+}
+
 fn format_doc_detail(value: &Value) -> String {
     let doc = extract_primary_object(value, &["id", "title", "content"]);
     let id = doc.get("id").and_then(|v| v.as_str()).unwrap_or("—");
@@ -3165,6 +3324,9 @@ pub struct MemoryInput {
     pub since: Option<String>,
     #[serde(default)]
     pub offset: Option<i64>,
+    /// get_doc: how many characters of the content to show (#384).
+    #[serde(default)]
+    pub max_chars: Option<i64>,
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
@@ -5174,6 +5336,7 @@ impl ToolHandler for MemoryTool {
                 let content = input
                     .content
                     .ok_or_else(|| Error::Validation("content is required".to_string()))?;
+                check_doc_content_size(&content)?;
                 let title_for_user = title.clone();
                 let params = CreateDocParams {
                     title,
@@ -5264,7 +5427,8 @@ impl ToolHandler for MemoryTool {
                         || async move { client.get_doc(id).await },
                     )
                     .await?;
-                    let text = format_doc_detail(&result);
+                    let mut result = result;
+                    let text = show_doc(&mut result, input.offset, input.max_chars);
                     consume_grounding_memory_tool(&self.session).await;
                     return Ok(ToolResult::with_structured(text, result));
                 }
@@ -5308,7 +5472,7 @@ impl ToolHandler for MemoryTool {
                         "Resolved doc query \"{}\" to doc ID {}.\n\n{}",
                         query,
                         found.id,
-                        format_doc_detail(&result)
+                        show_doc(&mut result, input.offset, input.max_chars)
                     );
                     found.annotate(&mut result);
                     consume_grounding_memory_tool(&self.session).await;
@@ -5369,6 +5533,9 @@ impl ToolHandler for MemoryTool {
                         Some(super::doc_ops::apply_doc_ops(current_content, &ops)?)
                     }
                 };
+                if let Some(content) = content.as_deref() {
+                    check_doc_content_size(content)?;
+                }
                 let params = UpdateDocParams {
                     title: input.title,
                     content,
@@ -6255,7 +6422,7 @@ impl ToolHandler for MemoryTool {
                 false,
             )
             .string("title", "Title (for create/update operations)", false)
-            .string("content", "Content (for create/update operations). For update_doc prefer ops, which sends only the change.", false)
+            .string("content", "Content (for create/update operations; a doc holds at most about 2 MB). For update_doc prefer ops, which sends only the change.", false)
             .property("ops", super::doc_ops::doc_ops_schema(), false)
             .string(
                 "new_content",
@@ -6286,7 +6453,16 @@ impl ToolHandler for MemoryTool {
                 "ISO-8601 lower bound on decision time (decisions)",
                 false,
             )
-            .integer("offset", "Pagination offset (decisions)", false)
+            .integer(
+                "offset",
+                "Pagination offset (decisions); for get_doc, the character of the doc's content to start from",
+                false,
+            )
+            .integer(
+                "max_chars",
+                "get_doc: how many characters of the doc's content to show (default 40,000, at most 200,000)",
+                false,
+            )
             .string("source", "Decision source filter (decisions)", false)
             .string(
                 "rationale",
@@ -6617,7 +6793,11 @@ pub fn register_memory_tools(
             SchemaBuilder::new()
                 .description("Save a new doc to ContextStream memory")
                 .string("title", "Doc title", true)
-                .string("content", "Doc content (markdown)", true)
+                .string(
+                    "content",
+                    "Doc content (markdown), at most about 2 MB",
+                    true,
+                )
                 .string_enum(
                     "doc_type",
                     "Doc type",

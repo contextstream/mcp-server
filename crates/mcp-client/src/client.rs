@@ -21350,6 +21350,18 @@ fn deserialize_empty_success<T: DeserializeOwned>() -> Result<T> {
 }
 
 fn sanitize_http_error_body(status: u16, content_type: &str, body: &str) -> String {
+    let message = sanitized_http_error_text(status, content_type, body);
+    if status == 413 {
+        // #385: the API's own text ("length limit exceeded") says nothing
+        // about what to do.
+        return format!(
+            "{message}. The request was larger than the API accepts; send less in one call, for example by splitting the content"
+        );
+    }
+    message
+}
+
+fn sanitized_http_error_text(status: u16, content_type: &str, body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return format!("HTTP {} error", status);

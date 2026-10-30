@@ -44,6 +44,9 @@ pub struct ReminderInput {
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
     pub limit: Option<i64>,
+    /// list: where the page starts (#459). The API takes a limit only.
+    #[serde(default)]
+    pub offset: Option<i64>,
     // List/active fields
     pub status: Option<String>,
     pub context: Option<String>,
@@ -123,13 +126,29 @@ impl ToolHandler for ReminderTool {
 
         match action.as_str() {
             "list" => {
+                // The API takes a limit only, at most 100, so a page from an
+                // offset is the first offset + limit with the offset skipped
+                // here (#459): offset=2 listed the first reminders again.
+                let offset = input.offset.unwrap_or(0).max(0);
+                let page_size = input.limit.filter(|limit| *limit > 0).unwrap_or(20);
+                if offset > 0 && offset + page_size > REMINDER_LIST_MAX {
+                    return Err(Error::Validation(format!(
+                        "reminder list reaches the first {REMINDER_LIST_MAX} reminders \
+                         (offset + limit at most {REMINDER_LIST_MAX}); narrow it with status, \
+                         priority or context."
+                    )));
+                }
                 let params = ListRemindersParams {
                     workspace_id,
                     project_id,
                     status: input.status,
                     context: input.context,
                     priority: input.priority.clone(),
-                    limit: input.limit,
+                    limit: if offset > 0 {
+                        Some(offset + page_size)
+                    } else {
+                        input.limit
+                    },
                 };
                 let mut result = self.client.list_reminders(params).await?;
                 keep_matching_reminders(
@@ -137,6 +156,9 @@ impl ToolHandler for ReminderTool {
                     input.keywords.as_deref(),
                     input.priority.as_deref(),
                 );
+                if offset > 0 {
+                    skip_reminders(&mut result, offset as usize);
+                }
                 Ok(ToolResult::with_structured(
                     format_reminder_list(&result, false),
                     result,
@@ -263,6 +285,7 @@ impl ToolHandler for ReminderTool {
             .uuid("workspace_id", "Workspace ID", false)
             .uuid("project_id", "Project ID", false)
             .integer("limit", "Maximum results", false)
+            .integer("offset", "list: where the page starts, with limit", false)
             // List/active fields
             .string_enum("status", "Reminder status filter", VALID_STATUSES, false)
             .string("context", "Context to match relevant reminders", false)
@@ -347,6 +370,25 @@ fn reminder_object(result: &Value) -> &Value {
 }
 
 /// Extract the reminder array from common envelopes (bare array / {items|reminders|data}).
+/// The most reminders the API lists in one call.
+const REMINDER_LIST_MAX: i64 = 100;
+
+/// Drop the first `offset` reminders of a list response (#459).
+fn skip_reminders(result: &mut Value, offset: usize) {
+    let items = if result.is_array() {
+        result.as_array_mut()
+    } else {
+        ["items", "reminders", "data"]
+            .into_iter()
+            .find(|key| result.get(*key).is_some_and(Value::is_array))
+            .and_then(|key| result.get_mut(key))
+            .and_then(Value::as_array_mut)
+    };
+    if let Some(items) = items {
+        items.drain(..offset.min(items.len()));
+    }
+}
+
 fn reminder_items(result: &Value) -> Vec<&Value> {
     if let Some(arr) = result.as_array() {
         return arr.iter().collect();

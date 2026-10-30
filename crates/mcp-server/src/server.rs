@@ -3195,7 +3195,7 @@ mod tests {
             // (a project name) was added, and `kind` lost `discussion`, which
             // mapped to an API route that never existed, so every call failed.
             "entity",
-            "449b3b7ebe2741b31aff87f5feccc765a1b18e56e475b1c833a1bdd592d45d94",
+            "46ebf5d32e9ef66d931303dd0aea9b9da01bb9b5d156e77f8154355ce2204860",
         ),
         (
             "feed",
@@ -3302,7 +3302,7 @@ mod tests {
         ),
         (
             "reminder",
-            "360b02798e9627e8bbac06ea890a3722914b4e9826ff2097657df18ceff96f64",
+            "fd547c393406f274c9b25aab9c626f569904febf4d1e5cb3902372d30764df94",
         ),
         (
             "search",

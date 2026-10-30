@@ -98,6 +98,12 @@ pub struct EntityInput {
     pub body: Option<Value>,
     /// Query / filter params for list. Object whose keys map to query params.
     pub query: Option<Value>,
+    /// list: the page size and where the page starts (#459). They went into
+    /// `extra` and were dropped, so limit=2 listed every entity of the page.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
     /// Entity fields given beside `body` (`title="..."` at the top level, as
     /// other tools take them). Create and update fold them into `body`; a key
     /// in `body` wins (#277).
@@ -777,20 +783,77 @@ fn render_field_value(value: &Value) -> Option<String> {
 /// LLM-visible text content carries enough info to act on the entities (id +
 /// title + kind + status). Without this the structured payload alone is
 /// invisible to clients that only surface text content.
+/// The API pages every entity list with page/per_page (#459): limit and
+/// offset map to them, unless the `query` object names a page itself.
+fn add_list_page_params(
+    params: &mut Vec<(String, String)>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) {
+    let named = |key: &str| params.iter().any(|(name, _)| name == key);
+    if named("page") || named("per_page") || named("page_size") {
+        return;
+    }
+    let (page, size) = super::project::requested_page(None, None, limit, offset, 20);
+    if let Some(size) = size {
+        params.push(("per_page".to_string(), size.to_string()));
+    }
+    if let Some(page) = page {
+        params.push(("page".to_string(), page.to_string()));
+    }
+}
+
+/// Where a page of entities sits, from the response's total/page/per_page
+/// (#459): None when the response does not say.
+fn entity_page_position(result: &Value, shown: usize) -> Option<(usize, usize, usize)> {
+    let number = |key: &str| result.get(key).and_then(Value::as_u64).map(|n| n as usize);
+    let total = number("total")?;
+    let page = number("page").unwrap_or(1).max(1);
+    let per_page = number("per_page")
+        .filter(|size| *size > 0)
+        .unwrap_or(shown.max(1));
+    Some(((page - 1) * per_page, total, per_page))
+}
+
 fn format_entity_list(kind: &str, result: &Value) -> String {
     let items = extract_items_array(result);
     let count = items.map(|a| a.len()).unwrap_or(0);
+    let position = entity_page_position(result, count);
 
     if count == 0 {
+        if let Some((start, total, _)) =
+            position.filter(|(start, total, _)| *start > 0 && *total > 0)
+        {
+            return format!(
+                "Offset {start} is past the end: there are {total} {}. Pass a smaller offset (offset=0 for the first page).",
+                plural_kind(kind)
+            );
+        }
         return format!("No {} found.", plural_kind(kind));
     }
 
-    let mut text = format!("Found {} {}:\n\n", count, plural_kind(kind));
+    let start = position.map_or(0, |(start, _, _)| start);
+    let mut text = match position {
+        Some((start, total, _)) if start + count < total => format!(
+            "Showing {}–{} of {total} {}. Pass offset={} for more.\n\n",
+            start + 1,
+            start + count,
+            plural_kind(kind),
+            start + count
+        ),
+        Some((start, total, _)) if start > 0 => format!(
+            "Showing {}–{} of {total} {} (the end).\n\n",
+            start + 1,
+            start + count,
+            plural_kind(kind)
+        ),
+        _ => format!("Found {} {}:\n\n", count, plural_kind(kind)),
+    };
     if let Some(arr) = items {
         for (i, item) in arr.iter().enumerate() {
             let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("—");
             let title = entity_display_title(item);
-            let mut line = format!("{}. **{}** (id: {})", i + 1, title, id);
+            let mut line = format!("{}. **{}** (id: {})", start + i + 1, title, id);
             if let Some(t) = entity_type_label(item) {
                 line.push_str(&format!(" [{}]", t));
             }
@@ -907,6 +970,7 @@ impl ToolHandler for EntityTool {
 
         match action.as_str() {
             "list" => {
+                let (list_limit, list_offset) = (input.limit, input.offset);
                 // An unknown project_id is left out, with a note (#449): it
                 // answered "No tickets found." as if the project were empty.
                 let mut scope_note = None;
@@ -925,7 +989,8 @@ impl ToolHandler for EntityTool {
                     }
                 }
                 let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
-                let params = Self::build_list_params(&input.query, &ws, &proj);
+                let mut params = Self::build_list_params(&input.query, &ws, &proj);
+                add_list_page_params(&mut params, list_limit, list_offset);
                 let result = if let (Some(cache_kind), Some(ws_id)) = (
                     Self::warm_cache_kind(&kind),
                     ws.as_ref().and_then(|s| uuid::Uuid::parse_str(s).ok()),
@@ -1290,6 +1355,8 @@ impl ToolHandler for EntityTool {
                 "Filter params for list. Object whose keys/values become URL query params.",
                 false,
             )
+            .integer("limit", "list: page size", false)
+            .integer("offset", "list: where the page starts, with limit", false)
             .build()
     }
 }
@@ -1327,6 +1394,34 @@ pub fn register_entity_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entity_list_pages_by_limit_and_offset() {
+        // #459: limit and offset were dropped, so every call listed the whole
+        // first page.
+        let mut params = vec![("workspace_id".to_string(), "w".to_string())];
+        add_list_page_params(&mut params, Some(2), Some(2));
+        assert!(params.contains(&("per_page".to_string(), "2".to_string())));
+        assert!(params.contains(&("page".to_string(), "2".to_string())));
+        let mut named = vec![("page".to_string(), "5".to_string())];
+        add_list_page_params(&mut named, Some(2), Some(2));
+        assert_eq!(named, vec![("page".to_string(), "5".to_string())]);
+        let mut none = Vec::new();
+        add_list_page_params(&mut none, None, None);
+        assert!(none.is_empty());
+
+        let page = serde_json::json!({"items": [{"id": "h3", "title": "Third"}, {"id": "h4", "title": "Fourth"}],
+            "total": 11, "page": 2, "per_page": 2});
+        let text = format_entity_list("handoff", &page);
+        assert!(
+            text.starts_with("Showing 3–4 of 11 handoffs. Pass offset=4 for more."),
+            "{text}"
+        );
+        assert!(text.contains("3. **Third**"));
+        let past = serde_json::json!({"items": [], "total": 11, "page": 9, "per_page": 2});
+        assert!(format_entity_list("handoff", &past)
+            .starts_with("Offset 16 is past the end: there are 11 handoffs."));
+    }
 
     #[test]
     fn top_level_entity_fields_join_the_body_and_body_wins() {

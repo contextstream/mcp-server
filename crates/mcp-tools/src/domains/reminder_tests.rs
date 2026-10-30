@@ -590,3 +590,14 @@ fn keywords_and_priority_narrow_a_reminder_list() {
         json!([{"id": "3", "title": "Third", "content": "mentions BETAKW", "priority": "urgent", "keywords": []}])
     );
 }
+
+#[test]
+fn reminder_list_skips_the_offset() {
+    // #459: offset=2 listed the first reminders again.
+    let mut listed = serde_json::json!([{"id": "a"}, {"id": "b"}, {"id": "c"}, {"id": "d"}]);
+    skip_reminders(&mut listed, 2);
+    assert_eq!(listed, serde_json::json!([{"id": "c"}, {"id": "d"}]));
+    let mut wrapped = serde_json::json!({"items": [{"id": "a"}, {"id": "b"}]});
+    skip_reminders(&mut wrapped, 5);
+    assert_eq!(wrapped, serde_json::json!({"items": []}));
+}

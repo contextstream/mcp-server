@@ -6562,17 +6562,35 @@ fn lesson_guidance_from_value(value: &str) -> String {
     }
 }
 
-/// Typed `L` items from `/context/smart`.
+/// Typed `L` items from `/context/smart`. The API sends "title — prevention"
+/// after its own `[LESSONS_WARNING]` marker, and the stored severity in the
+/// item's `severity` (#380).
 pub(crate) fn lesson_lines_from_typed(items: &[&SmartContextItem]) -> Vec<LessonWarningLine> {
     items
         .iter()
-        .map(|item| LessonWarningLine {
-            title: lesson_title_from_value(&item.value),
-            guidance: lesson_guidance_from_value(&item.value),
-            severity: severity_from_text(&item.value),
-            relevance: Some(item.score),
-            id: item.item_id.map(|id| id.to_string()),
-            superseded: false,
+        .map(|item| {
+            let value = item.value.trim_start();
+            let value = value
+                .strip_prefix("[LESSONS_WARNING]")
+                .unwrap_or(value)
+                .trim_start();
+            let (title, guidance) = match value.split_once(" — ") {
+                Some((title, guidance)) if !value.contains('\n') => {
+                    (title.trim().to_string(), guidance.trim().to_string())
+                }
+                _ => (
+                    lesson_title_from_value(value),
+                    lesson_guidance_from_value(value),
+                ),
+            };
+            LessonWarningLine {
+                title,
+                guidance,
+                severity: item.severity.clone().or_else(|| severity_from_text(value)),
+                relevance: Some(item.score),
+                id: item.item_id.map(|id| id.to_string()),
+                superseded: false,
+            }
         })
         .collect()
 }
@@ -6663,6 +6681,21 @@ pub(crate) fn lesson_lines_from_values(items: &[Value]) -> Vec<LessonWarningLine
         .collect()
 }
 
+/// Critical first, then high, medium, low, and lessons with no stored
+/// severity last.
+fn severity_rank(severity: Option<&str>) -> u8 {
+    match severity
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("critical") => 4,
+        Some("high") => 3,
+        Some("medium") => 2,
+        Some("low") => 1,
+        _ => 0,
+    }
+}
+
 fn lesson_line_body(line: &LessonWarningLine) -> String {
     let guidance: String = line
         .guidance
@@ -6693,6 +6726,17 @@ pub(crate) fn render_lessons_warning(lines: &[LessonWarningLine], compact: bool)
     if lines.is_empty() {
         return String::new();
     }
+    // The most severe lessons first, then the most relevant (#380).
+    let mut lines: Vec<&LessonWarningLine> = lines.iter().collect();
+    lines.sort_by(|a, b| {
+        severity_rank(b.severity.as_deref())
+            .cmp(&severity_rank(a.severity.as_deref()))
+            .then_with(|| {
+                b.relevance
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.relevance.unwrap_or(0.0))
+            })
+    });
     let severity_label = |line: &LessonWarningLine| {
         line.severity
             .as_deref()
@@ -6707,7 +6751,7 @@ pub(crate) fn render_lessons_warning(lines: &[LessonWarningLine], compact: bool)
     };
     let mut text = String::new();
     if compact {
-        for line in lines.iter().take(LESSONS_WARNING_MAX) {
+        for line in lines.iter().copied().take(LESSONS_WARNING_MAX) {
             text.push_str(&format!(
                 "\n[LESSONS_WARNING] severity={} relevance={} {}",
                 severity_label(line),
@@ -6719,7 +6763,7 @@ pub(crate) fn render_lessons_warning(lines: &[LessonWarningLine], compact: bool)
         text.push_str("🚨 ");
         text.push_str(crate::notices::LESSONS_WARNING_HEADER);
         text.push('\n');
-        for (index, line) in lines.iter().take(LESSONS_WARNING_MAX).enumerate() {
+        for (index, line) in lines.iter().copied().take(LESSONS_WARNING_MAX).enumerate() {
             text.push_str(&format!(
                 "{}. [{}] {}",
                 index + 1,

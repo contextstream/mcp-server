@@ -1283,6 +1283,10 @@ pub struct SmartContextItem {
     /// Item subtype label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_type: Option<String>,
+    /// A lesson's stored severity (low, medium, high or critical), when the
+    /// API sends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
 }
 
 impl SmartContextItem {
@@ -1617,6 +1621,7 @@ mod tests {
             score: 0.85,
             item_id: None,
             item_type: None,
+            severity: None,
         };
         assert_eq!(item.kind(), ContextItemKind::Vcs);
         assert_eq!(item.precedence(), Precedence::Normal);
@@ -1630,6 +1635,7 @@ mod tests {
             score: 0.95,
             item_id: None,
             item_type: None,
+            severity: None,
         };
         assert_eq!(item.kind(), ContextItemKind::Preference);
         assert_eq!(item.precedence(), Precedence::High);
@@ -1643,6 +1649,7 @@ mod tests {
             score: 0.7,
             item_id: None,
             item_type: None,
+            severity: None,
         };
         assert_eq!(item.kind(), ContextItemKind::Lesson);
         assert_eq!(item.precedence(), Precedence::Critical);
@@ -1656,6 +1663,7 @@ mod tests {
             score: 0.5,
             item_id: None,
             item_type: None,
+            severity: None,
         };
         assert_eq!(item.kind(), ContextItemKind::Memory);
         assert_eq!(item.precedence(), Precedence::Normal);

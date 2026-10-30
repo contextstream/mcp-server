@@ -6240,6 +6240,7 @@ mod typed_item_formatting_tests {
             score,
             item_id: None,
             item_type: None,
+            severity: None,
         }
     }
 
@@ -6363,6 +6364,36 @@ mod typed_item_formatting_tests {
         ));
         assert!(result.contains("severity=unspecified relevance=0.30 Minor style issue"));
         assert!(!result.contains("severity=CRIT"));
+    }
+
+    #[test]
+    fn typed_lessons_show_the_api_severity_once_marked_and_most_severe_first() {
+        // #380: the API's text carries its own marker and no severity.
+        let mut low = make_item(
+            "L",
+            "[LESSONS_WARNING] Drain the low queue before deploying — drain it first",
+            0.42,
+        );
+        low.severity = Some("low".to_string());
+        let mut critical = make_item(
+            "L",
+            "[LESSONS_WARNING] Drain the critical queue before deploying — drain it first",
+            0.42,
+        );
+        critical.severity = Some("critical".to_string());
+        let unknown = make_item("L", "[LESSONS_WARNING] Keep the notes short", 0.9);
+        let result = format_typed_lessons(&[&low, &unknown, &critical], true);
+        assert_eq!(result.matches("[LESSONS_WARNING]").count(), 3, "{result}");
+        let at = |text: &str| {
+            result
+                .find(text)
+                .unwrap_or_else(|| panic!("{text:?} not in {result}"))
+        };
+        let critical_at = at("[LESSONS_WARNING] severity=critical relevance=0.42 Drain the critical queue before deploying: drain it first");
+        let low_at = at("[LESSONS_WARNING] severity=low relevance=0.42 Drain the low queue before deploying: drain it first");
+        let unknown_at =
+            at("[LESSONS_WARNING] severity=unspecified relevance=0.90 Keep the notes short");
+        assert!(critical_at < low_at && low_at < unknown_at, "{result}");
     }
 
     #[test]

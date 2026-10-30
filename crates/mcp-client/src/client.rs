@@ -15241,6 +15241,19 @@ impl ContextStreamClient {
         .await
     }
 
+    /// `GET /graph/{project_id}/status`: whether the project's code graph is
+    /// built (`status`, `node_count`). The query names the project so the
+    /// API's home forwarder routes it to the project's region (#370).
+    pub async fn graph_status(&self, project_id: Option<Uuid>) -> Result<serde_json::Value> {
+        let config = self.config.read().await;
+        let proj_id = project_id.or(config.default_project_id).ok_or_else(|| {
+            Error::Validation("project_id is required for graph status".to_string())
+        })?;
+        drop(config);
+        self.get(&format!("/graph/{proj_id}/status?project_id={proj_id}"))
+            .await
+    }
+
     /// Get freshness metadata for Code Health analyses.
     pub async fn graph_quality_freshness(
         &self,

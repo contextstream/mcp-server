@@ -2818,8 +2818,13 @@ const GRAPH_ANALYSES: &[&str] = &[
     "complexity",
 ];
 
-/// What an analysis says while the project's code graph has not been built.
-const GRAPH_NOT_BUILT: &str = "[GRAPH NOT BUILT] This project's code graph has not been built yet, so this analysis found nothing because there is nothing to search, not because the code has no dependencies, usages, cycles or unused code. Do not treat it as low risk. Start the build with graph(action=\"ingest\"); graph(action=\"quality_freshness\") shows when it is built (a first build can take several minutes after indexing).";
+/// What an analysis says while the project's code graph is not built;
+/// `state` is what the graph status said ("status: empty, 0 nodes").
+fn graph_not_built_text(state: &str) -> String {
+    format!(
+        "[GRAPH NOT BUILT] This project's code graph is not built yet ({state}), so this analysis found nothing because there is nothing to search, not because the code has no dependencies, usages, cycles or unused code. Do not treat it as low risk. Start the build with graph(action=\"ingest\") and run the analysis again once it is built (a first build can take several minutes after indexing)."
+    )
+}
 
 /// Whether an analysis answer says it found nothing, in the formatter's own
 /// words.
@@ -2841,13 +2846,22 @@ fn reports_nothing(result: &ToolResult) -> bool {
     })
 }
 
-/// Whether the freshness answer says the graph was never built
-/// (`graph_version: "never_indexed:0"`).
-fn graph_never_built(freshness: &Value) -> bool {
-    freshness
-        .get("graph_version")
+/// "status: empty, 0 nodes" when the graph status says the graph is not
+/// built (or is still building, or holds no nodes); `None` when it is ready.
+fn graph_not_ready(status: &Value) -> Option<String> {
+    let state = status
+        .get("status")
         .and_then(Value::as_str)
-        .is_some_and(|version| version.starts_with("never_indexed"))
+        .unwrap_or("unknown");
+    let nodes = status.get("node_count").and_then(Value::as_i64);
+    let ready = matches!(state, "completed" | "ready" | "complete" | "built");
+    if ready && nodes.is_none_or(|nodes| nodes > 0) {
+        return None;
+    }
+    Some(match nodes {
+        Some(nodes) => format!("status: {state}, {nodes} nodes"),
+        None => format!("status: {state}"),
+    })
 }
 
 #[async_trait]
@@ -2880,20 +2894,24 @@ impl ToolHandler for GraphTool {
         else {
             return Ok(result);
         };
-        let never_built = self
+        // The graph's own status, not Code Health freshness: freshness
+        // reported a timestamped version for a project whose graph was still
+        // empty (#370 retest).
+        let Some(state) = self
             .client
-            .graph_quality_freshness(scope.workspace_id, scope.project_id)
+            .graph_status(scope.project_id)
             .await
-            .is_ok_and(|freshness| graph_never_built(&freshness));
-        if !never_built {
+            .ok()
+            .and_then(|status| graph_not_ready(&status))
+        else {
             return Ok(result);
-        }
+        };
         let mut structured = result.structured_content.unwrap_or(Value::Null);
         if let Some(object) = structured.as_object_mut() {
             object.insert("graph_built".to_string(), Value::Bool(false));
         }
         Ok(ToolResult::with_structured(
-            GRAPH_NOT_BUILT.to_string(),
+            graph_not_built_text(&state),
             structured,
         ))
     }
@@ -3123,14 +3141,32 @@ mod graph_not_built_tests {
         ] {
             assert!(!reports_nothing(&ToolResult::text(text)), "{text}");
         }
-        assert!(graph_never_built(
-            &serde_json::json!({"graph_version": "never_indexed:0"})
-        ));
-        assert!(!graph_never_built(
-            &serde_json::json!({"graph_version": "2026-10-30T11:00:00Z:12"})
-        ));
-        assert!(!graph_never_built(&serde_json::json!({})));
-        assert!(GRAPH_NOT_BUILT.contains("graph(action=\"ingest\")"));
+        // The graph status shapes the API answers (QA's retest, 11:53Z).
+        assert_eq!(
+            graph_not_ready(
+                &serde_json::json!({"status": "empty", "node_count": 0, "last_indexed": null})
+            )
+            .as_deref(),
+            Some("status: empty, 0 nodes")
+        );
+        assert_eq!(
+            graph_not_ready(
+                &serde_json::json!({"status": "completed", "node_count": 62, "last_indexed": null})
+            ),
+            None
+        );
+        assert!(
+            graph_not_ready(&serde_json::json!({"status": "completed", "node_count": 0})).is_some()
+        );
+        assert!(
+            graph_not_ready(&serde_json::json!({"status": "processing", "node_count": 10}))
+                .is_some()
+        );
+        let text = graph_not_built_text("status: empty, 0 nodes");
+        assert!(
+            text.starts_with("[GRAPH NOT BUILT]") && text.contains("graph(action=\"ingest\")"),
+            "{text}"
+        );
     }
 
     #[test]

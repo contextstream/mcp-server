@@ -907,6 +907,23 @@ impl ToolHandler for EntityTool {
 
         match action.as_str() {
             "list" => {
+                // An unknown project_id is left out, with a note (#449): it
+                // answered "No tickets found." as if the project were empty.
+                let mut scope_note = None;
+                if let Some(id) = project_id
+                    .as_deref()
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                {
+                    let workspace = input
+                        .workspace_id
+                        .as_deref()
+                        .and_then(|id| uuid::Uuid::parse_str(id.trim()).ok());
+                    scope_note =
+                        super::scope::unknown_project_note(&self.client, workspace, id).await;
+                    if scope_note.is_some() {
+                        project_id = None;
+                    }
+                }
                 let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
                 let params = Self::build_list_params(&input.query, &ws, &proj);
                 let result = if let (Some(cache_kind), Some(ws_id)) = (
@@ -940,7 +957,11 @@ impl ToolHandler for EntityTool {
                     self.client.entity_list(&kind, params).await?
                 };
                 let text = format_entity_list(&kind, &result);
-                Ok(ToolResult::with_structured(text, result))
+                let output = ToolResult::with_structured(text, result);
+                Ok(match scope_note {
+                    Some(note) => output.with_prefix(format!("{note}\n")),
+                    None => output,
+                })
             }
 
             "get" => {

@@ -17924,9 +17924,22 @@ impl ToolHandler for SessionTool {
                     .workspace_id
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok());
+                // An unknown project_id is left out, with a note (#449).
+                let mut project_id = input.project_id;
+                let mut scope_note = None;
+                if let Some(id) = project_id
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id.trim()).ok())
+                {
+                    scope_note =
+                        super::scope::unknown_project_note(&self.client, workspace_uuid, id).await;
+                    if scope_note.is_some() {
+                        project_id = None;
+                    }
+                }
                 let list_input = ListPlansInput {
                     workspace_id: input.workspace_id,
-                    project_id: input.project_id,
+                    project_id,
                     query: input.query,
                     status: input.status,
                     limit: input.limit,
@@ -17941,7 +17954,10 @@ impl ToolHandler for SessionTool {
                     .execute(serde_json::to_value(&list_input).unwrap())
                     .await
                 {
-                    Ok(r) => Ok(r),
+                    Ok(r) => Ok(match scope_note {
+                        Some(note) => r.with_prefix(format!("{note}\n")),
+                        None => r,
+                    }),
                     Err(err) if super::workspace_drift::is_workspace_access_error(&err) => {
                         Ok(super::workspace_drift::drift_collection_result(
                             "plans",

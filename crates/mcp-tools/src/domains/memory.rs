@@ -3914,6 +3914,52 @@ impl MemoryTool {
     }
 }
 
+/// Memory reads narrowed by `project_id` (#449). For a project_id that named
+/// no project of the workspace they listed the whole workspace or nothing
+/// with no word about it, and `search` answered a 409 to retry for ever.
+const PROJECT_SCOPED_READ_ACTIONS: &[&str] = &[
+    "search",
+    "list_nodes",
+    "list_events",
+    "list_tasks",
+    "list_todos",
+    "list_diagrams",
+    "list_docs",
+];
+
+/// A read's project_id that names no project of its workspace is left out,
+/// with the note `resolve_read_scope` gives the reads it serves (decisions,
+/// recall, lessons), so every read answers a stale id the same way (#449).
+async fn drop_unknown_read_project(
+    client: &ContextStreamClient,
+    mut input: Value,
+) -> (Value, Option<String>) {
+    let action = input
+        .get("action")
+        .and_then(Value::as_str)
+        .map(|action| action.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !PROJECT_SCOPED_READ_ACTIONS.contains(&action.as_str()) {
+        return (input, None);
+    }
+    let uuid = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id.trim()).ok())
+    };
+    let Some(project_id) = uuid("project_id") else {
+        return (input, None);
+    };
+    let note = super::scope::unknown_project_note(client, uuid("workspace_id"), project_id).await;
+    if note.is_some() {
+        if let Some(object) = input.as_object_mut() {
+            object.remove("project_id");
+        }
+    }
+    (input, note)
+}
+
 /// Routing summary advertised as the tool description (<= 1024 chars).
 const MEMORY_TOOL_DESCRIPTION: &str = "Persistent memory storage — docs, runbooks, specs, ADRs, RFCs, decisions, lessons, preferences, tasks, todos, knowledge nodes, transcripts. NOT for codebase/file search (use `search`).\n\nFinding a doc, runbook, spec, ADR, or decision? Use this tool, NOT `find`, `ls`, `grep`, or filesystem search: ContextStream docs are not on disk. Start with memory(action=\"search\", query=\"…\") (memory nodes and relevant docs together), then memory(action=\"list_docs\", query=\"…\") + get_doc (ID or natural-language title query), memory(action=\"decisions\", query=\"…\"), or session(action=\"recall\", query=\"…\") for past sessions.\n\nElsewhere: plans → session(action=\"capture_plan\"); tickets/handoffs → entity; lessons → session; bundles → capsule. create_task is a lightweight todo, not a ticket (pass plan_id + plan_step_id for plan tasks).\n\nActions include create_decision, create_node, create_event, create_task, create_todo, create_diagram, create_doc, list_transcripts. Full action reference: the `action` parameter.";
 
@@ -3921,9 +3967,8 @@ const MEMORY_TOOL_DESCRIPTION: &str = "Persistent memory storage — docs, runbo
 /// [`crate::schema::with_full_reference`].
 const MEMORY_TOOL_REFERENCE: &str = "Persistent memory storage — docs, runbooks, specs, ADRs, RFCs, decisions, lessons, preferences, tasks, todos, knowledge nodes, transcripts. NOT for codebase/file search.\n\n⚠️ FINDING A DOC, RUNBOOK, SPEC, OR ARCHITECTURE NOTE? USE THIS TOOL — NOT `find`, `ls`, `grep`, or filesystem searches. ContextStream docs/runbooks/specs/decisions/lessons live ONLY in this tool's storage (Postgres + indexes), NEVER on disk under ~/.claude, /tmp, or the project tree. If the user mentions 'the doc on X', 'our runbook for Y', 'the design spec', 'the ADR/RFC', 'a postmortem', 'the architecture note', 'why we decided Z' — go through:\n  · memory(action=\"search\", query=\"…\") — hybrid across docs + nodes (try this first when unsure)\n  · memory(action=\"list_docs\", query=\"…\") then memory(action=\"get_doc\", doc_id=\"<id-or-title>\")\n  · memory(action=\"decisions\", query=\"…\") for past architectural decisions\n  · session(action=\"recall\", query=\"…\") if it might be in past-session transcripts\nFalling back to filesystem tools to find a ContextStream doc is wrong — the doc is not on disk.\n\nCodebase / source / files? Use the `search` tool, not memory.\n\nPlans? Use session(action=\"capture_plan\") instead of memory(action=\"create_event\", event_type=\"plan\"). Plan tasks should be created with plan_id, plan_step_id, priority/status, and a short description.\n\nDISTINCT FROM (don't use memory for these):\n· entity(kind=ticket|handoff|incident|release|experiment|goal|key_result|sprint|review|risk|backlog_view) — structured taxonomy entities with their own status timelines and per-kind fields. When the user says 'create a ticket', 'file a bug', 'create a handoff', 'log an incident', 'track this release' — that's `entity`, not memory(create_task).\n· session(action=capture_lesson|capture|recall|capture_plan) — lessons / decisions / snapshots / plans tied to the current session.\n· capsule(...) — portable context bundles for cross-agent handoffs.\n\nThis tool's `create_task` is a lightweight project-tracking todo with priority/status — NOT a 'ticket'. This tool's `create_task` should include plan_id and plan_step_id when the task belongs to a plan. This tool's `create_doc(doc_type=runbook)` is a versioned markdown doc — NOT a 'handoff'.\n\nNode actions: create_node, get_node, update_node, list_nodes, supersede_node (a *_id argument takes an id or a title: get/update take a title that names one record; delete, supersede and complete need an id or the exact title; anything else returns a [CANDIDATES] list and changes nothing). Query actions: search (searches memory nodes and relevant docs together, not code), decisions (typed envelope: query, category, sort=recency|relevance, status=active|superseded|disputed|verified|all, since, offset, limit), timeline, summary. Decision actions: create_decision (title, content, rationale, alternatives, scope, confidence, supersedes, category, tags), decision_action (decision_id or lookup text + decision_action=supersede|dispute|verify|invalidate|choose_successor, successor_id, reason). Event actions: create_event, get_event, update_event, list_events, distill_event, import_batch. Task actions: create_task, get_task, update_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram (diagram_type values: flowchart, sequence, class, er, gantt, mindmap, pie, other — use sequence for API/request flows and er for data models). Doc actions: create_doc, list_docs, get_doc, update_doc, create_roadmap (doc_type values: roadmap, spec, runbook, adr, rfc, postmortem, retro, release_notes, playbook, prd, user_story, persona, interview, design_spec, critique, glossary, oncall_schedule, slo, q_and_a, changelog, style_guide, general — `get_doc` accepts ID or natural-language title query; to change part of a doc, `update_doc` takes ops=[...] (append, prepend, replace_section, str_replace) instead of the whole content). Transcript actions: list_transcripts, get_transcript, search_transcripts, search_archive. `search_archive` queries the cold storage tier for transcripts past the hot-retention window (remote/hosted deployments only). Team actions: team_tasks, team_todos, team_diagrams, team_docs.";
 
-#[async_trait]
-impl ToolHandler for MemoryTool {
-    async fn execute(&self, input: Value) -> Result<ToolResult> {
+impl MemoryTool {
+    async fn execute_action(&self, input: Value) -> Result<ToolResult> {
         let mut input: MemoryInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
         check_stored_types(&input.action.to_ascii_lowercase(), &mut input)?;
@@ -6782,6 +6827,18 @@ impl ToolHandler for MemoryTool {
                 input.action
             ))),
         }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for MemoryTool {
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let (input, note) = drop_unknown_read_project(&self.client, input).await;
+        let output = self.execute_action(input).await?;
+        Ok(match note {
+            Some(note) => output.with_prefix(format!("{note}\n")),
+            None => output,
+        })
     }
 
     fn metadata(&self) -> &ToolMetadata {

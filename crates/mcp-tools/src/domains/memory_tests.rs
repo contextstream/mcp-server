@@ -3221,3 +3221,64 @@ mod server_body_doc_tests {
         );
     }
 }
+
+#[tokio::test]
+async fn a_read_leaves_out_a_project_id_that_names_no_project() {
+    // #449: list_docs, list_nodes, list_tasks … listed the whole workspace or
+    // nothing for an unknown project_id, and search answered a 409.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind project server");
+    let address = listener.local_addr().expect("project server address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept project request");
+        let mut buffer = vec![0_u8; 16 * 1024];
+        let count = socket
+            .read(&mut buffer)
+            .await
+            .expect("read project request");
+        let body =
+            r#"{"success":false,"error":{"code":"NOT_FOUND","message":"Project not found"}}"#;
+        let response = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write project response");
+        String::from_utf8_lossy(&buffer[..count]).to_string()
+    });
+    let mut config = TestFixtures::test_config();
+    config.api_url = format!("http://{address}");
+    let client = ContextStreamClient::new(config);
+
+    let project = "22222222-2222-4222-8222-222222222222";
+    let input = json!({
+        "action": "list_docs",
+        "workspace_id": "11111111-1111-4111-8111-111111111111",
+        "project_id": project,
+    });
+    let (input, note) = drop_unknown_read_project(&client, input).await;
+    let request = server.await.expect("project server");
+    assert!(request.starts_with(&format!("GET /api/v1/projects/{project}")));
+    assert!(input.get("project_id").is_none());
+    assert_eq!(
+        note.as_deref(),
+        Some(
+            super::super::scope::missing_project_ignored_note(Uuid::parse_str(project).unwrap())
+                .as_str()
+        )
+    );
+
+    // A write, or a read without a project_id, is not checked.
+    let write = json!({"action": "create_doc", "project_id": project});
+    let (unchanged, note) = drop_unknown_read_project(&client, write.clone()).await;
+    assert_eq!((unchanged, note), (write, None));
+    let unscoped = json!({"action": "list_docs"});
+    let (unchanged, note) = drop_unknown_read_project(&client, unscoped.clone()).await;
+    assert_eq!((unchanged, note), (unscoped, None));
+}

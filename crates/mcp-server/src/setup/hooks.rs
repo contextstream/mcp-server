@@ -659,6 +659,30 @@ pub(super) fn managed_helper_problem() -> Option<String> {
     helper_problem_at(&managed_binary_path())
 }
 
+/// Whether `editor`'s hook file runs `contextstream-mcp` from the PATH rather
+/// than the managed helper by absolute path: the public Antigravity plugin's
+/// hooks do. Their helper is whatever is on the PATH, so the managed one being
+/// absent says nothing about them.
+pub(super) fn hooks_run_from_path(editor: &Editor) -> bool {
+    if *editor != Editor::Antigravity {
+        return false;
+    }
+    antigravity_hooks_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        // A command is a JSON string, so one that starts with the bare program
+        // contains `"contextstream-mcp hook `; an absolute path starts `"\"/`.
+        .is_some_and(|hooks| hooks.to_string().contains("\"contextstream-mcp hook "))
+}
+
+/// Why `contextstream-mcp` on the PATH cannot run a hook, or `None` when it can.
+pub(super) fn path_helper_problem() -> Option<String> {
+    match which::which("contextstream-mcp") {
+        Ok(path) => helper_problem_at(&path),
+        Err(_) => Some("`contextstream-mcp` is not on the PATH".to_string()),
+    }
+}
+
 /// Ensure the managed local helper binary exists at a stable user-writable path.
 pub fn ensure_managed_binary_installed() -> Result<PathBuf> {
     ensure_managed_binary_installed_with_report(true)
@@ -5156,5 +5180,37 @@ mod customized_settings_tests {
         } else {
             std::env::remove_var("HOME");
         }
+    }
+
+    #[test]
+    fn hooks_run_from_the_path_only_for_the_published_plugins_commands() {
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+        let path = antigravity_hooks_path().expect("hooks path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        std::fs::write(&path, antigravity_published_hooks().to_string()).unwrap();
+        let published = hooks_run_from_path(&Editor::Antigravity);
+
+        let mut root = JsonMap::new();
+        root.insert(
+            ANTIGRAVITY_HOOK_ENTRY.to_string(),
+            antigravity_hook_entry("/home/u/.contextstream/bin/contextstream-mcp"),
+        );
+        std::fs::write(&path, Value::Object(root).to_string()).unwrap();
+        let managed = hooks_run_from_path(&Editor::Antigravity);
+        let other_editor = hooks_run_from_path(&Editor::ClaudeCode);
+
+        match previous {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(published, "bare program is looked up on the PATH");
+        assert!(!managed, "an absolute helper path is not");
+        assert!(!other_editor);
     }
 }

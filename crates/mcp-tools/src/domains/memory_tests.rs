@@ -3332,3 +3332,21 @@ fn decisions_say_at_least_when_the_api_read_part_of_the_list() {
             .starts_with("No decisions recorded yet (status=active).")
     );
 }
+
+#[test]
+fn list_nodes_refuses_a_status_it_cannot_filter_by() {
+    // #456: every status value gave the same list of 1,532 decision nodes.
+    for status in ["active", "superseded", "disputed", "verified"] {
+        let problem = list_nodes_status_problem(Some(status)).expect("refused");
+        assert!(
+            problem.contains("list_nodes does not filter by status"),
+            "{problem}"
+        );
+        assert!(problem.contains(&format!(
+            "memory(action=\"decisions\", status=\"{status}\")"
+        )));
+    }
+    assert_eq!(list_nodes_status_problem(Some("all")), None);
+    assert_eq!(list_nodes_status_problem(Some(" ")), None);
+    assert_eq!(list_nodes_status_problem(None), None);
+}

@@ -871,6 +871,13 @@ fn tool_string_literal(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
+/// Which project an ingest is for, from the sources that name one. They must agree
+/// or the ingest is refused. The session's active project is only a default: when
+/// the caller names a project, it does not count as a disagreement (a long-lived
+/// server indexing a second project by id and path was refused because the first
+/// ingest had made its project the session's, mcp-server#455). The folder mapping
+/// and the local index metadata are claims about this folder, so they still must
+/// agree with the named project.
 fn reconcile_ingest_project_id(
     action: &str,
     folder_path: &str,
@@ -892,17 +899,23 @@ fn reconcile_ingest_project_id(
         return Ok(None);
     };
 
-    if candidates
-        .iter()
-        .any(|(project_id, _)| project_id.is_some_and(|id| id != agreed_project_id))
-    {
+    let session_is_only_a_default = explicit_project_id.is_some();
+    if candidates.iter().any(|(project_id, source)| {
+        project_id.is_some_and(|id| id != agreed_project_id)
+            && !(session_is_only_a_default && *source == "session_project_id")
+    }) {
         let details = candidates
             .iter()
             .filter_map(|(project_id, source)| project_id.map(|id| format!("{source}={id}")))
             .collect::<Vec<_>>()
             .join(", ");
+        let session_note = session_project_id.map_or_else(String::new, |id| {
+            format!(
+                " This session is bound to project {id} (by init, or by an earlier index or ingest_local); pass project_id to use another project."
+            )
+        });
         return Err(Error::Validation(format!(
-            "Refusing to {action} local folder '{folder_path}': project scope sources disagree ({details}). No local ingest was started and no folder mapping or index metadata was changed. Re-run init(folder_path=\"{folder_path}\") and correct the stale folder mapping or local index metadata so every non-empty project_id agrees before retrying."
+            "Refusing to {action} local folder '{folder_path}': project scope sources disagree ({details}). No local ingest was started and no folder mapping or index metadata was changed.{session_note} Re-run init(folder_path=\"{folder_path}\") and correct the stale folder mapping or local index metadata so every non-empty project_id agrees before retrying."
         )));
     }
 
@@ -2086,7 +2099,10 @@ impl ProjectTool {
             }
         }
 
-        if session_project_id != Some(resolved_project.project_id) {
+        // A project named by the caller does not move a session that is already
+        // bound to another one (mcp-server#455).
+        let names_another_project = explicit_project_id.is_some() && session_project_id.is_some();
+        if session_project_id != Some(resolved_project.project_id) && !names_another_project {
             self.session
                 .update_scope(
                     resolved_workspace_id,

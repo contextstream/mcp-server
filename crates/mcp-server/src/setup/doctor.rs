@@ -3264,6 +3264,12 @@ pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -
     }
     super::safe_edit::set_dry_run(options.dry_run);
     let _dry_run_reset = DoctorDryRunReset;
+    if !options.repair {
+        // A check writes nothing. set_dry_run(false) turned installation-state
+        // persistence on, and building the API client would then create the
+        // identity this same run had just reported missing (#341).
+        mcp_client::activation::set_installation_state_persistence_enabled(false);
+    }
     if options.dry_run {
         let _ = super::safe_edit::take_planned_changes();
     }

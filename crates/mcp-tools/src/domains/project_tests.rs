@@ -2482,3 +2482,28 @@ fn project_get_reads_as_text() {
         "Project ov175516 (11111111-1111-4111-8111-111111111111)\nOverview retest description\nPath: /tmp/ov\nWorkspace: 22222222-2222-4222-8222-222222222222\nCreated: 2026-10-30T17:55:16Z\nUpdated: 2026-10-30T17:55:17Z"
     );
 }
+
+#[test]
+fn a_wrongly_shaped_brief_section_is_named_with_the_shape_it_takes() {
+    // #437: the API's deserializer text named Rust types and a column.
+    let problem = |sections: Value| brief_sections_problem(&sections).unwrap_or_default();
+    assert!(problem(json!({"what": "A probe project"})).starts_with(
+        "sections.what must be {\"text\": \"...\", \"evidence\": \"<file or source it comes from>\"}; got a string"
+    ));
+    assert!(
+        problem(json!({"stack": ["Python"]})).starts_with("sections.stack[0] must be {\"text\"")
+    );
+    assert!(problem(json!({"commands": ["make test"]}))
+        .starts_with("sections.commands[0] must be {\"kind\": \"build|test|run|lint\""));
+    assert!(problem(json!({"what": {"fact": "x"}})).ends_with("got an object without \"text\""));
+    assert!(problem(json!({"stack": "Python"})).starts_with("sections.stack must be a list of"));
+    assert!(problem(json!({"vibes": []})).starts_with("sections.vibes is not a brief section"));
+    assert_eq!(
+        brief_sections_problem(&json!({
+            "what": {"text": "A probe", "evidence": "README.md"},
+            "commands": [{"kind": "test", "command": "make test", "evidence": "Makefile"}],
+            "stack": [{"text": "Python", "evidence": "pyproject.toml"}]
+        })),
+        None
+    );
+}

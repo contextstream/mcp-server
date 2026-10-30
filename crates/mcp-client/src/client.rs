@@ -38,6 +38,9 @@ struct LocalFileScan {
     /// inference is involved and they help remove content indexed by older
     /// clients before the policy existed.
     policy_deleted_paths: Vec<String>,
+    /// Text files over [`MAX_INDEXABLE_FILE_BYTES`] seen during the walk, with
+    /// their sizes: never indexed, and said so in the result (mcp-server#340).
+    too_large: Vec<(String, u64)>,
     /// True only when every indexable candidate was enumerated and read.
     /// Absence-based deletions and full manifest replacement are unsafe when
     /// a file cap, walk error, metadata error, or read error made the scan
@@ -480,6 +483,25 @@ impl IngestRootLayout {
             .flatten()
             .any(ContextStreamClient::should_skip_ingest_directory)
     }
+}
+
+/// The largest file ingest reads: a bigger one is left out of the index (and
+/// reported, mcp-server#340). Also the cap on every bounded read below.
+const MAX_INDEXABLE_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// How many left-out files the result names.
+const TOO_LARGE_EXAMPLES: usize = 5;
+
+/// The first few paths of the files left out for size, in path order.
+fn too_large_examples(too_large: &[(String, u64)]) -> Vec<String> {
+    let mut paths: Vec<&str> = too_large.iter().map(|(path, _)| path.as_str()).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+        .into_iter()
+        .take(TOO_LARGE_EXAMPLES)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Process-wide project ingest lease. Every local ingest entry point funnels
@@ -7300,6 +7322,8 @@ impl ContextStreamClient {
                     "files_skipped": skipped,
                     "files_compacted": compacted_files,
                     "files_deferred": deferred_due_to_payload,
+                    "files_too_large": scan.too_large.len(),
+                    "files_too_large_examples": too_large_examples(&scan.too_large),
                     "total_files": total_files,
                     "files_hashed": content_files_read,
                     "content_bytes_read": content_bytes_read,
@@ -7380,6 +7404,8 @@ impl ContextStreamClient {
                     "files_skipped": skipped,
                     "files_compacted": compacted_files,
                     "files_deferred": 0,
+                    "files_too_large": scan.too_large.len(),
+                    "files_too_large_examples": too_large_examples(&scan.too_large),
                     "total_files": total_files,
                     "files_hashed": content_files_read,
                     "content_bytes_read": content_bytes_read,
@@ -7412,6 +7438,8 @@ impl ContextStreamClient {
                         "files_skipped": skipped,
                         "files_compacted": compacted_files,
                         "files_deferred": 0,
+                        "files_too_large": scan.too_large.len(),
+                        "files_too_large_examples": too_large_examples(&scan.too_large),
                         "total_files": total_files,
                         "files_hashed": content_files_read,
                         "content_bytes_read": content_bytes_read,
@@ -7463,6 +7491,8 @@ impl ContextStreamClient {
                         "files_skipped": skipped,
                         "files_compacted": compacted_files,
                         "files_deferred": 0,
+                        "files_too_large": scan.too_large.len(),
+                        "files_too_large_examples": too_large_examples(&scan.too_large),
                         "total_files": total_files,
                         "files_hashed": content_files_read,
                         "content_bytes_read": content_bytes_read,
@@ -7549,6 +7579,8 @@ impl ContextStreamClient {
                     "files_skipped": skipped,
                     "files_compacted": compacted_files,
                     "files_deferred": deferred_due_to_payload,
+                    "files_too_large": scan.too_large.len(),
+                    "files_too_large_examples": too_large_examples(&scan.too_large),
                     "total_files": total_files,
                     "scan_complete": false,
                     "committed": true,
@@ -8057,6 +8089,8 @@ impl ContextStreamClient {
             "files_skipped": skipped,
             "files_compacted": compacted_files,
             "files_deferred": deferred_due_to_payload,
+            "files_too_large": scan.too_large.len(),
+            "files_too_large_examples": too_large_examples(&scan.too_large),
             "files_failed": total_failed,
             "total_files": total_files,
             "files_hashed": content_files_read,
@@ -11241,6 +11275,7 @@ impl ContextStreamClient {
 
         let mut candidate_paths = Vec::new();
         let mut policy_deleted_paths = Vec::new();
+        let mut too_large: Vec<(String, u64)> = Vec::new();
         let cursor_path = Self::scan_cursor_path(root_path, cursor_scope);
         let existing_epoch = (max_files != usize::MAX)
             .then(|| Self::read_scan_epoch(cursor_path.as_deref()))
@@ -11292,8 +11327,8 @@ impl ContextStreamClient {
                 }
             };
 
-            let max_size = 5 * 1024 * 1024;
-            if metadata.len() > max_size {
+            if metadata.len() > MAX_INDEXABLE_FILE_BYTES {
+                too_large.push((relative.clone(), metadata.len()));
                 policy_deleted_paths.push(relative);
                 continue;
             }
@@ -11587,6 +11622,7 @@ impl ContextStreamClient {
             content_bytes_read,
             reused_files,
             policy_deleted_paths,
+            too_large,
             complete,
             whole_checkout,
             observed_paths,
@@ -28847,6 +28883,58 @@ mod tests {
             &layout,
             "src/deleted.rs",
         ));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    // mcp-server#340: a text file over 5 MiB was left out of the index without a
+    // word, and `index` still said "Project indexed". The scan keeps what it
+    // left out, and the result names the first few.
+    #[test]
+    fn a_scan_reports_the_files_it_leaves_out_for_size(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("mcp-client-too-large-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("small.txt"), "indexed\n")?;
+        for index in (0..7).rev() {
+            // Sparse: one byte over the limit, without writing 5 MiB.
+            let big = std::fs::File::create(root.join(format!("big{index}.txt")))?;
+            big.set_len(MAX_INDEXABLE_FILE_BYTES + 1)?;
+        }
+
+        let client = ContextStreamClient::new(Config::default());
+        let scan = client.read_local_files(root.to_string_lossy().as_ref(), usize::MAX, false)?;
+        let sent: Vec<&str> = scan
+            .files
+            .iter()
+            .filter_map(|file| file.get("path").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(sent, ["small.txt"], "only the small file is sent");
+        assert_eq!(scan.too_large.len(), 7);
+        assert!(
+            scan.too_large
+                .iter()
+                .all(|(_, bytes)| *bytes == MAX_INDEXABLE_FILE_BYTES + 1),
+            "{:?}",
+            scan.too_large
+        );
+        assert!(
+            scan.complete,
+            "a stable policy exclusion is not a partial scan"
+        );
+        assert_eq!(
+            scan.policy_deleted_paths.len(),
+            7,
+            "an older indexed copy is still removed"
+        );
+        // The result names the first five, in path order.
+        assert_eq!(
+            too_large_examples(&scan.too_large),
+            ["big0.txt", "big1.txt", "big2.txt", "big3.txt", "big4.txt"]
+        );
+        // Nothing left out: nothing to say.
+        assert!(too_large_examples(&[]).is_empty());
 
         std::fs::remove_dir_all(root)?;
         Ok(())

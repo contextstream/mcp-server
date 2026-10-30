@@ -3980,9 +3980,10 @@ async fn run_index_or_ingest(
                     setup::warmup_context(&bg_client, bg_ws_id.as_ref()).await;
                     (
                         format!(
-                            "Status: Complete\nProject: {}\nFiles indexed: {}\nCompleted: {}\n",
+                            "Status: Complete\nProject: {}\nFiles indexed: {}\n{}Completed: {}\n",
                             project_name_clone,
                             outcome.files_indexed,
+                            too_large_status_line(outcome.files_too_large),
                             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
                         ),
                         "ContextStream Index Update Complete".to_string(),
@@ -4008,10 +4009,11 @@ async fn run_index_or_ingest(
                 ),
                 Ok(outcome) => (
                     format!(
-                        "Status: Incomplete\nProject: {}\nFiles indexed so far: {}\nFiles deferred: {}\nScan complete: {}\nFinished: {}\n",
+                        "Status: Incomplete\nProject: {}\nFiles indexed so far: {}\nFiles deferred: {}\n{}Scan complete: {}\nFinished: {}\n",
                         project_name_clone,
                         outcome.files_indexed,
                         outcome.files_deferred,
+                        too_large_status_line(outcome.files_too_large),
                         outcome.scan_complete,
                         chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
                     ),
@@ -4067,6 +4069,15 @@ async fn run_index_or_ingest(
     }
 
     Ok(())
+}
+
+/// The status file's line for files left out for size, or nothing.
+fn too_large_status_line(files_too_large: usize) -> String {
+    if files_too_large == 0 {
+        String::new()
+    } else {
+        format!("Files over 5 MiB, not indexed: {files_too_large}\n")
+    }
 }
 
 async fn run_stdio_server() -> Result<()> {

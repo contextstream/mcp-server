@@ -2431,3 +2431,22 @@ fn a_project_page_says_where_it_sits_and_how_to_get_more() {
         "Found 3 projects.\n\n"
     );
 }
+
+#[test]
+fn project_overview_and_statistics_read_as_text() {
+    // #429: "Project overview loaded." / "Project statistics loaded."
+    let overview = json!({"id": "11111111-1111-4111-8111-111111111111", "name": "sxproj",
+        "brief": "Project sxproj", "top_tags": ["api", "db"],
+        "content_summary": {"total_items": 5, "by_type": {"fact": 2, "decision": 3}},
+        "updated_at": "2026-10-30T10:24:16Z"});
+    assert_eq!(
+        format_project_overview(&overview),
+        "Project sxproj (11111111-1111-4111-8111-111111111111)\nProject sxproj\nMemory items: 5 (decision 3, fact 2)\nTop tags: api, db\nUpdated: 2026-10-30T10:24:16Z"
+    );
+    let statistics = json!({"file_count": 62, "total_lines": 306, "chunk_count": 77,
+        "last_indexed": "2026-10-30T14:53:58Z", "decision_count": 0, "lesson_count": 0});
+    assert_eq!(
+        format_project_statistics(&statistics),
+        "Project statistics: 62 files, 306 lines, 77 indexed chunks; 0 decisions, 0 lessons.\nLast indexed: 2026-10-30T14:53:58Z"
+    );
+}

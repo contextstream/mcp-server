@@ -133,6 +133,12 @@ fn setups_own_commands_work_on_the_installed_public_plugin() {
     let report = text(&output);
     assert!(!report.contains("has no ContextStream block"), "{report}");
     assert!(!report.contains("does not run"), "{report}");
+    // Their hooks run `contextstream-mcp` from the PATH: the managed helper's
+    // absence says nothing about them.
+    assert!(
+        !report.contains("the helper binary the hooks run"),
+        "{report}"
+    );
     assert!(report.contains("plugin"), "{report}");
 
     // Uninstall takes out what setup owns and does not fail on the rest.

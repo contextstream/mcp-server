@@ -1007,10 +1007,28 @@ fn windsurf_entry_keys_valid(entry: &Value) -> bool {
 /// Check the hooks surface for one editor: the hook entries, and the helper
 /// binary they all call.
 fn check_hooks(editor: &Editor) -> SurfaceCheck {
-    with_helper_check(
-        check_hooks_config(editor),
-        super::hooks::managed_helper_problem(),
-    )
+    let check = check_hooks_config(editor);
+    if super::hooks::hooks_run_from_path(editor) {
+        return with_path_helper_check(check, super::hooks::path_helper_problem());
+    }
+    with_helper_check(check, super::hooks::managed_helper_problem())
+}
+
+/// The same for hooks that run `contextstream-mcp` from the PATH (the public
+/// Antigravity plugin's): they do nothing, quietly, when it is not there.
+fn with_path_helper_check(check: SurfaceCheck, problem: Option<String>) -> SurfaceCheck {
+    match problem {
+        Some(problem) if check.status == CheckStatus::Pass => SurfaceCheck::problem(
+            "hooks",
+            CheckStatus::Fail,
+            format!(
+                "the hooks run `contextstream-mcp` from the PATH and it is unusable: {problem}, so every hook does nothing"
+            ),
+            None,
+            "npx -y @contextstream/mcp-server setup",
+        ),
+        _ => check,
+    }
 }
 
 /// Fail a passing hooks check when the helper binary every managed hook runs
@@ -4061,6 +4079,34 @@ mod tests {
             stacked.detail.contains("duplicated front matter"),
             "{}",
             stacked.detail
+        );
+    }
+
+    #[test]
+    fn hooks_that_run_from_the_path_are_judged_by_the_path_not_the_managed_helper() {
+        let healthy = SurfaceCheck::pass("hooks", "3 current managed hook entries installed", None);
+        assert_eq!(
+            with_path_helper_check(healthy.clone(), None).status,
+            CheckStatus::Pass
+        );
+        let missing = with_path_helper_check(
+            healthy,
+            Some("`contextstream-mcp` is not on the PATH".to_string()),
+        );
+        assert_eq!(missing.status, CheckStatus::Fail);
+        assert!(
+            missing.detail.contains("from the PATH"),
+            "{}",
+            missing.detail
+        );
+        assert!(
+            !missing.detail.contains(".contextstream"),
+            "{}",
+            missing.detail
+        );
+        assert_eq!(
+            missing.fix.as_deref(),
+            Some("npx -y @contextstream/mcp-server setup")
         );
     }
 

@@ -3972,6 +3972,25 @@ fn literal_check_complete(result: &SearchResponse) -> bool {
         == Some(true)
 }
 
+/// Whether a search answer may be replayed from the warm cache (#463). An
+/// answer with no rows, or one the server marks as partial (the index is not
+/// ready, the literal scan is incomplete), changes as soon as indexing moves
+/// on; a replay repeated it for the cache's whole 30 s.
+fn search_answer_is_cacheable(result: &SearchResponse) -> bool {
+    let has_rows = !result.results.is_empty() || !result.paths.is_empty();
+    let index_ready = result
+        .project_index_state
+        .as_deref()
+        .is_none_or(|state| state.trim().eq_ignore_ascii_case("ready"));
+    let literal_partial = result
+        .literal_match
+        .as_ref()
+        .and_then(|summary| summary.get("complete"))
+        .and_then(Value::as_bool)
+        == Some(false);
+    has_rows && index_ready && !literal_partial
+}
+
 /// Whether the server's literal check read every indexed file and found the
 /// text in none of them: an answer, not a weak ranking.
 fn literal_check_found_nothing(result: &SearchResponse) -> bool {
@@ -10922,7 +10941,9 @@ impl SearchTool {
                     }
                 }
                 let (text, structured) = budget_search_tool_payload(text, structured);
-                if use_search_cache && !response.degraded {
+                // An empty guided answer is not replayed: indexing may be
+                // about to fill it (#463).
+                if use_search_cache && !response.degraded && !response.results.is_empty() {
                     put_search_cache(cache_key, (text.clone(), structured.clone()));
                 }
                 metrics::counter!(
@@ -14341,7 +14362,7 @@ impl SearchTool {
         // Store in warm cache so the next identical non-local call can
         // short-circuit via the [SEARCH_CACHED] path. Cached value is the
         // rendered (text, structured) pair so the repeat call doesn't re-render.
-        if use_search_cache && checkout_scope_confirmed {
+        if use_search_cache && checkout_scope_confirmed && search_answer_is_cacheable(&result) {
             put_search_cache(cache_key.clone(), (text.clone(), structured.clone()));
         }
 

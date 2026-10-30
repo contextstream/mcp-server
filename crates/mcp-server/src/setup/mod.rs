@@ -3098,20 +3098,7 @@ async fn run_setup_noninteractive(
         .map_err(|_| {
             anyhow::anyhow!("Credential validation timed out; check connectivity and re-run.")
         })?
-        .map_err(|e| {
-            // Offline, a timeout, a 5xx or a rate limit says nothing about the
-            // credentials; only a refusal does (#248).
-            if e.is_retryable() {
-                anyhow::anyhow!(
-                    "Could not verify the saved credentials: {api_url} did not answer ({e}). \
-                     Check the connection and re-run; nothing was changed."
-                )
-            } else {
-                anyhow::anyhow!(
-                    "Saved credentials are invalid ({e}); run `contextstream-mcp setup` interactively."
-                )
-            }
-        })?;
+        .map_err(|e| unattended_key_check_failure(&e, &api_url))?;
     let credentials_saved = persist_setup_credentials(&api_key, &api_url)?;
     if credentials_saved && !safe_edit::is_dry_run() {
         ui::say(
@@ -6444,8 +6431,74 @@ fn parse_setup_ingest_job_progress(
     }
 }
 
+/// Why `setup --yes` stopped at the key check. The key may come from
+/// CONTEXTSTREAM_API_KEY as well as from saved credentials, so the message
+/// says "the API key". The installation identity is already written by then,
+/// so "nothing was changed" was not quite true (#338). Offline, a timeout, a
+/// 5xx or a rate limit says nothing about the key; only a refusal does (#248).
+fn unattended_key_check_failure(error: &mcp_types::Error, api_url: &str) -> anyhow::Error {
+    if error.is_retryable() {
+        anyhow::anyhow!(
+            "Could not verify the API key: {api_url} did not answer ({error}). Check the \
+             connection and re-run; no editor or saved credential was changed."
+        )
+    } else if matches!(error, mcp_types::Error::Http { status: 401, .. }) {
+        anyhow::anyhow!(
+            "ContextStream did not accept the API key ({error}): it is invalid, expired or \
+             revoked. Set a valid CONTEXTSTREAM_API_KEY, save one with `contextstream-mcp \
+             configure --api-key-stdin`, or run `contextstream-mcp setup` interactively."
+        )
+    } else {
+        anyhow::anyhow!(
+            "The API key could not be checked ({error}); run `contextstream-mcp setup` \
+             interactively."
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // #338
+    #[test]
+    fn unattended_setup_names_the_api_key_and_what_was_left_alone() {
+        let url = "http://127.0.0.1:9";
+        let offline = super::unattended_key_check_failure(
+            &mcp_types::Error::Network("Connection failed: refused".into()),
+            url,
+        )
+        .to_string();
+        assert!(
+            offline.starts_with("Could not verify the API key: http://127.0.0.1:9 did not answer"),
+            "{offline}"
+        );
+        assert!(
+            offline.contains("no editor or saved credential was changed"),
+            "{offline}"
+        );
+        assert!(!offline.contains("saved credentials"), "{offline}");
+
+        let refused =
+            super::unattended_key_check_failure(&mcp_types::Error::http(401, "Unauthorized"), url)
+                .to_string();
+        assert!(
+            refused.starts_with("ContextStream did not accept the API key"),
+            "{refused}"
+        );
+        assert!(refused.contains("CONTEXTSTREAM_API_KEY"), "{refused}");
+        assert!(
+            !refused.contains("Saved credentials are invalid"),
+            "{refused}"
+        );
+
+        let other =
+            super::unattended_key_check_failure(&mcp_types::Error::http(403, "Forbidden"), url)
+                .to_string();
+        assert!(
+            other.starts_with("The API key could not be checked"),
+            "{other}"
+        );
+    }
+
     use super::{
         ambiguous_workspace_message, canonical_checkout_root, classify_project_workspace,
         data_collection_disclosure, editor_needs_managed_helper, format_index_completion_message,

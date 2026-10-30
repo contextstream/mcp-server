@@ -4145,7 +4145,7 @@ impl ContextStreamClient {
                     let error = if e.is_timeout() {
                         Error::Timeout(timeout.as_secs())
                     } else if e.is_connect() {
-                        Error::Network(format!("Connection failed: {}", e))
+                        Error::Network(connect_failure(&e))
                     } else {
                         Error::Network(e.to_string())
                     };
@@ -4347,7 +4347,7 @@ impl ContextStreamClient {
             if e.is_timeout() {
                 Error::Timeout(timeout.as_secs())
             } else if e.is_connect() {
-                Error::Network(format!("Connection failed: {}", e))
+                Error::Network(connect_failure(&e))
             } else {
                 Error::Network(e.to_string())
             }
@@ -4476,7 +4476,7 @@ impl ContextStreamClient {
             if e.is_timeout() {
                 Error::Timeout(timeout.as_secs())
             } else if e.is_connect() {
-                Error::Network(format!("Connection failed: {}", e))
+                Error::Network(connect_failure(&e))
             } else {
                 Error::Network(e.to_string())
             }
@@ -22402,6 +22402,22 @@ mod path_ingest_gate_tests {
     }
 }
 
+/// A failed connection's text. reqwest's own names only the URL ("error
+/// sending request for url (…)"); why it failed (connection refused, a host
+/// name that did not resolve) is at the end of its source chain (#338).
+fn connect_failure(error: &reqwest::Error) -> String {
+    let mut cause = None;
+    let mut source = std::error::Error::source(error);
+    while let Some(next) = source {
+        cause = Some(next.to_string());
+        source = next.source();
+    }
+    match cause.filter(|cause| !cause.is_empty()) {
+        Some(cause) => format!("Connection failed: {error}: {cause}"),
+        None => format!("Connection failed: {error}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Tests build a Config via `default()` then tweak a couple of fields for
@@ -27895,6 +27911,11 @@ mod tests {
         let started = std::time::Instant::now();
         let error = client.me().await.expect_err("nothing listens there");
         assert!(matches!(error, Error::Network(_)), "{error}");
+        // #338: the text says why, not only which URL.
+        assert!(
+            error.to_string().to_lowercase().contains("refused"),
+            "{error}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "took {:?}",

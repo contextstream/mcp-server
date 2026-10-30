@@ -35,6 +35,7 @@ pub use client::MEDIA_INDEX_MAX_BYTES;
 pub use client::{
     entity_kind_to_path,
     feed_source_key,
+    filter_memory_events_by_type,
     infer_memory_query_node_type,
     unsupported_entity_kind_reason,
     // Workspace params

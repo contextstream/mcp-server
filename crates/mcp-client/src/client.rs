@@ -14180,11 +14180,23 @@ impl ContextStreamClient {
             Error::Validation("Failed to create replacement node for supersede".to_string())
         })?;
 
-        // Step 3: Mark old node as superseded by new node
-        let body = serde_json::json!({ "superseded_by": new_id });
-        let _: serde_json::Value = self
+        // Step 3: Mark old node as superseded by new node. The API refuses
+        // the body without the workspace ("Missing or invalid
+        // superseded_by"), and a refusal here used to leave the replacement
+        // behind as a duplicate on every retry (#405).
+        let body = serde_json::json!({
+            "superseded_by": new_id,
+            "workspace_id": workspace_id,
+        });
+        let marked: Result<serde_json::Value> = self
             .post(&format!("/memory/nodes/{}/supersede", node_id), body)
-            .await?;
+            .await;
+        if let Err(error) = marked {
+            if let Ok(replacement) = Uuid::parse_str(new_id) {
+                let _ = self.delete_memory_node(replacement).await;
+            }
+            return Err(error);
+        }
 
         Ok(serde_json::json!({
             "status": "superseded",
@@ -20192,11 +20204,36 @@ impl ImportMemoryEventsParams {
         let (workspace_id, project_id) =
             scope_ids_with_defaults(self.workspace_id, self.project_id, config);
         strip_nulls(serde_json::json!({
-            "events": self.events,
+            "events": scope_import_events(self.events, workspace_id, project_id),
             "workspace_id": workspace_id,
             "project_id": project_id,
         }))
     }
+}
+
+/// The API reads each imported event's own workspace and project, not the
+/// batch's: an event without them was refused ("workspace_id is required")
+/// even with the batch scoped (#406). Fill them from the batch where the
+/// event has none.
+fn scope_import_events(
+    events: Vec<serde_json::Value>,
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+) -> Vec<serde_json::Value> {
+    events
+        .into_iter()
+        .map(|mut event| {
+            if let Some(object) = event.as_object_mut() {
+                for (key, value) in [("workspace_id", workspace_id), ("project_id", project_id)] {
+                    let missing = object.get(key).is_none_or(serde_json::Value::is_null);
+                    if let (true, Some(value)) = (missing, value) {
+                        object.insert(key.to_string(), serde_json::json!(value));
+                    }
+                }
+            }
+            event
+        })
+        .collect()
 }
 
 /// Update memory node parameters.
@@ -28350,6 +28387,26 @@ mod tests {
             row["preview"],
             "We decided the bilby cache uses Redis with a 5 minute TTL."
         );
+    }
+
+    #[test]
+    fn imported_events_carry_the_batch_scope_unless_they_have_their_own() {
+        // #406
+        let workspace = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let other = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let events = scope_import_events(
+            vec![
+                serde_json::json!({"event_type": "note", "title": "a"}),
+                serde_json::json!({"event_type": "note", "title": "b", "workspace_id": other.to_string()}),
+                serde_json::json!({"event_type": "note", "title": "c", "workspace_id": null}),
+            ],
+            Some(workspace),
+            None,
+        );
+        assert_eq!(events[0]["workspace_id"], workspace.to_string());
+        assert_eq!(events[1]["workspace_id"], other.to_string());
+        assert_eq!(events[2]["workspace_id"], workspace.to_string());
+        assert!(events[0].get("project_id").is_none());
     }
 
     #[test]

@@ -346,7 +346,12 @@ def cmd_assemble(args):
     require(not extra, "unexpected files in the bundle: " + ", ".join(extra))
     with tempfile.TemporaryDirectory() as work:
         syft = fetch_tool(SYFT, "syft", Path(work))
-        subprocess.run([str(syft), "scan", "dir:" + str(dist), "--quiet", "--output", "spdx-json=" + str(dist / "sbom.spdx.json")],
+        # The SBOM lists what the binaries are built from: Cargo.lock's crates, under the release's name
+        # and version. A scan of the dist directory found only the binaries themselves, version UNKNOWN
+        # (#431).
+        subprocess.run([str(syft), "scan", "file:" + str(ROOT / "Cargo.lock"), "--source-name", "contextstream-mcp",
+                        "--source-version", args.version, "--quiet",
+                        "--output", "spdx-json=" + str(dist / "sbom.spdx.json")],
                        check=True, stdin=subprocess.DEVNULL, timeout=600)
     contract.generate_release_files(dist, args.version, args.commit)
     contract.verify_release_files(dist, args.version, args.commit)

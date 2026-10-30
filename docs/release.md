@@ -72,7 +72,7 @@ flowchart TD
    - the code signature on arm64;
    - the version string.
 4. **publish** (4 CPUs) assembles the bundle, then does the following in this order:
-   1. Assembles the bundle with syft and the release contract: `sbom.spdx.json`, `version.json` and `checksums.txt`.
+   1. Assembles the bundle with syft and the release contract: `sbom.spdx.json` (the crates in `Cargo.lock`, under `contextstream-mcp` and the release version), `version.json` and `checksums.txt`.
       Or, on a resume, fetches the bundle from R2.
    2. Pushes the annotated tag `vX.Y.Z`.
    3. Writes R2 `mcp/vX.Y.Z/`, with `version.json` last, then `mcp/latest/`. Every object is read back.

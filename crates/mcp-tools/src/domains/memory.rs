@@ -972,6 +972,18 @@ fn format_event_detail(value: &Value) -> String {
         .trim();
 
     let mut text = format!("**{}**\nID: {}\nType: {}", title, id, event_type);
+    // The type the caller asked for, when the store keeps it under another
+    // (bug as ticket, implementation as manual_note, …) (#410).
+    if let Some(original) = event
+        .get("metadata")
+        .and_then(|metadata| metadata.get("original_type"))
+        .and_then(|v| v.as_str())
+        .filter(|original| {
+            !original.is_empty() && *original != event_type && *original != "uncategorized"
+        })
+    {
+        text.push_str(&format!(" (captured as {original})"));
+    }
     if let Some(ts) = occurred_at {
         text.push_str(&format!("\nOccurred: {}", ts));
     }
@@ -4542,7 +4554,13 @@ impl ToolHandler for MemoryTool {
                 let raw_result = if let Some(bundle) = cached_result {
                     served_from_cache = true;
                     cache_age_ms = bundle.age_ms;
-                    bundle.payload
+                    // The cached bundle is the newest events unfiltered;
+                    // the caller's type and limit apply here (#410).
+                    let mut payload = bundle.payload;
+                    if let Some(event_type) = input.event_type.as_deref() {
+                        mcp_client::filter_memory_events_by_type(&mut payload, event_type, input.limit);
+                    }
+                    payload
                 } else {
                     let primary = match self
                         .client

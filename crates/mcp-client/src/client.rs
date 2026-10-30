@@ -14006,22 +14006,41 @@ impl ContextStreamClient {
         })?;
         drop(config);
 
+        // An event is stored under the API's type for what it was captured
+        // as (bug -> ticket, conversation -> chat, the note-like types ->
+        // manual_note), so the filter asks for the stored type and keeps the
+        // events captured as the requested one (#410).
+        let requested = event_type
+            .as_deref()
+            .map(|t| Self::normalize_session_capture_original_type(Some(t)));
+        let api_type = requested
+            .as_deref()
+            .map(Self::map_session_capture_api_event_type);
+        let fetch_limit = match (&requested, limit) {
+            (Some(_), limit) => Some(limit.unwrap_or(20).max(1).saturating_mul(4).min(200)),
+            (None, limit) => limit,
+        };
+
         // Uses /memory/events/workspace/{workspace_id} endpoint
         let mut path = format!("/memory/events/workspace/{}", ws_id);
         let mut params = vec![];
         if let Some(id) = proj_id {
             params.push(format!("project_id={}", id));
         }
-        if let Some(t) = event_type {
+        if let Some(t) = api_type {
             params.push(format!("event_type={}", t));
         }
-        if let Some(l) = limit {
+        if let Some(l) = fetch_limit {
             params.push(format!("limit={}", l));
         }
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));
         }
-        self.get(&path).await
+        let mut result: serde_json::Value = self.get(&path).await?;
+        if let Some(requested) = event_type.as_deref() {
+            filter_memory_events_by_type(&mut result, requested, limit);
+        }
+        Ok(result)
     }
 
     /// Get a memory event by ID.
@@ -22177,6 +22196,41 @@ fn infer_workspace_id_from_body<B: Serialize>(body: &Option<B>) -> Option<Uuid> 
     Uuid::parse_str(ws_id).ok()
 }
 
+/// Keep the events captured as `requested` (the type a caller passed to
+/// create_event), at most `limit` (#410). A captured event records it in
+/// `metadata.original_type`; an event without one is matched on its own type.
+pub fn filter_memory_events_by_type(
+    result: &mut serde_json::Value,
+    requested: &str,
+    limit: Option<i64>,
+) {
+    let wanted = ContextStreamClient::normalize_session_capture_original_type(Some(requested));
+    let keep = |event: &serde_json::Value| {
+        let original = event
+            .get("metadata")
+            .and_then(|metadata| metadata.get("original_type"))
+            .and_then(serde_json::Value::as_str);
+        let own = original.or_else(|| event.get("event_type").and_then(serde_json::Value::as_str));
+        own.map(|own| ContextStreamClient::normalize_session_capture_original_type(Some(own)))
+            .is_some_and(|own| own == wanted)
+    };
+    let list = if result.is_array() {
+        result.as_array_mut()
+    } else {
+        ["items", "events", "data"]
+            .into_iter()
+            .find(|key| result.get(*key).is_some_and(serde_json::Value::is_array))
+            .and_then(|key| result.get_mut(key))
+            .and_then(serde_json::Value::as_array_mut)
+    };
+    if let Some(events) = list {
+        events.retain(|event| keep(event));
+        if let Some(limit) = limit.filter(|limit| *limit > 0) {
+            events.truncate(limit as usize);
+        }
+    }
+}
+
 fn normalize_session_smart_search_response(mut result: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = result.as_object_mut() {
         if obj.get("results").is_none() {
@@ -28407,6 +28461,32 @@ mod tests {
         assert_eq!(events[1]["workspace_id"], other.to_string());
         assert_eq!(events[2]["workspace_id"], workspace.to_string());
         assert!(events[0].get("project_id").is_none());
+    }
+
+    #[test]
+    fn listed_events_match_the_type_they_were_captured_as() {
+        // #410: bug -> ticket, implementation -> manual_note, ...
+        let mut result = serde_json::json!({"items": [
+            {"id": "1", "event_type": "ticket", "metadata": {"original_type": "bug"}},
+            {"id": "2", "event_type": "ticket", "metadata": {"original_type": "feature"}},
+            {"id": "3", "event_type": "manual_note", "metadata": {"original_type": "implementation"}},
+            {"id": "4", "event_type": "manual_note"},
+            {"id": "5", "event_type": "decision"}
+        ]});
+        let mut bugs = result.clone();
+        filter_memory_events_by_type(&mut bugs, "bug", None);
+        assert_eq!(bugs["items"].as_array().unwrap().len(), 1);
+        assert_eq!(bugs["items"][0]["id"], "1");
+        let mut notes = result.clone();
+        filter_memory_events_by_type(&mut notes, "manual_note", None);
+        assert_eq!(notes["items"].as_array().unwrap().len(), 1);
+        assert_eq!(notes["items"][0]["id"], "4");
+        filter_memory_events_by_type(&mut result, "Implementation", Some(5));
+        assert_eq!(result["items"][0]["id"], "3");
+        assert_eq!(
+            ContextStreamClient::map_session_capture_api_event_type("bug"),
+            "ticket"
+        );
     }
 
     #[test]

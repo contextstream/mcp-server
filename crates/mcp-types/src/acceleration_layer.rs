@@ -444,6 +444,10 @@ pub struct AccelerationAnalyticsRender {
 pub enum AccelerationAnalyticsError {
     #[error("analytics provider is unavailable: {0}")]
     Unavailable(String),
+    /// The API refused the request as asked (400, 404, 409, 422): the caller
+    /// can change it; the service is fine (#439).
+    #[error("{0}")]
+    Refused(String),
     #[error("analytics request failed: {0}")]
     Request(String),
     #[error("analytics response decode failed: {0}")]
@@ -570,6 +574,10 @@ pub struct AccelerationJobResultPage {
 pub enum AccelerationJobError {
     #[error("job provider is unavailable: {0}")]
     Unavailable(String),
+    /// The API refused the request as asked (400, 409, 422): the caller can
+    /// change it; the service is fine (#439).
+    #[error("{0}")]
+    Refused(String),
     #[error("job request failed: {0}")]
     Request(String),
     #[error("job response decode failed: {0}")]

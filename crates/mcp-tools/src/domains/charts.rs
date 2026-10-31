@@ -14,7 +14,8 @@
 use async_trait::async_trait;
 use mcp_session::SessionManager;
 use mcp_types::acceleration_layer::{
-    AccelerationAnalyticsRenderRequest, AccelerationAnalyticsScope, AccelerationLayer,
+    AccelerationAnalyticsError, AccelerationAnalyticsRenderRequest, AccelerationAnalyticsScope,
+    AccelerationLayer,
 };
 use mcp_types::atlas_layer::{AtlasChartId, AtlasChartScope, AtlasLayer};
 use mcp_types::{
@@ -350,6 +351,26 @@ impl AtlasChartTool {
             .await
         {
             Ok(render) => render,
+            Err(AccelerationAnalyticsError::Refused(reason)) => {
+                // The service is fine; the call asked for something it does
+                // not have (#439).
+                let known = match provider.list_charts().await {
+                    Ok(charts) if !charts.is_empty() => format!(
+                        " Charts: {}.",
+                        charts
+                            .iter()
+                            .map(|chart| chart.chart_key.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    _ => String::new(),
+                };
+                return Ok(ToolResult::error(format!(
+                    "chart(action=\"render\") refused: {reason}. range is a number and a unit \
+                     (m, h or d: 24h, 7d); granularity is minute, hour or day; filters is an \
+                     object of the chart's dimensions.{known}"
+                )));
+            }
             Err(error) => {
                 tracing::warn!(error = %error, "acceleration-analytics: render failed");
                 return Ok(ToolResult::with_structured(
@@ -868,6 +889,53 @@ mod tests {
         let caller = format!("chart-test-caller-{workspace}");
         crate::domains::caller_access::remember_for_test(&caller, workspace, None, allowed);
         mcp_client::run_with_caller_cache_identity(caller, call).await
+    }
+
+    struct RefusingAnalytics;
+
+    #[async_trait]
+    impl AnalyticsProvider for RefusingAnalytics {
+        async fn list_charts(
+            &self,
+        ) -> std::result::Result<Vec<AccelerationAnalyticsChart>, AccelerationAnalyticsError>
+        {
+            FakeAnalyticsProvider { fail_render: false }
+                .list_charts()
+                .await
+        }
+
+        async fn render_chart(
+            &self,
+            _request: AccelerationAnalyticsRenderRequest,
+        ) -> std::result::Result<AccelerationAnalyticsRender, AccelerationAnalyticsError> {
+            Err(AccelerationAnalyticsError::Refused(
+                "analytics chart `nope` not found".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_render_the_api_refused_is_the_callers_error_not_a_degraded_service() {
+        // #439: "[ACCELERATION_DEGRADED] ... 404 Not Found", isError false.
+        let layer: AccelerationLayer = Arc::new(FakeAccelerationLayer {
+            provider: Arc::new(RefusingAnalytics),
+        });
+        let tool = AtlasChartTool::with_acceleration(noop_layer(), layer, fake_session());
+        let ws = Uuid::new_v4();
+        let result = as_caller_who_reads(ws, true, || {
+            tool.execute(serde_json::json!({
+                "action": "render",
+                "chart": "nope",
+                "workspace_id": ws.to_string(),
+            }))
+        })
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("analytics chart `nope` not found"), "{text}");
+        assert!(text.contains("Charts: tool_latency_p95"), "{text}");
+        assert!(!text.contains("DEGRADED"), "{text}");
     }
 
     #[tokio::test]

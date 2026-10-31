@@ -20,6 +20,7 @@ pub mod grounding;
 pub mod help;
 pub mod index_keeper;
 pub mod integrations;
+pub(crate) mod linked_workspaces;
 pub(crate) mod lookup;
 pub mod media;
 pub mod memory;

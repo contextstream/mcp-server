@@ -78,10 +78,12 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
         name: "workspace_read",
         tool: "workspace",
         title: "Read Workspaces",
-        description: "List ContextStream workspaces, read one, or list its members, without \
-                      changing anything. Same arguments as workspace(action=...) for these \
-                      actions. Use `workspace` only to create, delete or change a workspace.",
-        actions: &["list", "get", "team_members"],
+        description: "List ContextStream workspaces, read one, list its members, or see its \
+                      shared knowledge (the workspaces it shares knowledge with and uses \
+                      knowledge from), without changing anything. Same arguments as \
+                      workspace(action=...) for these actions. Use `workspace` only to create, \
+                      delete or change a workspace or its links.",
+        actions: &["list", "get", "team_members", "sharing"],
     },
     ReadOnlyTwin {
         name: "project_read",

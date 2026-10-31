@@ -2105,7 +2105,7 @@ fn normalize_doc_search_result(doc: &Value) -> Value {
 }
 
 fn normalize_memory_search_result(item: &Value) -> Value {
-    serde_json::json!({
+    let mut normalized = serde_json::json!({
         "entity_type": "memory",
         "id": extract_memory_result_id(item),
         "title": extract_display_title(item),
@@ -2113,7 +2113,16 @@ fn normalize_memory_search_result(item: &Value) -> Value {
         "score": extract_memory_result_score(item),
         "match_source": "memory_search",
         "node_type": extract_memory_result_type(item),
-    })
+    });
+    // Shared knowledge: a hit from a linked workspace keeps its workspace.
+    if let Some(name) = super::linked_workspaces::linked_workspace_name(item) {
+        normalized["linked"] = Value::Bool(true);
+        normalized["workspace_name"] = Value::String(name.to_string());
+        if let Some(id) = super::linked_workspaces::linked_workspace_id(item) {
+            normalized["workspace_id"] = Value::String(id.to_string());
+        }
+    }
+    normalized
 }
 
 fn result_score(item: &Value) -> i64 {
@@ -2177,6 +2186,7 @@ fn format_hybrid_search_results(query: &str, results: &[Value]) -> String {
                 .to_string(),
         };
 
+        let label = super::linked_workspaces::label_with_workspace(&label, item);
         text.push_str(&format!(
             "{}. [{}] **{}** (id: {})\n",
             i + 1,
@@ -2490,9 +2500,14 @@ impl ToolHandler for MemorySearchTool {
         } else {
             format!("{}\n\n{text}", notices.join("\n"))
         };
+        let text = match super::linked_workspaces::linked_footer(&response) {
+            Some(footer) => format!("{text}\n\n{footer}"),
+            None => text,
+        };
 
         let structured = serde_json::json!({
             "query": query,
+            "linked_workspaces": super::linked_workspaces::linked_workspaces(&response),
             "results": hybrid_results,
             "doc_matches": docs,
             "resolved_doc": resolved_doc,
@@ -2869,8 +2884,9 @@ pub(crate) fn render_decisions_envelope(
             let id = one_line(
                 decision_str(node, &["id", "node_id", "decision_id"]).unwrap_or("unknown"),
             );
+            let tag = super::linked_workspaces::label_with_workspace("DECISION", node);
             text.push_str(&format!(
-                "{}. [DECISION] {title} — status={status} freshness={freshness} category={category} id={id}\n",
+                "{}. [{tag}] {title} — status={status} freshness={freshness} category={category} id={id}\n",
                 index + 1
             ));
             if let Some(content) = node
@@ -2923,6 +2939,9 @@ pub(crate) fn render_decisions_envelope(
         }
     }
     text.push_str(&render_degraded_lines(envelope));
+    if let Some(footer) = super::linked_workspaces::linked_footer(envelope) {
+        text.push_str(&format!("\n{footer}\n"));
+    }
     text
 }
 

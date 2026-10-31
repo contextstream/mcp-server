@@ -3425,11 +3425,11 @@ mod tests {
         ),
         (
             "workspace",
-            "87e20ca59a1e82789e995fc8eecffac03d43d29f701f35305adf7ed914cfa885",
+            "f2f1783f5d0202bfe5c6954c5bef641e091e66e87c04438a3c370f7639723bdc",
         ),
         (
             "workspace_read",
-            "d6f6bc3fddb158aafc94ae5cde4e4156b695c7cf7aa669cb681f8dd68efadf15",
+            "9c9ff0e005c9455a45d050c1127eac156f74553b5e80e7fc1655522e779fca34",
         ),
     ];
 

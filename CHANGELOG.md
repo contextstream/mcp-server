@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.52
+
+- Search: a search that names another workspace takes nothing from this session's checkout unless the checkout belongs to that workspace. It sends no checkout scope, uses no uncommitted files or local index, and adds no local text matches from this folder, so passing a linked workspace's `workspace_id`, as the [LINKED_WORKSPACES] footer suggests, searches only that workspace (#487).
+- Memory: a doc read from a linked workspace keeps its "From: <workspace>" label in its details, in the candidates of a lookup by title and in the footer (#486).
+- Session recall shows a linked workspace's team docs, labeled "(from <workspace>)" (#486).
+
 ## 1.0.51
 
 - Shared work items (`entity`) on the hosted gateway use the connection's workspace and project (`X-ContextStream-Workspace-Id`, `X-ContextStream-Project-Id`), as the other tools do. Before, with only the header, lists came back empty, a new ticket was filed in the account's default workspace, and `get` by title said it found nothing (#488).

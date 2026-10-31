@@ -425,7 +425,12 @@ fn the_tool_offers_a_producer_not_a_model_menu() {
             .len(),
         23
     );
-    assert_eq!(properties["voice"]["enum"].as_array().unwrap().len(), 12);
+    // Any voice by name or id: free text, no list to pick from.
+    assert!(properties["voice"].get("enum").is_none());
+    assert!(properties["voice"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("a voice by name (e.g. Josh) or id; voices lists them"));
     assert_eq!(
         properties["mode"]["enum"],
         json!(["variation", "revision", "resize"])
@@ -894,3 +899,152 @@ fn pieces_are_named_by_index_or_id() {
 }
 
 mod brand;
+
+const JOSH_ID: &str = "ZoiZ8fuDWInAcwPXaVeq";
+
+fn project_or(request: &Recorded, otherwise: impl Fn(&Recorded) -> Answer) -> Answer {
+    if request.method == "GET" && request.path.starts_with("/projects/") {
+        return Answer::ok(json!({"id": PROJECT, "name": "studio", "workspace_id": WORKSPACE}));
+    }
+    if request.method == "GET" && request.path == "/credits/balance" {
+        return Answer::raw(
+            200,
+            json!({"credits": {"spendable": 5000, "total_available": 5000}}),
+        );
+    }
+    otherwise(request)
+}
+
+#[tokio::test]
+async fn any_voice_is_asked_for_by_name_and_the_plan_shows_it_locked() {
+    let stub = Stub::start(Arc::new(|request: &Recorded| {
+        project_or(request, |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/create/quotes") => {
+                    let mut ready = quote("ready");
+                    let josh = json!({"name": "Josh - Conversational Agent", "voiceId": JOSH_ID,
+                                  "source": "account", "locked": true});
+                    ready["plan"]["voice"] = josh.clone();
+                    ready["plan"]["pieces"][0]["voice"] = josh;
+                    Answer::status(202, ready)
+                }
+                _ => Answer::error(404, "NOT_FOUND", "Not found: nothing here"),
+            }
+        })
+    }))
+    .await;
+    let tool = stub.tool();
+    let result = tool
+        .execute(
+            json!({"action": "plan", "prompt": "A short voice-over for the release",
+                        "form": "voice-over", "voice": " Josh ", "wait_seconds": 20}),
+        )
+        .await
+        .unwrap();
+    assert!(!result.is_error, "{}", text_of(&result));
+    let text = text_of(&result);
+    assert!(
+        text.contains(
+            "Voice: Josh - Conversational Agent (locked). Every piece that speaks is said in it."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("   Voice: Josh - Conversational Agent (locked)."),
+        "{text}"
+    );
+    assert_eq!(structured(&result)["voice"]["voiceId"], JOSH_ID);
+    let posted = stub.posts_to("/create/quotes");
+    assert_eq!(posted[0].body["request"]["voice"], "Josh");
+    assert_eq!(posted[0].body["request"]["form"], "voice-over");
+}
+
+#[tokio::test]
+async fn a_voice_that_could_be_several_is_asked_about_not_guessed() {
+    let question = "“Rachel” could be any of these voices: Rachel - calm (id AaaaaaaaaaaaaaaaaaaA; ElevenLabs library); Rachel (id BbbbbbbbbbbbbbbbbbbB; ElevenLabs library). Which one? Send the one you mean as voice (its id is exact), or search with the voices list.";
+    let stub = Stub::start(Arc::new(move |request: &Recorded| {
+        project_or(request, |request| match request.path.as_str() {
+            "/create/quotes" => Answer::error(422, "voice_ambiguous", question),
+            _ => Answer::error(404, "NOT_FOUND", "Not found: nothing here"),
+        })
+    }))
+    .await;
+    let tool = stub.tool();
+    let result = tool
+        .execute(json!({"action": "plan", "prompt": "A film about our launch", "voice": "Rachel"}))
+        .await
+        .unwrap();
+    assert!(result.is_error);
+    assert_eq!(text_of(&result), format!("Not planned: {question}"));
+    assert!(stub.posts_to("/create/jobs").is_empty());
+}
+
+#[tokio::test]
+async fn voices_lists_the_curated_ones_by_key_and_any_other_by_id() {
+    let stub = Stub::start(Arc::new(|request: &Recorded| {
+        project_or(request, |request| match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/create/voices") => Answer::ok(json!({"voices": [
+                {"voiceId": JOSH_ID, "name": "Josh - Conversational Agent", "accent": "american",
+                 "gender": "male", "source": "account"},
+                {"voiceId": "TxGEqnHWrfWFTfGW9XjX", "name": "Josh", "source": "library"}
+            ]})),
+            _ => Answer::error(404, "NOT_FOUND", "Not found: nothing here"),
+        })
+    }))
+    .await;
+    let tool = stub.tool();
+    let result = tool
+        .execute(json!({"action": "voices", "query": "Josh"}))
+        .await
+        .unwrap();
+    assert!(!result.is_error, "{}", text_of(&result));
+    let text = text_of(&result);
+    assert!(text.starts_with("Voices for “Josh”:"), "{text}");
+    assert!(
+        text.contains("- Josh - Conversational Agent: ZoiZ8fuDWInAcwPXaVeq (the studio's own, american, male)."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Pass one as voice on plan or revise"),
+        "{text}"
+    );
+    assert_eq!(
+        structured(&result)["voices"].as_array().map(Vec::len),
+        Some(2)
+    );
+    let asked = stub
+        .requests()
+        .into_iter()
+        .find(|r| r.path == "/create/voices")
+        .expect("asked");
+    assert_eq!(
+        asked.query,
+        format!("workspaceId={WORKSPACE}&search=Josh&limit=20")
+    );
+}
+
+#[tokio::test]
+async fn a_piece_planned_again_can_be_said_in_another_voice() {
+    let stub = Stub::start(api(Arc::new(Mutex::new(("generating".into(), false))))).await;
+    let tool = stub.tool();
+    let result = tool
+        .execute(json!({"action": "revise", "make_id": JOB, "piece": 0, "change": "slower", "voice": "Josh", "wait_seconds": 20}))
+        .await
+        .unwrap();
+    assert!(!result.is_error, "{}", text_of(&result));
+    let posted = stub.posts_to("/create/quotes");
+    assert_eq!(posted[0].body["request"]["voice"], "Josh");
+    // An image still has no voice.
+    let stub = Stub::start(api(Arc::new(Mutex::new(("succeeded".into(), true))))).await;
+    let refused = stub
+        .tool()
+        .execute(json!({"action": "revise", "make_id": JOB, "piece": "brand-board", "change": "darker", "voice": "Josh"}))
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("is an image: voice is for a sound that speaks"),
+        "{refused}"
+    );
+}

@@ -218,10 +218,6 @@ pub(crate) fn size_ids() -> Vec<&'static str> {
     SIZES.iter().map(|s| s.id).collect()
 }
 
-pub(crate) fn voice_keys() -> Vec<&'static str> {
-    VOICES.iter().map(|(key, _)| *key).collect()
-}
-
 /// "Social Set", "social_set" and "social-set" are one key.
 fn key_of(raw: &str) -> String {
     raw.trim()
@@ -330,26 +326,26 @@ fn sizes_problem(said: &str) -> Error {
     ))
 }
 
-/// The voice asked for, if any.
-pub(crate) fn parse_voice(raw: Option<&str>) -> Result<Option<&'static str>> {
+/// The longest voice asked for, by name or id.
+pub(crate) const MAX_VOICE_CHARS: usize = 100;
+
+/// The voice asked for, if any: a curated voice's key in any spelling ("Warm narrator"),
+/// else any voice by name or id as written ("Josh", "ZoiZ8fuDWInAcwPXaVeq"). Create finds it
+/// when it plans and locks it, or says which voices it could be; it never picks another.
+pub(crate) fn parse_voice(raw: Option<&str>) -> Result<Option<String>> {
     let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
         return Ok(None);
     };
+    if raw.chars().count() > MAX_VOICE_CHARS || raw.chars().any(char::is_control) {
+        return Err(Error::Validation(format!(
+            "voice: a voice's name or id, up to {MAX_VOICE_CHARS} characters (voices lists them)."
+        )));
+    }
     let key = key_of(raw);
-    VOICES
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(k, _)| Some(*k))
-        .ok_or_else(|| {
-            Error::Validation(format!(
-                "Unknown voice “{raw}”. Voices: {}.",
-                VOICES
-                    .iter()
-                    .map(|(k, how)| format!("{k} ({how})"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        })
+    Ok(Some(VOICES.iter().find(|(k, _)| *k == key).map_or_else(
+        || raw.to_string(),
+        |(k, _)| (*k).to_string(),
+    )))
 }
 
 /// Whether a form, sizes and a voice go together, said plainly when they don't.
@@ -610,6 +606,32 @@ pub(crate) fn exports_words(piece: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| capitalized(&and_list(parts)))
 }
 
+/// The voice a piece speaks in, in words: its name, then ElevenLabs' id when `with_id` and
+/// Create gives one, and "locked" when the making is locked to it:
+/// "Josh - Conversational Agent (locked)", "Josh - Conversational Agent (ZoiZ8fuDWInAcwPXaVeq, locked)".
+pub(crate) fn voice_words(voice: Option<&Value>, with_id: bool) -> Option<String> {
+    let name = voice_name(voice)?;
+    let voice = voice?;
+    let mut notes = Vec::new();
+    if with_id {
+        if let Some(id) = voice
+            .get("voiceId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+        {
+            notes.push(id.to_string());
+        }
+    }
+    if voice.get("locked").and_then(Value::as_bool) == Some(true) {
+        notes.push("locked".to_string());
+    }
+    Some(if notes.is_empty() {
+        name
+    } else {
+        format!("{name} ({})", notes.join(", "))
+    })
+}
+
 /// The voice a piece speaks in: its name, else its key.
 pub(crate) fn voice_name(voice: Option<&Value>) -> Option<String> {
     match voice? {
@@ -655,7 +677,7 @@ pub(crate) fn plan_lines(piece: &Value) -> Vec<String> {
     if let Some(files) = exports_words(piece) {
         lines.push(format!("   Files: {files}."));
     }
-    if let Some(voice) = voice_name(piece.get("voice")) {
+    if let Some(voice) = voice_words(piece.get("voice"), false) {
         lines.push(format!("   Voice: {voice}."));
     }
     if let Some(from) = started_from(piece.get("from")) {
@@ -669,7 +691,7 @@ pub(crate) fn plan_delivery(piece: &Value) -> Option<Value> {
     let form = piece.get("form").and_then(Value::as_str);
     let sizes = sizes_words(piece.get("sizes"));
     let files = exports_words(piece);
-    let voice = voice_name(piece.get("voice"));
+    let voice = voice_words(piece.get("voice"), true);
     let from = mode_of(piece.get("from"));
     if form.is_none() && sizes.is_none() && files.is_none() && voice.is_none() && from.is_none() {
         return None;
@@ -973,13 +995,22 @@ pub(crate) fn made_lines(piece: &Value, made: &Value) -> Vec<String> {
     if let Some(sounds) = pack_words(made.get("pack")) {
         lines.push(format!("   Sounds: {sounds}."));
     }
-    if let Some(voice) = voice_name(made.get("voice").or_else(|| piece.get("voice"))) {
+    if let Some(voice) = voice_words(made_voice(piece, made), true) {
         lines.push(format!("   Voice: {voice}."));
     }
     if let Some(from) = started_from(made.get("from")) {
         lines.push(format!("   {from}"));
     }
     lines
+}
+
+/// The voice a made piece was said in: as its placard records it (name, ElevenLabs' id,
+/// locked), else as it was planned.
+fn made_voice<'a>(piece: &'a Value, made: &'a Value) -> Option<&'a Value> {
+    made.pointer("/placard/voice")
+        .or_else(|| made.get("voice"))
+        .or_else(|| piece.get("voice"))
+        .filter(|voice| !voice.is_null())
 }
 
 /// A made piece's brand work for the structured result.
@@ -997,10 +1028,7 @@ pub(crate) fn made_entry(entry: &mut Value, piece: &Value, made: &Value) {
     put("caption", made.get("caption").cloned());
     put("sizes", made.get("sizes").cloned());
     put("pack", made.get("pack").cloned());
-    put(
-        "voice",
-        made.get("voice").or_else(|| piece.get("voice")).cloned(),
-    );
+    put("voice", made_voice(piece, made).cloned());
     put("from", made.get("from").cloned());
     if let Some(checks) = made.get("checks").and_then(Value::as_array) {
         put("checks", Some(Value::Array(checks.clone())));
@@ -1068,13 +1096,55 @@ pub(crate) fn form_description() -> String {
 /// The voice parameter's description.
 pub(crate) fn voice_description() -> String {
     format!(
-        "The voice that speaks (plan, revise), for voice-over, podcast-intro, podcast-outro or no form: {}. Default: the brand kit's narrator.",
+        "The voice that speaks (plan, revise): a voice by name (e.g. Josh) or id; voices lists them. For any piece that speaks: a film, an explainer, a voice-over, a podcast intro or outro (with a form: voice-over, podcast-intro or podcast-outro). The plan locks it: every piece that speaks is said in it, or the plan says which voices it could be. Curated: {}. Default: the brand kit's narrator.",
         VOICES
             .iter()
             .map(|(k, how)| format!("{k} ({how})"))
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// The voices Create lists (`GET /create/voices`), one line each: a curated voice by its
+/// key, any other by ElevenLabs' id, with where it is from and how it sounds.
+pub(crate) fn voices_lines(voices: &[Value]) -> Vec<String> {
+    voices
+        .iter()
+        .filter_map(|voice| {
+            let name = voice.get("name").and_then(Value::as_str)?.trim();
+            let handle = voice
+                .get("key")
+                .or_else(|| voice.get("voiceId"))
+                .and_then(Value::as_str)?;
+            let mut about = vec![match voice.get("source").and_then(Value::as_str) {
+                Some("curated") => "curated",
+                Some("library") => "ElevenLabs library",
+                Some("preset") => "preset",
+                _ => "the studio's own",
+            }
+            .to_string()];
+            for key in ["accent", "gender"] {
+                if let Some(word) = voice
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|w| !w.trim().is_empty())
+                {
+                    about.push(word.trim().to_string());
+                }
+            }
+            let description = voice
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(|d| format!(" {}", d.chars().take(160).collect::<String>()))
+                .unwrap_or_default();
+            Some(format!(
+                "- {name}: {handle} ({}).{description}",
+                about.join(", ")
+            ))
+        })
+        .collect()
 }
 
 /// The sizes parameter's schema.
@@ -1135,13 +1205,25 @@ mod tests {
             .to_string()
             .contains("social-set (one post in each network's size)"));
         assert_eq!(
-            parse_voice(Some("Warm narrator")).unwrap(),
+            parse_voice(Some("Warm narrator")).unwrap().as_deref(),
             Some("warm-narrator")
         );
-        assert!(parse_voice(Some("robot"))
+        // Any other voice, by name or id, goes to Create as written: it finds and locks it.
+        assert_eq!(
+            parse_voice(Some(" Josh ")).unwrap().as_deref(),
+            Some("Josh")
+        );
+        assert_eq!(
+            parse_voice(Some("ZoiZ8fuDWInAcwPXaVeq"))
+                .unwrap()
+                .as_deref(),
+            Some("ZoiZ8fuDWInAcwPXaVeq")
+        );
+        assert_eq!(parse_voice(Some("  ")).unwrap(), None);
+        assert!(parse_voice(Some(&"x".repeat(101)))
             .unwrap_err()
             .to_string()
-            .contains("calm-guide (soft and reassuring)"));
+            .contains("up to 100 characters"));
 
         let sonic = find_form("sonic-logo");
         let story = vec![find_size("instagram-story").unwrap()];
@@ -1219,6 +1301,20 @@ mod tests {
                 "   From a made piece: it, changed as asked."
             ]
         );
+        // A voice the making is locked to says so; a made piece names the voice's id too.
+        let josh = json!({"name": "Josh - Conversational Agent", "voiceId": "ZoiZ8fuDWInAcwPXaVeq", "source": "account", "locked": true});
+        assert_eq!(
+            plan_lines(&json!({"medium": "sound", "voice": josh})),
+            ["   Voice: Josh - Conversational Agent (locked)."]
+        );
+        let made = json!({"placard": {"voice": {"name": "Josh - Conversational Agent", "voiceId": "ZoiZ8fuDWInAcwPXaVeq", "locked": true}}});
+        assert_eq!(
+            made_lines(&json!({"medium": "sound"}), &made),
+            ["   Voice: Josh - Conversational Agent (ZoiZ8fuDWInAcwPXaVeq, locked)."]
+        );
+        let mut entry = json!({});
+        made_entry(&mut entry, &json!({"medium": "sound"}), &made);
+        assert_eq!(entry["voice"]["voiceId"], "ZoiZ8fuDWInAcwPXaVeq");
         assert!(plan_delivery(&json!({"medium": "video"})).is_none());
         assert_eq!(plan_delivery(&set).unwrap()["form_label"], "Social set");
     }
@@ -1312,6 +1408,24 @@ mod tests {
             ))
             .unwrap(),
             "Tap 0.4 s and Success 1 s"
+        );
+    }
+
+    #[test]
+    fn voices_are_listed_by_key_or_id_with_where_they_are_from() {
+        let lines = voices_lines(&[
+            json!({"key": "warm-narrator", "name": "George", "description": "Warm, mature narrator.", "accent": "British", "source": "curated"}),
+            json!({"voiceId": "ZoiZ8fuDWInAcwPXaVeq", "name": "Josh - Conversational Agent", "accent": "american", "gender": "male", "source": "account"}),
+            json!({"voiceId": "TxGEqnHWrfWFTfGW9XjX", "name": "Josh", "source": "library"}),
+            json!({"name": "No handle"}),
+        ]);
+        assert_eq!(
+            lines,
+            [
+                "- George: warm-narrator (curated, British). Warm, mature narrator.",
+                "- Josh - Conversational Agent: ZoiZ8fuDWInAcwPXaVeq (the studio's own, american, male).",
+                "- Josh: TxGEqnHWrfWFTfGW9XjX (ElevenLabs library).",
+            ]
         );
     }
 }

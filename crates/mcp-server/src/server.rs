@@ -325,7 +325,8 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "stop": "Stopping a ContextStudio making",
             "library": "Listing ContextStudio makings",
             "brand": "Reading the brand kit",
-            "products": "Listing connected products"
+            "products": "Listing connected products",
+            "voices": "Listing ContextStudio voices"
         });
     } else if domains::slipstream::is_tool_name(name) {
         metadata["actions"] = serde_json::json!({

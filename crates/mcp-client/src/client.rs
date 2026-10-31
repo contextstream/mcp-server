@@ -1924,6 +1924,23 @@ fn error_reports_a_lasting_state(error: &Error) -> bool {
     )
 }
 
+/// A 502 or 504 from the edge in front of the API carries no word from the
+/// origin: the write may or may not have reached it. A keyed write to an
+/// origin that keeps keys is resent with the same key, as after a lost
+/// connection, and gets the stored answer if it was applied (#477).
+fn is_edge_gateway_status(status: u16) -> bool {
+    matches!(status, 502 | 504)
+}
+
+/// The API's answer to a key whose first request has not finished.
+fn is_idempotency_key_in_progress(error: &Error) -> bool {
+    matches!(error, Error::Http { status: 409, message, .. }
+        if message.contains("Idempotency-Key is still in progress"))
+}
+
+/// The wait before a keyed write whose 2xx answer was cut off asks again.
+const CUT_ANSWER_RETRY_DELAY: Duration = Duration::from_millis(200);
+
 fn status_attempt_failure(status: u16) -> AttemptFailure {
     match status {
         429 | 503 => AttemptFailure::Refused,
@@ -4684,7 +4701,14 @@ impl ContextStreamClient {
             let response = match sent {
                 Ok(resp) => {
                     observe_tenant_home_header(resp.headers());
-                    observe_idempotency_support(&config.api_url, resp.headers(), is_write);
+                    // Only a write the origin answered, without the header,
+                    // shows it does not keep keys: an edge's 502 says nothing
+                    // about the origin (#477).
+                    observe_idempotency_support(
+                        &config.api_url,
+                        resp.headers(),
+                        is_write && resp.status().is_success(),
+                    );
                     resp
                 }
                 Err(e) => {
@@ -4749,18 +4773,51 @@ impl ContextStreamClient {
             debug!("Response: {} (attempt {})", status, attempt + 1);
 
             if status.is_success() {
-                return self.parse_response(response).await;
+                let parsed = self.parse_response(response).await;
+                // A write answered 2xx was applied; only its answer was cut
+                // off. A keyed write asks again with the same key and gets
+                // the stored answer back; otherwise it says it may have been
+                // saved (#477).
+                match parsed {
+                    Err(error @ Error::Network(_)) if resend_unsafe => {
+                        if is_write
+                            && attempt < max_retries
+                            && api_supports_idempotency(&config.api_url)
+                        {
+                            retry_delay = Some(CUT_ANSWER_RETRY_DELAY);
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(write_outcome_unknown(error));
+                    }
+                    other => return other,
+                }
             }
 
             // A write answered with an error is retried after it may have
-            // applied only when this very response says the API kept its
-            // idempotency key; an edge or proxy 5xx never says so.
+            // applied when this very response says the API kept its
+            // idempotency key, or when an edge 502/504 (which never says so)
+            // stands in front of an origin that keeps keys (#477).
             let response_keeps_key = response_advertises_idempotency(response.headers());
             let response_is_replay = response_is_idempotent_replay(response.headers());
 
             // Handle error response
             let error = self.parse_error(response).await;
             debug!("Error response: {:?}", error);
+
+            // A resend whose first attempt is still running is answered 409
+            // after a short wait: ask again with the same key, and if it is
+            // still running, say it may have been saved (#477).
+            if is_write && is_idempotency_key_in_progress(&error) {
+                if attempt < max_retries {
+                    if let Some(delay) = self.retry_config.delay_before_retry(&error, attempt) {
+                        retry_delay = Some(delay);
+                        attempt += 1;
+                        continue;
+                    }
+                }
+                return Err(write_outcome_unknown(error));
+            }
 
             if is_retryable_status(status.as_u16())
                 && attempt < max_retries
@@ -4769,7 +4826,10 @@ impl ContextStreamClient {
                 && retry_permitted(
                     resend_unsafe,
                     status_attempt_failure(status.as_u16()),
-                    is_write && response_keeps_key,
+                    is_write
+                        && (response_keeps_key
+                            || (is_edge_gateway_status(status.as_u16())
+                                && api_supports_idempotency(&config.api_url))),
                 )
             {
                 // A server-requested wait beyond the in-request cap is handed
@@ -23993,6 +24053,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_edge_502_on_a_keyed_write_is_resent_with_the_same_key() {
+        // #477: the edge's 15 s deadline answers 502 without the origin's
+        // idempotency header; the write was saved, and the call said only
+        // that it may have been.
+        let (client, server) = client_with_http_sequence_headers(vec![
+            (
+                "200 OK",
+                "x-contextstream-idempotency: 1\r\n",
+                r#"{"success":true,"data":[]}"#.to_string(),
+            ),
+            (
+                "502 Bad Gateway",
+                "",
+                r#"{"error":{"code":"bad_gateway","message":"Upstream API origin unavailable"}}"#
+                    .to_string(),
+            ),
+            (
+                "200 OK",
+                "x-contextstream-idempotency: 1\r\n",
+                r#"{"success":true,"data":{"id":"doc-1"}}"#.to_string(),
+            ),
+        ])
+        .await;
+        client
+            .get::<serde_json::Value>("/workspaces")
+            .await
+            .expect("the origin answers and says it keeps keys");
+        let saved = client
+            .post::<serde_json::Value, _>("/docs", serde_json::json!({"title": "t"}))
+            .await
+            .expect("the resent write gets the stored answer");
+        assert_eq!(saved["id"], "doc-1", "{saved}");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let first = request_header(&requests[1], IDEMPOTENCY_KEY_HEADER).unwrap();
+        let second = request_header(&requests[2], IDEMPOTENCY_KEY_HEADER).unwrap();
+        assert_eq!(first, second, "the same key both times");
+    }
+
+    #[tokio::test]
+    async fn a_keyed_write_whose_answer_was_cut_off_asks_again_with_the_same_key() {
+        // #477: a 200 whose body stopped half way gave a bare "error decoding
+        // response body" for a doc that was saved.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut keys = Vec::new();
+            for answer in [
+                // Promises 200 bytes, sends 20, and closes.
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nx-contextstream-idempotency: 1\r\nContent-Length: 200\r\nConnection: close\r\n\r\n{\"success\":true,\"dat".to_string(),
+                {
+                    let body = r#"{"success":true,"data":{"id":"doc-2"}}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nx-contextstream-idempotency: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                },
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0u8; 64 * 1024];
+                let read = socket.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                keys.push(request_header(&request, IDEMPOTENCY_KEY_HEADER).map(str::to_string));
+                socket.write_all(answer.as_bytes()).await.unwrap();
+                socket.shutdown().await.ok();
+            }
+            keys
+        });
+        let mut config = Config::default();
+        config.api_url = format!("http://{addr}");
+        config.api_key = Some("test-key".to_string());
+        let client = ContextStreamClient::new(config);
+        let saved = client
+            .post::<serde_json::Value, _>("/docs", serde_json::json!({"title": "t"}))
+            .await
+            .expect("the second ask gets the stored answer");
+        assert_eq!(saved["id"], "doc-2", "{saved}");
+        let keys = server.await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].is_some());
+        assert_eq!(keys[0], keys[1], "the same key both times");
+    }
+
+    #[tokio::test]
     async fn a_create_the_api_does_not_key_is_not_resent() {
         // #477: project create was resent after a lost answer and then said
         // "That project name is already in use" about the project it made.
@@ -24056,18 +24201,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_error_without_the_header_is_not_retried_even_after_an_advertisement() {
+    async fn a_write_answered_without_the_header_forgets_the_origin() {
+        // An answered write without the header shows the origin does not keep
+        // keys; an edge 502 says nothing about the origin and is resent
+        // instead (#477, an_edge_502_on_a_keyed_write_is_resent_with_the_same_key).
         let (client, server) = client_with_http_sequence_headers(vec![
             (
                 "201 Created",
                 "x-contextstream-idempotency: 1\r\n",
                 r#"{"data":{"id":"d1"}}"#.to_string(),
             ),
-            (
-                "502 Bad Gateway",
-                "",
-                r#"{"error":{"code":"bad_gateway","message":"edge"}}"#.to_string(),
-            ),
+            ("201 Created", "", r#"{"data":{"id":"d2"}}"#.to_string()),
         ])
         .await;
         let _: serde_json::Value = client
@@ -24076,18 +24220,61 @@ mod tests {
             .unwrap();
         let api_url = client.config().await.api_url.clone();
         assert!(api_supports_idempotency(&api_url));
-        let second = tokio::time::timeout(
-            Duration::from_millis(900),
-            client.post::<serde_json::Value, _>("/docs", serde_json::json!({"title": "b"})),
-        )
-        .await
-        .expect("an edge 5xx must not enter retry backoff");
-        assert!(matches!(second, Err(Error::Http { status: 502, .. })));
-        assert_eq!(server.await.unwrap().len(), 2, "no retry of the 502");
+        let _: serde_json::Value = client
+            .post("/docs", serde_json::json!({"title": "b"}))
+            .await
+            .unwrap();
+        assert_eq!(server.await.unwrap().len(), 2);
         assert!(
             !api_supports_idempotency(&api_url),
             "a write answered without the header forgets the origin"
         );
+    }
+
+    #[tokio::test]
+    async fn a_resend_that_finds_the_first_attempt_running_asks_again() {
+        // #477: after an edge 502 the first attempt may still be running; the
+        // API holds the resend 3 s, then answers 409 "still in progress".
+        let in_progress = r#"{"error":{"code":"CONFLICT","message":"A request with this Idempotency-Key is still in progress; retry shortly"}}"#;
+        let (client, server) = client_with_http_sequence_headers(vec![
+            (
+                "200 OK",
+                "x-contextstream-idempotency: 1\r\n",
+                r#"{"success":true,"data":[]}"#.to_string(),
+            ),
+            (
+                "502 Bad Gateway",
+                "",
+                r#"{"error":{"code":"bad_gateway","message":"edge"}}"#.to_string(),
+            ),
+            (
+                "409 Conflict",
+                "x-contextstream-idempotency: 1\r\n",
+                in_progress.to_string(),
+            ),
+            (
+                "200 OK",
+                "x-contextstream-idempotency: 1\r\n",
+                r#"{"success":true,"data":{"id":"doc-3"}}"#.to_string(),
+            ),
+        ])
+        .await;
+        client
+            .get::<serde_json::Value>("/workspaces")
+            .await
+            .unwrap();
+        let saved = client
+            .post::<serde_json::Value, _>("/docs", serde_json::json!({"title": "t"}))
+            .await
+            .expect("the stored answer once the first attempt finished");
+        assert_eq!(saved["id"], "doc-3", "{saved}");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        let keys: Vec<_> = requests[1..]
+            .iter()
+            .map(|request| request_header(request, IDEMPOTENCY_KEY_HEADER).unwrap())
+            .collect();
+        assert!(keys.windows(2).all(|pair| pair[0] == pair[1]), "{keys:?}");
     }
 
     #[test]

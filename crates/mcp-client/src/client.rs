@@ -4705,8 +4705,13 @@ impl ContextStreamClient {
                     // wait 6.5 s or more with the network down (#320). One quick
                     // retry covers a blip; timeouts keep the full schedule.
                     let refused = e.is_connect() && !e.is_timeout();
+                    // An origin that took the whole timeout to not answer is
+                    // stalled: four attempts of 30 s made one call take two
+                    // minutes, and the session init before it two more (#478).
                     let retries_allowed = if refused {
                         max_retries.min(CONNECT_FAILURE_RETRIES)
+                    } else if e.is_timeout() {
+                        max_retries.min(TIMEOUT_RETRIES)
                     } else {
                         max_retries
                     };
@@ -22332,6 +22337,8 @@ pub fn coordination_notice_path(
 /// Retries of a request whose connection was refused, unroutable or
 /// unresolved, and the wait before each (#320).
 const CONNECT_FAILURE_RETRIES: u32 = 1;
+/// Retries of a request that timed out: one, for a blip (#478).
+const TIMEOUT_RETRIES: u32 = 1;
 const CONNECT_FAILURE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 fn extract_error_message(body: &serde_json::Value, status: u16) -> String {

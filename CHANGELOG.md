@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.0.47
+
+- ContextStudio (`studio`):
+  - `voice` takes any voice by name (e.g. Josh) or id, on `plan` and `revise`, for any piece that speaks: a film, an explainer, a voice-over, a podcast intro or outro. Create finds it and locks it: every piece that speaks is said in it.
+  - The plan shows the locked voice ("Voice: Josh - Conversational Agent (locked)"), and a result names the voice each piece was said in, with its id.
+  - A name that fits several voices, or none, isn't planned: the answer lists the voices it could be.
+  - A new `voices` action lists and searches the voices to pass: the curated ones by key, the studio's own ElevenLabs voices and the shared library's by id.
+- Writes and the network:
+  - A write whose answer was lost says so, and an unkeyed create is not sent again (#477). A keyed write gets its answer back after an edge 502 or a cut-off body (#477).
+  - A timeout says the seconds waited over all its attempts, and a timed-out request is tried once more, not three times (#478).
+  - Over stdio, ping, tools/list and initialize are answered while a tool call waits on the API (#478).
+  - A 200 that says it failed, isn't the API, or is empty no longer reads as saved (#420).
+  - Creates the API does not key are never resent blindly (#483), and a project delete refused while files are still being taken in is asked again (#474).
+  - A JSON-RPC batch holds at most 20 messages (#421). Stored text can't forge notice lines or result rows, and control bytes never reach a client (#419).
+- Security and indexing:
+  - `chart` and `async_job` check the caller's access to the workspace before acting under the service token, and a caller's mistake is an error that says what to change (#439).
+  - Committed service-account keys, terraform state, secret manifests and kubeconfigs are no longer uploaded, and a credential under an ordinary name is withheld by its content; files an older release indexed are read again once so the check can withhold them (#425).
+  - `skill import` refuses a credential file, as `media index` does (#469).
+  - Latin-1, Windows-1252 and UTF-16 text is indexed instead of silently left out (#448). An indexable file uploads whole, so exhaustive search sees all of it (#432).
+  - Indexing a project named by id and path is no longer refused because the session's project is another one, and an index asked for while one runs says it joins that run (#455).
+  - A watcher stops once its ~/.contextstream directory is gone (#457).
+- Graph: an unbuilt graph, a graph being built and an analysis still running each say so instead of "none found", usages finds Python callers, and circular_dependencies, unused_code and complexity_metrics name what they count (#467, #468, #472, #479, #480).
+- `async_job`: a job no runner has started says so instead of "pending" (#438). `chart`'s render text gives the values, their unit and the worst series (#440).
+- Telemetry: a hosted tool call names the person who made it, not only the workspace's owner.
+- Lists page alike: projects, project files, workspaces, entities, reminders, plans, skills, memory events and nodes, transcripts and index history take limit and offset, say where a page sits, and say when a page is past the end (#381, #390, #391, #411, #441, #442, #451, #452, #454, #459, #460, #462, #465).
+- Tools show their data and say what they did:
+  - project get, overview, statistics and files; workspace index_settings; session user_context; integration summary (#429, #430, #435, #441, #466);
+  - integration and vcs reads for a provider that is not connected say so (#458, #471);
+  - a misspelled argument is refused with the one meant, and an argument a tool doesn't have is named under its answer (#423, #470);
+  - an unknown project_id is left out of every read, and said (#449);
+  - list_nodes refuses a status it can't filter by, and brief_update names a wrongly shaped section (#437, #456);
+  - a doc keeps its body and place in context and memory search (#416); context() labels knowledge nodes by type (#414);
+  - list_events and create_event agree on the event type, session delta reports the changes since the given time, and a snapshot captured without session_id belongs to the session init started (#389, #395, #410);
+  - reminders narrow by keywords and priority and can be deleted; list_tasks sends its date filters and keeps a task's blocked reason (#412, #413, #426);
+  - a superseding node is titled by its new content; a finished plan nobody closed is no longer the "Latest actionable plan" (#415, #428);
+  - get_lessons and decisions say "at least" for a partial count (#452, #461);
+  - search no longer panics on a hit past the end of a shorter file, and an empty or partial answer is not replayed from the warm cache; a memory write changes the caller's search cache keys and drops the cached project overview (#443, #453, #463, #464);
+  - the project list is fetched in parallel and reused for a few seconds, and target_project resolves names in a workspace of thousands of projects (#450);
+  - skill import refuses empty content and unknown formats, and names what it created (#399).
+- The CLI ends one-shot commands with a message and exit 1 when stdout can't be written, not a panic (#422). The release SBOM lists the crates the binaries are built from (#431).
+
 ## 1.0.46
 
 - Indexing:

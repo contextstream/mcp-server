@@ -445,26 +445,37 @@ impl EntityTool {
         action_name: &str,
         hint: Option<&str>,
     ) -> Result<Lookup> {
-        if let Ok(id) = Uuid::parse_str(lookup.trim()) {
+        let reference = lookup.trim();
+        if let Ok(id) = Uuid::parse_str(reference) {
             return Ok(Lookup::Found(lookup::Found::by_id(id)));
         }
 
-        let mut params = Vec::new();
-        if let Some(ws) = workspace_id {
-            params.push(("workspace_id".to_string(), ws.clone()));
-        }
-        if let Some(pj) = project_id {
-            params.push(("project_id".to_string(), pj.clone()));
-        }
-        params.push(("limit".to_string(), "100".to_string()));
-        params.push(("query".to_string(), lookup.trim().to_string()));
-
-        let list = self.client.entity_list(kind, params).await?;
-        let items = extract_items_array(&list)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
         let singular = kind.replace('_', " ");
         let plural = plural_kind(kind);
+        let record_kind = RecordKind::new(&singular, &plural);
+        // The API matches `query` as one substring of the title, so the
+        // reference as given finds only titles that contain it word for word.
+        // When no candidate shares a word with it (other word order, a dropped
+        // word, punctuation, extra spaces), one of its words is searched
+        // instead and the resolver's own rule picks the record (#489).
+        let mut candidates = lookup::candidates_from_items(
+            &self
+                .reference_candidates(kind, reference, workspace_id, project_id)
+                .await?,
+            ENTITY_TITLE_FIELDS,
+        );
+        if lookup::resolve(reference, &candidates, record_kind, action.destructive)
+            == lookup::Outcome::NoMatch
+        {
+            if let Some(word) = lookup::search_word(reference, record_kind) {
+                candidates = lookup::candidates_from_items(
+                    &self
+                        .reference_candidates(kind, &word, workspace_id, project_id)
+                        .await?,
+                    ENTITY_TITLE_FIELDS,
+                );
+            }
+        }
         let retry = if crate::domains::destructive::separated("entity", action_name).is_some() {
             format!("delete(action=\"entity.{action_name}\", kind=\"{kind}\", id=\"<id>\")")
         } else {
@@ -472,21 +483,62 @@ impl EntityTool {
         };
         lookup::resolve_reference(
             &LookupContext {
-                kind: RecordKind::new(&singular, &plural),
+                kind: record_kind,
                 action,
                 retry: &retry,
                 hint,
             },
             lookup,
-            &lookup::candidates_from_items(items, ENTITY_TITLE_FIELDS),
+            &candidates,
             || {
-                format!(
+                let mut message = format!(
                     "No {} found matching \"{}\". Use entity(kind=\"{}\", action=\"list\", query={{\"query\": \"{}\"}}) to inspect candidates.",
                     plural, lookup, kind, lookup
-                )
+                );
+                if looks_like_id_prefix(reference) {
+                    message.push_str(" An id must be given whole: part of one is not looked up.");
+                }
+                message
             },
         )
     }
+
+    /// One page of `kind`'s listing whose titles match `query`, closed records
+    /// included, as the candidates for a reference by title.
+    async fn reference_candidates(
+        &self,
+        kind: &str,
+        query: &str,
+        workspace_id: &Option<String>,
+        project_id: &Option<String>,
+    ) -> Result<Vec<Value>> {
+        let mut params = Vec::new();
+        if let Some(ws) = workspace_id {
+            params.push(("workspace_id".to_string(), ws.clone()));
+        }
+        if let Some(pj) = project_id {
+            params.push(("project_id".to_string(), pj.clone()));
+        }
+        // The API pages with `per_page` (at most 100); it has no `limit`.
+        params.push(("per_page".to_string(), "100".to_string()));
+        // Tickets and incidents leave out resolved, closed and cancelled ones
+        // unless asked, and a reference to one of those must still find it.
+        if matches!(kind, "ticket" | "incident") {
+            params.push(("include_closed".to_string(), "true".to_string()));
+        }
+        params.push(("query".to_string(), query.to_string()));
+        let list = self.client.entity_list(kind, params).await?;
+        Ok(extract_items_array(&list).cloned().unwrap_or_default())
+    }
+}
+
+/// Text made only of hex digits and hyphens, with a digit, shorter than a
+/// UUID: most likely the start of an id, which is not looked up by prefix.
+fn looks_like_id_prefix(text: &str) -> bool {
+    let text = text.trim();
+    (4..36).contains(&text.len())
+        && text.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+        && text.chars().any(|ch| ch.is_ascii_digit())
 }
 
 /// Drill through the common list-response shapes to a flat `Vec<Value>` of
@@ -2388,5 +2440,82 @@ mod tests {
             "{other}"
         );
         assert!(!other.contains("project_id="), "{other}");
+    }
+
+    /// #489: a reference by title fetched its candidates with `limit` (not an
+    /// API parameter, so one default page of 50), without closed tickets, and
+    /// with the whole reference as one substring. A resolved ticket, or its
+    /// title in another word order, was "not found" after the API answered 200.
+    #[tokio::test]
+    async fn a_title_in_another_word_order_finds_a_resolved_ticket() {
+        let resolved = serde_json::json!({
+            "id": TICKET_ID,
+            "title": "Login page crashes on submit",
+            "kind": "bug",
+            "status": "resolved",
+            "workspace_id": WORKSPACE_ID,
+            "project_id": MCP_SERVER_PROJECT_ID,
+        });
+        let (tool, server) = entity_tool_with_http_sequence(vec![
+            ("200 OK", serde_json::json!({"items": [], "total": 0})),
+            (
+                "200 OK",
+                serde_json::json!({"items": [resolved.clone()], "total": 1}),
+            ),
+            ("200 OK", resolved),
+        ])
+        .await;
+
+        let result = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "get",
+                "id": "crashes login page on submit",
+                "workspace_id": WORKSPACE_ID,
+            }))
+            .await
+            .expect("get by title");
+        assert!(
+            result_text(&result).contains("Login page crashes on submit"),
+            "{}",
+            result_text(&result)
+        );
+
+        let requests = server.await.expect("entity request server");
+        let lines: Vec<&str> = requests
+            .iter()
+            .map(|request| request.lines().next().unwrap_or_default())
+            .collect();
+        for lookup in &lines[..2] {
+            assert!(lookup.starts_with("GET /api/v1/tickets?"), "{lookup}");
+            assert!(lookup.contains("per_page=100"), "{lookup}");
+            assert!(lookup.contains("include_closed=true"), "{lookup}");
+            assert!(!lookup.contains("limit="), "{lookup}");
+        }
+        assert!(
+            lines[0].contains("query=crashes%20login%20page%20on%20submit")
+                || lines[0].contains("query=crashes+login+page+on+submit"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("query=crashes ") || lines[1].contains("query=crashes&"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with(&format!("GET /api/v1/tickets/{TICKET_ID}")),
+            "{}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn a_reference_that_looks_like_part_of_an_id_is_named_as_one() {
+        assert!(looks_like_id_prefix("4444abcd"));
+        assert!(looks_like_id_prefix("44444444-4444"));
+        assert!(!looks_like_id_prefix("login page"));
+        assert!(!looks_like_id_prefix("beef"));
+        assert!(!looks_like_id_prefix("123"));
     }
 }

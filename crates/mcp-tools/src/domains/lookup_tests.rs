@@ -700,3 +700,21 @@ fn the_score_only_orders_the_list() {
         ]
     );
 }
+
+/// #489: the word a title lookup searches by when the reference as given found
+/// nothing.
+#[test]
+fn the_search_word_is_the_longest_one_that_says_which_record() {
+    let tickets = RecordKind::new("ticket", "tickets");
+    assert_eq!(
+        search_word("crashes login page on submit", tickets).as_deref(),
+        Some("crashes")
+    );
+    assert_eq!(
+        search_word("the login ticket", tickets).as_deref(),
+        Some("login")
+    );
+    assert_eq!(search_word("login.", tickets).as_deref(), Some("login"));
+    assert_eq!(search_word("Login", tickets), None);
+    assert_eq!(search_word("  ", tickets), None);
+}

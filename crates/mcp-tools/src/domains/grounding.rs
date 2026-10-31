@@ -128,6 +128,11 @@ pub fn replay_selection(
 /// half of a response after its text has already used the qualified selector.
 pub fn retain_selected_payload(recall: &mut Value, hits: &[GroundingHit]) {
     remove_superseded_core_projections(recall);
+    // Linked docs are never candidate evidence (their scope is another workspace), so the
+    // candidate text leaves them out, and so does the structured half.
+    if let Some(object) = recall.as_object_mut() {
+        object.remove("supplemental_linked_results");
+    }
     let query = CandidateQueryEvidence::from_payload(recall);
     let mut seen = std::collections::HashSet::new();
     for field in ["results", "supplemental_results"] {

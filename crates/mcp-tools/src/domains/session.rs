@@ -11189,7 +11189,16 @@ fn format_recall_doc_matches(docs: &[Value]) -> String {
             .get("title")
             .and_then(|value| value.as_str())
             .unwrap_or("Untitled");
-        text.push_str(&format!("{}. **{}**\n", index + 1, title));
+        // A doc of a linked workspace says where it came from, as decisions do (#486).
+        match super::linked_workspaces::linked_workspace_name(doc) {
+            Some(workspace) => text.push_str(&format!(
+                "{}. **{}** (from {})\n",
+                index + 1,
+                title,
+                workspace
+            )),
+            None => text.push_str(&format!("{}. **{}**\n", index + 1, title)),
+        }
 
         if let Some(preview) = doc
             .get("content_preview")

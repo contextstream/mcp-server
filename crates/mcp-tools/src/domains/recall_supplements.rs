@@ -111,8 +111,74 @@ fn checked_results(
     Ok(results.clone())
 }
 
+/// The linked docs the evidence check answered separately (`linked_results`): docs discovery
+/// found in a workspace linked to this one, which the API re-read there as the person (#486).
+/// Each is checked as strictly as this workspace's own evidence:
+/// - asked about, answered once and not also here;
+/// - primary-authorized for this exact query;
+/// - labeled with the linked workspace whose scope it carries, never this one.
+///
+/// The API reads none for a request about a project. If any one is malformed, all are dropped:
+/// they are extra, never a reason to lose this workspace's evidence.
+fn checked_linked_results(
+    linked: Option<&Value>,
+    workspace: Uuid,
+    project: Option<Uuid>,
+    query: &str,
+    sources: &[Value],
+    home: &[Value],
+) -> Vec<Value> {
+    let Some(results) = linked.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    if project.is_some() {
+        return Vec::new();
+    }
+    let digest = hex::encode(Sha256::digest(query.as_bytes()));
+    let mut seen: HashSet<&str> = home
+        .iter()
+        .filter(|result| result["source_kind"] == "doc")
+        .filter_map(|result| result["id"].as_str())
+        .collect();
+    let mut checked = Vec::new();
+    for result in results {
+        let metadata = &result["metadata"];
+        let provenance = &metadata["retrieval_provenance"];
+        let scope = &provenance["source_scope"];
+        let admitted = result.get("id").and_then(Value::as_str).is_some_and(|id| {
+            result["source_kind"] == "doc"
+                && sources.iter().any(|s| s["kind"] == "doc" && s["id"] == id)
+                && seen.insert(id)
+                && metadata["source_kind"] == "doc"
+                && metadata["source_entity_id"] == id
+                && metadata["doc_id"] == id
+        }) && metadata["linked"] == true
+            && metadata["workspace_name"]
+                .as_str()
+                .is_some_and(|name| !name.trim().is_empty())
+            && scope["workspace_id"]
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some_and(|id| id != workspace)
+            && metadata["workspace_id"] == scope["workspace_id"]
+            && metadata["source_scope"] == *scope
+            && scope.get("project_id").is_some()
+            && provenance["version"] == 2
+            && provenance["evidence_source"] == "primary_authorized_display"
+            && provenance["query_sha256"] == digest
+            && provenance["score_kind"] == "uncalibrated"
+            && provenance["calibration"] == "uncalibrated";
+        if !admitted {
+            return Vec::new();
+        }
+        checked.push(result.clone());
+    }
+    checked
+}
+
 pub(super) fn mark_unavailable(recall: &mut Value) {
     if let Some(object) = recall.as_object_mut() {
+        object.remove("supplemental_linked_results");
         object.insert("supplemental_results".into(), json!([]));
         object.insert("supplemental_source_ids".into(), json!([]));
         object.insert("supplemental_status".into(), json!("unavailable"));
@@ -129,7 +195,11 @@ pub(super) fn mark_unavailable(recall: &mut Value) {
 pub(super) fn display_views(recall: &Value) -> (Vec<Value>, Vec<Value>) {
     let mut decisions = Vec::new();
     let mut docs = Vec::new();
-    if let Some(results) = recall.get("supplemental_results").and_then(Value::as_array) {
+    // This workspace's evidence, then the linked docs, which carry their workspace's label.
+    for results in ["supplemental_results", "supplemental_linked_results"]
+        .into_iter()
+        .filter_map(|field| recall.get(field).and_then(Value::as_array))
+    {
         for result in results {
             let Some(mut display) = result.get("metadata").and_then(Value::as_object).cloned()
             else {
@@ -183,18 +253,30 @@ pub(super) async fn attach(
             let workspace = workspace.ok_or_else(invalid)?;
             let sources = source_ids(decisions, docs)?;
             if sources.is_empty() {
-                return Ok((Vec::new(), sources));
+                return Ok((Vec::new(), Vec::new(), sources));
             }
             // Never cache this response: docs do not carry memory cache revisions.
             let value: Value = client.post("/session/recall/evidence", json!({
             "query":query,"workspace_id":workspace,"project_id":project,"sources":sources
         })).await?;
-            checked_results(value, workspace, project, query, &sources)
-                .map(|results| (results, sources))
+            let linked = value.get("linked_results").cloned();
+            let results = checked_results(value, workspace, project, query, &sources)?;
+            let linked = checked_linked_results(
+                linked.as_ref(),
+                workspace,
+                project,
+                query,
+                &sources,
+                &results,
+            );
+            Ok::<_, Error>((results, linked, sources))
         };
     match tokio::time::timeout(Duration::from_millis(1800), attempt).await {
-        Ok(Ok((results, sources))) => {
+        Ok(Ok((results, linked, sources))) => {
             if let Some(object) = recall.as_object_mut() {
+                if !linked.is_empty() {
+                    object.insert("supplemental_linked_results".into(), json!(linked));
+                }
                 object.insert("supplemental_results".into(), json!(results));
                 object.insert("supplemental_source_ids".into(), json!(sources));
                 object.insert("supplemental_status".into(), json!("available"));
@@ -279,6 +361,97 @@ mod tests {
                 "accepted {path}"
             );
         }
+    }
+
+    fn linked_response(ws: Uuid, home_id: Uuid, linked_ws: Uuid, linked_id: Uuid) -> Value {
+        let mut value = response(ws, home_id, "primary");
+        let scope = json!({"workspace_id":linked_ws,"project_id":null});
+        value["linked_results"] = json!([{
+            "id":linked_id,"source_kind":"doc","result_type":"doc","score":0.0,
+            "metadata":{"doc_id":linked_id,"source_kind":"doc","source_entity_id":linked_id,
+                "title":"graphics runbook","content_preview":"linked body","source_scope":scope,
+                "source_project_id":null,"linked":true,"workspace_id":linked_ws,
+                "workspace_name":"Product",
+                "retrieval_provenance":{"version":2,"evidence_source":"primary_authorized_display",
+                    "score_kind":"uncalibrated","calibration":"uncalibrated","source_scope":scope,
+                    "query_sha256":hex::encode(Sha256::digest(b"graphics")),
+                    "query_term_matches":1,"query_term_count":1,"lexical_query_coverage":1.0}}}]);
+        value["linked_workspaces"] =
+            json!([{"workspace_id":linked_ws,"name":"Product","status":"ok","hits":1}]);
+        value
+    }
+
+    #[test]
+    fn linked_docs_are_evidence_only_as_labeled_reads_of_another_workspace() {
+        // #486: recall dropped a linked workspace's doc that its own discovery had found.
+        let ws = Uuid::new_v4();
+        let (home_id, linked_ws, linked_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let sources = vec![
+            json!({"kind":"doc","id":home_id}),
+            json!({"kind":"doc","id":linked_id}),
+        ];
+        let valid = linked_response(ws, home_id, linked_ws, linked_id);
+        let home = checked_results(valid.clone(), ws, None, "graphics", &sources).unwrap();
+        assert_eq!(home.len(), 1, "this workspace's evidence is unchanged");
+        let check = |value: &Value, project: Option<Uuid>| {
+            checked_linked_results(
+                value.get("linked_results"),
+                ws,
+                project,
+                "graphics",
+                &sources,
+                &home,
+            )
+        };
+        assert_eq!(check(&valid, None).len(), 1);
+        assert!(
+            check(&valid, Some(Uuid::new_v4())).is_empty(),
+            "never for a project"
+        );
+        for (path, replacement) in [
+            ("/linked_results/0/metadata/linked", json!(false)),
+            ("/linked_results/0/metadata/workspace_name", json!(" ")),
+            (
+                "/linked_results/0/metadata/retrieval_provenance/source_scope/workspace_id",
+                json!(ws),
+            ),
+            (
+                "/linked_results/0/metadata/source_scope/workspace_id",
+                json!(Uuid::new_v4()),
+            ),
+            (
+                "/linked_results/0/metadata/workspace_id",
+                json!(Uuid::new_v4()),
+            ),
+            (
+                "/linked_results/0/metadata/retrieval_provenance/query_sha256",
+                json!("0".repeat(64)),
+            ),
+            ("/linked_results/0/metadata/doc_id", json!(Uuid::new_v4())),
+            ("/linked_results/0/id", json!(home_id)),
+            ("/linked_results/0/id", json!(Uuid::new_v4())),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(path).unwrap() = replacement;
+            assert!(check(&invalid, None).is_empty(), "accepted {path}");
+        }
+
+        let mut recall = json!({"results": []});
+        recall["supplemental_results"] = json!(home);
+        recall["supplemental_linked_results"] = json!(check(&valid, None));
+        let (_, docs) = display_views(&recall);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(
+            crate::domains::linked_workspaces::linked_workspace_name(&docs[0]),
+            None
+        );
+        assert_eq!(
+            crate::domains::linked_workspaces::linked_workspace_name(&docs[1]),
+            Some("Product")
+        );
+        mark_unavailable(&mut recall);
+        assert!(recall.get("supplemental_linked_results").is_none());
+        assert!(display_views(&recall).1.is_empty());
     }
 
     #[tokio::test]

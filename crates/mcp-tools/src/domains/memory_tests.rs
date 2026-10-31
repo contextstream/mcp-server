@@ -3101,7 +3101,10 @@ mod paging_footer_tests {
 }
 
 mod linked_doc_label_tests {
-    use super::{build_hybrid_search_results, format_collection, format_hybrid_search_results};
+    use super::{
+        build_hybrid_search_results, format_collection, format_doc_detail,
+        format_hybrid_search_results,
+    };
     use serde_json::json;
 
     #[test]
@@ -3132,6 +3135,12 @@ mod linked_doc_label_tests {
             "{list}"
         );
         assert!(list.contains("**own doc** (id: doc-2) [general]"), "{list}");
+        let detail = format_doc_detail(&linked);
+        assert!(
+            detail.contains("\nFrom: Product (a linked workspace; read only)"),
+            "{detail}"
+        );
+        assert!(!format_doc_detail(&own).contains("From:"));
     }
 }
 

@@ -136,6 +136,20 @@ impl AtlasJobTool {
         let project_id = parse_optional_project_id(input.project_id.as_deref())?;
 
         if let Some(provider) = acceleration_provider {
+            // Submitted under the gateway's service token: only for a scope
+            // the caller can read.
+            if !super::caller_access::caller_can_read(
+                self.session.client(),
+                workspace_id,
+                project_id,
+            )
+            .await?
+            {
+                return Ok(ToolResult::error(super::caller_access::no_access_message(
+                    workspace_id,
+                    project_id,
+                )));
+            }
             let started = std::time::Instant::now();
             let handle = match provider
                 .submit_job(AccelerationJobSpec {
@@ -443,6 +457,35 @@ impl AtlasJobTool {
         ))
     }
 
+    /// A job is read under the gateway's service token by its id alone: it is
+    /// shown, and its records fetched, only when the caller can read the job's
+    /// workspace. A job whose workspace the API does not say is not shown.
+    async fn refuse_unless_caller_reads_job(
+        &self,
+        state: &mcp_types::acceleration_layer::AccelerationJobState,
+    ) -> Result<Option<ToolResult>> {
+        let Some(workspace_id) = state.workspace_id else {
+            return Ok(Some(ToolResult::error(format!(
+                "[ACCELERATION_JOB] job `{}` can't be shown: the API did not say which \
+                 workspace it belongs to, so access to it can't be checked.",
+                state.job_id
+            ))));
+        };
+        if super::caller_access::caller_can_read(
+            self.session.client(),
+            workspace_id,
+            state.project_id,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(ToolResult::error(format!(
+            "[ACCELERATION_JOB] job `{}` not found.",
+            state.job_id
+        ))))
+    }
+
     async fn resolve_workspace_id(&self, raw: Option<&str>) -> Option<Uuid> {
         if let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) {
             if let Ok(parsed) = Uuid::parse_str(s) {
@@ -474,6 +517,9 @@ impl AtlasJobTool {
             }
         };
         let elapsed_ms = started.elapsed().as_millis() as u64;
+        if let Some(refusal) = self.refuse_unless_caller_reads_job(&state).await? {
+            return Ok(refusal);
+        }
         let progress_str = state
             .progress
             .map(|p| format!(" {:.1}%", (p * 100.0).clamp(0.0, 100.0)))
@@ -537,6 +583,9 @@ impl AtlasJobTool {
                 ));
             }
         };
+        if let Some(refusal) = self.refuse_unless_caller_reads_job(&state).await? {
+            return Ok(refusal);
+        }
         if !state.status.is_terminal() {
             let mut text = format!(
                 "[ACCELERATION_JOB] job `{}` not yet complete (status: {}).",
@@ -1149,6 +1198,184 @@ mod tests {
         assert_eq!(s["status"], serde_json::json!("completed"));
         assert_eq!(s["is_terminal"], serde_json::json!(true));
         assert_eq!(s["record_count"], serde_json::json!(2));
+    }
+
+    /// An acceleration job provider whose one job belongs to `job_workspace`.
+    struct FakeJobs {
+        job_workspace: Option<Uuid>,
+        submits: std::sync::atomic::AtomicUsize,
+        pages: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl mcp_types::acceleration_layer::JobProvider for FakeJobs {
+        async fn submit_job(
+            &self,
+            spec: AccelerationJobSpec,
+        ) -> std::result::Result<
+            mcp_types::acceleration_layer::AccelerationJobHandle,
+            mcp_types::acceleration_layer::AccelerationJobError,
+        > {
+            self.submits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(mcp_types::acceleration_layer::AccelerationJobHandle {
+                job_id: Uuid::from_u128(0x4380_00aa).to_string(),
+                kind: spec.kind,
+                submitted_at: chrono::Utc::now(),
+                estimated_total: None,
+            })
+        }
+
+        async fn poll_job(
+            &self,
+            job_id: &str,
+        ) -> std::result::Result<
+            mcp_types::acceleration_layer::AccelerationJobState,
+            mcp_types::acceleration_layer::AccelerationJobError,
+        > {
+            Ok(mcp_types::acceleration_layer::AccelerationJobState {
+                job_id: job_id.to_string(),
+                kind: AccelerationJobKind::MemoryExport,
+                workspace_id: self.job_workspace,
+                project_id: None,
+                status: AccelerationJobStatus::Completed,
+                progress: Some(1.0),
+                record_count: Some(1),
+                submitted_at: chrono::Utc::now(),
+                started_at: Some(chrono::Utc::now()),
+                completed_at: Some(chrono::Utc::now()),
+                error: None,
+            })
+        }
+
+        async fn fetch_result_page(
+            &self,
+            job_id: &str,
+            _cursor: Option<u64>,
+            _limit: usize,
+        ) -> std::result::Result<
+            mcp_types::acceleration_layer::AccelerationJobResultPage,
+            mcp_types::acceleration_layer::AccelerationJobError,
+        > {
+            self.pages.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(mcp_types::acceleration_layer::AccelerationJobResultPage {
+                job_id: job_id.to_string(),
+                seq_start: 0,
+                records: vec![serde_json::json!({"id": "secret-record"})],
+                has_more: false,
+            })
+        }
+    }
+
+    struct FakeJobsLayer {
+        jobs: Arc<FakeJobs>,
+    }
+
+    impl mcp_types::acceleration_layer::McpAccelerationLayer for FakeJobsLayer {
+        fn has_connection(&self) -> bool {
+            true
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+
+        fn jobs(&self) -> Option<Arc<dyn mcp_types::acceleration_layer::JobProvider>> {
+            Some(self.jobs.clone())
+        }
+    }
+
+    fn accelerated_tool(job_workspace: Option<Uuid>) -> (AtlasJobTool, Arc<FakeJobs>) {
+        let jobs = Arc::new(FakeJobs {
+            job_workspace,
+            submits: Default::default(),
+            pages: Default::default(),
+        });
+        let layer: AccelerationLayer = Arc::new(FakeJobsLayer { jobs: jobs.clone() });
+        (
+            AtlasJobTool::with_acceleration(
+                mcp_types::atlas_layer::noop_layer(),
+                layer,
+                fake_session(),
+            ),
+            jobs,
+        )
+    }
+
+    async fn as_caller<F, Fut>(name: &str, call: F) -> Fut::Output
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future,
+    {
+        mcp_client::run_with_caller_cache_identity(name.to_string(), call).await
+    }
+
+    #[tokio::test]
+    async fn submit_refuses_a_workspace_the_caller_cannot_read() {
+        let (tool, jobs) = accelerated_tool(None);
+        let ws = Uuid::from_u128(0x4380_0101);
+        crate::domains::caller_access::remember_for_test("jobs-caller-a", ws, None, false);
+        let result = as_caller("jobs-caller-a", || {
+            tool.execute(serde_json::json!({
+                "action": "submit_export",
+                "collection": "decisions",
+                "workspace_id": ws.to_string(),
+            }))
+        })
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("don't have access to workspace"));
+        assert_eq!(jobs.submits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn another_workspaces_job_is_not_found_and_its_records_are_not_fetched() {
+        let theirs = Uuid::from_u128(0x4380_0102);
+        let (tool, jobs) = accelerated_tool(Some(theirs));
+        crate::domains::caller_access::remember_for_test("jobs-caller-b", theirs, None, false);
+        let job_id = Uuid::from_u128(0x4380_00aa).to_string();
+        for action in ["poll", "result"] {
+            let result = as_caller("jobs-caller-b", || {
+                tool.execute(serde_json::json!({"action": action, "job_id": job_id.clone()}))
+            })
+            .await
+            .unwrap();
+            assert!(result.is_error, "{action}");
+            let text = result_text(&result);
+            assert!(text.contains("not found"), "{action}: {text}");
+            assert!(!text.contains("secret-record"), "{action}: {text}");
+        }
+        assert_eq!(jobs.pages.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_job_whose_workspace_is_unknown_is_not_shown() {
+        let (tool, jobs) = accelerated_tool(None);
+        let job_id = Uuid::from_u128(0x4380_00aa).to_string();
+        let result = as_caller("jobs-caller-c", || {
+            tool.execute(serde_json::json!({"action": "result", "job_id": job_id}))
+        })
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("can't be shown"));
+        assert_eq!(jobs.pages.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_caller_reads_the_records_of_a_job_in_their_workspace() {
+        let mine = Uuid::from_u128(0x4380_0103);
+        let (tool, jobs) = accelerated_tool(Some(mine));
+        crate::domains::caller_access::remember_for_test("jobs-caller-d", mine, None, true);
+        let job_id = Uuid::from_u128(0x4380_00aa).to_string();
+        let result = as_caller("jobs-caller-d", || {
+            tool.execute(serde_json::json!({"action": "result", "job_id": job_id}))
+        })
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        assert_eq!(jobs.pages.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

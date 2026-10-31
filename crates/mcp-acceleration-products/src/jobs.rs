@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use mcp_types::acceleration_layer::{
     AccelerationJobError, AccelerationJobHandle, AccelerationJobKind, AccelerationJobResultPage,
     AccelerationJobSpec, AccelerationJobState, AccelerationJobStatus, JobProvider,
+    CALLER_ACCESS_HEADER,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -104,6 +105,10 @@ struct SubmitJobResponse {
 #[derive(Debug, Deserialize)]
 struct PollJobResponse {
     job_id: uuid::Uuid,
+    #[serde(default)]
+    workspace_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    project_id: Option<uuid::Uuid>,
     kind: String,
     status: String,
     progress: Option<f64>,
@@ -134,6 +139,7 @@ impl JobProvider for ContextStreamJobProvider {
             .post(self.endpoint("jobs/submit"))
             .bearer_auth(&self.job_api_token)
             .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
+            .header(CALLER_ACCESS_HEADER, "checked")
             .json(&SubmitJobBody::from(spec))
             .send()
             .await
@@ -157,6 +163,7 @@ impl JobProvider for ContextStreamJobProvider {
             .post(self.endpoint("jobs/poll"))
             .bearer_auth(&self.job_api_token)
             .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
+            .header(CALLER_ACCESS_HEADER, "checked")
             .json(&PollJobBody { job_id })
             .send()
             .await
@@ -169,6 +176,8 @@ impl JobProvider for ContextStreamJobProvider {
         Ok(AccelerationJobState {
             job_id: data.job_id.to_string(),
             kind: parse_job_kind(&data.kind)?,
+            workspace_id: data.workspace_id,
+            project_id: data.project_id,
             status: AccelerationJobStatus::parse(&data.status).ok_or_else(|| {
                 AccelerationJobError::Decode(format!("unknown job status `{}`", data.status))
             })?,
@@ -192,6 +201,7 @@ impl JobProvider for ContextStreamJobProvider {
             .post(self.endpoint("jobs/result"))
             .bearer_auth(&self.job_api_token)
             .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
+            .header(CALLER_ACCESS_HEADER, "checked")
             .json(&ResultJobBody {
                 job_id,
                 cursor,

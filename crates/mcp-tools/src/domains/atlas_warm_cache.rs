@@ -130,6 +130,7 @@ pub const MAX_LOOKUP_WAIT: Duration = Duration::from_millis(50);
 /// to the legacy Atlas federation warm cache while the migration is
 /// in compatibility mode.
 pub async fn try_lookup_accelerated(
+    client: &mcp_client::ContextStreamClient,
     acceleration_layer: &AccelerationLayer,
     atlas_layer: &AtlasLayer,
     kind: AtlasWarmCacheKind,
@@ -138,6 +139,22 @@ pub async fn try_lookup_accelerated(
 ) -> Option<CachedBundle> {
     if !caller_cache_access_allowed() {
         return None;
+    }
+    // The cache is read under the gateway's service token, which reads any
+    // workspace: it serves only a scope this caller was checked to read. An
+    // unchecked scope misses now and is checked for the next call, so the
+    // primary path is not made slower.
+    match super::caller_access::known_caller_access(scope.workspace_id, scope.project_id) {
+        Some(true) => {}
+        Some(false) => return None,
+        None => {
+            super::caller_access::check_caller_access_in_background(
+                client,
+                scope.workspace_id,
+                scope.project_id,
+            );
+            return None;
+        }
     }
 
     if let Some(bundle) = try_acceleration_lookup(acceleration_layer, kind, &scope).await {
@@ -516,7 +533,12 @@ pub fn put_accelerated_in_background(
         return;
     }
 
-    if let Some(provider) = acceleration_layer.warm_cache() {
+    // Written under the service token too: only for a scope this caller was
+    // checked to read.
+    let caller_checked =
+        super::caller_access::known_caller_access(scope.workspace_id, scope.project_id)
+            == Some(true);
+    if let Some(provider) = acceleration_layer.warm_cache().filter(|_| caller_checked) {
         if let Some((scope_type, scope_id)) = read_model_scope_for_federation(&scope) {
             let put = WarmCachePut {
                 scope: AccelerationReadModelScope {
@@ -966,6 +988,128 @@ pub fn scope_hash_for_dependency_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A warm cache that holds a bundle for every scope and counts lookups.
+    struct EveryScopeCached {
+        lookups: std::sync::atomic::AtomicUsize,
+        puts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl mcp_types::acceleration_layer::WarmCacheProvider for EveryScopeCached {
+        async fn get_read_model(
+            &self,
+            _lookup: WarmCacheLookup,
+        ) -> Result<
+            Option<mcp_types::acceleration_layer::WarmCacheHit>,
+            mcp_types::acceleration_layer::WarmCacheError,
+        > {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(mcp_types::acceleration_layer::WarmCacheHit {
+                payload: serde_json::json!({"events": ["someone else's event"]}),
+                served_from: WarmCacheLayer::Redis,
+                cache_hit: true,
+                stale: false,
+                generation: None,
+                source_generation: None,
+                etag: None,
+                freshness: serde_json::Value::Null,
+            }))
+        }
+
+        async fn put_read_model(
+            &self,
+            _put: WarmCachePut,
+        ) -> Result<(), mcp_types::acceleration_layer::WarmCacheError> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct WarmLayer(std::sync::Arc<EveryScopeCached>);
+
+    impl mcp_types::acceleration_layer::McpAccelerationLayer for WarmLayer {
+        fn has_connection(&self) -> bool {
+            true
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+
+        fn warm_cache(
+            &self,
+        ) -> Option<std::sync::Arc<dyn mcp_types::acceleration_layer::WarmCacheProvider>> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_warm_cache_serves_and_takes_only_scopes_the_caller_was_checked_to_read() {
+        let cache = std::sync::Arc::new(EveryScopeCached {
+            lookups: Default::default(),
+            puts: Default::default(),
+        });
+        let layer: AccelerationLayer = std::sync::Arc::new(WarmLayer(cache.clone()));
+        let atlas = mcp_types::atlas_layer::noop_layer();
+        let client = mcp_client::ContextStreamClient::new(mcp_types::config::Config::default());
+        let theirs = Uuid::from_u128(0x4380_0201);
+        let mine = Uuid::from_u128(0x4380_0202);
+        let scope = |workspace_id| AtlasFederationScope {
+            workspace_id,
+            project_id: None,
+            scope_hash: scope_hash_for_memory_events_hot(workspace_id, None),
+            user_scope: None,
+        };
+        crate::domains::caller_access::remember_for_test("warm-caller", theirs, None, false);
+        crate::domains::caller_access::remember_for_test("warm-caller", mine, None, true);
+
+        mcp_client::run_with_caller_cache_identity("warm-caller".to_string(), || async {
+            // Another workspace: no lookup, no write.
+            let refused = try_lookup_accelerated(
+                &client,
+                &layer,
+                &atlas,
+                AtlasWarmCacheKind::MemoryEventsHot,
+                scope(theirs),
+                130,
+            )
+            .await;
+            assert!(refused.is_none());
+            assert_eq!(cache.lookups.load(std::sync::atomic::Ordering::SeqCst), 0);
+            put_accelerated_in_background(
+                layer.clone(),
+                atlas.clone(),
+                AtlasWarmCacheKind::MemoryEventsHot,
+                scope(theirs),
+                serde_json::json!({"events": []}),
+            );
+
+            // The caller's own workspace is served.
+            let served = try_lookup_accelerated(
+                &client,
+                &layer,
+                &atlas,
+                AtlasWarmCacheKind::MemoryEventsHot,
+                scope(mine),
+                130,
+            )
+            .await;
+            assert!(served.is_some());
+            assert_eq!(cache.lookups.load(std::sync::atomic::Ordering::SeqCst), 1);
+            put_accelerated_in_background(
+                layer.clone(),
+                atlas.clone(),
+                AtlasWarmCacheKind::MemoryEventsHot,
+                scope(mine),
+                serde_json::json!({"events": []}),
+            );
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(cache.puts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn context_hash_includes_workspace_project_intent() {

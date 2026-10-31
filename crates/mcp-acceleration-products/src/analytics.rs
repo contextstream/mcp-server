@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use mcp_types::acceleration_layer::{
     AccelerationAnalyticsChart, AccelerationAnalyticsError, AccelerationAnalyticsRender,
     AccelerationAnalyticsRenderRequest, AccelerationAnalyticsSeries, AnalyticsProvider,
+    CALLER_ACCESS_HEADER,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -109,6 +110,7 @@ impl AnalyticsProvider for ContextStreamAnalyticsProvider {
             .get(self.endpoint("analytics/charts"))
             .bearer_auth(&self.job_api_token)
             .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
+            .header(CALLER_ACCESS_HEADER, "checked")
             .send()
             .await
             .map_err(|error| AccelerationAnalyticsError::Request(error.to_string()))?;
@@ -129,6 +131,7 @@ impl AnalyticsProvider for ContextStreamAnalyticsProvider {
             .post(self.endpoint("analytics/render"))
             .bearer_auth(&self.job_api_token)
             .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
+            .header(CALLER_ACCESS_HEADER, "checked")
             .json(&AnalyticsRenderBody::from(request))
             .send()
             .await

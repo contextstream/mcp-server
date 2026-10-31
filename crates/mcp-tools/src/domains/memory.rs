@@ -4916,6 +4916,7 @@ impl MemoryTool {
                         user_scope: None,
                     };
                     super::atlas_warm_cache::try_lookup_accelerated(
+                        &self.client,
                         &self.acceleration_layer,
                         &self.atlas_layer,
                         mcp_types::atlas_layer::AtlasWarmCacheKind::MemoryEventsHot,
@@ -6509,6 +6510,19 @@ impl MemoryTool {
                     use mcp_types::acceleration_layer::{
                         AccelerationArchiveCollection, AccelerationArchiveScope,
                     };
+                    // Searched under the gateway's service token: only a
+                    // scope the caller can read.
+                    if !super::caller_access::caller_can_read(
+                        &self.client,
+                        workspace_id,
+                        project_id,
+                    )
+                    .await?
+                    {
+                        return Ok(ToolResult::error(
+                            super::caller_access::no_access_message(workspace_id, project_id),
+                        ));
+                    }
                     let mut scope = AccelerationArchiveScope::new(workspace_id);
                     scope.project_id = project_id;
                     if let Some(scope_str) = input.scope.as_deref() {

@@ -1517,6 +1517,146 @@ async fn build_graph_agent_workflow(
     })
 }
 
+/// Most findings a quality analysis names in its text; the rest are paged.
+const LISTED_FINDINGS_MAX: usize = 25;
+
+/// The findings of a quality analysis, one per line, so a client that reads
+/// only the text sees what the count counts (#480). Says where the page
+/// starts and how to get the next one when the answer holds fewer than the
+/// total.
+fn listed_findings(
+    result: &Value,
+    keys: &[&str],
+    total: usize,
+    requested_offset: Option<i64>,
+    line: fn(&Value) -> Option<String>,
+) -> String {
+    let Some(items) = keys
+        .iter()
+        .find_map(|key| result.get(*key).and_then(Value::as_array))
+    else {
+        return String::new();
+    };
+    let lines: Vec<String> = items
+        .iter()
+        .filter_map(line)
+        .take(LISTED_FINDINGS_MAX)
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let offset = result
+        .get("offset")
+        .and_then(Value::as_u64)
+        .map(|offset| offset as usize)
+        .or_else(|| requested_offset.map(|offset| offset.max(0) as usize))
+        .unwrap_or(0);
+    let mut text = String::new();
+    for line in &lines {
+        text.push_str("\n- ");
+        text.push_str(line);
+    }
+    let end = offset + lines.len();
+    if offset > 0 || end < total {
+        text.push_str(&format!(
+            "\nShowing {}\u{2013}{end} of {total}.",
+            offset + 1
+        ));
+        if end < total {
+            text.push_str(&format!(" Pass offset={end} for more."));
+        }
+    }
+    text
+}
+
+/// `a.py -> b.py -> a.py (Module, Medium)`.
+fn cycle_line(cycle: &Value) -> Option<String> {
+    let members: Vec<&str> = cycle
+        .get("cycle")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if members.is_empty() {
+        return None;
+    }
+    let mut line = members.join(" -> ");
+    let details: Vec<&str> = ["cycle_type", "severity"]
+        .iter()
+        .filter_map(|key| cycle.get(*key).and_then(Value::as_str))
+        .collect();
+    if !details.is_empty() {
+        line.push_str(&format!(" ({})", details.join(", ")));
+    }
+    Some(line)
+}
+
+/// `Function `_unused_helper` in util.py`.
+fn unused_element_line(element: &Value) -> Option<String> {
+    let name = element.get("name").and_then(Value::as_str)?;
+    let kind = element
+        .get("element_type")
+        .and_then(Value::as_str)
+        .unwrap_or("Element");
+    match element.get("file_path").and_then(Value::as_str) {
+        Some(path) if !path.is_empty() && path != name => {
+            Some(format!("{kind} `{name}` in {path}"))
+        }
+        _ => Some(format!("{kind} `{name}`")),
+    }
+}
+
+/// The complex and the long functions by name, as the summary counts them.
+fn complexity_findings(result: &Value) -> String {
+    let mut text = String::new();
+    let rows = |key: &str| {
+        result
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|rows| rows.iter().take(LISTED_FINDINGS_MAX).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let place = |row: &Value| {
+        let path = row.get("file_path").and_then(Value::as_str).unwrap_or("");
+        match row.pointer("/line_range/0").and_then(Value::as_u64) {
+            Some(line) if !path.is_empty() => format!(" in {path}:{line}"),
+            _ if !path.is_empty() => format!(" in {path}"),
+            _ => String::new(),
+        }
+    };
+    let complex = rows("high_complexity_functions");
+    if !complex.is_empty() {
+        text.push_str("\nComplex functions:");
+        for row in complex {
+            let Some(name) = row.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let score = row
+                .get("complexity")
+                .and_then(Value::as_u64)
+                .map(|score| format!(", complexity {score}"))
+                .unwrap_or_default();
+            text.push_str(&format!("\n- `{name}`{}{score}", place(row)));
+        }
+    }
+    let long = rows("long_functions");
+    if !long.is_empty() {
+        text.push_str("\nLong functions:");
+        for row in long {
+            let Some(name) = row.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let lines = row
+                .get("line_count")
+                .and_then(Value::as_u64)
+                .map(|lines| format!(", {lines} lines"))
+                .unwrap_or_default();
+            text.push_str(&format!("\n- `{name}`{}{lines}", place(row)));
+        }
+    }
+    text
+}
+
 fn graph_agent_workflow_summary(workflow: &Value) -> String {
     let tracking_visibility = workflow
         .pointer("/account_scope/tracking_visibility")
@@ -2265,7 +2405,11 @@ impl GraphTool {
                 let recommendations = circular_dependency_recommendations(total_cycles);
                 attach_recommendations(&mut result, &recommendations);
                 let body = if total_cycles > 0 {
-                    format!("Found {} circular dependency cycles.", total_cycles)
+                    format!(
+                        "Found {} circular dependency cycles.{}",
+                        total_cycles,
+                        listed_findings(&result, &["cycles"], total_cycles, input.offset, cycle_line)
+                    )
                 } else {
                     "No circular dependencies found.".to_string()
                 };
@@ -2403,7 +2547,17 @@ impl GraphTool {
                 let recommendations = unused_code_recommendations(total_unused);
                 attach_recommendations(&mut result, &recommendations);
                 let body = if total_unused > 0 {
-                    format!("Found {} potentially unused code elements.", total_unused)
+                    format!(
+                        "Found {} potentially unused code elements.{}",
+                        total_unused,
+                        listed_findings(
+                            &result,
+                            &["unused_elements", "unused"],
+                            total_unused,
+                            input.offset,
+                            unused_element_line,
+                        )
+                    )
                 } else {
                     "No unused code detected.".to_string()
                 };
@@ -2465,6 +2619,7 @@ impl GraphTool {
                         complex, long
                     )
                 };
+                text.push_str(&complexity_findings(&result));
                 push_recommendations(&mut text, &recommendations);
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note.as_deref() {
@@ -3246,6 +3401,55 @@ pub fn register_graph_tools(
 #[cfg(test)]
 #[path = "graph_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod graph_findings_text_tests {
+    use super::*;
+
+    #[test]
+    fn the_cycles_and_unused_elements_are_named_in_the_text() {
+        // #480: "Found 1 circular dependency cycles." named no module.
+        let cycles = serde_json::json!({
+            "cycles": [{"cycle": ["a.py", "b.py", "a.py"], "cycle_type": "Module", "severity": "Medium"}],
+            "total_count": 1,
+        });
+        assert_eq!(
+            listed_findings(&cycles, &["cycles"], 1, None, cycle_line),
+            "\n- a.py -> b.py -> a.py (Module, Medium)"
+        );
+        let unused = serde_json::json!({
+            "unused_elements": [
+                {"element_type": "Function", "name": "_unused_helper", "file_path": "util.py", "confidence": 0.9},
+                {"element_type": "Module", "name": "c.py", "file_path": "c.py", "confidence": 0.7},
+            ],
+            "total_count": 5,
+            "returned_count": 2,
+            "truncated": true,
+        });
+        assert_eq!(
+            listed_findings(&unused, &["unused_elements"], 5, Some(2), unused_element_line),
+            "\n- Function `_unused_helper` in util.py\n- Module `c.py`\nShowing 3\u{2013}4 of 5. Pass offset=4 for more."
+        );
+        assert_eq!(
+            listed_findings(&serde_json::json!({}), &["cycles"], 3, None, cycle_line),
+            ""
+        );
+    }
+
+    #[test]
+    fn the_complex_and_long_functions_are_named() {
+        let result = serde_json::json!({
+            "summary": {"complex_function_count": 1, "long_function_count": 1},
+            "high_complexity_functions": [{"name": "used_c", "file_path": "c.py", "complexity": 12, "line_range": [3, 40]}],
+            "long_functions": [{"name": "run", "file_path": "d.py", "line_count": 120, "line_range": [1, 120]}],
+        });
+        assert_eq!(
+            complexity_findings(&result),
+            "\nComplex functions:\n- `used_c` in c.py:3, complexity 12\nLong functions:\n- `run` in d.py:1, 120 lines"
+        );
+        assert_eq!(complexity_findings(&serde_json::json!({"summary": {}})), "");
+    }
+}
 
 #[cfg(test)]
 mod graph_not_built_tests {

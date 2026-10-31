@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.50
+
+- Search: a search that names a workspace searches that workspace. The session's own project, or the project its folder maps to, no longer narrows a search of another workspace, so passing a linked workspace's `workspace_id`, as the [LINKED_WORKSPACES] footer suggests, searches that workspace (#487).
+- Shared knowledge: a link change is honoured on the next call. Memory search and recall no longer replay an answer read under the old link, and an answer read through a link to another workspace is never cached, so a link removed anywhere (another process, the hosted gateway, the web app) stops showing that workspace's knowledge at once (#487).
+
 ## 1.0.49
 
 - ContextStudio (`studio`): recorded explainers. An explainer of a CLI, an MCP server, a coding agent or a terminal workflow is recorded from real sessions on a fresh machine started for the making, never drawn.

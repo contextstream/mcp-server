@@ -8206,6 +8206,97 @@ mod scope_widening_tests {
         assert_eq!(structured["total"], 3);
     }
 
+    /// #364: the server's pattern lane can't run a regex with `\b` (or `\s`,
+    /// `\d`, `.*`, `|`) and marks the rows it returned without checking them
+    /// (`literal_verified: false`). Those are related rows, not results: the
+    /// header says so and counts checked matches apart, each such row is
+    /// marked, and none is more than low confidence. A page the server checked
+    /// keeps the plain header.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rows_the_server_did_not_check_against_the_regex_are_not_results() {
+        let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+        let server = RoutedServer::spawn(Box::new(move |line, body| {
+            if line.contains("/search/") {
+                let unchecked = |id: &str, path: &str, score: f64| json!({"id":id, "file_path":path, "start_line":1, "content":"zebrafin_9", "score":score, "metadata":{"literal_verified":false}});
+                let checked = json!({"id":"a", "file_path":"src/f12.ts", "start_line":1, "content":"zebrafin_12", "score":0.5, "metadata":{"literal_verified":true, "match_type":"content"}});
+                let rows = if body.contains("zebrafin_1") {
+                    vec![
+                        checked,
+                        unchecked("b", "src/f9.ts", 0.49),
+                        unchecked("c", "src/f24.ts", 0.43),
+                    ]
+                } else if body.contains("zebrafin_2") {
+                    vec![
+                        unchecked("b", "src/f9.ts", 0.49),
+                        unchecked("c", "src/f24.ts", 0.43),
+                    ]
+                } else {
+                    vec![
+                        json!({"id":"d", "file_path":"src/f15.ts", "start_line":1, "content":"zebrafin_15", "score":0.9}),
+                    ]
+                };
+                let total = rows.len();
+                return (
+                    200,
+                    json!({"results": rows, "total": total, "project_index_state":"ready"})
+                        .to_string(),
+                );
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, workspace));
+            }
+            (404, json!({"error":"not found"}).to_string())
+        }));
+        let (tool, session) = gateway_tool(&server.base_url);
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+
+        let mixed = tool
+            .execute(json!({"query":"zebrafin_1[0-9]\\b","mode":"pattern"}))
+            .await
+            .unwrap();
+        let text = text_of(&mixed);
+        assert!(
+            text.contains("1 checked match and 2 related rows for"),
+            "{text}"
+        );
+        assert!(
+            text.contains("did not check the related rows (marked)"),
+            "{text}"
+        );
+        assert!(!text.contains("3 results"), "{text}");
+        assert_eq!(text.matches(REGEX_UNCHECKED_ROW_LABEL).count(), 2, "{text}");
+        let checked_line = text.lines().find(|l| l.contains("src/f12.ts")).unwrap();
+        assert!(!checked_line.contains(REGEX_UNCHECKED_ROW_LABEL), "{text}");
+
+        let unchecked_only = tool
+            .execute(json!({"query":"zebrafin_2\\d\\b","mode":"pattern"}))
+            .await
+            .unwrap();
+        let text = text_of(&unchecked_only);
+        assert!(text.contains("No checked matches for"), "{text}");
+        assert!(text.contains("2 related rows below"), "{text}");
+        assert!(!text.contains("2 results"), "{text}");
+        let structured = unchecked_only.structured_content.as_ref().unwrap();
+        assert_eq!(
+            structured["why_this_result"]["confidence_band"], "low",
+            "{structured}"
+        );
+        assert_eq!(
+            structured["search_explainability"]["top_result_confidence_band"], "low",
+            "{structured}"
+        );
+
+        let plain = tool
+            .execute(json!({"query":"zebrafin_3[5]","mode":"pattern"}))
+            .await
+            .unwrap();
+        let text = text_of(&plain);
+        assert!(text.contains("1 results for"), "{text}");
+        assert!(!text.contains(REGEX_UNCHECKED_ROW_LABEL), "{text}");
+    }
+
     /// #222: a literal that lives only in a minified bundle or `dist/` file is
     /// found by the exact modes, and no mode lets "[LITERAL] found" be followed
     /// by an empty result.

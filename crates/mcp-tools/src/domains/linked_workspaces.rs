@@ -1,5 +1,4 @@
-//! Shared knowledge: knowledge from the workspaces linked to the one an agent works in
-//! (contextstream plan 483f30df).
+//! Shared knowledge: knowledge from the workspaces linked to the one an agent works in.
 //!
 //! When workspaces are linked, the API also searches the linked workspaces the person can open.
 //! It labels each linked hit with its workspace (`workspace_name`, `workspace_id` and
@@ -17,7 +16,9 @@ fn field<'a>(item: &'a Value, key: &str) -> Option<&'a Value> {
 
 /// Whether the API marked `item` as read from a linked workspace.
 pub(crate) fn is_linked(item: &Value) -> bool {
-    field(item, "linked").and_then(Value::as_bool).unwrap_or(false)
+    field(item, "linked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// The linked workspace `item` came from, by name, when it came from one.
@@ -51,7 +52,11 @@ pub(crate) fn label_with_workspace(label: &str, item: &Value) -> String {
 pub(crate) fn linked_workspaces(response: &Value) -> Vec<Value> {
     response
         .get("linked_workspaces")
-        .or_else(|| response.get("data").and_then(|data| data.get("linked_workspaces")))
+        .or_else(|| {
+            response
+                .get("data")
+                .and_then(|data| data.get("linked_workspaces"))
+        })
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
@@ -115,7 +120,8 @@ pub(crate) fn append_linked_code(
     linked_results: &[mcp_types::api::SearchResult],
     linked_workspaces: &[Value],
 ) {
-    let Some(footer) = linked_footer(&serde_json::json!({ "linked_workspaces": linked_workspaces }))
+    let Some(footer) =
+        linked_footer(&serde_json::json!({ "linked_workspaces": linked_workspaces }))
     else {
         return;
     };
@@ -188,8 +194,15 @@ mod tests {
         assert_eq!(linked_workspace_name(&top), Some("Product"));
         assert_eq!(linked_workspace_id(&top), Some("w-1"));
         assert_eq!(linked_workspace_name(&nested), Some("Design"));
-        assert_eq!(linked_workspace_name(&home), None, "only linked hits are labeled");
-        assert_eq!(label_with_workspace("decision", &top), "decision · from Product");
+        assert_eq!(
+            linked_workspace_name(&home),
+            None,
+            "only linked hits are labeled"
+        );
+        assert_eq!(
+            label_with_workspace("decision", &top),
+            "decision · from Product"
+        );
         assert_eq!(label_with_workspace("decision", &home), "decision");
     }
 
@@ -201,7 +214,8 @@ mod tests {
         ]}});
         let footer = linked_footer(&response).expect("footer");
         assert!(footer.starts_with("[LINKED_WORKSPACES] Also searched the workspaces linked to this one: Product (2 shown), Design (no code; not read in time)."));
-        assert!(footer.ends_with("To search one fully, pass its workspace_id (Product=w-1, Design=w-2)."));
+        assert!(footer
+            .ends_with("To search one fully, pass its workspace_id (Product=w-1, Design=w-2)."));
         assert!(linked_footer(&json!({"results": []})).is_none());
         assert!(linked_footer(&json!({"linked_workspaces": []})).is_none());
     }
@@ -230,7 +244,8 @@ mod tests {
         assert!(text.contains(
             "\n[LINKED_WORKSPACES] Also searched the workspaces linked to this one: Product (1 shown)."
         ));
-        assert!(text.ends_with("  src/upload.rs:42  pub fn handle_upload(  · from Product, project api\n"));
+        assert!(text
+            .ends_with("  src/upload.rs:42  pub fn handle_upload(  · from Product, project api\n"));
         assert_eq!(structured["linked_results"][0]["workspace_id"], "w-1");
         assert_eq!(structured["linked_results"][0]["project_name"], "api");
         assert_eq!(structured["linked_workspaces"][0]["name"], "Product");

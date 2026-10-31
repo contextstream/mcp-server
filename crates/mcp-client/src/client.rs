@@ -5884,7 +5884,7 @@ impl ContextStreamClient {
     }
 
     // =========================================================================
-    // Shared knowledge (contextstream plan 483f30df)
+    // Shared knowledge between workspaces
     // =========================================================================
 
     /// The workspace to act on: the one given, else the session's.

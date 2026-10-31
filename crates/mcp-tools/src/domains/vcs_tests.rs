@@ -309,3 +309,111 @@ fn list_answers_show_each_item_not_only_the_count() {
     );
     assert!(text.ends_with("… and 5 more."), "{text}");
 }
+
+/// A stub API for a workspace whose GitHub is not connected: the synced pull
+/// and issue lists answer an empty page, every repository read the API's 404.
+async fn unconnected_github_api() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = lines.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap_or(0);
+                    if count == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                seen.lock().unwrap().push(line.clone());
+                let path = line.split(' ').nth(1).unwrap_or_default();
+                let path = path.split('?').next().unwrap_or_default();
+                let (status, payload) = if path.ends_with("/pulls") || path.ends_with("/issues") {
+                    ("200 OK", json!({"items": [], "total": 0}).to_string())
+                } else {
+                    (
+                        "404 Not Found",
+                        json!({"error": "Not found: Integration github not found"}).to_string(),
+                    )
+                };
+                let _ = socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+        }
+    });
+    (base_url, lines)
+}
+
+fn result_text(result: &ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match item {
+            mcp_types::tool::ContentItem::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn reads_for_a_provider_that_is_not_connected_say_so() {
+    // #471: seven reads answered "HTTP error (404): Not found: Integration
+    // github not found", and list_pulls / list_issues "Found 0".
+    let (base_url, lines) = unconnected_github_api().await;
+    let mut config = TestFixtures::test_config();
+    config.api_url = base_url;
+    let tool = VcsTool::new(ContextStreamClient::new(config));
+    let workspace = Uuid::new_v4();
+    for action in [
+        "get_repo",
+        "list_commits",
+        "list_branches",
+        "list_pulls",
+        "list_issues",
+    ] {
+        let result = tool
+            .execute(
+                json!({"action": action, "provider": "github", "repo": "octo/widgets",
+                            "workspace_id": workspace}),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{action}: {error}"));
+        let text = result_text(&result);
+        assert!(result.is_error, "{action}: {text}");
+        assert!(
+            text.starts_with("GitHub is not connected for this workspace."),
+            "{action}: {text}"
+        );
+    }
+    // `repo="owner/name"` lists that repository, not the whole workspace.
+    let lines = lines.lock().unwrap().clone();
+    let pulls =
+        format!("GET /api/v1/integrations/workspaces/{workspace}/vcs/repos/octo%2Fwidgets/pulls");
+    assert!(
+        lines.iter().any(|line| line.starts_with(&pulls)),
+        "{lines:?}"
+    );
+}

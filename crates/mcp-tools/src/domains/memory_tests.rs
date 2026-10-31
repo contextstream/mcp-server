@@ -3100,6 +3100,41 @@ mod paging_footer_tests {
     }
 }
 
+mod linked_doc_label_tests {
+    use super::{build_hybrid_search_results, format_collection, format_hybrid_search_results};
+    use serde_json::json;
+
+    #[test]
+    fn a_doc_of_a_linked_workspace_names_it_in_search_and_in_lists() {
+        // #486: a linked workspace's doc came back without the "from <workspace>" its decisions
+        // carry.
+        let linked = json!({"id": "doc-1", "title": "linked doc title", "doc_type": "general",
+                            "content": "The body says doctoken.", "linked": true,
+                            "workspace_name": "Product",
+                            "workspace_id": "11111111-1111-4111-8111-111111111111"});
+        let own = json!({"id": "doc-2", "title": "own doc", "doc_type": "general",
+                         "content": "The body says doctoken too."});
+        let results = build_hybrid_search_results(&[], &[linked.clone(), own.clone()], 10);
+        let linked_row = results.iter().find(|row| row["id"] == "doc-1").unwrap();
+        assert_eq!(
+            linked_row["workspace_id"],
+            "11111111-1111-4111-8111-111111111111"
+        );
+        let text = format_hybrid_search_results("doctoken", &results);
+        assert!(
+            text.contains("[doc/general · from Product] **linked doc title**"),
+            "{text}"
+        );
+        assert!(text.contains("[doc/general] **own doc**"), "{text}");
+        let list = format_collection("docs", &json!({"items": [linked, own]}));
+        assert!(
+            list.contains("**linked doc title** (id: doc-1) [general · from Product]"),
+            "{list}"
+        );
+        assert!(list.contains("**own doc** (id: doc-2) [general]"), "{list}");
+    }
+}
+
 mod superseded_marker_tests {
     use super::format_collection;
     use serde_json::json;

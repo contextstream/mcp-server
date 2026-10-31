@@ -66,7 +66,10 @@ fn normalize_input_shape(tool: &str, schema: &Value, input: &mut Value) -> Vec<S
 /// A negative `limit` (or other count) is refused before any request is sent.
 fn refuse_negative_counts(tool: &str, input: &Value) -> Result<()> {
     match crate::input_shape::negative_count_argument(input) {
-        Some(message) => Err(Error::Validation(format!("{tool}: {message}"))),
+        Some(message) => Err(Error::refused(
+            mcp_types::ValidationReason::OutOfRange,
+            format!("{tool}: {message}"),
+        )),
         None => Ok(()),
     }
 }
@@ -397,6 +400,45 @@ fn entity_write_action_label(input: &Value) -> Option<&'static str> {
     })
 }
 
+/// Bounded `<action>:<kind>` label for entity reads. Every entity `list` and
+/// `get` was labelled `other` (#490).
+fn entity_read_action_label(input: &Value) -> Option<&'static str> {
+    let kind = input
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    Some(match (input_action(input)?, kind) {
+        ("list", "ticket") => "list:ticket",
+        ("list", "handoff") => "list:handoff",
+        ("list", "backlog_view") => "list:backlog_view",
+        ("list", "incident") => "list:incident",
+        ("list", "release") => "list:release",
+        ("list", "experiment") => "list:experiment",
+        ("list", "goal") => "list:goal",
+        ("list", "key_result") => "list:key_result",
+        ("list", "sprint") => "list:sprint",
+        ("list", "review") => "list:review",
+        ("list", "risk") => "list:risk",
+        ("list", "coordination") => "list:coordination",
+        ("list", _) => "list:other",
+        ("get", "ticket") => "get:ticket",
+        ("get", "handoff") => "get:handoff",
+        ("get", "backlog_view") => "get:backlog_view",
+        ("get", "incident") => "get:incident",
+        ("get", "release") => "get:release",
+        ("get", "experiment") => "get:experiment",
+        ("get", "goal") => "get:goal",
+        ("get", "key_result") => "get:key_result",
+        ("get", "sprint") => "get:sprint",
+        ("get", "review") => "get:review",
+        ("get", "risk") => "get:risk",
+        ("get", "coordination") => "get:coordination",
+        ("get", _) => "get:other",
+        _ => return None,
+    })
+}
+
 /// `(tool, action)` metric labels for the agent-facing writes, all from
 /// fixed allowlists. These feed the latency histogram only; the acceleration
 /// signal stream stays limited to hot reads.
@@ -478,6 +520,11 @@ pub fn tool_call_action_label(name: &str, input: &Value) -> &'static str {
         .map_or(name, |twin| twin.tool);
     acceleration_observation_action(name, input)
         .or_else(|| write_observation_labels(name, input).map(|(_, action)| action))
+        .or_else(|| {
+            (name == "entity")
+                .then(|| entity_read_action_label(input))
+                .flatten()
+        })
         .unwrap_or("other")
 }
 
@@ -1669,6 +1716,32 @@ mod acceleration_observation_tests {
         fn signals(&self) -> Option<Arc<dyn SignalProvider>> {
             Some(self.provider.clone())
         }
+    }
+
+    #[test]
+    fn entity_reads_are_labelled_by_action_and_kind() {
+        // #490: every entity list and get was labelled `other`.
+        let label = |input: serde_json::Value| tool_call_action_label("entity", &input);
+        assert_eq!(
+            label(serde_json::json!({"action": "list", "kind": "ticket"})),
+            "list:ticket"
+        );
+        assert_eq!(
+            label(serde_json::json!({"action": " get ", "kind": " handoff"})),
+            "get:handoff"
+        );
+        assert_eq!(
+            label(serde_json::json!({"action": "get", "kind": "made-up"})),
+            "get:other"
+        );
+        assert_eq!(
+            label(serde_json::json!({"action": "create", "kind": "ticket"})),
+            "create:ticket"
+        );
+        assert_eq!(
+            label(serde_json::json!({"action": "search", "kind": "ticket"})),
+            "other"
+        );
     }
 
     #[test]

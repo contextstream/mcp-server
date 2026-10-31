@@ -38,7 +38,7 @@
 //! resolves.
 
 use mcp_types::tool::ToolResult;
-use mcp_types::{Error, Result};
+use mcp_types::{Error, Result, ValidationReason};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -709,7 +709,10 @@ pub(crate) fn resolve_reference(
             reason,
             &candidates,
         ))),
-        Outcome::Found { .. } | Outcome::NoMatch => Err(Error::Validation(not_found())),
+        Outcome::Found { .. } | Outcome::NoMatch => Err(Error::refused(
+            ValidationReason::ReferenceNotFound,
+            not_found(),
+        )),
     }
 }
 

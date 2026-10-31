@@ -209,12 +209,15 @@ pub fn normalize_linked_items_with_allowed_kinds(
         let kind = canonical_linked_item_kind(kind_raw)
             .filter(|k| allowed_kinds.contains(k))
             .ok_or_else(|| {
-                Error::Validation(format!(
-                    "linked_items[{}].kind '{}' is invalid; use one of: {}",
-                    idx,
-                    kind_raw,
-                    allowed_kinds.join(", ")
-                ))
+                Error::refused(
+                    mcp_types::ValidationReason::InvalidValue,
+                    format!(
+                        "linked_items[{}].kind '{}' is invalid; use one of: {}",
+                        idx,
+                        kind_raw,
+                        allowed_kinds.join(", ")
+                    ),
+                )
             })?;
 
         let id = obj

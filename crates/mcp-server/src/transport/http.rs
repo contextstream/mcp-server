@@ -1323,82 +1323,91 @@ async fn serve_mcp_streamable(
         } else {
             None
         };
-    let (result, api_calls) = mcp_client::run_counting_api_calls(async {
-        match request.method.as_str() {
-            "server/discover" if surface_profile == ToolSurfaceProfile::Coach => {
-                Ok(crate::server::build_coach_stateless_discover_result())
-            }
-            "server/discover" => Ok(build_contextstream_stateless_discover_result()),
-            // The coach surface serves its ChatGPT component as a resource.
-            "resources/list" if surface_profile == ToolSurfaceProfile::Coach => {
-                Ok(crate::server::coach_resources_list())
-            }
-            "resources/templates/list" if surface_profile == ToolSurfaceProfile::Coach => {
-                Ok(crate::server::coach_resource_templates_list())
-            }
-            "resources/read" if surface_profile == ToolSurfaceProfile::Coach => {
-                crate::server::coach_resource_read(&request.params).map_err(|(code, message)| {
-                    JsonRpcError {
-                        code,
-                        message,
-                        data: None,
+    // The class of the error a tool call was answered with, set where the error
+    // becomes the answer (`tool_call_error_response`), for telemetry (#490).
+    let ((result, api_calls), call_error_class) = TOOL_CALL_ERROR_CLASS
+        .scope(std::cell::RefCell::new(None), async {
+            let answered =
+            mcp_client::run_counting_api_calls(async {
+                    match request.method.as_str() {
+                        "server/discover" if surface_profile == ToolSurfaceProfile::Coach => {
+                            Ok(crate::server::build_coach_stateless_discover_result())
+                        }
+                        "server/discover" => Ok(build_contextstream_stateless_discover_result()),
+                        // The coach surface serves its ChatGPT component as a resource.
+                        "resources/list" if surface_profile == ToolSurfaceProfile::Coach => {
+                            Ok(crate::server::coach_resources_list())
+                        }
+                        "resources/templates/list" if surface_profile == ToolSurfaceProfile::Coach => {
+                            Ok(crate::server::coach_resource_templates_list())
+                        }
+                        "resources/read" if surface_profile == ToolSurfaceProfile::Coach => {
+                            crate::server::coach_resource_read(&request.params).map_err(|(code, message)| {
+                                JsonRpcError {
+                                    code,
+                                    message,
+                                    data: None,
+                                }
+                            })
+                        }
+                        "initialize" if stateless_request => Err(JsonRpcError {
+                            code: -32601,
+                            message: format!(
+                                "Method not found: initialize is not part of MCP {MCP_PROTOCOL_2026_07_28}"
+                            ),
+                            data: None,
+                        }),
+                        "initialize" => {
+                            state
+                                .telemetry
+                                .update_managed_initialize_hints_for_session(
+                                    &request.params,
+                                    response_session_id.as_deref(),
+                                    managed_runtime_identity,
+                                )
+                                .await;
+                            let result = handle_initialize_method(&state, &request.params).await;
+                            if let (Ok(_), Some(session_id)) = (result.as_ref(), response_session_id.as_deref())
+                            {
+                                remember_session_client(session_id, &request.params);
+                            }
+                            if result.is_ok() {
+                                state
+                                    .telemetry
+                                    .emit_managed_connected_readiness(
+                                        response_session_id.as_deref(),
+                                        workspace_id_for_stream,
+                                        project_id_for_stream,
+                                    )
+                                    .await;
+                            }
+                            result
+                        }
+                        "tools/list" => handle_list_tools_method(&state, request_registry.clone()).await,
+                        "tools/call" => {
+                            handle_call_tool_method(
+                                &state,
+                                request.params,
+                                request.id.clone(),
+                                wire_observation.clone(),
+                                stateless_request,
+                                request_registry,
+                            )
+                            .await
+                        }
+                        "ping" if !stateless_request => Ok(serde_json::json!({})),
+                        _ => Err(JsonRpcError {
+                            code: -32601,
+                            message: format!("Method not found: {}", request.method),
+                            data: None,
+                        }),
                     }
                 })
-            }
-            "initialize" if stateless_request => Err(JsonRpcError {
-                code: -32601,
-                message: format!(
-                    "Method not found: initialize is not part of MCP {MCP_PROTOCOL_2026_07_28}"
-                ),
-                data: None,
-            }),
-            "initialize" => {
-                state
-                    .telemetry
-                    .update_managed_initialize_hints_for_session(
-                        &request.params,
-                        response_session_id.as_deref(),
-                        managed_runtime_identity,
-                    )
-                    .await;
-                let result = handle_initialize_method(&state, &request.params).await;
-                if let (Ok(_), Some(session_id)) = (result.as_ref(), response_session_id.as_deref())
-                {
-                    remember_session_client(session_id, &request.params);
-                }
-                if result.is_ok() {
-                    state
-                        .telemetry
-                        .emit_managed_connected_readiness(
-                            response_session_id.as_deref(),
-                            workspace_id_for_stream,
-                            project_id_for_stream,
-                        )
-                        .await;
-                }
-                result
-            }
-            "tools/list" => handle_list_tools_method(&state, request_registry.clone()).await,
-            "tools/call" => {
-                handle_call_tool_method(
-                    &state,
-                    request.params,
-                    request.id.clone(),
-                    wire_observation.clone(),
-                    stateless_request,
-                    request_registry,
-                )
-                .await
-            }
-            "ping" if !stateless_request => Ok(serde_json::json!({})),
-            _ => Err(JsonRpcError {
-                code: -32601,
-                message: format!("Method not found: {}", request.method),
-                data: None,
-            }),
-        }
-    })
-    .await;
+                .await;
+            let class = TOOL_CALL_ERROR_CLASS.with(|slot| slot.borrow_mut().take());
+            (answered, class)
+        })
+        .await;
 
     if stateless_handshake && result.is_ok() {
         state
@@ -1406,8 +1415,13 @@ async fn serve_mcp_streamable(
             .emit_managed_connected_readiness(None, workspace_id_for_stream, project_id_for_stream)
             .await;
     }
-    if let (Some(name), Err(error)) = (tool_name.as_deref(), result.as_ref()) {
-        log_failed_tool_call(&headers, name, error);
+    // A tool call failed when it was answered with a JSON-RPC error or with an
+    // `isError` result; an `isError` answer counted as ok before (#490).
+    let call_failure = tool_name
+        .as_ref()
+        .and_then(|_| tool_call_failure(&result, call_error_class.as_deref()));
+    if let (Some(name), Some(failure)) = (tool_name.as_deref(), call_failure.as_ref()) {
+        log_failed_tool_call(&headers, name, failure);
     }
     if let Some(name) = tool_name.as_deref() {
         log_tool_call_timing(
@@ -1415,7 +1429,7 @@ async fn serve_mcp_streamable(
             name,
             tool_action.unwrap_or("other"),
             tool_call_started.elapsed(),
-            result.is_ok(),
+            call_failure.is_none(),
             api_calls,
         );
     }
@@ -1426,7 +1440,11 @@ async fn serve_mcp_streamable(
     // Atlas stream remains a temporary compatibility fallback when no
     // acceleration signal provider is configured.
     if let (Some(name), Some(ws)) = (tool_name.as_deref(), workspace_id_for_stream) {
-        let outcome = if result.is_ok() { "ok" } else { "error" };
+        let outcome = if call_failure.is_none() {
+            "ok"
+        } else {
+            "error"
+        };
         let elapsed_ms = tool_call_started.elapsed().as_millis() as u64;
         let action = tool_action.unwrap_or("other");
         let mut payload = serde_json::json!({
@@ -1438,9 +1456,11 @@ async fn serve_mcp_streamable(
         // Why a call failed, as a short class and the JSON-RPC code, never the
         // message, which can quote the caller's arguments. A customer's failed
         // search carried only {"outcome":"error"} (2026-10-30).
-        if let Err(error) = result.as_ref() {
-            payload["error_class"] = Value::String(tool_error_class(&error.message));
-            payload["error_code"] = Value::from(error.code);
+        if let Some(failure) = call_failure.as_ref() {
+            payload["error_class"] = Value::String(failure.class.clone());
+            if let Some(code) = failure.code {
+                payload["error_code"] = Value::from(code);
+            }
         }
         if let Some(signals) = state.registry.acceleration_layer().signals() {
             let mut event = mcp_types::acceleration_layer::AccelerationSignalEvent::with_scope(
@@ -1453,7 +1473,7 @@ async fn serve_mcp_streamable(
             event.action = Some(action.to_string());
             event.provider = Some("mcp_http".to_string());
             event.latency_ms = Some(elapsed_ms);
-            event.degraded = Some(result.is_err());
+            event.degraded = Some(call_failure.is_some());
             let client = state.client.clone();
             // Keeps the request's caller, so the event names who made the call.
             mcp_client::spawn_with_task_context(async move {
@@ -2554,6 +2574,22 @@ fn session_client_identity(headers: &HeaderMap) -> (String, String) {
         .unwrap_or_else(|| ("unknown".to_string(), String::new()))
 }
 
+tokio::task_local! {
+    /// The class of the error a tool call was answered with, set where the
+    /// error becomes the answer: a JSON-RPC error or an `isError` result
+    /// (#490).
+    static TOOL_CALL_ERROR_CLASS: std::cell::RefCell<Option<String>>;
+}
+
+/// The class of a tool's error: its reason when the tool gave one, else from
+/// its text (#490).
+fn typed_tool_error_class(err: &mcp_types::Error) -> String {
+    match err.validation_reason() {
+        Some(reason) => format!("validation:{}", reason.as_str()),
+        None => tool_error_class(&err.to_string()),
+    }
+}
+
 /// A short class for a failed tool call's error, from its message prefix
 /// (`mcp_types::Error`'s display forms). Classes carry no argument values.
 fn tool_error_class(message: &str) -> String {
@@ -2578,8 +2614,19 @@ fn tool_error_class(message: &str) -> String {
         } else if rest.contains("only reads (actions:")
             || rest.contains(" has no action ")
             || rest.contains(" has no `")
+            || rest.starts_with("Unknown action")
         {
             "unknown_action"
+        } else if rest.starts_with("Unknown entity kind") || rest.starts_with("Unknown kind") {
+            "unknown_kind"
+        } else if rest.starts_with("No ") && rest.contains(" found matching ") {
+            "reference_not_found"
+        } else if rest.contains("can't be negative") {
+            "out_of_range"
+        } else if rest.contains("target_project") {
+            "scope_unresolved"
+        } else if rest.contains(" is invalid; use one of") {
+            "invalid_value"
         } else if rest.contains(" is required") {
             "missing_argument"
         } else {
@@ -2642,8 +2689,42 @@ fn log_tool_call_timing(
     );
 }
 
-fn log_failed_tool_call(headers: &HeaderMap, tool: &str, error: &JsonRpcError) {
-    let class = tool_error_class(&error.message);
+/// Why a tools/call failed: its class, and the JSON-RPC code when it was
+/// answered with an error rather than an `isError` result (#490).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolCallFailure {
+    class: String,
+    code: Option<i32>,
+}
+
+/// The failure a tools/call was answered with, if any. `typed_class` is the
+/// class set where the tool's error became the answer; without it a JSON-RPC
+/// error is classed by its text and an `isError` result is `tool_result`.
+fn tool_call_failure(
+    result: &Result<Value, JsonRpcError>,
+    typed_class: Option<&str>,
+) -> Option<ToolCallFailure> {
+    match result {
+        Err(error) => Some(ToolCallFailure {
+            class: typed_class
+                .map(str::to_string)
+                .unwrap_or_else(|| tool_error_class(&error.message)),
+            code: Some(error.code),
+        }),
+        Ok(answer) if answer.get("isError").and_then(Value::as_bool) == Some(true) => {
+            Some(ToolCallFailure {
+                class: typed_class
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "tool_result".to_string()),
+                code: None,
+            })
+        }
+        Ok(_) => None,
+    }
+}
+
+fn log_failed_tool_call(headers: &HeaderMap, tool: &str, failure: &ToolCallFailure) {
+    let class = failure.class.clone();
     let (client_name, client_version) = session_client_identity(headers);
     let tool = loggable_client_token(tool).unwrap_or_else(|| "unknown".to_string());
     metrics::counter!(
@@ -2655,7 +2736,7 @@ fn log_failed_tool_call(headers: &HeaderMap, tool: &str, error: &JsonRpcError) {
     warn!(
         target: "contextstream::tool_errors",
         tool = %tool,
-        error_code = error.code,
+        error_code = ?failure.code,
         error_class = %class,
         client_name = %client_name,
         client_version = %client_version,
@@ -3025,10 +3106,16 @@ fn tool_call_error_response(
     call_title: Option<&str>,
     call_icon: &str,
 ) -> Result<Value, JsonRpcError> {
+    // The class telemetry reports, from the error itself rather than from
+    // its text afterwards, and for an `isError` answer as well (#490).
+    let _ = TOOL_CALL_ERROR_CLASS.try_with(|slot| {
+        *slot.borrow_mut() = Some(typed_tool_error_class(&err));
+    });
     if strict_protocol_errors
         && matches!(
             &err,
             mcp_types::Error::Validation(_)
+                | mcp_types::Error::Refused { .. }
                 | mcp_types::Error::InvalidUuid(_)
                 | mcp_types::Error::Serialization(_)
         )
@@ -7099,6 +7186,31 @@ mod tests {
                 "validation:unknown_action",
             ),
             ("Validation error: query is required for search", "validation:missing_argument"),
+            // #490: entity's failures, before each source names its reason.
+            (
+                "Validation error: Unknown action: search. Available actions: list, get",
+                "validation:unknown_action",
+            ),
+            (
+                "Validation error: Unknown entity kind: 'task'. Valid kinds: ticket",
+                "validation:unknown_kind",
+            ),
+            (
+                "Validation error: No tickets found matching \"x\". Use entity(kind=\"ticket\", action=\"list\")",
+                "validation:reference_not_found",
+            ),
+            (
+                "Validation error: Unknown target_project 'x'. Projects in this workspace: a",
+                "validation:scope_unresolved",
+            ),
+            (
+                "Validation error: entity: `limit` can't be negative (got -1)",
+                "validation:out_of_range",
+            ),
+            (
+                "Validation error: linked_items[1].kind 'decision' is invalid; use one of: ticket",
+                "validation:invalid_value",
+            ),
             ("HTTP error (403): workspace not accessible", "http:403"),
             ("Request timeout after 10 seconds", "timeout"),
             ("Invalid UUID: abc", "invalid_uuid"),
@@ -7108,6 +7220,71 @@ mod tests {
             assert_eq!(class_seen, class, "{message}");
             assert!(!class_seen.contains("maybe") && !class_seen.contains("secret"));
         }
+    }
+
+    #[tokio::test]
+    async fn an_is_error_answer_is_a_failure_with_the_class_of_its_error() {
+        // #490: a tool call answered with `isError` was counted as ok, and the
+        // class came from the message text only.
+        let (answer, typed) = TOOL_CALL_ERROR_CLASS
+            .scope(std::cell::RefCell::new(None), async {
+                let answer = tool_call_error_response(
+                    mcp_types::Error::http(400, "Invalid status 'done'."),
+                    false,
+                    None,
+                    "icon",
+                );
+                let typed = TOOL_CALL_ERROR_CLASS.with(|slot| slot.borrow_mut().take());
+                (answer, typed)
+            })
+            .await;
+        assert_eq!(typed.as_deref(), Some("http:400"));
+        let failure =
+            tool_call_failure(&answer, typed.as_deref()).expect("an isError answer fails");
+        assert_eq!(
+            failure,
+            ToolCallFailure {
+                class: "http:400".to_string(),
+                code: None
+            }
+        );
+
+        // A refusal with a reason is classed by the reason, strict or not.
+        let (strict, typed) = TOOL_CALL_ERROR_CLASS
+            .scope(std::cell::RefCell::new(None), async {
+                let answer = tool_call_error_response(
+                    mcp_types::Error::refused(
+                        mcp_types::ValidationReason::ReferenceNotFound,
+                        "No tickets found matching \"x\".",
+                    ),
+                    true,
+                    None,
+                    "icon",
+                );
+                let typed = TOOL_CALL_ERROR_CLASS.with(|slot| slot.borrow_mut().take());
+                (answer, typed)
+            })
+            .await;
+        let error = strict
+            .as_ref()
+            .expect_err("strict answers a JSON-RPC error");
+        assert_eq!(error.code, -32602);
+        assert_eq!(
+            tool_call_failure(&strict, typed.as_deref()),
+            Some(ToolCallFailure {
+                class: "validation:reference_not_found".to_string(),
+                code: Some(-32602)
+            })
+        );
+
+        // A plain answer is no failure; an isError result with no class is
+        // `tool_result`.
+        assert_eq!(tool_call_failure(&Ok(json!({"content": []})), None), None);
+        assert_eq!(
+            tool_call_failure(&Ok(json!({"content": [], "isError": true})), None)
+                .map(|failure| failure.class),
+            Some("tool_result".to_string())
+        );
     }
 
     #[test]

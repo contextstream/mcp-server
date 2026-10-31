@@ -2365,6 +2365,7 @@ async fn handle_request_dispatch(
                         && matches!(
                             &e,
                             mcp_types::Error::Validation(_)
+                                | mcp_types::Error::Refused { .. }
                                 | mcp_types::Error::InvalidUuid(_)
                                 | mcp_types::Error::Serialization(_)
                         )

@@ -53,7 +53,7 @@ use mcp_types::{
     api::Project,
     atlas_layer::AtlasWarmCacheKind,
     tool::{ToolAnnotations, ToolCategory, ToolMetadata, ToolResult},
-    AtlasLayer, Error, Result,
+    AtlasLayer, Error, Result, ValidationReason,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -244,26 +244,32 @@ impl EntityTool {
             return Ok(target.to_string());
         }
         let projects = self.workspace_projects(workspace_id).await.map_err(|err| {
-            let reason = match &err {
-                Error::Validation(message) => message.clone(),
-                other => other.to_string(),
-            };
-            Error::Validation(format!(
-                "Could not list this workspace's projects to resolve target_project '{}': {}. \
-                 Pass project_id instead.",
-                target,
-                reason.trim_end_matches('.')
-            ))
+            let reason = err
+                .validation_message()
+                .map(str::to_string)
+                .unwrap_or_else(|| err.to_string());
+            Error::refused(
+                ValidationReason::ScopeUnresolved,
+                format!(
+                    "Could not list this workspace's projects to resolve target_project '{}': {}. \
+                     Pass project_id instead.",
+                    target,
+                    reason.trim_end_matches('.')
+                ),
+            )
         })?;
         let key = project_name_key(target);
         if let Some(project) = projects.iter().find(|p| project_name_key(&p.name) == key) {
             return Ok(project.id.to_string());
         }
-        Err(Error::Validation(format!(
-            "Unknown target_project '{}'. {}",
-            target,
-            describe_workspace_projects(&projects)
-        )))
+        Err(Error::refused(
+            ValidationReason::ScopeUnresolved,
+            format!(
+                "Unknown target_project '{}'. {}",
+                target,
+                describe_workspace_projects(&projects)
+            ),
+        ))
     }
 
     async fn workspace_projects(&self, workspace_id: &Option<String>) -> Result<Vec<Project>> {
@@ -989,8 +995,9 @@ impl ToolHandler for EntityTool {
         let input: EntityInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
 
-        let kind = input.kind.to_lowercase();
-        let action = input.action.to_lowercase();
+        // " list" and " ticket" mean list and ticket (#490).
+        let kind = input.kind.trim().to_lowercase();
+        let action = input.action.trim().to_lowercase();
 
         // Up-front kind validation so we fail fast with a useful error
         // (instead of leaking the URL-builder error from the client).
@@ -998,11 +1005,14 @@ impl ToolHandler for EntityTool {
             return Err(Error::Validation(reason.to_string()));
         }
         if entity_kind_to_path(&kind).is_none() {
-            return Err(Error::Validation(format!(
-                "Unknown entity kind: '{}'. Valid kinds: {}",
-                kind,
-                VALID_ENTITY_KINDS.join(", ")
-            )));
+            return Err(Error::refused(
+                ValidationReason::UnknownKind,
+                format!(
+                    "Unknown entity kind: '{}'. Valid kinds: {}",
+                    kind,
+                    VALID_ENTITY_KINDS.join(", ")
+                ),
+            ));
         }
 
         // `target_project` names the project instead of giving its id. It
@@ -1331,11 +1341,14 @@ impl ToolHandler for EntityTool {
                 Ok(found.tool_result(text, result))
             }
 
-            _ => Err(Error::Validation(format!(
-                "Unknown action: {}. Available actions: {}",
-                action,
-                VALID_ACTIONS.join(", ")
-            ))),
+            _ => Err(Error::refused(
+                ValidationReason::UnknownAction,
+                format!(
+                    "Unknown action: {}. Available actions: {}",
+                    action,
+                    VALID_ACTIONS.join(", ")
+                ),
+            )),
         }
     }
 
@@ -2517,5 +2530,50 @@ mod tests {
         assert!(!looks_like_id_prefix("login page"));
         assert!(!looks_like_id_prefix("beef"));
         assert!(!looks_like_id_prefix("123"));
+    }
+
+    /// #490: an unknown action or kind is refused with its reason, so the
+    /// error class says which it was; " list" and " ticket" are not unknown.
+    #[tokio::test]
+    async fn an_unknown_action_or_kind_is_refused_with_its_reason() {
+        let (tool, server) = entity_tool_with_http_sequence(vec![(
+            "200 OK",
+            serde_json::json!({"items": [], "total": 0}),
+        )])
+        .await;
+
+        let unknown_action = tool
+            .execute(serde_json::json!({"kind": "ticket", "action": "search", "workspace_id": WORKSPACE_ID}))
+            .await
+            .expect_err("search is no entity action");
+        assert_eq!(
+            unknown_action.validation_reason(),
+            Some(ValidationReason::UnknownAction),
+            "{unknown_action}"
+        );
+        let unknown_kind = tool
+            .execute(
+                serde_json::json!({"kind": "task", "action": "list", "workspace_id": WORKSPACE_ID}),
+            )
+            .await
+            .expect_err("task is no entity kind");
+        assert_eq!(
+            unknown_kind.validation_reason(),
+            Some(ValidationReason::UnknownKind),
+            "{unknown_kind}"
+        );
+
+        tool.execute(
+            serde_json::json!({"kind": " ticket", "action": " list", "workspace_id": WORKSPACE_ID}),
+        )
+        .await
+        .expect("a padded action and kind still list");
+        let requests = server.await.expect("entity request server");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].starts_with("GET /api/v1/tickets?"),
+            "{}",
+            requests[0]
+        );
     }
 }

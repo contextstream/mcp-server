@@ -706,7 +706,7 @@ impl Coach {
     /// A write refused before anything was sent.
     fn not_sent(&self, attempted: &str, error: Error) -> Reply {
         let message = match error {
-            Error::Validation(message) => message,
+            Error::Validation(message) | Error::Refused { message, .. } => message,
             other => other.user_facing_message(),
         };
         let line = status_line(

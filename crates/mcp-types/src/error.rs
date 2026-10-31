@@ -37,6 +37,15 @@ pub enum Error {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// A validation error whose reason is known where the call was refused.
+    /// It reads exactly as [`Error::Validation`]; telemetry reports the reason
+    /// as its class instead of guessing it from the text (#490).
+    #[error("Validation error: {message}")]
+    Refused {
+        reason: ValidationReason,
+        message: String,
+    },
+
     /// Tool execution error
     #[error("Tool error: {0}")]
     Tool(String),
@@ -122,6 +131,37 @@ impl Error {
         }
     }
 
+    /// A validation error whose reason is known where the call was refused
+    /// (#490).
+    pub fn refused(reason: ValidationReason, message: impl Into<String>) -> Self {
+        Self::Refused {
+            reason,
+            message: message.into(),
+        }
+    }
+
+    /// The text of a validation error, either kind, without its "Validation
+    /// error: " prefix.
+    pub fn validation_message(&self) -> Option<&str> {
+        match self {
+            Self::Validation(message) | Self::Refused { message, .. } => Some(message),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a validation error, either kind.
+    pub fn is_validation(&self) -> bool {
+        self.validation_message().is_some()
+    }
+
+    /// Why a validation error was refused, when it was refused with a reason.
+    pub fn validation_reason(&self) -> Option<ValidationReason> {
+        match self {
+            Self::Refused { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+
     /// Get the error code.
     pub fn code(&self) -> ErrorCode {
         match self {
@@ -129,7 +169,7 @@ impl Error {
             Self::Network(_) => ErrorCode::NetworkError,
             Self::Config(_) => ErrorCode::BadRequest,
             Self::MissingCredentials => ErrorCode::Unauthorized,
-            Self::Validation(_) => ErrorCode::ValidationError,
+            Self::Validation(_) | Self::Refused { .. } => ErrorCode::ValidationError,
             Self::Tool(_) => ErrorCode::InternalError,
             Self::Serialization(_) => ErrorCode::BadRequest,
             Self::InvalidUuid(_) => ErrorCode::ValidationError,
@@ -178,6 +218,7 @@ impl Error {
             | Self::Network(message)
             | Self::Config(message)
             | Self::Validation(message)
+            | Self::Refused { message, .. }
             | Self::Tool(message)
             | Self::PlanRestriction(message)
             | Self::IntegrationNotConnected(message)
@@ -276,6 +317,41 @@ impl Error {
     }
 }
 
+/// Why a call was refused, for the class telemetry reports (#490). Each says
+/// what kind of mistake it was and carries nothing the caller typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationReason {
+    /// The tool has no such action.
+    UnknownAction,
+    /// No such kind of record (an entity kind, say).
+    UnknownKind,
+    /// A reference by id or title named no record; the API was asked.
+    ReferenceNotFound,
+    /// The call needs a workspace or project that could not be resolved.
+    ScopeUnresolved,
+    /// A number outside what the argument allows (a negative limit).
+    OutOfRange,
+    /// A value that is not one of those the argument allows.
+    InvalidValue,
+    /// A required argument is missing or empty.
+    MissingArgument,
+}
+
+impl ValidationReason {
+    /// The class suffix, as in `validation:unknown_action`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownAction => "unknown_action",
+            Self::UnknownKind => "unknown_kind",
+            Self::ReferenceNotFound => "reference_not_found",
+            Self::ScopeUnresolved => "scope_unresolved",
+            Self::OutOfRange => "out_of_range",
+            Self::InvalidValue => "invalid_value",
+            Self::MissingArgument => "missing_argument",
+        }
+    }
+}
+
 /// Error codes matching the TypeScript implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
@@ -346,6 +422,36 @@ impl fmt::Display for ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_call_reads_as_a_validation_error_and_keeps_its_reason() {
+        // #490: the reason is the class telemetry reports, while the caller
+        // sees the same text as before.
+        let refused = Error::refused(ValidationReason::UnknownAction, "Unknown action: search.");
+        assert_eq!(
+            refused.to_string(),
+            "Validation error: Unknown action: search."
+        );
+        assert_eq!(refused.code(), ErrorCode::ValidationError);
+        assert_eq!(
+            refused.validation_reason(),
+            Some(ValidationReason::UnknownAction)
+        );
+        assert_eq!(
+            refused.validation_message(),
+            Some("Unknown action: search.")
+        );
+        assert!(refused.is_validation());
+        assert_eq!(
+            ValidationReason::ReferenceNotFound.as_str(),
+            "reference_not_found"
+        );
+
+        let plain = Error::Validation("bad".to_string());
+        assert_eq!(plain.validation_reason(), None);
+        assert_eq!(plain.validation_message(), Some("bad"));
+        assert!(!Error::Network("down".to_string()).is_validation());
+    }
 
     #[test]
     fn only_a_401_is_a_key_refusal() {

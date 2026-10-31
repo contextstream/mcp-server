@@ -3058,6 +3058,21 @@ fn reports_graph_building(result: &ToolResult) -> bool {
         == Some(true)
 }
 
+/// The graph state an analysis answer gives when the API says the project's
+/// graph is not built (`graph_built: false`, "status: empty"); `None` when it
+/// doesn't say so.
+fn reports_graph_not_built(result: &ToolResult) -> Option<String> {
+    let structured = result.structured_content.as_ref()?;
+    if structured.get("graph_built").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let state = structured
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("empty");
+    Some(format!("status: {state}"))
+}
+
 /// Whether an analysis answer says it found nothing, in the formatter's own
 /// words.
 fn reports_nothing(result: &ToolResult) -> bool {
@@ -3166,6 +3181,17 @@ impl ToolHandler for GraphTool {
                 graph_building_text(),
                 result.structured_content.unwrap_or(Value::Null),
             ));
+        }
+        // The analysis answer itself says the graph is not built. Asked a
+        // moment later, the graph's status could already read built, and
+        // "No unused code detected" stood for two unused modules (#484).
+        if is_analysis {
+            if let Some(state) = reports_graph_not_built(&result) {
+                return Ok(ToolResult::with_structured(
+                    graph_not_built_text(&state),
+                    result.structured_content.unwrap_or(Value::Null),
+                ));
+            }
         }
         if is_analysis && reports_analysis_running(&result) && reports_nothing(&result) {
             return Ok(ToolResult::with_structured(
@@ -3501,6 +3527,35 @@ mod graph_not_built_tests {
         assert!(
             text.starts_with("[GRAPH NOT BUILT]") && text.contains("graph(action=\"ingest\")"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn an_analysis_that_says_the_graph_is_not_built_is_believed() {
+        // #484: the API answered `graph_built: false`, the graph status asked
+        // a moment later already read built, and "No unused code detected"
+        // stood for a project of two unused modules.
+        let unbuilt = ToolResult::with_structured(
+            "No unused code detected.",
+            serde_json::json!({"status": "empty", "graph_built": false, "analysis": "unused_code"}),
+        );
+        assert_eq!(
+            reports_graph_not_built(&unbuilt).as_deref(),
+            Some("status: empty")
+        );
+        let text = graph_not_built_text(&reports_graph_not_built(&unbuilt).unwrap());
+        assert!(text.starts_with("[GRAPH NOT BUILT]"), "{text}");
+        assert!(!text.contains("No unused code detected"), "{text}");
+        assert_eq!(
+            reports_graph_not_built(&ToolResult::with_structured(
+                "No unused code detected.",
+                serde_json::json!({"unused_elements": [], "graph_built": true}),
+            )),
+            None
+        );
+        assert_eq!(
+            reports_graph_not_built(&ToolResult::text("No unused code detected.")),
+            None
         );
     }
 

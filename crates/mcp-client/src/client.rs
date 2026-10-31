@@ -17055,15 +17055,18 @@ impl ContextStreamClient {
 
         // Inject defaults for workspace_id / project_id if absent.
         let config = self.config.read().await;
-        let has_ws = params.iter().any(|(k, _)| k == "workspace_id");
+        let named_workspace = params
+            .iter()
+            .find(|(k, _)| k == "workspace_id")
+            .map(|(_, v)| v.clone());
         let has_pj = params.iter().any(|(k, _)| k == "project_id");
-        if !has_ws {
+        if named_workspace.is_none() {
             if let Some(id) = config.default_workspace_id {
                 params.push(("workspace_id".to_string(), id.to_string()));
             }
         }
         if !has_pj {
-            if let Some(id) = config.default_project_id {
+            if let Some(id) = default_project_for(&config, named_workspace.as_deref()) {
                 params.push(("project_id".to_string(), id.to_string()));
             }
         }
@@ -17114,13 +17117,17 @@ impl ContextStreamClient {
         // Fill defaults from config.
         let config = self.config.read().await;
         if let Some(obj) = body.as_object_mut() {
+            let named_workspace = obj
+                .get("workspace_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string);
             if !obj.contains_key("workspace_id") {
                 if let Some(id) = config.default_workspace_id {
                     obj.insert("workspace_id".to_string(), serde_json::json!(id));
                 }
             }
             if !obj.contains_key("project_id") {
-                if let Some(id) = config.default_project_id {
+                if let Some(id) = default_project_for(&config, named_workspace.as_deref()) {
                     obj.insert("project_id".to_string(), serde_json::json!(id));
                 }
             }
@@ -19671,6 +19678,17 @@ pub struct HotPathHintEntry {
     pub path: String,
     pub score: f64,
     pub source: String,
+}
+
+/// The configured default project for a request that names `workspace_id`.
+/// The default project belongs to the default workspace, so a request that
+/// names another workspace does not take it (#487, #488).
+fn default_project_for(config: &Config, workspace_id: Option<&str>) -> Option<Uuid> {
+    let named = workspace_id.map(str::trim).filter(|id| !id.is_empty());
+    match (named, config.default_workspace_id) {
+        (Some(named), Some(default)) if Uuid::parse_str(named).ok() != Some(default) => None,
+        _ => config.default_project_id,
+    }
 }
 
 impl SearchParams {
@@ -24021,6 +24039,67 @@ mod tests {
         assert!(
             message.contains("the API URL \"not-a-url\" is not a valid URL"),
             "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entity_call_naming_another_workspace_takes_no_default_project() {
+        // #488: the default project is the session's, in the default workspace.
+        let (home, project, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let empty = serde_json::json!({"items": [], "total": 0}).to_string();
+        let created = serde_json::json!({"id": Uuid::new_v4(), "title": "t"}).to_string();
+        let (client, server) = client_with_http_sequence(vec![
+            ("200 OK", empty.clone()),
+            ("201 Created", created),
+            ("200 OK", empty),
+        ])
+        .await;
+        client.set_defaults(Some(home), Some(project)).await;
+
+        client
+            .entity_list(
+                "ticket",
+                vec![("workspace_id".to_string(), other.to_string())],
+            )
+            .await
+            .expect("list another workspace");
+        client
+            .entity_create(
+                "ticket",
+                serde_json::json!({"title": "t", "workspace_id": other.to_string()}),
+            )
+            .await
+            .expect("create in another workspace");
+        client
+            .entity_list("ticket", Vec::new())
+            .await
+            .expect("list the default workspace");
+
+        let requests = server.await.expect("entity server");
+        let line = |request: &str| request.lines().next().unwrap_or_default().to_string();
+        let other_list = line(&requests[0]);
+        assert!(
+            other_list.contains(&format!("workspace_id={other}")),
+            "{other_list}"
+        );
+        assert!(!other_list.contains("project_id="), "{other_list}");
+        let (_, body) = requests[1].split_once("\r\n\r\n").expect("create body");
+        let body: serde_json::Value = serde_json::from_str(body).expect("create JSON");
+        assert_eq!(
+            body["workspace_id"],
+            serde_json::json!(other.to_string()),
+            "{body}"
+        );
+        assert!(body.get("project_id").is_none(), "{body}");
+        // Its own workspace still takes the default project.
+        let home_list = line(&requests[2]);
+        assert!(
+            home_list.contains(&format!("workspace_id={home}")),
+            "{home_list}"
+        );
+        assert!(
+            home_list.contains(&format!("project_id={project}")),
+            "{home_list}"
         );
     }
 

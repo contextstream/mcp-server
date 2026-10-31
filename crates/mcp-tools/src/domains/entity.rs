@@ -165,53 +165,65 @@ impl EntityTool {
 
     /// Resolve scope IDs for an entity call. Precedence (highest first):
     ///   1. Explicit `workspace_id` / `project_id` in the call body.
-    ///   2. SessionManager's current per-task active scope (set by
-    ///      `init` / `context` and partitioned by `TASK_SESSION_KEY` so
-    ///      it doesn't leak across users on the hosted gateway).
-    ///   3. Falls through to None — letting the API server's own
-    ///      per-user defaulting kick in.
+    ///   2. The scope the other tools fall back to (`read_scope_defaults`):
+    ///      the session's active scope (set by `init` / `context`, per caller
+    ///      on the hosted gateway), else the connection's
+    ///      (`X-ContextStream-Workspace-Id` / `-Project-Id` on the hosted
+    ///      gateway), else the configured defaults. Without the connection's,
+    ///      every hosted call reached the API with no workspace and read or
+    ///      filed in the account's default workspace (#488).
+    ///   3. None, and the API applies its own per-user default.
+    ///
+    /// The default project goes with the default workspace: a call that names
+    /// another workspace takes no project from it (#487).
     ///
     /// Returns `(workspace_id, project_id)` as `Option<String>` so the
     /// existing query/body builders can ignore None values cleanly.
-    /// Emits a warn-level trace when the session active scope is being
-    /// applied (i.e., when the caller didn't pass IDs and the session
-    /// supplied them) — useful for spotting cases where an agent is
-    /// relying on implicit scope when it shouldn't.
     async fn resolve_scope(
         &self,
         explicit_workspace_id: &Option<String>,
         explicit_project_id: &Option<String>,
     ) -> (Option<String>, Option<String>) {
-        let mut ws = explicit_workspace_id.clone();
-        let mut proj = explicit_project_id.clone();
+        let named = |id: &Option<String>| {
+            id.as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        };
+        let mut ws = named(explicit_workspace_id);
+        let mut proj = named(explicit_project_id);
         if ws.is_some() && proj.is_some() {
             return (ws, proj);
         }
 
-        let state = self.session.state().await;
-        let mut applied_session_ws = false;
-        let mut applied_session_proj = false;
+        let (default_ws, default_proj) =
+            super::scope::read_scope_defaults(&self.client, Some(self.session.as_ref())).await;
+        let names_other_workspace = ws
+            .as_deref()
+            .is_some_and(|named| Uuid::parse_str(named).ok() != default_ws);
+        let mut applied_default_ws = false;
+        let mut applied_default_proj = false;
         if ws.is_none() {
-            if let Some(id) = state.workspace_id {
+            if let Some(id) = default_ws {
                 ws = Some(id.to_string());
-                applied_session_ws = true;
+                applied_default_ws = true;
             }
         }
-        if proj.is_none() {
-            if let Some(id) = state.project_id {
+        if proj.is_none() && !names_other_workspace {
+            if let Some(id) = default_proj {
                 proj = Some(id.to_string());
-                applied_session_proj = true;
+                applied_default_proj = true;
             }
         }
 
-        if applied_session_ws || applied_session_proj {
+        if applied_default_ws || applied_default_proj {
             tracing::debug!(
                 target: "entity",
-                applied_session_ws,
-                applied_session_proj,
+                applied_default_ws,
+                applied_default_proj,
                 ws = ?ws,
                 proj = ?proj,
-                "entity: applied session active scope to fill missing ids"
+                "entity: applied the default scope to fill missing ids"
             );
         }
 
@@ -2308,5 +2320,73 @@ mod tests {
         let summary = format_entity_summary("incident", &incident);
         assert!(!summary.contains("assignees:"));
         assert!(!summary.contains("linked:"));
+    }
+
+    /// #488: on the hosted gateway the session is empty, and the tool read its
+    /// scope from the arguments and the session only. With just the
+    /// connection's `X-ContextStream-Workspace-Id` header every call reached the
+    /// API with no workspace: lists read the account's default workspace and
+    /// creates were filed there.
+    #[tokio::test]
+    async fn the_connections_workspace_scopes_lists_and_creates() {
+        let other_workspace = "55555555-5555-5555-5555-555555555555";
+        let (tool, server) = entity_tool_with_http_sequence(vec![
+            (
+                "200 OK",
+                serde_json::json!({"items": [stored_ticket(false, SESSION_PROJECT_ID)], "total": 1}),
+            ),
+            ("201 Created", stored_ticket(false, SESSION_PROJECT_ID)),
+            ("200 OK", serde_json::json!({"items": [], "total": 0})),
+        ])
+        .await;
+        let connection = mcp_types::AuthOverride {
+            api_key: Some("test-key".to_string()),
+            workspace_id: Some(Uuid::parse_str(WORKSPACE_ID).unwrap()),
+            project_id: Some(Uuid::parse_str(SESSION_PROJECT_ID).unwrap()),
+            ..Default::default()
+        };
+        mcp_client::run_with_auth_override(connection, || async {
+            tool.execute(serde_json::json!({"kind": "ticket", "action": "list"}))
+                .await
+                .expect("list");
+            tool.execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "create",
+                "body": {"title": "Fix the hook"}
+            }))
+            .await
+            .expect("create");
+            // A call that names another workspace takes no project from the
+            // connection.
+            tool.execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "list",
+                "workspace_id": other_workspace
+            }))
+            .await
+            .expect("list another workspace");
+        })
+        .await;
+
+        let requests = server.await.expect("entity request server");
+        let list = requests[0].lines().next().unwrap_or_default();
+        assert!(list.starts_with("GET /api/v1/tickets?"), "{list}");
+        assert!(
+            list.contains(&format!("workspace_id={WORKSPACE_ID}")),
+            "{list}"
+        );
+        assert!(
+            list.contains(&format!("project_id={SESSION_PROJECT_ID}")),
+            "{list}"
+        );
+        let created = request_body(&requests[1]);
+        assert_eq!(created["workspace_id"], WORKSPACE_ID, "{created}");
+        assert_eq!(created["project_id"], SESSION_PROJECT_ID, "{created}");
+        let other = requests[2].lines().next().unwrap_or_default();
+        assert!(
+            other.contains(&format!("workspace_id={other_workspace}")),
+            "{other}"
+        );
+        assert!(!other.contains("project_id="), "{other}");
     }
 }

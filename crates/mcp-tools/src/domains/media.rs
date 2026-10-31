@@ -952,30 +952,7 @@ fn validate_media_index_file_with_cap(
 /// (`~/.ssh`, `~/.aws`, `~/.gnupg`, ...). The path is also canonicalized so a
 /// symlink into a sensitive directory cannot dodge the check. Never bypassable.
 fn media_secret_rejection_reason(path: &Path) -> Option<String> {
-    let canonical = std::fs::canonicalize(path).ok();
-    for candidate in std::iter::once(path).chain(canonical.as_deref()) {
-        for component in candidate.components() {
-            if let std::path::Component::Normal(os) = component {
-                if let Some(name) = os.to_str() {
-                    if mcp_client::SENSITIVE_DIR_NAMES.contains(&name) {
-                        return Some(format!("it lives inside a sensitive directory ({name})"));
-                    }
-                }
-            }
-        }
-    }
-
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    if !file_name.is_empty() && mcp_client::ContextStreamClient::should_skip_file(file_name, true) {
-        return Some(format!(
-            "'{file_name}' matches the blocked-file filter (secrets, keys, archives, and binaries are never uploaded)"
-        ));
-    }
-
-    None
+    mcp_client::secret_path_rejection_reason(path, &mcp_client::SENSITIVE_DIR_NAMES)
 }
 
 /// True when `path` is the same as, or nested inside, `root` (component-wise,

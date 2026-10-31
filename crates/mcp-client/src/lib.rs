@@ -206,8 +206,9 @@ pub use client::{
     set_runtime_self_update_disabled,
 };
 pub use ingest_guard::{
-    broad_ingest_opt_in_from_env, validate_ingest_root, IngestRootAssessment, IngestRootOptions,
-    IngestRootRejection, IngestRootRejectionReason, ALLOW_BROAD_INGEST_ENV, SENSITIVE_DIR_NAMES,
+    broad_ingest_opt_in_from_env, secret_path_rejection_reason, validate_ingest_root,
+    IngestRootAssessment, IngestRootOptions, IngestRootRejection, IngestRootRejectionReason,
+    ALLOW_BROAD_INGEST_ENV, CREDENTIAL_DIR_NAMES, SENSITIVE_DIR_NAMES,
 };
 pub use mcp_types::agentic::{ComplianceEventRecorded, ComplianceEventRequest};
 pub use mcp_types::answer::{

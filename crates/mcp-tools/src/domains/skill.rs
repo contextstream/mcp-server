@@ -1026,9 +1026,25 @@ impl SkillTool {
                         .to_string(),
                 ));
             }
-            tokio::fs::read_to_string(file_path)
+            // The file is read and sent to the server as a skill: not a credential
+            // file, whatever it holds (mcp-server#469; `media index` has the same rule).
+            if let Some(reason) = mcp_client::secret_path_rejection_reason(
+                Path::new(file_path),
+                &mcp_client::CREDENTIAL_DIR_NAMES,
+            ) {
+                return Err(Error::Validation(format!(
+                    "skill(action=\"import\") refuses '{file_path}' because {reason}. Secrets and credentials are never read into a skill: import a copy of the skill kept outside that folder."
+                )));
+            }
+            let text = tokio::fs::read_to_string(file_path)
                 .await
-                .map_err(|e| Error::Validation(format!("Failed to read file: {}", e)))?
+                .map_err(|e| Error::Validation(format!("Failed to read file: {}", e)))?;
+            if let Some(what) = mcp_client::ContextStreamClient::secret_content_reason(&text) {
+                return Err(Error::Validation(format!(
+                    "skill(action=\"import\") refuses '{file_path}' because it holds {what}. Secrets and credentials are never read into a skill."
+                )));
+            }
+            text
         } else if let Some(content) = &input.content {
             content.clone()
         } else {
@@ -2443,5 +2459,82 @@ mod import_result_tests {
             "Offset 100 is past the end: there are 34 skill(s). Pass a smaller offset (offset=0 for the first page).\n"
         );
         assert_eq!(skills_page_heading(5, None), "Found 5 skill(s).\n");
+    }
+}
+
+// `skill import` reads a local file and stores it on the server as a skill: it must not
+// read a credential file, which `media index` already refuses (mcp-server#469).
+#[cfg(test)]
+mod import_path_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool() -> SkillTool {
+        let config = mcp_types::Config::default();
+        let client = mcp_client::ContextStreamClient::new(config.clone());
+        let session = Arc::new(mcp_session::SessionManager::new(client.clone(), config));
+        SkillTool::new(client, session)
+    }
+
+    async fn import_error(file: &std::path::Path) -> String {
+        tool()
+            .execute(json!({"action": "import", "file_path": file.to_string_lossy()}))
+            .await
+            .expect_err("the import is refused before anything is sent")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn skill_import_refuses_a_file_inside_a_credential_directory() {
+        let home = tempfile::tempdir().expect("home");
+        for dir in [".ssh", ".aws"] {
+            let folder = home.path().join(dir);
+            std::fs::create_dir_all(&folder).expect("folder");
+            let file = folder.join("notes.md");
+            std::fs::write(&file, "## default\nAKIAFAKE\n").expect("file");
+            let text = import_error(&file).await;
+            assert!(
+                text.contains("refuses") && text.contains(&format!("sensitive directory ({dir})")),
+                "{text}"
+            );
+        }
+
+        // A `..` out of the project into the folder does not dodge it.
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).expect("project");
+        let through = project.join("..").join(".ssh").join("notes.md");
+        let text = import_error(&through).await;
+        assert!(text.contains("sensitive directory (.ssh)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn skill_import_refuses_a_credential_file_name_and_a_private_key_inside() {
+        let dir = tempfile::tempdir().expect("dir");
+        let env_file = dir.path().join(".env");
+        std::fs::write(&env_file, "## token\nAPI_TOKEN=x\n").expect("file");
+        let text = import_error(&env_file).await;
+        assert!(text.contains("blocked-file filter"), "{text}");
+
+        let note = dir.path().join("skill.md");
+        std::fs::write(
+            &note,
+            "## deploy\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAfakefakefakefakefakefake\n-----END RSA PRIVATE KEY-----\n",
+        )
+        .expect("file");
+        let text = import_error(&note).await;
+        assert!(text.contains("holds a private key"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn skill_import_still_reads_skills_kept_under_dot_config() {
+        // `.config` is too broad to index, but editors keep skills there; the guard
+        // passes it, and the empty file is then refused for having nothing to import.
+        let home = tempfile::tempdir().expect("home");
+        let folder = home.path().join(".config").join("opencode");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let file = folder.join("SKILL.md");
+        std::fs::write(&file, "  \n").expect("file");
+        let text = import_error(&file).await;
+        assert!(text.contains("nothing to import"), "{text}");
     }
 }

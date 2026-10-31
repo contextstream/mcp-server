@@ -11731,6 +11731,20 @@ impl SearchTool {
             explicit_project_id = None;
         }
         let mut session_folder_path = normalize_search_root(state.folder_path.as_deref());
+        // A search of another workspace takes nothing from this session's
+        // checkout unless the checkout belongs to the named workspace: not its
+        // checkout scope (the API answered from that checkout), its uncommitted
+        // files, its local index, nor local text matches (#487).
+        let local_checkout_allowed = !names_other_workspace
+            || match session_folder_path.as_deref() {
+                Some(path) => resolve_workspace(path)
+                    .await
+                    .is_some_and(|mapping| Some(mapping.workspace_id) == explicit_workspace_id),
+                None => false,
+            };
+        if !local_checkout_allowed {
+            session_folder_path = None;
+        }
         let dirty_file_snapshot = read_dirty_file_snapshot(
             session_folder_path
                 .as_deref()
@@ -12476,7 +12490,7 @@ impl SearchTool {
         let target_project_id = resolved_project_id.or(project_id);
         let local_project_root = read_local_project_root_for_project(target_project_id)
             .or_else(|| read_current_config_root_for_project(target_project_id));
-        let allow_current_dir_fallback = target_project_id.is_none();
+        let allow_current_dir_fallback = target_project_id.is_none() && local_checkout_allowed;
         let mut resolved_project_meta_path: Option<String> = None;
         let mut resolved_project_name: Option<String> = None;
         let scoped_session_folder_path = scoped_session_folder_path(
@@ -12528,7 +12542,7 @@ impl SearchTool {
         let mut folder_path = resolved_project_root;
         if folder_path.is_none() {
             folder_path = read_local_project_root_for_project(resolved_project_id.or(project_id));
-            if folder_path.is_none() && target_project_id.is_none() {
+            if folder_path.is_none() && target_project_id.is_none() && local_checkout_allowed {
                 folder_path = current_dir_search_root();
             }
         }

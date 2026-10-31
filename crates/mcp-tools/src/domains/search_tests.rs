@@ -8158,6 +8158,118 @@ mod scope_widening_tests {
         }
     }
 
+    /// #487: the footer's advice, end to end. A session bound to workspace A's
+    /// checkout is told a linked workspace's id ("pass its workspace_id") and
+    /// searches it. That search sent A's checkout scope (`installation_id`,
+    /// `checkout_locator`), so the API answered from A's checkout, and the local
+    /// exact-text check added A's files to it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_footers_workspace_id_searches_that_workspace_without_this_checkout() {
+        let (home, project, linked) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+        std::fs::write(
+            temp.path().join("app/a.py"),
+            "def revoke_fn_487():\n    return 1\n",
+        )
+        .unwrap();
+        let linked_id = linked.to_string();
+        let server = RoutedServer::spawn(Box::new(move |line, body| {
+            if line.contains("/search/") {
+                let body: Value = serde_json::from_str(body).unwrap_or_default();
+                if body["workspace_id"] == linked_id.as_str() {
+                    return (
+                        200,
+                        json!({"results": [], "total": 0, "project_index_state": "ready"})
+                            .to_string(),
+                    );
+                }
+                return (
+                    200,
+                    json!({
+                        "results": [], "total": 0, "project_index_state": "ready",
+                        "linked_workspaces": [{"workspace_id": linked_id, "name": "Product",
+                            "include_code": true, "status": "ok", "hits": 0}]
+                    })
+                    .to_string(),
+                );
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, home));
+            }
+            (404, json!({"error": "not found"}).to_string())
+        }));
+        let mut config = TestFixtures::test_config();
+        config.api_url = server.base_url.clone();
+        config.default_workspace_id = Some(home);
+        config.default_project_id = Some(project);
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        session
+            .update_scope(
+                Some(home),
+                Some(project),
+                Some(temp.path().to_string_lossy().into_owned()),
+            )
+            .await;
+        let keeper = create_mock_index_keeper(&client, &session);
+        let tool = SearchTool::new(
+            client,
+            session,
+            keeper,
+            mcp_types::atlas_layer::noop_layer(),
+        );
+
+        let (own, other) = mcp_client::run_with_installation_id(Uuid::new_v4(), || async {
+            let own = tool
+                .execute(json!({"query": "revoke_fn_487", "mode": "keyword"}))
+                .await
+                .unwrap();
+            let footer = text_of(&own);
+            let named = footer
+                .split("Product=")
+                .nth(1)
+                .map(|rest| rest.chars().take(36).collect::<String>())
+                .unwrap_or_else(|| panic!("the footer names the linked workspace: {footer}"));
+            let other = tool
+                .execute(
+                    json!({"query": "revoke_fn_487", "mode": "keyword", "workspace_id": named}),
+                )
+                .await
+                .unwrap();
+            (own, other)
+        })
+        .await;
+
+        let bodies = server.search_bodies();
+        let (own_bodies, other_bodies): (Vec<&Value>, Vec<&Value>) = bodies
+            .iter()
+            .partition(|body| body["workspace_id"] != linked.to_string().as_str());
+        assert!(
+            !own_bodies.is_empty() && !other_bodies.is_empty(),
+            "{bodies:?}"
+        );
+        // The session's own search keeps its checkout.
+        assert!(
+            own_bodies
+                .iter()
+                .any(|body| body["checkout_locator"].is_string()),
+            "{own_bodies:?}"
+        );
+        for body in &other_bodies {
+            for field in ["project_id", "installation_id", "checkout_locator"] {
+                assert!(body[field].is_null(), "{field}: {body}");
+            }
+        }
+        assert!(
+            text_of(&own).contains("[LINKED_WORKSPACES]"),
+            "{}",
+            text_of(&own)
+        );
+        let other_text = text_of(&other);
+        assert!(!other_text.contains("app/a.py"), "{other_text}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exhaustive_literal_page_keeps_indexed_lines_without_local_twins() {
         let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());

@@ -2991,6 +2991,22 @@ mod recall_augmentation_tests {
     }
 
     #[test]
+    fn recall_text_names_the_workspace_a_linked_doc_came_from() {
+        // #486: a linked workspace's doc in recall reads like this workspace's own otherwise.
+        let docs = vec![
+            json!({"title": "Own runbook", "content_preview": "Ours."}),
+            json!({"title": "Team runbook", "content_preview": "Theirs.", "linked": true,
+                   "workspace_name": "Product"}),
+        ];
+        let text = format_recall_augmented_text("runbook", &[], &[], &docs, &[]);
+        assert!(text.contains("1. **Own runbook**\n"), "{text}");
+        assert!(
+            text.contains("2. **Team runbook** (from Product)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn recall_text_includes_project_matches_when_present() {
         let project_matches = vec![json!({
             "kind": "project_doc",

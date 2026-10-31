@@ -332,10 +332,47 @@ mod degraded_memory_search_tests {
 mod caller_cache_identity_tests {
     use super::{
         build_memory_search_cache_key, build_transcripts_search_cache_key,
-        current_memory_cache_identity, memory_search_cache_key_for_caller,
+        current_memory_cache_identity, memory_search_cache, memory_search_cache_key_at,
+        memory_search_cache_key_for_caller, put_memory_search_cache,
         transcripts_search_cache_key_for_caller,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn a_link_change_gives_another_key_and_a_linked_answer_is_not_kept() {
+        // #487: after a share or unshare the hosted gateway replayed the memory
+        // search it had cached under the old link for up to 30 s.
+        let key = |links: u64| {
+            memory_search_cache_key_at(
+                "caller",
+                Some(Uuid::from_u128(1)),
+                None,
+                "team doc token",
+                None,
+                Some(10),
+                "0.0",
+                links,
+            )
+        };
+        assert_eq!(key(1), key(1));
+        assert_ne!(key(1), key(2));
+
+        let linked = (
+            "Team doc · from Product".to_string(),
+            serde_json::json!({
+                "linked_workspaces": [{"workspace_id": "w", "name": "Product", "hits": 1}],
+                "results": [],
+            }),
+        );
+        put_memory_search_cache(Some("caller-487"), "memory-487-linked".to_string(), linked);
+        assert!(memory_search_cache().get("memory-487-linked").is_none());
+        let own = (
+            "Team doc".to_string(),
+            serde_json::json!({"linked_workspaces": [], "results": [{"id": "d"}]}),
+        );
+        put_memory_search_cache(Some("caller-487"), "memory-487-own".to_string(), own);
+        assert!(memory_search_cache().get("memory-487-own").is_some());
+    }
 
     #[test]
     fn cache_keys_partition_callers_and_retain_no_raw_values() {

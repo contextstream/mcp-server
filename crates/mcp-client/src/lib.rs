@@ -34,6 +34,18 @@ pub use client::SessionRefreshHook;
 pub use client::TaskListFilters;
 pub use client::MEDIA_INDEX_MAX_BYTES;
 pub use client::{
+    answer_reads_linked_workspaces, get_task_auth_override, get_task_caller_cache_identity,
+    get_task_config_override, get_task_edge_geography, get_task_installation_id,
+    get_task_mcp_session_id, get_task_model_id, get_task_session_key,
+    get_task_tool_surface_profile, knowledge_link_generation, memory_write_generation,
+    note_knowledge_link_change_for_test, run_capturing_tenant_home, run_counting_api_calls,
+    run_with_auth_override, run_with_caller_cache_identity, run_with_capsule_scope,
+    run_with_config_override, run_with_edge_geography, run_with_installation_id,
+    run_with_mcp_session_id, run_with_model_id, run_with_session_key,
+    run_with_tool_surface_profile, spawn_with_task_context, ApiCallStats, CapturedTenantHome,
+    TaskContextSnapshot, TENANT_HOME_SCOPE_HEADER,
+};
+pub use client::{
     delta_since,
     entity_kind_to_path,
     feed_source_key,
@@ -190,17 +202,6 @@ pub use client::{
     FEED_GROUNDING_MAX_ITEMS,
     FEED_MAX_PAGE_SIZE,
     VALID_ENTITY_KINDS,
-};
-pub use client::{
-    get_task_auth_override, get_task_caller_cache_identity, get_task_config_override,
-    get_task_edge_geography, get_task_installation_id, get_task_mcp_session_id, get_task_model_id,
-    get_task_session_key, get_task_tool_surface_profile, knowledge_link_generation,
-    memory_write_generation, note_knowledge_link_change_for_test, run_capturing_tenant_home,
-    run_counting_api_calls, run_with_auth_override, run_with_caller_cache_identity,
-    run_with_capsule_scope, run_with_config_override, run_with_edge_geography,
-    run_with_installation_id, run_with_mcp_session_id, run_with_model_id, run_with_session_key,
-    run_with_tool_surface_profile, spawn_with_task_context, ApiCallStats, CapturedTenantHome,
-    TaskContextSnapshot, TENANT_HOME_SCOPE_HEADER,
 };
 pub use client::{
     local_files_denied, runtime_self_update_disabled, set_local_files_denied,

@@ -476,6 +476,90 @@ fn film_source(film: &Value) -> String {
     }
 }
 
+/// A recorded explainer's recording (Create's `film.recording`), when the film has one.
+pub(crate) fn recording_of(film: &Value) -> Option<&Value> {
+    film.get("recording")
+        .filter(|recording| recording.is_object())
+}
+
+/// The plan's line: "Recorded on a fresh machine: Claude Code 2.1.x with the ContextStream MCP, in mcp-server".
+pub(crate) fn recording_line(film: &Value) -> Option<String> {
+    recording_of(film)?
+        .get("line")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+/// What a recorded explainer's plan still asks before it can be recorded.
+pub(crate) fn recording_questions(film: &Value) -> Vec<String> {
+    recording_of(film)
+        .and_then(|recording| recording.get("questions"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|question| question.get("question").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Where a recorded explainer's film is, in one sentence: "Recording beat 2 of 4: Claude Code plans a film".
+fn recorded_phase_words(film: &Value, beats: &[Value]) -> String {
+    let count = beats.len();
+    let status_of = |beat: &Value| {
+        beat.get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let recorded = beats.iter().filter(|b| status_of(b) == "filmed").count();
+    let starting = matches!(
+        film.pointer("/recording/machine/state")
+            .and_then(Value::as_str),
+        None | Some("renting" | "starting" | "provisioning")
+    ) && recorded == 0;
+    match film.get("phase").and_then(Value::as_str) {
+        Some("story") => {
+            "Writing the sessions to record, while a fresh machine starts for them.".to_string()
+        }
+        Some("filming") => {
+            let busy = beats.iter().position(|b| {
+                matches!(status_of(b).as_str(), "filming" | "refilming" | "replanned")
+            });
+            match busy {
+                None => format!("Recording {count} sessions: {recorded} of {count} recorded."),
+                Some(at) => {
+                    let shows = beats[at]
+                        .get("shows")
+                        .and_then(Value::as_str)
+                        .map(|shows| shows.trim().trim_end_matches('.').to_string())
+                        .filter(|shows| !shows.is_empty());
+                    let what = shows.map_or(String::new(), |shows| format!(": {shows}"));
+                    let doing = match status_of(&beats[at]).as_str() {
+                        "refilming" => format!("Recording beat {} of {count} again{what}", at + 1),
+                        "replanned" => format!("Writing beat {} of {count} again", at + 1),
+                        _ if starting => format!(
+                            "Starting a fresh machine, then recording beat {} of {count}{what}",
+                            at + 1
+                        ),
+                        _ => format!("Recording beat {} of {count}{what}", at + 1),
+                    };
+                    format!("{doing}. {recorded} of {count} recorded.")
+                }
+            }
+        }
+        Some("narration") => format!("All {count} sessions recorded. Recording the narration."),
+        Some("cutting") => {
+            "Narrated. Cutting the recorded sessions into the film in the house look.".to_string()
+        }
+        Some("done") => format!("Recorded in {count} sessions on a fresh machine."),
+        _ => "Waiting to start.".to_string(),
+    }
+}
+
 /// Where a product explainer's film is, in one sentence.
 pub(crate) fn film_phase_words(film: &Value) -> String {
     let beats = film
@@ -491,6 +575,9 @@ pub(crate) fn film_phase_words(film: &Value) -> String {
             .to_string()
     };
     let filmed = beats.iter().filter(|b| status_of(b) == "filmed").count();
+    if recording_of(film).is_some() {
+        return recorded_phase_words(film, &beats);
+    }
     match film.get("phase").and_then(Value::as_str) {
         Some("story") => format!("Writing the story from {}.", film_source(film)),
         Some("filming") => {
@@ -738,6 +825,46 @@ mod tests {
         assert_eq!(
             film_phase_words(&done),
             "Filmed in 2 beats from Offscript Studio, map v8."
+        );
+    }
+
+    #[test]
+    fn a_recorded_explainer_says_which_session_it_is_recording() {
+        let film = json!({
+            "product": {"name": "Claude Code", "mapVersion": null},
+            "recording": {
+                "line": "Recorded on a fresh machine: Claude Code 2.1.x with the ContextStream MCP, in launch-site",
+                "questions": [],
+                "machine": {"state": "ready", "gpu": "RTX 4090", "minutes": 9.0}
+            },
+            "phase": "filming",
+            "beats": [
+                {"shows": "Claude Code plans a launch sound", "screen": "Claude Code", "status": "filmed"},
+                {"shows": "Claude Code planning a film.", "screen": "Claude Code", "status": "filming"},
+                {"shows": "The film's status", "screen": "Claude Code", "status": "waiting"},
+                {"shows": "The result", "screen": "Claude Code", "status": "waiting"},
+            ],
+        });
+        assert_eq!(
+            film_phase_words(&film),
+            "Recording beat 2 of 4: Claude Code planning a film. 1 of 4 recorded."
+        );
+        assert_eq!(
+            recording_line(&film).as_deref(),
+            Some("Recorded on a fresh machine: Claude Code 2.1.x with the ContextStream MCP, in launch-site")
+        );
+        let starting = json!({"recording": {"line": "x", "machine": {"state": "starting"}}, "phase": "filming",
+            "beats": [{"shows": "Plan a sound", "status": "filming"}, {"shows": "Make it", "status": "waiting"}]});
+        assert_eq!(
+            film_phase_words(&starting),
+            "Starting a fresh machine, then recording beat 1 of 2: Plan a sound. 0 of 2 recorded."
+        );
+        let asks = json!({"recording": {"line": "x", "questions": [{"id": "repo", "question": "Which repository?"}]}});
+        assert_eq!(recording_questions(&asks), ["Which repository?"]);
+        let done = json!({"recording": {"line": "x"}, "phase": "done", "beats": [{}, {}, {}]});
+        assert_eq!(
+            film_phase_words(&done),
+            "Recorded in 3 sessions on a fresh machine."
         );
     }
 }

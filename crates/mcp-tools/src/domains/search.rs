@@ -3791,14 +3791,71 @@ fn score_confidence_band(score: Option<f64>) -> &'static str {
     }
 }
 
+/// Whether the server returned this row without checking it against the
+/// query's regex (`metadata.literal_verified: false`). Its pattern lane can't
+/// run a regex with `\b`, `\s`, `\w`, `\d`, `.*`, `|` or `(?`, so it returns
+/// rows that share words with the pattern and marks them (#364).
+fn row_is_regex_unchecked(item: &mcp_types::api::SearchResult) -> bool {
+    item.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("literal_verified"))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+/// How many rows of a page the server did not check against the regex.
+fn regex_unchecked_rows(results: &[mcp_types::api::SearchResult]) -> usize {
+    results
+        .iter()
+        .filter(|item| row_is_regex_unchecked(item))
+        .count()
+}
+
+/// The mark on a row the server did not check against the regex.
+const REGEX_UNCHECKED_ROW_LABEL: &str = "[related, not checked against the regex]";
+
+/// The header of a page with rows the server did not check against the regex:
+/// those are related rows, not results, and a pattern without the regex
+/// features the server can't run is checked exactly (#364).
+fn regex_unchecked_header(
+    checked: usize,
+    unchecked: usize,
+    query: &str,
+    mode: &str,
+    timing: &str,
+) -> String {
+    let related = format!(
+        "{unchecked} related row{}",
+        if unchecked == 1 { "" } else { "s" }
+    );
+    let lead = if checked == 0 {
+        format!("\u{1f50d} No checked matches for \"{query}\" ({mode} search{timing}): {related} below.")
+    } else {
+        format!(
+            "\u{1f50d} {checked} checked match{} and {related} for \"{query}\" ({mode} search{timing}).",
+            if checked == 1 { "" } else { "es" }
+        )
+    };
+    format!(
+        "{lead} The server can't run this regex, so it did not check the related rows (marked) against it: they may not match, and lines that do match may be missing. Without `\\b`, `\\s`, `\\w`, `\\d`, `.*`, `|` or `(?`, a pattern is checked exactly.\n\n"
+    )
+}
+
 /// A row's confidence band. When the server checked the row literally
 /// (`metadata.literal_match`), that check decides: a row that does not contain
 /// the query is never more than "low", whatever its score, and a row that
-/// contains it exactly is "high". Otherwise the score decides.
+/// contains it exactly is "high". A row the server did not check against the
+/// query's regex is never more than "low" either. Otherwise the score decides.
 fn result_confidence_band(item: Option<&mcp_types::api::SearchResult>) -> &'static str {
     let Some(item) = item else {
         return "unknown";
     };
+    if row_is_regex_unchecked(item) {
+        return match score_confidence_band(item.score) {
+            "unknown" => "unknown",
+            _ => "low",
+        };
+    }
     let literal = item
         .metadata
         .as_ref()
@@ -13693,13 +13750,24 @@ impl SearchTool {
                 .query_time_ms
                 .map(|ms| format!(" in {}ms", ms))
                 .unwrap_or_default();
-            text.push_str(&format!(
-                "\u{1f50d} {} results for \"{}\" ({} search{}):\n\n",
-                total,
-                input.query,
-                executed_mode.as_str(),
-                timing
-            ));
+            let unchecked = regex_unchecked_rows(&result.results);
+            if unchecked > 0 {
+                text.push_str(&regex_unchecked_header(
+                    result.results.len() - unchecked,
+                    unchecked,
+                    &input.query,
+                    executed_mode.as_str(),
+                    &timing,
+                ));
+            } else {
+                text.push_str(&format!(
+                    "\u{1f50d} {} results for \"{}\" ({} search{}):\n\n",
+                    total,
+                    input.query,
+                    executed_mode.as_str(),
+                    timing
+                ));
+            }
 
             // Honest provenance when the server's zero-result recovery found
             // these rows via fast-tier query rewrites instead of the original
@@ -13794,9 +13862,10 @@ impl SearchTool {
                         unscored.score = None;
                         format_result_line(position, &unscored, show_content)
                     };
+                    let line = label_widened_scope_row(line, widened_row_label(item).as_deref());
                     text.push_str(&label_widened_scope_row(
                         line,
-                        widened_row_label(item).as_deref(),
+                        row_is_regex_unchecked(item).then_some(REGEX_UNCHECKED_ROW_LABEL),
                     ));
                 }
                 if omitted_rows > 0 {

@@ -1377,8 +1377,20 @@ fn normalize_graph_target_type(target_type: Option<String>, target_id: &str) -> 
     }
 }
 
+/// The usages target type: as given, else read from the id's shape. A path
+/// is a module, and anything else is matched as any kind: the old default,
+/// "component", matched no Python function or module, so usages answered 0
+/// for targets with callers (#468).
 fn normalize_usages_target_type(target_type: Option<String>, target_id: &str) -> String {
-    normalize_graph_target_type(target_type, target_id).unwrap_or_else(|| "component".to_string())
+    normalize_graph_target_type(target_type, target_id).unwrap_or_else(|| {
+        let id = target_id.trim();
+        let path_like = !id.contains("::")
+            && (id.contains('/')
+                || id
+                    .rsplit_once('.')
+                    .is_some_and(|(stem, ext)| !stem.is_empty() && (1..=5).contains(&ext.len())));
+        if path_like { "module" } else { "any" }.to_string()
+    })
 }
 
 fn array_len_for_any_key(result: &Value, keys: &[&str]) -> usize {
@@ -2740,10 +2752,14 @@ impl GraphTool {
                     .map(|a| a.len())
                     .unwrap_or(0);
 
-                let mut text = format!(
-                    "Found {} usages of {} \"{}\".\n\n",
-                    usages_count, target_type, target_id
-                );
+                let mut text = if target_type == "any" {
+                    format!("Found {usages_count} usages of \"{target_id}\".\n\n")
+                } else {
+                    format!(
+                        "Found {} usages of {} \"{}\".\n\n",
+                        usages_count, target_type, target_id
+                    )
+                };
 
                 if let Some(usages_arr) = result.get("usages").and_then(|v| v.as_array()) {
                     for (i, usage) in usages_arr.iter().take(20).enumerate() {
@@ -2866,6 +2882,40 @@ fn graph_not_ready(status: &Value) -> Option<String> {
     })
 }
 
+/// The API's answer for a target the project's graph does not hold
+/// (mcp-server#424); before the graph is built every target gets it.
+fn error_says_target_not_in_graph(error: &Error) -> bool {
+    matches!(error, Error::Http { status: 404, message, .. }
+        if message.contains("is not in this project's code graph"))
+}
+
+impl GraphTool {
+    /// What the graph's status says when the project's graph is not built
+    /// ("status: empty, 0 nodes"); `None` when it is, or when that cannot be
+    /// told. The graph's own status, not Code Health freshness: freshness
+    /// reported a timestamped version for a project whose graph was still
+    /// empty (#370 retest).
+    async fn graph_not_built_state(
+        &self,
+        workspace_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Option<String> {
+        let scope = resolve_read_scope(
+            &self.client,
+            self.session.as_ref(),
+            workspace_id,
+            project_id,
+        )
+        .await
+        .ok()?;
+        self.client
+            .graph_status(scope.project_id)
+            .await
+            .ok()
+            .and_then(|status| graph_not_ready(&status))
+    }
+}
+
 #[async_trait]
 impl ToolHandler for GraphTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
@@ -2876,35 +2926,34 @@ impl ToolHandler for GraphTool {
             .to_ascii_lowercase();
         let raw_id = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_string);
         let (raw_workspace, raw_project) = (raw_id("workspace_id"), raw_id("project_id"));
-        let result = self.execute_action(input).await?;
-        if result.is_error
-            || !GRAPH_ANALYSES.contains(&action.as_str())
-            || !reports_nothing(&result)
-        {
+        let is_analysis = GRAPH_ANALYSES.contains(&action.as_str());
+        let result = match self.execute_action(input).await {
+            Ok(result) => result,
+            // "not in this project's code graph … Check the spelling" for a
+            // graph that is not built yet: say that first (#472).
+            Err(error) if is_analysis && error_says_target_not_in_graph(&error) => {
+                return match self
+                    .graph_not_built_state(raw_workspace.as_deref(), raw_project.as_deref())
+                    .await
+                {
+                    Some(state) => Ok(ToolResult::with_structured(
+                        graph_not_built_text(&state),
+                        serde_json::json!({"graph_built": false}),
+                    )),
+                    None => Err(error),
+                };
+            }
+            Err(error) => return Err(error),
+        };
+        if result.is_error || !is_analysis || !reports_nothing(&result) {
             return Ok(result);
         }
         // An analysis of a graph that was never built found nothing because
         // there is nothing to search: for minutes after setup it said "no
         // cycles", "0 usages" and "likely low-risk" (#370).
-        let Ok(scope) = resolve_read_scope(
-            &self.client,
-            self.session.as_ref(),
-            raw_workspace.as_deref(),
-            raw_project.as_deref(),
-        )
-        .await
-        else {
-            return Ok(result);
-        };
-        // The graph's own status, not Code Health freshness: freshness
-        // reported a timestamped version for a project whose graph was still
-        // empty (#370 retest).
         let Some(state) = self
-            .client
-            .graph_status(scope.project_id)
+            .graph_not_built_state(raw_workspace.as_deref(), raw_project.as_deref())
             .await
-            .ok()
-            .and_then(|status| graph_not_ready(&status))
         else {
             return Ok(result);
         };
@@ -3172,6 +3221,30 @@ mod graph_not_built_tests {
             text.starts_with("[GRAPH NOT BUILT]") && text.contains("graph(action=\"ingest\")"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_target_the_graph_lacks_is_told_apart_from_an_unbuilt_graph() {
+        // #472: before the graph was built every target got "is not in this
+        // project's code graph … Check the spelling".
+        let http = |status: u16, message: &str| Error::Http {
+            status,
+            message: message.to_string(),
+            code: mcp_types::ErrorCode::UnknownError,
+            source: None,
+        };
+        assert!(error_says_target_not_in_graph(&http(
+            404,
+            "Not found: \"slugify_title\" is not in this project's code graph: no function, type, module or file has that id, path or name."
+        )));
+        assert!(!error_says_target_not_in_graph(&http(
+            404,
+            "Project not found"
+        )));
+        assert!(!error_says_target_not_in_graph(&http(
+            500,
+            "\"x\" is not in this project's code graph"
+        )));
     }
 
     #[test]

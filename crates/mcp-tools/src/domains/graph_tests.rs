@@ -214,6 +214,20 @@ mod usages_target_type_tests {
     }
 
     #[test]
+    fn an_untyped_target_is_a_module_when_it_is_a_path_and_any_kind_otherwise() {
+        // #468: the "component" default matched no Python function or module.
+        for (id, expected) in [
+            ("used_fn", "any"),
+            ("util.py::used_fn", "any"),
+            ("util.py", "module"),
+            ("src/app", "module"),
+            ("HydrationStateService", "type"),
+        ] {
+            assert_eq!(normalize_usages_target_type(None, id), expected, "{id}");
+        }
+    }
+
+    #[test]
     fn normalizes_service_alias_to_type() {
         assert_eq!(
             normalize_usages_target_type(Some("service".to_string()), "HydrationStateService"),

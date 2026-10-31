@@ -952,6 +952,34 @@ fn doc_object_mut(value: &mut Value) -> Option<&mut serde_json::Map<String, Valu
     data.get_mut("data").and_then(Value::as_object_mut)
 }
 
+/// A doc's detail is read by id (`GET /docs/{id}`), whose answer does not say the doc came from
+/// a linked workspace. When the list row it was resolved from says so, the detail takes the
+/// row's label and shows where the doc came from too (#486).
+fn carry_linked_label(detail: &mut Value, rows: &[Value], id: Uuid) {
+    let id = id.to_string();
+    let Some(row) = rows
+        .iter()
+        .find(|row| row.get("id").and_then(Value::as_str) == Some(id.as_str()))
+        .filter(|row| super::linked_workspaces::is_linked(row))
+    else {
+        return;
+    };
+    let Some(path) = ["", "/data", "/data/data"]
+        .into_iter()
+        .find(|path| detail.pointer(path).and_then(|doc| doc.get("id")).is_some())
+    else {
+        return;
+    };
+    let Some(doc) = detail.pointer_mut(path).and_then(Value::as_object_mut) else {
+        return;
+    };
+    for key in ["linked", "workspace_name", "workspace_id"] {
+        if let Some(value) = row.get(key) {
+            doc.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
 /// A doc as `get_doc` shows it: the header and at most one window of the
 /// content (#384). The structured copy gets the same window, with where it
 /// sits in the whole, so neither copy carries a large doc in full.
@@ -1946,6 +1974,29 @@ async fn search_docs_by_title(
     query: &str,
     limit: Option<i64>,
 ) -> Result<Vec<Value>> {
+    search_docs_by_title_reporting(
+        client,
+        workspace_id,
+        project_id,
+        doc_type,
+        is_personal,
+        query,
+        limit,
+    )
+    .await
+    .map(|(docs, _)| docs)
+}
+
+/// [`search_docs_by_title`], with the `linked_workspaces` its query read reported.
+async fn search_docs_by_title_reporting(
+    client: &ContextStreamClient,
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    doc_type: Option<&str>,
+    is_personal: Option<bool>,
+    query: &str,
+    limit: Option<i64>,
+) -> Result<(Vec<Value>, Vec<Value>)> {
     let fetch_limit = limit.unwrap_or(50).clamp(5, 100);
     let return_limit = limit.unwrap_or(10).clamp(1, 25) as usize;
     let query = query.trim();
@@ -1959,6 +2010,7 @@ async fn search_docs_by_title(
             Some(fetch_limit),
         )
         .await?;
+    let linked_reports = super::linked_workspaces::linked_workspaces(&server_docs);
     let mut docs = extract_collection_array(&server_docs)
         .cloned()
         .unwrap_or_default();
@@ -1990,7 +2042,7 @@ async fn search_docs_by_title(
 
     let mut ranked = rank_docs_for_query(dedupe_docs(docs), query, return_limit);
     keep_server_body_matches(&mut ranked, server_matches, return_limit);
-    Ok(ranked)
+    Ok((ranked, linked_reports))
 }
 
 /// What a doc the server matched by its body scores in memory search: as
@@ -2046,7 +2098,7 @@ fn format_doc_matches(query: &str, docs: &[Value]) -> String {
             i + 1,
             title,
             id,
-            doc_type
+            super::linked_workspaces::label_with_workspace(doc_type, doc)
         ));
     }
 
@@ -2084,6 +2136,28 @@ async fn resolve_doc_uuid_for_action(
         Some(DOC_LOOKUP_LIMIT),
     )
     .await?;
+    // A doc read from a linked workspace is read only here: a title never picks one to change
+    // or delete (shared knowledge never writes through a link).
+    let (linked, matches): (Vec<Value>, Vec<Value>) = matches
+        .into_iter()
+        .partition(super::linked_workspaces::is_linked);
+    if matches.is_empty() && !linked.is_empty() {
+        let mut names: Vec<String> = Vec::new();
+        for doc in &linked {
+            if let Some(name) = super::linked_workspaces::linked_workspace_name(doc) {
+                let name = one_line(name);
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        return Err(Error::Validation(format!(
+            "No doc in this workspace matches \"{}\"; nothing was {}. The docs that do are in linked workspaces ({}), which are read only here. To change one, work in its own workspace.",
+            lookup.trim(),
+            action.done,
+            names.join(", ")
+        )));
+    }
     resolve_memory_reference(
         &DOC,
         action,
@@ -2424,7 +2498,7 @@ impl ToolHandler for MemorySearchTool {
             async {
                 tokio::time::timeout(
                     MEMORY_SEARCH_DOCS_TIMEOUT,
-                    search_docs_by_title(
+                    search_docs_by_title_reporting(
                         &docs_client,
                         workspace_id,
                         project_id,
@@ -2438,6 +2512,10 @@ impl ToolHandler for MemorySearchTool {
                 .map_err(|_| Error::Timeout(MEMORY_SEARCH_DOCS_TIMEOUT.as_secs()))?
             }
         );
+        let (docs, doc_reports) = match docs {
+            Ok((docs, reports)) => (Ok(docs), reports),
+            Err(error) => (Err(error), Vec::new()),
+        };
         let (response, docs, memory_transport_degraded, docs_degraded) = match (response, docs) {
             (Ok(response), Ok(docs)) => (response, docs, false, false),
             (Err(memory_error), Ok(docs))
@@ -2506,7 +2584,10 @@ impl ToolHandler for MemorySearchTool {
                     }
                 };
                 match detail {
-                    Ok(doc) => Some(doc),
+                    Ok(mut doc) => {
+                        carry_linked_label(&mut doc, &docs, doc_uuid);
+                        Some(doc)
+                    }
                     Err(error) => {
                         doc_detail_degraded = true;
                         tracing::warn!(error = %error, "document detail lookup unavailable; preserving ranked matches");
@@ -2551,14 +2632,36 @@ impl ToolHandler for MemorySearchTool {
         } else {
             format!("{}\n\n{text}", notices.join("\n"))
         };
-        let text = match super::linked_workspaces::linked_footer(&response) {
+        // What the answer shows from each linked workspace, its docs included.
+        let mut shown: Vec<&Value> = hybrid_results.iter().collect();
+        if let Some(detail) = resolved_doc
+            .as_ref()
+            .map(|doc| extract_primary_object(doc, &["id", "title", "content"]))
+        {
+            if !hybrid_results
+                .iter()
+                .any(|row| row.get("id").is_some() && row.get("id") == detail.get("id"))
+            {
+                shown.push(detail);
+            }
+        }
+        let linked_reports = super::linked_workspaces::answer_reports(
+            &[
+                super::linked_workspaces::linked_workspaces(&response),
+                doc_reports,
+            ],
+            &shown,
+        );
+        let text = match super::linked_workspaces::linked_footer(
+            &serde_json::json!({ "linked_workspaces": linked_reports }),
+        ) {
             Some(footer) => format!("{text}\n\n{footer}"),
             None => text,
         };
 
         let structured = serde_json::json!({
             "query": query,
-            "linked_workspaces": super::linked_workspaces::linked_workspaces(&response),
+            "linked_workspaces": linked_reports,
             "results": hybrid_results,
             "doc_matches": docs,
             "resolved_doc": resolved_doc,
@@ -6182,6 +6285,7 @@ impl MemoryTool {
                 .found(DOC.kind, query);
                 if let Some(found) = named {
                     let mut result = self.client.get_doc(found.id).await?;
+                    carry_linked_label(&mut result, &matches, found.id);
                     let text = format!(
                         "Resolved doc query \"{}\" to doc ID {}.\n\n{}",
                         query,

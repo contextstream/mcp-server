@@ -82,11 +82,18 @@ pub(crate) fn linked_footer(response: &Value) -> Option<String> {
         if report.get("include_code").and_then(Value::as_bool) == Some(false) {
             notes.push("no code".to_string());
         }
-        match status {
-            "ok" => notes.push(format!("{hits} shown")),
-            "timed_out" => notes.push("not read in time".to_string()),
-            "unavailable" => notes.push("not readable from this region".to_string()),
-            _ => notes.push("not read".to_string()),
+        let unread = match status {
+            "ok" => None,
+            "timed_out" => Some("not read in time"),
+            "unavailable" => Some("not readable from this region"),
+            _ => Some("not read"),
+        };
+        // An answer can read a workspace twice (memory search reads its docs apart); what one
+        // read found still shows when the other did not finish.
+        match unread {
+            None => notes.push(format!("{hits} shown")),
+            Some(why) if hits > 0 => notes.push(format!("{hits} shown; part {why}")),
+            Some(why) => notes.push(why.to_string()),
         }
         parts.push(format!("{name} ({})", notes.join("; ")));
         if let Some(id) = report.get("workspace_id").and_then(Value::as_str) {
@@ -108,6 +115,65 @@ pub(crate) fn linked_footer(response: &Value) -> Option<String> {
         ));
     }
     Some(text)
+}
+
+/// Whether `report` is the report of the workspace with this id (or, lacking ids, this name).
+fn reports_workspace(report: &Value, id: Option<&str>, name: &str) -> bool {
+    match (report.get("workspace_id").and_then(Value::as_str), id) {
+        (Some(reported), Some(id)) => reported == id,
+        _ => report
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|reported| one_line(reported) == one_line(name)),
+    }
+}
+
+/// The `linked_workspaces` of an answer made from several reads (memory search reads its docs
+/// apart from its memory), one report per workspace. A workspace one read could not read keeps
+/// that read's status. `hits` counts the items of `shown` that came from the workspace, so the
+/// footer says what the answer shows: a linked doc showed above "(0 shown)", the memory read's
+/// count (#486). A workspace that only `shown` names is added as read.
+pub(crate) fn answer_reports(reads: &[Vec<Value>], shown: &[&Value]) -> Vec<Value> {
+    let mut reports: Vec<Value> = Vec::new();
+    for report in reads.iter().flatten() {
+        let Some(name) = report.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let id = report.get("workspace_id").and_then(Value::as_str);
+        let status = report.get("status").and_then(Value::as_str).unwrap_or("ok");
+        match reports
+            .iter_mut()
+            .find(|kept| reports_workspace(kept, id, name))
+        {
+            Some(kept) => {
+                if status != "ok"
+                    && kept.get("status").and_then(Value::as_str).unwrap_or("ok") == "ok"
+                {
+                    kept["status"] = Value::from(status);
+                }
+            }
+            None => reports.push(report.clone()),
+        }
+    }
+    for report in &mut reports {
+        report["hits"] = Value::from(0);
+    }
+    for item in shown {
+        let Some(name) = linked_workspace_name(item) else {
+            continue;
+        };
+        let id = linked_workspace_id(item);
+        match reports
+            .iter_mut()
+            .find(|kept| reports_workspace(kept, id, name))
+        {
+            Some(kept) => kept["hits"] = Value::from(kept["hits"].as_u64().unwrap_or(0) + 1),
+            None => reports.push(serde_json::json!({
+                "workspace_id": id, "name": name, "status": "ok", "hits": 1,
+            })),
+        }
+    }
+    reports
 }
 
 /// The code a search found in the workspaces linked to this one (the API's `linked_results` and
@@ -218,6 +284,34 @@ mod tests {
             .ends_with("To search one fully, pass its workspace_id (Product=w-1, Design=w-2)."));
         assert!(linked_footer(&json!({"results": []})).is_none());
         assert!(linked_footer(&json!({"linked_workspaces": []})).is_none());
+    }
+
+    #[test]
+    fn an_answer_counts_what_it_shows_from_each_linked_workspace() {
+        // #486: memory search showed a linked doc above "Product (0 shown)": the count was the
+        // memory read's, and the doc came from the docs read.
+        let memory = vec![
+            json!({"workspace_id": "w-1", "name": "Product", "include_code": true, "status": "ok", "hits": 0}),
+            json!({"workspace_id": "w-2", "name": "Design", "include_code": true, "status": "ok", "hits": 1}),
+        ];
+        let docs = vec![
+            json!({"workspace_id": "w-1", "name": "Product", "include_code": true, "status": "ok", "hits": 1}),
+            json!({"workspace_id": "w-2", "name": "Design", "include_code": true, "status": "timed_out", "hits": 0}),
+            json!({"workspace_id": "w-3", "name": "Ops", "include_code": true, "status": "failed", "hits": 0}),
+        ];
+        let doc = json!({"id": "d-1", "linked": true, "workspace_name": "Product", "workspace_id": "w-1"});
+        let decision = json!({"id": "n-1", "metadata": {"linked": true, "workspace_name": "Design", "workspace_id": "w-2"}});
+        let own = json!({"id": "d-2", "workspace_id": "w-home"});
+        let unreported =
+            json!({"id": "d-3", "linked": true, "workspace_name": "Sales", "workspace_id": "w-4"});
+        let reports = answer_reports(&[memory, docs], &[&doc, &decision, &own, &unreported]);
+        let footer = linked_footer(&json!({"linked_workspaces": reports})).expect("footer");
+        assert!(
+            footer.starts_with("[LINKED_WORKSPACES] Also searched the workspaces linked to this one: Product (1 shown), Design (1 shown; part not read in time), Ops (not read), Sales (1 shown)."),
+            "{footer}"
+        );
+        assert_eq!(reports.len(), 4);
+        assert!(answer_reports(&[vec![], vec![]], &[&own]).is_empty());
     }
 
     #[test]

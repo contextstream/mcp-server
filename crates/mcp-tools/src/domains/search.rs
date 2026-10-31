@@ -14298,6 +14298,15 @@ impl SearchTool {
             }
         }
 
+        // Shared knowledge: the code the API found in the workspaces linked to this one
+        // (contextstream plan 483f30df), after this workspace's own results.
+        crate::domains::linked_workspaces::append_linked_code(
+            &mut text,
+            &mut structured,
+            &result.linked_results,
+            &result.linked_workspaces,
+        );
+
         // Rollout logging (requirement #11)
         crate::domains::scope::log_mcp_request(
             "search",

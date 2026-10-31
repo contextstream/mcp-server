@@ -3139,10 +3139,230 @@ mod paging_footer_tests {
 
 mod linked_doc_label_tests {
     use super::{
-        build_hybrid_search_results, format_collection, format_doc_detail,
-        format_hybrid_search_results,
+        build_hybrid_search_results, carry_linked_label, format_collection, format_doc_detail,
+        format_doc_matches, format_hybrid_search_results, resolve_doc_uuid_for_action,
+        MemorySearchTool, TestFixtures, ToolHandler,
     };
-    use serde_json::json;
+    use crate::domains::lookup::{Lookup, LookupAction};
+    use mcp_client::ContextStreamClient;
+    use mcp_types::tool::ContentItem;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const LINKED_DOC: &str = "22222222-2222-4222-8222-222222222222";
+    const OWN_DOC: &str = "33333333-3333-4333-8333-333333333333";
+    const LINKED_WS: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn linked_row(title: &str) -> Value {
+        json!({"id": LINKED_DOC, "title": title, "doc_type": "general",
+               "content": "Team doc body.", "linked": true, "workspace_name": "Product",
+               "workspace_id": LINKED_WS})
+    }
+
+    /// Serves `docs` for doc lists, `detail` for any doc read by id and `memory` for memory
+    /// search until the client goes quiet; returns the request lines it saw.
+    fn serve(
+        listener: tokio::net::TcpListener,
+        docs: Value,
+        detail: Value,
+        memory: Value,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let mut buffer = vec![0u8; 32 * 1024];
+                let read = socket.read(&mut buffer).await.expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let line = request.lines().next().unwrap_or_default().to_string();
+                let body = if line.starts_with("GET /api/v1/docs/") {
+                    detail.clone()
+                } else if line.starts_with("GET /api/v1/docs") {
+                    docs.clone()
+                } else if line.starts_with("POST /api/v1/memory/search ") {
+                    memory.clone()
+                } else {
+                    panic!("unexpected request line: {line}");
+                }
+                .to_string();
+                lines.push(line);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            lines
+        })
+    }
+
+    async fn mock_api() -> (ContextStreamClient, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{}", listener.local_addr().expect("listener addr"));
+        config.api_key = Some("test-key".to_string());
+        (ContextStreamClient::new(config), listener)
+    }
+
+    #[test]
+    fn a_detail_read_by_id_keeps_the_label_of_the_row_it_was_resolved_from() {
+        // #486: get_doc by title and memory search re-read the doc by id, whose answer has no
+        // label, so a linked doc's detail read like this workspace's own.
+        let id = uuid::Uuid::parse_str(LINKED_DOC).unwrap();
+        let rows = [linked_row("Team doc title")];
+        let mut wrapped = json!({"data": {"id": LINKED_DOC, "title": "Team doc title",
+                                          "doc_type": "general", "content": "Team doc body."}});
+        carry_linked_label(&mut wrapped, &rows, id);
+        assert!(
+            format_doc_detail(&wrapped).contains("\nFrom: Product (a linked workspace; read only)")
+        );
+        let mut own = json!({"id": OWN_DOC, "title": "Own doc", "content": "Own body."});
+        let own_rows = [json!({"id": OWN_DOC, "title": "Own doc", "doc_type": "general"})];
+        carry_linked_label(&mut own, &own_rows, uuid::Uuid::parse_str(OWN_DOC).unwrap());
+        assert!(!format_doc_detail(&own).contains("From:"));
+        assert_eq!(own.get("linked"), None);
+    }
+
+    #[test]
+    fn doc_candidates_name_a_linked_workspace() {
+        // #486: get_doc's candidate list showed a linked doc as "[general]".
+        let own = json!({"id": OWN_DOC, "title": "Own doc", "doc_type": "general"});
+        let text = format_doc_matches("doc title", &[linked_row("Team doc title"), own]);
+        assert!(
+            text.contains(&format!(
+                "1. **Team doc title** (id: {LINKED_DOC}) [general · from Product]"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("2. **Own doc** (id: {OWN_DOC}) [general]")),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_search_shows_where_a_linked_doc_came_from_and_counts_it() {
+        // #486: the resolved doc's detail had no "From:" line, and the footer under the linked
+        // doc said "Product (0 shown)".
+        let (client, listener) = mock_api().await;
+        let report = json!({"workspace_id": LINKED_WS, "name": "Product", "include_code": true,
+                            "status": "ok", "hits": 0});
+        let docs_report = json!({"workspace_id": LINKED_WS, "name": "Product",
+                                 "include_code": true, "status": "ok", "hits": 1});
+        let server = serve(
+            listener,
+            json!({"success": true, "data": {"items": [linked_row("Team doc title 486")],
+                                             "total": 0, "linked_workspaces": [docs_report]}}),
+            json!({"success": true, "data": {"id": LINKED_DOC, "title": "Team doc title 486",
+                                             "doc_type": "general", "content": "Team doc body.",
+                                             "workspace_id": LINKED_WS}}),
+            json!({"success": true, "data": {"results": [], "total": 0,
+                                             "linked_workspaces": [report]}}),
+        );
+        let tool = MemorySearchTool::new(client);
+        let result = tool
+            .execute(json!({"query": "Team doc title 486", "limit": 5}))
+            .await
+            .expect("memory search");
+        let text = match &result.content[0] {
+            ContentItem::Text { text } => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(text.contains("Resolved doc query"), "{text}");
+        assert!(
+            text.contains("\nFrom: Product (a linked workspace; read only)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[doc/general · from Product] **Team doc title 486**"),
+            "{text}"
+        );
+        assert!(
+            text.contains("linked to this one: Product (1 shown)."),
+            "{text}"
+        );
+        let structured = result.structured_content.expect("structured");
+        assert_eq!(structured["linked_workspaces"][0]["hits"], 1);
+        let resolved = &structured["resolved_doc"];
+        let name = resolved
+            .pointer("/data/workspace_name")
+            .or_else(|| resolved.get("workspace_name"));
+        assert_eq!(name, Some(&json!("Product")));
+        let lines = server.await.expect("server");
+        assert!(lines
+            .iter()
+            .any(|line| line.starts_with(&format!("GET /api/v1/docs/{LINKED_DOC}"))));
+    }
+
+    #[tokio::test]
+    async fn a_title_never_picks_a_linked_doc_to_change() {
+        // Shared knowledge reads only: update_doc and delete_doc by title resolve in this
+        // workspace, though the docs list falls through to linked workspaces.
+        let (client, listener) = mock_api().await;
+        let server = serve(
+            listener,
+            json!({"success": true, "data": {"items": [linked_row("Team doc title")], "total": 0}}),
+            json!({}),
+            json!({}),
+        );
+        for action in [LookupAction::UPDATE, LookupAction::DELETE] {
+            let error = match resolve_doc_uuid_for_action(
+                &client,
+                None,
+                None,
+                "Team doc title",
+                None,
+                None,
+                action,
+                "update_doc",
+            )
+            .await
+            {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("a linked doc was picked to change"),
+            };
+            assert!(
+                error.contains("No doc in this workspace matches \"Team doc title\""),
+                "{error}"
+            );
+            assert!(
+                error.contains("linked workspaces (Product), which are read only here"),
+                "{error}"
+            );
+        }
+        drop(server);
+
+        let (client, listener) = mock_api().await;
+        let own = json!({"id": OWN_DOC, "title": "Team doc title", "doc_type": "general"});
+        let server = serve(
+            listener,
+            json!({"success": true, "data": {"items": [linked_row("Team doc title"), own]}}),
+            json!({}),
+            json!({}),
+        );
+        match resolve_doc_uuid_for_action(
+            &client,
+            None,
+            None,
+            "Team doc title",
+            None,
+            None,
+            LookupAction::UPDATE,
+            "update_doc",
+        )
+        .await
+        {
+            Ok(Lookup::Found(found)) => assert_eq!(found.id.to_string(), OWN_DOC),
+            other => panic!("expected this workspace's doc, got {:?}", other.map(|_| ())),
+        }
+        drop(server);
+    }
 
     #[test]
     fn a_doc_of_a_linked_workspace_names_it_in_search_and_in_lists() {

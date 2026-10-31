@@ -60,6 +60,10 @@ fn put_memory_search_cache(
     let Some(caller_identity) = caller_identity else {
         return;
     };
+    // An answer read through a link to another workspace is not kept (#487).
+    if mcp_client::answer_reads_linked_workspaces(&value.1) {
+        return;
+    }
     if !rendered_entry_fits(&value.0, &value.1, MEMORY_SEARCH_CACHE_MAX_ENTRY_BYTES) {
         tracing::debug!("memory search result exceeded local cache entry budget");
         return;
@@ -105,6 +109,30 @@ fn build_memory_search_cache_key(
     node_type: Option<&str>,
     limit: Option<i64>,
 ) -> String {
+    memory_search_cache_key_at(
+        caller_identity,
+        workspace_id,
+        project_id,
+        query,
+        node_type,
+        limit,
+        &mcp_client::memory_write_generation(),
+        mcp_client::knowledge_link_generation(),
+    )
+}
+
+/// [`build_memory_search_cache_key`] at the given memory-write and link generations.
+#[allow(clippy::too_many_arguments)]
+fn memory_search_cache_key_at(
+    caller_identity: &str,
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    query: &str,
+    node_type: Option<&str>,
+    limit: Option<i64>,
+    memory_writes: &str,
+    knowledge_links: u64,
+) -> String {
     let workspace_id = workspace_id.map(|id| id.to_string());
     let project_id = project_id.map(|id| id.to_string());
     let limit = limit.map(|value| value.to_string());
@@ -118,8 +146,11 @@ fn build_memory_search_cache_key(
     append_memory_cache_key_field(&mut canonical, "limit", limit.as_deref());
     // A write by this caller changes the key: the search made before it is
     // not replayed after it (#464).
-    let generation = mcp_client::memory_write_generation();
-    append_memory_cache_key_field(&mut canonical, "memory_writes", Some(&generation));
+    append_memory_cache_key_field(&mut canonical, "memory_writes", Some(memory_writes));
+    // So does a link change made in this process, by any caller: what the
+    // linked workspaces add follows the links (#487).
+    let knowledge_links = knowledge_links.to_string();
+    append_memory_cache_key_field(&mut canonical, "knowledge_links", Some(&knowledge_links));
     format!(
         "memory-search-local:v2:{}",
         super::search::sha256_hex_bytes(&canonical)

@@ -11774,6 +11774,10 @@ fn put_recall_cache(caller_identity: Option<&str>, cache_key: String, value: (St
     let Some(caller_identity) = caller_identity else {
         return;
     };
+    // An answer read through a link to another workspace is not kept (#487).
+    if mcp_client::answer_reads_linked_workspaces(&value.1) {
+        return;
+    }
     if !crate::domains::result_cache::rendered_entry_fits(
         &value.0,
         &value.1,
@@ -11799,6 +11803,32 @@ fn build_recall_cache_key(
     include_related: Option<bool>,
     include_decisions: Option<bool>,
 ) -> String {
+    recall_cache_key_at(
+        caller_identity,
+        workspace_id,
+        project_id,
+        checkout_locator,
+        query,
+        include_related,
+        include_decisions,
+        &mcp_client::memory_write_generation(),
+        mcp_client::knowledge_link_generation(),
+    )
+}
+
+/// [`build_recall_cache_key`] at the given memory-write and link generations.
+#[allow(clippy::too_many_arguments)]
+fn recall_cache_key_at(
+    caller_identity: &str,
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    checkout_locator: Option<&str>,
+    query: &str,
+    include_related: Option<bool>,
+    include_decisions: Option<bool>,
+    memory_writes: &str,
+    knowledge_links: u64,
+) -> String {
     let workspace_id = workspace_id.map(|id| id.to_string());
     let project_id = project_id.map(|id| id.to_string());
     let include_related = include_related.map(|value| value.to_string());
@@ -11820,9 +11850,11 @@ fn build_recall_cache_key(
         "include_decisions",
         include_decisions.as_deref(),
     );
-    // A memory write by this caller changes the key (#464).
-    let generation = mcp_client::memory_write_generation();
-    append_context_cache_field(&mut canonical, "memory_writes", Some(&generation));
+    // A memory write by this caller changes the key (#464), and so does a link
+    // change made in this process by any caller (#487).
+    append_context_cache_field(&mut canonical, "memory_writes", Some(memory_writes));
+    let knowledge_links = knowledge_links.to_string();
+    append_context_cache_field(&mut canonical, "knowledge_links", Some(&knowledge_links));
     format!(
         "recall-local:v3:{}",
         super::search::sha256_hex_bytes(&canonical)
@@ -11871,6 +11903,40 @@ mod recall_cache_key_tests {
         let explicit =
             build_recall_cache_key(caller, None, None, None, "q", Some(true), Some(false));
         assert_ne!(absent, explicit);
+    }
+
+    #[test]
+    fn key_follows_link_changes_and_skips_answers_read_through_a_link() {
+        // #487: a link change in this process gives another key, and an answer
+        // read through a link is not kept at all.
+        let key = |links: u64| {
+            recall_cache_key_at(
+                "caller",
+                Some(Uuid::from_u128(1)),
+                None,
+                None,
+                "same query",
+                None,
+                None,
+                "0.0",
+                links,
+            )
+        };
+        assert_eq!(key(1), key(1));
+        assert_ne!(key(1), key(2));
+
+        let linked = (
+            "from Product".to_string(),
+            serde_json::json!({"items": [{"id": "d", "linked": true}]}),
+        );
+        put_recall_cache(Some("caller-487"), "recall-487-linked".to_string(), linked);
+        assert!(recall_cache().get("recall-487-linked").is_none());
+        let own = (
+            "own".to_string(),
+            serde_json::json!({"items": [{"id": "d"}]}),
+        );
+        put_recall_cache(Some("caller-487"), "recall-487-own".to_string(), own);
+        assert!(recall_cache().get("recall-487-own").is_some());
     }
 
     #[test]

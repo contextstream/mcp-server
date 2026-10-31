@@ -1671,6 +1671,39 @@ pub fn note_knowledge_link_change_for_test() {
     KNOWLEDGE_LINK_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether an API answer was read through a link to another workspace: it reports the
+/// linked workspaces it read (`linked_workspaces`), carries rows found in them
+/// (`linked_results`), or has a row marked `linked: true` (on the row or in its
+/// `metadata`). Result caches do not keep such an answer (#487). Only this process's
+/// own link changes can drop a cached answer, and a link removed by another process,
+/// another gateway or the web app must stop showing that workspace's knowledge on the
+/// next call.
+pub fn answer_reads_linked_workspaces(answer: &serde_json::Value) -> bool {
+    fn read_through_a_link(value: &serde_json::Value, depth: usize) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        match value {
+            serde_json::Value::Object(fields) => {
+                fields.iter().any(|(name, value)| match name.as_str() {
+                    "linked" if value.as_bool() == Some(true) => true,
+                    "linked_workspaces" | "linked_results"
+                        if value.as_array().is_some_and(|items| !items.is_empty()) =>
+                    {
+                        true
+                    }
+                    _ => read_through_a_link(value, depth + 1),
+                })
+            }
+            serde_json::Value::Array(items) => items
+                .iter()
+                .any(|item| read_through_a_link(item, depth + 1)),
+            _ => false,
+        }
+    }
+    read_through_a_link(answer, 0)
+}
+
 /// The current caller's memory write generation, for result-cache keys
 /// (#464). It changes after every memory write this caller makes.
 pub fn memory_write_generation() -> String {
@@ -4528,9 +4561,14 @@ impl ContextStreamClient {
     }
 
     fn cache_response(&self, cache_key: Option<CacheKey>, value: serde_json::Value, ttl: Duration) {
-        if let Some(cache_key) = cache_key {
-            self.cache.set_with_ttl(cache_key, value, ttl);
+        let Some(cache_key) = cache_key else {
+            return;
+        };
+        // An answer read through a link to another workspace is not kept (#487).
+        if answer_reads_linked_workspaces(&value) {
+            return;
         }
+        self.cache.set_with_ttl(cache_key, value, ttl);
     }
 
     fn should_cache_search_response(body: &serde_json::Value) -> bool {
@@ -19638,7 +19676,15 @@ pub struct HotPathHintEntry {
 impl SearchParams {
     fn with_defaults(self, config: &Config, search_type: &str) -> serde_json::Value {
         let workspace_id = self.workspace_id.or(config.default_workspace_id);
-        let project_id = self.project_id.or(config.default_project_id);
+        // The default project belongs to the default workspace: a search that
+        // names another workspace does not take it (#487).
+        let names_other_workspace = matches!(
+            (self.workspace_id, config.default_workspace_id),
+            (Some(named), Some(default)) if named != default
+        );
+        let project_id = self
+            .project_id
+            .or(config.default_project_id.filter(|_| !names_other_workspace));
         let requested_file_types = self.file_types.clone();
 
         // Mirror TypeScript behavior: forward file type constraints for both
@@ -23976,6 +24022,43 @@ mod tests {
             message.contains("the API URL \"not-a-url\" is not a valid URL"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn a_search_of_another_workspace_does_not_take_the_default_project() {
+        // #487: the default project is the session's, in the default workspace.
+        let (home, project, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut config = Config::default();
+        config.default_workspace_id = Some(home);
+        config.default_project_id = Some(project);
+        let search = |workspace_id: Option<Uuid>| {
+            SearchParams {
+                query: "revoke_fn".to_string(),
+                workspace_id,
+                ..Default::default()
+            }
+            .with_defaults(&config, "keyword")
+        };
+
+        let body = search(Some(other));
+        assert_eq!(body["workspace_id"], serde_json::json!(other), "{body}");
+        assert!(body.get("project_id").is_none(), "{body}");
+
+        // Its own workspace, named or not, still searches the default project.
+        for workspace_id in [None, Some(home)] {
+            let body = search(workspace_id);
+            assert_eq!(body["workspace_id"], serde_json::json!(home), "{body}");
+            assert_eq!(body["project_id"], serde_json::json!(project), "{body}");
+        }
+        // A project the caller names is always sent.
+        let body = SearchParams {
+            query: "revoke_fn".to_string(),
+            workspace_id: Some(other),
+            project_id: Some(project),
+            ..Default::default()
+        }
+        .with_defaults(&config, "keyword");
+        assert_eq!(body["project_id"], serde_json::json!(project), "{body}");
     }
 
     #[tokio::test]
@@ -30636,7 +30719,7 @@ mod tests {
     // #487: a running process kept returning a revoked link's code rows after
     // `unshare`, from the answers it had cached under the link.
     #[tokio::test]
-    async fn a_link_change_drops_the_searches_cached_under_the_old_link() {
+    async fn answers_read_through_a_link_are_not_cached_and_a_link_change_drops_the_rest() {
         let workspace = Uuid::from_u128(0x487);
         let other = Uuid::from_u128(0x488);
         let linked = SearchResponse {
@@ -30651,63 +30734,80 @@ mod tests {
             serde_json::json!({"success": true, "data": serde_json::to_value(response).unwrap()})
                 .to_string()
         };
+        let link_changed = serde_json::json!({"success": true, "data": {}}).to_string();
         let (client, server) = client_with_http_sequence(vec![
+            ("200 OK", envelope(&SearchResponse::default())),
+            ("200 OK", link_changed.clone()),
             ("200 OK", envelope(&linked)),
-            (
-                "200 OK",
-                serde_json::json!({"success": true, "data": {}}).to_string(),
-            ),
+            ("200 OK", envelope(&linked)),
+            ("200 OK", link_changed),
             ("200 OK", envelope(&SearchResponse::default())),
         ])
         .await;
 
-        let (first, repeated, after_unshare, generations) =
-            run_with_session_key(SessionKey::Local, || async {
-                let params = SearchParams {
-                    query: format!("revoke_fn_{}", Uuid::new_v4()),
-                    workspace_id: Some(workspace),
-                    ..SearchParams::default()
-                };
-                let before = knowledge_link_generation();
-                let first = client
-                    .search_keyword(params.clone())
-                    .await
-                    .expect("search under the link");
-                // The same search again is answered from the cache: the server is not asked.
-                let repeated = client
-                    .search_keyword(params.clone())
-                    .await
-                    .expect("cached search");
-                client
-                    .remove_knowledge_link(Some(workspace), other, "both")
-                    .await
-                    .expect("unshare");
-                let after = client
-                    .search_keyword(params)
-                    .await
-                    .expect("search after the unshare");
-                (
-                    first,
-                    repeated,
-                    after,
-                    (before, knowledge_link_generation()),
-                )
-            })
-            .await;
+        let (answers, generations) = run_with_session_key(SessionKey::Local, || async {
+            let params = SearchParams {
+                query: format!("revoke_fn_{}", Uuid::new_v4()),
+                workspace_id: Some(workspace),
+                ..SearchParams::default()
+            };
+            let search = || client.search_keyword(params.clone());
+            let before = knowledge_link_generation();
+            let mut answers = Vec::new();
+            answers.push(search().await.expect("search with no link"));
+            // The same search again is answered from the cache: the server is not asked.
+            answers.push(search().await.expect("cached search"));
+            client
+                .set_knowledge_link(Some(workspace), other, "both", None)
+                .await
+                .expect("share");
+            // The share drops the cached answer, and an answer read through the
+            // link is not kept: both searches ask the server.
+            answers.push(search().await.expect("search under the link"));
+            answers.push(search().await.expect("search under the link again"));
+            client
+                .remove_knowledge_link(Some(workspace), other, "both")
+                .await
+                .expect("unshare");
+            answers.push(search().await.expect("search after the unshare"));
+            (answers, (before, knowledge_link_generation()))
+        })
+        .await;
 
-        assert_eq!(first.linked_results.len(), 1);
-        assert_eq!(repeated.linked_results.len(), 1);
-        assert!(
-            after_unshare.linked_results.is_empty(),
-            "the unshare must drop the cached answer that carried the other workspace's code"
-        );
+        let linked_rows: Vec<usize> = answers
+            .iter()
+            .map(|answer| answer.linked_results.len())
+            .collect();
+        assert_eq!(linked_rows, [0, 0, 1, 1, 0]);
         assert_ne!(generations.0, generations.1);
         let requests = server.await.expect("link server task");
         assert_eq!(
             requests.len(),
-            3,
-            "one search, the unshare, one search again; the repeat came from the cache"
+            6,
+            "only the repeat of the search with no link came from the cache"
         );
+    }
+
+    #[test]
+    fn an_answer_read_through_a_link_is_recognised_in_every_shape() {
+        use serde_json::json;
+        for linked in [
+            json!({"linked_workspaces": [{"workspace_id": "w", "name": "A", "hits": 0}]}),
+            json!({"data": {"linked_workspaces": [{"name": "A"}]}}),
+            json!({"linked_results": [{"id": "r"}]}),
+            json!({"results": [{"id": "d", "linked": true}]}),
+            json!({"data": {"items": [{"id": "d", "metadata": {"linked": true}}]}}),
+        ] {
+            assert!(answer_reads_linked_workspaces(&linked), "{linked}");
+        }
+        for own in [
+            json!({"results": [{"id": "d"}], "linked_workspaces": [], "linked_results": []}),
+            json!({"results": [{"id": "d", "linked": false}]}),
+            json!([]),
+            json!(null),
+        ] {
+            assert!(!answer_reads_linked_workspaces(&own), "{own}");
+        }
     }
 
     #[tokio::test]

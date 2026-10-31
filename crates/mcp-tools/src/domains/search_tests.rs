@@ -8363,6 +8363,58 @@ mod scope_widening_tests {
         }
     }
 
+    /// #487: a search that names another workspace searches that workspace. The
+    /// session's project belongs to the session's workspace; sent with the named
+    /// one, it was what the API searched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_search_of_another_workspace_takes_no_project_from_the_session() {
+        let (home, project, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let server = RoutedServer::spawn(Box::new(move |line, _| {
+            if line.contains("/search/") {
+                return (
+                    200,
+                    json!({"results": [], "total": 0, "project_index_state": "ready"}).to_string(),
+                );
+            }
+            if line.contains(&format!("/projects/{project}")) && !line.contains("/index") {
+                return (200, project_body(project, home));
+            }
+            (404, json!({"error": "not found"}).to_string())
+        }));
+        let (tool, session) = gateway_tool(&server.base_url);
+        session.update_scope(Some(home), Some(project), None).await;
+
+        tool.execute(json!({
+            "query": "revoke_fn_other",
+            "mode": "keyword",
+            "workspace_id": other.to_string(),
+        }))
+        .await
+        .unwrap();
+        let bodies = server.search_bodies();
+        assert!(!bodies.is_empty(), "the search reached the API");
+        for body in &bodies {
+            assert_eq!(body["workspace_id"], other.to_string(), "{body}");
+            assert!(body["project_id"].is_null(), "{body}");
+        }
+
+        // The session's own workspace, named or not, still searches its project.
+        for (query, named) in [("revoke_fn_home", false), ("revoke_fn_home_named", true)] {
+            let mut args = json!({"query": query, "mode": "keyword"});
+            if named {
+                args["workspace_id"] = json!(home.to_string());
+            }
+            tool.execute(args).await.unwrap();
+            let body = server
+                .search_bodies()
+                .into_iter()
+                .rev()
+                .find(|body| body["query"] == query)
+                .expect("the search reached the API");
+            assert_eq!(body["project_id"], project.to_string(), "{body}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_foreign_project_without_workspace_names_the_replacement_in_text() {
         let (workspace, project, foreign, foreign_workspace) = (

@@ -204,6 +204,10 @@ fn search_cache() -> &'static crate::domains::result_cache::ResultCache<(String,
 }
 
 fn put_search_cache(cache_key: String, value: (String, Value)) {
+    // An answer read through a link to another workspace is not kept (#487).
+    if mcp_client::answer_reads_linked_workspaces(&value.1) {
+        return;
+    }
     let caller_scope = super::atlas_warm_cache::current_caller_cache_scope();
     let Some(caller_identity) = caller_scope.cache_identity() else {
         return;
@@ -11709,6 +11713,15 @@ impl SearchTool {
         let mut workspace_id = explicit_workspace_id
             .or(shared_scope.workspace_id)
             .or(state.workspace_id);
+        // A search that names another workspace than the session's searches that
+        // workspace. The session's project, and the projects its folder maps to,
+        // belong to the session's own workspace: the only project that may narrow
+        // the search is the one `resolve_read_scope` found in the named workspace
+        // (#487). Sent with the named workspace, the session's project was what
+        // the API searched.
+        let names_other_workspace =
+            explicit_workspace_id.is_some() && explicit_workspace_id != state.workspace_id;
+        let session_project_id = state.project_id.filter(|_| !names_other_workspace);
         let requested_explicit_project_id = input
             .project_id
             .as_ref()
@@ -11766,12 +11779,15 @@ impl SearchTool {
                 if workspace_id.is_none() {
                     workspace_id = Some(mapping.workspace_id);
                 }
-                resolved_folder_project_id = mapping.project_id;
+                resolved_folder_project_id = mapping
+                    .project_id
+                    .filter(|id| !names_other_workspace || Some(*id) == shared_scope.project_id);
             }
         }
         let local_index_project_id = session_folder_path
             .as_deref()
-            .and_then(ContextStreamClient::indexed_project_id_for_folder);
+            .and_then(ContextStreamClient::indexed_project_id_for_folder)
+            .filter(|id| !names_other_workspace || Some(*id) == shared_scope.project_id);
 
         // `resolve_read_scope` already validates an explicit project against
         // the active workspace and records any correction in `note`. Do not
@@ -11783,7 +11799,7 @@ impl SearchTool {
             .or(resolved_folder_project_id)
             .or(local_index_project_id)
             .or(shared_scope.project_id)
-            .or(state.project_id);
+            .or(session_project_id);
         if let (Some(candidate_id), Some(active_folder)) =
             (cross_machine_candidate_id, session_folder_path.as_deref())
         {
@@ -11854,15 +11870,8 @@ impl SearchTool {
             }
         }
 
-        let allow_fallback_project = input
-            .workspace_id
-            .as_deref()
-            .is_none_or(|value| value.trim().is_empty())
-            || explicit_workspace_id == shared_scope.workspace_id
-            || explicit_workspace_id == state.workspace_id;
-        let project_id = explicit_project_id.or_else(|| {
-            allow_fallback_project.then(|| shared_scope.project_id.or(state.project_id))?
-        });
+        let project_id =
+            explicit_project_id.or_else(|| shared_scope.project_id.or(session_project_id));
         let active_index_repair = maybe_repair_active_index_before_search(
             &self.client,
             workspace_id,
@@ -12158,7 +12167,12 @@ impl SearchTool {
             )
             .await;
         }
-        if requested_mode != SearchMode::Team && explicit_project_id.is_none() {
+        // The session's related projects are its own working set, not the named
+        // workspace's (#487).
+        if requested_mode != SearchMode::Team
+            && explicit_project_id.is_none()
+            && !names_other_workspace
+        {
             for related_id in &shared_scope.related_project_ids {
                 push_unique_project_candidate(&mut candidate_project_ids, Some(*related_id));
             }

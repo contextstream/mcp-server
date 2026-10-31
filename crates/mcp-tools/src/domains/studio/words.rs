@@ -168,6 +168,7 @@ pub(crate) fn quote_problem(code: Option<&str>) -> &'static str {
         Some("engine_unavailable") => "The studio couldn’t plan this just now. Try again in a moment.",
         Some("timed_out") => "Planning took too long and was stopped. Plan it again.",
         Some("invalid_request") => "The studio couldn’t read this request. Change the wording, then plan it again.",
+        Some("voice_unavailable") => "The voice asked for can’t be used for this. Choose another (voices lists them), or leave the voice out, then plan it again.",
         _ => "This couldn’t be planned. Try again.",
     }
 }
@@ -184,6 +185,10 @@ pub(crate) fn piece_problem(code: Option<&str>, medium: &str) -> String {
                 .to_string()
         }
         Some("timed_out") => "This piece took too long and was stopped. It isn’t charged.".to_string(),
+        Some("voice_unavailable") => {
+            "The voice asked for couldn’t be used, so this piece wasn’t made in another one. It isn’t charged."
+                .to_string()
+        }
         _ => "This piece couldn’t be finished. It isn’t charged.".to_string(),
     }
 }

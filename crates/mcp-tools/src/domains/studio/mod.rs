@@ -71,6 +71,7 @@ const VALID_ACTIONS: &[&str] = &[
     "library",
     "brand",
     "products",
+    "voices",
     "email_audiences",
     "email_draft",
     "email_campaigns",
@@ -117,9 +118,9 @@ const LIBRARY_LIMIT_MAX: i64 = 50;
 /// How long a listing waits for the catalog before leaving the tool out.
 pub const LISTING_BUDGET: Duration = Duration::from_millis(2500);
 
-const DESCRIPTION: &str = "ContextStudio: films, explainers, brand images and brand sounds from one plain request, made from the team's brand and knowledge. No models to pick.\n\nBrand images (social sets in each network's size, ad sets, hero and product shots, posters and flyers with print PDFs, email headers, brand graphics) and brand sounds (sonic logos, music beds, loops, effect packs, voice-overs, podcast intros and outros): form, with sizes or voice, makes it exact.\n\nFlow: plan -> show the person its price -> make with their go-ahead -> status -> result: downloadable files with alt text and captions. revise a made piece: variation, revision or resize. Also stop, library, brand, products.\n\nMoney: plan is free; make spends at most the plan's price, only with the person's go-ahead (the client asks, or pass accepted_price_credits).\n\nEmail on the team's own Resend, where offered: email_* actions draft, revise, preview in mail-client mockups, test, send (only with the person's go), report, contacts, unsubscribes.";
+const DESCRIPTION: &str = "ContextStudio: films, explainers, brand images and brand sounds from one plain request, made from the team's brand and knowledge. No models to pick.\n\nBrand images (social sets in each network's size, ad sets, hero and product shots, posters and flyers with print PDFs, email headers, brand graphics) and brand sounds (sonic logos, music beds, loops, effect packs, voice-overs, podcast intros and outros): form, with sizes or voice, makes it exact.\n\nFlow: plan -> show the person its price -> make with their go-ahead -> status -> result: downloadable files with alt text and captions. revise a made piece: variation, revision or resize. Also stop, library, brand, products, voices.\n\nMoney: plan is free; make spends at most the plan's price, only with the person's go-ahead (the client asks, or pass accepted_price_credits).\n\nEmail on the team's own Resend, where offered: email_* actions draft, revise, preview in mail-client mockups, test, send (only with the person's go), report, contacts, unsubscribes.";
 
-const TOOL_REFERENCE: &str = "ContextStudio makes finished pieces (films, product explainers filmed from the team's connected product, brand images, brand sounds, music) from a plain request, in the team's brand. Never choose a model: describe what is needed and who it is for. For brand work, name its form for an exact plan.\n\nBrand images: social-set (one post in each network's size), ad-set, hero, product-shot, email-header, brand-graphic, and poster and flyer (printed sheets with a print-ready PDF). An image is made once, as one idea, and delivered in each of its sizes (at most 6; the first is the master shape) as PNG, JPG and WebP with a ZIP of the set, with alt text and a caption, and checked (type inside each network's safe area, contrast, the mark).\nBrand sounds: sonic-logo, music-bed, loop, sfx-pack, voice-over, podcast-intro, podcast-outro. A sound comes as WAV and MP3 at -16 LUFS for the web, a -23 LUFS broadcast master and its stems (a pack: each sound, and a ZIP), with loudness checks.\n\nActions:\n- plan: prompt (plain words, at most 4000 characters). form: brand work by name (optional). sizes: image size ids for an image form other than poster or flyer (default: the form's own). voice: for voice-over, podcast-intro or podcast-outro. context: what you know that the workspace may not (the change you just made, release notes, the doc you have open), as [{title, text}] or one string; at most 4 notes, 6000 characters each. attachments: images [{path (a local PNG, JPEG or WebP; stdio only) or content_id, role: subject|product|style|logo}]. Returns the plan: each piece with its sizes, files and voice, why, one price (up to N credits, likely about M), the balance, plan_id. Spends nothing. plan_id alone reads a plan again. wait_seconds (default 90, up to 100).\n- make: plan_id. Show the person the plan and its price first. If the client can ask them, it does; otherwise pass accepted_price_credits (the price they accepted, at least the plan's). Returns make_id.\n- status: make_id (default: the latest making), wait_seconds (default 50, up to 100). Each piece's state, with progress reported while it waits; call again until it has ended.\n- result: make_id, piece (index or id, optional). Images inline, video and sound as signed links (valid about 15 minutes), each piece's placard. Brand work: each file as its own signed link (each size's PNG, the set ZIP or the print PDF; the web MP3, the broadcast WAV, the stems or the pack's ZIP; up to 12 a piece), its alt text and caption (use them when posting it), and any check that didn't pass.\n- revise: make_id, piece, mode, change, sizes. From a made image or sound: mode variation (more like it; change optional), revision (it, changed as change says) or resize (an image in new sizes: pass sizes; not a poster or flyer). Default: revision with a change, resize with only sizes, else variation. A made film: another like it, with the change. A piece that wasn't made: that piece again. Make the new plan like any plan.\n- stop: make_id. Stops a making; the hold is released and nothing undelivered is charged.\n- library: recent makings here, newest first (limit, at most 50).\n- brand: the workspace's brand kit, which everything is made from.\n- products: connected products and their maps; ask plan for an explainer of something in one, and it is filmed from the real product.\n\nEmail (offered where Create's catalog has email; the team sends through its own Resend account):\n- email_audiences: the audiences and their segments with how many each reaches, and whether Resend is connected and ready.\n- email_draft: prompt (\"announce our winter sale to customers\"), optional audience_id or segment_id. Writes a draft campaign in the brand: campaign_id, subject and preheader with alternatives, an outline, who it goes to, a studio link. Sends nothing; free.\n- email_campaigns: campaigns and where each stands (status: draft|scheduled|testing|sending|paused|sent|cancelled|failed; limit).\n- email_test: campaign_id, to (optional: the person's own address, the default, or delivered@resend.dev, bounced@resend.dev, complained@resend.dev), variant (an A/B subject, optional). Subject marked [Test].\n- email_send: campaign_id, send_at (\"now\", the default, or a local time 2026-11-02T09:00), time_zone (IANA, e.g. Europe/London; needed with a local time). Needs the person's go: the client asks them when it can; otherwise show them the campaign, its sender and recipient count, then pass confirm_recipients with that count. Scheduling again moves it.\n- email_cancel: campaign_id. Unschedules a scheduled campaign, or stops one that is sending, testing or paused.\n- email_report: campaign_id for its report (delivered, opened, clicked, bounces, complaints, unsubscribes, top links); without it, the workspace's trends (days, default 30).\n- email_preview: campaign_id, variant (an A/B subject: 0 A, 1 B, 2 C; optional). A link to share that shows the email in Gmail, Outlook and Apple Mail mockups on desktop, tablet and phone, light and dark, images on or off (it expires; the studio turns it off), plus the inbox line (from, subject, preheader), who it goes to and what to check.\n- email_revise: campaign_id and change (plain words: \"shorter subject\", \"add a button to https://acme.com/pricing\"), or subject and/or preheader to set. Drafts only. Returns the new revision, what changed and the outline.\n- email_duplicate: campaign_id. A draft copy to change and send again.\n- email_contacts: operation list (default; query, audience_id, status subscribed|suppressed, limit), add (contacts: addresses or [{email, first_name, last_name, tags}], at most 100; consent_source manual|form|api and consent_note, both required; audience_id optional) or unsubscribe (email: onto the suppression list). Erasing a contact can't be undone, so it is the delete tool's, after confirming with the person: delete with action=\"studio.email_contact_erase\" and email (an unsubscribe stays on the suppression list).\n- email_unsubscribes: operation list (default; the suppression list with why, how, when and from which campaign, and the last days' report: query, reason unsubscribed|bounced|complained|manual, campaign_id, days, limit), add (contacts or email; note) or remove (email, note). A remove needs the person's go: the client asks them when it can; otherwise show them who and why, then pass confirm_email with the address.\n\nResend is connected in the studio (https://ctxproduct.com/studio/email/settings), never through this tool: never ask for or pass an API key.";
+const TOOL_REFERENCE: &str = "ContextStudio makes finished pieces (films, product explainers filmed from the team's connected product, brand images, brand sounds, music) from a plain request, in the team's brand. Never choose a model: describe what is needed and who it is for. For brand work, name its form for an exact plan.\n\nBrand images: social-set (one post in each network's size), ad-set, hero, product-shot, email-header, brand-graphic, and poster and flyer (printed sheets with a print-ready PDF). An image is made once, as one idea, and delivered in each of its sizes (at most 6; the first is the master shape) as PNG, JPG and WebP with a ZIP of the set, with alt text and a caption, and checked (type inside each network's safe area, contrast, the mark).\nBrand sounds: sonic-logo, music-bed, loop, sfx-pack, voice-over, podcast-intro, podcast-outro. A sound comes as WAV and MP3 at -16 LUFS for the web, a -23 LUFS broadcast master and its stems (a pack: each sound, and a ZIP), with loudness checks.\n\nActions:\n- plan: prompt (plain words, at most 4000 characters). form: brand work by name (optional). sizes: image size ids for an image form other than poster or flyer (default: the form's own). voice: a voice by name (e.g. Josh) or id; `voices` lists them. It is for any piece that speaks (a film, an explainer, a voice-over, a podcast intro or outro), and the plan locks it: every piece that speaks is said in it, shown as \"Voice: Josh - Conversational Agent (locked)\". A name that fits several voices, or none, is not planned: the answer lists the voices it could be, so ask the person which. context: what you know that the workspace may not (the change you just made, release notes, the doc you have open), as [{title, text}] or one string; at most 4 notes, 6000 characters each. attachments: images [{path (a local PNG, JPEG or WebP; stdio only) or content_id, role: subject|product|style|logo}]. Returns the plan: each piece with its sizes, files and voice, why, one price (up to N credits, likely about M), the balance, plan_id. Spends nothing. plan_id alone reads a plan again. wait_seconds (default 90, up to 100).\n- make: plan_id. Show the person the plan and its price first. If the client can ask them, it does; otherwise pass accepted_price_credits (the price they accepted, at least the plan's). Returns make_id.\n- status: make_id (default: the latest making), wait_seconds (default 50, up to 100). Each piece's state, with progress reported while it waits; call again until it has ended.\n- result: make_id, piece (index or id, optional). Images inline, video and sound as signed links (valid about 15 minutes), each piece's placard (with the voice it was said in, by name and id). Brand work: each file as its own signed link (each size's PNG, the set ZIP or the print PDF; the web MP3, the broadcast WAV, the stems or the pack's ZIP; up to 12 a piece), its alt text and caption (use them when posting it), and any check that didn't pass.\n- revise: make_id, piece, mode, change, sizes, voice. From a made image or sound: mode variation (more like it; change optional), revision (it, changed as change says) or resize (an image in new sizes: pass sizes; not a poster or flyer). Default: revision with a change, resize with only sizes, else variation. A made film: another like it, with the change. A piece that wasn't made: that piece again. Make the new plan like any plan.\n- stop: make_id. Stops a making; the hold is released and nothing undelivered is charged.\n- library: recent makings here, newest first (limit, at most 50).\n- brand: the workspace's brand kit, which everything is made from.\n- products: connected products and their maps; ask plan for an explainer of something in one, and it is filmed from the real product.\n- voices: query (a name, accent or style; optional), limit. The voices plan and revise take: the curated ones by key, the studio's own ElevenLabs voices and the shared library's by id (an id is exact). Spends nothing.\n\nEmail (offered where Create's catalog has email; the team sends through its own Resend account):\n- email_audiences: the audiences and their segments with how many each reaches, and whether Resend is connected and ready.\n- email_draft: prompt (\"announce our winter sale to customers\"), optional audience_id or segment_id. Writes a draft campaign in the brand: campaign_id, subject and preheader with alternatives, an outline, who it goes to, a studio link. Sends nothing; free.\n- email_campaigns: campaigns and where each stands (status: draft|scheduled|testing|sending|paused|sent|cancelled|failed; limit).\n- email_test: campaign_id, to (optional: the person's own address, the default, or delivered@resend.dev, bounced@resend.dev, complained@resend.dev), variant (an A/B subject, optional). Subject marked [Test].\n- email_send: campaign_id, send_at (\"now\", the default, or a local time 2026-11-02T09:00), time_zone (IANA, e.g. Europe/London; needed with a local time). Needs the person's go: the client asks them when it can; otherwise show them the campaign, its sender and recipient count, then pass confirm_recipients with that count. Scheduling again moves it.\n- email_cancel: campaign_id. Unschedules a scheduled campaign, or stops one that is sending, testing or paused.\n- email_report: campaign_id for its report (delivered, opened, clicked, bounces, complaints, unsubscribes, top links); without it, the workspace's trends (days, default 30).\n- email_preview: campaign_id, variant (an A/B subject: 0 A, 1 B, 2 C; optional). A link to share that shows the email in Gmail, Outlook and Apple Mail mockups on desktop, tablet and phone, light and dark, images on or off (it expires; the studio turns it off), plus the inbox line (from, subject, preheader), who it goes to and what to check.\n- email_revise: campaign_id and change (plain words: \"shorter subject\", \"add a button to https://acme.com/pricing\"), or subject and/or preheader to set. Drafts only. Returns the new revision, what changed and the outline.\n- email_duplicate: campaign_id. A draft copy to change and send again.\n- email_contacts: operation list (default; query, audience_id, status subscribed|suppressed, limit), add (contacts: addresses or [{email, first_name, last_name, tags}], at most 100; consent_source manual|form|api and consent_note, both required; audience_id optional) or unsubscribe (email: onto the suppression list). Erasing a contact can't be undone, so it is the delete tool's, after confirming with the person: delete with action=\"studio.email_contact_erase\" and email (an unsubscribe stays on the suppression list).\n- email_unsubscribes: operation list (default; the suppression list with why, how, when and from which campaign, and the last days' report: query, reason unsubscribed|bounced|complained|manual, campaign_id, days, limit), add (contacts or email; note) or remove (email, note). A remove needs the person's go: the client asks them when it can; otherwise show them who and why, then pass confirm_email with the address.\n\nResend is connected in the studio (https://ctxproduct.com/studio/email/settings), never through this tool: never ask for or pass an API key.";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StudioInput {
@@ -302,7 +303,7 @@ impl StudioTool {
         let form = forms::parse_form(input.form.as_deref())?;
         let sizes = forms::parse_sizes(input.sizes.as_ref())?;
         let voice = forms::parse_voice(input.voice.as_deref())?;
-        forms::check_together(form, &sizes, voice)?;
+        forms::check_together(form, &sizes, voice.as_deref())?;
         let (workspace_id, project_id) = self.scope(input).await?;
         let wait = self
             .wait(
@@ -338,7 +339,7 @@ impl StudioTool {
         if !references.is_empty() {
             request["references"] = json!(references);
         }
-        forms::ask(&mut request, form, &sizes, voice);
+        forms::ask(&mut request, form, &sizes, voice.as_deref());
         self.ask_for_plan(workspace_id, project_id, &request, &notes, wait, &mut said)
             .await
     }
@@ -486,6 +487,16 @@ impl StudioTool {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                // The voice the making is locked to, when one was asked for.
+                if let Some(voice) = forms::voice_words(plan.get("voice"), false) {
+                    let speaking = pieces.iter().any(|piece| piece.get("voice").is_some());
+                    lines.push(if speaking {
+                        format!("Voice: {voice}. Every piece that speaks is said in it.")
+                    } else {
+                        format!("Voice: {voice}. Nothing in this plan speaks, so it isn't used.")
+                    });
+                    structured["voice"] = plan.get("voice").cloned().unwrap_or(Value::Null);
+                }
                 lines.push(String::new());
                 for (at, piece) in pieces.iter().enumerate() {
                     lines.push(format!(
@@ -1480,7 +1491,9 @@ impl StudioTool {
 
         // A made image or sound: Create starts from it.
         if made && matches!(medium, "image" | "sound") {
-            if let Some(problem) = from_problem(mode, medium, &piece.piece, &title, &sizes, voice) {
+            if let Some(problem) =
+                from_problem(mode, medium, &piece.piece, &title, &sizes, voice.as_deref())
+            {
                 return Err(Error::Validation(problem));
             }
             let mut request = json!({
@@ -1488,7 +1501,7 @@ impl StudioTool {
                 "prompt": forms::from_prompt(mode, change, &sizes),
                 "from": {"jobId": job_id, "piece": piece.index(), "mode": mode.as_str()},
             });
-            forms::ask(&mut request, None, &sizes, voice);
+            forms::ask(&mut request, None, &sizes, voice.as_deref());
             said.push(format!(
                 "A plan for {}; nothing is made until it is made like any plan.",
                 forms::from_words(mode, &title, &sizes)
@@ -1510,9 +1523,9 @@ impl StudioTool {
                 words::medium_name(medium).to_lowercase()
             )));
         }
-        if !sizes.is_empty() || voice.is_some() {
+        if !sizes.is_empty() {
             return Err(Error::Validation(format!(
-                "sizes and voice are for revising a made image or sound; “{title}” {}.",
+                "sizes are for revising a made image; “{title}” {}.",
                 if made {
                     format!("is a {}", words::medium_name(medium).to_lowercase())
                 } else {
@@ -1545,6 +1558,8 @@ impl StudioTool {
         if !references.is_empty() {
             request["references"] = json!(references);
         }
+        // A film speaks: it can be planned again in another voice.
+        forms::ask(&mut request, None, &[], voice.as_deref());
         if let Some(topics) = job
             .pointer("/request/topicFeedIds")
             .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
@@ -1741,6 +1756,64 @@ impl StudioTool {
                     "tokens": tokens,
                 },
             }),
+        ))
+    }
+
+    /// The voices plan and revise take, found by name, accent or style.
+    async fn voices(&self, input: &StudioInput) -> Result<ToolResult> {
+        let (workspace_id, _) = self.scope(input).await?;
+        let search = input
+            .query
+            .as_deref()
+            .or(input.prompt.as_deref())
+            .map(str::trim)
+            .unwrap_or("");
+        if search.chars().count() > forms::MAX_VOICE_CHARS {
+            return Err(Error::Validation(format!(
+                "query: a voice's name, accent or style, up to {} characters.",
+                forms::MAX_VOICE_CHARS
+            )));
+        }
+        let limit = input.limit.unwrap_or(20).clamp(1, 50);
+        let answer = self
+            .create()
+            .voices(workspace_id, search, limit)
+            .await
+            .map_err(unreachable)?;
+        self.note_offer(answer.status).await;
+        if !answer.is_success() {
+            return Ok(ToolResult::error(refusal(&answer, Subject::Other)));
+        }
+        let voices = answer
+            .data
+            .get("voices")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let note = answer.data.get("note").and_then(Value::as_str);
+        let mut lines = Vec::new();
+        if voices.is_empty() {
+            lines.push(if search.is_empty() {
+                "No voices could be listed just now.".to_string()
+            } else {
+                format!("No voice fits “{search}”. Try another name, an accent or a style, or leave query out to list them.")
+            });
+        } else {
+            lines.push(if search.is_empty() {
+                "Voices:".to_string()
+            } else {
+                format!("Voices for “{search}”:")
+            });
+            lines.extend(forms::voices_lines(&voices));
+            lines.push(String::new());
+            lines.push("Pass one as voice on plan or revise: its key or id (an id is exact), or its name. The plan locks it for every piece that speaks.".to_string());
+        }
+        if let Some(note) = note.filter(|n| !n.trim().is_empty()) {
+            lines.push(note.trim().to_string());
+        }
+        Ok(ToolResult::with_structured(
+            lines.join("\n"),
+            json!({"workspace_id": workspace_id, "query": search, "voices": voices}),
         ))
     }
 
@@ -2128,6 +2201,7 @@ impl ToolHandler for StudioTool {
             "library" => self.library(&input).await,
             "brand" => self.brand(&input).await,
             "products" => self.products(&input).await,
+            "voices" => self.voices(&input).await,
             // `email_contact_erase` comes only from `delete`: the registry refuses it here.
             email if email::EMAIL_ACTIONS.contains(&email) || email == email::ERASE_ACTION => {
                 self.email(email, &input).await
@@ -2220,7 +2294,7 @@ pub(crate) fn input_schema() -> Value {
         )
         .string_enum("form", &forms::form_description(), &forms::form_ids(), false)
         .property("sizes", forms::sizes_schema(), false)
-        .string_enum("voice", &forms::voice_description(), &forms::voice_keys(), false)
+        .string("voice", &forms::voice_description(), false)
         .string_enum(
             "mode",
             "How revise starts from a made image or sound: variation (more like it), revision (it, changed as change says) or resize (an image in new sizes; pass sizes). Default: revision with a change, resize with only sizes, else variation.",
@@ -2232,7 +2306,7 @@ pub(crate) fn input_schema() -> Value {
             "How long to wait: plan (default 90, up to 100), status (default 50, up to 100)",
             false,
         )
-        .integer("limit", "How many makings (library), campaigns (email_campaigns), contacts (email_contacts) or suppressions (email_unsubscribes), at most 50", false)
+        .integer("limit", "How many makings (library), voices (voices), campaigns (email_campaigns), contacts (email_contacts) or suppressions (email_unsubscribes), at most 50", false)
         .uuid("campaign_id", "The email campaign (email_draft returns it; the other email actions take it)", false)
         .uuid("audience_id", "The audience an email draft goes to (email_audiences lists them)", false)
         .uuid("segment_id", "A segment of the audience instead (email_draft)", false)
@@ -2292,7 +2366,7 @@ pub(crate) fn input_schema() -> Value {
             false,
         )
         .string("consent_note", "Where added contacts agreed to hear from the team (email_contacts add), e.g. \"Signed up at the Spring market\"", false)
-        .string("query", "Search words: part of an address or name (email_contacts, email_unsubscribes)", false)
+        .string("query", "Search words: a voice's name, accent or style (voices), or part of an address or name (email_contacts, email_unsubscribes)", false)
         .string_enum(
             "reason",
             "Only suppressions with this reason (email_unsubscribes)",

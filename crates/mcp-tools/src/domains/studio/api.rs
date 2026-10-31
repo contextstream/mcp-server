@@ -90,6 +90,7 @@ pub(crate) fn is_make_code(code: &str) -> bool {
         code,
         "make_unplanned"
             | "media_unavailable"
+            | "voice_unavailable"
             | "brand_unavailable"
             | "reference_unavailable"
             | "model_unavailable"
@@ -169,6 +170,26 @@ impl Create<'_> {
         self.call(
             "GET",
             &format!("/create/jobs/{job_id}?workspaceId={workspace_id}"),
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// The voices a making can speak in: the curated ones, then the studio's own and the
+    /// shared library's, for `search` (all of them when it is empty).
+    pub async fn voices(
+        &self,
+        workspace_id: Uuid,
+        search: &str,
+        limit: i64,
+    ) -> Result<StudioAnswer> {
+        self.call(
+            "GET",
+            &format!(
+                "/create/voices?workspaceId={workspace_id}&search={}&limit={limit}",
+                urlencoding::encode(search)
+            ),
             None,
             None,
         )

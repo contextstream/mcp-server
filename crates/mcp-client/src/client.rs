@@ -4693,8 +4693,11 @@ impl ContextStreamClient {
                     } else {
                         AttemptFailure::MaybeApplied
                     };
+                    // A timeout counts the seconds waited over every attempt:
+                    // two attempts of 30 s said "after 30 seconds" a minute
+                    // in (#478).
                     let error = if e.is_timeout() {
-                        Error::Timeout(timeout.as_secs())
+                        Error::Timeout(timeout.as_secs() * u64::from(attempt + 1))
                     } else if e.is_connect() {
                         Error::Network(connect_failure(&e))
                     } else {
@@ -29801,6 +29804,39 @@ mod tests {
             started.elapsed()
         );
         drop(socket);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_api_is_tried_twice_and_the_timeout_counts_both_attempts() {
+        // #478: an origin that accepts the connection and never answers was
+        // tried four times, and the error said one attempt's 30 s.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        let config = mcp_types::Config {
+            api_url: format!("http://{address}"),
+            api_key: Some("cs_test_stalled".to_string()),
+            ..Default::default()
+        };
+        let client = ContextStreamClient::new(config);
+        let options = RequestOptions {
+            timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let error = client
+            .request::<serde_json::Value, ()>("GET", "/workspaces", None, Some(options))
+            .await
+            .expect_err("the API never answers");
+        assert!(matches!(error, Error::Timeout(2)), "{error}");
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

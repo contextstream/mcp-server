@@ -496,8 +496,8 @@ async fn brand_work_that_does_not_fit_is_refused_before_anything_is_sent() {
             "Unknown size “instagram-reel”. Sizes: instagram-post (1080×1350)",
         ),
         (
-            json!({"voice": "robot"}),
-            "Unknown voice “robot”. Voices: warm-narrator (warm and unhurried)",
+            json!({"voice": "x".repeat(101)}),
+            "voice: a voice's name or id, up to 100 characters (voices lists them).",
         ),
     ] {
         let mut input = json!({"action": "plan", "prompt": "Something for the sale"});

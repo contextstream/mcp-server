@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.53
+
+- `entity` accepts `action` and `kind` with stray spaces (`" list"`, `" ticket"`), and its errors no longer repeat them (#490).
+- Hosted gateway usage records: a refused call is recorded with its reason (an unknown action or kind, a reference that matched nothing, a scope that could not be resolved, a negative count or an invalid value) instead of a general validation error. A call answered with an error result is recorded as a failed call, with the API's HTTP status when the API refused it, and `entity` reads are recorded as `list:<kind>` and `get:<kind>` (#490).
+
 ## 1.0.52
 
 - Search: a search that names another workspace takes nothing from this session's checkout unless the checkout belongs to that workspace. It sends no checkout scope, uses no uncommitted files or local index, and adds no local text matches from this folder, so passing a linked workspace's `workspace_id`, as the [LINKED_WORKSPACES] footer suggests, searches only that workspace (#487).

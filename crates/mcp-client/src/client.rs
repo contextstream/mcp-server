@@ -12384,7 +12384,7 @@ impl ContextStreamClient {
     /// that carries its `private_key`, and an AWS access key id next to a
     /// `secret` (an id alone is an identifier, and AWS's documented
     /// `...EXAMPLE` ids are not keys). The filename list cannot see these (#425).
-    fn secret_content_reason(content: &str) -> Option<&'static str> {
+    pub fn secret_content_reason(content: &str) -> Option<&'static str> {
         if Self::has_private_key_block(content) {
             return Some("a private key");
         }

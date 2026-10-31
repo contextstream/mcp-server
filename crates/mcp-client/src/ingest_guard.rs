@@ -39,6 +39,46 @@ pub const REPO_MARKERS: [&str; 5] = [
 pub const SENSITIVE_DIR_NAMES: [&str; 6] =
     [".ssh", ".aws", ".gnupg", ".kube", ".docker", ".config"];
 
+/// The directories that hold credentials. [`SENSITIVE_DIR_NAMES`] also lists `.config`,
+/// which is too broad to index but is where some editors keep the skills and rules that
+/// `skill import` reads on purpose.
+pub const CREDENTIAL_DIR_NAMES: [&str; 5] = [".ssh", ".aws", ".gnupg", ".kube", ".docker"];
+
+/// Why a file must never be read and sent to the server, judged by its path alone:
+/// it lives inside one of `dir_names` (checked on the path as given and on its
+/// canonical form, so a `..` or a symlink cannot dodge it), or its name is one the
+/// secret/credential filter blocks (`.env`, `id_rsa`, `*.pem`, `*.key`, ...). One rule
+/// for every tool that reads a local file for the server (`media index`,
+/// `skill import`, mcp-server#469).
+pub fn secret_path_rejection_reason(path: &Path, dir_names: &[&str]) -> Option<String> {
+    let canonical = std::fs::canonicalize(path).ok();
+    for candidate in std::iter::once(path).chain(canonical.as_deref()) {
+        for component in candidate.components() {
+            if let Component::Normal(os) = component {
+                if let Some(name) = os.to_str() {
+                    if dir_names.contains(&name) {
+                        return Some(format!("it lives inside a sensitive directory ({name})"));
+                    }
+                }
+            }
+        }
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if !file_name.is_empty()
+        && crate::client::ContextStreamClient::should_skip_file(file_name, true)
+    {
+        return Some(format!(
+            "'{file_name}' matches the blocked-file filter (secrets, keys, archives, and binaries are never uploaded)"
+        ));
+    }
+
+    None
+}
+
 /// Absolute OS/system directories that are never a legitimate project root (they
 /// hold OS state and credentials, not project sources). Matched against both the
 /// supplied and canonical path. Deliberately excludes `/var` and `/usr` because
@@ -305,6 +345,53 @@ mod tests {
     fn home() -> PathBuf {
         let h = dirs::home_dir().expect("home dir available in test env");
         std::fs::canonicalize(&h).unwrap_or(h)
+    }
+
+    // One path rule for every tool that reads a local file for the server (#469).
+    #[test]
+    fn secret_path_rule_names_credential_folders_and_blocked_names() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let ssh = base.path().join(".ssh");
+        let config = base.path().join(".config").join("opencode");
+        std::fs::create_dir_all(&ssh).expect("ssh");
+        std::fs::create_dir_all(&config).expect("config");
+        std::fs::create_dir_all(base.path().join("project")).expect("project");
+        let key = ssh.join("notes.md");
+        let skill = config.join("SKILL.md");
+        std::fs::write(&key, "x").expect("key");
+        std::fs::write(&skill, "x").expect("skill");
+
+        let reason = secret_path_rejection_reason(&key, &CREDENTIAL_DIR_NAMES)
+            .expect("a file in .ssh is refused");
+        assert!(reason.contains(".ssh"), "{reason}");
+        // The same file reached through a `..` is still found by its real path.
+        let through = base
+            .path()
+            .join("project")
+            .join("..")
+            .join(".ssh")
+            .join("notes.md");
+        assert!(secret_path_rejection_reason(&through, &CREDENTIAL_DIR_NAMES).is_some());
+        // And through a symlink.
+        #[cfg(unix)]
+        {
+            let link = base.path().join("project").join("link.md");
+            std::os::unix::fs::symlink(&key, &link).expect("symlink");
+            assert!(secret_path_rejection_reason(&link, &CREDENTIAL_DIR_NAMES).is_some());
+        }
+
+        // `.config` is a folder to index with care, not a credential folder.
+        assert!(secret_path_rejection_reason(&skill, &CREDENTIAL_DIR_NAMES).is_none());
+        assert!(secret_path_rejection_reason(&skill, &SENSITIVE_DIR_NAMES).is_some());
+
+        // A credential file name is refused wherever it is.
+        let env = secret_path_rejection_reason(&base.path().join(".env"), &CREDENTIAL_DIR_NAMES)
+            .expect(".env is refused");
+        assert!(env.contains("blocked-file filter"), "{env}");
+        assert!(
+            secret_path_rejection_reason(&base.path().join("SKILL.md"), &CREDENTIAL_DIR_NAMES)
+                .is_none()
+        );
     }
 
     #[test]

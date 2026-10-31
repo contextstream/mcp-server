@@ -12,6 +12,7 @@
   - A timeout says the seconds waited over all its attempts, and a timed-out request is tried once more, not three times (#478).
   - Over stdio, ping, tools/list and initialize are answered while a tool call waits on the API (#478).
   - A 200 that says it failed, isn't the API, or is empty no longer reads as saved (#420).
+  - Creates the API does not key are never resent blindly (#483), and a project delete refused while files are still being taken in is asked again (#474).
   - A JSON-RPC batch holds at most 20 messages (#421). Stored text can't forge notice lines or result rows, and control bytes never reach a client (#419).
 - Security and indexing:
   - `chart` and `async_job` check the caller's access to the workspace before acting under the service token, and a caller's mistake is an error that says what to change (#439).
@@ -21,7 +22,8 @@
   - Indexing a project named by id and path is no longer refused because the session's project is another one, and an index asked for while one runs says it joins that run (#455).
   - A watcher stops once its ~/.contextstream directory is gone (#457).
 - Graph: an unbuilt graph, a graph being built and an analysis still running each say so instead of "none found", usages finds Python callers, and circular_dependencies, unused_code and complexity_metrics name what they count (#467, #468, #472, #479, #480).
-- `async_job`: a job no runner has started says so instead of "pending" (#438).
+- `async_job`: a job no runner has started says so instead of "pending" (#438). `chart`'s render text gives the values, their unit and the worst series (#440).
+- Telemetry: a hosted tool call names the person who made it, not only the workspace's owner.
 - Lists page alike: projects, project files, workspaces, entities, reminders, plans, skills, memory events and nodes, transcripts and index history take limit and offset, say where a page sits, and say when a page is past the end (#381, #390, #391, #411, #441, #442, #451, #452, #454, #459, #460, #462, #465).
 - Tools show their data and say what they did:
   - project get, overview, statistics and files; workspace index_settings; session user_context; integration summary (#429, #430, #435, #441, #466);

@@ -983,6 +983,13 @@ fn format_doc_detail(value: &Value) -> String {
         one_line(id),
         one_line(doc_type)
     );
+    // Shared knowledge: a doc read from a linked workspace says so (#486).
+    if let Some(name) = super::linked_workspaces::linked_workspace_name(doc) {
+        text.push_str(&format!(
+            "\nFrom: {} (a linked workspace; read only)",
+            one_line(name)
+        ));
+    }
     if created_at != "—" {
         text.push_str(&format!("\nCreated: {}", created_at));
     }

@@ -1768,6 +1768,46 @@ pub fn is_agent_write_request(method: &str, api_path: &str) -> bool {
         .any(|root| route_matches_root(path, root))
 }
 
+/// Creates the API does not key: no `Idempotency-Key` is stored for them, so
+/// a resend after a lost answer made a second record, or failed with "name
+/// already in use" about the record the first attempt had made (#477).
+const UNKEYED_CREATE_ROUTES: &[&str] = &["projects", "skills", "workspaces"];
+
+/// Whether `method` on `api_path` creates a record the API does not key.
+pub fn is_unkeyed_create_request(method: &str, api_path: &str) -> bool {
+    if !method.eq_ignore_ascii_case("POST") {
+        return false;
+    }
+    let path = api_path
+        .strip_prefix("/api/v1/")
+        .or_else(|| api_path.strip_prefix("/api/"))
+        .unwrap_or_else(|| api_path.trim_start_matches('/'));
+    let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    UNKEYED_CREATE_ROUTES.contains(&path)
+}
+
+/// What a write that may have been applied says when it is not resent (#477):
+/// a bare "HTTP error (502)" or "Network error" invited a retry that made a
+/// second doc, todo, task or reminder.
+fn write_outcome_unknown(error: Error) -> Error {
+    const NOTE: &str = " The write may have reached ContextStream and been saved before its answer was lost: look for it (list or get) before trying again, or a second copy may be made.";
+    match error {
+        Error::Http {
+            status,
+            message,
+            code,
+            source,
+        } => Error::Http {
+            status,
+            message: format!("{message}{NOTE}"),
+            code,
+            source,
+        },
+        Error::Network(message) => Error::Network(format!("{message}{NOTE}")),
+        other => other,
+    }
+}
+
 /// How long an origin's `x-contextstream-idempotency: 1` is trusted for a
 /// write that got no response at all (timeout, reset). A write that did get
 /// a response is judged by that response alone (see
@@ -4589,6 +4629,9 @@ impl ContextStreamClient {
         // One idempotency key per logical write, reused by every retry of
         // it below (the retries resend this same built request).
         let is_write = is_agent_write_request(method, &api_path);
+        // A write that must not be resent blindly once it may have run: the
+        // keyed agent writes, and the creates the API does not key (#477).
+        let resend_unsafe = is_write || is_unkeyed_create_request(method, &api_path);
         if is_write && !request_options_has_header(&options, IDEMPOTENCY_KEY_HEADER) {
             req = req.header(IDEMPOTENCY_KEY_HEADER, Uuid::new_v4().to_string());
         }
@@ -4671,9 +4714,9 @@ impl ContextStreamClient {
                     if error.is_retryable()
                         && attempt < retries_allowed
                         && retry_permitted(
-                            is_write,
+                            resend_unsafe,
                             failure,
-                            api_supports_idempotency(&config.api_url),
+                            is_write && api_supports_idempotency(&config.api_url),
                         )
                     {
                         let delay = if refused {
@@ -4686,6 +4729,9 @@ impl ContextStreamClient {
                             attempt += 1;
                             continue;
                         }
+                    }
+                    if resend_unsafe && failure == AttemptFailure::MaybeApplied {
+                        return Err(write_outcome_unknown(error));
                     }
                     return Err(error);
                 }
@@ -4713,9 +4759,9 @@ impl ContextStreamClient {
                 && !response_is_replay
                 && !error_reports_a_lasting_state(&error)
                 && retry_permitted(
-                    is_write,
+                    resend_unsafe,
                     status_attempt_failure(status.as_u16()),
-                    response_keeps_key,
+                    is_write && response_keeps_key,
                 )
             {
                 // A server-requested wait beyond the in-request cap is handed
@@ -4744,6 +4790,12 @@ impl ContextStreamClient {
                 }
             }
 
+            // A 5xx (other than a 503 refusal) after a write may have run:
+            // say so, since it was not resent (#477).
+            let maybe_applied = status.is_server_error() && status.as_u16() != 503;
+            if resend_unsafe && maybe_applied && !response_is_replay {
+                return Err(write_outcome_unknown(error));
+            }
             return Err(error);
         }
     }
@@ -23900,6 +23952,72 @@ mod tests {
         let key = request_header(&requests[0], IDEMPOTENCY_KEY_HEADER)
             .expect("writes carry an idempotency key");
         assert!(Uuid::parse_str(key).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_write_whose_answer_was_lost_says_it_may_have_been_saved() {
+        // #477: "HTTP error (502)" for a doc that was saved invited a retry
+        // that made a second copy.
+        let (client, server) = client_with_http_sequence_headers(vec![(
+            "502 Bad Gateway",
+            "",
+            r#"{"error":{"code":"bad_gateway","message":"Upstream API origin unavailable"}}"#
+                .to_string(),
+        )])
+        .await;
+        let result = client
+            .post::<serde_json::Value, _>("/docs", serde_json::json!({"title": "t"}))
+            .await;
+        match result {
+            Err(Error::Http {
+                status: 502,
+                message,
+                ..
+            }) => assert!(
+                message.contains("may have reached ContextStream and been saved"),
+                "{message}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_create_the_api_does_not_key_is_not_resent() {
+        // #477: project create was resent after a lost answer and then said
+        // "That project name is already in use" about the project it made.
+        assert!(is_unkeyed_create_request("POST", "/api/v1/projects"));
+        assert!(is_unkeyed_create_request("POST", "/skills"));
+        assert!(!is_unkeyed_create_request("GET", "/api/v1/projects"));
+        assert!(!is_unkeyed_create_request(
+            "POST",
+            "/api/v1/projects/abc/index"
+        ));
+        let (client, server) = client_with_http_sequence_headers(vec![
+            (
+                "502 Bad Gateway",
+                "",
+                r#"{"error":{"code":"bad_gateway","message":"Upstream API origin unavailable"}}"#
+                    .to_string(),
+            ),
+            ("200 OK", "", r#"{"success":true,"data":{}}"#.to_string()),
+        ])
+        .await;
+        let result = client
+            .post::<serde_json::Value, _>("/projects", serde_json::json!({"name": "p"}))
+            .await;
+        match result {
+            Err(Error::Http {
+                status: 502,
+                message,
+                ..
+            }) => assert!(
+                message.contains("may have reached ContextStream"),
+                "{message}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        server.abort();
     }
 
     #[tokio::test]

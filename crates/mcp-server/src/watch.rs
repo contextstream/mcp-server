@@ -2767,6 +2767,12 @@ mod tests {
 
     #[test]
     fn bridge_health_is_fresh_and_privacy_bounded_while_the_lock_is_held() {
+        // watch_enabled_respects_opt_out sets CONTEXTSTREAM_WATCH=0 under this
+        // lock; reading it unlocked answered "Disabled" when the two ran at
+        // once (the 1.0.47 release gate).
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let directory = tempdir().expect("tempdir");
         let lock = acquire_singleton_lock_at(directory.path()).expect("lock");
         lock.write_heartbeat(3);
@@ -2785,6 +2791,12 @@ mod tests {
 
     #[test]
     fn stale_heartbeat_is_degraded_and_health_probe_never_creates_state() {
+        // watch_enabled_respects_opt_out sets CONTEXTSTREAM_WATCH=0 under this
+        // lock; reading it unlocked answered "Disabled" when the two ran at
+        // once (the 1.0.47 release gate).
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let directory = tempdir().expect("tempdir");
         let state_dir = directory.path().join("not-created");
         let stopped = sync_bridge_health_at(&state_dir, chrono::Utc::now());

@@ -2193,7 +2193,9 @@ impl GraphTool {
                             input.offset,
                         )
                         .await?;
-                    if let Some(ws) = scope.workspace_id {
+                    // A "graph is building" answer is not kept (#467).
+                    let building = primary.get("graph_building").and_then(Value::as_bool) == Some(true);
+                    if let (Some(ws), false) = (scope.workspace_id, building) {
                         let fed_scope = mcp_types::atlas_layer::AtlasFederationScope {
                             workspace_id: ws,
                             project_id: scope.project_id,
@@ -2321,7 +2323,9 @@ impl GraphTool {
                             input.element_type.as_deref(),
                         )
                         .await?;
-                    if let Some(ws) = scope.workspace_id {
+                    // A "graph is building" answer is not kept (#467).
+                    let building = primary.get("graph_building").and_then(Value::as_bool) == Some(true);
+                    if let (Some(ws), false) = (scope.workspace_id, building) {
                         let fed_scope = mcp_types::atlas_layer::AtlasFederationScope {
                             workspace_id: ws,
                             project_id: scope.project_id,
@@ -2842,6 +2846,24 @@ fn graph_not_built_text(state: &str) -> String {
     )
 }
 
+/// What an analysis says while the project's graph is being built (#467):
+/// the API answers {"graph_building": true} instead of analysing a
+/// half-written graph, which said "No circular dependencies found" for a repo
+/// with a cycle.
+fn graph_building_text() -> String {
+    "[GRAPH BUILDING] This project's code graph is being built right now, so this analysis has no answer yet. It is not a finding that there are no dependencies, usages, cycles or unused code. Run it again in a few seconds.".to_string()
+}
+
+/// Whether the API answered that the project's graph is being built.
+fn reports_graph_building(result: &ToolResult) -> bool {
+    result
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.get("graph_building"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 /// Whether an analysis answer says it found nothing, in the formatter's own
 /// words.
 fn reports_nothing(result: &ToolResult) -> bool {
@@ -2945,6 +2967,12 @@ impl ToolHandler for GraphTool {
             }
             Err(error) => return Err(error),
         };
+        if is_analysis && reports_graph_building(&result) {
+            return Ok(ToolResult::with_structured(
+                graph_building_text(),
+                result.structured_content.unwrap_or(Value::Null),
+            ));
+        }
         if result.is_error || !is_analysis || !reports_nothing(&result) {
             return Ok(result);
         }
@@ -2961,10 +2989,14 @@ impl ToolHandler for GraphTool {
         if let Some(object) = structured.as_object_mut() {
             object.insert("graph_built".to_string(), Value::Bool(false));
         }
-        Ok(ToolResult::with_structured(
-            graph_not_built_text(&state),
-            structured,
-        ))
+        // "status: rebuilding" is a build in progress, not a graph to start.
+        let text =
+            if state.starts_with("status: building") || state.starts_with("status: rebuilding") {
+                graph_building_text()
+            } else {
+                graph_not_built_text(&state)
+            };
+        Ok(ToolResult::with_structured(text, structured))
     }
 
     fn metadata(&self) -> &ToolMetadata {
@@ -3221,6 +3253,22 @@ mod graph_not_built_tests {
             text.starts_with("[GRAPH NOT BUILT]") && text.contains("graph(action=\"ingest\")"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn an_analysis_during_a_build_says_the_graph_is_building() {
+        // #467: "No circular dependencies found" for a repo with a cycle,
+        // read from a half-written graph.
+        let building = ToolResult::with_structured(
+            "No circular dependencies found.",
+            serde_json::json!({"status": "building", "graph_building": true}),
+        );
+        assert!(reports_graph_building(&building));
+        assert!(!reports_graph_building(&ToolResult::with_structured(
+            "No circular dependencies found.",
+            serde_json::json!({"cycles": []}),
+        )));
+        assert!(graph_building_text().starts_with("[GRAPH BUILDING]"));
     }
 
     #[test]

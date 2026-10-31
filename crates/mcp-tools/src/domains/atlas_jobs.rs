@@ -18,7 +18,8 @@
 use async_trait::async_trait;
 use mcp_session::SessionManager;
 use mcp_types::acceleration_layer::{
-    AccelerationJobKind, AccelerationJobSpec, AccelerationJobStatus, AccelerationLayer,
+    AccelerationJobError, AccelerationJobKind, AccelerationJobSpec, AccelerationJobStatus,
+    AccelerationLayer,
 };
 use mcp_types::atlas_layer::{
     AtlasJobKind, AtlasJobSpec, AtlasJobStatus, AtlasLayer, AtlasSearchCollection,
@@ -95,7 +96,7 @@ impl AtlasJobTool {
             name: "async_job".to_string(),
             title: "Async export jobs".to_string(),
             description: "Submit, poll, and page results from long-running async jobs over the \
-                 caller's memory data (transcripts / decisions / lessons / docs). Use \
+                 caller's memory data (transcripts / decisions / lessons / docs / QA). Use \
                  when a synchronous list / aggregate would time out or return more rows \
                  than the caller can stream. Actions: submit_export, submit_aggregate, \
                  poll, result. Submit returns a `job_id` immediately; poll reports \
@@ -133,6 +134,10 @@ impl AtlasJobTool {
         let collection = parse_collection(input.collection.as_deref(), kind)?;
         let filter = input.filter.unwrap_or(Value::Null);
         let options = input.options.unwrap_or(Value::Null);
+        // A filter or option the runner does not read was accepted and then
+        // ignored (#439).
+        validate_job_filter(&filter)?;
+        validate_job_options(&options, kind)?;
         let project_id = parse_optional_project_id(input.project_id.as_deref())?;
 
         if let Some(provider) = acceleration_provider {
@@ -163,6 +168,11 @@ impl AtlasJobTool {
                 .await
             {
                 Ok(handle) => handle,
+                Err(AccelerationJobError::Refused(reason)) => {
+                    return Ok(ToolResult::error(format!(
+                        "[ACCELERATION_JOB] submit refused: {reason}"
+                    )));
+                }
                 Err(error) => {
                     tracing::warn!(error = %error, "acceleration-jobs: submit_job failed");
                     return Ok(ToolResult::with_structured(
@@ -262,6 +272,7 @@ impl AtlasJobTool {
             })?;
 
         if should_use_acceleration_job(job_id, &self.acceleration_layer, &self.atlas_layer) {
+            require_job_uuid(job_id)?;
             return self.poll_acceleration_job(job_id).await;
         }
 
@@ -333,6 +344,7 @@ impl AtlasJobTool {
             })?;
 
         if should_use_acceleration_job(job_id, &self.acceleration_layer, &self.atlas_layer) {
+            require_job_uuid(job_id)?;
             return self
                 .result_acceleration_job(job_id, input.cursor, input.limit)
                 .await;
@@ -505,6 +517,9 @@ impl AtlasJobTool {
         let started = std::time::Instant::now();
         let state = match provider.poll_job(job_id).await {
             Ok(state) => state,
+            Err(error) if job_error_is_the_callers(&error) => {
+                return Ok(ToolResult::error(job_error_text(job_id, &error)));
+            }
             Err(error) => {
                 return Ok(ToolResult::with_structured(
                     format!("[ACCELERATION_JOB] poll failed: {}", error),
@@ -572,6 +587,9 @@ impl AtlasJobTool {
 
         let state = match provider.poll_job(job_id).await {
             Ok(state) => state,
+            Err(error) if job_error_is_the_callers(&error) => {
+                return Ok(ToolResult::error(job_error_text(job_id, &error)));
+            }
             Err(error) => {
                 return Ok(ToolResult::with_structured(
                     format!("[ACCELERATION_JOB] result failed: {}", error),
@@ -744,6 +762,165 @@ fn job_not_started_note(
     ))
 }
 
+/// Date keys the job runner reads from `filter` (and `options`) directly.
+const JOB_FILTER_DATE_KEYS: &[&str] = &[
+    "from",
+    "to",
+    "from_date",
+    "to_date",
+    "created_after",
+    "created_before",
+    "updated_after",
+    "updated_before",
+    "started_after",
+    "started_before",
+    "occurred_after",
+    "occurred_before",
+    "valid_after",
+    "valid_before",
+];
+/// Fields the job runner reads a `{"$gte"|"$gt"|"$lte"|"$lt": date}` bound from.
+const JOB_FILTER_BOUND_FIELDS: &[&str] = &[
+    "created_at",
+    "updated_at",
+    "started_at",
+    "occurred_at",
+    "valid_from",
+];
+const JOB_FILTER_BOUND_OPERATORS: &[&str] = &["$gte", "$gt", "$lte", "$lt"];
+
+fn is_job_date(value: &Value) -> bool {
+    value.as_str().is_some_and(|raw| {
+        chrono::DateTime::parse_from_rfc3339(raw).is_ok()
+            || chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").is_ok()
+    })
+}
+
+/// The job runner reads only a time window from `filter`; anything else was
+/// accepted and silently ignored (#439).
+fn validate_job_filter(filter: &Value) -> Result<()> {
+    let refuse = |what: String| {
+        Error::Validation(format!(
+            "async_job: {what}. `filter` takes a time window only: {} (a date, e.g. \
+             \"2026-10-01\" or an RFC 3339 time), or {} with {} and a date, e.g. \
+             {{\"updated_at\": {{\"$gte\": \"2026-10-01\"}}}}.",
+            JOB_FILTER_DATE_KEYS.join(", "),
+            JOB_FILTER_BOUND_FIELDS.join(", "),
+            JOB_FILTER_BOUND_OPERATORS.join(", ")
+        ))
+    };
+    let object = match filter {
+        Value::Null => return Ok(()),
+        Value::Object(object) => object,
+        _ => return Err(refuse("`filter` must be a JSON object".to_string())),
+    };
+    for (key, value) in object {
+        if JOB_FILTER_DATE_KEYS.contains(&key.as_str()) {
+            if !is_job_date(value) {
+                return Err(refuse(format!("`filter.{key}` is not a date")));
+            }
+        } else if JOB_FILTER_BOUND_FIELDS.contains(&key.as_str()) {
+            let Some(bounds) = value.as_object().filter(|bounds| !bounds.is_empty()) else {
+                return Err(refuse(format!("`filter.{key}` needs an operator")));
+            };
+            for (operator, bound) in bounds {
+                if !JOB_FILTER_BOUND_OPERATORS.contains(&operator.as_str()) {
+                    return Err(refuse(format!(
+                        "`filter.{key}` has an unknown operator `{operator}`"
+                    )));
+                }
+                if !is_job_date(bound) {
+                    return Err(refuse(format!("`filter.{key}.{operator}` is not a date")));
+                }
+            }
+        } else {
+            return Err(refuse(format!("`filter` key `{key}` is not read")));
+        }
+    }
+    Ok(())
+}
+
+/// The options the job runner reads: `limit`, `include_content` (exports),
+/// `bucket` (aggregates; default day) and the same date keys as `filter`.
+fn validate_job_options(options: &Value, kind: AtlasJobKind) -> Result<()> {
+    let object = match options {
+        Value::Null => return Ok(()),
+        Value::Object(object) => object,
+        _ => {
+            return Err(Error::Validation(
+                "async_job: `options` must be a JSON object".to_string(),
+            ))
+        }
+    };
+    for (key, value) in object {
+        let ok = match key.as_str() {
+            "limit" => value.as_u64().is_some_and(|limit| limit >= 1),
+            "include_content" => kind == AtlasJobKind::MemoryExport && value.as_bool().is_some(),
+            "bucket" => {
+                kind == AtlasJobKind::MemoryAggregate
+                    && value.as_str().is_some_and(|bucket| {
+                        matches!(
+                            bucket.trim().to_ascii_lowercase().as_str(),
+                            "hour"
+                                | "hours"
+                                | "day"
+                                | "days"
+                                | "week"
+                                | "weeks"
+                                | "month"
+                                | "months"
+                        )
+                    })
+            }
+            date if JOB_FILTER_DATE_KEYS.contains(&date) => is_job_date(value),
+            _ => false,
+        };
+        if !ok {
+            let takes = match kind {
+                AtlasJobKind::MemoryExport => {
+                    "submit_export takes limit (1 or more) and include_content (true or false)"
+                }
+                AtlasJobKind::MemoryAggregate => {
+                    "submit_aggregate takes limit (1 or more) and bucket (hour, day, week or \
+                     month; default day)"
+                }
+            };
+            return Err(Error::Validation(format!(
+                "async_job: `options.{key}` is not read as given. {takes}, and the date keys \
+                 of `filter`."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Acceleration jobs are named by the UUID submit returned.
+fn require_job_uuid(job_id: &str) -> Result<()> {
+    Uuid::parse_str(job_id).map(|_| ()).map_err(|_| {
+        Error::Validation(format!(
+            "async_job: job_id `{job_id}` is not a job id; pass the UUID that submit returned"
+        ))
+    })
+}
+
+/// A job the API does not know, or a request it refused as asked, is the
+/// caller's to fix: an error, not a degraded service (#439).
+fn job_error_is_the_callers(error: &AccelerationJobError) -> bool {
+    matches!(
+        error,
+        AccelerationJobError::JobNotFound(_) | AccelerationJobError::Refused(_)
+    )
+}
+
+fn job_error_text(job_id: &str, error: &AccelerationJobError) -> String {
+    match error {
+        AccelerationJobError::JobNotFound(_) => {
+            format!("[ACCELERATION_JOB] job `{job_id}` not found.")
+        }
+        other => format!("[ACCELERATION_JOB] job `{job_id}`: {other}"),
+    }
+}
+
 fn parse_collection(raw: Option<&str>, kind: AtlasJobKind) -> Result<AtlasSearchCollection> {
     let raw = raw
         .map(str::trim)
@@ -751,7 +928,7 @@ fn parse_collection(raw: Option<&str>, kind: AtlasJobKind) -> Result<AtlasSearch
         .ok_or_else(|| {
             Error::Validation(format!(
                 "async_job({}) requires `collection` (one of: transcripts, decisions, \
-                 lessons, docs)",
+                 lessons, docs, qa_questions, qa_answers, qa_kb_items)",
                 match kind {
                     AtlasJobKind::MemoryExport => "submit_export",
                     AtlasJobKind::MemoryAggregate => "submit_aggregate",
@@ -861,19 +1038,22 @@ impl ToolHandler for AtlasJobTool {
             )
             .string(
                 "collection",
-                "submit_*: source collection (transcripts | decisions | lessons | docs).",
+                "submit_*: source collection (transcripts | decisions | lessons | docs | \
+                 qa_questions | qa_answers | qa_kb_items).",
                 false,
             )
             .object(
                 "filter",
-                "submit_*: optional record filter (JSON object with field/op/value \
-                 conditions; e.g. {\"updated_at\": {\"$gte\": \"2026-01-01\"}}).",
+                "submit_*: optional time window: created_after / created_before (or from / \
+                 to, updated_*, started_*, occurred_*, valid_*) with a date, or \
+                 {\"updated_at\": {\"$gte\": \"2026-01-01\"}} on created_at, updated_at, \
+                 started_at, occurred_at or valid_from. Other keys are refused.",
                 false,
             )
             .object(
                 "options",
-                "submit_export: {include_content?: bool}. submit_aggregate: \
-                 {bucket: hour|day|week|month}.",
+                "submit_export: {include_content?: bool, limit?: n}. submit_aggregate: \
+                 {bucket?: hour|day|week|month (default day), limit?: n}.",
                 false,
             )
             .string("job_id", "poll/result: job_id returned by submit.", false)
@@ -1308,6 +1488,75 @@ mod tests {
         Fut: std::future::Future,
     {
         mcp_client::run_with_caller_cache_identity(name.to_string(), call).await
+    }
+
+    #[test]
+    fn a_filter_or_option_the_runner_does_not_read_is_refused() {
+        // #439: these were accepted, given a job id, and then ignored.
+        for filter in [
+            serde_json::json!("updated_at>2026"),
+            serde_json::json!({"updated_at": {"": "x"}}),
+            serde_json::json!({"title; DROP TABLE x": {"": 1}}),
+            serde_json::json!({"created_after": "yesterday"}),
+        ] {
+            assert!(validate_job_filter(&filter).is_err(), "{filter}");
+        }
+        for filter in [
+            serde_json::Value::Null,
+            serde_json::json!({"updated_at": {"$gte": "2026-01-01"}}),
+            serde_json::json!({"created_after": "2026-10-01T00:00:00Z", "to": "2026-10-31"}),
+        ] {
+            assert!(validate_job_filter(&filter).is_ok(), "{filter}");
+        }
+        let decade = serde_json::json!({"bucket": "decade"});
+        let err = validate_job_options(&decade, AtlasJobKind::MemoryAggregate).unwrap_err();
+        assert!(
+            err.to_string().contains("hour, day, week or month"),
+            "{err}"
+        );
+        assert!(
+            validate_job_options(&serde_json::Value::Null, AtlasJobKind::MemoryAggregate).is_ok()
+        );
+        assert!(validate_job_options(
+            &serde_json::json!({"bucket": "week", "limit": 10}),
+            AtlasJobKind::MemoryAggregate
+        )
+        .is_ok());
+        assert!(validate_job_options(
+            &serde_json::json!({"include_content": true}),
+            AtlasJobKind::MemoryExport
+        )
+        .is_ok());
+        assert!(validate_job_options(
+            &serde_json::json!({"include_content": "yes"}),
+            AtlasJobKind::MemoryExport
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_job_id_that_is_not_a_uuid_or_not_known_is_an_error() {
+        // #439: "poll failed: ... 422 Unprocessable Entity" and "... 404 Not
+        // Found" came back as successful results.
+        let (tool, _) = accelerated_tool(None);
+        let err = tool
+            .execute(serde_json::json!({"action": "poll", "job_id": "nope"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pass the UUID that submit returned"),
+            "{err}"
+        );
+        let not_found = AccelerationJobError::JobNotFound("MCP job not found".to_string());
+        assert!(job_error_is_the_callers(&not_found));
+        assert_eq!(
+            job_error_text("j1", &not_found),
+            "[ACCELERATION_JOB] job `j1` not found."
+        );
+        assert!(!job_error_is_the_callers(&AccelerationJobError::Request(
+            "server returned 502".to_string()
+        )));
     }
 
     #[tokio::test]

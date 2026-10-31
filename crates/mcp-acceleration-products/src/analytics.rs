@@ -164,9 +164,23 @@ async fn decode_envelope<T: for<'de> Deserialize<'de>>(
             status = status.as_u16(),
             "acceleration analytics API request failed"
         );
-        return Err(AccelerationAnalyticsError::Request(format!(
-            "server returned {status}"
-        )));
+        // The API says what was wrong with the request; a caller mistake is
+        // told apart from a service that is down (#439).
+        let message = response
+            .json::<ApiResponse<Value>>()
+            .await
+            .ok()
+            .and_then(|envelope| envelope.error)
+            .map(|error| error.message)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| format!("server returned {status}"));
+        return Err(match status.as_u16() {
+            404 => AccelerationAnalyticsError::Refused(message),
+            400 | 409 | 422 => AccelerationAnalyticsError::Refused(message),
+            _ => {
+                AccelerationAnalyticsError::Request(format!("server returned {status}: {message}"))
+            }
+        });
     }
 
     let envelope = response

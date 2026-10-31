@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.49
+
+- ContextStudio (`studio`): recorded explainers. An explainer of a CLI, an MCP server, a coding agent or a terminal workflow is recorded from real sessions on a fresh machine started for the making, never drawn.
+  - The plan says so ("Recorded on a fresh machine: Claude Code 2.1.x with the ContextStream MCP, in <project>."). When it still needs something (which repository, how a tool is installed), it lists the questions under `questions` and isn't made until the person's agent answers them and plans again with the answers as context.
+  - `status` names the session being recorded ("Recording beat 2 of 4: Claude Code plans a film. 1 of 4 recorded.") and then the narration, the cut and the result ("Recorded in 3 sessions on a fresh machine.").
+- Memory: a doc from a linked workspace names its workspace in memory search ("[doc/general · from Product]"), in doc lists ("[general · from Product]") and in its detail ("From: Product (a linked workspace; read only)") (#486).
+- Sharing or unsharing a workspace drops the searches a running process cached under the old link, so an answer read under the old link is not replayed (#487).
+- Graph: an analysis whose answer says the graph is not built says "[GRAPH NOT BUILT]" at once, instead of "none found" (#484).
+- Search: rows the server could not check against a regex are counted apart from matches and marked "[related, not checked against the regex]" (#364).
+
 ## 1.0.48
 
 - Shared knowledge between workspaces:

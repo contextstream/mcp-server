@@ -314,6 +314,20 @@ impl AtlasChartTool {
 
         let mut scope = AccelerationAnalyticsScope::new(workspace_id);
         scope.project_id = parse_optional_project_id(input.project_id.as_deref())?;
+        // Rendered under the gateway's service token: only for a workspace
+        // the caller can read.
+        if !super::caller_access::caller_can_read(
+            self.session.client(),
+            workspace_id,
+            scope.project_id,
+        )
+        .await?
+        {
+            return Ok(ToolResult::error(super::caller_access::no_access_message(
+                workspace_id,
+                scope.project_id,
+            )));
+        }
 
         let range = input
             .range
@@ -845,6 +859,51 @@ mod tests {
         assert_eq!(archived["configured"], serde_json::json!(false));
     }
 
+    /// Runs `call` as a caller whose access to `workspace` was checked.
+    async fn as_caller_who_reads<F, Fut>(workspace: Uuid, allowed: bool, call: F) -> Fut::Output
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future,
+    {
+        let caller = format!("chart-test-caller-{workspace}");
+        crate::domains::caller_access::remember_for_test(&caller, workspace, None, allowed);
+        mcp_client::run_with_caller_cache_identity(caller, call).await
+    }
+
+    #[tokio::test]
+    async fn render_refuses_a_workspace_the_caller_cannot_read() {
+        let tool = AtlasChartTool::with_acceleration(
+            noop_layer(),
+            acceleration_layer(true),
+            fake_session(),
+        );
+        let ws = Uuid::new_v4();
+        let call = || {
+            tool.execute(serde_json::json!({
+                "action": "render",
+                "chart": "tool_latency_p95",
+                "workspace_id": ws.to_string(),
+            }))
+        };
+        let result = as_caller_who_reads(ws, false, call).await.unwrap();
+        assert!(result.is_error);
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("don't have access to workspace"), "{text}");
+        // The provider was not asked: it would have failed with "rollup query failed".
+        assert!(!text.contains("rollup query failed"), "{text}");
+
+        // A caller with no identity is never served either.
+        let anonymous = tool
+            .execute(serde_json::json!({
+                "action": "render",
+                "chart": "tool_latency_p95",
+                "workspace_id": ws.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(anonymous.is_error);
+    }
+
     #[tokio::test]
     async fn render_prefers_acceleration_analytics() {
         let tool = AtlasChartTool::with_acceleration(
@@ -853,16 +912,17 @@ mod tests {
             fake_session(),
         );
         let ws = Uuid::new_v4();
-        let result = tool
-            .execute(serde_json::json!({
+        let result = as_caller_who_reads(ws, true, || {
+            tool.execute(serde_json::json!({
                 "action": "render",
                 "chart": "tool_latency_p95",
                 "workspace_id": ws.to_string(),
                 "range": "24h",
                 "filters": {"tool_name": "context"},
             }))
-            .await
-            .unwrap();
+        })
+        .await
+        .unwrap();
 
         assert!(!result.is_error);
         let structured = result.structured_content.expect("structured payload");
@@ -895,14 +955,15 @@ mod tests {
             fake_session(),
         );
         let ws = Uuid::new_v4();
-        let result = tool
-            .execute(serde_json::json!({
+        let result = as_caller_who_reads(ws, true, || {
+            tool.execute(serde_json::json!({
                 "action": "render",
                 "chart": "tool_latency_p95",
                 "workspace_id": ws.to_string(),
             }))
-            .await
-            .unwrap();
+        })
+        .await
+        .unwrap();
 
         assert!(!result.is_error);
         let structured = result.structured_content.expect("structured payload");

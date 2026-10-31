@@ -133,6 +133,7 @@ impl ToolHandler for GraphRelatedTool {
                 user_scope: None,
             };
             crate::domains::atlas_warm_cache::try_lookup_accelerated(
+                &self.client,
                 &self.acceleration_layer,
                 &self.atlas_layer,
                 mcp_types::atlas_layer::AtlasWarmCacheKind::RelatedNodes,
@@ -399,6 +400,7 @@ impl ToolHandler for GraphDependenciesTool {
                 user_scope: None,
             };
             crate::domains::atlas_warm_cache::try_lookup_accelerated(
+                &self.client,
                 &self.acceleration_layer,
                 &self.atlas_layer,
                 mcp_types::atlas_layer::AtlasWarmCacheKind::DependencyResult,
@@ -671,6 +673,7 @@ impl ToolHandler for GraphImpactTool {
                 user_scope: None,
             };
             crate::domains::atlas_warm_cache::try_lookup_accelerated(
+                &self.client,
                 &self.acceleration_layer,
                 &self.atlas_layer,
                 mcp_types::atlas_layer::AtlasWarmCacheKind::SubgraphSnapshot,
@@ -2045,6 +2048,7 @@ impl GraphTool {
                 user_scope: None,
                     };
                     crate::domains::atlas_warm_cache::try_lookup_accelerated(
+                        &self.client,
                         &self.acceleration_layer,
                         &self.atlas_layer,
                         mcp_types::atlas_layer::AtlasWarmCacheKind::SubgraphSnapshot,
@@ -2170,6 +2174,7 @@ impl GraphTool {
                 user_scope: None,
                     };
                     crate::domains::atlas_warm_cache::try_lookup_accelerated(
+                        &self.client,
                         &self.acceleration_layer,
                         &self.atlas_layer,
                         mcp_types::atlas_layer::AtlasWarmCacheKind::SubgraphSnapshot,
@@ -2305,6 +2310,7 @@ impl GraphTool {
                 user_scope: None,
                     };
                     crate::domains::atlas_warm_cache::try_lookup_accelerated(
+                        &self.client,
                         &self.acceleration_layer,
                         &self.atlas_layer,
                         mcp_types::atlas_layer::AtlasWarmCacheKind::SubgraphSnapshot,

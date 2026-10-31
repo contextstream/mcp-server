@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use mcp_types::acceleration_layer::{
     AccelerationArchiveCollection, AccelerationArchiveError, AccelerationArchiveHit,
-    AccelerationArchiveScope, ArchiveProvider,
+    AccelerationArchiveScope, ArchiveProvider, CALLER_ACCESS_HEADER,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -116,6 +116,7 @@ impl ArchiveProvider for ContextStreamArchiveProvider {
             .post(self.endpoint("archive/search"))
             .bearer_auth(&self.job_api_token)
             .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
+            .header(CALLER_ACCESS_HEADER, "checked")
             .json(&ArchiveSearchBody::from_scope(query, scope, limit))
             .send()
             .await

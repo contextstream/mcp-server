@@ -9104,6 +9104,7 @@ impl ToolHandler for ContextTool {
                 &distributed_context_request_identity,
             );
             super::atlas_warm_cache::try_lookup_accelerated(
+                &self.client,
                 &self.acceleration_layer,
                 &self.atlas_layer,
                 mcp_types::atlas_layer::AtlasWarmCacheKind::Context,

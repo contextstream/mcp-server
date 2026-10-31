@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use mcp_client::client::loopback_api_forwarder_headers;
 use mcp_types::acceleration_layer::{
     WarmCacheError, WarmCacheHit, WarmCacheLookup, WarmCacheProvider, WarmCachePut,
-    WarmCacheRebuild,
+    WarmCacheRebuild, CALLER_ACCESS_HEADER,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -174,6 +174,7 @@ impl WarmCacheProvider for ContextStreamWarmCacheProvider {
             .post(self.endpoint("read-model/get"))
             .bearer_auth(&self.job_api_token)
             .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
+            .header(CALLER_ACCESS_HEADER, "checked")
             .json(&ReadModelGetBody::from(lookup))
             .send()
             .await
@@ -210,6 +211,7 @@ impl WarmCacheProvider for ContextStreamWarmCacheProvider {
             .post(self.endpoint("read-model/enqueue-rebuild"))
             .bearer_auth(&self.job_api_token)
             .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
+            .header(CALLER_ACCESS_HEADER, "checked")
             .json(&EnqueueRebuildBody::from(rebuild))
             .send()
             .await
@@ -235,6 +237,7 @@ impl WarmCacheProvider for ContextStreamWarmCacheProvider {
             .post(self.endpoint("read-model/put-jsonb"))
             .bearer_auth(&self.job_api_token)
             .headers(loopback_api_forwarder_headers(&self.acceleration_api_url))
+            .header(CALLER_ACCESS_HEADER, "checked")
             .json(&PutReadModelJsonbBody::from(put))
             .send()
             .await

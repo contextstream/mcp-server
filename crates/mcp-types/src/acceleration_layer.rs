@@ -534,10 +534,21 @@ impl AccelerationJobStatus {
     }
 }
 
+/// Sent with every acceleration request that names a workspace, once the
+/// gateway has checked with the caller's own credentials that the caller can
+/// read it. The routes run under the gateway's service token, so the API
+/// cannot check the caller and refuses a request without this header.
+pub const CALLER_ACCESS_HEADER: &str = "x-contextstream-caller-access";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AccelerationJobState {
     pub job_id: String,
     pub kind: AccelerationJobKind,
+    /// The job's scope, checked against the caller before the job is shown.
+    #[serde(default)]
+    pub workspace_id: Option<Uuid>,
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
     pub status: AccelerationJobStatus,
     pub progress: Option<f64>,
     pub record_count: Option<u64>,

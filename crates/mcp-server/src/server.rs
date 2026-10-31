@@ -27,6 +27,7 @@ pub fn build_registry(
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new(config);
     registry.set_session_manager(session.clone());
+    registry.set_caller_client(client.clone());
     if !config.is_http_transport {
         registry.set_activation_client(client.clone());
     }

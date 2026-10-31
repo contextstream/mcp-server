@@ -714,6 +714,9 @@ pub struct ToolRegistry {
     /// telemetry. Remote HTTP gateways intentionally leave this unset because
     /// their process installation is not the end user's editor installation.
     activation_client: Option<ContextStreamClient>,
+    /// Asks the API who the current caller is (with the caller's own
+    /// credentials), so telemetry names the person who made a call.
+    caller_client: Option<ContextStreamClient>,
 }
 
 /// Answers carry stored text as stored, and terminal control bytes in it
@@ -748,6 +751,7 @@ impl ToolRegistry {
             acceleration_layer: noop_acceleration_layer(),
             session: None,
             activation_client: None,
+            caller_client: None,
         }
     }
 
@@ -759,6 +763,12 @@ impl ToolRegistry {
 
     pub fn set_activation_client(&mut self, client: ContextStreamClient) {
         self.activation_client = Some(client);
+    }
+
+    /// The client telemetry uses to name the person who made a call
+    /// (`caller_access::caller_user_id`).
+    pub fn set_caller_client(&mut self, client: ContextStreamClient) {
+        self.caller_client = Some(client);
     }
 
     /// Replace the legacy compatibility layer. Public builds install a no-op.
@@ -1078,6 +1088,7 @@ impl ToolRegistry {
             return;
         };
         let session = self.session.clone();
+        let caller_client = self.caller_client.clone();
         let explicit_workspace_id = request.workspace_id;
         let explicit_project_id = request.project_id;
         let tool = request.tool;
@@ -1120,6 +1131,9 @@ impl ToolRegistry {
             event.provider = Some("mcp_gateway".to_string());
             event.latency_ms = Some(latency_ms);
             event.degraded = Some(degraded);
+            if let Some(client) = caller_client.as_ref() {
+                event.actor_user_id = crate::domains::caller_access::caller_user_id(client).await;
+            }
 
             if let Err(error) = signals.emit(event).await {
                 tracing::debug!(%error, "MCP acceleration observation skipped");

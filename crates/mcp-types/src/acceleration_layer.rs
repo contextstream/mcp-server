@@ -102,6 +102,12 @@ pub struct AccelerationSignalEvent {
     pub kind: AccelerationSignalKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
+    /// The person who made the call: the account the API authenticated for the caller's own
+    /// credentials (never a value the caller sends). The tenant stays the scope's owner, so a team
+    /// member's calls are no longer recorded only under the workspace's owner. None for system
+    /// work and unauthenticated calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_user_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +138,7 @@ impl AccelerationSignalEvent {
         Self {
             kind,
             tenant_id: None,
+            actor_user_id: None,
             workspace_id: None,
             project_id: None,
             tool: None,

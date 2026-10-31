@@ -45,6 +45,8 @@ impl ContextStreamSignalProvider {
 #[derive(Debug, Serialize)]
 struct TelemetryBody {
     tenant_id: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor_user_id: Option<uuid::Uuid>,
     workspace_id: Option<uuid::Uuid>,
     project_id: Option<uuid::Uuid>,
     tool: Option<String>,
@@ -66,6 +68,7 @@ impl From<AccelerationSignalEvent> for TelemetryBody {
         let metadata = bounded_metadata(&signal_type, event.metadata);
         Self {
             tenant_id: event.tenant_id,
+            actor_user_id: event.actor_user_id,
             workspace_id: event.workspace_id,
             project_id: event.project_id,
             tool: event.tool,
@@ -253,6 +256,27 @@ mod tests {
         assert_eq!(body.provider, "server_telemetry");
         assert_eq!(body.latency_ms, Some(12));
         assert_eq!(body.metadata["files_indexed"], 3);
+    }
+
+    #[test]
+    fn telemetry_body_names_the_person_who_made_a_tool_call_only_when_known() {
+        let workspace_id = uuid::Uuid::new_v4();
+        let member = uuid::Uuid::new_v4();
+        let mut event = AccelerationSignalEvent::with_scope(
+            AccelerationSignalKind::ToolCall,
+            workspace_id,
+            None,
+            serde_json::json!({"tool_name": "search"}),
+        );
+        event.actor_user_id = Some(member);
+        let body = serde_json::to_value(TelemetryBody::from(event.clone())).expect("body");
+        assert_eq!(body["actor_user_id"], serde_json::json!(member));
+        // The tenant is not guessed here: the API resolves it from the workspace (its owner).
+        assert_eq!(body["tenant_id"], serde_json::Value::Null);
+
+        event.actor_user_id = None;
+        let body = serde_json::to_value(TelemetryBody::from(event)).expect("body");
+        assert!(body.get("actor_user_id").is_none(), "{body}");
     }
 
     #[test]

@@ -79,6 +79,22 @@ pub async fn caller_can_read(
     Ok(allowed)
 }
 
+/// The account the API authenticated for the current caller's own credentials
+/// (`/account/context`, cached per caller), for telemetry: a tool call is
+/// recorded under the person who made it, as well as the workspace's owner.
+/// None for a caller with no credentials of their own (system work, an
+/// unauthenticated request) or when the API can't say.
+pub async fn caller_user_id(client: &ContextStreamClient) -> Option<Uuid> {
+    mcp_client::get_task_auth_override()?;
+    caller_identity()?;
+    client
+        .get_account_context()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|context| context.user_id)
+}
+
 /// Starts [`caller_can_read`] for the current caller without waiting, so a
 /// later call of the same scope knows the answer. For the warm cache, whose
 /// lookups must not make the primary path slower.
@@ -197,5 +213,118 @@ mod tests {
         assert!(is_refusal(&Error::http(401, "unauthorized")));
         assert!(!is_refusal(&Error::http(500, "boom")));
         assert!(!is_refusal(&Error::Timeout(30)));
+    }
+
+    /// An API that answers `/account/context` with the account of whichever
+    /// caller's own key the request carries, and refuses anything else.
+    /// Serves exactly `requests` connections, so an extra call would fail.
+    async fn account_api(accounts: Vec<(&'static str, Uuid)>, requests: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind account test listener");
+        let address = listener.local_addr().expect("account test address");
+        tokio::spawn(async move {
+            for _ in 0..requests {
+                let (mut socket, _) = listener.accept().await.expect("accept account request");
+                let mut buffer = vec![0_u8; 64 * 1024];
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("read account request");
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                assert!(
+                    request.starts_with("GET /api/v1/account/context "),
+                    "{request}"
+                );
+                let account = accounts
+                    .iter()
+                    .find(|(key, _)| request.contains(key))
+                    .map(|(_, id)| *id);
+                let (status, body) = match account {
+                    Some(id) => (
+                        "200 OK",
+                        serde_json::json!({ "user_id": id, "account_type": "team" }),
+                    ),
+                    None => (
+                        "401 Unauthorized",
+                        serde_json::json!({ "error": "unauthorized" }),
+                    ),
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write account response");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    async fn as_caller(client: &ContextStreamClient, caller: &str, key: &str) -> Option<Uuid> {
+        let auth = mcp_types::AuthOverride {
+            api_key: Some(key.to_string()),
+            ..Default::default()
+        };
+        mcp_client::run_with_caller_cache_identity(caller.to_string(), || {
+            mcp_client::run_with_auth_override(auth, || caller_user_id(client))
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_team_member_and_the_owner_are_each_named_by_their_own_credentials() {
+        let member = Uuid::from_u128(0x4380_0010);
+        let owner = Uuid::from_u128(0x4380_0011);
+        // Two answers: one per caller. A repeat is served from the per-caller cache.
+        let api_url = account_api(
+            vec![("member-own-key", member), ("owner-own-key", owner)],
+            2,
+        )
+        .await;
+        let client = ContextStreamClient::new(mcp_types::config::Config {
+            api_url,
+            api_key: None,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            as_caller(&client, "telemetry-member", "member-own-key").await,
+            Some(member)
+        );
+        assert_eq!(
+            as_caller(&client, "telemetry-owner", "owner-own-key").await,
+            Some(owner)
+        );
+        assert_eq!(
+            as_caller(&client, "telemetry-member", "member-own-key").await,
+            Some(member)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_without_the_callers_own_credentials_names_no_one() {
+        let client = ContextStreamClient::new(mcp_types::config::Config {
+            api_url: "http://127.0.0.1:9".to_string(),
+            api_key: Some("gateway-process-key".to_string()),
+            ..Default::default()
+        });
+        // System work: no caller credentials, so the gateway's own account is never named.
+        assert_eq!(caller_user_id(&client).await, None);
+        // Credentials the API refuses name no one either.
+        let api_url = account_api(vec![], 1).await;
+        let refusing = ContextStreamClient::new(mcp_types::config::Config {
+            api_url,
+            api_key: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            as_caller(&refusing, "telemetry-stranger", "unknown-key").await,
+            None
+        );
     }
 }

@@ -275,33 +275,37 @@ impl AtlasJobTool {
             .progress
             .map(|p| format!(" {:.1}%", (p * 100.0).clamp(0.0, 100.0)))
             .unwrap_or_default();
-        let header = format!(
+        let mut header = format!(
             "[JOB] job `{}` is {}{} ({}ms)",
             state.job_id,
             state.status.as_str(),
             progress_str,
             elapsed_ms
         );
+        let mut structured = serde_json::json!({
+            "stages_used": ["async_jobs"],
+            "available": true,
+            "job_id": state.job_id,
+            "kind": state.kind.as_str(),
+            "status": state.status.as_str(),
+            "is_terminal": state.status.is_terminal(),
+            "progress": state.progress,
+            "record_count": state.record_count,
+            "submitted_at": state.submitted_at.to_rfc3339(),
+            "started_at": state.started_at.map(|t| t.to_rfc3339()),
+            "completed_at": state.completed_at.map(|t| t.to_rfc3339()),
+            "error": state.error,
+            "elapsed_ms": elapsed_ms,
+            "origin": "async_jobs",
+        });
+        note_job_not_started(
+            &mut header,
+            &mut structured,
+            state.status == AtlasJobStatus::Pending && state.started_at.is_none(),
+            state.submitted_at,
+        );
 
-        Ok(ToolResult::with_structured(
-            header,
-            serde_json::json!({
-                "stages_used": ["async_jobs"],
-                "available": true,
-                "job_id": state.job_id,
-                "kind": state.kind.as_str(),
-                "status": state.status.as_str(),
-                "is_terminal": state.status.is_terminal(),
-                "progress": state.progress,
-                "record_count": state.record_count,
-                "submitted_at": state.submitted_at.to_rfc3339(),
-                "started_at": state.started_at.map(|t| t.to_rfc3339()),
-                "completed_at": state.completed_at.map(|t| t.to_rfc3339()),
-                "error": state.error,
-                "elapsed_ms": elapsed_ms,
-                "origin": "async_jobs",
-            }),
-        ))
+        Ok(ToolResult::with_structured(header, structured))
     }
 
     async fn result_action(&self, input: AtlasJobInput) -> Result<ToolResult> {
@@ -341,23 +345,29 @@ impl AtlasJobTool {
             }
         };
         if !state.status.is_terminal() {
-            return Ok(ToolResult::with_structured(
-                format!(
-                    "[JOB] job `{}` not yet complete (status: {}). \
-                     Poll again in a few seconds.",
-                    state.job_id,
-                    state.status.as_str()
-                ),
-                serde_json::json!({
-                    "stages_used": ["async_jobs"],
-                    "available": true,
-                    "job_id": state.job_id,
-                    "status": state.status.as_str(),
-                    "is_terminal": false,
-                    "progress": state.progress,
-                    "results": [],
-                }),
-            ));
+            let mut text = format!(
+                "[JOB] job `{}` not yet complete (status: {}).",
+                state.job_id,
+                state.status.as_str()
+            );
+            let mut structured = serde_json::json!({
+                "stages_used": ["async_jobs"],
+                "available": true,
+                "job_id": state.job_id,
+                "status": state.status.as_str(),
+                "is_terminal": false,
+                "progress": state.progress,
+                "results": [],
+            });
+            if !note_job_not_started(
+                &mut text,
+                &mut structured,
+                state.status == AtlasJobStatus::Pending && state.started_at.is_none(),
+                state.submitted_at,
+            ) {
+                text.push_str(" Poll again in a few seconds.");
+            }
+            return Ok(ToolResult::with_structured(text, structured));
         }
         if state.status == AtlasJobStatus::Failed {
             return Ok(ToolResult::with_structured(
@@ -469,32 +479,38 @@ impl AtlasJobTool {
             .map(|p| format!(" {:.1}%", (p * 100.0).clamp(0.0, 100.0)))
             .unwrap_or_default();
 
-        Ok(ToolResult::with_structured(
-            format!(
-                "[ACCELERATION_JOB] job `{}` is {}{} ({}ms)",
-                state.job_id,
-                state.status.as_str(),
-                progress_str,
-                elapsed_ms
-            ),
-            serde_json::json!({
-                "stages_used": ["acceleration_jobs"],
-                "available": true,
-                "job_id": state.job_id,
-                "kind": state.kind.as_str(),
-                "status": state.status.as_str(),
-                "is_terminal": state.status.is_terminal(),
-                "progress": state.progress,
-                "record_count": state.record_count,
-                "submitted_at": state.submitted_at.to_rfc3339(),
-                "started_at": state.started_at.map(|t| t.to_rfc3339()),
-                "completed_at": state.completed_at.map(|t| t.to_rfc3339()),
-                "error": state.error,
-                "elapsed_ms": elapsed_ms,
-                "origin": "acceleration_jobs",
-                "marker": "[ACCELERATION_JOB]",
-            }),
-        ))
+        let mut text = format!(
+            "[ACCELERATION_JOB] job `{}` is {}{} ({}ms)",
+            state.job_id,
+            state.status.as_str(),
+            progress_str,
+            elapsed_ms
+        );
+        let mut structured = serde_json::json!({
+            "stages_used": ["acceleration_jobs"],
+            "available": true,
+            "job_id": state.job_id,
+            "kind": state.kind.as_str(),
+            "status": state.status.as_str(),
+            "is_terminal": state.status.is_terminal(),
+            "progress": state.progress,
+            "record_count": state.record_count,
+            "submitted_at": state.submitted_at.to_rfc3339(),
+            "started_at": state.started_at.map(|t| t.to_rfc3339()),
+            "completed_at": state.completed_at.map(|t| t.to_rfc3339()),
+            "error": state.error,
+            "elapsed_ms": elapsed_ms,
+            "origin": "acceleration_jobs",
+            "marker": "[ACCELERATION_JOB]",
+        });
+        note_job_not_started(
+            &mut text,
+            &mut structured,
+            state.status == AccelerationJobStatus::Pending && state.started_at.is_none(),
+            state.submitted_at,
+        );
+
+        Ok(ToolResult::with_structured(text, structured))
     }
 
     async fn result_acceleration_job(
@@ -522,23 +538,30 @@ impl AtlasJobTool {
             }
         };
         if !state.status.is_terminal() {
-            return Ok(ToolResult::with_structured(
-                format!(
-                    "[ACCELERATION_JOB] job `{}` not yet complete (status: {}). Poll again in a few seconds.",
-                    state.job_id,
-                    state.status.as_str()
-                ),
-                serde_json::json!({
-                    "stages_used": ["acceleration_jobs"],
-                    "available": true,
-                    "job_id": state.job_id,
-                    "status": state.status.as_str(),
-                    "is_terminal": false,
-                    "progress": state.progress,
-                    "records": [],
-                    "marker": "[ACCELERATION_JOB]",
-                }),
-            ));
+            let mut text = format!(
+                "[ACCELERATION_JOB] job `{}` not yet complete (status: {}).",
+                state.job_id,
+                state.status.as_str()
+            );
+            let mut structured = serde_json::json!({
+                "stages_used": ["acceleration_jobs"],
+                "available": true,
+                "job_id": state.job_id,
+                "status": state.status.as_str(),
+                "is_terminal": false,
+                "progress": state.progress,
+                "records": [],
+                "marker": "[ACCELERATION_JOB]",
+            });
+            if !note_job_not_started(
+                &mut text,
+                &mut structured,
+                state.status == AccelerationJobStatus::Pending && state.started_at.is_none(),
+                state.submitted_at,
+            ) {
+                text.push_str(" Poll again in a few seconds.");
+            }
+            return Ok(ToolResult::with_structured(text, structured));
         }
         if state.status == AccelerationJobStatus::Failed {
             return Ok(ToolResult::with_structured(
@@ -616,6 +639,60 @@ impl AtlasJobTool {
             }),
         ))
     }
+}
+
+/// How long a job may wait for a runner before poll and result say so. A
+/// small export starts within seconds while a runner is up (#438).
+const JOB_NOT_STARTED_NOTE_AFTER_SECONDS: i64 = 120;
+
+/// Adds to a poll or result answer that the job has waited long for a runner
+/// that never started it, and returns whether it did. Every poll answered
+/// "pending" for hours when no runner was picking jobs up, and an agent
+/// polled on (#438).
+fn note_job_not_started(
+    text: &mut String,
+    structured: &mut serde_json::Value,
+    waiting_for_a_runner: bool,
+    submitted_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some((waited, note)) =
+        job_not_started_note(waiting_for_a_runner, submitted_at, chrono::Utc::now())
+    else {
+        return false;
+    };
+    text.push_str(&note);
+    structured["not_started_after_seconds"] = serde_json::json!(waited);
+    true
+}
+
+fn job_not_started_note(
+    waiting_for_a_runner: bool,
+    submitted_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(i64, String)> {
+    if !waiting_for_a_runner {
+        return None;
+    }
+    let waited = (now - submitted_at).num_seconds();
+    if waited < JOB_NOT_STARTED_NOTE_AFTER_SECONDS {
+        return None;
+    }
+    let minutes = waited / 60;
+    let wait = if minutes < 60 {
+        format!("{minutes} min")
+    } else {
+        format!("{} h {} min", minutes / 60, minutes % 60)
+    };
+    Some((
+        waited,
+        format!(
+            " It has not started {wait} after it was submitted, and a small job starts within \
+             seconds, so no job runner may be taking jobs. Don't wait on it: read the collection \
+             with its own action instead (memory(action=\"decisions\"), \
+             session(action=\"get_lessons\"), memory(action=\"list_docs\") or \
+             memory(action=\"list_transcripts\"))."
+        ),
+    ))
 }
 
 fn parse_collection(raw: Option<&str>, kind: AtlasJobKind) -> Result<AtlasSearchCollection> {
@@ -879,6 +956,12 @@ mod tests {
                 .insert(job_id.to_string(), records);
         }
 
+        fn submitted_ago(&self, job_id: &str, ago: chrono::Duration) {
+            if let Some(state) = self.jobs.lock().unwrap().get_mut(job_id) {
+                state.submitted_at = chrono::Utc::now() - ago;
+            }
+        }
+
         fn fail_with(&self, job_id: &str, error: &str) {
             let mut jobs = self.jobs.lock().unwrap();
             if let Some(state) = jobs.get_mut(job_id) {
@@ -1066,6 +1149,76 @@ mod tests {
         assert_eq!(s["status"], serde_json::json!("completed"));
         assert_eq!(s["is_terminal"], serde_json::json!(true));
         assert_eq!(s["record_count"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn a_job_no_runner_started_says_so_instead_of_pending() {
+        // #438: every poll answered "pending" for hours.
+        let (tool, mock) = build_tool();
+        let submit = tool
+            .execute(serde_json::json!({
+                "action": "submit_export",
+                "collection": "decisions",
+                "workspace_id": Uuid::new_v4().to_string(),
+            }))
+            .await
+            .unwrap();
+        let job_id = submit.structured_content.unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let fresh = tool
+            .execute(serde_json::json!({"action": "poll", "job_id": job_id.clone()}))
+            .await
+            .unwrap();
+        assert!(!result_text(&fresh).contains("has not started"));
+        assert!(fresh.structured_content.unwrap()["not_started_after_seconds"].is_null());
+
+        mock.submitted_ago(&job_id, chrono::Duration::minutes(10));
+        let poll = tool
+            .execute(serde_json::json!({"action": "poll", "job_id": job_id.clone()}))
+            .await
+            .unwrap();
+        let text = result_text(&poll);
+        assert!(
+            text.contains("It has not started 10 min after it was submitted"),
+            "{text}"
+        );
+        let s = poll.structured_content.unwrap();
+        assert_eq!(s["status"], serde_json::json!("pending"));
+        assert!(s["not_started_after_seconds"].as_i64().unwrap() >= 600);
+
+        let result = tool
+            .execute(serde_json::json!({"action": "result", "job_id": job_id}))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("Don't wait on it"), "{text}");
+        assert!(!text.contains("Poll again"), "{text}");
+    }
+
+    #[test]
+    fn the_not_started_note_waits_two_minutes_and_skips_started_jobs() {
+        let now = chrono::Utc::now();
+        let ago = |seconds| now - chrono::Duration::seconds(seconds);
+        assert!(job_not_started_note(true, ago(119), now).is_none());
+        assert!(job_not_started_note(false, ago(3600), now).is_none());
+        let (waited, note) = job_not_started_note(true, ago(2 * 3600 + 5 * 60), now).unwrap();
+        assert_eq!(waited, 2 * 3600 + 5 * 60);
+        assert!(note.contains("has not started 2 h 5 min after"), "{note}");
+    }
+
+    fn result_text(result: &ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|item| match item {
+                mcp_types::tool::ContentItem::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[tokio::test]

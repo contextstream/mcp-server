@@ -745,8 +745,12 @@ fn format_collection(entity_name: &str, value: &Value) -> String {
             let status = item.get("status").and_then(|v| v.as_str());
 
             let mut line = format!("{}. **{}** (id: {})", i + 1, title, one_line(id));
+            // Shared knowledge: an item of a linked workspace names it (#486).
             if let Some(t) = item_type {
-                line.push_str(&format!(" [{}]", one_line(t)));
+                let t = super::linked_workspaces::label_with_workspace(t, item);
+                line.push_str(&format!(" [{}]", one_line(&t)));
+            } else if let Some(name) = super::linked_workspaces::linked_workspace_name(item) {
+                line.push_str(&format!(" [from {}]", one_line(name)));
             }
             if let Some(s) = status {
                 line.push_str(&format!(" — {}", one_line(s)));
@@ -2093,7 +2097,7 @@ fn memory_search_error_allows_docs_fallback(error: &Error) -> bool {
 }
 
 fn normalize_doc_search_result(doc: &Value) -> Value {
-    serde_json::json!({
+    let mut normalized = serde_json::json!({
         "entity_type": "doc",
         "id": doc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown"),
         "title": doc.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled"),
@@ -2101,7 +2105,16 @@ fn normalize_doc_search_result(doc: &Value) -> Value {
         "score": doc_match_score(doc),
         "match_source": doc_match_source(doc),
         "doc_type": doc.get("doc_type").and_then(|v| v.as_str()).unwrap_or("unknown"),
-    })
+    });
+    // Shared knowledge: a doc from a linked workspace keeps its workspace (#486).
+    if let Some(name) = super::linked_workspaces::linked_workspace_name(doc) {
+        normalized["linked"] = Value::Bool(true);
+        normalized["workspace_name"] = Value::String(name.to_string());
+        if let Some(id) = super::linked_workspaces::linked_workspace_id(doc) {
+            normalized["workspace_id"] = Value::String(id.to_string());
+        }
+    }
+    normalized
 }
 
 fn normalize_memory_search_result(item: &Value) -> Value {

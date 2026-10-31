@@ -307,6 +307,14 @@ pub struct SearchResponse {
     /// checked the text literally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub literal_match: Option<serde_json::Value>,
+    /// Shared knowledge (contextstream plan 483f30df): the best code hits of the workspaces
+    /// linked to the searched one whose links include code, each labeled in its `metadata`
+    /// (`workspace_id`, `workspace_name`, `linked: true`). Page one only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_results: Vec<SearchResult>,
+    /// How each of those linked searches went: `{workspace_id, name, include_code, status, hits}`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_workspaces: Vec<serde_json::Value>,
 }
 
 impl SearchResponse {

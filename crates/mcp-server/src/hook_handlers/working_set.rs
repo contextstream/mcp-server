@@ -415,7 +415,7 @@ pub(crate) fn scope_warning_for(
     if cross_workspace {
         let requested = requested_workspace.unwrap_or_default().trim();
         return Some(format!(
-            "[SCOPE_MISMATCH] {call} targets workspace_id={requested}, but this session's primary project {primary_label} is in workspace_id={primary_workspace}. Use workspace_id={primary_workspace} and project_id={primary} unless you deliberately mean the other workspace."
+            "[SCOPE_MISMATCH] {call} targets workspace_id={requested}, but this session's primary project {primary_label} is in workspace_id={primary_workspace}. Use workspace_id={primary_workspace} and project_id={primary} unless you deliberately mean the other workspace. Reading a workspace linked to this one (shared knowledge, named in [LINKED_WORKSPACES]) is expected; never write into it unless the user asked."
         ));
     }
     None

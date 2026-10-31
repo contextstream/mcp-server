@@ -6157,7 +6157,22 @@ impl ContextStreamClient {
     /// Delete a project.
     pub async fn delete_project(&self, id: Uuid) -> Result<serde_json::Value> {
         self.invalidate_project_caches();
-        self.delete(&format!("/projects/{}", id)).await
+        // A delete that meets an upload still being taken in is refused for
+        // a few seconds (409); it is asked again before the caller is told
+        // (#474).
+        let mut attempt = 0;
+        loop {
+            match self.delete(&format!("/projects/{}", id)).await {
+                Err(error)
+                    if attempt < PROJECT_DELETE_BUSY_RETRIES
+                        && project_is_taking_in_files(&error) =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(PROJECT_DELETE_BUSY_WAIT).await;
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Merge a duplicate source project into a target project.
@@ -22435,6 +22450,18 @@ pub fn coordination_notice_path(
     path
 }
 
+/// How often, and how long apart, a project delete refused because the
+/// project is still taking in files is asked again (#474).
+const PROJECT_DELETE_BUSY_RETRIES: u32 = 4;
+const PROJECT_DELETE_BUSY_WAIT: Duration = Duration::from_secs(2);
+
+/// The API's 409 for a project that is still taking in files: transient.
+fn project_is_taking_in_files(error: &Error) -> bool {
+    matches!(error, Error::Http { status: 409, message, .. }
+        if message.contains("is still taking in files")
+            || message.contains("has active file-ingest"))
+}
+
 /// Retries of a request whose connection was refused, unroutable or
 /// unresolved, and the wait before each (#320).
 const CONNECT_FAILURE_RETRIES: u32 = 1;
@@ -24243,6 +24270,29 @@ mod tests {
             other => panic!("{other:?}"),
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_project_delete_refused_while_files_are_taken_in_is_asked_again() {
+        // #474: "409 ... has active file-ingest admission"; the same delete
+        // succeeded 4 s later.
+        let busy = r#"{"error":{"code":"CONFLICT","message":"Conflict: Project p has active file-ingest admission a; wait for it to finish or cancel it before changing project scope"}}"#;
+        let (client, server) = client_with_http_sequence_headers(vec![
+            ("409 Conflict", "", busy.to_string()),
+            ("200 OK", "", r#"{"success":true,"data":{}}"#.to_string()),
+        ])
+        .await;
+        let started = std::time::Instant::now();
+        client
+            .delete_project(Uuid::from_u128(0x474))
+            .await
+            .expect("deleted on the second ask");
+        assert!(started.elapsed() >= PROJECT_DELETE_BUSY_WAIT);
+        assert_eq!(server.await.unwrap().len(), 2);
+        assert!(!project_is_taking_in_files(&Error::http(
+            409,
+            "name already in use"
+        )));
     }
 
     #[tokio::test]

@@ -55,7 +55,8 @@ use api::{refusal, unreachable, Create, Subject};
 pub use gate::StudioGate;
 use words::{
     beat_lines, clip, credits, film_phase_words, headline, is_explainer, job_ended, making_problem,
-    piece_facts, piece_progress, quote_problem, sentence, stage_words, PieceState,
+    piece_facts, piece_progress, quote_problem, recording_line, recording_questions, sentence,
+    stage_words, PieceState,
 };
 
 /// The tool's name.
@@ -487,6 +488,8 @@ impl StudioTool {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                // What a recorded explainer still asks before it can be made.
+                let mut asked: Vec<String> = Vec::new();
                 // The voice the making is locked to, when one was asked for.
                 if let Some(voice) = forms::voice_words(plan.get("voice"), false) {
                     let speaking = pieces.iter().any(|piece| piece.get("voice").is_some());
@@ -518,7 +521,21 @@ impl StudioTool {
                         lines.push(format!("   Why: {why}"));
                     }
                     if is_explainer(piece) {
-                        if let Some(film) = piece.get("film") {
+                        if let Some(line) = piece.get("film").and_then(recording_line) {
+                            // A recorded explainer: recorded from real sessions on a fresh machine, never drawn.
+                            lines.push(format!("   {}", sentence(Some(&line)).unwrap_or(line)));
+                            let questions = piece
+                                .get("film")
+                                .map(recording_questions)
+                                .unwrap_or_default();
+                            if !questions.is_empty() {
+                                lines.push(format!(
+                                    "   Before it can be recorded: {}",
+                                    questions.join(" ")
+                                ));
+                                asked.extend(questions);
+                            }
+                        } else if let Some(film) = piece.get("film") {
                             let product = film
                                 .pointer("/product/name")
                                 .and_then(Value::as_str)
@@ -531,6 +548,14 @@ impl StudioTool {
                             }
                         }
                     }
+                }
+                if !asked.is_empty() {
+                    lines.push(String::new());
+                    lines.push(
+                        "It can't be made until these are answered: answer them from what you know, or ask the person, then plan again with the answers as context."
+                            .to_string(),
+                    );
+                    structured["questions"] = json!(asked);
                 }
                 if let Some(reason) = plan.pointer("/needsProduct/reason").and_then(Value::as_str) {
                     lines.push(String::new());

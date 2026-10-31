@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.51
+
+- Shared work items (`entity`) on the hosted gateway use the connection's workspace and project (`X-ContextStream-Workspace-Id`, `X-ContextStream-Project-Id`), as the other tools do. Before, with only the header, lists came back empty, a new ticket was filed in the account's default workspace, and `get` by title said it found nothing (#488).
+- A call that names another workspace no longer takes the default project of the session or the connection (#488).
+- `entity` `get` and `update` by title find resolved, closed and cancelled tickets and incidents, and a title given in another word order, with punctuation or with extra spaces. A reference that looks like part of an id says an id must be given whole (#489).
+
 ## 1.0.50
 
 - Search: a search that names a workspace searches that workspace. The session's own project, or the project its folder maps to, no longer narrows a search of another workspace, so passing a linked workspace's `workspace_id`, as the [LINKED_WORKSPACES] footer suggests, searches that workspace (#487).

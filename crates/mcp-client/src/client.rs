@@ -1770,8 +1770,44 @@ pub fn is_agent_write_request(method: &str, api_path: &str) -> bool {
 
 /// Creates the API does not key: no `Idempotency-Key` is stored for them, so
 /// a resend after a lost answer made a second record, or failed with "name
-/// already in use" about the record the first attempt had made (#477).
-const UNKEYED_CREATE_ROUTES: &[&str] = &["projects", "skills", "workspaces"];
+/// already in use" about the record the first attempt had made (#477). A
+/// KB item resent after a 502 was stored twice (#483). `*` is one path
+/// segment.
+const UNKEYED_CREATE_ROUTES: &[&str] = &[
+    "projects",
+    "skills",
+    "workspaces",
+    "workspaces/bootstrap",
+    "workspaces/*/content/external",
+    "projects/*/merge",
+    "skills/import",
+    "qa_agent/kb",
+    "qa_agent/feedback",
+    "qa_agent/ask",
+    "discussions",
+    "feeds",
+    "feeds/*/posts",
+    "feeds/*/shares",
+    "feeds/*/sources",
+    "capsules",
+    "session/remember",
+    "integrations/notion/pages",
+    "docs/roadmap",
+    "flash/push",
+    "analytics/compliance/events",
+];
+
+fn route_matches_pattern(path: &str, pattern: &str) -> bool {
+    let mut path = path.split('/');
+    let mut pattern = pattern.split('/');
+    loop {
+        match (path.next(), pattern.next()) {
+            (None, None) => return true,
+            (Some(segment), Some(want)) if want == "*" || want == segment => {}
+            _ => return false,
+        }
+    }
+}
 
 /// Whether `method` on `api_path` creates a record the API does not key.
 pub fn is_unkeyed_create_request(method: &str, api_path: &str) -> bool {
@@ -1783,7 +1819,9 @@ pub fn is_unkeyed_create_request(method: &str, api_path: &str) -> bool {
         .or_else(|| api_path.strip_prefix("/api/"))
         .unwrap_or_else(|| api_path.trim_start_matches('/'));
     let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
-    UNKEYED_CREATE_ROUTES.contains(&path)
+    UNKEYED_CREATE_ROUTES
+        .iter()
+        .any(|pattern| route_matches_pattern(path, pattern))
 }
 
 /// What a write that may have been applied says when it is not resent (#477):
@@ -24135,6 +24173,76 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys[0].is_some());
         assert_eq!(keys[0], keys[1], "the same key both times");
+    }
+
+    #[test]
+    fn creates_outside_the_keyed_routes_are_never_resent_blindly() {
+        // #483: POST /qa_agent/kb was retried after a 502 like a read, and
+        // the workspace held two copies.
+        for path in [
+            "/api/v1/qa_agent/kb",
+            "/feeds/4f0c/posts",
+            "/workspaces/4f0c/content/external",
+            "/session/remember",
+            "/capsules",
+            "/flash/push",
+        ] {
+            assert!(is_unkeyed_create_request("POST", path), "{path}");
+        }
+        for path in [
+            "/qa_agent/kb/4f0c",
+            "/feeds/ensure",
+            "/session/init",
+            "/session/recall",
+            "/graph/impact-analysis",
+            "/feeds/4f0c/posts/extra",
+        ] {
+            assert!(!is_unkeyed_create_request("POST", path), "{path}");
+        }
+        assert!(!is_unkeyed_create_request("PUT", "/qa_agent/kb"));
+    }
+
+    #[tokio::test]
+    async fn a_kb_item_whose_answer_was_lost_is_not_resent_even_after_an_advertisement() {
+        // #483: the origin advertises idempotency on every answer, but this
+        // route stores no key; a resend makes a second item.
+        let (client, server) = client_with_http_sequence_headers(vec![
+            (
+                "200 OK",
+                "x-contextstream-idempotency: 1\r\n",
+                r#"{"success":true,"data":[]}"#.to_string(),
+            ),
+            (
+                "502 Bad Gateway",
+                "",
+                r#"{"error":{"code":"bad_gateway","message":"edge"}}"#.to_string(),
+            ),
+            (
+                "200 OK",
+                "",
+                r#"{"success":true,"data":{"id":"kb-2"}}"#.to_string(),
+            ),
+        ])
+        .await;
+        client
+            .get::<serde_json::Value>("/workspaces")
+            .await
+            .unwrap();
+        let result = client
+            .post::<serde_json::Value, _>("/qa_agent/kb", serde_json::json!({"title": "t"}))
+            .await;
+        match result {
+            Err(Error::Http {
+                status: 502,
+                message,
+                ..
+            }) => assert!(
+                message.contains("may have reached ContextStream and been saved"),
+                "{message}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        server.abort();
     }
 
     #[tokio::test]

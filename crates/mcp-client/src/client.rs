@@ -17045,13 +17045,7 @@ impl ContextStreamClient {
         kind: &str,
         mut params: Vec<(String, String)>,
     ) -> Result<serde_json::Value> {
-        let segment = entity_kind_to_path(kind).ok_or_else(|| {
-            Error::Validation(format!(
-                "Unknown entity kind: '{}'. Valid: {}",
-                kind,
-                VALID_ENTITY_KINDS.join(", ")
-            ))
-        })?;
+        let segment = entity_kind_to_path(kind).ok_or_else(|| unknown_entity_kind(kind))?;
 
         // Inject defaults for workspace_id / project_id if absent.
         let config = self.config.read().await;
@@ -17088,13 +17082,7 @@ impl ContextStreamClient {
 
     /// Get a single entity of `kind` by id.
     pub async fn entity_get(&self, kind: &str, id: Uuid) -> Result<serde_json::Value> {
-        let segment = entity_kind_to_path(kind).ok_or_else(|| {
-            Error::Validation(format!(
-                "Unknown entity kind: '{}'. Valid: {}",
-                kind,
-                VALID_ENTITY_KINDS.join(", ")
-            ))
-        })?;
+        let segment = entity_kind_to_path(kind).ok_or_else(|| unknown_entity_kind(kind))?;
         self.get(&format!("/{}/{}", segment, id)).await
     }
 
@@ -17107,11 +17095,7 @@ impl ContextStreamClient {
         mut body: serde_json::Value,
     ) -> Result<serde_json::Value> {
         if entity_kind_to_path(kind).is_none() {
-            return Err(Error::Validation(format!(
-                "Unknown entity kind: '{}'. Valid: {}",
-                kind,
-                VALID_ENTITY_KINDS.join(", ")
-            )));
+            return Err(unknown_entity_kind(kind));
         }
 
         // Fill defaults from config.
@@ -17165,25 +17149,13 @@ impl ContextStreamClient {
         id: Uuid,
         body: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let segment = entity_kind_to_path(kind).ok_or_else(|| {
-            Error::Validation(format!(
-                "Unknown entity kind: '{}'. Valid: {}",
-                kind,
-                VALID_ENTITY_KINDS.join(", ")
-            ))
-        })?;
+        let segment = entity_kind_to_path(kind).ok_or_else(|| unknown_entity_kind(kind))?;
         self.patch(&format!("/{}/{}", segment, id), body).await
     }
 
     /// Delete (soft-delete) an entity of `kind`.
     pub async fn entity_delete(&self, kind: &str, id: Uuid) -> Result<serde_json::Value> {
-        let segment = entity_kind_to_path(kind).ok_or_else(|| {
-            Error::Validation(format!(
-                "Unknown entity kind: '{}'. Valid: {}",
-                kind,
-                VALID_ENTITY_KINDS.join(", ")
-            ))
-        })?;
+        let segment = entity_kind_to_path(kind).ok_or_else(|| unknown_entity_kind(kind))?;
         self.delete(&format!("/{}/{}", segment, id)).await
     }
 
@@ -19678,6 +19650,18 @@ pub struct HotPathHintEntry {
     pub path: String,
     pub score: f64,
     pub source: String,
+}
+
+/// The answer to an entity call whose kind is none the API has (#490).
+fn unknown_entity_kind(kind: &str) -> Error {
+    Error::refused(
+        mcp_types::ValidationReason::UnknownKind,
+        format!(
+            "Unknown entity kind: '{}'. Valid: {}",
+            kind,
+            VALID_ENTITY_KINDS.join(", ")
+        ),
+    )
 }
 
 /// The configured default project for a request that names `workspace_id`.

@@ -615,7 +615,15 @@ fn a_reference_that_matches_nothing_is_the_callers_not_found_error() {
         || "No docs found matching \"billing export\".".to_string(),
     )
     .expect_err("no shared word is a miss");
-    assert!(matches!(error, Error::Validation(message) if message.contains("No docs found")));
+    assert!(matches!(
+        &error,
+        Error::Refused { reason: ValidationReason::ReferenceNotFound, message }
+            if message.contains("No docs found")
+    ));
+    assert_eq!(
+        error.to_string(),
+        "Validation error: No docs found matching \"billing export\"."
+    );
 }
 
 #[test]

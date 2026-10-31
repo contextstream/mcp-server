@@ -45,7 +45,7 @@ pub use atlas_layer::{
 pub use config::{
     AuthOverride, Config, ConfigOverride, EdgeGeography, NearestRegion, SessionKey, TrafficClass,
 };
-pub use error::{is_non_blocking_parser_error_message, Error, ErrorCode, Result};
+pub use error::{is_non_blocking_parser_error_message, Error, ErrorCode, Result, ValidationReason};
 pub use harness::{
     HarnessId, HarnessProfile, HarnessReadinessEvidence, HarnessReadinessStage, HookCapabilities,
     McpConfigFormat, McpTransportSupport, ReadinessEvidenceSource, ReadinessEvidenceStatus,

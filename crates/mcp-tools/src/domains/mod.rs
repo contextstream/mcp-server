@@ -4,7 +4,7 @@ pub mod account_mode;
 pub mod answer;
 pub mod atlas_jobs;
 pub mod atlas_warm_cache;
-pub(crate) mod caller_access;
+pub mod caller_access;
 pub mod capsule;
 pub mod charts;
 pub mod coach;

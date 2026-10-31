@@ -1454,7 +1454,11 @@ async fn serve_mcp_streamable(
             event.provider = Some("mcp_http".to_string());
             event.latency_ms = Some(elapsed_ms);
             event.degraded = Some(result.is_err());
-            tokio::spawn(async move {
+            let client = state.client.clone();
+            // Keeps the request's caller, so the event names who made the call.
+            mcp_client::spawn_with_task_context(async move {
+                event.actor_user_id =
+                    mcp_tools::domains::caller_access::caller_user_id(&client).await;
                 if let Err(e) = signals.emit(event).await {
                     debug!(
                         error = %e,

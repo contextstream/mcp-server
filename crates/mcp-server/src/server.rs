@@ -1059,13 +1059,25 @@ impl TokenizerWarmup {
     }
 }
 
+/// A tool call waiting for the stdio tool-call task, with what the session
+/// had negotiated when it arrived.
+struct QueuedToolCall {
+    request: serde_json::Value,
+    params: serde_json::Value,
+    client_can_elicit: bool,
+    client_protocol: Option<String>,
+    announces_tool_changes: bool,
+}
+
 /// Run the stdio transport for JSON-RPC.
 ///
 /// A reader task reads the client's lines (see `transport::stdio_peer`): answers to this
 /// server's own requests reach the tool call waiting on them, and everything else is
-/// handled here, one message at a time, in arrival order. A tool call runs with the client
-/// as its peer (`mcp_tools::peer`), so it can report progress when the call carried a
-/// progress token and ask the person a question when the client can elicit.
+/// handled here in arrival order. Tool calls run one at a time, in arrival order, on their
+/// own task, so a call waiting on the API no longer holds up `ping`, `tools/list` or
+/// `initialize` behind it (#478). A tool call runs with the client as its peer
+/// (`mcp_tools::peer`), so it can report progress when the call carried a progress token
+/// and ask the person a question when the client can elicit.
 async fn run_stdio_transport(
     registry: ToolRegistry,
     client: ContextStreamClient,
@@ -1085,6 +1097,16 @@ async fn run_stdio_transport(
 
     let registry = Arc::new(registry);
     let client = Arc::new(client);
+    let (tool_calls, queued_calls) = tokio::sync::mpsc::channel::<QueuedToolCall>(64);
+    let tool_call_task = tokio::spawn(run_stdio_tool_calls(
+        queued_calls,
+        registry.clone(),
+        client.clone(),
+        session.clone(),
+        telemetry.clone(),
+        writer.clone(),
+        peer.clone(),
+    ));
     let mut tokenizer_warmup = TokenizerWarmup::new();
     // Whether this client was told `tools.listChanged` at initialize.
     let mut announces_tool_changes = false;
@@ -1129,34 +1151,31 @@ async fn run_stdio_transport(
             );
         }
 
+        if is_tool_call {
+            let call = QueuedToolCall {
+                request,
+                params,
+                client_can_elicit,
+                client_protocol: client_protocol.clone(),
+                announces_tool_changes,
+            };
+            if tool_calls.send(call).await.is_err() {
+                // The tool-call task ended: it could no longer write to the client.
+                break;
+            }
+            continue;
+        }
+
         let wire_observation = mcp_tools::wire_tokens::WireTokenObservation::default();
-        let handled = handle_request(
+        let response = handle_request(
             &registry,
             &client,
             &session,
             &telemetry,
             request,
             wire_observation.clone(),
-        );
-        // A tool call can report progress to its client mid-call. An initialize-era
-        // session's client is asked questions live (it declared elicitation at initialize);
-        // a stateless (2026-07-28) call carries its own capabilities, and a question goes
-        // back as its result (`input_required`), answered in the call that follows.
-        let response = if is_tool_call {
-            let stateless = has_stateless_protocol_metadata(&params);
-            let mut call_peer = mcp_tools::peer::CallPeer::new(
-                peer.clone(),
-                mcp_tools::peer::CallPeer::progress_token_of(&params),
-                !stateless && client_can_elicit,
-            )
-            .with_client_protocol(client_protocol.as_deref().filter(|_| !stateless));
-            if stateless && mcp_tools::peer::CallPeer::stateless_client_can_elicit(&params) {
-                call_peer = call_peer.with_inline_input(&params);
-            }
-            mcp_tools::peer::run_with_call_peer(call_peer, handled).await
-        } else {
-            handled.await
-        };
+        )
+        .await;
 
         // Don't write empty responses (e.g. for notifications)
         if !response.is_empty() {
@@ -1178,11 +1197,76 @@ async fn run_stdio_transport(
         if legacy_initialize {
             announces_tool_changes = registry.get(domains::slipstream::TOOL_NAME).is_some();
         }
+    }
+    debug!("Client disconnected");
+
+    // The calls already read are still answered.
+    drop(tool_calls);
+    match tool_call_task.await {
+        Ok(result) => result,
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The stdio tool-call task: each call in arrival order, its answer written as soon as it is
+/// ready, while the reader loop keeps answering everything else (#478).
+async fn run_stdio_tool_calls(
+    mut calls: tokio::sync::mpsc::Receiver<QueuedToolCall>,
+    registry: Arc<ToolRegistry>,
+    client: Arc<ContextStreamClient>,
+    session: Arc<SessionManager>,
+    telemetry: AgenticTelemetry,
+    writer: Arc<crate::transport::stdio_peer::LineWriter<tokio::io::Stdout>>,
+    peer: Arc<crate::transport::stdio_peer::StdioPeer<tokio::io::Stdout>>,
+) -> Result<()> {
+    while let Some(call) = calls.recv().await {
+        let QueuedToolCall {
+            request,
+            params,
+            client_can_elicit,
+            client_protocol,
+            announces_tool_changes,
+        } = call;
+        let wire_observation = mcp_tools::wire_tokens::WireTokenObservation::default();
+        let handled = handle_request(
+            &registry,
+            &client,
+            &session,
+            &telemetry,
+            request,
+            wire_observation.clone(),
+        );
+        // A tool call can report progress to its client mid-call. An initialize-era
+        // session's client is asked questions live (it declared elicitation at initialize);
+        // a stateless (2026-07-28) call carries its own capabilities, and a question goes
+        // back as its result (`input_required`), answered in the call that follows.
+        let stateless = has_stateless_protocol_metadata(&params);
+        let mut call_peer = mcp_tools::peer::CallPeer::new(
+            peer.clone(),
+            mcp_tools::peer::CallPeer::progress_token_of(&params),
+            !stateless && client_can_elicit,
+        )
+        .with_client_protocol(client_protocol.as_deref().filter(|_| !stateless));
+        if stateless && mcp_tools::peer::CallPeer::stateless_client_can_elicit(&params) {
+            call_peer = call_peer.with_inline_input(&params);
+        }
+        let response = mcp_tools::peer::run_with_call_peer(call_peer, handled).await;
+
+        if !response.is_empty() {
+            let mut observed_wire = response.as_bytes().to_vec();
+            observed_wire.push(b'\n');
+            mcp_tools::wire_tokens::observe_final_wire_bytes(
+                &observed_wire,
+                &wire_observation,
+                "mcp_stdio_final_response",
+            );
+            writer.write_line(&response).await?;
+        }
 
         // A call may have changed what tools/list would show of Slipstream (init moved
         // the session to another workspace, an agent was turned on): say so, and the
         // client lists tools again.
-        if announces_tool_changes && is_tool_call {
+        if announces_tool_changes {
             if let Some(notice) = slipstream_list_changed_notice(&registry, &client, &session).await
             {
                 writer.write_line(notice).await?;
@@ -1197,8 +1281,6 @@ async fn run_stdio_transport(
             exec_updated_binary();
         }
     }
-    debug!("Client disconnected");
-
     Ok(())
 }
 

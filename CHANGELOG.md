@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.48
+
+- Shared knowledge between workspaces:
+  - `workspace` `sharing`, `share` and `unshare` (`workspace_read` reads `sharing` too): see a workspace's links, link it with another workspace by id or exact name (both ways by default, or `direction` `share` or `use`, with `include_code`), and remove a link. Answers name what changed, who can open what and who may change it.
+  - Memory search, decisions and session recall show hits from linked workspaces labeled with their workspace ("from Product"). A [LINKED_WORKSPACES] footer names the linked workspaces that were read, how many hits each gave, which were not read, and their ids to search one fully.
+  - Code search adds the best code hits of linked workspaces whose links include code, each naming its workspace and project, under [LINKED_WORKSPACES]. Structured output carries `linked_results` and `linked_workspaces`; an API without them reads as before.
+  - Reading a workspace linked to this one is no longer flagged as a scope mistake. Writing into it still is, unless the user asked.
+  - The rules gain a "Linked workspaces (shared knowledge)" section.
+
 ## 1.0.47
 
 - ContextStudio (`studio`):

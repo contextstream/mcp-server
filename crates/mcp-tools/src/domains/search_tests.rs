@@ -2259,6 +2259,18 @@ mod auto_mode_tests {
         );
     }
 
+    // #487: what linked workspaces add to a search follows the links, so a change of
+    // a link must not leave the process replaying an answer cached under the old one.
+    #[test]
+    fn the_search_cache_key_follows_the_links_of_workspaces() {
+        let input = base_input("revoke_fn");
+        let key = || cache_key(None, None, &input, SearchMode::Keyword, None);
+        let before = key();
+        assert_eq!(before, key(), "the same link state gives the same key");
+        mcp_client::note_knowledge_link_change_for_test();
+        assert_ne!(before, key(), "a link change gives another key");
+    }
+
     #[test]
     fn sha256_cache_digest_matches_standard_vectors() {
         assert_eq!(

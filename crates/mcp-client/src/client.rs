@@ -1652,6 +1652,25 @@ fn bump_memory_write_generation() {
     }
 }
 
+/// How many times a link between workspaces has been made, changed or removed by this
+/// process. What other workspaces' knowledge a search shows depends on the links, so
+/// the tool-level search cache puts it in its keys: an answer read under the old link
+/// is not replayed after a `share` or `unshare` (#487).
+static KNOWLEDGE_LINK_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The number of link changes this process has made (see [`KNOWLEDGE_LINK_GENERATION`]).
+pub fn knowledge_link_generation() -> u64 {
+    KNOWLEDGE_LINK_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Moves [`knowledge_link_generation`] as a link change does, so a test of a result
+/// cache above the client can see its key follow it. Not for product code.
+#[doc(hidden)]
+pub fn note_knowledge_link_change_for_test() {
+    KNOWLEDGE_LINK_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The current caller's memory write generation, for result-cache keys
 /// (#464). It changes after every memory write this caller makes.
 pub fn memory_write_generation() -> String {
@@ -4558,6 +4577,19 @@ impl ContextStreamClient {
         self.invalidate_custom_cache_prefix(WORKSPACE_CACHE_PREFIX);
     }
 
+    /// A link between workspaces was made, changed or removed. Which other workspaces'
+    /// code, memory, docs and recall a search shows depends on it, so no cached answer
+    /// read under the old link may be replayed, here or in the tool-level result caches
+    /// that key on the generations: a running process kept returning a revoked link's
+    /// code after `unshare` (#487). Run whether the call answered or not, because a
+    /// lost answer can follow a change the API made.
+    fn invalidate_knowledge_link_caches(&self) {
+        KNOWLEDGE_LINK_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.invalidate_memory_read_caches();
+        self.invalidate_doc_caches();
+        self.invalidate_custom_cache_prefix(SEARCH_CACHE_PREFIX);
+    }
+
     fn invalidate_project_caches(&self) {
         self.invalidate_custom_cache_prefix(PROJECT_CACHE_PREFIX);
         self.invalidate_custom_cache_prefix(PROJECT_CATALOG_CACHE_PREFIX);
@@ -5920,11 +5952,14 @@ impl ContextStreamClient {
         if let Some(include_code) = include_code {
             body["include_code"] = serde_json::json!(include_code);
         }
-        self.put(
-            &format!("/workspaces/{workspace_id}/knowledge-sharing/{other}"),
-            body,
-        )
-        .await
+        let result = self
+            .put(
+                &format!("/workspaces/{workspace_id}/knowledge-sharing/{other}"),
+                body,
+            )
+            .await;
+        self.invalidate_knowledge_link_caches();
+        result
     }
 
     /// Remove a link in the given direction (`both` by default).
@@ -5935,10 +5970,13 @@ impl ContextStreamClient {
         direction: &str,
     ) -> Result<serde_json::Value> {
         let workspace_id = self.workspace_or_session(workspace_id).await?;
-        self.delete(&format!(
-            "/workspaces/{workspace_id}/knowledge-sharing/{other}?direction={direction}"
-        ))
-        .await
+        let result = self
+            .delete(&format!(
+                "/workspaces/{workspace_id}/knowledge-sharing/{other}?direction={direction}"
+            ))
+            .await;
+        self.invalidate_knowledge_link_caches();
+        result
     }
 
     /// Every workspace the caller can open, with its links.
@@ -30592,6 +30630,83 @@ mod tests {
             requests.len(),
             2,
             "degraded success responses must not enter the client cache"
+        );
+    }
+
+    // #487: a running process kept returning a revoked link's code rows after
+    // `unshare`, from the answers it had cached under the link.
+    #[tokio::test]
+    async fn a_link_change_drops_the_searches_cached_under_the_old_link() {
+        let workspace = Uuid::from_u128(0x487);
+        let other = Uuid::from_u128(0x488);
+        let linked = SearchResponse {
+            linked_results: vec![SearchResult {
+                id: "linked-row".to_string(),
+                file_path: Some("app/a.py".to_string()),
+                ..SearchResult::default()
+            }],
+            ..SearchResponse::default()
+        };
+        let envelope = |response: &SearchResponse| {
+            serde_json::json!({"success": true, "data": serde_json::to_value(response).unwrap()})
+                .to_string()
+        };
+        let (client, server) = client_with_http_sequence(vec![
+            ("200 OK", envelope(&linked)),
+            (
+                "200 OK",
+                serde_json::json!({"success": true, "data": {}}).to_string(),
+            ),
+            ("200 OK", envelope(&SearchResponse::default())),
+        ])
+        .await;
+
+        let (first, repeated, after_unshare, generations) =
+            run_with_session_key(SessionKey::Local, || async {
+                let params = SearchParams {
+                    query: format!("revoke_fn_{}", Uuid::new_v4()),
+                    workspace_id: Some(workspace),
+                    ..SearchParams::default()
+                };
+                let before = knowledge_link_generation();
+                let first = client
+                    .search_keyword(params.clone())
+                    .await
+                    .expect("search under the link");
+                // The same search again is answered from the cache: the server is not asked.
+                let repeated = client
+                    .search_keyword(params.clone())
+                    .await
+                    .expect("cached search");
+                client
+                    .remove_knowledge_link(Some(workspace), other, "both")
+                    .await
+                    .expect("unshare");
+                let after = client
+                    .search_keyword(params)
+                    .await
+                    .expect("search after the unshare");
+                (
+                    first,
+                    repeated,
+                    after,
+                    (before, knowledge_link_generation()),
+                )
+            })
+            .await;
+
+        assert_eq!(first.linked_results.len(), 1);
+        assert_eq!(repeated.linked_results.len(), 1);
+        assert!(
+            after_unshare.linked_results.is_empty(),
+            "the unshare must drop the cached answer that carried the other workspace's code"
+        );
+        assert_ne!(generations.0, generations.1);
+        let requests = server.await.expect("link server task");
+        assert_eq!(
+            requests.len(),
+            3,
+            "one search, the unshare, one search again; the repeat came from the cache"
         );
     }
 

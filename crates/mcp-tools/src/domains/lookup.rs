@@ -533,6 +533,23 @@ fn exact_key(text: &str) -> String {
         .to_lowercase()
 }
 
+/// The word to search a store that matches text as a substring by, when the
+/// reference as given found no record: its longest word that says which record
+/// is meant (filler words and the record's own nouns aside), the first of that
+/// length. `None` when the reference has no word, or is that word already.
+pub(crate) fn search_word(reference: &str, kind: RecordKind<'_>) -> Option<String> {
+    let all = words(reference);
+    let nouns = kind.nouns();
+    let mut best: Option<&str> = None;
+    for word in significant(&all, &nouns) {
+        if best.is_none_or(|current| word.chars().count() > current.chars().count()) {
+            best = Some(word);
+        }
+    }
+    let word = best?.to_string();
+    (word != reference.trim().to_lowercase()).then_some(word)
+}
+
 /// The lowercase words of `text`; anything that is not a letter or a digit
 /// separates words.
 fn words(text: &str) -> Vec<String> {

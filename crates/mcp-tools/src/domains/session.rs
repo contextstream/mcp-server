@@ -11216,7 +11216,15 @@ fn format_recall_decision_matches(decisions: &[Value]) -> String {
             .or_else(|| decision.get("title"))
             .and_then(|value| value.as_str())
             .unwrap_or("Untitled decision");
-        text.push_str(&format!("{}. **{}**\n", index + 1, title));
+        match super::linked_workspaces::linked_workspace_name(decision) {
+            Some(workspace) => text.push_str(&format!(
+                "{}. **{}** (from {})\n",
+                index + 1,
+                title,
+                workspace
+            )),
+            None => text.push_str(&format!("{}. **{}**\n", index + 1, title)),
+        }
 
         if let Some(preview) = decision
             .get("details")
@@ -11304,6 +11312,7 @@ fn format_recall_memory_items(items: &[Value], limit: usize) -> String {
         } else {
             kind.to_string()
         };
+        let label = super::linked_workspaces::label_with_workspace(&label, item);
         text.push_str(&format!("{}. [{}] **{}**\n", index + 1, label, title));
 
         if let Some(when) = recall_item_str(item, &["occurred_at", "created_at"]) {

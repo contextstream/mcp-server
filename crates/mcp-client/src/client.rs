@@ -5884,6 +5884,69 @@ impl ContextStreamClient {
     }
 
     // =========================================================================
+    // Shared knowledge (contextstream plan 483f30df)
+    // =========================================================================
+
+    /// The workspace to act on: the one given, else the session's.
+    async fn workspace_or_session(&self, workspace_id: Option<Uuid>) -> Result<Uuid> {
+        let config = self.config.read().await;
+        workspace_id_with_default(workspace_id, &config).ok_or_else(|| {
+            Error::Validation(
+                "workspace_id is required: no workspace is set for this session".to_string(),
+            )
+        })
+    }
+
+    /// A workspace's shared knowledge: the workspaces it shares its knowledge with, those
+    /// whose knowledge it uses, who may change that, and (for them) what it could link with.
+    pub async fn knowledge_sharing(&self, workspace_id: Option<Uuid>) -> Result<serde_json::Value> {
+        let workspace_id = self.workspace_or_session(workspace_id).await?;
+        self.get(&format!("/workspaces/{workspace_id}/knowledge-sharing"))
+            .await
+    }
+
+    /// Link a workspace with another, or change a link. `direction` is `both`, `share`
+    /// (this workspace's knowledge goes to `other`) or `use` (`other`'s comes here);
+    /// `include_code` left out keeps an existing link's setting (a new one includes code).
+    pub async fn set_knowledge_link(
+        &self,
+        workspace_id: Option<Uuid>,
+        other: Uuid,
+        direction: &str,
+        include_code: Option<bool>,
+    ) -> Result<serde_json::Value> {
+        let workspace_id = self.workspace_or_session(workspace_id).await?;
+        let mut body = serde_json::json!({ "direction": direction });
+        if let Some(include_code) = include_code {
+            body["include_code"] = serde_json::json!(include_code);
+        }
+        self.put(
+            &format!("/workspaces/{workspace_id}/knowledge-sharing/{other}"),
+            body,
+        )
+        .await
+    }
+
+    /// Remove a link in the given direction (`both` by default).
+    pub async fn remove_knowledge_link(
+        &self,
+        workspace_id: Option<Uuid>,
+        other: Uuid,
+        direction: &str,
+    ) -> Result<serde_json::Value> {
+        let workspace_id = self.workspace_or_session(workspace_id).await?;
+        self.delete(&format!(
+            "/workspaces/{workspace_id}/knowledge-sharing/{other}?direction={direction}"
+        ))
+        .await
+    }
+
+    /// Every workspace the caller can open, with its links.
+    pub async fn account_knowledge_sharing(&self) -> Result<serde_json::Value> {
+        self.get("/knowledge-sharing").await
+    }
+
+    // =========================================================================
     // Projects
     // =========================================================================
 

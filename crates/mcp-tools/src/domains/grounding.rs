@@ -52,6 +52,10 @@ pub struct GroundingHit {
     /// Rendered note when the API flagged this decision as overlapping
     /// another session's decision on the same subject (`possible_conflicts`).
     pub conflict_note: Option<String>,
+    /// Shared knowledge: the linked workspace this hit came from, when it
+    /// came from one (read-only here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_workspace: Option<String>,
 }
 
 /// Missing evidence and unavailable retrieval are intentionally different.
@@ -949,6 +953,8 @@ pub fn parse_recall_results_with_policy(
                 stale_reason,
                 historical_status_claim,
                 conflict_note,
+                source_workspace: super::linked_workspaces::linked_workspace_name(item)
+                    .map(str::to_string),
             })
         })
         .collect();
@@ -976,6 +982,9 @@ fn format_hit_label(hit: &GroundingHit) -> String {
     let mut prefix = String::new();
     if !hit.kind.is_empty() && hit.kind != "hit" {
         prefix.push_str(&hit.kind.replace('_', " "));
+    }
+    if let Some(workspace) = hit.source_workspace.as_deref() {
+        append_label_part(&mut prefix, &format!("from {workspace}"));
     }
     if let Some(age) = hit.age_days {
         if age == 0 {
@@ -1630,6 +1639,26 @@ mod tests {
     }
 
     #[test]
+    fn a_hit_from_a_linked_workspace_says_where_it_came_from() {
+        let recall = json!({"results": [{
+            "id": "11111111-1111-1111-1111-111111111111",
+            "score": 0.9,
+            "result_type": "Event",
+            "metadata": {
+                "title": "Use Stripe Billing for seats",
+                "event_type": "decision",
+                "linked": true,
+                "workspace_name": "Product",
+                "workspace_id": "22222222-2222-2222-2222-222222222222"
+            }
+        }]});
+        let hits = parse_recall_results_with_policy(&recall, false);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_workspace.as_deref(), Some("Product"));
+        assert!(format_hit_label(&hits[0]).contains("from Product"));
+    }
+
+    #[test]
     fn format_includes_action_hints() {
         let hits = vec![GroundingHit {
             kind: "transcript".to_string(),
@@ -1646,7 +1675,8 @@ mod tests {
             stale_reason: None,
             historical_status_claim: false,
             conflict_note: None,
-            search_keywords: "Fix auth".to_string(),
+                        source_workspace: None,
+search_keywords: "Fix auth".to_string(),
         }];
         let s = format_grounding_block(&hits, true);
         assert!(s.contains("[GROUNDING]"));
@@ -1696,7 +1726,8 @@ mod tests {
             stale_reason: None,
             historical_status_claim: false,
             conflict_note: None,
-            search_keywords: "Prod DB migration runbook".to_string(),
+                        source_workspace: None,
+search_keywords: "Prod DB migration runbook".to_string(),
         }];
 
         let verbose = format_grounding_block(&hits, false);

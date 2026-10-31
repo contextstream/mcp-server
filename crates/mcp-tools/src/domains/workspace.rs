@@ -271,6 +271,16 @@ pub struct WorkspaceInput {
     pub max_machines: Option<i64>,
     pub branch_policy: Option<String>,
     pub conflict_resolution: Option<String>,
+    // Shared knowledge fields
+    /// share/unshare: the other workspace, by id or exact name.
+    #[serde(default)]
+    pub with: Option<String>,
+    /// share/unshare: both (default), share or use.
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// share: whether code goes with the knowledge.
+    #[serde(default)]
+    pub include_code: Option<bool>,
 }
 
 /// Unified workspace tool handler.
@@ -469,8 +479,36 @@ impl ToolHandler for WorkspaceTool {
                     result,
                 ))
             }
+            "sharing" => {
+                let workspace_id = parse_optional_workspace_id(input.workspace_id.as_deref())?;
+                let view = self.client.knowledge_sharing(workspace_id).await?;
+                Ok(ToolResult::with_structured(sharing_text(&view, None), view))
+            }
+            "share" | "unshare" => {
+                let action = input.action.to_lowercase();
+                let workspace_id = parse_optional_workspace_id(input.workspace_id.as_deref())?;
+                let reference = input.with.as_deref().map(str::trim).filter(|r| !r.is_empty()).ok_or_else(|| {
+                    Error::Validation(format!(
+                        "{action}: `with` is required: the other workspace's id or exact name"
+                    ))
+                })?;
+                let direction = parse_direction(input.direction.as_deref())?;
+                let account = self.client.account_knowledge_sharing().await?;
+                let (other, other_name) = resolve_workspace_reference(&account, reference)?;
+                let view = if action == "share" {
+                    self.client
+                        .set_knowledge_link(workspace_id, other, direction, input.include_code)
+                        .await?
+                } else {
+                    self.client
+                        .remove_knowledge_link(workspace_id, other, direction)
+                        .await?
+                };
+                let lead = change_sentence(&view, &action, &other_name);
+                Ok(ToolResult::with_structured(sharing_text(&view, Some(&lead)), view))
+            }
             _ => Err(Error::Validation(format!(
-                "Unknown action: {}. Available actions: list, get, create, delete, associate, bootstrap, team_members, index_settings.",
+                "Unknown action: {}. Available actions: list, get, create, delete, associate, bootstrap, team_members, index_settings, sharing, share, unshare.",
                 input.action
             ))),
         }
@@ -481,7 +519,7 @@ impl ToolHandler for WorkspaceTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "workspace".to_string(),
             title: "Workspace Operations".to_string(),
-            description: "Workspace management. Actions: list, get, create, associate (link folder to workspace), bootstrap (create workspace and initialize), team_members (list members with access - team plans only), index_settings (get/update multi-machine sync settings - admin only).".to_string(),
+            description: "Workspace management. Actions: list, get, create, associate (link folder to workspace), bootstrap (create workspace and initialize), team_members (list members with access - team plans only), index_settings (get/update multi-machine sync settings - admin only), sharing (shared knowledge: the workspaces this one shares its knowledge with and uses knowledge from), share (link this workspace with another: with=<id or exact name>, direction both|share|use, include_code; takes an owner or admin of both), unshare (remove a link). Linked knowledge shows up in search, memory, recall and context, labeled with its workspace; a link never gives anyone access they don't already have, and personal items never cross.".to_string(),
             category: ToolCategory::Workspace,
             annotations: ToolAnnotations::destructive(),
             is_pro: false,
@@ -499,6 +537,9 @@ impl ToolHandler for WorkspaceTool {
             "bootstrap",
             "team_members",
             "index_settings",
+            "sharing",
+            "share",
+            "unshare",
         ];
 
         SchemaBuilder::new()
@@ -580,8 +621,274 @@ impl ToolHandler for WorkspaceTool {
                 VALID_CONFLICT_RESOLUTIONS,
                 false,
             )
+            // Shared knowledge fields
+            .string(
+                "with",
+                "The other workspace, by id or exact name (for share/unshare)",
+                false,
+            )
+            .string_enum(
+                "direction",
+                "both (default): each uses the other's knowledge; share: this workspace's knowledge goes to the other; use: the other's comes here (for share/unshare)",
+                VALID_SHARING_DIRECTIONS,
+                false,
+            )
+            .boolean(
+                "include_code",
+                "Whether code goes with the knowledge (for share; a new link includes code unless this is false)",
+                false,
+            )
             .build()
     }
+}
+
+/// Directions of a shared-knowledge link, seen from the workspace acted on.
+const VALID_SHARING_DIRECTIONS: &[&str] = &["both", "share", "use"];
+
+fn parse_optional_workspace_id(raw: Option<&str>) -> Result<Option<Uuid>> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => Uuid::parse_str(value)
+            .map(Some)
+            .map_err(|_| not_an_id("workspace_id", "workspace", value)),
+    }
+}
+
+fn parse_direction(raw: Option<&str>) -> Result<&'static str> {
+    match raw.map(|value| value.trim().to_ascii_lowercase()) {
+        None => Ok("both"),
+        Some(value) => VALID_SHARING_DIRECTIONS
+            .iter()
+            .copied()
+            .find(|direction| *direction == value)
+            .ok_or_else(|| {
+                Error::Validation(format!(
+                    "direction must be both, share or use (got {value})"
+                ))
+            }),
+    }
+}
+
+/// The workspace `reference` names among those the caller can open: its id, or its exact name
+/// (case aside). A personal space is never linked.
+fn resolve_workspace_reference(account: &Value, reference: &str) -> Result<(Uuid, String)> {
+    let workspaces: Vec<&Value> = account
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().collect())
+        .unwrap_or_default();
+    fn name_of(workspace: &Value) -> String {
+        workspace
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+    fn id_of(workspace: &Value) -> Option<Uuid> {
+        workspace
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok())
+    }
+    if let Ok(id) = Uuid::parse_str(reference) {
+        if let Some(workspace) = workspaces.iter().find(|w| id_of(w) == Some(id)) {
+            return Ok((id, name_of(workspace)));
+        }
+        return Err(Error::Validation(format!(
+            "No workspace you can open has id {reference}"
+        )));
+    }
+    let matches: Vec<&&Value> = workspaces
+        .iter()
+        .filter(|workspace| name_of(workspace).eq_ignore_ascii_case(reference))
+        .collect();
+    match matches.as_slice() {
+        [only] => {
+            let id = id_of(only).ok_or_else(|| {
+                Error::Validation(format!("Workspace {reference} has no id in the answer"))
+            })?;
+            Ok((id, name_of(only)))
+        }
+        [] => {
+            let names: Vec<String> = workspaces
+                .iter()
+                .filter(|w| !w.get("personal").and_then(Value::as_bool).unwrap_or(false))
+                .map(|w| name_of(w))
+                .collect();
+            Err(Error::Validation(format!(
+                "No workspace you can open is named \"{reference}\". Yours: {}.",
+                if names.is_empty() { "none".to_string() } else { names.join(", ") }
+            )))
+        }
+        several => Err(Error::Validation(format!(
+            "Several workspaces are named \"{reference}\"; pass one's id: {}",
+            several
+                .iter()
+                .filter_map(|w| id_of(w).map(|id| id.to_string()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// One sentence on what a share/unshare did, from the API's `changed` list.
+fn change_sentence(view: &Value, action: &str, other: &str) -> String {
+    let here = view
+        .get("workspace_name")
+        .and_then(Value::as_str)
+        .unwrap_or("This workspace");
+    let changes: Vec<&Value> = view
+        .get("changed")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().collect())
+        .unwrap_or_default();
+    let changed = changes
+        .iter()
+        .filter(|change| change.get("change").and_then(Value::as_str) != Some("unchanged"))
+        .count();
+    if action == "unshare" {
+        return if changed == 0 {
+            format!("{here} and {other} were not linked in that direction; nothing changed.")
+        } else {
+            format!("{here} and {other} no longer share knowledge in that direction. Nothing was deleted.")
+        };
+    }
+    if changed == 0 {
+        return format!("{here} and {other} were already linked that way; nothing changed.");
+    }
+    let code_left_out = changes
+        .iter()
+        .any(|change| change.get("include_code").and_then(Value::as_bool) == Some(false));
+    format!(
+        "Linked: agents now use the knowledge across {here} and {other} as set below{}.",
+        if code_left_out { " (code left out where marked)" } else { "" }
+    )
+}
+
+/// The workspace's links in words: one line per linked workspace, who may change them, and what
+/// a manager could link next.
+fn sharing_text(view: &Value, lead: Option<&str>) -> String {
+    let here = view
+        .get("workspace_name")
+        .and_then(Value::as_str)
+        .unwrap_or("This workspace");
+    let mut text = String::new();
+    if let Some(lead) = lead {
+        text.push_str(lead);
+        text.push_str("\n\n");
+    }
+    text.push_str(&format!("[SHARED_KNOWLEDGE] {here}\n"));
+    let list = |key: &str| -> Vec<Value> {
+        view.get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let shares = list("shares_with");
+    let uses = list("uses_from");
+    let mut ids: Vec<String> = Vec::new();
+    for link in shares.iter().chain(uses.iter()) {
+        if let Some(id) = link.get("workspace_id").and_then(Value::as_str) {
+            if !ids.iter().any(|seen| seen == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    if ids.is_empty() {
+        text.push_str("Not linked with any workspace. Its agents use only its own knowledge.\n");
+    } else {
+        for id in &ids {
+            let find = |links: &[Value]| -> Option<Value> {
+                links
+                    .iter()
+                    .find(|link| link.get("workspace_id").and_then(Value::as_str) == Some(id.as_str()))
+                    .cloned()
+            };
+            let shared = find(&shares);
+            let used = find(&uses);
+            let any = shared.as_ref().or(used.as_ref());
+            let name = any
+                .and_then(|link| link.get("name").and_then(Value::as_str))
+                .unwrap_or("a workspace you can't open");
+            let code = |link: &Option<Value>| {
+                link.as_ref()
+                    .and_then(|link| link.get("include_code").and_then(Value::as_bool))
+                    .unwrap_or(true)
+            };
+            let direction = match (shared.is_some(), used.is_some()) {
+                (true, true) => format!(
+                    "both ways ({}; {})",
+                    if code(&shared) { "our code shared" } else { "our code kept here" },
+                    if code(&used) { "its code used" } else { "its code left out" }
+                ),
+                (true, false) => format!(
+                    "{name} uses {here}'s knowledge ({})",
+                    if code(&shared) { "code included" } else { "code left out" }
+                ),
+                _ => format!(
+                    "{here} uses {name}'s knowledge ({})",
+                    if code(&used) { "code included" } else { "code left out" }
+                ),
+            };
+            text.push_str(&format!("- {name} ({id}): {direction}"));
+            if let Some(people) = used.as_ref().and_then(|link| link.get("people_who_can_open")) {
+                let can = people.get("can_open").and_then(Value::as_i64).unwrap_or(0);
+                let total = people.get("total").and_then(Value::as_i64).unwrap_or(0);
+                if total > 0 && can < total {
+                    text.push_str(&format!(
+                        ". {can} of {total} people here can open it; the others get none of its knowledge"
+                    ));
+                }
+            }
+            text.push('\n');
+        }
+        text.push_str("Linked knowledge appears in search, memory, recall and context labeled \"from <workspace>\". It is read-only here, and each person gets only what they can open there.\n");
+    }
+    let can_manage = view.get("can_manage").and_then(Value::as_bool).unwrap_or(false);
+    if can_manage {
+        let candidates: Vec<String> = view
+            .get("candidates")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|candidate| {
+                        !(candidate.get("shares_with").and_then(Value::as_bool).unwrap_or(false)
+                            && candidate.get("uses_from").and_then(Value::as_bool).unwrap_or(false))
+                    })
+                    .filter_map(|candidate| candidate.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !candidates.is_empty() {
+            text.push_str(&format!(
+                "Could link with: {}. workspace(action=\"share\", with=\"<name or id>\") links both ways; direction=\"use\" or \"share\" links one way; include_code=false leaves code out.\n",
+                candidates.join(", ")
+            ));
+        }
+    } else {
+        let managers: Vec<String> = view
+            .get("managers")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|manager| manager.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        text.push_str(&if managers.is_empty() {
+            "Only an owner or admin of this workspace can change its links.\n".to_string()
+        } else {
+            format!(
+                "Only an owner or admin can change these links: {}.\n",
+                managers.join(", ")
+            )
+        });
+    }
+    text
 }
 
 /// Register all workspace tools.

@@ -483,9 +483,8 @@ impl VcsTool {
     }
 }
 
-#[async_trait]
-impl ToolHandler for VcsTool {
-    async fn execute(&self, input: Value) -> Result<ToolResult> {
+impl VcsTool {
+    async fn run_action(&self, input: Value) -> Result<ToolResult> {
         let input: VcsInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
 
@@ -643,7 +642,12 @@ impl ToolHandler for VcsTool {
                 self.client.get(&path).await?
             }
             "list_pulls" => {
-                let base_path = if input.repo_ref.is_some() || input.owner.is_some() {
+                // `repo="owner/name"` names a repository too (#471): it
+                // listed the whole workspace.
+                let names_repo = input.repo_ref.is_some()
+                    || input.owner.is_some()
+                    || input.repo.as_deref().is_some_and(|repo| repo.contains('/'));
+                let base_path = if names_repo {
                     format!(
                         "{}/pulls",
                         Self::repo_base_path(workspace_id, &Self::repo_ref(&input)?)
@@ -694,7 +698,12 @@ impl ToolHandler for VcsTool {
                 }
             }
             "list_issues" => {
-                let base_path = if input.repo_ref.is_some() || input.owner.is_some() {
+                // `repo="owner/name"` names a repository too (#471): it
+                // listed the whole workspace.
+                let names_repo = input.repo_ref.is_some()
+                    || input.owner.is_some()
+                    || input.repo.as_deref().is_some_and(|repo| repo.contains('/'));
+                let base_path = if names_repo {
                     format!(
                         "{}/issues",
                         Self::repo_base_path(workspace_id, &Self::repo_ref(&input)?)
@@ -1252,6 +1261,142 @@ impl ToolHandler for VcsTool {
             Self::success_text(&action, &result),
             result,
         ))
+    }
+}
+
+fn vcs_provider_name(provider: &str) -> &'static str {
+    match provider {
+        "github" => "GitHub",
+        "gitlab" => "GitLab",
+        "bitbucket" => "Bitbucket",
+        _ => "This provider",
+    }
+}
+
+/// A provider that is not connected is an answer in words, not an HTTP
+/// status (#471, as #458 did for `integration`): seven reads said "HTTP error
+/// (404): Not found: Integration github not found".
+fn vcs_unavailable_text(provider: &str, error: &Error) -> Option<String> {
+    let Error::Http {
+        status, message, ..
+    } = error
+    else {
+        return None;
+    };
+    let lower = message.to_ascii_lowercase();
+    let name = vcs_provider_name(provider);
+    let not_found = lower.contains("integration") && lower.contains("not found");
+    match status {
+        404 if not_found => Some(format!(
+            "{name} is not connected for this workspace. Connect it in the dashboard (Settings > Integrations), then try again."
+        )),
+        503 if lower.contains("is not connected") => Some(message.trim().to_string()),
+        403 if lower.contains("not enabled yet") => Some(format!(
+            "{name} is not available yet: external integrations are not enabled for this account."
+        )),
+        _ => None,
+    }
+}
+
+/// The lists that read the workspace's synced copy and so answered "Found 0"
+/// for a provider that is not connected (#471).
+const SYNCED_LIST_ACTIONS: &[&str] = &["list_pulls", "list_issues"];
+
+#[async_trait]
+impl ToolHandler for VcsTool {
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let parsed: Option<VcsInput> = serde_json::from_value(input.clone()).ok();
+        let provider = parsed
+            .as_ref()
+            .and_then(|input| Self::validate_provider(&input.provider).ok().flatten())
+            .unwrap_or_default();
+        let action = parsed
+            .as_ref()
+            .map(|input| input.action.trim().to_lowercase())
+            .unwrap_or_default();
+        let answer = match self.run_action(input).await {
+            Err(error) => {
+                return match vcs_unavailable_text(&provider, &error) {
+                    Some(text) => Ok(ToolResult::error(text)),
+                    None => Err(error),
+                }
+            }
+            Ok(answer) => answer,
+        };
+        // An empty synced list for a named provider: say when the provider
+        // is not connected instead of "Found 0 pull requests".
+        let empty = answer
+            .structured_content
+            .as_ref()
+            .and_then(Self::result_items)
+            .is_some_and(|items| items.is_empty());
+        let (Some(input), true, false) = (
+            parsed,
+            empty && SYNCED_LIST_ACTIONS.contains(&action.as_str()),
+            provider.is_empty(),
+        ) else {
+            return Ok(answer);
+        };
+        let Ok(workspace_id) = self.resolve_workspace_id(&input.workspace_id).await else {
+            return Ok(answer);
+        };
+        let mut params = Vec::new();
+        Self::push_query_value(&mut params, "provider", Some(provider.clone()));
+        let names_repo = Self::repo_ref(&input).is_ok();
+        let probe = match Self::repo_ref(&input) {
+            Ok(repo_ref) => Self::query_path(Self::repo_base_path(workspace_id, &repo_ref), params),
+            Err(_) => Self::query_path(
+                format!("{}/repos", Self::workspace_base_path(workspace_id)),
+                params,
+            ),
+        };
+        match self.client.get::<Value>(&probe).await {
+            Err(error) => match vcs_unavailable_text(&provider, &error) {
+                Some(text) => Ok(ToolResult::error(text)),
+                None => Ok(answer),
+            },
+            // No repository of this provider at all: the empty list says
+            // nothing about the provider's pull requests or issues.
+            Ok(repos)
+                if !names_repo
+                    && Self::result_items(&repos).is_some_and(|items| items.is_empty()) =>
+            {
+                let mut text = Self::success_text(
+                    &action,
+                    answer.structured_content.as_ref().unwrap_or(&Value::Null),
+                );
+                text.push_str(&format!(
+                    " No {} repository is connected or synced for this workspace; connect it in the dashboard (Settings > Integrations), and vcs(action=\"list_repos\") lists the connected ones.",
+                    vcs_provider_name(&provider)
+                ));
+                Ok(ToolResult::with_structured(
+                    text,
+                    answer.structured_content.clone().unwrap_or(Value::Null),
+                ))
+            }
+            // Synced repositories of a provider that is no longer connected:
+            // ask one of them, whose read says whether the provider is.
+            Ok(repos) if !names_repo => {
+                let first = Self::result_items(&repos)
+                    .and_then(|items| items.first())
+                    .and_then(|repo| repo.get("full_name").and_then(Value::as_str))
+                    .map(str::to_string);
+                let Some(full_name) = first else {
+                    return Ok(answer);
+                };
+                let mut params = Vec::new();
+                Self::push_query_value(&mut params, "provider", Some(provider.clone()));
+                let path = Self::query_path(Self::repo_base_path(workspace_id, &full_name), params);
+                match self.client.get::<Value>(&path).await {
+                    Err(error) => match vcs_unavailable_text(&provider, &error) {
+                        Some(text) => Ok(ToolResult::error(text)),
+                        None => Ok(answer),
+                    },
+                    Ok(_) => Ok(answer),
+                }
+            }
+            Ok(_) => Ok(answer),
+        }
     }
 
     fn metadata(&self) -> &ToolMetadata {

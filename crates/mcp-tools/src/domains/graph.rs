@@ -2193,8 +2193,14 @@ impl GraphTool {
                             input.offset,
                         )
                         .await?;
-                    // A "graph is building" answer is not kept (#467).
-                    let building = primary.get("graph_building").and_then(Value::as_bool) == Some(true);
+                    // A "graph is building" or "analysis running" answer is
+                    // not kept (#467).
+                    let building = primary.get("graph_building").and_then(Value::as_bool) == Some(true)
+                        || primary
+                            .get("analysis_status")
+                            .and_then(|status| status.get("state"))
+                            .and_then(Value::as_str)
+                            == Some("in_progress");
                     if let (Some(ws), false) = (scope.workspace_id, building) {
                         let fed_scope = mcp_types::atlas_layer::AtlasFederationScope {
                             workspace_id: ws,
@@ -2323,8 +2329,14 @@ impl GraphTool {
                             input.element_type.as_deref(),
                         )
                         .await?;
-                    // A "graph is building" answer is not kept (#467).
-                    let building = primary.get("graph_building").and_then(Value::as_bool) == Some(true);
+                    // A "graph is building" or "analysis running" answer is
+                    // not kept (#467).
+                    let building = primary.get("graph_building").and_then(Value::as_bool) == Some(true)
+                        || primary
+                            .get("analysis_status")
+                            .and_then(|status| status.get("state"))
+                            .and_then(Value::as_str)
+                            == Some("in_progress");
                     if let (Some(ws), false) = (scope.workspace_id, building) {
                         let fed_scope = mcp_types::atlas_layer::AtlasFederationScope {
                             workspace_id: ws,
@@ -2854,6 +2866,27 @@ fn graph_building_text() -> String {
     "[GRAPH BUILDING] This project's code graph is being built right now, so this analysis has no answer yet. It is not a finding that there are no dependencies, usages, cycles or unused code. Run it again in a few seconds.".to_string()
 }
 
+/// What an analysis says while its job is still running (#467): the API
+/// answers the first call with an empty, in-progress result, which read
+/// "No circular dependencies found" for a repo with a cycle.
+fn analysis_running_text(analysis: &str) -> String {
+    format!(
+        "[ANALYSIS RUNNING] The {analysis} analysis is running now, so this answer has no findings yet. It is not a finding that there are none. Ask again in a few seconds."
+    )
+}
+
+/// Whether the API answered with a quality analysis whose job is still
+/// running.
+fn reports_analysis_running(result: &ToolResult) -> bool {
+    result
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.get("analysis_status"))
+        .and_then(|status| status.get("state"))
+        .and_then(Value::as_str)
+        == Some("in_progress")
+}
+
 /// Whether the API answered that the project's graph is being built.
 fn reports_graph_building(result: &ToolResult) -> bool {
     result
@@ -2970,6 +3003,12 @@ impl ToolHandler for GraphTool {
         if is_analysis && reports_graph_building(&result) {
             return Ok(ToolResult::with_structured(
                 graph_building_text(),
+                result.structured_content.unwrap_or(Value::Null),
+            ));
+        }
+        if is_analysis && reports_analysis_running(&result) && reports_nothing(&result) {
+            return Ok(ToolResult::with_structured(
+                analysis_running_text(&action),
                 result.structured_content.unwrap_or(Value::Null),
             ));
         }
@@ -3269,6 +3308,25 @@ mod graph_not_built_tests {
             serde_json::json!({"cycles": []}),
         )));
         assert!(graph_building_text().starts_with("[GRAPH BUILDING]"));
+    }
+
+    #[test]
+    fn an_analysis_whose_job_is_running_says_so() {
+        // #467: the first call's empty in-progress answer read "No circular
+        // dependencies found".
+        let running = ToolResult::with_structured(
+            "No circular dependencies found.",
+            serde_json::json!({"cycles": [], "count": 0,
+                               "analysis_status": {"state": "in_progress", "progress_pct": 0}}),
+        );
+        assert!(reports_analysis_running(&running));
+        assert!(reports_nothing(&running));
+        let done = ToolResult::with_structured(
+            "No circular dependencies found.",
+            serde_json::json!({"cycles": [], "analysis_status": {"state": "completed"}}),
+        );
+        assert!(!reports_analysis_running(&done));
+        assert!(analysis_running_text("circular_dependencies").starts_with("[ANALYSIS RUNNING]"));
     }
 
     #[test]

@@ -90,6 +90,38 @@ fn refuse_mistyped_arguments(tool: &str, schema: &Value, input: &Value) -> Resul
     )))
 }
 
+/// Name the arguments the tool's schema does not have, under its answer
+/// (#470): they were dropped without a word, so an agent that asked for 2 rows
+/// and got 20 could not tell why.
+fn note_undeclared_arguments(
+    tool: &str,
+    undeclared: &[String],
+    outcome: Result<ToolResult>,
+) -> Result<ToolResult> {
+    if undeclared.is_empty() {
+        return outcome;
+    }
+    outcome.map(|mut result| {
+        let names = undeclared
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (verb, them) = if undeclared.len() == 1 {
+            ("is not an argument", "it")
+        } else {
+            ("are not arguments", "them")
+        };
+        let note = format!(
+            "\n\nNot read: {names} {verb} of {tool}, so the call ran without {them} (tools/list gives its arguments)."
+        );
+        if let Some(mcp_types::tool::ContentItem::Text { text }) = result.content.first_mut() {
+            text.push_str(&note);
+        }
+        result
+    })
+}
+
 /// A handler's argument-parsing error, made actionable: the tool, the fields
 /// whose type still differs from the schema, and what to send instead.
 fn explain_input_error(
@@ -961,6 +993,7 @@ impl ToolRegistry {
         refuse_negative_counts(name, &input)?;
         refuse_mistyped_arguments(name, &tool.input_schema, &input)?;
         ignore_placeholder_scope_ids(name, &mut input);
+        let undeclared = crate::input_shape::undeclared_arguments(&tool.input_schema, &input);
 
         // Attribute downstream server-side compliance events to the agent's
         // model: resolve it from the file-backed session model cache (warmed by
@@ -991,6 +1024,7 @@ impl ToolRegistry {
             None => call.await,
         };
         let outcome = explain_input_error(name, &mismatches, outcome);
+        let outcome = note_undeclared_arguments(name, &undeclared, outcome);
 
         if let Some((request, started)) = observation {
             self.report_acceleration_observation(request, started.elapsed(), outcome.as_ref());
@@ -1324,12 +1358,14 @@ impl ToolRegistry {
         refuse_negative_counts(name, &input)?;
         refuse_mistyped_arguments(name, &operation.input_schema, &input)?;
         ignore_placeholder_scope_ids(name, &mut input);
+        let undeclared = crate::input_shape::undeclared_arguments(&operation.input_schema, &input);
 
         let observation =
             acceleration_observation_request(name, &input).map(|request| (request, Instant::now()));
         let write_timing = write_timing_start(name, &input, observation.is_some());
         let outcome = operation.handler.execute(input).await;
         let outcome = explain_input_error(name, &mismatches, outcome);
+        let outcome = note_undeclared_arguments(name, &undeclared, outcome);
         if let Some((request, started)) = observation {
             self.report_acceleration_observation(request, started.elapsed(), outcome.as_ref());
         }

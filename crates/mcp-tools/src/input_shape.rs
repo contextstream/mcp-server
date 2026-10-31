@@ -381,6 +381,33 @@ pub fn mistyped_arguments(schema: &Value, input: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The arguments that are not the schema's at all (#470): no tool reads them,
+/// so a caller that sent `limit` to a tool without one got the whole page and
+/// no sign that its argument did nothing. Accepted aliases and `_` keys
+/// (client metadata) are left out; misspellings are refused before this.
+pub fn undeclared_arguments(schema: &Value, input: &Value) -> Vec<String> {
+    let (Some(props), Some(object)) = (properties(schema), input.as_object()) else {
+        return Vec::new();
+    };
+    // `{"workspace": {"id": …}}` is read for its id (normalize_arguments).
+    let read_for_scope = |key: &str| {
+        (key == "workspace" && props.contains_key("workspace_id"))
+            || (key == "project" && props.contains_key("project_id"))
+    };
+    let mut keys: Vec<String> = object
+        .keys()
+        .filter(|key| {
+            !props.contains_key(key.as_str())
+                && !key.starts_with('_')
+                && !ACCEPTED_ALIASES.contains(&key.as_str())
+                && !read_for_scope(key)
+        })
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
 /// Edits (insert, delete, change, swap of neighbours) from `a` to `b`.
 fn typo_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
@@ -496,6 +523,19 @@ mod tests {
         let fine = json!({"action": "x", "tag": "t", "node_ids": [], "ref": "r",
                           "_meta": {}, "something_else": 1});
         assert!(mistyped_arguments(&schema, &fine).is_empty());
+    }
+
+    #[test]
+    fn an_argument_no_tool_reads_is_named() {
+        // #470: `zzqq_unknown_arg` was accepted and dropped by all 18 tools.
+        let schema = json!({"properties": {"action": {}, "limit": {}}});
+        let input = json!({"action": "list", "limit": 2, "zzqq_unknown_arg": 1,
+                           "ref": "r", "_meta": {}, "cursor": "c"});
+        assert_eq!(
+            undeclared_arguments(&schema, &input),
+            vec!["cursor", "zzqq_unknown_arg"]
+        );
+        assert!(undeclared_arguments(&schema, &json!({"action": "list"})).is_empty());
     }
 
     #[test]

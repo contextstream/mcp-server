@@ -1261,6 +1261,31 @@ impl ToolHandler for TypedTool {
 mod input_shape_tests {
     use super::*;
 
+    #[test]
+    fn an_argument_the_schema_lacks_is_named_under_the_answer() {
+        // #470: 0 of 18 tools said that `zzqq_unknown_arg` did nothing.
+        let one = note_undeclared_arguments(
+            "reminder",
+            &["zzqq_unknown_arg".to_string()],
+            Ok(ToolResult::text("Found 0 reminders.")),
+        )
+        .unwrap();
+        let text = match &one.content[0] {
+            mcp_types::tool::ContentItem::Text { text } => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            text,
+            "Found 0 reminders.\n\nNot read: `zzqq_unknown_arg` is not an argument of reminder, so the call ran without it (tools/list gives its arguments)."
+        );
+        let none =
+            note_undeclared_arguments("reminder", &[], Ok(ToolResult::text("Found 0 reminders.")))
+                .unwrap();
+        assert!(
+            matches!(&none.content[0], mcp_types::tool::ContentItem::Text { text } if text == "Found 0 reminders.")
+        );
+    }
+
     const W: &str = "11111111-2222-4333-8444-555555555555";
     const P: &str = "66666666-6666-4666-8666-666666666666";
 

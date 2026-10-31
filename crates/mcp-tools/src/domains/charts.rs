@@ -387,19 +387,11 @@ impl AtlasChartTool {
             }
         };
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let point_count: usize = render.series.iter().map(|series| series.points.len()).sum();
+        let unit = chart_unit(&render.chart_key);
+        let text = chart_render_text(&render, unit, elapsed_ms);
 
         Ok(ToolResult::with_structured(
-            format!(
-                "[ACCELERATION_ANALYTICS] {} ({}, {}, {} point{}, {}ms). \
-                 Served by ContextStream acceleration analytics, not MongoDB Atlas Charts.",
-                render.title,
-                render.range,
-                render.granularity,
-                point_count,
-                if point_count == 1 { "" } else { "s" },
-                elapsed_ms
-            ),
+            text,
             serde_json::json!({
                 "stages_used": ["acceleration_analytics"],
                 "available": true,
@@ -407,6 +399,7 @@ impl AtlasChartTool {
                 "title": render.title,
                 "range": render.range,
                 "granularity": render.granularity,
+                "unit": unit,
                 "source": render.source,
                 "series": render.series,
                 "generated_at": render.generated_at.to_rfc3339(),
@@ -472,6 +465,129 @@ impl AtlasChartTool {
 
 /// Build the standard [`ToolResult`] returned when no supported chart
 /// provider can satisfy a request.
+/// What a chart's values measure: the API's rollup gives latency in
+/// milliseconds, rates in percent and the health charts as event counts.
+fn chart_unit(chart_key: &str) -> &'static str {
+    match chart_key {
+        "tool_latency_p95" => "ms",
+        key if key.ends_with("_rate") => "%",
+        _ => "events",
+    }
+}
+
+fn chart_value(value: f64, unit: &str) -> String {
+    match unit {
+        "%" => format!("{value:.1}%"),
+        "ms" => format!("{value:.0} ms"),
+        _ => format!("{value:.0}"),
+    }
+}
+
+/// Most series a chart names in its text; all of them stay in the
+/// structured answer.
+const CHART_SERIES_LISTED: usize = 5;
+
+/// What the chart shows, in the text a client without structuredContent
+/// reads: the unit, the extremes with where and when, and the worst series.
+/// The query time comes last; it read as the latency (#440).
+fn chart_render_text(
+    render: &mcp_types::acceleration_layer::AccelerationAnalyticsRender,
+    unit: &str,
+    elapsed_ms: u64,
+) -> String {
+    let points: usize = render.series.iter().map(|series| series.points.len()).sum();
+    let mut text = format!(
+        "[ACCELERATION_ANALYTICS] {}, last {} by {}, in {unit}: {} series, {points} point{}.",
+        render.title,
+        render.range,
+        render.granularity,
+        render.series.len(),
+        if points == 1 { "" } else { "s" }
+    );
+    // A hit rate is worst when low; latency, degraded rates and counts when
+    // high.
+    let low_is_worst = render.chart_key == "acceleration_cache_hit_rate";
+    let mut all: Vec<(
+        &str,
+        &mcp_types::acceleration_layer::AccelerationAnalyticsPoint,
+    )> = render
+        .series
+        .iter()
+        .flat_map(|series| {
+            series
+                .points
+                .iter()
+                .map(move |point| (series.name.as_str(), point))
+        })
+        .collect();
+    if all.is_empty() {
+        text.push_str(" No data in this range.");
+    } else {
+        all.sort_by(|a, b| a.1.value.total_cmp(&b.1.value));
+        let at = |(name, point): &(
+            &str,
+            &mcp_types::acceleration_layer::AccelerationAnalyticsPoint,
+        )| {
+            format!(
+                "{} ({name}, {})",
+                chart_value(point.value, unit),
+                point.t.format("%Y-%m-%d %H:%MZ")
+            )
+        };
+        text.push_str(&format!(
+            "\nHighest: {}. Lowest: {}.",
+            at(&all[all.len() - 1]),
+            at(&all[0])
+        ));
+        let mut series: Vec<_> = render
+            .series
+            .iter()
+            .filter(|series| !series.points.is_empty())
+            .map(|series| {
+                let values = series.points.iter().map(|point| point.value);
+                let max = values.clone().fold(f64::MIN, f64::max);
+                let min = values.fold(f64::MAX, f64::min);
+                let latest = series.points.iter().max_by_key(|point| point.t).unwrap();
+                (series, min, max, latest)
+            })
+            .collect();
+        if low_is_worst {
+            series.sort_by(|a, b| a.1.total_cmp(&b.1));
+        } else {
+            series.sort_by(|a, b| b.2.total_cmp(&a.2));
+        }
+        text.push_str(&format!(
+            "\nSeries, {} first:",
+            if low_is_worst { "lowest" } else { "highest" }
+        ));
+        for (series, min, max, latest) in series.iter().take(CHART_SERIES_LISTED) {
+            text.push_str(&format!(
+                "\n- {}: latest {} ({}), min {}, max {}, {} point{}",
+                series.name,
+                chart_value(latest.value, unit),
+                latest.t.format("%H:%MZ"),
+                chart_value(*min, unit),
+                chart_value(*max, unit),
+                series.points.len(),
+                if series.points.len() == 1 { "" } else { "s" }
+            ));
+        }
+        if series.len() > CHART_SERIES_LISTED {
+            text.push_str(&format!(
+                "\n{} more series in the structured answer (filters narrows them).",
+                series.len() - CHART_SERIES_LISTED
+            ));
+        }
+    }
+    if render.degraded {
+        if let Some(note) = render.note.as_deref() {
+            text.push_str(&format!("\nNote: {note}"));
+        }
+    }
+    text.push_str(&format!("\n(query {elapsed_ms} ms)"));
+    text
+}
+
 fn charts_unavailable(layer: &AtlasLayer, acceleration_layer: &AccelerationLayer) -> ToolResult {
     let note = if acceleration_layer.is_enabled() {
         "[ACCELERATION_DEGRADED] Analytics provider is not configured. Chart rendering is unavailable in this deployment."
@@ -912,6 +1028,76 @@ mod tests {
                 "analytics chart `nope` not found".to_string(),
             ))
         }
+    }
+
+    #[test]
+    fn the_chart_text_gives_the_unit_the_extremes_and_the_worst_series() {
+        // #440: "Tool latency p95 (24h, hour, 212 points, 155ms)": 155 ms was
+        // the query time, and no value was in the text.
+        use mcp_types::acceleration_layer::{
+            AccelerationAnalyticsPoint, AccelerationAnalyticsRender, AccelerationAnalyticsSeries,
+        };
+        let t = |hour: u32| {
+            chrono::DateTime::parse_from_rfc3339(&format!("2026-10-30T{hour:02}:00:00Z"))
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let render = AccelerationAnalyticsRender {
+            chart_key: "tool_latency_p95".to_string(),
+            title: "Tool latency p95".to_string(),
+            range: "24h".to_string(),
+            granularity: "hour".to_string(),
+            source: "postgres_rollup".to_string(),
+            series: vec![
+                AccelerationAnalyticsSeries {
+                    name: "context".to_string(),
+                    points: vec![
+                        AccelerationAnalyticsPoint {
+                            t: t(8),
+                            value: 120.0,
+                        },
+                        AccelerationAnalyticsPoint {
+                            t: t(9),
+                            value: 212.0,
+                        },
+                    ],
+                },
+                AccelerationAnalyticsSeries {
+                    name: "agents / other".to_string(),
+                    points: vec![
+                        AccelerationAnalyticsPoint {
+                            t: t(17),
+                            value: 4054.0,
+                        },
+                        AccelerationAnalyticsPoint {
+                            t: t(8),
+                            value: 0.0,
+                        },
+                    ],
+                },
+            ],
+            generated_at: t(18),
+            degraded: false,
+            note: None,
+        };
+        let text = chart_render_text(&render, chart_unit(&render.chart_key), 155);
+        assert!(text.starts_with(
+            "[ACCELERATION_ANALYTICS] Tool latency p95, last 24h by hour, in ms: 2 series, 4 points."
+        ), "{text}");
+        assert!(
+            text.contains("Highest: 4054 ms (agents / other, 2026-10-30 17:00Z)."),
+            "{text}"
+        );
+        assert!(text.contains("Lowest: 0 ms (agents / other"), "{text}");
+        let agents = text
+            .find("- agents / other: latest 4054 ms (17:00Z), min 0 ms, max 4054 ms")
+            .unwrap();
+        let context = text.find("- context: latest 212 ms (09:00Z)").unwrap();
+        assert!(agents < context, "highest first: {text}");
+        assert!(text.ends_with("(query 155 ms)"), "{text}");
+        assert!(!text.contains("MongoDB"), "{text}");
+        assert_eq!(chart_unit("acceleration_cache_hit_rate"), "%");
+        assert_eq!(chart_unit("signal_emit_health"), "events");
     }
 
     #[tokio::test]

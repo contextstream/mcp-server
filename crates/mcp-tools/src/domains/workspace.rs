@@ -717,7 +717,11 @@ fn resolve_workspace_reference(account: &Value, reference: &str) -> Result<(Uuid
                 .collect();
             Err(Error::Validation(format!(
                 "No workspace you can open is named \"{reference}\". Yours: {}.",
-                if names.is_empty() { "none".to_string() } else { names.join(", ") }
+                if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(", ")
+                }
             )))
         }
         several => Err(Error::Validation(format!(
@@ -761,7 +765,11 @@ fn change_sentence(view: &Value, action: &str, other: &str) -> String {
         .any(|change| change.get("include_code").and_then(Value::as_bool) == Some(false));
     format!(
         "Linked: agents now use the knowledge across {here} and {other} as set below{}.",
-        if code_left_out { " (code left out where marked)" } else { "" }
+        if code_left_out {
+            " (code left out where marked)"
+        } else {
+            ""
+        }
     )
 }
 
@@ -801,7 +809,9 @@ fn sharing_text(view: &Value, lead: Option<&str>) -> String {
             let find = |links: &[Value]| -> Option<Value> {
                 links
                     .iter()
-                    .find(|link| link.get("workspace_id").and_then(Value::as_str) == Some(id.as_str()))
+                    .find(|link| {
+                        link.get("workspace_id").and_then(Value::as_str) == Some(id.as_str())
+                    })
                     .cloned()
             };
             let shared = find(&shares);
@@ -818,20 +828,39 @@ fn sharing_text(view: &Value, lead: Option<&str>) -> String {
             let direction = match (shared.is_some(), used.is_some()) {
                 (true, true) => format!(
                     "both ways ({}; {})",
-                    if code(&shared) { "our code shared" } else { "our code kept here" },
-                    if code(&used) { "its code used" } else { "its code left out" }
+                    if code(&shared) {
+                        "our code shared"
+                    } else {
+                        "our code kept here"
+                    },
+                    if code(&used) {
+                        "its code used"
+                    } else {
+                        "its code left out"
+                    }
                 ),
                 (true, false) => format!(
                     "{name} uses {here}'s knowledge ({})",
-                    if code(&shared) { "code included" } else { "code left out" }
+                    if code(&shared) {
+                        "code included"
+                    } else {
+                        "code left out"
+                    }
                 ),
                 _ => format!(
                     "{here} uses {name}'s knowledge ({})",
-                    if code(&used) { "code included" } else { "code left out" }
+                    if code(&used) {
+                        "code included"
+                    } else {
+                        "code left out"
+                    }
                 ),
             };
             text.push_str(&format!("- {name} ({id}): {direction}"));
-            if let Some(people) = used.as_ref().and_then(|link| link.get("people_who_can_open")) {
+            if let Some(people) = used
+                .as_ref()
+                .and_then(|link| link.get("people_who_can_open"))
+            {
                 let can = people.get("can_open").and_then(Value::as_i64).unwrap_or(0);
                 let total = people.get("total").and_then(Value::as_i64).unwrap_or(0);
                 if total > 0 && can < total {
@@ -844,7 +873,10 @@ fn sharing_text(view: &Value, lead: Option<&str>) -> String {
         }
         text.push_str("Linked knowledge appears in search, memory, recall and context labeled \"from <workspace>\". It is read-only here, and each person gets only what they can open there.\n");
     }
-    let can_manage = view.get("can_manage").and_then(Value::as_bool).unwrap_or(false);
+    let can_manage = view
+        .get("can_manage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if can_manage {
         let candidates: Vec<String> = view
             .get("candidates")
@@ -853,8 +885,14 @@ fn sharing_text(view: &Value, lead: Option<&str>) -> String {
                 items
                     .iter()
                     .filter(|candidate| {
-                        !(candidate.get("shares_with").and_then(Value::as_bool).unwrap_or(false)
-                            && candidate.get("uses_from").and_then(Value::as_bool).unwrap_or(false))
+                        !(candidate
+                            .get("shares_with")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                            && candidate
+                                .get("uses_from")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false))
                     })
                     .filter_map(|candidate| candidate.get("name").and_then(Value::as_str))
                     .map(str::to_string)

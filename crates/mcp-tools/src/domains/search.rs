@@ -14298,8 +14298,8 @@ impl SearchTool {
             }
         }
 
-        // Shared knowledge: the code the API found in the workspaces linked to this one
-        // (contextstream plan 483f30df), after this workspace's own results.
+        // Shared knowledge: the code the API found in the workspaces linked to this one,
+        // after this workspace's own results.
         crate::domains::linked_workspaces::append_linked_code(
             &mut text,
             &mut structured,

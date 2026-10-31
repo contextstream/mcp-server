@@ -1675,8 +1675,8 @@ mod tests {
             stale_reason: None,
             historical_status_claim: false,
             conflict_note: None,
-                        source_workspace: None,
-search_keywords: "Fix auth".to_string(),
+            source_workspace: None,
+            search_keywords: "Fix auth".to_string(),
         }];
         let s = format_grounding_block(&hits, true);
         assert!(s.contains("[GROUNDING]"));
@@ -1726,8 +1726,8 @@ search_keywords: "Fix auth".to_string(),
             stale_reason: None,
             historical_status_claim: false,
             conflict_note: None,
-                        source_workspace: None,
-search_keywords: "Prod DB migration runbook".to_string(),
+            source_workspace: None,
+            search_keywords: "Prod DB migration runbook".to_string(),
         }];
 
         let verbose = format_grounding_block(&hits, false);

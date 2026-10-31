@@ -419,6 +419,13 @@ fn build_search_cache_key_with_tokenizer(
 
     let mut canonical = Vec::new();
     append_cache_text(&mut canonical, "version", Some("search-cache-v5"));
+    // What linked workspaces add to an answer follows the links: a change of a link
+    // changes the key (#487).
+    append_cache_text(
+        &mut canonical,
+        "knowledge_links",
+        Some(&mcp_client::knowledge_link_generation().to_string()),
+    );
     append_cache_text(&mut canonical, "workspace_id", workspace.as_deref());
     append_cache_text(&mut canonical, "project_id", project.as_deref());
     append_cache_text(&mut canonical, "query", Some(&input.query));

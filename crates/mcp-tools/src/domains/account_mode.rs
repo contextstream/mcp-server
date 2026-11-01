@@ -127,6 +127,15 @@ pub fn resolve_is_personal(
     Some(execution_mode.default_is_personal())
 }
 
+/// The `is_personal` a lookup by reference (get, update, delete or complete one item by its id
+/// or title) filters on: only what the caller passed, or personal while team context is
+/// degraded. The account mode's default is for what a call creates or lists; as a lookup filter,
+/// personal mode's default hid every team doc, todo and diagram from its exact title, though
+/// get_doc found the doc (#492).
+pub fn lookup_is_personal(explicit: Option<bool>, team_context_degraded: bool) -> Option<bool> {
+    explicit.or(team_context_degraded.then_some(true))
+}
+
 /// Default list/read scope label for team entity actions.
 pub fn default_team_read_enabled(
     execution_mode: ExecutionMode,
@@ -371,6 +380,17 @@ mod tests {
         });
         assert_eq!(resolution.preference, AccountModePreference::Auto);
         assert_eq!(resolution.execution_mode, ExecutionMode::Team);
+    }
+
+    #[test]
+    fn a_lookup_filters_only_on_what_the_caller_passed() {
+        // #492: no mode default, so a team item is found by its title in personal mode.
+        assert_eq!(lookup_is_personal(None, false), None);
+        assert_eq!(lookup_is_personal(Some(true), false), Some(true));
+        assert_eq!(lookup_is_personal(Some(false), false), Some(false));
+        // Degraded team context still keeps a lookup to personal items, unless the caller says.
+        assert_eq!(lookup_is_personal(None, true), Some(true));
+        assert_eq!(lookup_is_personal(Some(false), true), Some(false));
     }
 
     #[test]

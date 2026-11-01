@@ -3711,3 +3711,227 @@ fn list_nodes_refuses_a_status_it_cannot_filter_by() {
     assert_eq!(list_nodes_status_problem(Some(" ")), None);
     assert_eq!(list_nodes_status_problem(None), None);
 }
+
+mod personal_mode_reference_tests {
+    // #492: in personal account mode every memory call got is_personal=true unless the caller
+    // passed one, and a lookup by title filtered on it, so a team doc, todo or diagram was never
+    // found by its exact title (get_doc, which passed no filter, found the doc).
+    use super::{MemoryTool, TestFixtures, ToolHandler};
+    use mcp_client::ContextStreamClient;
+    use mcp_session::SessionManager;
+    use mcp_types::tool::ContentItem;
+    use mcp_types::ExecutionMode;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const WORKSPACE: &str = "22222222-2222-4222-8222-222222222222";
+    const TEAM_ITEM: &str = "33333333-3333-4333-8333-333333333333";
+
+    /// Answers a collection list (a GET with no id after the collection) with `list` and every
+    /// other request with `other`, until the client goes quiet; returns the request lines.
+    fn serve(
+        listener: tokio::net::TcpListener,
+        list: Value,
+        other: Value,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                // The whole request, body included, so closing never cuts a write short.
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let read = socket.read(&mut buffer).await.expect("read request");
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    if read == 0 {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                let line = request.lines().next().unwrap_or_default().to_string();
+                let path = line.split(' ').nth(1).unwrap_or_default();
+                let route = path
+                    .trim_start_matches("/api/v1/")
+                    .split('?')
+                    .next()
+                    .unwrap_or_default();
+                let body = if line.starts_with("GET ") && !route.contains('/') {
+                    list.clone()
+                } else {
+                    other.clone()
+                }
+                .to_string();
+                lines.push(line);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            lines
+        })
+    }
+
+    /// The memory tool in a session on WORKSPACE, in personal mode (the default for an
+    /// individual account), against a mock API.
+    async fn personal_mode_tool() -> (MemoryTool, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{}", listener.local_addr().expect("listener addr"));
+        config.api_key = Some("test-key".to_string());
+        config.default_project_id = None;
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        session
+            .initialize(Some(WORKSPACE.parse().unwrap()), None, None, None)
+            .await;
+        assert_eq!(
+            session.active_execution_mode().await,
+            ExecutionMode::Personal
+        );
+        (
+            MemoryTool::new(client, session, mcp_types::atlas_layer::noop_layer()),
+            listener,
+        )
+    }
+
+    fn text_of(result: &mcp_types::tool::ToolResult) -> String {
+        match &result.content[0] {
+            ContentItem::Text { text } => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_team_doc_is_updated_and_deleted_by_its_exact_title_in_personal_mode() {
+        let team_doc = json!({"id": TEAM_ITEM, "title": "Own team doc 492",
+                              "doc_type": "general", "is_personal": false});
+        let calls = [
+            (
+                json!({"action": "update_doc", "doc_id": "Own team doc 492", "content": "v1"}),
+                "PATCH",
+            ),
+            (
+                json!({"action": "delete_doc", "doc_id": "Own team doc 492"}),
+                "DELETE",
+            ),
+        ];
+        for (call, verb) in calls {
+            let (tool, listener) = personal_mode_tool().await;
+            let server = serve(
+                listener,
+                json!({"success": true, "data": {"items": [team_doc.clone()], "total": 1}}),
+                json!({"success": true, "data": team_doc.clone()}),
+            );
+            let text = text_of(&tool.execute(call).await.expect("by its exact title"));
+            assert!(!text.contains("[CANDIDATES]"), "{text}");
+            let lines = server.await.expect("server");
+            let lookups: Vec<&String> = lines
+                .iter()
+                .filter(|line| line.starts_with("GET /api/v1/docs?"))
+                .collect();
+            assert!(!lookups.is_empty(), "{lines:?}");
+            assert!(
+                lookups.iter().all(|line| !line.contains("is_personal")),
+                "the lookup must not be narrowed to personal docs: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with(&format!("{verb} /api/v1/docs/{TEAM_ITEM}"))),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_who_passes_is_personal_still_narrows_the_lookup() {
+        let (tool, listener) = personal_mode_tool().await;
+        let server = serve(
+            listener,
+            json!({"success": true, "data": {"items": [], "total": 0}}),
+            json!({"success": true, "data": {}}),
+        );
+        let _ = tool
+            .execute(json!({"action": "update_doc", "doc_id": "Own team doc 492",
+                            "content": "v1", "is_personal": true}))
+            .await;
+        let lines = server.await.expect("server");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("GET /api/v1/docs?")
+                    && line.contains("is_personal=true")),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_diagrams_and_todos_are_found_by_title_in_personal_mode() {
+        let diagram = json!({"id": TEAM_ITEM, "title": "Team flow 492", "diagram_type": "flowchart",
+                             "content": "flowchart TD; A-->B", "is_personal": false});
+        let todo = json!({"id": TEAM_ITEM, "title": "Team todo 492", "content": "Team todo 492",
+                          "status": "pending", "is_personal": false});
+        let calls = [
+            (
+                json!({"action": "get_diagram", "diagram_id": "Team flow 492"}),
+                diagram,
+                "diagrams",
+            ),
+            (
+                json!({"action": "complete_todo", "todo_id": "Team todo 492"}),
+                todo,
+                "todos",
+            ),
+        ];
+        for (call, item, collection) in calls {
+            let (tool, listener) = personal_mode_tool().await;
+            let server = serve(
+                listener,
+                json!({"success": true, "data": {"items": [item.clone()], "total": 1}}),
+                json!({"success": true, "data": item.clone()}),
+            );
+            let text = text_of(&tool.execute(call).await.expect("by its exact title"));
+            assert!(!text.contains("[CANDIDATES]"), "{text}");
+            let lines = server.await.expect("server");
+            let list = format!("GET /api/v1/{collection}");
+            let lookups: Vec<&String> = lines
+                .iter()
+                .filter(|line| line.starts_with(&list) && !line[list.len()..].starts_with('/'))
+                .collect();
+            assert!(!lookups.is_empty(), "{lines:?}");
+            assert!(
+                lookups.iter().all(|line| !line.contains("is_personal")),
+                "the lookup must not be narrowed to personal items: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!("/api/v1/{collection}/{TEAM_ITEM}"))),
+                "{lines:?}"
+            );
+        }
+    }
+}

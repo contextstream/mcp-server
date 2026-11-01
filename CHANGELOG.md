@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.54
+
+- `answer`: a call that selects exactly one workspace and at most one project now also sends them as the current scope, so "this workspace" and "this project" resolve to the requested scope. Before, such a call was asked which workspace or project it meant, with no candidates to choose from (#388).
+
 ## 1.0.53
 
 - `entity` accepts `action` and `kind` with stray spaces (`" list"`, `" ticket"`), and its errors no longer repeat them (#490).

@@ -115,6 +115,34 @@ fn push_unique_project_candidate(candidates: &mut Vec<Uuid>, candidate: Option<U
     }
 }
 
+/// How a project a read would filter by is outside the read's workspace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutsideWorkspace {
+    /// It belongs to a different workspace.
+    Foreign,
+    /// It no longer exists, or this caller can't see it.
+    Missing,
+}
+
+/// Whether `project_id` is outside `workspace_id`. None when the project is
+/// in it, or when it could not be checked.
+pub(crate) async fn project_outside_workspace(
+    client: &ContextStreamClient,
+    workspace_id: Option<Uuid>,
+    project_id: Uuid,
+) -> Option<OutsideWorkspace> {
+    match client.get_project(project_id).await {
+        Ok(project) => match (workspace_id, project.workspace_id) {
+            (Some(asked), Some(owner)) if asked != owner => Some(OutsideWorkspace::Foreign),
+            _ => None,
+        },
+        Err(error) if is_not_found_error(&error) || is_project_scope_error(&error) => {
+            Some(OutsideWorkspace::Missing)
+        }
+        Err(_) => None,
+    }
+}
+
 /// The note for a read's explicit project_id that names no project of its
 /// workspace (#449): the one `resolve_read_scope` gives, so every read that
 /// leaves such an id out says so the same way. None when the project is
@@ -124,17 +152,35 @@ pub(crate) async fn unknown_project_note(
     workspace_id: Option<Uuid>,
     project_id: Uuid,
 ) -> Option<String> {
-    match client.get_project(project_id).await {
-        Ok(project) => match (workspace_id, project.workspace_id) {
-            (Some(asked), Some(owner)) if asked != owner => {
-                Some(foreign_project_ignored_note(project_id))
-            }
-            _ => None,
-        },
-        Err(error) if is_not_found_error(&error) || is_project_scope_error(&error) => {
-            Some(missing_project_ignored_note(project_id))
-        }
-        Err(_) => None,
+    project_outside_workspace(client, workspace_id, project_id)
+        .await
+        .map(|outside| match outside {
+            OutsideWorkspace::Foreign => foreign_project_ignored_note(project_id),
+            OutsideWorkspace::Missing => missing_project_ignored_note(project_id),
+        })
+}
+
+/// What a read says when it leaves out the default project it would have
+/// filtered by, which is outside its workspace (#493). The caller never passed
+/// it, so the note says where it came from: the connection's
+/// `X-ContextStream-Project-Id` header on the hosted gateway, or a default.
+pub(crate) fn default_project_ignored_note(
+    project_id: Uuid,
+    outside: OutsideWorkspace,
+    from_connection: bool,
+) -> String {
+    let why = match outside {
+        OutsideWorkspace::Foreign => "belongs to a different workspace",
+        OutsideWorkspace::Missing => "no longer exists",
+    };
+    if from_connection {
+        format!(
+            "This connection's project (X-ContextStream-Project-Id {project_id}) {why} and was ignored, so this covers the whole workspace. Fix or remove that header in this MCP server's config."
+        )
+    } else {
+        format!(
+            "The default project {project_id} {why} and was ignored, so this covers the whole workspace. Run init to pick the project again, or pass project_id."
+        )
     }
 }
 

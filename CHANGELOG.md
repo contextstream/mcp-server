@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.55
+
+- Memory, in personal account mode: `update_doc` and `delete_doc`, the todo lookups (`get_todo`, `update_todo`, `delete_todo`, `complete_todo`) and the diagram lookups (`get_diagram`, `update_diagram`, `delete_diagram`) find a team item by its exact title. Before, they searched personal items only and answered "No doc title has every word of ..." for a team doc that `get_doc` found. Creates and lists keep the personal default, and a personal and a team item with the same title are both offered as candidates (#492).
+- Shared work items (`entity`) on the hosted gateway: when the connection's `X-ContextStream-Project-Id` names a project of another workspace, or one that no longer exists, lists and lookups by title leave it out and cover the whole workspace. The answer starts with a note saying the connection's project was ignored and why. Before, they answered "No tickets found." with nothing saying why. A configured default project gets the same note (#493).
+
 ## 1.0.54
 
 - `answer`: a call that selects exactly one workspace and at most one project now also sends them as the current scope, so "this workspace" and "this project" resolve to the requested scope. Before, such a call was asked which workspace or project it meant, with no candidates to choose from (#388).

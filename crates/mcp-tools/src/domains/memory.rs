@@ -4319,6 +4319,12 @@ impl MemoryTool {
             }
         });
 
+        // Lookups by reference filter on the caller's own is_personal; creates and lists take
+        // the account mode's default below.
+        let lookup_is_personal = crate::domains::account_mode::lookup_is_personal(
+            input.is_personal,
+            state.team_context_degraded,
+        );
         input.is_personal = crate::domains::account_mode::resolve_is_personal(
             state.active_execution_mode,
             input.is_personal,
@@ -5673,7 +5679,7 @@ impl MemoryTool {
                         project_id,
                         status: input.todo_status.clone(),
                         priority: input.todo_priority.clone(),
-                        is_personal: input.is_personal,
+                        is_personal: lookup_is_personal,
                         scope: input.scope.clone(),
                         query: Some(todo_lookup.clone()),
                         created_after: None,
@@ -5720,7 +5726,7 @@ impl MemoryTool {
                         // does not have them yet.
                         status: None,
                         priority: None,
-                        is_personal: input.is_personal,
+                        is_personal: lookup_is_personal,
                         scope: input.scope.clone(),
                         query: Some(todo_lookup.clone()),
                         created_after: None,
@@ -5789,7 +5795,7 @@ impl MemoryTool {
                         project_id,
                         status: input.todo_status.clone(),
                         priority: input.todo_priority.clone(),
-                        is_personal: input.is_personal,
+                        is_personal: lookup_is_personal,
                         scope: input.scope.clone(),
                         query: Some(todo_lookup.clone()),
                         created_after: None,
@@ -5832,7 +5838,7 @@ impl MemoryTool {
                         project_id,
                         status: input.todo_status.clone(),
                         priority: input.todo_priority.clone(),
-                        is_personal: input.is_personal,
+                        is_personal: lookup_is_personal,
                         scope: input.scope.clone(),
                         query: Some(todo_lookup.clone()),
                         created_after: None,
@@ -6018,7 +6024,7 @@ impl MemoryTool {
                     .list_diagrams(
                         workspace_id,
                         project_id,
-                        input.is_personal,
+                        lookup_is_personal,
                         Some(100),
                         input.diagram_type.clone(),
                     )
@@ -6049,7 +6055,7 @@ impl MemoryTool {
                     .list_diagrams(
                         workspace_id,
                         project_id,
-                        input.is_personal,
+                        lookup_is_personal,
                         Some(100),
                         input.diagram_type.clone(),
                     )
@@ -6102,7 +6108,7 @@ impl MemoryTool {
                     .list_diagrams(
                         workspace_id,
                         project_id,
-                        input.is_personal,
+                        lookup_is_personal,
                         Some(100),
                         input.diagram_type.clone(),
                     )
@@ -6316,7 +6322,7 @@ impl MemoryTool {
                     doc_id.trim(),
                     // `doc_type` is the new type here, not a filter.
                     None,
-                    input.is_personal,
+                    lookup_is_personal,
                     LookupAction::UPDATE,
                     "update_doc",
                 )
@@ -6397,7 +6403,7 @@ impl MemoryTool {
                     project_id,
                     doc_id.trim(),
                     input.doc_type.as_deref(),
-                    input.is_personal,
+                    lookup_is_personal,
                     LookupAction::DELETE,
                     "delete_doc",
                 )

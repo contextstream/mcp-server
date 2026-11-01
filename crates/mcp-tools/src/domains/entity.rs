@@ -163,6 +163,55 @@ impl EntityTool {
         }
     }
 
+    /// The note for a read that names no project when the default project it
+    /// would filter by (the connection's `X-ContextStream-Project-Id` on the
+    /// hosted gateway, or the configured default) is outside its workspace: of
+    /// another workspace, or gone. The read then leaves that project out and
+    /// covers the whole workspace, as with a named project_id (#449). Kept, it
+    /// answered every list "No … found" with nothing saying why (#493).
+    ///
+    /// None when the default project is in the workspace, when there is none,
+    /// when it could not be checked, or when it is the session's own (set by
+    /// init, which checks it).
+    async fn default_project_left_out(
+        &self,
+        explicit_workspace_id: &Option<String>,
+    ) -> Option<String> {
+        if self.session.state().await.project_id.is_some() {
+            return None;
+        }
+        let (ws, proj) = self.resolve_scope(explicit_workspace_id, &None).await;
+        let workspace = ws.as_deref().and_then(|id| Uuid::parse_str(id).ok())?;
+        let project = proj.as_deref().and_then(|id| Uuid::parse_str(id).ok())?;
+        let outside =
+            super::scope::project_outside_workspace(&self.client, Some(workspace), project).await?;
+        let from_connection =
+            mcp_client::get_task_auth_override().and_then(|auth| auth.project_id) == Some(project);
+        Some(super::scope::default_project_ignored_note(
+            project,
+            outside,
+            from_connection,
+        ))
+    }
+
+    /// [`Self::resolve_scope`] for a read: without the default project when
+    /// [`Self::default_project_left_out`] left it out.
+    async fn read_scope(
+        &self,
+        explicit_workspace_id: &Option<String>,
+        explicit_project_id: &Option<String>,
+        default_project_note: &Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        let (ws, proj) = self
+            .resolve_scope(explicit_workspace_id, explicit_project_id)
+            .await;
+        if default_project_note.is_some() && explicit_project_id.is_none() {
+            (ws, None)
+        } else {
+            (ws, proj)
+        }
+    }
+
     /// Resolve scope IDs for an entity call. Precedence (highest first):
     ///   1. Explicit `workspace_id` / `project_id` in the call body.
     ///   2. The scope the other tools fall back to (`read_scope_defaults`):
@@ -989,6 +1038,14 @@ const ENTITY_TOOL_REFERENCE: &str = "Structured taxonomy entities — tickets, h
                 when you set it."
                 ;
 
+/// `output` with a scope `note`, when there is one, as its first line.
+fn with_scope_note(output: ToolResult, note: &Option<String>) -> ToolResult {
+    match note {
+        Some(note) => output.with_prefix(format!("{note}\n")),
+        None => output,
+    }
+}
+
 #[async_trait]
 impl ToolHandler for EntityTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
@@ -1042,6 +1099,16 @@ impl ToolHandler for EntityTool {
             project_id = Some(resolved);
         }
 
+        // A read that names no project filters by the default one only when that
+        // project is in the workspace (#493).
+        let default_project_note = if project_id.is_none()
+            && matches!(action.as_str(), "list" | "get" | "update" | "delete")
+        {
+            self.default_project_left_out(&input.workspace_id).await
+        } else {
+            None
+        };
+
         match action.as_str() {
             "list" => {
                 let (list_limit, list_offset) = (input.limit, input.offset);
@@ -1062,7 +1129,9 @@ impl ToolHandler for EntityTool {
                         project_id = None;
                     }
                 }
-                let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
+                let (ws, proj) = self
+                    .read_scope(&input.workspace_id, &project_id, &default_project_note)
+                    .await;
                 let mut params = Self::build_list_params(&input.query, &ws, &proj);
                 add_list_page_params(&mut params, list_limit, list_offset);
                 let result = if let (Some(cache_kind), Some(ws_id)) = (
@@ -1097,14 +1166,16 @@ impl ToolHandler for EntityTool {
                 };
                 let text = format_entity_list(&kind, &result);
                 let output = ToolResult::with_structured(text, result);
-                Ok(match scope_note {
+                Ok(match scope_note.or_else(|| default_project_note.clone()) {
                     Some(note) => output.with_prefix(format!("{note}\n")),
                     None => output,
                 })
             }
 
             "get" => {
-                let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
+                let (ws, proj) = self
+                    .read_scope(&input.workspace_id, &project_id, &default_project_note)
+                    .await;
                 let lookup = input
                     .id
                     .as_deref()
@@ -1125,7 +1196,9 @@ impl ToolHandler for EntityTool {
                     .await?
                 {
                     Lookup::Found(found) => found,
-                    Lookup::Candidates(candidates) => return Ok(candidates),
+                    Lookup::Candidates(candidates) => {
+                        return Ok(with_scope_note(candidates, &default_project_note))
+                    }
                 };
                 let id = found.id;
                 let workspace_id = ws.as_ref().and_then(|s| uuid::Uuid::parse_str(s).ok());
@@ -1168,7 +1241,10 @@ impl ToolHandler for EntityTool {
                     text.push('\n');
                     text.push_str(&fields);
                 }
-                Ok(found.tool_result(text, result))
+                Ok(with_scope_note(
+                    found.tool_result(text, result),
+                    &default_project_note,
+                ))
             }
 
             "create" => {
@@ -1237,7 +1313,9 @@ impl ToolHandler for EntityTool {
                             .to_string(),
                     ));
                 }
-                let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
+                let (ws, proj) = self
+                    .read_scope(&input.workspace_id, &project_id, &default_project_note)
+                    .await;
                 let lookup = input
                     .id
                     .as_deref()
@@ -1259,7 +1337,9 @@ impl ToolHandler for EntityTool {
                     .await?
                 {
                     Lookup::Found(found) => found,
-                    Lookup::Candidates(candidates) => return Ok(candidates),
+                    Lookup::Candidates(candidates) => {
+                        return Ok(with_scope_note(candidates, &default_project_note))
+                    }
                 };
                 let id = found.id;
                 let mut body = merged_body;
@@ -1308,11 +1388,16 @@ impl ToolHandler for EntityTool {
                     }
                 }
                 append_reply_notes(&mut text, &kind, &body, &result);
-                Ok(found.tool_result(text, result))
+                Ok(with_scope_note(
+                    found.tool_result(text, result),
+                    &default_project_note,
+                ))
             }
 
             "delete" => {
-                let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
+                let (ws, proj) = self
+                    .read_scope(&input.workspace_id, &project_id, &default_project_note)
+                    .await;
                 let lookup = input
                     .id
                     .as_deref()
@@ -1333,12 +1418,17 @@ impl ToolHandler for EntityTool {
                     .await?
                 {
                     Lookup::Found(found) => found,
-                    Lookup::Candidates(candidates) => return Ok(candidates),
+                    Lookup::Candidates(candidates) => {
+                        return Ok(with_scope_note(candidates, &default_project_note))
+                    }
                 };
                 let id = found.id;
                 let result = self.client.entity_delete(&kind, id).await?;
                 let text = format!("Deleted {} {}.", kind, id);
-                Ok(found.tool_result(text, result))
+                Ok(with_scope_note(
+                    found.tool_result(text, result),
+                    &default_project_note,
+                ))
             }
 
             _ => Err(Error::refused(
@@ -2396,6 +2486,12 @@ mod tests {
     async fn the_connections_workspace_scopes_lists_and_creates() {
         let other_workspace = "55555555-5555-5555-5555-555555555555";
         let (tool, server) = entity_tool_with_http_sequence(vec![
+            // #493: the list checks the connection's project first.
+            (
+                "200 OK",
+                serde_json::json!({"id": SESSION_PROJECT_ID, "name": "Hooks",
+                                   "workspace_id": WORKSPACE_ID}),
+            ),
             (
                 "200 OK",
                 serde_json::json!({"items": [stored_ticket(false, SESSION_PROJECT_ID)], "total": 1}),
@@ -2434,7 +2530,12 @@ mod tests {
         .await;
 
         let requests = server.await.expect("entity request server");
-        let list = requests[0].lines().next().unwrap_or_default();
+        let check = requests[0].lines().next().unwrap_or_default();
+        assert!(
+            check.starts_with(&format!("GET /api/v1/projects/{SESSION_PROJECT_ID}")),
+            "{check}"
+        );
+        let list = requests[1].lines().next().unwrap_or_default();
         assert!(list.starts_with("GET /api/v1/tickets?"), "{list}");
         assert!(
             list.contains(&format!("workspace_id={WORKSPACE_ID}")),
@@ -2444,15 +2545,94 @@ mod tests {
             list.contains(&format!("project_id={SESSION_PROJECT_ID}")),
             "{list}"
         );
-        let created = request_body(&requests[1]);
+        let created = request_body(&requests[2]);
         assert_eq!(created["workspace_id"], WORKSPACE_ID, "{created}");
         assert_eq!(created["project_id"], SESSION_PROJECT_ID, "{created}");
-        let other = requests[2].lines().next().unwrap_or_default();
+        let other = requests[3].lines().next().unwrap_or_default();
         assert!(
             other.contains(&format!("workspace_id={other_workspace}")),
             "{other}"
         );
         assert!(!other.contains("project_id="), "{other}");
+    }
+
+    /// #493: a connection's `X-ContextStream-Project-Id` of another workspace,
+    /// or of a project that is gone, made every list answer "No … found" with
+    /// nothing saying why. A named project_id is left out with a note (#449);
+    /// the connection's now is too, and the read covers the whole workspace.
+    #[tokio::test]
+    async fn a_connection_project_outside_the_workspace_is_left_out_with_a_note() {
+        let foreign_project = "66666666-6666-6666-6666-666666666666";
+        let other_workspace = "77777777-7777-7777-7777-777777777777";
+        let (tool, server) = entity_tool_with_http_sequence(vec![
+            (
+                "200 OK",
+                serde_json::json!({"id": foreign_project, "name": "excalidraw",
+                                   "workspace_id": other_workspace}),
+            ),
+            (
+                "200 OK",
+                serde_json::json!({"items": [stored_ticket(false, SESSION_PROJECT_ID)], "total": 1}),
+            ),
+            ("404 Not Found", serde_json::json!({"error": "Project not found"})),
+            (
+                "200 OK",
+                serde_json::json!({"items": [stored_ticket(false, SESSION_PROJECT_ID)], "total": 1}),
+            ),
+        ])
+        .await;
+        let connection = |project: &str| mcp_types::AuthOverride {
+            api_key: Some("test-key".to_string()),
+            workspace_id: Some(Uuid::parse_str(WORKSPACE_ID).unwrap()),
+            project_id: Some(Uuid::parse_str(project).unwrap()),
+            ..Default::default()
+        };
+        let list = || tool.execute(serde_json::json!({"kind": "ticket", "action": "list"}));
+        let foreign = mcp_client::run_with_auth_override(connection(foreign_project), || async {
+            list().await.expect("list with another workspace's project")
+        })
+        .await;
+        let gone = mcp_client::run_with_auth_override(connection(SESSION_PROJECT_ID), || async {
+            list().await.expect("list with a project that is gone")
+        })
+        .await;
+
+        let text = result_text(&foreign);
+        assert!(
+            text.starts_with(&format!(
+                "This connection's project (X-ContextStream-Project-Id {foreign_project}) belongs to a different workspace and was ignored, so this covers the whole workspace."
+            )),
+            "{text}"
+        );
+        assert!(text.contains("Fix the hook"), "{text}");
+        let text = result_text(&gone);
+        assert!(
+            text.starts_with(&format!(
+                "This connection's project (X-ContextStream-Project-Id {SESSION_PROJECT_ID}) no longer exists and was ignored"
+            )),
+            "{text}"
+        );
+        let requests = server.await.expect("entity request server");
+        let lines: Vec<&str> = requests
+            .iter()
+            .map(|request| request.lines().next().unwrap_or_default())
+            .collect();
+        assert!(
+            lines[0].starts_with(&format!("GET /api/v1/projects/{foreign_project}")),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].starts_with(&format!("GET /api/v1/projects/{SESSION_PROJECT_ID}")),
+            "{lines:?}"
+        );
+        for list in [lines[1], lines[3]] {
+            assert!(list.starts_with("GET /api/v1/tickets?"), "{list}");
+            assert!(
+                list.contains(&format!("workspace_id={WORKSPACE_ID}")),
+                "{list}"
+            );
+            assert!(!list.contains("project_id="), "{list}");
+        }
     }
 
     /// #489: a reference by title fetched its candidates with `limit` (not an

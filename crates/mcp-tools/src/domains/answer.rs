@@ -497,6 +497,32 @@ fn build_request(input: AnswerInput) -> Result<AnswerRequestV1> {
             )))
         }
     };
+    // "This workspace" and "this project" name the client's current scope (client_context), which
+    // the API never takes from the requested selectors: a call that selected its one workspace
+    // (and project) still got "Which workspace should this answer use?" with no candidates
+    // (#388). A call that selects one workspace and at most one project, with the visibility
+    // those imply, is working there and says so, unless it names its current scope itself.
+    let named_current = (
+        parse_uuid(input.current_workspace_id, "current_workspace_id")?,
+        parse_uuid(input.current_project_id, "current_project_id")?,
+    );
+    let visibility_inferred = input
+        .visibility
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty();
+    let (current_workspace_id, current_project_id) = match named_current {
+        (None, None)
+            if visibility_inferred && workspace_ids.len() == 1 && project_ids.len() <= 1 =>
+        {
+            (
+                workspace_ids.iter().next().copied(),
+                project_ids.iter().next().copied(),
+            )
+        }
+        named => named,
+    };
     let response_mode = match input.response_mode.as_deref().map(str::trim) {
         None | Some("") if action == "recent_changes" => Some(AnswerResponseModeV1::Structured),
         None | Some("") => None,
@@ -567,8 +593,8 @@ fn build_request(input: AnswerInput) -> Result<AnswerRequestV1> {
         },
         client_context: AnswerPlanClientContextV1 {
             timezone,
-            current_workspace_id: parse_uuid(input.current_workspace_id, "current_workspace_id")?,
-            current_project_id: parse_uuid(input.current_project_id, "current_project_id")?,
+            current_workspace_id,
+            current_project_id,
         },
         response_mode,
         response_budget,
@@ -839,6 +865,86 @@ mod tests {
             error.to_string().contains("workspace_id must be a UUID"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn one_selected_workspace_and_project_are_the_current_scope_unless_named() {
+        // #388: "this workspace" and "this project" name the client's current scope, which the
+        // tool never filled from its selectors, so the API asked which one was meant and
+        // offered no candidates.
+        let workspace = Uuid::from_u128(21);
+        let other = Uuid::from_u128(22);
+        let project = Uuid::from_u128(23);
+        let wire = |args: &Value| {
+            serde_json::to_value(
+                build_request(serde_json::from_value(args.clone()).unwrap()).unwrap(),
+            )
+            .unwrap()
+        };
+
+        let one_workspace = wire(&json!({
+            "question": "summarize the recent decisions in this workspace",
+            "workspace_id": workspace.to_string(),
+        }));
+        assert_eq!(
+            one_workspace["client_context"]["current_workspace_id"],
+            json!(workspace)
+        );
+        assert_eq!(
+            one_workspace["client_context"]["current_project_id"],
+            Value::Null
+        );
+        assert_eq!(one_workspace["requested_scope"]["visibility"], "workspace");
+
+        let one_project = wire(&json!({
+            "question": "what is this project about?",
+            "scope_mode": "explicit",
+            "workspace_id": workspace.to_string(),
+            "project_id": project.to_string(),
+        }));
+        assert_eq!(
+            one_project["client_context"]["current_workspace_id"],
+            json!(workspace)
+        );
+        assert_eq!(
+            one_project["client_context"]["current_project_id"],
+            json!(project)
+        );
+        assert_eq!(one_project["requested_scope"]["visibility"], "project");
+
+        // Not one place, or a visibility the caller chose: nothing is assumed.
+        for args in [
+            json!({"question": "q"}),
+            json!({"question": "q", "project_id": project.to_string()}),
+            json!({"question": "q", "workspace_ids": [workspace.to_string(), other.to_string()]}),
+            json!({"question": "q", "workspace_id": workspace.to_string(),
+                   "project_ids": [project.to_string(), other.to_string()]}),
+            json!({"question": "q", "workspace_id": workspace.to_string(), "visibility": "account"}),
+        ] {
+            let request = wire(&args);
+            assert_eq!(
+                request["client_context"]["current_workspace_id"],
+                Value::Null,
+                "{args}"
+            );
+            assert_eq!(
+                request["client_context"]["current_project_id"],
+                Value::Null,
+                "{args}"
+            );
+        }
+
+        // A current scope the caller names is sent as named.
+        let named = wire(&json!({
+            "question": "q",
+            "workspace_id": workspace.to_string(),
+            "current_workspace_id": other.to_string(),
+        }));
+        assert_eq!(
+            named["client_context"]["current_workspace_id"],
+            json!(other)
+        );
+        assert_eq!(named["client_context"]["current_project_id"], Value::Null);
     }
 
     #[test]

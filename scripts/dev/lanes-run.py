@@ -30,7 +30,8 @@ the slot family. Only contextstream's --validate sends a verdict key, and only t
 Exit status: the command's, when a host ran it (or reused a passing verdict for exactly this key); 3 when the patch
 doesn't apply; 75 when no host ran it (depot-run then runs it on Namespace). --result gets
 {"ran", "run", "where": "lanes", "host", "base", "rc", "reused"}, and with no run "why" the last host passed it over:
-busy, unreachable, no-base (it lacked the base and took no bundle), too-big (the patch) or other (serve's 70 or 2).
+busy, not-ready (a host gap: a tool missing, its off switch), unreachable, no-base (it lacked the base and took no
+bundle), too-big (the patch) or other (serve's 70 or 2).
 
 Host keys are pinned (scripts/dev/lanes-known-hosts, StrictHostKeyChecking=yes); the key is the agents' serve key, forced
 on the host to serve, so it can do nothing but ask for a run.
@@ -104,6 +105,7 @@ class Run:
         self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
         self.report = None
         self.need = None
+        self.status = b""   # serve's last own line ("csvalidate: ..."): busy, or not ready and why
         self.printed = False
         threading.Thread(target=self.feed, args=(data,), daemon=True).start()
         self.timer = threading.Timer(guard_s, self.stop)
@@ -143,6 +145,8 @@ class Run:
                 except ValueError:
                     self.need = None
                 continue
+            if line.startswith(b"csvalidate: "):
+                self.status = line
             out.write(line)
             out.flush()
             self.printed = True
@@ -273,7 +277,7 @@ def main():
             return 3
         why = {75: "busy or not ready", 255: "unreachable", 70: "serve's own error", 2: "refused the request"}.get(
             rc, "ended with %d and no report" % rc)
-        why_not = {75: "busy", 255: "unreachable"}.get(rc, "other")
+        why_not = {75: "not-ready" if b"not ready" in run.status else "busy", 255: "unreachable"}.get(rc, "other")
         # 75 and 2: nothing ran (what came out is serve's own status line). Otherwise a run may have started and stopped.
         unfinished = run.printed and rc not in (75, 2)
         say("%s: %s%s" % (host, why, "; its output above is from a run that didn't finish" if unfinished else ""))

@@ -16,10 +16,19 @@
 # --arch arm64 runs on an arm64 instance (the release's linux-arm64 build). --cold runs without the cache volume (a clean room). --artifact keeps PATH (relative to the repository root; a file,
 # directory or glob) and brings it back. --print shows what would run.
 # The token is ~/.config/nsc/token.json (agentbox envs have it) or NSC_TOKEN_FILE; it is never printed.
+#
+# LANES (owner 2026-11-02: Namespace only for overflow and coflow): an amd64 run goes first to the agents' lane hosts in
+# the LANE_HOSTS line below (NS_RUN_LANES overrides it; off turns lanes off), through scripts/dev/lanes-run.py (the same
+# file as contextstream's): the same tree in the host's mcp-server slot (LANES_FAMILY, default rust). With no lanes key
+# (~/.config/lanes/key, DEPOT_RUN_LANES_KEY), --arch arm64, or no lane host free, it runs on Namespace, and the instance's
+# nsrun-lanes label says why (contextstream's scripts/dev/lanes-overflow counts them). OFF SWITCH: LANE_HOSTS="".
 # Exit status: 0 passed; 1 failed or timed out; 2 bad usage; 3 your changes did not apply to the merge base; 5 Namespace
 # refused the token; 6 the upload lock stayed held; 7 Namespace could not run it.
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# LANES: the agents' lane hosts, tried in order before Namespace. OFF SWITCH: make this LANE_HOSTS="" and push.
+# lat-lax2-f4-lanes-1 (Latitude f4-metal-small, Los Angeles; contextstream docs/runbooks/lane-host.md), proved 2026-11-02.
+LANE_HOSTS="lanes@64.34.88.9"
 cpus=16; timeout=45; label=""; cold=0; print_only=0; artifacts=(); arch=amd64
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -80,7 +89,27 @@ opts=(--base "$base" --patch "$ns/patch.diff" --cpus "$cpus" --timeout "$timeout
 opts+=(--arch "$arch")
 for a in ${artifacts[@]+"${artifacts[@]}"}; do opts+=(--artifact "$a"); done
 [[ $print_only -eq 0 ]] || opts+=(--print)
-echo "ns-run: on Namespace: base ${base:0:12} plus $(wc -c < "$ns/patch.diff" | tr -d ' ') bytes of patch" >&2
 rc=0
-python3 "$here/ns-run.py" "${opts[@]}" -- "$@" || rc=$?
+# LANES: a lane host first (amd64 only: the lane hosts are x86); a run it took is the verdict. No key, no host, arm64, or
+# none free: Namespace, labelled why.
+lanes_state=off
+lane_hosts=${NS_RUN_LANES-$LANE_HOSTS}
+[[ $lane_hosts != off ]] || lane_hosts=""
+[[ $arch == amd64 ]] || { lane_hosts=""; lanes_state=arm64; }
+lane_key=${DEPOT_RUN_LANES_KEY:-$HOME/.config/lanes/key}
+if [[ $print_only -eq 0 && -n "$lane_hosts" && -r "$lane_key" ]]; then
+  lopts=(--hosts "$lane_hosts" --key "$lane_key" --repo mcp-server --family "${LANES_FAMILY:-rust}" --base "$base"
+         --patch "$ns/patch.diff" --timeout "$timeout" --result "$ns/lanes.json")
+  [[ -z "$label" ]] || lopts+=(--label "$label")
+  [[ $cold -eq 0 ]] || lopts+=(--scratch-target --fresh)
+  for a in ${artifacts[@]+"${artifacts[@]}"}; do lopts+=(--artifact "$a"); done
+  python3 "$here/lanes-run.py" "${lopts[@]}" -- "$@" || rc=$?
+  if [[ $rc -ne 75 ]] || grep -q '"ran": true' "$ns/lanes.json" 2>/dev/null; then exit $rc; fi
+  lanes_state="overflow-$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("why") or "other")' "$ns/lanes.json" 2>/dev/null || echo other)"
+  rc=0
+  echo "ns-run: no lane host free: on Namespace instead" >&2
+fi
+[[ $print_only -eq 1 ]] || opts+=(--lanes-state "$lanes_state")
+echo "ns-run: on Namespace: base ${base:0:12} plus $(wc -c < "$ns/patch.diff" | tr -d ' ') bytes of patch" >&2
+python3 "${NS_RUN_PY:-$here/ns-run.py}" "${opts[@]}" -- "$@" || rc=$?
 exit $rc

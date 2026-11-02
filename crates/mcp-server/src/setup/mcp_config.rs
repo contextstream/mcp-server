@@ -5535,6 +5535,11 @@ mod tests {
 
     #[test]
     fn key_bearing_project_config_is_excluded_from_git_once() {
+        // git reads HOME and XDG_CONFIG_HOME (its global ignore), which other tests set for the whole process: hold the
+        // crate's env lock, or a concurrent test's home can make .mcp.json read as ignored and nothing is written.
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let repo = tempfile::tempdir().expect("repo");
         let git = |args: &[&str]| {
             std::process::Command::new("git")
@@ -5569,6 +5574,11 @@ mod tests {
 
     #[test]
     fn tracked_project_config_is_left_alone() {
+        // git reads HOME and XDG_CONFIG_HOME (its global ignore), which other tests set for the whole process: hold the
+        // crate's env lock, or a concurrent test's home can make .mcp.json read as ignored and nothing is written.
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let repo = tempfile::tempdir().expect("repo");
         let git = |args: &[&str]| {
             std::process::Command::new("git")

@@ -183,6 +183,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=90)
     ap.add_argument("--label", default="")
     ap.add_argument("--repo", default="mcp-server")
+    ap.add_argument("--lanes-state", default="",
+                    help="OVERFLOW count: why this agent run is on Namespace and not a lane (scripts/dev/ns-run; label nsrun-lanes)")
     ap.add_argument("--cold", action="store_true")
     ap.add_argument("--artifact", action="append", default=[])
     ap.add_argument("--print", dest="print_only", action="store_true")
@@ -311,7 +313,9 @@ def run(a, cmd, cpus, mem, nonce, tag, work, inst, destroy, end):
         "documentedPurpose": ("depot-run (namespace): " + (a.label or " ".join(cmd)))[:200],
         "deadline": deadline, "placement": ["continent:us"],
         "labels": [{"name": "nsrun" if a.kind == "agent" else "nsrun-release", "value": nonce},
-                   {"name": "nsrun-repo", "value": a.repo}] + (agent_labels(want_tree) if a.kind == "agent" else []),
+                   {"name": "nsrun-repo", "value": a.repo}] + (agent_labels(want_tree) if a.kind == "agent" else [])
+                  + ([{"name": "nsrun-lanes", "value": label_value(a.lanes_state)}]
+                     if a.kind == "agent" and a.lanes_state else []),
         "experimental": {"authorizedSshKeys": [open(key + ".pub").read().strip()]},
         "workloadPermissions": [{"resourceType": "tenant", "resourceId": "", "actions": ["get"]}]
                                + ([{"resourceType": "cache/httpcache", "resourceId": a.sccache_cache, "actions": ["ensure", "read", "write"]}]

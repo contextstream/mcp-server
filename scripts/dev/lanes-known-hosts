@@ -1,0 +1,4 @@
+# LANES (job 6): the lane hosts' SSH host keys, pinned (scripts/dev/lanes-run.py: StrictHostKeyChecking=yes).
+# One line per host in depot-run's LANE_HOSTS (docs/runbooks/lane-host.md). The Vultr trial host's is gone with it.
+# lat-lax2-f4-lanes-1 (Latitude sv_6B9VaL44Ra7vr), from upcloud-host 2026-11-02
+64.34.88.9 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBho53e/0kBJxSiLsX2+8VlzmzLyUTJgjTPIiCp6/52Y

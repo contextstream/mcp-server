@@ -520,25 +520,60 @@ async fn brand_work_that_does_not_fit_is_refused_before_anything_is_sent() {
 async fn result_names_the_files_and_their_library_item_without_links_by_default() {
     let (stub, _) = brand_stub("made").await;
     let tool = stub.tool();
-    let result = tool.execute(json!({"action": "result", "make_id": JOB})).await.unwrap();
+    let result = tool
+        .execute(json!({"action": "result", "make_id": JOB}))
+        .await
+        .unwrap();
     assert!(!result.is_error, "{}", text_of(&result));
     let text = text_of(&result);
-    assert!(text.contains("   Files (in your ContextStudio library as “"), "{text}");
-    assert!(text.contains("Download links are made on request and expire"), "{text}");
+    assert!(
+        text.contains("   Files (in your ContextStudio library as “"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Download links are made on request and expire"),
+        "{text}"
+    );
     for leak in ["http://", "https://", "X-Amz", "links valid", "Link (valid"] {
         assert!(!text.contains(leak), "{leak} in {text}");
     }
     let shape = serde_json::to_string(&structured(&result)).unwrap();
-    for leak in ["http://", "https://", "X-Amz", "\"url\"", "url_expires_in_seconds", "expires_in_seconds"] {
+    for leak in [
+        "http://",
+        "https://",
+        "X-Amz",
+        "\"url\"",
+        "url_expires_in_seconds",
+        "expires_in_seconds",
+    ] {
         assert!(!shape.contains(leak), "{leak} in {shape}");
     }
-    assert!(!result.content.iter().any(|item| matches!(item, ContentItem::ResourceLink { .. })));
+    assert!(!result
+        .content
+        .iter()
+        .any(|item| matches!(item, ContentItem::ResourceLink { .. })));
     // No link was even made.
-    assert!(!stub.requests().iter().any(|r| r.path.ends_with("/download-url")), "a link was signed");
+    assert!(
+        !stub
+            .requests()
+            .iter()
+            .any(|r| r.path.ends_with("/download-url")),
+        "a link was signed"
+    );
     // On request, today's links.
-    let linked = tool.execute(json!({"action": "result", "make_id": JOB, "links": true})).await.unwrap();
-    assert!(text_of(&linked).contains("   Files (links valid about 15 minutes):"), "{}", text_of(&linked));
-    assert!(linked.content.iter().any(|item| matches!(item, ContentItem::ResourceLink { .. })));
+    let linked = tool
+        .execute(json!({"action": "result", "make_id": JOB, "links": true}))
+        .await
+        .unwrap();
+    assert!(
+        text_of(&linked).contains("   Files (links valid about 15 minutes):"),
+        "{}",
+        text_of(&linked)
+    );
+    assert!(linked
+        .content
+        .iter()
+        .any(|item| matches!(item, ContentItem::ResourceLink { .. })));
 }
 
 #[tokio::test]

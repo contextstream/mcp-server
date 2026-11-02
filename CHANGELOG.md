@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.57
+
+- Studio: `result` no longer puts signed download links in what the agent sees. By default it names each made file by its kind and size under its ContextStudio library item and id, says that download links are made on request, and signs no link: the text and the structured result carry no URL, no `url` or expiry fields and no ResourceLink. `links: true`, for when the person asks for a download link, returns the result as before. The inline image is unchanged (#495).
+- Ids: tools take the start of a record's id (8 or more hex characters), as reports quote them. A read or an edit opens the one record of the caller's own whose id starts with it; a removal, or several matches, needs the whole id, and a not-found error lists the whole ids it could be. This covers `get_plan`, `memory` doc and task lookups, `entity` get and update, lesson updates and `coordination` get, ack, reply and dismiss.
+- `coordination`: `inbox` accepts `limit` sent as a string (`"6"`). On the hosted gateway a share names the caller's session (the `session_id` already passed to `context` or `init`), so replies to it reach that session. A refused reply says to ack the notice and answer the sender with `share(to=<their agent name>)`.
+
 ## 1.0.56
 
 - Billing: a request the API refuses with `402 PAYMENT_REQUIRED` (a subscription past due beyond its grace period) now answers `[ERROR] Payment required:` with the API's own message and a link to manage billing. Before, every 402 read as "[CREDITS_EXHAUSTED] You've run out of credits" with upgrade paths, even for a subscriber on the top plan. Other 402s are unchanged.

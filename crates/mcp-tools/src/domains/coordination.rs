@@ -72,10 +72,13 @@ const SCOPE_DEFAULTED_ACTIONS: &[&str] = &[
     "check_in", "inbox", "list", "share", "settings", "get", "ack", "reply", "dismiss",
 ];
 
+/// Fill the scope a call left out from the session's. Returns true when the
+/// session's project was not borrowed because the call names another
+/// workspace than the session's.
 fn fill_scope_defaults(
     input: &mut CoordinationInput,
     (workspace, project): (Option<Uuid>, Option<Uuid>),
-) {
+) -> bool {
     let explicit_ws = input
         .workspace_id
         .as_deref()
@@ -90,12 +93,14 @@ fn fill_scope_defaults(
         Ok(named) => Some(named) != workspace,
         Err(_) => true,
     });
-    if explicit_ws.is_none() {
+    let (gave_workspace, gave_project) = (explicit_ws.is_some(), explicit_proj.is_some());
+    if !gave_workspace {
         input.workspace_id = workspace.map(|id| id.to_string());
     }
-    if explicit_proj.is_none() && !names_another_workspace {
+    if !gave_project && !names_another_workspace {
         input.project_id = project.map(|id| id.to_string());
     }
+    !gave_project && names_another_workspace && project.is_some()
 }
 
 pub struct CoordinationTool {
@@ -200,10 +205,11 @@ impl ToolHandler for CoordinationTool {
         let mut input: CoordinationInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
         let action = input.action.to_lowercase();
+        let mut project_not_borrowed = false;
         if SCOPE_DEFAULTED_ACTIONS.contains(&action.as_str()) {
             let defaults =
                 super::scope::read_scope_defaults(&self.client, self.session.as_deref()).await;
-            fill_scope_defaults(&mut input, defaults);
+            project_not_borrowed = fill_scope_defaults(&mut input, defaults);
         }
         let workspace_id = Self::parse_uuid(&input.workspace_id, "workspace_id")?;
         let project_id = Self::parse_uuid(&input.project_id, "project_id")?;
@@ -296,11 +302,18 @@ impl ToolHandler for CoordinationTool {
                             .into(),
                     )
                 })?;
+                // The session's project is used when the call names none; with
+                // none to use, say why and what to pass. "Call init first"
+                // misled agents whose init was in another session: hosted
+                // connections keep scope per session, and every share they
+                // sent afterwards failed (coordination/share missing
+                // project_id, 2026-11-02).
                 let project_id = project_id.ok_or_else(|| {
-                    Error::Validation(
-                        "project_id is required for action=\"share\" (pass project_id explicitly or call init(...) first)"
-                            .into(),
-                    )
+                    Error::Validation(if project_not_borrowed {
+                        "project_id is required for action=\"share\": the workspace_id you passed is not this session's, so this session's project isn't used. Pass the project_id the share is about.".to_string()
+                    } else {
+                        "project_id is required for action=\"share\": this session has no project (scope lasts only within the session that called init). Pass the project_id the share is about, or call init with folder_path in this session.".to_string()
+                    })
                 })?;
                 let mut body = serde_json::json!({
                     "title": title,
@@ -995,6 +1008,10 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("origin_project_id"), "{msg}");
+        // It says why: this session has no project. "Call init first" misled
+        // agents whose init was in another session (2026-11-02).
+        assert!(msg.contains("this session has no project"), "{msg}");
+        assert!(!msg.contains("call init(...) first"), "{msg}");
 
         // Session scope in Workspace A is not borrowed when caller names Workspace B without project_id.
         let other_ws = Uuid::new_v4();
@@ -1017,6 +1034,8 @@ mod tests {
             msg.contains("project_id is required for action=\"share\""),
             "{msg}"
         );
+        // And here why the session's project isn't used.
+        assert!(msg.contains("is not this session's"), "{msg}");
     }
 
     #[tokio::test]

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.59
+
+- Hosted gateway: a session served by mcp.contextstream.io is never told to update the MCP (no `[VERSION_NOTICE]` or `[VERSION]` line from `init`, `context` or setup), since a hosted user has no binary to update. When the gateway itself is behind the latest release, it logs one warning per newer version for its operators instead. A server you run yourself (stdio or local) still tells you when a newer version is out.
+
 ## 1.0.58
 
 - `instruct`: a call without `session_id` reads this connection's own session (the one `init` or `context` started). With no session yet, the error says to pass the `session_id` that `init` or `context` returned. `session_id` is no longer required in the schema.

@@ -7,12 +7,13 @@
 # gate.sh expects) in mcp-gate-target-<part>, so later releases build warm.
 #
 #   scripts/release/gate-on-box.sh rust|checks      exit: gate.sh's
+#   scripts/release/gate-on-box.sh --image          only make sure the image exists; print its tag (build-on-box.sh)
 set -euo pipefail
-part=${1:?rust or checks}
-case "$part" in rust|checks) ;; *) echo "gate-on-box: unknown part $part" >&2; exit 2 ;; esac
+part=${1:?rust, checks or --image}
+case "$part" in rust|checks|--image) ;; *) echo "gate-on-box: unknown part $part" >&2; exit 2 ;; esac
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$root"
-say() { echo "gate-on-box: $*"; }
+say() { echo "gate-on-box: $*" >&2; }
 channel=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)
 [[ "$channel" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { say "rust-toolchain.toml names no channel"; exit 2; }
 tag="mcp-gate:$( (cat scripts/release/gate.Dockerfile; echo "$channel") | sha256sum | cut -c1-16)"
@@ -23,10 +24,11 @@ else
   say "building $tag on the box (Rust $channel)"
   context=$(mktemp -d)
   docker buildx build --builder default --load --progress=plain -t "$tag" --build-arg "RUST_CHANNEL=$channel" \
-    -f scripts/release/gate.Dockerfile "$context" 2>&1 | tail -n 20
+    -f scripts/release/gate.Dockerfile "$context" 2>&1 | tail -n 20 >&2
   rm -rf "$context"
   say "image built in $(( $(date +%s) - started )) s"
 fi
+if [ "$part" = --image ]; then echo "$tag"; exit 0; fi
 work=$(mktemp -d "${RUNNER_TEMP:-/tmp}/mcp-gate.XXXXXX")
 cleanup() {
   docker run --rm --user 0 -v "$work:/w" "$tag" chown -R "$(id -u):$(id -g)" /w >/dev/null 2>&1 || true

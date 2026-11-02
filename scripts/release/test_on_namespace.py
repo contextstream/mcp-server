@@ -124,17 +124,23 @@ class WorkflowOnCsrunTests(unittest.TestCase):
     def test_on_csrun_the_gate_runs_on_the_box_and_the_builds_run_only_their_namespace_step(self):
         # The gate runs on the self-hosted box (scripts/release/gate-on-box.sh), with no Namespace token; the builds still
         # run on Namespace.
-        for name, suffix, script, env in (("gate", "on the box", "scripts/release/gate-on-box.sh", None),
-                                          ("build", "on Namespace", "scripts/release/on-namespace.sh",
-                                           {"REPOS_NAMESPACE_TOKEN": "${{ secrets.REPOS_NAMESPACE_TOKEN }}"})):
+        arm = "matrix.artifact == 'contextstream-mcp-linux-arm64'"
+        for name, suffix, script, env, when in (
+                ("gate", "on the box", "scripts/release/gate-on-box.sh", None, "needs.plan.outputs.runner == 'csrun'"),
+                ("build", "on the box", "scripts/release/build-on-box.sh", {"SOURCE_DATE_EPOCH": "${{ needs.plan.outputs.epoch }}"},
+                 "needs.plan.outputs.runner == 'csrun' && matrix.artifact != 'contextstream-mcp-linux-arm64'"),
+                ("build", "on Namespace", "scripts/release/on-namespace.sh",
+                 {"REPOS_NAMESPACE_TOKEN": "${{ secrets.REPOS_NAMESPACE_TOKEN }}"}, "needs.plan.outputs.runner == 'csrun' && " + arm)):
             steps = self.jobs[name]["steps"]
             own = [step for step in steps if step["name"].endswith(suffix)]
             self.assertEqual(len(own), 1, name)
-            self.assertEqual(own[0]["if"], "needs.plan.outputs.runner == 'csrun'")
+            self.assertEqual(own[0]["if"], when)
             self.assertIn(script, own[0]["run"])
             self.assertEqual(own[0].get("env"), env)
+            csrun_steps = [step for step in steps if "needs.plan.outputs.runner == 'csrun'" in step.get("if", "")
+                           and not step["name"].startswith(("Check out", "Upload"))]
             for step in steps:
-                if step is own[0] or step["name"].startswith(("Check out", "Upload")):
+                if step in csrun_steps or step["name"].startswith(("Check out", "Upload")):
                     continue
                 with self.subTest(job=name, step=step["name"]):
                     self.assertIn("needs.plan.outputs.runner != 'csrun'", step.get("if", ""))
@@ -152,8 +158,10 @@ class WorkflowOnCsrunTests(unittest.TestCase):
             self.assertEqual(depot["with"], csrun["with"])
         build = next(step for step in self.jobs["build"]["steps"] if step["name"].endswith("on Namespace"))["run"]
         for piece in ('--artifact "out/${{ matrix.artifact }}"', "SOURCE_DATE_EPOCH=${{ needs.plan.outputs.epoch }}",
-                      "'contextstream-mcp-linux-arm64' && 'arm64' || 'amd64'"):
+                      "--arch arm64"):
             self.assertIn(piece, build)
+        box = next(step for step in self.jobs["build"]["steps"] if step["name"].endswith("on the box"))["run"]
+        self.assertEqual(box, 'bash scripts/release/build-on-box.sh "${{ matrix.artifact }}" "${{ needs.plan.outputs.version }}"')
 
 
 if __name__ == "__main__":

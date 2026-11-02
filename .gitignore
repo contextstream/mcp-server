@@ -40,3 +40,6 @@ __pycache__/
 
 # Depot agent runs (scripts/dev/depot-run writes one-off workflows here)
 .depot/agent-runs/
+
+# scripts/dev/ns-run brings artifacts back here (one folder per Namespace instance).
+.depot-run-artifacts/

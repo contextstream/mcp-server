@@ -8234,11 +8234,11 @@ fn a_lessons_page_from_a_full_scan_says_at_least_and_where_it_is() {
 
 #[tokio::test]
 async fn get_plan_opens_a_plan_by_the_start_of_its_id() {
-    // Reports quote plans by 8 characters ("plan 8618fff9"); get_plan answered
+    // Reports quote plans by their first 8 characters (77777777); get_plan answered
     // "Invalid plan_id" (15 times in a day, 2026-11-01).
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    const PLAN: &str = "8618fff9-0b2a-4c3d-9e00-000000000001";
-    const OTHER: &str = "11111111-0b2a-4c3d-9e00-000000000002";
+    const PLAN: &str = "77777777-7777-4777-8777-777777777777";
+    const OTHER: &str = "66666666-6666-4666-8666-666666666666";
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -8274,7 +8274,7 @@ async fn get_plan_opens_a_plan_by_the_start_of_its_id() {
     });
     let tool = GetPlanTool::new(ContextStreamClient::new(config));
     let result = tool
-        .execute(json!({"plan_id": "8618fff9", "workspace_id": TestFixtures::workspace_id()}))
+        .execute(json!({"plan_id": "77777777", "workspace_id": TestFixtures::workspace_id()}))
         .await
         .expect("the plan opens");
     assert!(!result.is_error, "{result:?}");
@@ -8287,7 +8287,7 @@ async fn get_plan_opens_a_plan_by_the_start_of_its_id() {
     assert!(
         !lines
             .iter()
-            .any(|l| l.contains("8618fff9&") || l.ends_with("8618fff9 HTTP/1.1")),
+            .any(|l| l.contains("77777777&") || l.ends_with("77777777 HTTP/1.1")),
         "{lines:?}"
     );
 }

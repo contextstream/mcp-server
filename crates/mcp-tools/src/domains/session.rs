@@ -15852,7 +15852,7 @@ impl ToolHandler for GetPlanTool {
         let input: GetPlanInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
 
-        // A plan_id that is the start of an id (as agents quote plans: 7c3281fb)
+        // A plan_id that is the start of an id (as agents quote plans: 550e8400)
         // is looked up among the caller's plans; anything else that isn't a
         // whole UUID is refused, saying what to pass.
         let plan_ref = input

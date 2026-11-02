@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Run a build or test command on a Namespace instance, on this checkout's tree: the merge base with origin/main plus
+# your changes (commits, edits and new untracked files). Its output streams here and its exit status is the verdict.
+# mcp-server's copy of contextcode's scripts/dev/ns-run, the Namespace half of
+# contextstream's scripts/dev/depot-run; the instance, the cache volume and the tree checks are scripts/dev/ns-run.py and
+# scripts/dev/ns-runner.sh.
+#
+#   scripts/dev/ns-run [--cpus N] [--timeout MIN] [--label TEXT] [--cold] [--artifact PATH]... [--print] -- <command...>
+#
+#   scripts/dev/ns-run --cpus 32 -- bash scripts/release/gate.sh rust
+#   scripts/dev/ns-run -- bash scripts/release/gate.sh checks
+#   scripts/dev/ns-run --artifact out/contextstream-mcp-linux-x64 -- bash scripts/release/build.sh contextstream-mcp-linux-x64 1.0.57
+#
+# The command runs from the repository root as uid 1001, with rust-toolchain.toml's Rust, Node 22, docker and sudo.
+# --cpus picks the shape: 4, 8, 16 (the default), 32 or 64 (which runs as 32). --timeout is in minutes (default 45).
+# --arch arm64 runs on an arm64 instance (the release's linux-arm64 build). --cold runs without the cache volume (a clean room). --artifact keeps PATH (relative to the repository root; a file,
+# directory or glob) and brings it back. --print shows what would run.
+# The token is ~/.config/nsc/token.json (agentbox envs have it) or NSC_TOKEN_FILE; it is never printed.
+# Exit status: 0 passed; 1 failed or timed out; 2 bad usage; 3 your changes did not apply to the merge base; 5 Namespace
+# refused the token; 6 the upload lock stayed held; 7 Namespace could not run it.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cpus=16; timeout=45; label=""; cold=0; print_only=0; artifacts=(); arch=amd64
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cpus) cpus=${2:?--cpus needs a number}; shift 2 ;;
+    --timeout) timeout=${2:?--timeout needs minutes}; shift 2 ;;
+    --label) label=${2:?--label needs text}; shift 2 ;;
+    --cold) cold=1; shift ;;
+    --arch) arch=${2:?--arch needs amd64 or arm64}; shift 2 ;;
+    --artifact) artifacts+=("${2:?--artifact needs a path}"); shift 2 ;;
+    --print) print_only=1; shift ;;
+    -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+    --) shift; break ;;
+    *) echo "ns-run: unknown option $1 (usage: scripts/dev/ns-run [opts] -- <command...>)" >&2; exit 2 ;;
+  esac
+done
+[[ $# -gt 0 ]] || { echo "ns-run: no command given (usage: scripts/dev/ns-run [opts] -- <command...>)" >&2; exit 2; }
+case "$cpus" in 4|8|16|32|64) ;; *) echo "ns-run: --cpus must be 4, 8, 16, 32 or 64" >&2; exit 2 ;; esac
+[[ "$timeout" =~ ^[0-9]+$ ]] || { echo "ns-run: --timeout must be a number of minutes" >&2; exit 2; }
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+base=$(git merge-base HEAD origin/main 2>/dev/null || true)
+[[ -n "$base" ]] || { echo "ns-run: no merge base with origin/main (git fetch origin main)" >&2; exit 2; }
+
+# ONE UPLOAD AT A TIME per checkout: invocations in the same checkout share its index, and one's marking of new files
+# could race another's. From marking new files to the patch being made, an invocation holds a lock directory in this
+# checkout's git dir; a lock left by a process that is gone is taken over.
+lock_dir="$(git rev-parse --absolute-git-dir)/ns-run.lock"
+lock_held=0
+take_lock() {
+  local waited=0 owner
+  until mkdir "$lock_dir" 2>/dev/null; do
+    owner=$(cat "$lock_dir/pid" 2>/dev/null || true)
+    if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then rm -rf "$lock_dir"; continue; fi
+    if [[ $waited -eq 0 ]]; then echo "ns-run: another ns-run in this checkout is making its patch; waiting for it" >&2; fi
+    sleep 0.5; waited=$((waited + 1))
+    if [[ $waited -ge 1200 ]]; then echo "ns-run: the lock $lock_dir is still held after 10 minutes" >&2; exit 6; fi
+  done
+  echo $$ > "$lock_dir/pid"; lock_held=1
+}
+drop_lock() { [[ $lock_held -eq 1 ]] || return 0; rm -rf "$lock_dir"; lock_held=0; }
+
+# The patch: git diff --binary from the merge base (commits, edits and new untracked files, marked intent-to-add only
+# while the diff is made).
+ns=$(mktemp -d)
+new_files=()
+trap '[[ ${#new_files[@]} -eq 0 ]] || git reset -q -- "${new_files[@]}" 2>/dev/null || true; drop_lock; rm -rf "$ns"' EXIT
+take_lock
+while IFS= read -r -d '' f; do new_files+=("$f"); done < <(git ls-files -z --others --exclude-standard)
+[[ ${#new_files[@]} -eq 0 ]] || git add -N -- "${new_files[@]}"
+git diff --binary "$base" > "$ns/patch.diff"
+[[ ${#new_files[@]} -eq 0 ]] || git reset -q -- "${new_files[@]}"
+new_files=()
+drop_lock
+
+opts=(--base "$base" --patch "$ns/patch.diff" --cpus "$cpus" --timeout "$timeout" --repo mcp-server --result "$ns/result.json")
+[[ -z "$label" ]] || opts+=(--label "$label")
+[[ $cold -eq 0 ]] || opts+=(--cold)
+opts+=(--arch "$arch")
+for a in ${artifacts[@]+"${artifacts[@]}"}; do opts+=(--artifact "$a"); done
+[[ $print_only -eq 0 ]] || opts+=(--print)
+echo "ns-run: on Namespace: base ${base:0:12} plus $(wc -c < "$ns/patch.diff" | tr -d ' ') bytes of patch" >&2
+rc=0
+python3 "$here/ns-run.py" "${opts[@]}" -- "$@" || rc=$?
+exit $rc

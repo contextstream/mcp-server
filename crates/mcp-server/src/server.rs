@@ -3267,7 +3267,7 @@ mod tests {
             // Coordination v2: action=reply with `message`, and `metadata`
             // (git branch/commit) on check_in as judge evidence.
             "coordination",
-            "e2d3e012ea534f68d5064054920b3f0f1ce6383745002a2d164ab63e55c0fda8",
+            "5f7a6c7923d67648079eeb3b5b70f0863b97f533821b66528a30729de4b6cafc",
         ),
         (
             // #335 review: `studio.email_contact_erase` (with `email`) joined

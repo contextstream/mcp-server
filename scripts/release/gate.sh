@@ -51,7 +51,7 @@ case "$part" in
       step "$t" python3 ".github/scripts/$t.py"
     done
     step release_scripts python3 -m unittest discover -s scripts/release -p 'test_*.py'
-    step release_shell bash -n scripts/release/build.sh scripts/release/gate.sh
+    step release_shell bash -n scripts/release/build.sh scripts/release/gate.sh scripts/release/on-namespace.sh
     step adoption_tests bash -c 'cd testing/adoption && python3 -m unittest discover -s . -p "test_*.py"'
     for t in testing/grounding/test_*.py; do
       step "grounding_$(basename "$t" .py)" bash -c "cd testing/grounding && python3 $(basename "$t")"

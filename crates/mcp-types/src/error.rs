@@ -77,6 +77,12 @@ pub enum Error {
         available: Option<i32>,
     },
 
+    /// The API refused the call for payment (HTTP 402 with the code
+    /// `PAYMENT_REQUIRED`), e.g. a subscription past due beyond its grace
+    /// period. Not a credit balance: never answered as "out of credits".
+    #[error("Payment required: {message}")]
+    PaymentRequired { message: String },
+
     /// Feature not available on current plan
     #[error("Feature not available: {0}")]
     PlanRestriction(String),
@@ -176,6 +182,7 @@ impl Error {
             Self::Io(_) => ErrorCode::InternalError,
             Self::RateLimited { .. } => ErrorCode::RateLimited,
             Self::InsufficientCredits { .. } => ErrorCode::PaymentRequired,
+            Self::PaymentRequired { .. } => ErrorCode::PaymentRequired,
             Self::PlanRestriction(_) => ErrorCode::Forbidden,
             Self::IntegrationNotConnected(_) => ErrorCode::NotFound,
             Self::Cancelled => ErrorCode::NetworkError,
@@ -223,7 +230,8 @@ impl Error {
             | Self::PlanRestriction(message)
             | Self::IntegrationNotConnected(message)
             | Self::RateLimited { message, .. }
-            | Self::InsufficientCredits { message, .. } => message.as_str(),
+            | Self::InsufficientCredits { message, .. }
+            | Self::PaymentRequired { message } => message.as_str(),
             Self::MissingCredentials
             | Self::Serialization(_)
             | Self::InvalidUuid(_)

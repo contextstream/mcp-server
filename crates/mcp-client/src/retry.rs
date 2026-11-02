@@ -103,7 +103,9 @@ pub enum IngestFailure {
 impl IngestFailure {
     pub fn classify(error: &Error) -> Self {
         match error {
-            Error::Http { status: 403, .. } | Error::PlanRestriction(_) => Self::Denied,
+            Error::Http { status: 403, .. }
+            | Error::PlanRestriction(_)
+            | Error::PaymentRequired { .. } => Self::Denied,
             Error::Http { status: 401, .. } | Error::MissingCredentials => Self::Unauthorized,
             Error::RateLimited { retry_after, .. } => Self::RateLimited {
                 retry_after: *retry_after,
@@ -207,6 +209,12 @@ mod tests {
 
     #[test]
     fn a_credit_refusal_halts_the_project_and_is_not_retried_as_transient() {
+        assert_eq!(
+            IngestFailure::classify(&Error::PaymentRequired {
+                message: "Your subscription payment is past due.".to_string()
+            }),
+            IngestFailure::Denied
+        );
         let refused = Error::InsufficientCredits {
             message: "You've run out of credits.".into(),
             required: Some(20),

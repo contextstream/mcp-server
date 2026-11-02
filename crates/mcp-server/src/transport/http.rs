@@ -2584,6 +2584,14 @@ tokio::task_local! {
 /// The class of a tool's error: its reason when the tool gave one, else from
 /// its text (#490).
 fn typed_tool_error_class(err: &mcp_types::Error) -> String {
+    // Billing and credential refusals carry free text that matched no prefix
+    // and read as "other" (a past-due subscriber's refusals, 2026-11-01).
+    match err {
+        mcp_types::Error::PaymentRequired { .. } => return "payment_required".to_string(),
+        mcp_types::Error::InsufficientCredits { .. } => return "credits_exhausted".to_string(),
+        mcp_types::Error::MissingCredentials => return "missing_credentials".to_string(),
+        _ => {}
+    }
     match err.validation_reason() {
         Some(reason) => format!("validation:{}", reason.as_str()),
         None => tool_error_class(&err.to_string()),
@@ -2648,6 +2656,8 @@ fn tool_error_class(message: &str) -> String {
         ("Invalid UUID", "invalid_uuid"),
         ("IO error", "io"),
         ("Rate limited", "rate_limited"),
+        ("Payment required", "payment_required"),
+        ("Missing credentials", "missing_credentials"),
         ("Feature not available", "feature_unavailable"),
         ("Integration not connected", "integration_not_connected"),
         ("Request cancelled", "cancelled"),
@@ -8468,6 +8478,53 @@ mod tool_call_error_tests {
         let api = mcp_types::Error::http(404, "Not Found");
         let response = tool_call_error_response(api, false, None, "◎").expect("a tool result");
         assert_eq!(response["isError"], true);
+    }
+
+    #[test]
+    fn billing_and_credential_refusals_have_their_own_classes() {
+        let credits = mcp_types::Error::InsufficientCredits {
+            message: "You've run out of credits.".to_string(),
+            required: Some(20),
+            available: Some(3),
+        };
+        assert_eq!(typed_tool_error_class(&credits), "credits_exhausted");
+        assert_eq!(
+            typed_tool_error_class(&mcp_types::Error::MissingCredentials),
+            "missing_credentials"
+        );
+        let past_due = mcp_types::Error::PaymentRequired {
+            message: "Your subscription payment is past due.".to_string(),
+        };
+        assert_eq!(typed_tool_error_class(&past_due), "payment_required");
+        // The class of a JSON-RPC error read from its text agrees.
+        assert_eq!(tool_error_class(&past_due.to_string()), "payment_required");
+        assert_eq!(
+            tool_error_class(&mcp_types::Error::MissingCredentials.to_string()),
+            "missing_credentials"
+        );
+    }
+
+    #[test]
+    fn a_payment_refusal_is_answered_with_its_message_not_as_out_of_credits() {
+        let past_due = mcp_types::Error::PaymentRequired {
+            message: "Your subscription payment is past due. Please update your payment method \
+                      to continue using premium features.\n\nManage billing: \
+                      https://contextstream.io/account/billing"
+                .to_string(),
+        };
+        let response = tool_call_error_response(past_due, false, None, "◎").expect("a tool result");
+        assert_eq!(response["isError"], true);
+        let text = response["content"][0]["text"].as_str().expect("text");
+        assert!(
+            text.contains("Your subscription payment is past due."),
+            "{text}"
+        );
+        assert!(
+            text.contains("https://contextstream.io/account/billing"),
+            "{text}"
+        );
+        assert!(!text.contains("CREDITS_EXHAUSTED"), "{text}");
+        assert!(!text.contains("run out of credits"), "{text}");
     }
 
     #[test]

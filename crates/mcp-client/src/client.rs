@@ -5337,7 +5337,7 @@ impl ContextStreamClient {
             let text = String::from_utf8_lossy(&body_bytes);
             sanitize_http_error_body(status, &content_type, &text)
         };
-        let _code = extract_error_code(&body);
+        let code = extract_error_code(&body);
         if mcp_types::is_non_blocking_parser_error_message(&message) {
             warn!(
                 status,
@@ -5361,6 +5361,9 @@ impl ContextStreamClient {
 
         if status == 402 {
             let details = body.get("error").and_then(|e| e.get("details"));
+            if code.as_deref() == Some("PAYMENT_REQUIRED") {
+                return Self::payment_required_error(message, details);
+            }
             let required = details
                 .and_then(|d| d.get("required"))
                 .and_then(|v| v.as_i64())
@@ -5374,6 +5377,21 @@ impl ContextStreamClient {
         }
 
         Error::http_with_code(status, message, ErrorCode::from_status(status))
+    }
+
+    /// The error for a payment refusal (HTTP 402 with the code
+    /// `PAYMENT_REQUIRED`: a subscription past due beyond its grace period):
+    /// the API's own message and where to settle it. It is not a credit
+    /// balance, so it carries no credit or upgrade advice.
+    fn payment_required_error(message: String, details: Option<&serde_json::Value>) -> Error {
+        let billing_url = details
+            .and_then(|d| d.get("billing_url"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|url| url.starts_with("https://"))
+            .unwrap_or("https://contextstream.io/account/billing");
+        Error::PaymentRequired {
+            message: format!("{message}\n\nManage billing: {billing_url}"),
+        }
     }
 
     /// The error for a credit refusal (HTTP 402, or a queued ingest job that
@@ -24882,6 +24900,39 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(server.await.expect("server"), 1, "no in-request retry");
+    }
+
+    #[tokio::test]
+    async fn a_past_due_refusal_says_the_payment_is_past_due_not_out_of_credits() {
+        // A subscription past due beyond its grace answers 402 PAYMENT_REQUIRED.
+        // It was told "You've run out of credits" with upgrade paths, even on
+        // Elite, and the API's own message was dropped.
+        let (client, server) = client_with_raw_responses(
+            vec![raw_response(
+                "402 Payment Required",
+                "",
+                r#"{"success":false,"error":{"code":"PAYMENT_REQUIRED","message":"Your subscription payment is past due. Please update your payment method to continue using premium features.","details":{"pricing_url":"https://contextstream.io/pricing","billing_url":"https://contextstream.io/account/billing","help":"Upgrade your plan to continue using ContextStream."}}}"#,
+            )],
+            Duration::from_millis(2_500),
+        )
+        .await;
+        let error = client
+            .post::<serde_json::Value, _>("/session/init", serde_json::json!({}))
+            .await
+            .expect_err("402 must surface");
+        let text = error.user_facing_message();
+        assert!(
+            text.contains("Your subscription payment is past due."),
+            "{text}"
+        );
+        assert!(
+            text.contains("https://contextstream.io/account/billing"),
+            "{text}"
+        );
+        for wrong in ["run out of credits", "Purchase credits", "upgrade", "Elite"] {
+            assert!(!text.contains(wrong), "{wrong:?} in {text}");
+        }
+        assert_eq!(server.await.expect("server"), 1, "not retried");
     }
 
     fn out_of_credits_body() -> &'static str {

@@ -1125,7 +1125,10 @@ pub async fn context_block(
 /// a limit): nothing ran, and suggestions stop for a while.
 pub fn is_refusal(error: &Error) -> bool {
     matches!(error, Error::Http { status, .. } if (400..500).contains(status))
-        || matches!(error, Error::InsufficientCredits { .. })
+        || matches!(
+            error,
+            Error::InsufficientCredits { .. } | Error::PaymentRequired { .. }
+        )
 }
 
 #[cfg(test)]

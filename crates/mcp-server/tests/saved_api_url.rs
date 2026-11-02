@@ -254,9 +254,33 @@ fn install_release_like_binary(home: &Path) -> PathBuf {
     let dest = bin_dir.join("contextstream-mcp");
     let src = PathBuf::from(env!("CARGO_BIN_EXE_contextstream-mcp"));
     if std::fs::hard_link(&src, &dest).is_err() {
-        std::fs::copy(&src, &dest).expect("copy binary");
+        copy_binary_outside_this_process(&src, &dest);
     }
     dest
+}
+
+/// The copy `install_release_like_binary` falls back to when it cannot hard-link (the target dir and HOME on different
+/// filesystems, as on a Namespace runner). It runs in a child process (`cp`), so no descriptor writing the binary is ever
+/// open in this test process, where another test's fork could inherit it for a moment and make the exec of the copy fail
+/// with "Text file busy" (ETXTBSY).
+#[cfg(unix)]
+fn copy_binary_outside_this_process(src: &std::path::Path, dest: &std::path::Path) {
+    let status = std::process::Command::new("cp")
+        .arg(src)
+        .arg(dest)
+        .status()
+        .expect("run cp");
+    assert!(
+        status.success(),
+        "cp {} {}: {status}",
+        src.display(),
+        dest.display()
+    );
+}
+
+#[cfg(not(unix))]
+fn copy_binary_outside_this_process(src: &std::path::Path, dest: &std::path::Path) {
+    std::fs::copy(src, dest).expect("copy binary");
 }
 
 fn run_cli(bin: &Path, home: &Path, cwd: &Path, args: &[&str]) -> Output {

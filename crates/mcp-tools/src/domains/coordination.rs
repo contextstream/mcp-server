@@ -1202,7 +1202,7 @@ mod short_id_tests {
         tokio::spawn(async move {
             let mut lines = Vec::new();
             while let Ok(Ok((mut socket, _))) =
-                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
             {
                 let mut buffer = vec![0u8; 16 * 1024];
                 let read = socket.read(&mut buffer).await.expect("read request");

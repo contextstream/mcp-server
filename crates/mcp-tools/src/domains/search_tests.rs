@@ -641,12 +641,13 @@ mod guided_search_tests {
             query_time_ms: Some(2),
             ..Default::default()
         };
+        let guided_delay = std::time::Duration::from_secs(1);
         let (base_url, requests, server) = spawn_search_recording_server(vec![
             RecordingHttpResponse {
                 expected_path: "/search/guided",
                 status: 200,
                 body: guided_success_body(workspace_id, project_id, None),
-                delay: std::time::Duration::from_millis(150),
+                delay: guided_delay,
             },
             RecordingHttpResponse {
                 expected_path: "/search/hybrid",
@@ -659,8 +660,12 @@ mod guided_search_tests {
         let mut input = legacy_learning_input("auth middleware");
         input.mode = Some("guided".to_string());
 
+        // Guided always times out (its answer waits a second; its share is
+        // 25 ms) and hybrid keeps nearly the whole 10 s: a 25 ms total left
+        // hybrid about 4 ms, which a busy host sometimes missed (2026-11-02).
+        let total = std::time::Duration::from_secs(10);
         let result = tool
-            .execute_guided_search_with_timeout(
+            .execute_guided_search_with_budget(
                 &input,
                 Some(workspace_id),
                 Some(project_id),
@@ -668,7 +673,11 @@ mod guided_search_tests {
                 None,
                 false,
                 "guided-timeout-fallback".to_string(),
-                std::time::Duration::from_millis(25),
+                GuidedExecutionBudget::with_primary(
+                    std::time::Instant::now(),
+                    std::time::Duration::from_millis(25),
+                    total,
+                ),
             )
             .await
             .expect("guided timeout should serve hybrid fallback");
@@ -680,12 +689,16 @@ mod guided_search_tests {
             result.structured_content.as_ref().unwrap()["degradation_reason"],
             "transport_fallback"
         );
+        let latency = result.structured_content.as_ref().unwrap()["total_latency_ms"]
+            .as_i64()
+            .unwrap_or_default();
         assert!(
-            result.structured_content.as_ref().unwrap()["total_latency_ms"]
-                .as_i64()
-                .unwrap_or_default()
-                <= 25,
-            "reported latency must cover the single caller-supplied deadline, not start a second fallback clock"
+            latency <= total.as_millis() as i64,
+            "reported latency must fall within the single caller-supplied deadline: {latency} ms"
+        );
+        assert!(
+            latency < guided_delay.as_millis() as i64,
+            "hybrid served without waiting for the timed-out guided answer: {latency} ms"
         );
 
         let (guided_line, guided_body) = requests
@@ -1060,9 +1073,11 @@ mod guided_search_tests {
                 expected_path: "/search/guided",
                 status: 200,
                 body: guided_success_body(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), None),
-                // This would fit a newly-reset 96ms primary clock, but cannot
-                // fit the ~26ms left after the injected 70ms handler prework.
-                delay: std::time::Duration::from_millis(50),
+                // This would fit a newly-reset 960ms primary clock, but cannot
+                // fit the ~260ms left after the injected 700ms handler prework.
+                // (Ten times the first scale: at 120ms, hybrid's 18ms window
+                // was a race on a busy host, 2026-11-02.)
+                delay: std::time::Duration::from_millis(500),
             },
             RecordingHttpResponse {
                 expected_path: "/search/hybrid",
@@ -1073,14 +1088,14 @@ mod guided_search_tests {
         ]);
         let (tool, _) = guided_tool_with_base_url(base_url);
         let tool = tool.with_guided_test_delays(
-            std::time::Duration::from_millis(70),
+            std::time::Duration::from_millis(700),
             std::time::Duration::ZERO,
         );
         let started = std::time::Instant::now();
         let result = tool
             .execute_with_guided_timeout(
                 json!({"query": "handler-entry-budget", "mode": "guided"}),
-                std::time::Duration::from_millis(120),
+                std::time::Duration::from_millis(1_200),
             )
             .await
             .expect("bounded handler should preserve hybrid evidence");
@@ -1089,11 +1104,11 @@ mod guided_search_tests {
         assert_eq!(structured["fallback_used"], true);
         assert_eq!(structured["results"][0]["file_path"], "src/bounded.rs");
         assert!(
-            wall <= std::time::Duration::from_millis(220),
-            "single 120ms deadline escaped in wall time: {wall:?}"
+            wall <= std::time::Duration::from_millis(1_700),
+            "single 1200ms deadline escaped in wall time: {wall:?}"
         );
         assert!(
-            structured["total_latency_ms"].as_i64().unwrap_or_default() <= 160,
+            structured["total_latency_ms"].as_i64().unwrap_or_default() <= 1_600,
             "reported total must include prework without resetting the clock"
         );
 
@@ -1116,15 +1131,18 @@ mod guided_search_tests {
                 delay: std::time::Duration::ZERO,
             }]);
         let (tool, _) = guided_tool_with_base_url(base_url);
+        // Ten times the first scale (80ms against 100ms of slack raced a busy
+        // host, 2026-11-02); the wall bound is under the injected 1.5s, so an
+        // escape from the deadline fails it.
         let tool = tool.with_guided_test_delays(
             std::time::Duration::ZERO,
-            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(1_500),
         );
         let started = std::time::Instant::now();
         let result = tool
             .execute_with_guided_timeout(
                 json!({"query": "bounded-finalization", "mode": "guided"}),
-                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(800),
             )
             .await
             .expect("deadline should return a bounded degraded envelope");
@@ -1132,10 +1150,10 @@ mod guided_search_tests {
         let structured = result.structured_content.as_ref().unwrap();
         assert_eq!(structured["degradation_reason"], "end_to_end_timeout");
         assert!(
-            wall <= std::time::Duration::from_millis(180),
-            "final shaping escaped the 80ms handler deadline: {wall:?}"
+            wall <= std::time::Duration::from_millis(1_300),
+            "final shaping escaped the 800ms handler deadline: {wall:?}"
         );
-        assert!(structured["total_latency_ms"].as_i64().unwrap_or_default() >= 80);
+        assert!(structured["total_latency_ms"].as_i64().unwrap_or_default() >= 800);
 
         assert!(requests
             .recv_timeout(std::time::Duration::from_secs(1))
@@ -1159,7 +1177,7 @@ mod guided_search_tests {
         let warm_input = json!({"query": query, "mode": "guided"});
         mcp_client::run_with_session_key(mcp_types::SessionKey::Local, || async {
             warm_tool
-                .execute_with_guided_timeout(warm_input, std::time::Duration::from_millis(250))
+                .execute_with_guided_timeout(warm_input, std::time::Duration::from_secs(5))
                 .await
                 .expect("first call should warm the rendered Guided cache")
         })
@@ -1174,14 +1192,14 @@ mod guided_search_tests {
         let (cached_tool, _) = guided_tool_with_base_url(base_url);
         let cached_tool = cached_tool.with_guided_test_delays(
             std::time::Duration::ZERO,
-            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(1_500),
         );
         let started = std::time::Instant::now();
         let cached = mcp_client::run_with_session_key(mcp_types::SessionKey::Local, || async {
             cached_tool
                 .execute_with_guided_timeout(
                     json!({"query": query, "mode": "guided"}),
-                    std::time::Duration::from_millis(80),
+                    std::time::Duration::from_millis(800),
                 )
                 .await
                 .expect("cache-hit finalization should fail closed on deadline")
@@ -1193,8 +1211,8 @@ mod guided_search_tests {
             "end_to_end_timeout"
         );
         assert!(
-            wall <= std::time::Duration::from_millis(180),
-            "cached finalization escaped the 80ms handler deadline: {wall:?}"
+            wall <= std::time::Duration::from_millis(1_300),
+            "cached finalization escaped the 800ms handler deadline: {wall:?}"
         );
     }
 }

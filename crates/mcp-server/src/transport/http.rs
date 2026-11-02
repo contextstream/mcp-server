@@ -1279,11 +1279,24 @@ async fn serve_mcp_streamable(
     };
     // Bounded action label (fixed allowlists; never raw input) for the
     // per-call timing line and telemetry.
-    let tool_action: Option<&'static str> = tool_name.as_deref().map(|name| {
-        mcp_tools::registry::tool_call_action_label(
-            name,
-            request.params.get("arguments").unwrap_or(&Value::Null),
-        )
+    let call_arguments = request
+        .params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Null);
+    // The hot-read or write label, else the action the tool's schema lists for
+    // the call (never what the caller typed): every other call read "other".
+    let tool_action: Option<String> = tool_name.as_deref().map(|name| {
+        match mcp_tools::registry::tool_call_action_label(name, &call_arguments) {
+            "other" => state
+                .registry
+                .get(name)
+                .and_then(|tool| {
+                    mcp_tools::registry::declared_action_label(&tool.input_schema, &call_arguments)
+                })
+                .unwrap_or_else(|| "other".to_string()),
+            label => label.to_string(),
+        }
     });
 
     // Atlas Stream Processing wiring — capture the call's start so a
@@ -1420,14 +1433,30 @@ async fn serve_mcp_streamable(
     let call_failure = tool_name
         .as_ref()
         .and_then(|_| tool_call_failure(&result, call_error_class.as_deref()));
+    // The declared argument a refused call was about, from its message, which
+    // itself is never sent: which argument customers' calls get wrong.
+    let call_failure_argument = tool_name.as_deref().and_then(|name| {
+        let failure = call_failure.as_ref()?;
+        if !failure.class.starts_with("validation:") {
+            return None;
+        }
+        let tool = state.registry.get(name)?;
+        mcp_tools::registry::refused_argument(&tool.input_schema, &tool_call_failure_text(&result)?)
+    });
     if let (Some(name), Some(failure)) = (tool_name.as_deref(), call_failure.as_ref()) {
-        log_failed_tool_call(&headers, name, failure);
+        log_failed_tool_call(
+            &headers,
+            name,
+            tool_action.as_deref().unwrap_or("other"),
+            call_failure_argument.as_deref(),
+            failure,
+        );
     }
     if let Some(name) = tool_name.as_deref() {
         log_tool_call_timing(
             &headers,
             name,
-            tool_action.unwrap_or("other"),
+            tool_action.as_deref().unwrap_or("other"),
             tool_call_started.elapsed(),
             call_failure.is_none(),
             api_calls,
@@ -1446,7 +1475,7 @@ async fn serve_mcp_streamable(
             "error"
         };
         let elapsed_ms = tool_call_started.elapsed().as_millis() as u64;
-        let action = tool_action.unwrap_or("other");
+        let action = tool_action.as_deref().unwrap_or("other");
         let mut payload = serde_json::json!({
             "tool_name": name,
             "action": action,
@@ -1460,6 +1489,9 @@ async fn serve_mcp_streamable(
             payload["error_class"] = Value::String(failure.class.clone());
             if let Some(code) = failure.code {
                 payload["error_code"] = Value::from(code);
+            }
+            if let Some(argument) = call_failure_argument.as_deref() {
+                payload["error_argument"] = Value::String(argument.to_string());
             }
         }
         if let Some(signals) = state.registry.acceleration_layer().signals() {
@@ -2679,7 +2711,7 @@ fn tool_error_class(message: &str) -> String {
 fn log_tool_call_timing(
     headers: &HeaderMap,
     tool: &str,
-    action: &'static str,
+    action: &str,
     elapsed: std::time::Duration,
     ok: bool,
     api_calls: mcp_client::ApiCallStats,
@@ -2733,7 +2765,26 @@ fn tool_call_failure(
     }
 }
 
-fn log_failed_tool_call(headers: &HeaderMap, tool: &str, failure: &ToolCallFailure) {
+/// The text a failed call was answered with: the JSON-RPC error's message, or
+/// an `isError` result's first text. Read in-process for the argument it names;
+/// never logged or sent.
+fn tool_call_failure_text(result: &Result<Value, JsonRpcError>) -> Option<String> {
+    match result {
+        Err(error) => Some(error.message.clone()),
+        Ok(answer) => answer
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+fn log_failed_tool_call(
+    headers: &HeaderMap,
+    tool: &str,
+    action: &str,
+    argument: Option<&str>,
+    failure: &ToolCallFailure,
+) {
     let class = failure.class.clone();
     let (client_name, client_version) = session_client_identity(headers);
     let tool = loggable_client_token(tool).unwrap_or_else(|| "unknown".to_string());
@@ -2746,6 +2797,8 @@ fn log_failed_tool_call(headers: &HeaderMap, tool: &str, failure: &ToolCallFailu
     warn!(
         target: "contextstream::tool_errors",
         tool = %tool,
+        action = action,
+        argument = argument.unwrap_or(""),
         error_code = ?failure.code,
         error_class = %class,
         client_name = %client_name,
@@ -7230,6 +7283,30 @@ mod tests {
             assert_eq!(class_seen, class, "{message}");
             assert!(!class_seen.contains("maybe") && !class_seen.contains("secret"));
         }
+    }
+
+    #[test]
+    fn a_refused_call_names_the_declared_argument_it_was_about() {
+        // Customers' refused calls carried only a class: which argument was
+        // wrong was nowhere (2026-11-02). The text is read in-process only.
+        let schema = serde_json::json!({
+            "properties": {"action": {"enum": ["get"]}, "session_id": {}, "limit": {}}
+        });
+        let refused: Result<Value, JsonRpcError> = Err(JsonRpcError {
+            code: -32602,
+            message: "Validation error: session_id is required".to_string(),
+            data: None,
+        });
+        let is_error: Result<Value, JsonRpcError> = Ok(serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "Validation error: `limit` is a string; send an integer."}]
+        }));
+        let argument = |result: &Result<Value, JsonRpcError>| {
+            mcp_tools::registry::refused_argument(&schema, &tool_call_failure_text(result)?)
+        };
+        assert_eq!(argument(&refused).as_deref(), Some("session_id"));
+        assert_eq!(argument(&is_error).as_deref(), Some("limit"));
+        assert_eq!(argument(&Ok(serde_json::json!({"content": []}))), None);
     }
 
     #[tokio::test]

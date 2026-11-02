@@ -91,11 +91,29 @@ impl FlashTool {
         }
     }
 
-    fn require_session_id(input: Option<String>) -> Result<String> {
-        input
+    /// The instruction session: the one the call names, else this
+    /// connection's own (the session init or context started). A customer's
+    /// `instruct(action="get")` without it failed with "session_id is
+    /// required" (2026-11-02) although the connection knew its session.
+    async fn session_id_for(&self, input: Option<String>) -> Result<String> {
+        if let Some(given) = input
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| Error::Validation("session_id is required".to_string()))
+        {
+            return Ok(given);
+        }
+        self.session
+            .state()
+            .await
+            .session_id
+            .filter(|own| !own.trim().is_empty())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "session_id is required: pass the session_id that init or context returned \
+                     (this connection has no session yet; call init first)."
+                        .to_string(),
+                )
+            })
     }
 
     fn map_entries(entries: Vec<FlashEntryInput>) -> Vec<FlashPushEntry> {
@@ -360,7 +378,7 @@ impl ToolHandler for FlashTool {
         let action = input.action.to_lowercase();
         let explicit_workspace_id = Self::parse_scope_id(&input.workspace_id, "workspace_id")?;
         let explicit_project_id = Self::parse_scope_id(&input.project_id, "project_id")?;
-        let session_id = Self::require_session_id(input.session_id)?;
+        let session_id = self.session_id_for(input.session_id).await?;
 
         let scope = self
             .resolve_or_bootstrap_scope(explicit_workspace_id, explicit_project_id, &session_id)
@@ -626,7 +644,11 @@ impl ToolHandler for FlashTool {
                 "Project ID (for get). Pass the current project_id returned by init/context. Omission is workspace-only on hosted HTTP; local stdio may inherit an exact matching active session.",
                 false,
             )
-            .string("session_id", "Session identifier", true)
+            .string(
+                "session_id",
+                "The session_id init or context returned. Defaults to this connection's session.",
+                false,
+            )
             .integer("limit", "Maximum entries (for get)", false)
             .property(
                 "entries",
@@ -927,7 +949,42 @@ mod tests {
         let tool = make_tool();
         let result = tool.execute(serde_json::json!({ "action": "get" })).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("session_id"));
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("session_id"), "{message}");
+        // It says where the id comes from.
+        assert!(message.contains("init or context returned"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_call_without_session_id_reads_this_connections_session() {
+        // A customer's instruct(action="get") without session_id failed
+        // (validation:missing_argument, 2026-11-02 11:39Z) although the
+        // connection had started its session.
+        let config = mcp_types::Config::default();
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        session
+            .initialize_with_session_id(None, None, None, None, Some("own-session".to_string()))
+            .await;
+        let tool = FlashTool::new(client, session);
+        assert_eq!(tool.session_id_for(None).await.unwrap(), "own-session");
+        assert_eq!(
+            tool.session_id_for(Some("  ".to_string())).await.unwrap(),
+            "own-session"
+        );
+        // A session the call names wins.
+        assert_eq!(
+            tool.session_id_for(Some("named".to_string()))
+                .await
+                .unwrap(),
+            "named"
+        );
+        // The schema no longer insists on it.
+        let schema = tool.input_schema();
+        assert!(!schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|field| field == "session_id")));
     }
 
     #[test]

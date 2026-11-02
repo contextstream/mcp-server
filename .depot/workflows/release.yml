@@ -127,11 +127,11 @@ jobs:
       - name: Gate (${{ matrix.part }})
         if: needs.plan.outputs.runner != 'csrun'
         run: bash scripts/release/gate.sh ${{ matrix.part }}
-      # On the self-hosted box the part runs there, in a container of scripts/release/gate.Dockerfile: no release waits
-      # for a rented machine.
-      - name: Gate (${{ matrix.part }}) on the box
+      # When the self-hosted box runs the release, the part runs on Latitude's BuildKit (scripts/release/gate.Dockerfile's
+      # stage gate), or on the box when Latitude cannot be reached: no release waits for a rented machine.
+      - name: Gate (${{ matrix.part }}) on Latitude or the box
         if: needs.plan.outputs.runner == 'csrun'
-        run: bash scripts/release/gate-on-box.sh ${{ matrix.part }}
+        run: bash scripts/release/on-lat.sh gate ${{ matrix.part }}
       - name: Compile cache stats
         if: always() && needs.plan.outputs.runner != 'csrun'
         run: sccache --show-stats 2>/dev/null | grep -E 'Compile requests|Cache hits|Cache misses' || true
@@ -205,13 +205,13 @@ jobs:
       - name: Build ${{ matrix.artifact }}
         if: needs.plan.outputs.runner != 'csrun'
         run: bash scripts/release/build.sh "${{ matrix.artifact }}" "${{ needs.plan.outputs.version }}"
-      # On the self-hosted box every binary builds there, linux-arm64 cross-compiled (build.sh): no release waits for a
-      # rented machine.
-      - name: Build ${{ matrix.artifact }} on the box
+      # When the self-hosted box runs the release, every binary builds on Latitude's BuildKit, linux-arm64 cross-compiled
+      # (build.sh), or on the box when Latitude cannot be reached: no release waits for a rented machine.
+      - name: Build ${{ matrix.artifact }} on Latitude or the box
         if: needs.plan.outputs.runner == 'csrun'
         env:
           SOURCE_DATE_EPOCH: ${{ needs.plan.outputs.epoch }}
-        run: bash scripts/release/build-on-box.sh "${{ matrix.artifact }}" "${{ needs.plan.outputs.version }}"
+        run: bash scripts/release/on-lat.sh build "${{ matrix.artifact }}" "${{ needs.plan.outputs.version }}"
       - name: Save the MSVC CRT and SDK
         if: matrix.artifact == 'contextstream-mcp-win-x64.exe' && steps.xwin.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && needs.plan.outputs.runner != 'csrun'
         continue-on-error: true

@@ -121,11 +121,12 @@ class WorkflowOnCsrunTests(unittest.TestCase):
         step = next(step for step in plan["steps"] if step.get("id") == "runner")
         self.assertIn('"${ACT:-}" = true', step["run"])
 
-    def test_on_csrun_the_gate_and_every_build_run_on_the_box(self):
-        # Every gate part and every binary (linux-arm64 cross-compiled) runs on the self-hosted box: no Namespace step.
+    def test_on_csrun_the_gate_and_every_build_run_on_latitude_or_the_box(self):
+        # Every gate part and every binary (linux-arm64 cross-compiled) runs on Latitude's BuildKit, or on the self-hosted
+        # box when Latitude cannot be reached: no Namespace step.
         for name, suffix, script, env in (
-                ("gate", "on the box", "scripts/release/gate-on-box.sh", None),
-                ("build", "on the box", "scripts/release/build-on-box.sh", {"SOURCE_DATE_EPOCH": "${{ needs.plan.outputs.epoch }}"})):
+                ("gate", "on Latitude or the box", "scripts/release/on-lat.sh gate", None),
+                ("build", "on Latitude or the box", "scripts/release/on-lat.sh build", {"SOURCE_DATE_EPOCH": "${{ needs.plan.outputs.epoch }}"})):
             when = "needs.plan.outputs.runner == 'csrun'"
             self.assertFalse([step for step in self.jobs[name]["steps"] if "on Namespace" in step["name"]
                               or "REPOS_NAMESPACE_TOKEN" in json.dumps(step)], name)
@@ -154,8 +155,8 @@ class WorkflowOnCsrunTests(unittest.TestCase):
             self.assertTrue(csrun["uses"].endswith("@" + old_pin), csrun["uses"])
             self.assertNotEqual(depot["uses"], csrun["uses"])
             self.assertEqual(depot["with"], csrun["with"])
-        box = next(step for step in self.jobs["build"]["steps"] if step["name"].endswith("on the box"))["run"]
-        self.assertEqual(box, 'bash scripts/release/build-on-box.sh "${{ matrix.artifact }}" "${{ needs.plan.outputs.version }}"')
+        box = next(step for step in self.jobs["build"]["steps"] if step["name"].endswith("on Latitude or the box"))["run"]
+        self.assertEqual(box, 'bash scripts/release/on-lat.sh build "${{ matrix.artifact }}" "${{ needs.plan.outputs.version }}"')
 
 
 if __name__ == "__main__":

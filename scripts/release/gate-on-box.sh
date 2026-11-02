@@ -28,7 +28,7 @@ if docker image inspect "$tag" >/dev/null 2>&1; then
 else
   say "building $tag on the box (Rust $channel)"
   context=$(mktemp -d)
-  docker buildx build --builder default --load --progress=plain -t "$tag" --build-arg "RUST_CHANNEL=$channel" \
+  docker buildx build --builder default --load --progress=plain --target env -t "$tag" --build-arg "RUST_CHANNEL=$channel" \
     -f scripts/release/gate.Dockerfile "$context" 2>&1 | tail -n 20 >&2
   rm -rf "$context"
   say "image built in $(( $(date +%s) - started )) s"

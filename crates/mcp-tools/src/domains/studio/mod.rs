@@ -1238,7 +1238,11 @@ impl StudioTool {
             } else {
                 None
             };
-            let elsewhere = if want_links { "open the link" } else { "it is in your ContextStudio library" };
+            let elsewhere = if want_links {
+                "open the link"
+            } else {
+                "it is in your ContextStudio library"
+            };
             if let Some((url, expires)) = &link {
                 entry["url"] = json!(url);
                 entry["url_expires_in_seconds"] = json!(expires);
@@ -1426,7 +1430,11 @@ impl StudioTool {
                     .map(|f| json!({"id": f.get("id"), "label": forms::file_label(f), "format": f.get("format")}))
                     .collect::<Vec<_>>());
             }
-            let content_id = entry.get("content_id").and_then(Value::as_str).unwrap_or("").to_string();
+            let content_id = entry
+                .get("content_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             lines.push(format!(
                 "   Files (in your ContextStudio library as “{}”, id {content_id}):",
                 progress.title()

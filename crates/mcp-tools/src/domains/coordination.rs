@@ -1174,8 +1174,8 @@ mod short_id_tests {
     use crate::testing::TestFixtures;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    const ITEM: &str = "50316692-6dfd-4fcb-83d5-88c1b266c9b2";
-    const NOTICE: &str = "de6b3908-8e6c-47c6-8820-f90e1093037a";
+    const ITEM: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const NOTICE: &str = "660e8400-e29b-41d4-a716-446655440000";
 
     /// Answers the inbox with one item and one notice, and an item read with
     /// the item; returns the request lines it saw.
@@ -1227,12 +1227,12 @@ mod short_id_tests {
 
     #[tokio::test]
     async fn an_item_is_read_by_the_start_of_its_id() {
-        // Reports quote items by 8 characters ("item=50316692"); get answered
+        // Reports quote items by 8 characters ("item=550e8400"); get answered
         // "Invalid coordination id" (10 times in a day, 2026-11-01).
         let (tool, listener) = tool().await;
         let seen = serve(listener);
         let result = tool
-            .execute(serde_json::json!({"action": "get", "id": "50316692",
+            .execute(serde_json::json!({"action": "get", "id": "550e8400",
                                         "workspace_id": TestFixtures::workspace_id()}))
             .await
             .expect("the item is read");
@@ -1289,7 +1289,7 @@ mod short_id_tests {
             let mut buffer = vec![0u8; 16 * 1024];
             let read = socket.read(&mut buffer).await.expect("read");
             let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-            let body = r#"{"id": "50316692-6dfd-4fcb-83d5-88c1b266c9b2", "title": "t"}"#;
+            let body = r#"{"id": "550e8400-e29b-41d4-a716-446655440000", "title": "t"}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -1302,13 +1302,13 @@ mod short_id_tests {
             serde_json::json!({"action": "share", "title": "t", "summary": "s",
                                         "workspace_id": TestFixtures::workspace_id(),
                                         "project_id": TestFixtures::project_id(),
-                                        "session_id": "ed9f209c-c901-4675-94a0-ac4c43dc6bd3"}),
+                                        "session_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}),
         )
         .await
         .expect("shared");
         let request = server.await.unwrap();
         assert!(
-            request.contains(r#""session_id":"ed9f209c-c901-4675-94a0-ac4c43dc6bd3""#),
+            request.contains(r#""session_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee""#),
             "{request}"
         );
     }

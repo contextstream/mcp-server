@@ -9,7 +9,7 @@
 //!
 //! 1. A UUID is the record's id. Nothing else is consulted.
 //!    The start of an id (8 to 35 hex characters, as agents quote records:
-//!    `7c3281fb`) names the one candidate whose id starts with it, for a read
+//!    `550e8400`) names the one candidate whose id starts with it, for a read
 //!    or an edit. Several such candidates, or an action that removes the
 //!    record, need the whole id; the error then lists the ids it could be.
 //! 2. Any other text is compared with the titles of the candidate records the
@@ -372,7 +372,7 @@ impl Outcome {
     }
 }
 
-/// The start of an id, as agents quote records (`7c3281fb`): 8 to 35 hex
+/// The start of an id, as agents quote records (`550e8400`): 8 to 35 hex
 /// characters (dashes allowed), not a whole UUID. It can name a record only
 /// among the candidates the caller fetched, which are the caller's own.
 pub(crate) fn id_prefix(reference: &str) -> Option<String> {

@@ -228,7 +228,19 @@ jobs:
         if: always() && needs.plan.outputs.runner != 'csrun'
         run: sccache --show-stats 2>/dev/null | grep -E 'Compile requests|Cache hits|Cache misses' || true
       - name: Upload ${{ matrix.artifact }}
+        if: needs.plan.outputs.runner != 'csrun'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      # csrun's artifact server (act) refuses the newer upload-artifact's requests ("unknown field mime_type"); v4.6.2
+      # sends none, so on csrun the binaries go up with it, and publish takes them down with download-artifact v4.3.0.
+      - name: Upload ${{ matrix.artifact }} (csrun)
+        if: needs.plan.outputs.runner == 'csrun'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact }}
           path: out/${{ matrix.artifact }}
@@ -255,8 +267,15 @@ jobs:
         with:
           node-version: '22.23.2'
       - name: Download the six binaries
-        if: needs.plan.outputs.build == 'true'
+        if: needs.plan.outputs.build == 'true' && needs.plan.outputs.runner != 'csrun'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: contextstream-mcp-*
+          path: ${{ runner.temp }}/dist
+          merge-multiple: true
+      - name: Download the six binaries (csrun)
+        if: needs.plan.outputs.build == 'true' && needs.plan.outputs.runner == 'csrun'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: contextstream-mcp-*
           path: ${{ runner.temp }}/dist

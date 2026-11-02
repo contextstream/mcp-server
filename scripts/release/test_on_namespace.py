@@ -134,6 +134,18 @@ class WorkflowOnCsrunTests(unittest.TestCase):
                     continue
                 with self.subTest(job=name, step=step["name"]):
                     self.assertIn("needs.plan.outputs.runner != 'csrun'", step.get("if", ""))
+        # The artifact steps: Depot keeps its pins; on csrun, act's artifact server takes only the older actions'
+        # requests (the newer ones send mime_type, which it refuses).
+        for job, prefix, old_pin in (("build", "Upload", "ea165f8d65b6e75b540449e92b4886f43607fa02"),
+                                     ("publish", "Download", "d3f86a106a0bac45b974a628896c90dbdf5c8093")):
+            steps = [step for step in self.jobs[job]["steps"] if step["name"].startswith(prefix)]
+            self.assertEqual(len(steps), 2, job)
+            depot, csrun = steps
+            self.assertIn("needs.plan.outputs.runner != 'csrun'", depot["if"])
+            self.assertIn("needs.plan.outputs.runner == 'csrun'", csrun["if"])
+            self.assertTrue(csrun["uses"].endswith("@" + old_pin), csrun["uses"])
+            self.assertNotEqual(depot["uses"], csrun["uses"])
+            self.assertEqual(depot["with"], csrun["with"])
         build = next(step for step in self.jobs["build"]["steps"] if step["name"].endswith("on Namespace"))["run"]
         for piece in ('--artifact "out/${{ matrix.artifact }}"', "SOURCE_DATE_EPOCH=${{ needs.plan.outputs.epoch }}",
                       "'contextstream-mcp-linux-arm64' && 'arm64' || 'amd64'"):

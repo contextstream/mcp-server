@@ -25,7 +25,7 @@
 #   tree-start, tree-finish  (the tests, with NSRUN_PLAIN_GIT=1, NSRUN_C and NSRUN_NS: plain git on $NSRUN_C/tree) the
 #             tree steps of run alone: set up the exact tree and the patch, and put it back and label it.
 set -uo pipefail
-NS=${NSRUN_NS:-/tmp/nsrun}; IN=$NS/in; C=${NSRUN_C:-/cache}; ROOTFS_VERSION=nsrun-mcp-server-rootfs-v1-$(uname -m)
+NS=${NSRUN_NS:-/tmp/nsrun}; IN=$NS/in; C=${NSRUN_C:-/cache}; ROOTFS_VERSION=nsrun-mcp-server-rootfs-v2-$(uname -m)
 UBUNTU=public.ecr.aws/docker/library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 NODE_VERSION=22.23.2
 SCCACHE_VERSION=v0.18.0
@@ -39,7 +39,10 @@ case "$(uname -m)" in
                  SCCACHE_SHA256=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
                  NSC_SHA256=ba46d10dcb31caff49eda5597c6208e8917c490a0602480d6de127688f287a10 ;;
 esac
-APT_PACKAGES="build-essential pkg-config libssl-dev libpq-dev cmake clang mold protobuf-compiler zstd git curl ca-certificates python3 python3-yaml jq bc sudo xz-utils util-linux openssh-client docker.io fio"
+APT_PACKAGES="build-essential pkg-config libssl-dev libpq-dev cmake clang lld llvm mold protobuf-compiler zstd git curl ca-certificates python3 python3-yaml jq bc sudo xz-utils util-linux openssh-client docker.io fio"
+# The release builds (scripts/release/build.sh): the darwin binaries link with lld; the Windows one builds with nasm
+# and is run once under Wine, which exists only for x86_64. The rootfs is read-only in a run, so they live here.
+[ "$ARCH" = amd64 ] && APT_PACKAGES="$APT_PACKAGES nasm wine64"
 FINISH_PORT=47123
 # nsc, for the compile cache's credentials (pinned; kept on the volume as bin/nsc-<version>)
 NSC_VERSION=0.0.588
@@ -319,6 +322,8 @@ INNER
     [ ! -f /tmp/nsrun/sccache.env ] || { cp /tmp/nsrun/sccache.env $R/run/nsrun/sccache.env; chown 1001:1001 $R/run/nsrun/sccache.env; chmod 600 $R/run/nsrun/sccache.env; }
     touch $R/run/docker.sock; mount --bind /var/run/docker.sock $R/run/docker.sock
     mount --bind /etc/resolv.conf $R/etc/resolv.conf
+    # clang and mold link the Linux targets only: with a global RUSTFLAGS linker, the Windows release build
+    # (cargo-xwin, lld-link) called clang -flavor link. No single quotes here: this is inside bash -c.
     exec chroot $R /usr/bin/setpriv --reuid=1001 --regid=1001 --init-groups /usr/bin/env -i \
       HOME=/home/runner USER=runner LOGNAME=runner SHELL=/bin/bash LANG=C.UTF-8 TERM=dumb \
       PATH=/home/runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin DOCKER_HOST=unix:///run/docker.sock \
@@ -326,7 +331,9 @@ INNER
       CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_TEST_DEBUG=line-tables-only \
       CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off CARGO_PROFILE_TEST_SPLIT_DEBUGINFO=off \
       CARGO_TERM_COLOR=never RUST_BACKTRACE=1 RUST_MIN_STACK=16777216 P2R4_WIRE_DIR=/data/dev/p2r4-wire \
-      RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold" NSRUN=1 CI=1 \
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang \
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold" \
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold" NSRUN=1 CI=1 \
       /bin/bash /run/nsrun/inner.sh
   '
   rc=$?

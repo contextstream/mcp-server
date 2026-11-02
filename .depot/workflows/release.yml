@@ -127,13 +127,11 @@ jobs:
       - name: Gate (${{ matrix.part }})
         if: needs.plan.outputs.runner != 'csrun'
         run: bash scripts/release/gate.sh ${{ matrix.part }}
-      - name: Gate (${{ matrix.part }}) on Namespace
+      # On the self-hosted box the part runs there, in a container of scripts/release/gate.Dockerfile: no release waits
+      # for a rented machine.
+      - name: Gate (${{ matrix.part }}) on the box
         if: needs.plan.outputs.runner == 'csrun'
-        env:
-          REPOS_NAMESPACE_TOKEN: ${{ secrets.REPOS_NAMESPACE_TOKEN }}
-        run: >-
-          bash scripts/release/on-namespace.sh --cpus 16 --timeout 60 --label "mcp-server release gate ${{ matrix.part }}"
-          -- bash scripts/release/gate.sh ${{ matrix.part }}
+        run: bash scripts/release/gate-on-box.sh ${{ matrix.part }}
       - name: Compile cache stats
         if: always() && needs.plan.outputs.runner != 'csrun'
         run: sccache --show-stats 2>/dev/null | grep -E 'Compile requests|Cache hits|Cache misses' || true

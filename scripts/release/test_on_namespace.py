@@ -121,16 +121,20 @@ class WorkflowOnCsrunTests(unittest.TestCase):
         step = next(step for step in plan["steps"] if step.get("id") == "runner")
         self.assertIn('"${ACT:-}" = true', step["run"])
 
-    def test_on_csrun_the_gate_and_builds_run_only_their_namespace_step(self):
-        for name in ("gate", "build"):
+    def test_on_csrun_the_gate_runs_on_the_box_and_the_builds_run_only_their_namespace_step(self):
+        # The gate runs on the self-hosted box (scripts/release/gate-on-box.sh), with no Namespace token; the builds still
+        # run on Namespace.
+        for name, suffix, script, env in (("gate", "on the box", "scripts/release/gate-on-box.sh", None),
+                                          ("build", "on Namespace", "scripts/release/on-namespace.sh",
+                                           {"REPOS_NAMESPACE_TOKEN": "${{ secrets.REPOS_NAMESPACE_TOKEN }}"})):
             steps = self.jobs[name]["steps"]
-            namespace = [step for step in steps if step["name"].endswith("on Namespace")]
-            self.assertEqual(len(namespace), 1, name)
-            self.assertEqual(namespace[0]["if"], "needs.plan.outputs.runner == 'csrun'")
-            self.assertIn("scripts/release/on-namespace.sh", namespace[0]["run"])
-            self.assertEqual(namespace[0]["env"], {"REPOS_NAMESPACE_TOKEN": "${{ secrets.REPOS_NAMESPACE_TOKEN }}"})
+            own = [step for step in steps if step["name"].endswith(suffix)]
+            self.assertEqual(len(own), 1, name)
+            self.assertEqual(own[0]["if"], "needs.plan.outputs.runner == 'csrun'")
+            self.assertIn(script, own[0]["run"])
+            self.assertEqual(own[0].get("env"), env)
             for step in steps:
-                if step is namespace[0] or step["name"].startswith(("Check out", "Upload")):
+                if step is own[0] or step["name"].startswith(("Check out", "Upload")):
                     continue
                 with self.subTest(job=name, step=step["name"]):
                     self.assertIn("needs.plan.outputs.runner != 'csrun'", step.get("if", ""))

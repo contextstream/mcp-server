@@ -38,6 +38,21 @@ fn init_git_repo(path: &Path) {
     }
 }
 
+/// The summary card fits each row to its width, so a long temporary path (a build host's per-slot TMPDIR, such as
+/// /lanes/slots/<slot>/tmp) cuts the Project row before its status ("would create, link & index"). Make the checkout
+/// under a short root so the assertions see the whole row on any host.
+fn short_tempdir() -> tempfile::TempDir {
+    let short = std::path::Path::new("/tmp");
+    if cfg!(unix) && short.is_dir() {
+        tempfile::Builder::new()
+            .prefix("csd")
+            .tempdir_in(short)
+            .unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    }
+}
+
 async fn spawn_mock_setup_server(
     expected_api_key: &'static str,
 ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
@@ -178,7 +193,7 @@ async fn spawn_mock_setup_server(
 async fn setup_yes_dry_run_in_new_repo_previews_project_files_and_hooks_without_writing() {
     const SECRET: &str = "dry-run-new-repo-preview-secret";
     let (api_url, create_project_calls, server) = spawn_mock_setup_server(SECRET).await;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = short_tempdir();
     let home = temp.path().join("home");
     let repo = temp.path().join("fresh-repo");
     std::fs::create_dir_all(&home).unwrap();
@@ -305,7 +320,7 @@ async fn setup_yes_dry_run_in_new_repo_previews_project_files_and_hooks_without_
 async fn setup_yes_dry_run_with_existing_mcp_json_does_not_mutate_git_info_exclude() {
     const SECRET: &str = "dry-run-existing-mcp-secret";
     let (api_url, create_project_calls, server) = spawn_mock_setup_server(SECRET).await;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = short_tempdir();
     let home = temp.path().join("home");
     let repo = temp.path().join("existing-mcp-repo");
     std::fs::create_dir_all(&home).unwrap();

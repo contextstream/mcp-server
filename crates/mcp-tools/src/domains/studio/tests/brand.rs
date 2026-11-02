@@ -515,12 +515,73 @@ async fn brand_work_that_does_not_fit_is_refused_before_anything_is_sent() {
 // result
 // ============================================================================
 
+/// No signed link unless the person asks (a recorded film showed them on screen, ContextStudio proof take ba874ef2).
+#[tokio::test]
+async fn result_names_the_files_and_their_library_item_without_links_by_default() {
+    let (stub, _) = brand_stub("made").await;
+    let tool = stub.tool();
+    let result = tool
+        .execute(json!({"action": "result", "make_id": JOB}))
+        .await
+        .unwrap();
+    assert!(!result.is_error, "{}", text_of(&result));
+    let text = text_of(&result);
+    assert!(
+        text.contains("   Files (in your ContextStudio library as “"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Download links are made on request and expire"),
+        "{text}"
+    );
+    for leak in ["http://", "https://", "X-Amz", "links valid", "Link (valid"] {
+        assert!(!text.contains(leak), "{leak} in {text}");
+    }
+    let shape = serde_json::to_string(&structured(&result)).unwrap();
+    for leak in [
+        "http://",
+        "https://",
+        "X-Amz",
+        "\"url\"",
+        "url_expires_in_seconds",
+        "expires_in_seconds",
+    ] {
+        assert!(!shape.contains(leak), "{leak} in {shape}");
+    }
+    assert!(!result
+        .content
+        .iter()
+        .any(|item| matches!(item, ContentItem::ResourceLink { .. })));
+    // No link was even made.
+    assert!(
+        !stub
+            .requests()
+            .iter()
+            .any(|r| r.path.ends_with("/download-url")),
+        "a link was signed"
+    );
+    // On request, today's links.
+    let linked = tool
+        .execute(json!({"action": "result", "make_id": JOB, "links": true}))
+        .await
+        .unwrap();
+    assert!(
+        text_of(&linked).contains("   Files (links valid about 15 minutes):"),
+        "{}",
+        text_of(&linked)
+    );
+    assert!(linked
+        .content
+        .iter()
+        .any(|item| matches!(item, ContentItem::ResourceLink { .. })));
+}
+
 #[tokio::test]
 async fn result_links_each_file_with_its_alt_text_caption_and_checks() {
     let (stub, _) = brand_stub("made").await;
     let tool = stub.tool();
     let result = tool
-        .execute(json!({"action": "result", "make_id": JOB}))
+        .execute(json!({"action": "result", "make_id": JOB, "links": true}))
         .await
         .unwrap();
     assert!(!result.is_error, "{}", text_of(&result));
@@ -627,7 +688,7 @@ async fn a_file_without_a_link_is_still_listed_and_a_piece_without_files_reads_a
     scene.lock().unwrap().unlinked = Some("0-linkedin-post.webp");
     let tool = stub.tool();
     let result = tool
-        .execute(json!({"action": "result", "make_id": JOB, "piece": 0}))
+        .execute(json!({"action": "result", "make_id": JOB, "piece": 0, "links": true}))
         .await
         .unwrap();
     let text = text_of(&result);
@@ -646,7 +707,7 @@ async fn a_file_without_a_link_is_still_listed_and_a_piece_without_files_reads_a
     let plain = Stub::start(api(Arc::new(Mutex::new(("succeeded".into(), true))))).await;
     let result = plain
         .tool()
-        .execute(json!({"action": "result", "make_id": JOB}))
+        .execute(json!({"action": "result", "make_id": JOB, "links": true}))
         .await
         .unwrap();
     let text = text_of(&result);
@@ -863,7 +924,7 @@ async fn brand_work_end_to_end_as_the_agent_reads_it() {
     assert_eq!(structured(&done)["follow_up"]["action"], "result");
     transcript.push_str(&shown(&input, &done, false));
 
-    let (input, result) = call(json!({"action": "result", "make_id": JOB})).await;
+    let (input, result) = call(json!({"action": "result", "make_id": JOB, "links": true})).await;
     assert!(!result.is_error, "{}", text_of(&result));
     transcript.push_str(&shown(&input, &result, true));
 

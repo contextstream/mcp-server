@@ -136,6 +136,8 @@ pub struct StudioInput {
     pub change: Option<String>,
     pub wait_seconds: Option<u64>,
     pub limit: Option<i64>,
+    /// result: signed download links, only when the person asks for them (default: none).
+    pub links: Option<bool>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
     // Brand work (forms.rs).
@@ -1173,6 +1175,8 @@ impl StudioTool {
 
     async fn result(&self, input: &StudioInput) -> Result<ToolResult> {
         let (workspace_id, _) = self.scope(input).await?;
+        // Signed download links only on request: anyone who sees one has the file, and agents quote them on screen.
+        let want_links = input.links.unwrap_or(false);
         let job_id = self.job_id(workspace_id, input).await?;
         let job = match self.read_job(workspace_id, job_id).await? {
             Ok(job) => job,
@@ -1229,7 +1233,16 @@ impl StudioTool {
                 lines.push(format!("   Length: {:.1} seconds.", ms / 1000.0));
                 entry["seconds"] = json!(ms / 1000.0);
             }
-            let link = self.create().download_url(workspace_id, &content_id).await;
+            let link = if want_links {
+                self.create().download_url(workspace_id, &content_id).await
+            } else {
+                None
+            };
+            let elsewhere = if want_links {
+                "open the link"
+            } else {
+                "it is in your ContextStudio library"
+            };
             if let Some((url, expires)) = &link {
                 entry["url"] = json!(url);
                 entry["url_expires_in_seconds"] = json!(expires);
@@ -1248,16 +1261,16 @@ impl StudioTool {
                             lines.push("   Shown above.".to_string());
                         }
                         Ok(OutputBytes::TooLarge) => {
-                            lines.push("   Too large to show here; open the link.".to_string());
+                            lines.push(format!("   Too large to show here; {elsewhere}."));
                         }
                         Ok(OutputBytes::Refused(status)) => {
                             lines.push(format!(
-                                "   It couldn't be read here (HTTP {status}); open the link."
+                                "   It couldn't be read here (HTTP {status}); {elsewhere}."
                             ));
                         }
                         Err(error) => {
                             lines.push(format!(
-                                "   It couldn't be read here ({error}); open the link."
+                                "   It couldn't be read here ({error}); {elsewhere}."
                             ));
                         }
                     }
@@ -1283,6 +1296,7 @@ impl StudioTool {
                     &mut content,
                     &mut entry,
                     shown_inline,
+                    want_links,
                 )
                 .await
             };
@@ -1300,6 +1314,11 @@ impl StudioTool {
                             });
                         }
                     }
+                    None if !want_links => lines.push(format!(
+                        "   In your ContextStudio library as “{}”, id {content_id}. {}",
+                        progress.title(),
+                        forms::LINKS_ON_REQUEST
+                    )),
                     None => lines.push(
                         "   No download link could be made; it is in the ContextStudio library."
                             .to_string(),
@@ -1385,6 +1404,7 @@ impl StudioTool {
         content: &mut Vec<ContentItem>,
         entry: &mut Value,
         shown_inline: bool,
+        want_links: bool,
     ) -> bool {
         let medium = progress
             .piece
@@ -1392,6 +1412,42 @@ impl StudioTool {
             .and_then(Value::as_str)
             .unwrap_or("");
         let (chosen, rest) = forms::chosen_files(files, medium, forms::FILES_PER_PIECE);
+        if !want_links {
+            // No links unless asked: each file by its kind and size, and the library item that holds them.
+            entry["files"] = json!(chosen
+                .iter()
+                .map(|file| {
+                    let mut plain = forms::file_entry(file, None);
+                    if let Some(map) = plain.as_object_mut() {
+                        map.remove("url");
+                    }
+                    plain
+                })
+                .collect::<Vec<_>>());
+            if !rest.is_empty() {
+                entry["more_files"] = json!(rest
+                    .iter()
+                    .map(|f| json!({"id": f.get("id"), "label": forms::file_label(f), "format": f.get("format")}))
+                    .collect::<Vec<_>>());
+            }
+            let content_id = entry
+                .get("content_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            lines.push(format!(
+                "   Files (in your ContextStudio library as “{}”, id {content_id}):",
+                progress.title()
+            ));
+            for file in &chosen {
+                lines.push(forms::file_line_plain(file));
+            }
+            if let Some(more) = forms::more_files_line(&rest, files) {
+                lines.push(more);
+            }
+            lines.push(format!("   {}", forms::LINKS_ON_REQUEST));
+            return true;
+        }
         let create = self.create();
         let signed: Vec<Option<forms::SignedFile>> =
             futures::future::join_all(chosen.iter().map(|file| {
@@ -2306,6 +2362,11 @@ pub(crate) fn input_schema() -> Value {
         )
         .uuid("plan_id", "The plan (plan returns it; make takes it)", false)
         .uuid("make_id", "The making (make returns it; status, result, revise, stop take it; default: the latest)", false)
+        .boolean(
+            "links",
+            "result: true only when the person asks for download links. Without it the result names each file and its library item, with no links: signed links expire and give anyone who sees them the file",
+            false,
+        )
         .integer(
             "accepted_price_credits",
             "The price the person accepted (make), at least the plan's price: needed when the client can't ask them",

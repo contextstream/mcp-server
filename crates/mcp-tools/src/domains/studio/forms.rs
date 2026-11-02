@@ -802,6 +802,34 @@ pub(crate) fn file_label(file: &Value) -> String {
     text(file, "id").to_string()
 }
 
+/// What a result says instead of links (they are made only when the person asks).
+pub(crate) const LINKS_ON_REQUEST: &str =
+    "Download links are made on request and expire; ask for them if you want to download the files.";
+
+/// "   - Instagram post · PNG · 1080×1350 · 1.2 MB", with no link.
+pub(crate) fn file_line_plain(file: &Value) -> String {
+    format!("   - {}{}", file_label(file), file_facts(file, None))
+}
+
+/// " · 1080×1350 · 1.2 MB": a file's size facts, as a line ends them.
+fn file_facts(file: &Value, signed: Option<&SignedFile>) -> String {
+    let mut facts: Vec<String> = Vec::new();
+    if let (Some(w), Some(h)) = (
+        file.get("width").and_then(Value::as_u64),
+        file.get("height").and_then(Value::as_u64),
+    ) {
+        facts.push(format!("{w}×{h}"));
+    }
+    if let Some(bytes) = file
+        .get("sizeBytes")
+        .and_then(Value::as_u64)
+        .or_else(|| signed.and_then(|s| s.size_bytes))
+    {
+        facts.push(bytes_words(bytes));
+    }
+    facts.iter().map(|fact| format!(" · {fact}")).collect()
+}
+
 /// "   - Instagram post · PNG · 1080×1350 · 1.2 MB: https://…".
 pub(crate) fn file_line(file: &Value, signed: Option<&SignedFile>) -> String {
     let mut facts: Vec<String> = Vec::new();

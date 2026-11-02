@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.58
+
+- `instruct`: a call without `session_id` reads this connection's own session (the one `init` or `context` started). With no session yet, the error says to pass the `session_id` that `init` or `context` returned. `session_id` is no longer required in the schema.
+- `project_read` with no `action` reads the project it names (`get`), or lists projects when it names none.
+- Hosted gateway: telemetry and the failure log label a call with the action its tool's schema lists (`none` when absent, `unknown` when not listed), never the text the caller typed; a refused call also carries `error_argument`, the declared argument its error names.
+
 ## 1.0.57
 
 - Studio: `result` no longer puts signed download links in what the agent sees. By default it names each made file by its kind and size under its ContextStudio library item and id, says that download links are made on request, and signs no link: the text and the structured result carry no URL, no `url` or expiry fields and no ResourceLink. `links: true`, for when the person asks for a download link, returns the result as before. The inline image is unchanged (#495).

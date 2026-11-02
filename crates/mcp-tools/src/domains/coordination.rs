@@ -127,6 +127,60 @@ impl CoordinationTool {
         }
     }
 
+    /// A coordination item or notice id: a whole UUID, or the start of one (8+
+    /// characters, as reports quote them) that names exactly one item or
+    /// notice in the caller's own inbox. Never another account's.
+    async fn coordination_id(
+        &self,
+        raw: &str,
+        param: &str,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+    ) -> Result<Uuid> {
+        let raw = raw.trim();
+        if let Ok(id) = Uuid::parse_str(raw) {
+            return Ok(id);
+        }
+        if crate::domains::lookup::id_prefix(raw).is_none() {
+            return Err(Error::refused(
+                mcp_types::ValidationReason::InvalidValue,
+                format!(
+                    "{param} \"{raw}\" is not an id: pass the whole 36-character id, or its first 8 or more characters, as coordination(action=\"inbox\") lists them."
+                ),
+            ));
+        }
+        let session_id = match self.session.as_deref() {
+            Some(session) => session.state().await.api_session_id.clone(),
+            None => None,
+        };
+        let inbox = self
+            .client
+            .coordination_inbox(workspace_id, project_id, session_id.as_deref(), Some(200))
+            .await?;
+        let ids = ["items", "notices"]
+            .iter()
+            .filter_map(|key| inbox.get(*key).and_then(Value::as_array))
+            .flatten()
+            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+            .filter_map(|id| Uuid::parse_str(id).ok());
+        let prefix = raw.to_ascii_lowercase();
+        let mut matching = crate::domains::lookup::ids_starting_with(&prefix, ids);
+        matching.sort();
+        matching.dedup();
+        match matching.as_slice() {
+            [one] => Ok(*one),
+            _ => Err(Error::refused(
+                mcp_types::ValidationReason::ReferenceNotFound,
+                format!(
+                    "No single coordination item or notice in your inbox has {param} {}",
+                    crate::domains::lookup::id_prefix_hint(raw, &matching, false)
+                        .map(|hint| format!("starting \"{raw}\". {hint}"))
+                        .unwrap_or_else(|| format!("\"{raw}\"."))
+                ),
+            )),
+        }
+    }
+
     fn parse_uuid_list(values: &Option<Vec<String>>) -> Result<Vec<Uuid>> {
         let Some(values) = values else {
             return Ok(Vec::new());
@@ -211,8 +265,9 @@ impl ToolHandler for CoordinationTool {
                     .as_deref()
                     .or(input.notice_id.as_deref())
                     .ok_or_else(|| Error::Validation("id is required for get".into()))?;
-                let uuid = Uuid::parse_str(id)
-                    .map_err(|_| Error::Validation("Invalid coordination id".into()))?;
+                let uuid = self
+                    .coordination_id(id, "id", workspace_id, project_id)
+                    .await?;
                 match self.client.get_coordination_item(uuid).await {
                     Ok(result) => Ok(ToolResult::with_structured(
                         format_item(&result, id),
@@ -272,11 +327,25 @@ impl ToolHandler for CoordinationTool {
                 {
                     body["to"] = serde_json::json!(to);
                 }
-                // The sending session never receives its own share back.
-                if let Some(session) = self.session.as_deref() {
-                    if let Some(session_id) = session.state().await.api_session_id.clone() {
-                        body["session_id"] = serde_json::json!(session_id);
-                    }
+                // The share names its sending session: that session never receives
+                // it back, and a reply to its notices reaches it. On the stateless
+                // hosted gateway there is no session state, so the caller's
+                // session_id stands in; without either, no reply can reach the
+                // sender (0 of 708 agents' shares named one, 2026-11-01).
+                let state_session = match self.session.as_deref() {
+                    Some(session) => session.state().await.api_session_id.clone(),
+                    None => None,
+                };
+                let sender = state_session.or_else(|| {
+                    input
+                        .session_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                });
+                if let Some(session_id) = sender {
+                    body["session_id"] = serde_json::json!(session_id);
                 }
                 let result = self.client.coordination_share(body).await?;
                 Ok(ToolResult::with_structured(
@@ -289,12 +358,24 @@ impl ToolHandler for CoordinationTool {
                     .notice_id
                     .or(input.id)
                     .ok_or_else(|| Error::Validation("notice_id is required for ack".into()))?;
-                let uuid = Uuid::parse_str(&notice_id)
-                    .map_err(|_| Error::Validation("Invalid notice_id".into()))?;
+                let uuid = self
+                    .coordination_id(&notice_id, "notice_id", workspace_id, project_id)
+                    .await?;
                 let result = self
                     .client
                     .ack_coordination_notice(uuid, workspace_id)
-                    .await?;
+                    .await
+                    .map_err(|e| match e {
+                        // A notice belongs to the session it was delivered to; after a
+                        // session moves, the same item reaches it as a new notice.
+                        Error::Http { status: 404, .. } => Error::refused(
+                            mcp_types::ValidationReason::ReferenceNotFound,
+                            format!(
+                                "Notice {notice_id} is not one of this session's notices. A notice belongs to the session it was delivered to; after a session moves, the same item comes back as a new notice: coordination(action=\"inbox\") lists this session's notices with their ids."
+                            ),
+                        ),
+                        other => other,
+                    })?;
                 Ok(ToolResult::with_structured(
                     format!("Acked coordination notice {notice_id}"),
                     result,
@@ -305,8 +386,9 @@ impl ToolHandler for CoordinationTool {
                     .notice_id
                     .or(input.id)
                     .ok_or_else(|| Error::Validation("notice_id is required for reply".into()))?;
-                let uuid = Uuid::parse_str(&notice_id)
-                    .map_err(|_| Error::Validation("Invalid notice_id".into()))?;
+                let uuid = self
+                    .coordination_id(&notice_id, "notice_id", workspace_id, project_id)
+                    .await?;
                 let message = input
                     .message
                     .as_deref()
@@ -316,7 +398,21 @@ impl ToolHandler for CoordinationTool {
                 let result = self
                     .client
                     .reply_coordination_notice(uuid, message, workspace_id)
-                    .await?;
+                    .await
+                    .map_err(|e| match e {
+                        // The share behind the notice named no sending session.
+                        Error::Http { status: 400, ref message, .. }
+                            if message.contains("no origin session") =>
+                        {
+                            Error::refused(
+                                mcp_types::ValidationReason::InvalidValue,
+                                format!(
+                                    "Notice {notice_id} can't take a reply: the share it came from didn't name its sender's session. Ack it with coordination(action=\"ack\", notice_id=\"{notice_id}\"), and answer the sender with coordination(action=\"share\", to=\"<their agent name>\", title=..., summary=...). Shares that pass session_id can be replied to."
+                                ),
+                            )
+                        }
+                        other => other,
+                    })?;
                 Ok(ToolResult::with_structured(
                     format_reply(&result, &notice_id),
                     result,
@@ -327,8 +423,9 @@ impl ToolHandler for CoordinationTool {
                     .notice_id
                     .or(input.id)
                     .ok_or_else(|| Error::Validation("notice_id is required for dismiss".into()))?;
-                let uuid = Uuid::parse_str(&notice_id)
-                    .map_err(|_| Error::Validation("Invalid notice_id".into()))?;
+                let uuid = self
+                    .coordination_id(&notice_id, "notice_id", workspace_id, project_id)
+                    .await?;
                 let result = self
                     .client
                     .dismiss_coordination_notice(uuid, workspace_id)
@@ -393,15 +490,28 @@ impl ToolHandler for CoordinationTool {
                 false,
             )
             .uuid("project_id", "Project ID. Defaults to active scope.", false)
-            .string("session_id", "Live session id for check_in / inbox.", false)
+            .string(
+                "session_id",
+                "Your live session id (the one you pass to context/init): for check_in / inbox, and on share so replies to it reach you.",
+                false,
+            )
             .string("task_summary", "What this agent is working on.", false)
             .object(
                 "metadata",
                 "Presence metadata for check_in shown to the judge as evidence, e.g. {\"git\": {\"branch\": \"...\", \"commit\": \"...\"}}.",
                 false,
             )
-            .string("id", "Coordination item id for get.", false)
-            .string("notice_id", "Notice id for ack / reply / dismiss.", false)
+            .string(
+                "id",
+                "Coordination item id for get: the whole id, or its first 8+ characters as inbox shows it.",
+                false,
+            )
+            .string(
+                "notice_id",
+                "Notice id for ack / reply / dismiss: the whole id, or its first 8+ characters.",
+                false,
+            )
+            .integer("limit", "Most items and notices inbox / list returns.", false)
             .string(
                 "message",
                 "Reply text for action=reply; delivered to the session that raised the notice.",
@@ -1055,5 +1165,163 @@ mod coordination_item_line_tests {
             text.contains("- 247b1040 [decision] To mcp-eng: #365 is yours — The first tool call re-stamps associated_at. (from coordinator)"),
             "{text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod short_id_tests {
+    use super::*;
+    use crate::testing::TestFixtures;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const ITEM: &str = "50316692-6dfd-4fcb-83d5-88c1b266c9b2";
+    const NOTICE: &str = "de6b3908-8e6c-47c6-8820-f90e1093037a";
+
+    /// Answers the inbox with one item and one notice, and an item read with
+    /// the item; returns the request lines it saw.
+    fn serve(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let mut buffer = vec![0u8; 16 * 1024];
+                let read = socket.read(&mut buffer).await.expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let line = request.lines().next().unwrap_or_default().to_string();
+                let body = if line.contains("/coordination/inbox") {
+                    serde_json::json!({"items": [{"id": ITEM, "title": "Coordinator: go"}],
+                                       "notices": [{"id": NOTICE, "item_id": ITEM}]})
+                } else if line.contains(&format!("/coordinations/{ITEM}")) {
+                    serde_json::json!({"id": ITEM, "title": "Coordinator: go", "summary": "Go."})
+                } else {
+                    serde_json::json!({})
+                }
+                .to_string();
+                lines.push(line);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            lines
+        })
+    }
+
+    async fn tool() -> (CoordinationTool, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{}", listener.local_addr().expect("addr"));
+        config.api_key = Some("test-key".to_string());
+        (
+            CoordinationTool::new(ContextStreamClient::new(config)),
+            listener,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_item_is_read_by_the_start_of_its_id() {
+        // Reports quote items by 8 characters ("item=50316692"); get answered
+        // "Invalid coordination id" (10 times in a day, 2026-11-01).
+        let (tool, listener) = tool().await;
+        let seen = serve(listener);
+        let result = tool
+            .execute(serde_json::json!({"action": "get", "id": "50316692",
+                                        "workspace_id": TestFixtures::workspace_id()}))
+            .await
+            .expect("the item is read");
+        assert!(!result.is_error, "{result:?}");
+        let lines = seen.await.unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(&format!("/coordinations/{ITEM}"))),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_id_that_starts_nothing_says_how_to_pass_it() {
+        let (tool, listener) = tool().await;
+        let _seen = serve(listener);
+        let err = tool
+            .execute(serde_json::json!({"action": "ack", "notice_id": "abcdef12",
+                                        "workspace_id": TestFixtures::workspace_id()}))
+            .await
+            .expect_err("no notice starts with abcdef12");
+        assert!(
+            err.to_string().contains("pass the whole 36-character id"),
+            "{err}"
+        );
+        let err = tool
+            .execute(
+                serde_json::json!({"action": "ack", "notice_id": "not-an-id",
+                                        "workspace_id": TestFixtures::workspace_id()}),
+            )
+            .await
+            .expect_err("not an id");
+        assert!(
+            err.to_string()
+                .contains("coordination(action=\"inbox\") lists them"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_share_names_the_callers_session_so_replies_reach_it() {
+        // 0 of 708 agents' shares named a sending session (2026-11-01): on the
+        // stateless gateway there is no session state, so every reply to them
+        // was refused with "no origin session".
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{}", listener.local_addr().expect("addr"));
+        config.api_key = Some("test-key".to_string());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = vec![0u8; 16 * 1024];
+            let read = socket.read(&mut buffer).await.expect("read");
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"id": "50316692-6dfd-4fcb-83d5-88c1b266c9b2", "title": "t"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+            request
+        });
+        let tool = CoordinationTool::new(ContextStreamClient::new(config));
+        tool.execute(
+            serde_json::json!({"action": "share", "title": "t", "summary": "s",
+                                        "workspace_id": TestFixtures::workspace_id(),
+                                        "project_id": TestFixtures::project_id(),
+                                        "session_id": "ed9f209c-c901-4675-94a0-ac4c43dc6bd3"}),
+        )
+        .await
+        .expect("shared");
+        let request = server.await.unwrap();
+        assert!(
+            request.contains(r#""session_id":"ed9f209c-c901-4675-94a0-ac4c43dc6bd3""#),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn inbox_limit_sent_as_a_string_is_read_as_a_number() {
+        // `limit: "6"` failed the schema ("invalid type: string \"6\", expected
+        // i64"): limit wasn't declared, so it wasn't coerced like other integers.
+        let tool = CoordinationTool::new(ContextStreamClient::new(TestFixtures::test_config()));
+        let mut input = serde_json::json!({"action": "inbox", "limit": "6"});
+        crate::input_shape::normalize_arguments(&tool.input_schema(), &mut input);
+        assert_eq!(input["limit"], serde_json::json!(6));
+        let parsed: CoordinationInput = serde_json::from_value(input).expect("parses");
+        assert_eq!(parsed.limit, Some(6));
     }
 }

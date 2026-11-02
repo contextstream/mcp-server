@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.56
+
+- Billing: a request the API refuses with `402 PAYMENT_REQUIRED` (a subscription past due beyond its grace period) now answers `[ERROR] Payment required:` with the API's own message and a link to manage billing. Before, every 402 read as "[CREDITS_EXHAUSTED] You've run out of credits" with upgrade paths, even for a subscriber on the top plan. Other 402s are unchanged.
+- Telemetry: a failed call's class comes from the error itself: `payment_required`, `credits_exhausted` or `missing_credentials` instead of `other`.
+- Ingest: a payment refusal halts the project as a denial does, instead of being retried as a transient error.
+
 ## 1.0.55
 
 - Memory, in personal account mode: `update_doc` and `delete_doc`, the todo lookups (`get_todo`, `update_todo`, `delete_todo`, `complete_todo`) and the diagram lookups (`get_diagram`, `update_diagram`, `delete_diagram`) find a team item by its exact title. Before, they searched personal items only and answered "No doc title has every word of ..." for a team doc that `get_doc` found. Creates and lists keep the personal default, and a personal and a team item with the same title are both offered as candidates (#492).

@@ -51,6 +51,8 @@ USER root
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends nasm wine64 >/dev/null \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 USER runner
+# runner's own: a cache mount below it would otherwise make ~/.cache root's, where build.sh keeps its tools.
+RUN mkdir -p /home/runner/.cache/cargo-xwin
 
 # One release binary (scripts/release/build.sh <artifact> <version>), exported by the stage binary as /<artifact>.
 FROM build-env AS build

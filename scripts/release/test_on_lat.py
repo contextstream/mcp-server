@@ -120,6 +120,11 @@ class OnLatitudeTests(unittest.TestCase):
         for stage in ("AS env", "AS src", "AS gate", "AS build-env", "AS build", "AS binary"):
             self.assertIn(stage, text)
         self.assertIn("--target env", (ROOT / "scripts/release/gate-on-box.sh").read_text())
+        # build.sh writes ~/.cache/mcp-release-build-tools: the image makes ~/.cache runner's before the xwin cache mount
+        # (whose parent BuildKit would otherwise create as root; dry run 7744).
+        build_env = text.split("AS build-env", 1)[1].split("AS build\n", 1)[0]
+        self.assertIn("USER runner\n# runner's own", build_env)
+        self.assertIn("RUN mkdir -p /home/runner/.cache/cargo-xwin", build_env)
 
 
 if __name__ == "__main__":

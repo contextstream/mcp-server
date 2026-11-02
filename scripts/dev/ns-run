@@ -104,7 +104,9 @@ if [[ $print_only -eq 0 && -n "$lane_hosts" && -r "$lane_key" ]]; then
   [[ $cold -eq 0 ]] || lopts+=(--scratch-target --fresh)
   for a in ${artifacts[@]+"${artifacts[@]}"}; do lopts+=(--artifact "$a"); done
   python3 "$here/lanes-run.py" "${lopts[@]}" -- "$@" || rc=$?
-  if [[ $rc -ne 75 ]] || grep -q '"ran": true' "$ns/lanes.json" 2>/dev/null; then exit $rc; fi
+  # A run the lane took is the verdict, even one whose command itself exited 75; read "ran" as JSON, not by its spacing.
+  if [[ $rc -ne 75 ]] || python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("ran") is True else 1)' \
+       "$ns/lanes.json" 2>/dev/null; then exit $rc; fi
   lanes_state="overflow-$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("why") or "other")' "$ns/lanes.json" 2>/dev/null || echo other)"
   rc=0
   echo "ns-run: no lane host free: on Namespace instead" >&2

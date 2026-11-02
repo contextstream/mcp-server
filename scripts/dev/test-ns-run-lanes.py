@@ -26,8 +26,10 @@ FAKE_SSH = textwrap.dedent('''\
         print("csvalidate: every mcp-server slot is busy", flush=True)
         sys.exit(75)
     print("LANE OUTPUT", flush=True)
-    print("LANES-REPORT " + json.dumps({"v": 1, "id": req["id"], "exit": 0, "seconds": 1, "slot": "mcp-server-rust-1",
+    code = 75 if os.environ.get("FAKE_LANES") == "exit75" else 0
+    print("LANES-REPORT " + json.dumps({"v": 1, "id": req["id"], "exit": code, "seconds": 1, "slot": "mcp-server-rust-1",
                                         "warm": True}), flush=True)
+    sys.exit(code)
 ''')
 FAKE_NS_RUN_PY = textwrap.dedent('''\
     import json, os, sys
@@ -94,6 +96,13 @@ class LanesTests(unittest.TestCase):
                 self.assertIn("NAMESPACE RAN", done.stdout)
                 argv = self.namespace_argv()
                 self.assertEqual(argv[argv.index("--lanes-state") + 1], want)
+
+    def test_a_command_that_exits_75_on_the_lane_is_its_verdict_not_an_overflow(self):
+        # 75 is also "no lane ran it"; the result's "ran" tells them apart (read as JSON, not by its spacing).
+        done = self.ns_run("--", "bash", "-c", "exit 75", FAKE_LANES="exit75")
+        self.assertEqual(done.returncode, 75, done.stderr)
+        self.assertIn("LANE OUTPUT", done.stdout)
+        self.assertIsNone(self.namespace_argv())
 
     def test_an_arm64_run_goes_to_namespace(self):
         done = self.ns_run("--arch", "arm64", "--", "true")

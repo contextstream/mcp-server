@@ -704,7 +704,7 @@ async fn status_reports_progress_while_it_waits_and_result_shows_the_pieces() {
     assert_eq!(structured(&done)["follow_up"]["action"], "result");
 
     let result = tool
-        .execute(json!({"action": "result", "make_id": JOB}))
+        .execute(json!({"action": "result", "make_id": JOB, "links": true}))
         .await
         .unwrap();
     let text = text_of(&result);
@@ -753,7 +753,7 @@ async fn status_reports_progress_while_it_waits_and_result_shows_the_pieces() {
     assert_eq!(wire["mimeType"], "audio/mp4");
 
     // Without a make_id, the latest making.
-    let latest = tool.execute(json!({"action": "result"})).await.unwrap();
+    let latest = tool.execute(json!({"action": "result", "links": true})).await.unwrap();
     assert_eq!(structured(&latest)["make_id"], JOB);
 }
 

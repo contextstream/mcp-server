@@ -719,6 +719,28 @@ pub fn local_files_denied() -> bool {
     HTTP_LOCAL_FILES_DENIED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The HTTP gateway's sessions were told its MCP is behind: the operators are
+/// told instead, once per newer version per process, by a warning in the
+/// gateway's log (target `contextstream::gateway_version`), since only a
+/// release can move the gateway.
+fn report_gateway_version_behind(current: Option<&str>, latest: Option<&str>) {
+    static REPORTED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let latest = latest.unwrap_or("unknown");
+    let Ok(mut reported) = REPORTED.lock() else {
+        return;
+    };
+    if reported.as_deref() == Some(latest) {
+        return;
+    }
+    *reported = Some(latest.to_string());
+    tracing::warn!(
+        target: "contextstream::gateway_version",
+        current = current.unwrap_or("unknown"),
+        latest,
+        "the hosted MCP gateway is behind the latest MCP release; roll the gateway (sessions are not told)"
+    );
+}
+
 /// When true, this process must never replace its own binary at runtime. The
 /// hosted HTTP gateway sets it at startup: its version is pinned by its
 /// release, so an upgrade must come through a repin, not through an
@@ -13474,16 +13496,29 @@ impl ContextStreamClient {
             .filter(|v| (5..=55).contains(v))
             .unwrap_or(15);
 
-        self.post_with_options(
-            "/context/smart",
-            body,
-            RequestOptions {
-                timeout: Some(Duration::from_secs(timeout_secs)),
-                retries: Some(0),
-                ..Default::default()
-            },
-        )
-        .await
+        let mut answer: ContextResponse = self
+            .post_with_options(
+                "/context/smart",
+                body,
+                RequestOptions {
+                    timeout: Some(Duration::from_secs(timeout_secs)),
+                    retries: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        // As for init: the gateway's sessions never see an update notice.
+        if self.config.read().await.is_http_transport {
+            if let Some(notice) = answer.version_notice.take() {
+                if notice.behind {
+                    report_gateway_version_behind(
+                        notice.current.as_deref(),
+                        notice.latest.as_deref(),
+                    );
+                }
+            }
+        }
+        Ok(answer)
     }
 
     /// Get fast cached context via /context/hook (Redis-cached, ~20-50ms).
@@ -13623,7 +13658,33 @@ impl ContextStreamClient {
         let config = self.config.read().await;
         let body = params.with_defaults(&config);
         drop(config);
-        self.post("/session/init", body).await
+        let mut answer: serde_json::Value = self.post("/session/init", body).await?;
+        self.withhold_gateway_version_notice(&mut answer).await;
+        Ok(answer)
+    }
+
+    /// The `version_notice` of an init answer is about a binary the person
+    /// runs themselves. A session served by the HTTP gateway
+    /// (mcp.contextstream.io) runs ours, pinned by its release, so the notice
+    /// is dropped from what the session sees and the operators are told
+    /// instead: every hosted Claude Code session was told to run
+    /// `contextstream-mcp update` while the gateway lagged npm (2026-11-02).
+    async fn withhold_gateway_version_notice(&self, answer: &mut serde_json::Value) {
+        if !self.config.read().await.is_http_transport {
+            return;
+        }
+        let Some(notice) = answer
+            .as_object_mut()
+            .and_then(|map| map.remove("version_notice"))
+        else {
+            return;
+        };
+        if notice.get("behind").and_then(serde_json::Value::as_bool) == Some(true) {
+            report_gateway_version_behind(
+                notice.get("current").and_then(serde_json::Value::as_str),
+                notice.get("latest").and_then(serde_json::Value::as_str),
+            );
+        }
     }
 
     /// Best-effort activation delivery. It is intentionally short-timeout,
@@ -13713,16 +13774,19 @@ impl ContextStreamClient {
         let config = self.config.read().await;
         let body = params.with_defaults(&config);
         drop(config);
-        self.post_with_options(
-            "/session/init",
-            body,
-            RequestOptions {
-                timeout: Some(Duration::from_secs(8)),
-                retries: Some(0),
-                ..Default::default()
-            },
-        )
-        .await
+        let mut answer: serde_json::Value = self
+            .post_with_options(
+                "/session/init",
+                body,
+                RequestOptions {
+                    timeout: Some(Duration::from_secs(8)),
+                    retries: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        self.withhold_gateway_version_notice(&mut answer).await;
+        Ok(answer)
     }
 
     fn normalize_session_capture_original_type(event_type: Option<&str>) -> String {
@@ -24201,6 +24265,46 @@ mod tests {
         config.api_url = format!("http://{addr}");
         config.api_key = Some("test-key".to_string());
         (ContextStreamClient::new(config), server)
+    }
+
+    // Every hosted Claude Code session was told "one version behind (1.0.57 →
+    // 1.0.58), update it with contextstream-mcp update" while the gateway lagged
+    // npm (2026-11-02). A hosted user runs no binary to update.
+    #[tokio::test]
+    async fn a_hosted_gateway_session_is_never_told_to_update_the_mcp() {
+        let notice = r#""version_notice":{"behind":true,"current":"1.0.57","latest":"1.0.58","upgrade_command":"contextstream-mcp update"}"#;
+        let init = format!("{{\"workspace_id\":null,{notice}}}");
+        let context = format!("{{\"context\":\"x\",{notice}}}");
+
+        // Served by the HTTP gateway: no notice, on init and on context.
+        let (client, _server) = client_with_release_response("200 OK", &init).await;
+        client.config.write().await.is_http_transport = true;
+        let answer = client
+            .session_init(SessionInitParams::default())
+            .await
+            .expect("init");
+        assert!(answer.get("version_notice").is_none(), "{answer}");
+        let (client, _server) = client_with_release_response("200 OK", &context).await;
+        client.config.write().await.is_http_transport = true;
+        let answer = client
+            .context_smart(ContextParams::default())
+            .await
+            .expect("context");
+        assert!(answer.version_notice.is_none(), "{answer:?}");
+
+        // A binary the person runs: they are told, and can update it.
+        let (client, _server) = client_with_release_response("200 OK", &init).await;
+        let answer = client
+            .session_init(SessionInitParams::default())
+            .await
+            .expect("init");
+        assert_eq!(answer["version_notice"]["behind"], true);
+        let (client, _server) = client_with_release_response("200 OK", &context).await;
+        let answer = client
+            .context_smart(ContextParams::default())
+            .await
+            .expect("context");
+        assert!(answer.version_notice.is_some_and(|notice| notice.behind));
     }
 
     async fn client_with_http_sequence(

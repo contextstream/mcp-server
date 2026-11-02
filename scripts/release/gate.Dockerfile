@@ -5,7 +5,7 @@
 # Node; user runner, uid 1001, with sudo) with the Rust toolchain rust-toolchain.toml names baked in (RUST_CHANNEL), with
 # every release target's standard library, and owned by runner (build.sh's rustup target add runs as runner).
 ARG UBUNTU=public.ecr.aws/docker/library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
-FROM ${UBUNTU}
+FROM ${UBUNTU} AS env
 ARG NODE_VERSION=22.23.2
 ARG RUST_CHANNEL
 ENV DEBIAN_FRONTEND=noninteractive
@@ -28,3 +28,42 @@ RUN test -n "$RUST_CHANNEL" \
 ENV PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin RUSTUP_HOME=/usr/local/rustup
 USER runner
 WORKDIR /home/runner
+
+# The checkout, owned by runner; cargo's home is a cache mount in the stages below.
+FROM env AS src
+ENV CARGO_HOME=/home/runner/.cargo CI=true
+WORKDIR /home/runner/src
+COPY --chown=1001:1001 . .
+RUN git config --global --add safe.directory '*'
+
+# One gate part (scripts/release/gate.sh rust|checks): the build's exit status is the part's. RUN_ID differs per run, so a
+# part always runs (cargo audit's advisories change while the tree does not).
+FROM src AS gate
+ARG PART
+ARG RUN_ID
+RUN --mount=type=cache,id=mcp-cargo-home,target=/home/runner/.cargo,uid=1001,gid=1001 \
+    --mount=type=cache,id=mcp-gate-target-${PART},target=/home/runner/src/target,uid=1001,gid=1001,sharing=locked \
+    echo "gate: run $RUN_ID, part $PART" && bash scripts/release/gate.sh "$PART"
+
+# Windows' check runs the binary under Wine, and nasm assembles for its crypto.
+FROM env AS build-env
+USER root
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends nasm wine64 >/dev/null \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+USER runner
+
+# One release binary (scripts/release/build.sh <artifact> <version>), exported by the stage binary as /<artifact>.
+FROM build-env AS build
+ENV CARGO_HOME=/home/runner/.cargo CI=true
+WORKDIR /home/runner/src
+COPY --chown=1001:1001 . .
+ARG ARTIFACT
+ARG VERSION
+ARG SOURCE_DATE_EPOCH
+RUN --mount=type=cache,id=mcp-cargo-home,target=/home/runner/.cargo,uid=1001,gid=1001 \
+    --mount=type=cache,id=mcp-build-target-${ARTIFACT},target=/home/runner/src/target,uid=1001,gid=1001,sharing=locked \
+    --mount=type=cache,id=mcp-build-xwin,target=/home/runner/.cache/cargo-xwin,uid=1001,gid=1001,sharing=locked \
+    git config --global --add safe.directory '*' && bash scripts/release/build.sh "$ARTIFACT" "$VERSION"
+
+FROM scratch AS binary
+COPY --from=build /home/runner/src/out/ /

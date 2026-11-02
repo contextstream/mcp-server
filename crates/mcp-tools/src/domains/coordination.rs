@@ -327,11 +327,25 @@ impl ToolHandler for CoordinationTool {
                 {
                     body["to"] = serde_json::json!(to);
                 }
-                // The sending session never receives its own share back.
-                if let Some(session) = self.session.as_deref() {
-                    if let Some(session_id) = session.state().await.api_session_id.clone() {
-                        body["session_id"] = serde_json::json!(session_id);
-                    }
+                // The share names its sending session: that session never receives
+                // it back, and a reply to its notices reaches it. On the stateless
+                // hosted gateway there is no session state, so the caller's
+                // session_id stands in; without either, no reply can reach the
+                // sender (0 of 708 agents' shares named one, 2026-11-01).
+                let state_session = match self.session.as_deref() {
+                    Some(session) => session.state().await.api_session_id.clone(),
+                    None => None,
+                };
+                let sender = state_session.or_else(|| {
+                    input
+                        .session_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                });
+                if let Some(session_id) = sender {
+                    body["session_id"] = serde_json::json!(session_id);
                 }
                 let result = self.client.coordination_share(body).await?;
                 Ok(ToolResult::with_structured(
@@ -384,7 +398,21 @@ impl ToolHandler for CoordinationTool {
                 let result = self
                     .client
                     .reply_coordination_notice(uuid, message, workspace_id)
-                    .await?;
+                    .await
+                    .map_err(|e| match e {
+                        // The share behind the notice named no sending session.
+                        Error::Http { status: 400, ref message, .. }
+                            if message.contains("no origin session") =>
+                        {
+                            Error::refused(
+                                mcp_types::ValidationReason::InvalidValue,
+                                format!(
+                                    "Notice {notice_id} can't take a reply: the share it came from didn't name its sender's session. Ack it with coordination(action=\"ack\", notice_id=\"{notice_id}\"), and answer the sender with coordination(action=\"share\", to=\"<their agent name>\", title=..., summary=...). Shares that pass session_id can be replied to."
+                                ),
+                            )
+                        }
+                        other => other,
+                    })?;
                 Ok(ToolResult::with_structured(
                     format_reply(&result, &notice_id),
                     result,
@@ -462,7 +490,11 @@ impl ToolHandler for CoordinationTool {
                 false,
             )
             .uuid("project_id", "Project ID. Defaults to active scope.", false)
-            .string("session_id", "Live session id for check_in / inbox.", false)
+            .string(
+                "session_id",
+                "Your live session id (the one you pass to context/init): for check_in / inbox, and on share so replies to it reach you.",
+                false,
+            )
             .string("task_summary", "What this agent is working on.", false)
             .object(
                 "metadata",
@@ -1238,6 +1270,46 @@ mod short_id_tests {
             err.to_string()
                 .contains("coordination(action=\"inbox\") lists them"),
             "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_share_names_the_callers_session_so_replies_reach_it() {
+        // 0 of 708 agents' shares named a sending session (2026-11-01): on the
+        // stateless gateway there is no session state, so every reply to them
+        // was refused with "no origin session".
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{}", listener.local_addr().expect("addr"));
+        config.api_key = Some("test-key".to_string());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = vec![0u8; 16 * 1024];
+            let read = socket.read(&mut buffer).await.expect("read");
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"id": "50316692-6dfd-4fcb-83d5-88c1b266c9b2", "title": "t"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+            request
+        });
+        let tool = CoordinationTool::new(ContextStreamClient::new(config));
+        tool.execute(
+            serde_json::json!({"action": "share", "title": "t", "summary": "s",
+                                        "workspace_id": TestFixtures::workspace_id(),
+                                        "project_id": TestFixtures::project_id(),
+                                        "session_id": "ed9f209c-c901-4675-94a0-ac4c43dc6bd3"}),
+        )
+        .await
+        .expect("shared");
+        let request = server.await.unwrap();
+        assert!(
+            request.contains(r#""session_id":"ed9f209c-c901-4675-94a0-ac4c43dc6bd3""#),
+            "{request}"
         );
     }
 

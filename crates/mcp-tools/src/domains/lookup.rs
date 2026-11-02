@@ -8,6 +8,10 @@
 //! # The rule
 //!
 //! 1. A UUID is the record's id. Nothing else is consulted.
+//!    The start of an id (8 to 35 hex characters, as agents quote records:
+//!    `7c3281fb`) names the one candidate whose id starts with it, for a read
+//!    or an edit. Several such candidates, or an action that removes the
+//!    record, need the whole id; the error then lists the ids it could be.
 //! 2. Any other text is compared with the titles of the candidate records the
 //!    caller fetched. Each candidate gets a [`MatchGrade`], best first:
 //!    - [`ExactTitle`](MatchGrade::ExactTitle): the title is the text, letter
@@ -368,6 +372,56 @@ impl Outcome {
     }
 }
 
+/// The start of an id, as agents quote records (`7c3281fb`): 8 to 35 hex
+/// characters (dashes allowed), not a whole UUID. It can name a record only
+/// among the candidates the caller fetched, which are the caller's own.
+pub(crate) fn id_prefix(reference: &str) -> Option<String> {
+    let reference = reference.trim().to_ascii_lowercase();
+    if reference.len() < 8 || reference.len() > 35 || Uuid::parse_str(&reference).is_ok() {
+        return None;
+    }
+    // Every character first: only then are bytes characters, and the first 8 may be sliced.
+    if !reference.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return None;
+    }
+    reference[..8]
+        .chars()
+        .all(|c| c.is_ascii_hexdigit())
+        .then_some(reference)
+}
+
+/// The ids of the candidates that start with `prefix`.
+pub(crate) fn ids_starting_with(prefix: &str, ids: impl IntoIterator<Item = Uuid>) -> Vec<Uuid> {
+    ids.into_iter()
+        .filter(|id| id.to_string().starts_with(prefix))
+        .collect()
+}
+
+/// What to add to a not-found message when the reference is the start of an
+/// id: the whole ids it could be, or that the whole id is needed.
+pub(crate) fn id_prefix_hint(
+    reference: &str,
+    matching: &[Uuid],
+    destructive: bool,
+) -> Option<String> {
+    id_prefix(reference)?;
+    let reference = reference.trim();
+    Some(match matching {
+        [] => format!(
+            "\"{reference}\" looks like the first characters of an id, and no record you can see starts with it; pass the whole 36-character id."
+        ),
+        [one] if destructive => {
+            format!("\"{reference}\" is the start of {one}; this action needs the whole id.")
+        }
+        [one] => format!("\"{reference}\" is the start of {one}; pass that id."),
+        many => format!(
+            "\"{reference}\" is the start of {} ids ({}); pass the whole one you mean.",
+            many.len(),
+            many.iter().map(Uuid::to_string).collect::<Vec<_>>().join(", ")
+        ),
+    })
+}
+
 /// Apply the rule in the module documentation to one reference.
 pub(crate) fn resolve(
     reference: &str,
@@ -382,6 +436,20 @@ pub(crate) fn resolve(
             title: None,
             grade: None,
         };
+    }
+    if let Some(prefix) = id_prefix(reference) {
+        let matching = ids_starting_with(&prefix, candidates.iter().map(|c| c.id));
+        if let ([id], false) = (matching.as_slice(), destructive) {
+            return Outcome::Found {
+                id: *id,
+                title: None,
+                grade: None,
+            };
+        }
+        if !matching.is_empty() {
+            // Several ids, or a removal: the not-found message names them.
+            return Outcome::NoMatch;
+        }
     }
 
     let ranked = rank(reference, candidates, kind);
@@ -709,10 +777,17 @@ pub(crate) fn resolve_reference(
             reason,
             &candidates,
         ))),
-        Outcome::Found { .. } | Outcome::NoMatch => Err(Error::refused(
-            ValidationReason::ReferenceNotFound,
-            not_found(),
-        )),
+        Outcome::Found { .. } | Outcome::NoMatch => {
+            let mut message = not_found();
+            let matching = id_prefix(reference)
+                .map(|prefix| ids_starting_with(&prefix, candidates.iter().map(|c| c.id)))
+                .unwrap_or_default();
+            if let Some(hint) = id_prefix_hint(reference, &matching, context.action.destructive) {
+                message.push(' ');
+                message.push_str(&hint);
+            }
+            Err(Error::refused(ValidationReason::ReferenceNotFound, message))
+        }
     }
 }
 

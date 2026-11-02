@@ -205,6 +205,22 @@ def channel_state(version, headers):
     }
 
 
+# RELEASE RUNNERS (off Depot CI, 2026-11-02): which runner may release. csrun (act on a self-hosted box) sets ACT=true;
+# Depot CI does not. A run on a runner left out plans nothing (ship and build false), so its gate, builds, publish and
+# hosted jobs are skipped. The Depot workflow file csrun also runs stays as it is; adding "depot" back turns it on again.
+RELEASE_RUNNERS = ("csrun",)
+
+
+def runner_name(environ=None):
+    """"csrun" when act runs this job, else "depot"."""
+    environ = os.environ if environ is None else environ
+    return "csrun" if environ.get("ACT") == "true" else "depot"
+
+
+def runner_releases(environ=None, runners=RELEASE_RUNNERS):
+    return runner_name(environ) in runners
+
+
 def decide(version, mode, tag_commit, head, state):
     """(ship, build, commit, reason) for a run. Pure: the tests drive it."""
     relation = contract.stable_version_relation
@@ -255,6 +271,8 @@ def cmd_plan(args):
         require(status == 200 and compare.get("status") in ("ahead", "identical"), "tag v%s is not on main" % version)
     state = channel_state(version, github_headers())
     ship, build, commit, reason = decide(version, mode, tag_commit, head, state)
+    if (ship or build) and not runner_releases():
+        ship, build, reason = False, False, "%s does not release (RELEASE_RUNNERS: %s)" % (runner_name(), ", ".join(RELEASE_RUNNERS))
     if commit != head:
         subprocess.run(["git", "fetch", "--quiet", "--depth", "1", "origin", commit], cwd=ROOT, check=True, timeout=300)
     epoch = subprocess.run(["git", "show", "-s", "--format=%ct", commit], cwd=ROOT, capture_output=True, text=True,

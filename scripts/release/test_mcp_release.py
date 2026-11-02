@@ -26,6 +26,23 @@ DONE = state(npm=True, npm_latest="1.0.30", github="published", github_latest="v
              r2_commit=TAG, r2_latest="1.0.30")
 
 
+class ReleaseRunners(unittest.TestCase):
+    """Off Depot CI: csrun releases; a Depot CI run plans nothing."""
+
+    def test_csrun_releases_and_depot_does_not(self):
+        self.assertEqual(release.RELEASE_RUNNERS, ("csrun",))
+        self.assertTrue(release.runner_releases({"ACT": "true"}))
+        self.assertFalse(release.runner_releases({}))
+        self.assertFalse(release.runner_releases({"ACT": "false"}))
+        self.assertTrue(release.runner_releases({}, runners=("depot", "csrun")), "adding depot back turns it on")
+
+    def test_plan_drops_ship_and_build_on_a_runner_that_does_not_release(self):
+        import inspect
+        source = inspect.getsource(release.cmd_plan)
+        self.assertIn("if (ship or build) and not runner_releases():", source)
+        self.assertLess(source.index("not runner_releases()"), source.index('outputs = {"ship": ship'))
+
+
 class Decide(unittest.TestCase):
     def test_a_new_version_releases_the_pushed_commit(self):
         self.assertEqual(release.decide("1.0.30", "release", None, HEAD, state())[:3], (True, True, HEAD))

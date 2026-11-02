@@ -132,7 +132,7 @@ mod degraded_memory_search_tests {
             let mut request_lines = Vec::new();
             loop {
                 let accepted =
-                    tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                    tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
                         .await;
                 let Ok(Ok((mut socket, _))) = accepted else {
                     break;
@@ -3170,7 +3170,7 @@ mod linked_doc_label_tests {
         tokio::spawn(async move {
             let mut lines = Vec::new();
             while let Ok(Ok((mut socket, _))) =
-                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
             {
                 let mut buffer = vec![0u8; 32 * 1024];
                 let read = socket.read(&mut buffer).await.expect("read request");
@@ -3738,7 +3738,7 @@ mod personal_mode_reference_tests {
         tokio::spawn(async move {
             let mut lines = Vec::new();
             while let Ok(Ok((mut socket, _))) =
-                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
             {
                 // The whole request, body included, so closing never cuts a write short.
                 let mut request = Vec::new();

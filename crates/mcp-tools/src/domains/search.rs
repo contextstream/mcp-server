@@ -10306,6 +10306,19 @@ impl GuidedExecutionBudget {
         }
     }
 
+    /// A budget whose primary share is `primary` rather than its usual 80%,
+    /// so a test can make the guided request time out while the fallback keeps
+    /// a window no busy host can miss: a 25 ms budget left hybrid about 4 ms,
+    /// and on the 24-core lane host its request sometimes never left
+    /// (2026-11-02).
+    #[cfg(test)]
+    fn with_primary(started: Instant, primary: Duration, total: Duration) -> Self {
+        let mut budget = Self::new(started, total);
+        budget.primary_deadline = started + primary.min(total);
+        budget.fallback_deadline = budget.fallback_deadline.max(budget.primary_deadline);
+        budget
+    }
+
     #[cfg(test)]
     fn with_test_delays(mut self, prework: Duration, finalization: Duration) -> Self {
         self.prework_delay = prework;

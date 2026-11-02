@@ -2772,7 +2772,7 @@ mod recall_augmentation_tests {
     #[tokio::test]
     async fn primary_recall_failure_cancels_pending_augmentations() {
         let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(5),
             join_recall_with_augmentations(
                 std::future::ready(Err(mcp_types::Error::Network(
                     "primary recall down".to_string(),
@@ -2791,7 +2791,7 @@ mod recall_augmentation_tests {
     #[tokio::test]
     async fn decision_failure_cancels_pending_best_effort_docs() {
         let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(5),
             join_recall_with_augmentations(
                 std::future::ready(Ok::<_, mcp_types::Error>(json!({"results": []}))),
                 std::future::ready(Err(mcp_types::Error::Network("decisions down".to_string()))),
@@ -8248,7 +8248,7 @@ async fn get_plan_opens_a_plan_by_the_start_of_its_id() {
     let server = tokio::spawn(async move {
         let mut lines = Vec::new();
         while let Ok(Ok((mut socket, _))) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
         {
             let mut buffer = vec![0u8; 16 * 1024];
             let read = socket.read(&mut buffer).await.expect("read");

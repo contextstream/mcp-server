@@ -18,6 +18,11 @@ channel=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\
 [[ "$channel" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { say "rust-toolchain.toml names no channel"; exit 2; }
 tag="mcp-gate:$( (cat scripts/release/gate.Dockerfile; echo "$channel") | sha256sum | cut -c1-16)"
 started=$(date +%s)
+# One image build at a time on the box: the release's gate parts and its six builds all start together, and a second
+# build of the same tag fails with 'image "…" already exists' (mcp-server's dry run 4241). The lock is held while
+# building; whoever gets it next finds the image kept.
+exec 9>/tmp/mcp-gate-image.lock
+flock 9
 if docker image inspect "$tag" >/dev/null 2>&1; then
   say "image $tag (kept)"
 else
@@ -28,6 +33,7 @@ else
   rm -rf "$context"
   say "image built in $(( $(date +%s) - started )) s"
 fi
+flock -u 9
 if [ "$part" = --image ]; then echo "$tag"; exit 0; fi
 work=$(mktemp -d "${RUNNER_TEMP:-/tmp}/mcp-gate.XXXXXX")
 cleanup() {

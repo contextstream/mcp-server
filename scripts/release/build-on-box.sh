@@ -3,13 +3,12 @@
 # .depot/workflows/release.yml when the box runs the release: no release waits for a rented machine. It runs in the gate's
 # image (scripts/release/gate-on-box.sh --image; build.sh installs its own cross tools with sudo, as anywhere), on a copy of
 # this checkout as uid 1001, in the box's relgate.slice, with cargo's registry, the artifact's ./target and cargo-xwin's
-# MSVC cache in named volumes. out/<artifact> comes back to this checkout. SOURCE_DATE_EPOCH is passed through.
-# linux-arm64 builds natively only (build.sh), so it does not build here.
+# MSVC cache in named volumes. out/<artifact> comes back to this checkout. SOURCE_DATE_EPOCH is passed through. linux-arm64
+# cross-compiles here too (build.sh: cargo-zigbuild, checked under qemu-aarch64).
 #
 #   scripts/release/build-on-box.sh <artifact> <version>      exit: build.sh's
 set -euo pipefail
 artifact=${1:?artifact}; version=${2:?version}
-case "$artifact" in contextstream-mcp-linux-arm64) echo "build-on-box: $artifact builds on an arm64 machine only" >&2; exit 2 ;; esac
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$root"
 tag=$(bash scripts/release/gate-on-box.sh --image)

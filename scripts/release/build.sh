@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Build and check one release binary on a Depot CI runner (.depot/workflows/release.yml, job build).
+# Build and check one release binary (.depot/workflows/release.yml, job build; on the self-hosted box through
+# scripts/release/build-on-box.sh).
 #
 #   scripts/release/build.sh <artifact> <version>
 #
-# Writes out/<artifact> in the repository root. The workflow picks the runner: linux-arm64 builds natively on an
-# arm64 runner, everything else on x86_64. Windows builds with cargo-xwin (MSVC CRT and SDK, license accepted by
+# Writes out/<artifact> in the repository root. Linux builds natively on its own architecture, and linux-arm64 also
+# cross-compiles on x86_64 with cargo-zigbuild against glibc 2.39, checked by running it under qemu-aarch64. Windows builds with cargo-xwin (MSVC CRT and SDK, license accepted by
 # the owner) and is run once under Wine. The darwin binaries build with clang and ld64.lld against an SDK root made
 # from Zig's macOS libc headers and the stubs in scripts/release/macos-link-stubs (no macOS runner exists in Depot CI)
 # and are checked structurally, since Linux cannot run them. Every tool download is pinned by sha256. SOURCE_DATE_EPOCH comes from the workflow.
@@ -18,6 +19,8 @@ cd "$root"
 ZIG_VERSION=0.14.1
 ZIG_SHA256=24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
 ZIG_DIR=zig-x86_64-linux-$ZIG_VERSION
+ZIGBUILD_VERSION=v0.24.0
+ZIGBUILD_SHA256=52be2cb85ad3875682564a29bac1832b2ab3db68b1c504765c92d5249cc9b96f
 XWIN_VERSION=v0.23.1
 XWIN_SHA256=c492c6dfb7e5ac0eee586b796e0fc950ba13077e7f0bbb046f445d71790d5360
 GLIBC_FLOOR=2.39
@@ -53,10 +56,23 @@ rustup target add --toolchain "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-tool
 case "$kind" in
   linux)
     case "$(uname -m):$target" in
-      x86_64:x86_64-*|aarch64:aarch64-*) ;;
-      *) echo "build.sh: $target must build on its own architecture (runner is $(uname -m))" >&2; exit 2 ;;
+      x86_64:x86_64-*|aarch64:aarch64-*)
+        cargo build --locked --release --package mcp-server --target "$target" "${features[@]}" ;;
+      x86_64:aarch64-unknown-linux-gnu)
+        # linux-arm64 on an x86_64 machine: cargo-zigbuild cross-compiles with Zig as the C compiler and linker, against
+        # glibc $GLIBC_FLOOR (the .2.39 target suffix), so the binary needs no newer glibc than the native build did.
+        cross=1
+        fetch "https://ziglang.org/download/$ZIG_VERSION/$ZIG_DIR.tar.xz" "$ZIG_SHA256" "$tools/zig.tar.xz"
+        tar -xJf "$tools/zig.tar.xz" -C "$tools"
+        fetch "https://github.com/rust-cross/cargo-zigbuild/releases/download/$ZIGBUILD_VERSION/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz" \
+          "$ZIGBUILD_SHA256" "$tools/zigbuild.tar.xz"
+        tar -xJf "$tools/zigbuild.tar.xz" -C "$tools"
+        # Zig links it: a linker the environment sets for Linux targets (clang with mold, in RUSTFLAGS) is for native builds.
+        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER \
+          PATH="$tools/$ZIG_DIR:$tools/cargo-zigbuild-x86_64-unknown-linux-musl:$PATH" \
+          cargo zigbuild --locked --release --package mcp-server --target "$target.$GLIBC_FLOOR" "${features[@]}" ;;
+      *) echo "build.sh: $target does not build on $(uname -m)" >&2; exit 2 ;;
     esac
-    cargo build --locked --release --package mcp-server --target "$target" "${features[@]}"
     ;;
   windows)
     command -v lld-link >/dev/null && { command -v wine64 >/dev/null || [ -x /usr/lib/wine/wine64 ]; } || {
@@ -125,8 +141,22 @@ install -m 0755 "$binary" "out/$artifact"
 
 case "$kind" in
   linux)
-    python3 .github/scripts/release_contract.py verify-binary "out/$artifact" "$version"
-    newest=$(objdump -T "out/$artifact" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+    if [ -n "${cross:-}" ]; then
+      # A cross-built binary runs under qemu-user with the target's own C runtime; its symbols are read by llvm-objdump.
+      command -v qemu-aarch64 >/dev/null && [ -d /usr/aarch64-linux-gnu/lib ] || {
+        log "installing qemu-user and the arm64 C runtime"
+        sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends qemu-user libc6-arm64-cross llvm >/dev/null
+      }
+      shown=$(qemu-aarch64 -L /usr/aarch64-linux-gnu "out/$artifact" --version 2>&1 | tail -1)
+      [ "$shown" = "contextstream-mcp $version" ] || { echo "build.sh: qemu-aarch64 printed [$shown]" >&2; exit 1; }
+      log "qemu-aarch64: $shown"
+      objdump=$(command -v llvm-objdump || ls /usr/lib/llvm-*/bin/llvm-objdump | sort -V | tail -1)
+    else
+      python3 .github/scripts/release_contract.py verify-binary "out/$artifact" "$version"
+      objdump=objdump
+    fi
+    newest=$("$objdump" -T "out/$artifact" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
     [ "$(printf '%s\n%s\n' "$newest" "$GLIBC_FLOOR" | sort -V | tail -1)" = "$GLIBC_FLOOR" ] || {
       echo "build.sh: $artifact needs glibc $newest, above the $GLIBC_FLOOR floor" >&2; exit 1; }
     log "$artifact needs glibc $newest at most"

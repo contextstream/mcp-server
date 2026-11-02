@@ -3302,7 +3302,7 @@ mod tests {
         ),
         (
             "instruct",
-            "93763d33e3d0c95fd84ee13bfd8a61b5ebbc1fc330d09f6f25fbd4a78dcdcb95",
+            "86a3a4c9b1fd4c2ba58711cf0979c2ddec7ede49ad3716d3eec229a303e1aa27",
         ),
         (
             // Additive: connected-app actions (apps, find, read,

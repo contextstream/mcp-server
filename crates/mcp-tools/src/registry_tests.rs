@@ -1612,3 +1612,55 @@ fn terminal_control_bytes_never_reach_a_client() {
         mcp_types::tool::ContentItem::Text { text } if text == "a[31mred\nb\tc"
     ));
 }
+
+// Customers' failed calls all read `memory/other` and `instruct/other`, with no
+// word of which argument was wrong (2026-11-02).
+#[test]
+fn telemetry_names_the_declared_action_and_the_refused_argument() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["get", "push", "create_doc"]},
+            "session_id": {"type": "string"},
+            "title": {"type": "string"},
+            "limit": {"type": "integer"}
+        }
+    });
+    let label = |input: Value| declared_action_label(&schema, &input);
+    assert_eq!(
+        label(serde_json::json!({"action": "Get"})).as_deref(),
+        Some("get")
+    );
+    assert_eq!(label(serde_json::json!({})).as_deref(), Some("none"));
+    assert_eq!(
+        label(serde_json::json!({"action": " "})).as_deref(),
+        Some("none")
+    );
+    // What the caller sent is never the label.
+    assert_eq!(
+        label(serde_json::json!({"action": "drop table"})).as_deref(),
+        Some("unknown")
+    );
+    assert_eq!(
+        label(serde_json::json!({"action": 3})).as_deref(),
+        Some("unknown")
+    );
+    let no_actions = serde_json::json!({"properties": {"query": {"type": "string"}}});
+    assert_eq!(
+        declared_action_label(&no_actions, &serde_json::json!({})),
+        None
+    );
+
+    let argument = |message: &str| refused_argument(&schema, message);
+    assert_eq!(
+        argument("session_id is required").as_deref(),
+        Some("session_id")
+    );
+    assert_eq!(
+        argument("memory: the arguments do not match the tool's input schema (invalid type: string \"title\", expected i64). `limit` is a string; send an integer.").as_deref(),
+        Some("limit")
+    );
+    assert_eq!(argument("missing field `title`").as_deref(), Some("title"));
+    // A message that names no declared argument names none.
+    assert_eq!(argument("Something went wrong with the query"), None);
+}

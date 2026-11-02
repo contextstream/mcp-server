@@ -271,6 +271,16 @@ fn read_action(twin: &ReadOnlyTwin, tool_actions: &[&str], input: &Value) -> Res
         if twin.name == "memory_read" && has_query {
             return Ok("search");
         }
+        // project_read with no action: the project it names, else the list. A
+        // customer's bare project_read failed with "needs an action"
+        // (validation:missing_action, 2026-11-02 11:20Z).
+        if twin.name == "project_read" {
+            let names_project = input
+                .get("project_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty());
+            return Ok(if names_project { "get" } else { "list" });
+        }
         return Err(Error::Validation(format!(
             "`{}` needs an action: one of {reads}.",
             twin.name
@@ -497,6 +507,30 @@ mod tests {
         assert_eq!(
             *inner.calls.lock().unwrap(),
             vec![json!({"action": "search", "query": "auth"})]
+        );
+    }
+
+    // A customer's bare project_read failed with "needs an action"
+    // (validation:missing_action, 2026-11-02 11:20Z).
+    #[tokio::test]
+    async fn project_read_without_an_action_reads_the_project_it_names_else_lists() {
+        let twin = READ_ONLY_TWINS
+            .iter()
+            .find(|twin| twin.name == "project_read")
+            .expect("project_read");
+        let inner = Arc::new(Recording::new());
+        let tool = ReadOnlyTwinTool::new(twin, inner.clone());
+        let project = "00000000-0000-4000-8000-000000000042";
+        tool.execute(json!({})).await.expect("a bare call lists");
+        tool.execute(json!({"project_id": project}))
+            .await
+            .expect("a named project is read");
+        assert_eq!(
+            *inner.calls.lock().unwrap(),
+            vec![
+                json!({"action": "list"}),
+                json!({"action": "get", "project_id": project}),
+            ]
         );
     }
 

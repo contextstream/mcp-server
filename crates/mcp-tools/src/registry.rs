@@ -528,6 +528,53 @@ pub fn tool_call_action_label(name: &str, input: &Value) -> &'static str {
         .unwrap_or("other")
 }
 
+/// The action a call asked for, as its tool's schema lists it, for telemetry
+/// when [`tool_call_action_label`] has no label (`other`): the `action`
+/// argument when the schema's `action` enum lists it, `none` when the call
+/// sent none, `unknown` when it sent one the schema doesn't list. `None` for a
+/// tool without an `action` argument. Never echoes arbitrary input: customers'
+/// failed calls all read `memory/other` and `instruct/other` (2026-11-02).
+pub fn declared_action_label(schema: &Value, input: &Value) -> Option<String> {
+    let listed = schema.pointer("/properties/action/enum")?.as_array()?;
+    let given = match input.get("action") {
+        None | Some(Value::Null) => return Some("none".to_string()),
+        Some(Value::String(given)) if given.trim().is_empty() => return Some("none".to_string()),
+        Some(Value::String(given)) => given.trim().to_lowercase(),
+        Some(_) => return Some("unknown".to_string()),
+    };
+    Some(
+        listed
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|action| *action == given)
+            .map_or_else(|| "unknown".to_string(), str::to_string),
+    )
+}
+
+/// The argument a refused call's message is about, when it names one of the
+/// tool's declared arguments (`session_id` in "session_id is required"), for
+/// telemetry: which argument callers get wrong, without the message, which can
+/// quote what they sent. A name in backticks wins over a bare word.
+pub fn refused_argument(schema: &Value, message: &str) -> Option<String> {
+    let declared = schema.get("properties")?.as_object()?;
+    let words = |text: &str| -> Vec<String> {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| !word.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let quoted = message
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .flat_map(words)
+        .collect::<Vec<_>>();
+    quoted
+        .into_iter()
+        .chain(words(message))
+        .find(|word| declared.contains_key(word.as_str()))
+}
+
 type WriteTiming = ((&'static str, &'static str), Instant);
 
 fn write_timing_start(name: &str, input: &Value, observed_as_read: bool) -> Option<WriteTiming> {

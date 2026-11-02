@@ -8231,3 +8231,63 @@ fn a_lessons_page_from_a_full_scan_says_at_least_and_where_it_is() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn get_plan_opens_a_plan_by_the_start_of_its_id() {
+    // Reports quote plans by 8 characters ("plan 8618fff9"); get_plan answered
+    // "Invalid plan_id" (15 times in a day, 2026-11-01).
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const PLAN: &str = "8618fff9-0b2a-4c3d-9e00-000000000001";
+    const OTHER: &str = "11111111-0b2a-4c3d-9e00-000000000002";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let mut config = TestFixtures::test_config();
+    config.api_url = format!("http://{}", listener.local_addr().expect("addr"));
+    config.api_key = Some("test-key".to_string());
+    let server = tokio::spawn(async move {
+        let mut lines = Vec::new();
+        while let Ok(Ok((mut socket, _))) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+        {
+            let mut buffer = vec![0u8; 16 * 1024];
+            let read = socket.read(&mut buffer).await.expect("read");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let line = request.lines().next().unwrap_or_default().to_string();
+            let body = if line.contains(&format!("/plans/{PLAN}")) {
+                json!({"id": PLAN, "title": "445 purge", "status": "active", "steps": []})
+            } else if line.contains("/plans") {
+                json!([{"id": PLAN, "title": "445 purge", "status": "active"},
+                       {"id": OTHER, "title": "Other plan", "status": "active"}])
+            } else {
+                json!({"id": TestFixtures::workspace_id(), "name": "Workspace"})
+            }
+            .to_string();
+            lines.push(line);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        }
+        lines
+    });
+    let tool = GetPlanTool::new(ContextStreamClient::new(config));
+    let result = tool
+        .execute(json!({"plan_id": "8618fff9", "workspace_id": TestFixtures::workspace_id()}))
+        .await
+        .expect("the plan opens");
+    assert!(!result.is_error, "{result:?}");
+    let lines = server.await.unwrap();
+    assert!(
+        lines.iter().any(|l| l.contains(&format!("/plans/{PLAN}"))),
+        "{lines:?}"
+    );
+    // The prefix is never sent as a title query.
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("8618fff9&") || l.ends_with("8618fff9 HTTP/1.1")),
+        "{lines:?}"
+    );
+}

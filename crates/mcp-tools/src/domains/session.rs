@@ -15852,29 +15852,44 @@ impl ToolHandler for GetPlanTool {
         let input: GetPlanInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
 
-        let lookup = input
-            .query
-            .as_deref()
-            .or(input.title.as_deref())
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-
-        let (plan_id, resolution_mode, plans_considered, scope_note, title_match) = if let Some(
-            plan_id,
-        ) = input
+        // A plan_id that is the start of an id (as agents quote plans: 7c3281fb)
+        // is looked up among the caller's plans; anything else that isn't a
+        // whole UUID is refused, saying what to pass.
+        let plan_ref = input
             .plan_id
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty());
+        let explicit_plan_id = match plan_ref {
+            Some(value) => match Uuid::parse_str(value) {
+                Ok(id) => Some(id),
+                Err(_) if lookup::id_prefix(value).is_some() => None,
+                Err(_) => {
+                    return Err(Error::refused(
+                        mcp_types::ValidationReason::InvalidValue,
+                        format!(
+                            "Invalid plan_id \"{value}\": pass the whole 36-character id, or its first 8 or more characters. To open a plan by its title, pass query=\"...\" instead."
+                        ),
+                    ))
+                }
+            },
+            None => None,
+        };
+        let lookup = plan_ref
+            .filter(|_| explicit_plan_id.is_none())
+            .or(input.query.as_deref())
+            .or(input.title.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        // The API filters listings by title; an id prefix is matched here instead.
+        let list_query = lookup.filter(|value| lookup::id_prefix(value).is_none());
+
+        let (plan_id, resolution_mode, plans_considered, scope_note, title_match) = if let Some(
+            plan_id,
+        ) =
+            explicit_plan_id
         {
-            (
-                Uuid::parse_str(plan_id)
-                    .map_err(|_| Error::Validation("Invalid plan_id".to_string()))?,
-                "explicit_id",
-                None,
-                None,
-                None,
-            )
+            (plan_id, "explicit_id", None, None, None)
         } else {
             let scope = resolve_read_scope(
                 &self.client,
@@ -15895,7 +15910,7 @@ impl ToolHandler for GetPlanTool {
                 .list_plans_filtered(
                     workspace_id.into(),
                     project_id,
-                    lookup,
+                    list_query,
                     input.status.as_deref(),
                     limit,
                 )
@@ -15910,7 +15925,7 @@ impl ToolHandler for GetPlanTool {
                 self.client
                     .list_workspace_plans_filtered(
                         workspace_id.into(),
-                        lookup,
+                        list_query,
                         input.status.as_deref(),
                         limit,
                     )

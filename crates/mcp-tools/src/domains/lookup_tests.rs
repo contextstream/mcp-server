@@ -726,3 +726,65 @@ fn the_search_word_is_the_longest_one_that_says_which_record() {
     assert_eq!(search_word("Login", tickets), None);
     assert_eq!(search_word("  ", tickets), None);
 }
+
+// ---------------------------------------------------------------------------
+// The start of an id, as agents quote records
+// ---------------------------------------------------------------------------
+
+const PLAN_A: &str = "7c3281fb-1d2e-4f00-8a00-000000000001";
+const PLAN_B: &str = "7c3281fb-9999-4f00-8a00-000000000002";
+const OTHER: &str = "d5ff7488-0000-4000-8000-000000000003";
+
+fn with_id(id: &str, title: &str) -> LookupCandidate {
+    LookupCandidate::new(Uuid::parse_str(id).unwrap(), title)
+}
+
+#[test]
+fn the_start_of_an_id_names_the_one_record_it_begins() {
+    // Agents quote records by their first 8 characters, as our reports do; a
+    // read failed with "No doc found matching \"d5ff7488\"" (2026-11-01).
+    let other = Outcome::Found {
+        id: Uuid::parse_str(OTHER).unwrap(),
+        title: None,
+        grade: None,
+    };
+    let candidates = [with_id(PLAN_A, "Plan A"), with_id(OTHER, "Other")];
+    assert_eq!(resolve("d5ff7488", &candidates, DOCS, false), other);
+    assert_eq!(resolve(" D5FF7488-0000 ", &candidates, DOCS, false), other);
+    // A removal still needs the whole id.
+    assert_eq!(
+        resolve("d5ff7488", &candidates, DOCS, true),
+        Outcome::NoMatch
+    );
+    // Two records that start the same way: neither is chosen.
+    let twins = [with_id(PLAN_A, "Plan A"), with_id(PLAN_B, "Plan B")];
+    assert_eq!(resolve("7c3281fb", &twins, DOCS, false), Outcome::NoMatch);
+    // Seven characters, words or a whole UUID are not the start of an id.
+    assert_eq!(id_prefix("7c3281f"), None);
+    assert_eq!(id_prefix("lazyfs gc"), None);
+    assert_eq!(id_prefix(PLAN_A), None);
+    assert_eq!(id_prefix("7C3281FB"), Some("7c3281fb".to_string()));
+}
+
+#[test]
+fn a_reference_that_starts_an_id_says_how_to_pass_it() {
+    let twins = [with_id(PLAN_A, "Plan A"), with_id(PLAN_B, "Plan B")];
+    let Err(err) = resolve_reference(&context(LookupAction::READ), "7c3281fb", &twins, || {
+        "No doc found matching \"7c3281fb\".".to_string()
+    }) else {
+        panic!("two ids start with 7c3281fb");
+    };
+    let err = err.to_string();
+    assert!(err.contains(PLAN_A) && err.contains(PLAN_B), "{err}");
+    assert!(err.contains("pass the whole one you mean"), "{err}");
+    let Err(err) = resolve_reference(&context(LookupAction::READ), "abcdef12", &twins, || {
+        "No doc found matching \"abcdef12\".".to_string()
+    }) else {
+        panic!("no id starts with abcdef12");
+    };
+    assert!(
+        err.to_string()
+            .contains("looks like the first characters of an id"),
+        "{err}"
+    );
+}

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.61
+
+- `memory`: a doc id the API doesn't know is refused as naming nothing by `get_doc`, `update_doc` and `delete_doc`, with the same message a title that matches nothing gets (No docs found matching `doc_id` "<id>", and `memory(action="list_docs")` to see the available ids), instead of a bare "HTTP error (404)". A doc title that matches nothing now names `doc_id` too.
+- `coordination`: `reply`, `dismiss` and `ack` on a notice that isn't this session's say so, and how to list this session's notices. A reply to a notice whose share named no sending session names `notice_id`. A reply longer than 2,000 characters is refused before it is sent, naming `message`. `project_id` now says that a share needs one.
+- Studio: a finished rehearsal reads as one. `status` reports `held_credits` 0 and `rehearsal: true`, and says the making holds nothing, charges 0 and keeps no placeholders, so no files come back; each placeholder piece reads "Made as a rehearsal placeholder, which isn't kept" instead of "Deleted". `result` says the same. Real makes are unchanged.
+
 ## 1.0.60
 
 - `memory`: a task, todo, diagram, node or event id the API doesn't know is refused as naming nothing, with the same message a title that matches nothing gets (for example "No tasks found matching `task_id` ...", and which list action shows the available ids), instead of a bare "HTTP error (404): Not found".

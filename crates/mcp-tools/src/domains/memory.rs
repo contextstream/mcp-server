@@ -10,7 +10,7 @@ use mcp_client::{
 };
 use mcp_types::{
     tool::{ToolAnnotations, ToolCategory, ToolMetadata, ToolResult},
-    Error, Result,
+    Error, Result, ValidationReason,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1534,6 +1534,33 @@ struct MemoryRecord {
     title_fields: &'static [&'static str],
 }
 
+impl MemoryRecord {
+    /// What a reference that names no record says: which argument it was in,
+    /// and where the ids are.
+    fn names_nothing(&self, reference: &str) -> String {
+        let plural = self.kind.plural;
+        format!(
+            "No {plural} found matching `{}` \"{}\". Use memory(action=\"list_{plural}\") to inspect available IDs.",
+            self.id_param,
+            reference.trim()
+        )
+    }
+
+    /// The API's 404 for an API call on this record's `id`, said the way a
+    /// title that names nothing is. An id the listing did not hold goes to the
+    /// API as given, and its 404 alone ("Not found: Content not found") told
+    /// the agent neither which argument nor how to find the ids (2026-11-03).
+    fn unknown_id(&self, id: Uuid, error: Error) -> Error {
+        match error {
+            Error::Http { status: 404, .. } => Error::refused(
+                ValidationReason::ReferenceNotFound,
+                self.names_nothing(&id.to_string()),
+            ),
+            other => other,
+        }
+    }
+}
+
 const NODE: MemoryRecord = MemoryRecord {
     kind: RecordKind::new("node", "nodes"),
     id_param: "node_id",
@@ -1633,7 +1660,6 @@ fn resolve_memory_reference(
         action_name,
         &format!("{}=\"<id>\"", record.id_param),
     );
-    let plural = record.kind.plural;
     lookup::resolve_reference(
         &LookupContext {
             kind: record.kind,
@@ -1643,12 +1669,7 @@ fn resolve_memory_reference(
         },
         lookup,
         candidates,
-        || {
-            format!(
-                "No {plural} found matching \"{}\". Use memory(action=\"list_{plural}\") to inspect available IDs.",
-                lookup.trim()
-            )
-        },
+        || record.names_nothing(lookup),
     )
 }
 
@@ -4433,7 +4454,11 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self.client.get_memory_node(id).await?;
+                let result = self
+                    .client
+                    .get_memory_node(id)
+                    .await
+                    .map_err(|error| NODE.unknown_id(id, error))?;
                 let text = format_node_detail(&result);
                 Ok(found.tool_result(text, result))
             }
@@ -4474,7 +4499,11 @@ impl MemoryTool {
                     content,
                     metadata: input.metadata,
                 };
-                let mut result = self.client.update_memory_node(id, params).await?;
+                let mut result = self
+                    .client
+                    .update_memory_node(id, params)
+                    .await
+                    .map_err(|error| NODE.unknown_id(id, error))?;
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert(
                         "operation_status".to_string(),
@@ -4558,7 +4587,11 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self.client.delete_memory_node(id).await?;
+                let result = self
+                    .client
+                    .delete_memory_node(id)
+                    .await
+                    .map_err(|error| NODE.unknown_id(id, error))?;
                 let text = "Node deleted successfully.";
                 Ok(found.tool_result(text, result))
             }
@@ -4688,7 +4721,11 @@ impl MemoryTool {
                     reason: input.reason,
                     title: input.title,
                 };
-                let result = self.client.supersede_memory_node(id, params).await?;
+                let result = self
+                    .client
+                    .supersede_memory_node(id, params)
+                    .await
+                    .map_err(|error| NODE.unknown_id(id, error))?;
                 let new_id = result
                     .get("new_node_id")
                     .and_then(Value::as_str)
@@ -4951,7 +4988,11 @@ impl MemoryTool {
                     content: input.content,
                     metadata: input.metadata,
                 };
-                let mut result = self.client.update_memory_event(id, params).await?;
+                let mut result = self
+                    .client
+                    .update_memory_event(id, params)
+                    .await
+                    .map_err(|error| EVENT.unknown_id(id, error))?;
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert(
                         "operation_status".to_string(),
@@ -5044,7 +5085,11 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self.client.delete_memory_event(id).await?;
+                let result = self
+                    .client
+                    .delete_memory_event(id)
+                    .await
+                    .map_err(|error| EVENT.unknown_id(id, error))?;
                 let text = "Event deleted successfully.";
                 Ok(found.tool_result(text, result))
             }
@@ -5373,7 +5418,11 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self.client.get_task(id).await?;
+                let result = self
+                    .client
+                    .get_task(id)
+                    .await
+                    .map_err(|error| TASK.unknown_id(id, error))?;
                 consume_grounding_memory_tool(&self.session).await;
                 let text = format_task_detail(&result);
                 Ok(found.tool_result(text, result))
@@ -5423,7 +5472,11 @@ impl MemoryTool {
                 };
 
                 if let Some(target_status) = status_only_task_update(&params) {
-                    let mut current = self.client.get_task(id).await?;
+                    let mut current = self
+                        .client
+                        .get_task(id)
+                        .await
+                        .map_err(|error| TASK.unknown_id(id, error))?;
                     if task_status_from_result(&current)
                         .is_some_and(|current_status| current_status.eq_ignore_ascii_case(target_status))
                     {
@@ -5453,7 +5506,11 @@ impl MemoryTool {
                         return Ok(found.tool_result(text, current));
                     }
                 }
-                let mut result = self.client.update_task(id, params).await?;
+                let mut result = self
+                    .client
+                    .update_task(id, params)
+                    .await
+                    .map_err(|error| TASK.unknown_id(id, error))?;
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert(
                         "operation_status".to_string(),
@@ -5502,7 +5559,11 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self.client.delete_task(id).await?;
+                let result = self
+                    .client
+                    .delete_task(id)
+                    .await
+                    .map_err(|error| TASK.unknown_id(id, error))?;
                 let text = "Task deleted successfully.";
                 Ok(found.tool_result(text, result))
             }
@@ -5706,7 +5767,11 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self.client.get_todo(id).await?;
+                let result = self
+                    .client
+                    .get_todo(id)
+                    .await
+                    .map_err(|error| TODO.unknown_id(id, error))?;
                 consume_grounding_memory_tool(&self.session).await;
                 let text = format_todo_detail(&result);
                 Ok(found.tool_result(text, result))
@@ -5763,7 +5828,11 @@ impl MemoryTool {
                     clear_due_at: input.clear_due_at,
                     status: input.todo_status,
                 };
-                let mut result = self.client.update_todo(id, params).await?;
+                let mut result = self
+                    .client
+                    .update_todo(id, params)
+                    .await
+                    .map_err(|error| TODO.unknown_id(id, error))?;
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert(
                         "operation_status".to_string(),
@@ -5822,7 +5891,11 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self.client.delete_todo(id).await?;
+                let result = self
+                    .client
+                    .delete_todo(id)
+                    .await
+                    .map_err(|error| TODO.unknown_id(id, error))?;
                 let text = "Todo deleted successfully.";
                 Ok(found.tool_result(text, result))
             }
@@ -5865,7 +5938,11 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self.client.complete_todo(id).await?;
+                let result = self
+                    .client
+                    .complete_todo(id)
+                    .await
+                    .map_err(|error| TODO.unknown_id(id, error))?;
                 let text = "Todo completed successfully.";
                 Ok(found.tool_result(text, result))
             }
@@ -6041,7 +6118,11 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self.client.get_diagram(id).await?;
+                let result = self
+                    .client
+                    .get_diagram(id)
+                    .await
+                    .map_err(|error| DIAGRAM.unknown_id(id, error))?;
                 let text = format_diagram_detail(&result);
                 Ok(found.tool_result(text, result))
             }
@@ -6078,7 +6159,11 @@ impl MemoryTool {
                     diagram_type: input.diagram_type,
                     metadata: input.metadata,
                 };
-                let mut result = self.client.update_diagram(id, params).await?;
+                let mut result = self
+                    .client
+                    .update_diagram(id, params)
+                    .await
+                    .map_err(|error| DIAGRAM.unknown_id(id, error))?;
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert(
                         "operation_status".to_string(),
@@ -6125,7 +6210,11 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self.client.delete_diagram(id).await?;
+                let result = self
+                    .client
+                    .delete_diagram(id)
+                    .await
+                    .map_err(|error| DIAGRAM.unknown_id(id, error))?;
                 let text = "Diagram deleted successfully.";
                 Ok(found.tool_result(text, result))
             }

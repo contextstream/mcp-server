@@ -2,6 +2,8 @@
 
 ## 1.0.60
 
+- `memory`: a task, todo, diagram, node or event id the API doesn't know is refused as naming nothing, with the same message a title that matches nothing gets (for example "No tasks found matching `task_id` ...", and which list action shows the available ids), instead of a bare "HTTP error (404): Not found".
+- `coordination` (share): when a share can't find its project, the error now says why. Either this session has no project (scope lasts only within the session that called `init`), so pass the `project_id` the share is about or call `init` with `folder_path` in this session; or the `workspace_id` you passed isn't this session's, so pass the `project_id` the share is about. It used to say only "call init(...) first", which misled sessions whose `init` ran elsewhere.
 - Studio: a connection may ask for its makes to be rehearsals: the header `X-ContextStream-Studio-Rehearsal: 1` on the hosted gateway, or `CONTEXTSTREAM_STUDIO_REHEARSAL=1` for a local binary. It is off unless one of them says on, and the header wins. A rehearsal's `make` is made by Create on its staging engine with placeholder media and charged 0 credits; the answer says so, and its structured result has `held_credits` 0 and `rehearsal: true`. A connection that doesn't ask makes as before.
 
 ## 1.0.59

@@ -1287,12 +1287,25 @@ fn check_editor_surfaces(
                     "contextstream-mcp update-rules --scope project --editors {}",
                     editor.id()
                 );
-                checks.push(check_rules_file(
-                    "rules_project",
-                    &path,
-                    CheckStatus::Fail,
-                    &fix,
-                ));
+                let mut check = check_rules_file("rules_project", &path, CheckStatus::Fail, &fix);
+                // A project header names only the project; the whole block
+                // has to come from the editor's global rules file.
+                let header_only =
+                    std::fs::read_to_string(super::rules::resolve_rules_file_path(&path))
+                        .is_ok_and(|content| super::rules::content_is_project_header(&content));
+                if header_only && super::rules::project_header_lacks_global_rules(editor) {
+                    check = SurfaceCheck::problem(
+                        "rules_project",
+                        CheckStatus::Fail,
+                        "project rules name only the project, and the global rules they rely on are missing",
+                        Some(&path),
+                        &format!(
+                            "contextstream-mcp update-rules --scope all --editors {}",
+                            editor.id()
+                        ),
+                    );
+                }
+                checks.push(check);
             }
         } else {
             checks.push(SurfaceCheck::problem(

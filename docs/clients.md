@@ -43,6 +43,18 @@ hooks that remind the agent to call `init`/`context` and to search ContextStream
 before its own grep and find. Antigravity shows it under its plugins
 (`agy plugin list`); `doctor` reports whether it is installed and on.
 
+Setup writes the full ContextStream rules into each client's global rules file
+(for example `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` or `~/.gemini/GEMINI.md`),
+which the client loads in every session. Claude Code, Codex and Gemini CLI load
+that file beside a project's own rules file, so for them the project's file holds
+only the project's workspace and project, and a session in the project reads the
+rules once. The project's file keeps the full rules when a client on the machine
+that reads it would not get them from a global file: another client sharing
+`AGENTS.md`, or `CLAUDE_CONFIG_DIR` or `CODEX_HOME` pointing elsewhere. If your
+project's rules file is committed and teammates use it without running
+ContextStream setup themselves, run `setup` or `update-rules` with
+`CONTEXTSTREAM_PROJECT_RULES=full` to keep the full rules in it.
+
 `<VS Code user dir>` is `~/.config/Code/User` on Linux,
 `~/Library/Application Support/Code/User` on macOS, and `%APPDATA%\Code\User` on
 Windows. `<Claude config dir>` is `~/.config/Claude`,

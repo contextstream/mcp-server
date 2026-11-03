@@ -554,9 +554,69 @@ async fn make_spends_nothing_without_the_persons_go_ahead() {
     );
     assert_eq!(jobs[0].body["quoteId"], QUOTE);
     assert_eq!(jobs[0].body["request"]["prompt"], "A sting for the release");
+    assert!(
+        jobs[0].body.get("rehearsal").is_none(),
+        "a normal connection never asks for a rehearsal"
+    );
+    assert!(
+        !text_of(&accepted).contains("rehearsal"),
+        "{}",
+        text_of(&accepted)
+    );
     let out = structured(&accepted);
     assert_eq!(out["make_id"], JOB);
     assert_eq!(out["follow_up"]["action"], "status");
+    assert_eq!(out["held_credits"], 412);
+    assert!(out.get("rehearsal").is_none());
+}
+
+#[tokio::test]
+async fn make_on_a_rehearsal_connection_is_a_create_rehearsal_and_says_so() {
+    let stub = Stub::start(api(Arc::new(Mutex::new(("queued".into(), false))))).await;
+    let tool = stub.tool();
+    let config = mcp_types::config::ConfigOverride {
+        studio_rehearsal: Some(true),
+        ..Default::default()
+    };
+    let made = mcp_client::run_with_config_override(config, || async {
+        tool.execute(json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 412}))
+            .await
+            .unwrap()
+    })
+    .await;
+    assert!(!made.is_error, "{}", text_of(&made));
+    let jobs = stub.posts_to("/create/jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].body["rehearsal"], true);
+    assert_eq!(jobs[0].body["quoteId"], QUOTE);
+    assert_eq!(
+        jobs[0].header("idempotency-key"),
+        Some(format!("rehearse-{QUOTE}").as_str()),
+        "a rehearsal never stands in for the real making of the plan"
+    );
+    let text = text_of(&made);
+    assert!(text.contains(super::REHEARSAL_NOTE), "{text}");
+    assert!(
+        text.contains("placeholder image") && text.contains("charged 0 credits"),
+        "{text}"
+    );
+    let out = structured(&made);
+    assert_eq!(out["rehearsal"], true);
+    assert_eq!(out["held_credits"], 0);
+}
+
+#[test]
+fn a_rehearsal_is_off_unless_the_connection_or_the_local_binary_says_on() {
+    assert!(!super::rehearsal_on(None, None));
+    assert!(!super::rehearsal_on(None, Some("")));
+    assert!(!super::rehearsal_on(None, Some("no")));
+    assert!(super::rehearsal_on(None, Some("1")));
+    assert!(super::rehearsal_on(None, Some(" TRUE ")));
+    assert!(super::rehearsal_on(Some(true), None));
+    assert!(
+        !super::rehearsal_on(Some(false), Some("1")),
+        "the connection's header wins over the environment"
+    );
 }
 
 #[tokio::test]

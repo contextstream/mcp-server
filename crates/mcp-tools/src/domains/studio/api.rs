@@ -151,6 +151,7 @@ impl Create<'_> {
         project_id: Option<Uuid>,
         quote: &Value,
         quote_id: Uuid,
+        rehearsal: bool,
     ) -> Result<StudioAnswer> {
         let mut body = json!({
             "workspaceId": workspace_id,
@@ -160,8 +161,17 @@ impl Create<'_> {
         if let Some(project_id) = project_id {
             body["projectId"] = json!(project_id);
         }
+        // A rehearsal (only when the connection asks for one) runs on Create's staging engine
+        // and is charged nothing, under its own key so it never stands in for the real making.
+        if rehearsal {
+            body["rehearsal"] = json!(true);
+        }
         // The key the web studio uses for a plan, so one plan is made once.
-        let key = format!("make-{quote_id}");
+        let key = if rehearsal {
+            format!("rehearse-{quote_id}")
+        } else {
+            format!("make-{quote_id}")
+        };
         self.call("POST", "/create/jobs", Some(&body), Some(&key))
             .await
     }

@@ -299,6 +299,12 @@ pub struct ConfigOverride {
     /// (`X-ContextStream-Agents-Auto-Accept-Max-Credits`, or its first name).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slipstream_auto_accept_max_credits: Option<u32>,
+    /// The studio's makes are rehearsals on this connection (`X-ContextStream-Studio-Rehearsal`):
+    /// Create makes them on its staging engine with placeholder media and charges nothing. Off
+    /// unless the connection sends it; ContextStudio's recording machines send it only for a
+    /// staging rehearsal of a film.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub studio_rehearsal: Option<bool>,
 }
 
 impl ConfigOverride {
@@ -322,6 +328,7 @@ impl ConfigOverride {
             && self.acceleration_enabled.is_none()
             && self.atlas_enabled.is_none()
             && self.slipstream_auto_accept_max_credits.is_none()
+            && self.studio_rehearsal.is_none()
     }
 
     pub fn affects_tool_registry(&self) -> bool {

@@ -1250,3 +1250,119 @@ async fn deleting_or_archiving_a_skill_needs_its_exact_name_or_title() {
         vec![format!("PATCH /api/v1/skills/{skill} HTTP/1.1")]
     );
 }
+
+// ---------------------------------------------------------------------------
+// An id the API does not know
+// ---------------------------------------------------------------------------
+
+/// A customer's `update_task` (2026-11-03) named a task by an id the
+/// workspace's task list did not hold. The id went to the API as given, the
+/// API answered 404, and the agent read only "HTTP error (404): Not found:
+/// Content not found". An id that names nothing is now said the way a title
+/// that names nothing is: which argument, and how to find the ids.
+#[tokio::test]
+async fn an_id_the_api_does_not_know_is_refused_as_naming_nothing() {
+    let missing = Uuid::new_v4();
+    let api = Api::start_with(|ws| {
+        let mut routes = vec![
+            route("GET", "/api/v1/tasks?", 200, items(json!([]))),
+            route("GET", "/api/v1/todos?", 200, items(json!([]))),
+            route("GET", "/api/v1/diagrams?", 200, items(json!([]))),
+            route(
+                "GET",
+                &format!("/api/v1/memory/nodes/workspace/{ws}"),
+                200,
+                items(json!([])),
+            ),
+        ];
+        for path in [
+            "/api/v1/tasks/",
+            "/api/v1/todos/",
+            "/api/v1/diagrams/",
+            "/api/v1/memory/nodes/",
+        ] {
+            for method in ["GET", "PATCH", "PUT", "POST", "DELETE"] {
+                routes.push(route(
+                    method,
+                    path,
+                    404,
+                    json!({"error": "Not found: Content not found"}),
+                ));
+            }
+        }
+        routes
+    })
+    .await;
+
+    let cases = [
+        ("task_id", "tasks", json!({"action": "get_task"})),
+        (
+            "task_id",
+            "tasks",
+            json!({"action": "update_task", "task_status": "completed"}),
+        ),
+        (
+            "task_id",
+            "tasks",
+            json!({"action": "update_task", "title": "Renamed"}),
+        ),
+        ("task_id", "tasks", json!({"action": "delete_task"})),
+        ("todo_id", "todos", json!({"action": "get_todo"})),
+        (
+            "todo_id",
+            "todos",
+            json!({"action": "update_todo", "title": "Renamed"}),
+        ),
+        ("todo_id", "todos", json!({"action": "delete_todo"})),
+        ("todo_id", "todos", json!({"action": "complete_todo"})),
+        ("diagram_id", "diagrams", json!({"action": "get_diagram"})),
+        (
+            "diagram_id",
+            "diagrams",
+            json!({"action": "update_diagram", "title": "Renamed"}),
+        ),
+        (
+            "diagram_id",
+            "diagrams",
+            json!({"action": "delete_diagram"}),
+        ),
+        ("node_id", "nodes", json!({"action": "get_node"})),
+        (
+            "node_id",
+            "nodes",
+            json!({"action": "update_node", "title": "Renamed"}),
+        ),
+        ("node_id", "nodes", json!({"action": "delete_node"})),
+    ];
+    let schema = api.memory().input_schema();
+    for (param, plural, mut input) in cases {
+        input[param] = json!(missing);
+        input["workspace_id"] = json!(api.ws);
+        let error = api
+            .memory()
+            .execute(input.clone())
+            .await
+            .expect_err("an id that names nothing is refused");
+        assert!(
+            matches!(
+                error,
+                mcp_types::Error::Refused {
+                    reason: mcp_types::ValidationReason::ReferenceNotFound,
+                    ..
+                }
+            ),
+            "{input}: {error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains(&missing.to_string()), "{input}: {text}");
+        assert!(
+            text.contains(&format!("memory(action=\"list_{plural}\")")),
+            "{input}: {text}"
+        );
+        assert_eq!(
+            crate::registry::refused_argument(&schema, &text).as_deref(),
+            Some(param),
+            "{input}: {text}"
+        );
+    }
+}

@@ -52,6 +52,10 @@ use crate::peer::{self, Elicited};
 /// What a rehearsal's make says, plainly.
 pub(crate) const REHEARSAL_NOTE: &str = "This is a rehearsal: Create makes it on its staging engine with a placeholder image, and it is charged 0 credits.";
 
+/// What status and result say of a rehearsal's making: it holds nothing, and its placeholders aren't kept. Without it a
+/// rehearsal read as 0 charged but its quote "held", and its pieces as "Deleted".
+pub(crate) const REHEARSAL_DONE: &str = "This making is a rehearsal: Create makes placeholders on its staging engine, holds nothing and charges 0 credits. A rehearsal's placeholders aren't kept, so no files come back.";
+
 /// The header a connection sends to make the studio's makes rehearsals (ConfigOverride::studio_rehearsal).
 pub const REHEARSAL_HEADER: &str = "x-contextstream-studio-rehearsal";
 /// The same switch for a local binary, from its environment.
@@ -82,9 +86,9 @@ use crate::schema::SchemaBuilder;
 use api::{refusal, unreachable, Create, Subject};
 pub use gate::StudioGate;
 use words::{
-    beat_lines, clip, credits, film_phase_words, headline, is_explainer, job_ended, making_problem,
-    piece_facts, piece_progress, quote_problem, recording_line, recording_questions, sentence,
-    stage_words, PieceState,
+    beat_lines, clip, credits, film_phase_words, headline, is_explainer, is_rehearsal, job_ended,
+    making_problem, piece_facts, piece_progress, quote_problem, recording_line,
+    recording_questions, sentence, stage_words, PieceState,
 };
 
 /// The tool's name.
@@ -1132,8 +1136,15 @@ impl StudioTool {
         }
         let charged = job.get("chargedCredits").and_then(Value::as_i64);
         let spent = charged.or_else(|| job.pointer("/make/spentCredits").and_then(Value::as_i64));
-        let held = job.get("quotedCredits").and_then(Value::as_i64);
+        let rehearsal = is_rehearsal(job);
+        // A rehearsal holds nothing: its quote only says what a real make would cost.
+        let held = if rehearsal {
+            Some(0)
+        } else {
+            job.get("quotedCredits").and_then(Value::as_i64)
+        };
         match (job_ended(job), spent, held) {
+            _ if rehearsal => lines.push(REHEARSAL_DONE.to_string()),
             (true, _, _) if charged.is_some() => lines.push(format!(
                 "Charged: {} credits.",
                 credits(charged.unwrap_or_default())
@@ -1175,6 +1186,9 @@ impl StudioTool {
             "charged_credits": job.get("chargedCredits"),
             "held_credits": held,
         });
+        if rehearsal {
+            structured["rehearsal"] = json!(true);
+        }
         if job_ended(job) {
             let made = pieces
                 .iter()
@@ -1418,12 +1432,20 @@ impl StudioTool {
             lines.push(String::new());
             lines.push("Still being made: the pieces above are the ones ready so far.".to_string());
         }
-        let structured = json!({
+        let rehearsal = is_rehearsal(&job);
+        if rehearsal {
+            lines.push(String::new());
+            lines.push(REHEARSAL_DONE.to_string());
+        }
+        let mut structured = json!({
             "make_id": job.get("id"),
             "status": job.get("status"),
             "pieces": described,
             "charged_credits": job.get("chargedCredits"),
         });
+        if rehearsal {
+            structured["rehearsal"] = json!(true);
+        }
         let mut result = ToolResult::with_structured(lines.join("\n"), structured);
         result.content.extend(content);
         Ok(result)

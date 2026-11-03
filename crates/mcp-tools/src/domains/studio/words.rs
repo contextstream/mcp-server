@@ -246,6 +246,19 @@ pub(crate) fn job_ended(job: &Value) -> bool {
     TERMINAL.contains(&job.get("status").and_then(Value::as_str).unwrap_or(""))
 }
 
+/// What a rehearsal's piece reads as once made: Create made a placeholder on its staging engine and kept nothing, so
+/// no files come back (Create's job says the piece was made but records no made piece for it).
+pub(crate) const REHEARSAL_PIECE: &str = "Made as a rehearsal placeholder, which isn't kept";
+
+/// Whether a making job is a rehearsal (a `make` on a rehearsal connection): Create records the staging production it
+/// made it in as `make.rehearsal`, or marks the job `rehearsal: true`.
+pub(crate) fn is_rehearsal(job: &Value) -> bool {
+    job.get("rehearsal").and_then(Value::as_bool) == Some(true)
+        || job
+            .pointer("/make/rehearsal")
+            .is_some_and(|value| !value.is_null() && value.as_bool() != Some(false))
+}
+
 fn by_index(list: Option<&Value>, index: i64) -> Option<&Value> {
     list?
         .as_array()?
@@ -268,6 +281,7 @@ pub(crate) fn piece_progress(job: &Value) -> Vec<PieceProgress> {
         .unwrap_or_default();
     let status = job.get("status").and_then(Value::as_str).unwrap_or("");
     let ended = job_ended(job);
+    let rehearsal = is_rehearsal(job);
     let job_code = job.pointer("/error/code").and_then(Value::as_str);
     pieces
         .into_iter()
@@ -316,7 +330,14 @@ pub(crate) fn piece_progress(job: &Value) -> Vec<PieceProgress> {
             match own.as_str() {
                 "made" => progress(
                     PieceState::Made,
-                    if made.is_some() { "Made" } else { "Deleted" }.to_string(),
+                    if made.is_some() {
+                        "Made"
+                    } else if rehearsal {
+                        REHEARSAL_PIECE
+                    } else {
+                        "Deleted"
+                    }
+                    .to_string(),
                 ),
                 _ if own == "failed" || failed.is_some() => {
                     let code = failed

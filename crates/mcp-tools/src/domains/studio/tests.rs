@@ -605,6 +605,72 @@ async fn make_on_a_rehearsal_connection_is_a_create_rehearsal_and_says_so() {
     assert_eq!(out["held_credits"], 0);
 }
 
+/// A finished rehearsal as Create reports one: succeeded, the quote's credits, 0 charged, the staging production under
+/// `make.rehearsal`, both pieces "made" with no made-piece record and no outputs.
+fn rehearsal_job() -> Value {
+    let mut job = job("succeeded", false);
+    job["quotedCredits"] = json!(16153);
+    job["chargedCredits"] = json!(0);
+    job["make"]["rehearsal"] = json!({"productionId": "44444444-4444-4444-8444-444444444444"});
+    job["make"]["plan"]["pieces"][0]["status"] = json!("made");
+    job["make"]["plan"]["pieces"][1]["status"] = json!("made");
+    job
+}
+
+#[tokio::test]
+async fn a_finished_rehearsal_holds_nothing_and_its_placeholders_read_as_not_kept() {
+    let stub = Stub::start(Arc::new(|request: &Recorded| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", p) if p.starts_with("/projects/") => {
+                Answer::ok(json!({"id": PROJECT, "name": "studio", "workspace_id": WORKSPACE}))
+            }
+            ("GET", p) if p == format!("/create/jobs/{JOB}") => Answer::ok(rehearsal_job()),
+            _ => Answer::status(404, json!({"error": "not here"})),
+        }
+    }))
+    .await;
+    let tool = stub.tool();
+
+    let status = tool
+        .execute(json!({"action": "status", "make_id": JOB}))
+        .await
+        .unwrap();
+    let text = text_of(&status);
+    assert!(!text.contains("Deleted"), "{text}");
+    assert!(!text.contains("Held"), "{text}");
+    assert!(text.contains(super::REHEARSAL_DONE), "{text}");
+    assert!(text.contains(super::words::REHEARSAL_PIECE), "{text}");
+    assert_eq!(structured(&status)["held_credits"], 0);
+    assert_eq!(structured(&status)["rehearsal"], true);
+    assert_eq!(structured(&status)["charged_credits"], 0);
+
+    let result = tool
+        .execute(json!({"action": "result", "make_id": JOB}))
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    assert!(!text.contains("Deleted"), "{text}");
+    assert!(text.contains(super::REHEARSAL_DONE), "{text}");
+    assert_eq!(structured(&result)["rehearsal"], true);
+}
+
+#[test]
+fn a_made_piece_with_no_record_still_reads_deleted_outside_a_rehearsal() {
+    let mut job = job("succeeded", false);
+    job["make"]["plan"]["pieces"][0]["status"] = json!("made");
+    let pieces = super::words::piece_progress(&job);
+    assert_eq!(pieces[0].words, "Deleted");
+    assert!(!super::words::is_rehearsal(&job));
+    job["make"]["rehearsal"] = json!(false);
+    assert!(!super::words::is_rehearsal(&job));
+    job["rehearsal"] = json!(true);
+    assert!(super::words::is_rehearsal(&job));
+    assert_eq!(
+        super::words::piece_progress(&job)[0].words,
+        super::words::REHEARSAL_PIECE
+    );
+}
+
 #[test]
 fn a_rehearsal_is_off_unless_the_connection_or_the_local_binary_says_on() {
     assert!(!super::rehearsal_on(None, None));

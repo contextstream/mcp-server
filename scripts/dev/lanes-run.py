@@ -23,6 +23,12 @@ of the base here, the same request goes to the same host once more with a thin b
 (`git bundle create base.bundle refs/remotes/origin/main ^HEAD_OF_HOST`, a tar member, "bundle" in request.json); the
 host verifies it, fetches it and runs. A head this checkout doesn't have, or one not under the base: the next host.
 
+HOSTS AND PASSES (coordinator 2026-11-03 01:40Z; the UpCloud box is the second lane host): --hosts lists hosts in order,
+each "user@host" or "user@host/fam,fam" (only those slot families: a host that offers no slot of the run's family is not
+asked). Pass 1 asks every host with "slot_wait_s": 0, so a busy host answers 75 at once and the next is tried; when
+every host was busy, pass 2 asks the first busy one again with the host's own wait (no slot_wait_s). Only then Namespace.
+The overflow reason is busy when any host was busy (capacity), else the last host's.
+
 REPOS (owner 2026-11-02 18:3xZ: Namespace only for overflow and coflow): this file is the same in contextstream,
 contextcode and mcp-server; --repo names the host's mirror and slots (sent as "repo", except for contextstream), --family
 the slot family. Only contextstream's --validate sends a verdict key, and only then is nsrun_verdicts.py loaded.
@@ -215,11 +221,30 @@ def main():
     data = payload(request, patch)
     guard_s = a.timeout * 60 + 600   # serve ends the run at the timeout; this only guards a host that went silent
 
-    hosts = [h for h in re.split(r"[\s,]+", a.hosts) if h]
-    attempts = [(h, None) for h in hosts]
-    why_not = "other"   # OVERFLOW: why the last host passed the run over (depot-run labels the Namespace run with it)
-    while attempts:
-        host, mode = attempts.pop(0)
+    hosts = []
+    for spec in a.hosts.split():
+        host, _, fams = spec.partition("/")
+        if fams and a.family not in fams.split(","):
+            continue   # HOSTS: it offers no slot of this family
+        hosts.append(host)
+    if not hosts:
+        say("no lane host offers a %s slot" % a.family)
+        result(ran=False, rc=75, why="other")
+        return 75
+    # PASSES: (host, mode, slot_wait_s); 0 in pass 1, None (the host's own wait) in pass 2.
+    attempts = [(h, None, 0) for h in hosts]
+    busy, why_not = [], "other"   # OVERFLOW: busy hosts (capacity), else why the last host passed the run over
+    second_pass = False
+    while attempts or (busy and not second_pass):
+        if not attempts:
+            second_pass = True
+            say("every lane host was busy: waiting for a slot on %s" % busy[0])
+            attempts = [(busy[0], None, None)]
+        host, mode, wait_s = attempts.pop(0)
+        if wait_s is None:
+            request.pop("slot_wait_s", None)
+        else:
+            request["slot_wait_s"] = wait_s
         refresh = mode == "fresh"
         if refresh:   # the host offered a kept verdict that doesn't hold: the same host, a fresh run
             request["fresh"] = True
@@ -244,7 +269,7 @@ def main():
             if reused and not (got == 0 and key and verdicts().valid_shared(rep.get("verdict"), key)):
                 say("%s offered a kept verdict that doesn't hold for this key: running it fresh" % host)
                 if not refresh:
-                    attempts.insert(0, (host, "fresh"))
+                    attempts.insert(0, (host, "fresh", wait_s))
                 continue
             if reused:
                 say("REUSED, no new run: lane run %s on %s passed this exact tree (%s), steps %s and validate code at %s. "
@@ -267,7 +292,7 @@ def main():
             else:
                 bundle, why = base_bundle(a.base, need.get("head"))
                 if bundle is not None:
-                    attempts.insert(0, (host, bundle))
+                    attempts.insert(0, (host, bundle, wait_s))
                     continue
                 say("%s doesn't have your base %s, and no bundle for it: %s" % (host, a.base[:12], why))
             continue
@@ -278,10 +303,12 @@ def main():
         why = {75: "busy or not ready", 255: "unreachable", 70: "serve's own error", 2: "refused the request"}.get(
             rc, "ended with %d and no report" % rc)
         why_not = {75: "not-ready" if b"not ready" in run.status else "busy", 255: "unreachable"}.get(rc, "other")
+        if why_not == "busy" and host not in busy:
+            busy.append(host)
         # 75 and 2: nothing ran (what came out is serve's own status line). Otherwise a run may have started and stopped.
         unfinished = run.printed and rc not in (75, 2)
         say("%s: %s%s" % (host, why, "; its output above is from a run that didn't finish" if unfinished else ""))
-    result(ran=False, rc=75, why=why_not)
+    result(ran=False, rc=75, why="busy" if busy else why_not)
     return 75
 
 

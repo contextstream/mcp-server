@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The release gate at the release commit (.depot/workflows/release.yml, job gate), in two parts that run side by side:
+# The release gate at the release commit (.csrun/workflows/release.yml, job gate), in two parts that run side by side:
 #
 #   scripts/release/gate.sh rust     fmt, clippy, the workspace tests, the debug build and its account-connection smoke
 #   scripts/release/gate.sh checks   cargo audit and cargo deny, the release contract, the public boundary, every script

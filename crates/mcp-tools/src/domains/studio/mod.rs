@@ -48,6 +48,34 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::peer::{self, Elicited};
+
+/// What a rehearsal's make says, plainly.
+pub(crate) const REHEARSAL_NOTE: &str = "This is a rehearsal: Create makes it on its staging engine with a placeholder image, and it is charged 0 credits.";
+
+/// The header a connection sends to make the studio's makes rehearsals (ConfigOverride::studio_rehearsal).
+pub const REHEARSAL_HEADER: &str = "x-contextstream-studio-rehearsal";
+/// The same switch for a local binary, from its environment.
+pub const REHEARSAL_ENV: &str = "CONTEXTSTREAM_STUDIO_REHEARSAL";
+
+/// Whether this connection's makes are rehearsals: its header when it sent one, else the local
+/// binary's environment. Off unless one of them says on.
+pub(crate) fn rehearsal_on(header: Option<bool>, env: Option<&str>) -> bool {
+    header.unwrap_or_else(|| {
+        env.is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    })
+}
+
+fn rehearsing() -> bool {
+    rehearsal_on(
+        mcp_client::get_task_config_override().and_then(|config| config.studio_rehearsal),
+        std::env::var(REHEARSAL_ENV).ok().as_deref(),
+    )
+}
 use crate::registry::ToolHandler;
 use crate::schema::SchemaBuilder;
 
@@ -925,9 +953,15 @@ impl StudioTool {
 
         // The project the plan was made in (Create checks it), else the session's.
         let project_id = planned_project(quote_id).unwrap_or(session_project);
+        // A rehearsal (only when the connection asks for one): Create makes it on its staging
+        // engine with a placeholder image and charges nothing.
+        let rehearsal = rehearsing();
+        if rehearsal {
+            notes.push(REHEARSAL_NOTE.to_string());
+        }
         let mut answer = self
             .create()
-            .start_job(workspace_id, project_id, &quote, quote_id)
+            .start_job(workspace_id, project_id, &quote, quote_id, rehearsal)
             .await
             .map_err(unreachable)?;
         let other_project = if project_id.is_some() {
@@ -943,7 +977,7 @@ impl StudioTool {
         {
             answer = self
                 .create()
-                .start_job(workspace_id, other_project, &quote, quote_id)
+                .start_job(workspace_id, other_project, &quote, quote_id, rehearsal)
                 .await
                 .map_err(unreachable)?;
         }
@@ -963,7 +997,12 @@ impl StudioTool {
             .as_mut()
             .and_then(Value::as_object_mut)
         {
-            map.insert("held_credits".to_string(), json!(price));
+            if rehearsal {
+                map.insert("held_credits".to_string(), json!(0));
+                map.insert("rehearsal".to_string(), json!(true));
+            } else {
+                map.insert("held_credits".to_string(), json!(price));
+            }
         }
         Ok(result)
     }

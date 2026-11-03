@@ -1,44 +1,52 @@
 #!/usr/bin/env bash
-# Run a build or test command on a Namespace instance, on this checkout's tree: the merge base with origin/main plus
-# your changes (commits, edits and new untracked files). Its output streams here and its exit status is the verdict.
-# mcp-server's copy of contextcode's scripts/dev/ns-run, the Namespace half of
-# contextstream's scripts/dev/depot-run; the instance, the cache volume and the tree checks are scripts/dev/ns-run.py and
-# scripts/dev/ns-runner.sh.
+# Run a build or test command on one of the agents' lane hosts, on this checkout's tree: the merge base with origin/main
+# plus your changes (commits, edits and new untracked files). Its output streams here and its exit status is the verdict.
+# ONE PLACE: a lane host (scripts/dev/lanes-run.py, the same file as contextstream's). OWNER RULE 2026-11-03: nothing uses
+# Namespace except coflow and contextstudio, so mcp-server has no Namespace path at all: --where namespace and Bitrise are refused by name,
+# and when every lane host is busy the run WAITS for a slot instead of going anywhere else.
 #
-#   scripts/dev/ns-run [--cpus N] [--timeout MIN] [--label TEXT] [--cold] [--artifact PATH]... [--print] -- <command...>
+#   scripts/dev/ns-run [--cpus N] [--timeout MIN] [--label TEXT] [--cold] [--artifact PATH]... [--wait-s SECONDS]
+#                      [--arch amd64] [--print] -- <command...>
 #
 #   scripts/dev/ns-run --cpus 32 -- bash scripts/release/gate.sh rust
 #   scripts/dev/ns-run -- bash scripts/release/gate.sh checks
 #   scripts/dev/ns-run --artifact out/contextstream-mcp-linux-x64 -- bash scripts/release/build.sh contextstream-mcp-linux-x64 1.0.57
 #
-# The command runs from the repository root as uid 1001, with rust-toolchain.toml's Rust, Node 22, docker and sudo.
-# --cpus picks the shape: 4, 8, 16 (the default), 32 or 64 (which runs as 32). --timeout is in minutes (default 45).
-# --arch arm64 runs on an arm64 instance (the release's linux-arm64 build). --cold runs without the cache volume (a clean room). --artifact keeps PATH (relative to the repository root; a file,
-# directory or glob) and brings it back. --print shows what would run.
-# The token is ~/.config/nsc/token.json (agentbox envs have it) or NSC_TOKEN_FILE; it is never printed.
+# The command runs from the repository root of the lane host, in its mcp-server slot (LANES_FAMILY, default rust), with
+# rust-toolchain.toml's Rust, Node 22, docker and sudo. --cpus is accepted for compatibility and no longer chooses a
+# shape: the lane host's slot does. --timeout is in minutes (default 45) and is also how long the run waits for a free
+# slot when --wait-s is not given. --cold runs in the host's scratch tree (a clean room). --artifact keeps PATH (relative
+# to the repository root; a file, directory or glob) and brings it back. --print shows what would run.
+# The lane hosts are x86: --arch arm64 is refused (it has no lane host, and Namespace is only coflow and contextstudio).
 #
-# LANES (owner 2026-11-02: Namespace only for overflow and coflow): an amd64 run goes first to the agents' lane hosts in
-# the LANE_HOSTS line below (NS_RUN_LANES overrides it; off turns lanes off), through scripts/dev/lanes-run.py (the same
-# file as contextstream's): the same tree in the host's mcp-server slot (LANES_FAMILY, default rust). With no lanes key
-# (~/.config/lanes/key, DEPOT_RUN_LANES_KEY), --arch arm64, or no lane host free, it runs on Namespace, and the instance's
-# nsrun-lanes label says why (contextstream's scripts/dev/lanes-overflow counts them). OFF SWITCH: LANE_HOSTS="".
-# Exit status: 0 passed; 1 failed or timed out; 2 bad usage; 3 your changes did not apply to the merge base; 5 Namespace
-# refused the token; 6 the upload lock stayed held; 7 Namespace could not run it.
+# The lane hosts are in the LANE_HOSTS line below (NS_RUN_LANES overrides it; off turns a run into a refusal); the key is
+# ~/.config/lanes/key (DEPOT_RUN_LANES_KEY) and holds no secret.
+# Exit status: 0 passed; 1 failed or timed out; 2 bad usage, or a --where/--arch this repo has no place for; 3 your
+# changes did not apply to the merge base; 6 the upload lock stayed held; 7 no lane host ran it (no host configured, no
+# key, or every slot busy for the whole wait).
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# LANES: the agents' lane hosts, tried in order before Namespace. OFF SWITCH: make this LANE_HOSTS="" and push.
+# LANES: the agents' lane hosts, tried in order. OFF SWITCH: make this LANE_HOSTS="" and push.
 # lat-lax2-f4-lanes-1 (Latitude f4-metal-small, Los Angeles; contextstream docs/runbooks/lane-host.md), proved 2026-11-02.
 LANE_HOSTS="lanes@64.34.88.9"
-cpus=16; timeout=45; label=""; cold=0; print_only=0; artifacts=(); arch=amd64
+cpus=16; timeout=45; label=""; cold=0; print_only=0; artifacts=(); arch=amd64; wait_s=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cpus) cpus=${2:?--cpus needs a number}; shift 2 ;;
     --timeout) timeout=${2:?--timeout needs minutes}; shift 2 ;;
     --label) label=${2:?--label needs text}; shift 2 ;;
     --cold) cold=1; shift ;;
+    --wait-s) wait_s=${2:?--wait-s needs seconds}; shift 2 ;;
     --arch) arch=${2:?--arch needs amd64 or arm64}; shift 2 ;;
     --artifact) artifacts+=("${2:?--artifact needs a path}"); shift 2 ;;
     --print) print_only=1; shift ;;
+    --where) case "${2:-}" in   # OWNER RULE 2026-11-03: only coflow and contextstudio may use Namespace.
+               lanes) shift 2 ;;
+               namespace|bitrise)
+                 echo "ns-run: --where $2 is refused: OWNER RULE 2026-11-03 -- only coflow and contextstudio may use Namespace. A run goes to a lane host (--where lanes, the default) and waits for a slot there." >&2
+                 exit 2 ;;
+               *) echo "ns-run: --where must be lanes (the default): a lane host is the only place a run happens (owner 2026-11-03: only coflow and contextstudio may use Namespace)" >&2; exit 2 ;;
+             esac ;;
     -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     --) shift; break ;;
     *) echo "ns-run: unknown option $1 (usage: scripts/dev/ns-run [opts] -- <command...>)" >&2; exit 2 ;;
@@ -47,6 +55,11 @@ done
 [[ $# -gt 0 ]] || { echo "ns-run: no command given (usage: scripts/dev/ns-run [opts] -- <command...>)" >&2; exit 2; }
 case "$cpus" in 4|8|16|32|64) ;; *) echo "ns-run: --cpus must be 4, 8, 16, 32 or 64" >&2; exit 2 ;; esac
 [[ "$timeout" =~ ^[0-9]+$ ]] || { echo "ns-run: --timeout must be a number of minutes" >&2; exit 2; }
+[[ -z "$wait_s" || "$wait_s" =~ ^[0-9]+$ ]] || { echo "ns-run: --wait-s must be a number of seconds" >&2; exit 2; }
+case "$arch" in
+  amd64) ;;
+  *) echo "ns-run: --arch $arch has no lane host: the lane hosts are x86 (owner 2026-11-03: only coflow and contextstudio may use Namespace). Run the amd64 gate here, or ask the owner where an arm64 build belongs." >&2; exit 2 ;;
+esac
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 base=$(git merge-base HEAD origin/main 2>/dev/null || true)
@@ -83,35 +96,32 @@ git diff --binary "$base" > "$ns/patch.diff"
 new_files=()
 drop_lock
 
-opts=(--base "$base" --patch "$ns/patch.diff" --cpus "$cpus" --timeout "$timeout" --repo mcp-server --result "$ns/result.json")
-[[ -z "$label" ]] || opts+=(--label "$label")
-[[ $cold -eq 0 ]] || opts+=(--cold)
-opts+=(--arch "$arch")
-for a in ${artifacts[@]+"${artifacts[@]}"}; do opts+=(--artifact "$a"); done
-[[ $print_only -eq 0 ]] || opts+=(--print)
-rc=0
-# LANES: a lane host first (amd64 only: the lane hosts are x86); a run it took is the verdict. No key, no host, arm64, or
-# none free: Namespace, labelled why.
-lanes_state=off
+# LANES ONLY: a lane host takes the run, and a run it took is the verdict, even one whose command itself exited 75
+# (read "ran" as JSON, not by its spacing). Every slot busy: it waits there, saying so, for --wait-s (default the
+# timeout); nothing else runs it. OWNER RULE 2026-11-03: Namespace is only for coflow and contextstudio work.
 lane_hosts=${NS_RUN_LANES-$LANE_HOSTS}
 [[ $lane_hosts != off ]] || lane_hosts=""
-[[ $arch == amd64 ]] || { lane_hosts=""; lanes_state=arm64; }
 lane_key=${DEPOT_RUN_LANES_KEY:-$HOME/.config/lanes/key}
-if [[ $print_only -eq 0 && -n "$lane_hosts" && -r "$lane_key" ]]; then
-  lopts=(--hosts "$lane_hosts" --key "$lane_key" --repo mcp-server --family "${LANES_FAMILY:-rust}" --base "$base"
-         --patch "$ns/patch.diff" --timeout "$timeout" --result "$ns/lanes.json")
-  [[ -z "$label" ]] || lopts+=(--label "$label")
-  [[ $cold -eq 0 ]] || lopts+=(--scratch-target --fresh)
-  for a in ${artifacts[@]+"${artifacts[@]}"}; do lopts+=(--artifact "$a"); done
-  python3 "$here/lanes-run.py" "${lopts[@]}" -- "$@" || rc=$?
-  # A run the lane took is the verdict, even one whose command itself exited 75; read "ran" as JSON, not by its spacing.
-  if [[ $rc -ne 75 ]] || python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("ran") is True else 1)' \
-       "$ns/lanes.json" 2>/dev/null; then exit $rc; fi
-  lanes_state="overflow-$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("why") or "other")' "$ns/lanes.json" 2>/dev/null || echo other)"
-  rc=0
-  echo "ns-run: no lane host free: on Namespace instead" >&2
+family=${LANES_FAMILY:-rust}
+[[ -n "$wait_s" ]] || wait_s=$((timeout * 60))
+if [[ $print_only -eq 1 ]]; then
+  echo "ns-run: would run on a lane host from: ${lane_hosts:-<none: NS_RUN_LANES=off>}"
+  echo "ns-run: family $family, key $lane_key, base ${base:0:12} plus $(wc -c < "$ns/patch.diff" | tr -d ' ') bytes of patch, timeout ${timeout}m, wait ${wait_s}s"
+  echo "ns-run: -- $*"
+  exit 0
 fi
-[[ $print_only -eq 1 ]] || opts+=(--lanes-state "$lanes_state")
-echo "ns-run: on Namespace: base ${base:0:12} plus $(wc -c < "$ns/patch.diff" | tr -d ' ') bytes of patch" >&2
-python3 "${NS_RUN_PY:-$here/ns-run.py}" "${opts[@]}" -- "$@" || rc=$?
-exit $rc
+if [[ -z "$lane_hosts" || ! -r "$lane_key" ]]; then
+  echo "ns-run: no lane host (LANE_HOSTS, NS_RUN_LANES) or no key at $lane_key: a lane host is the only place a run happens (owner 2026-11-03: only coflow and contextstudio may use Namespace)" >&2
+  exit 7
+fi
+lopts=(--hosts "$lane_hosts" --key "$lane_key" --repo mcp-server --family "$family" --base "$base"
+       --patch "$ns/patch.diff" --timeout "$timeout" --wait-s "$wait_s" --result "$ns/lanes.json"
+       --artifacts-dir "${TMPDIR:-/tmp}/ns-run-artifacts/lanes-$$")
+[[ -z "$label" ]] || lopts+=(--label "$label")
+[[ $cold -eq 0 ]] || lopts+=(--scratch-target --fresh)
+for a in ${artifacts[@]+"${artifacts[@]}"}; do lopts+=(--artifact "$a"); done
+rc=0
+python3 "$here/lanes-run.py" "${lopts[@]}" -- "$@" || rc=$?
+if [[ $rc -ne 75 ]] || python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("ran") is True else 1)' "$ns/lanes.json" 2>/dev/null; then exit $rc; fi
+echo "ns-run: no lane host ran it (every slot busy for the whole ${wait_s}s wait, a host unreachable, or no slot of this family): nothing else runs it (owner 2026-11-03: only coflow and contextstudio may use Namespace)" >&2
+exit 7

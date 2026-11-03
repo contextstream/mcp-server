@@ -4,8 +4,8 @@ Namespace (the merge base with origin/main plus your patch), through the host's 
 docs/runbooks/lane-host.md; protocol: serve.py `run`.
 
   lanes-run.py --hosts "lanes@HOST ..." --key FILE --base SHA --patch FILE --family rust|web|scripts --timeout MIN
-               [--label TEXT] [--scratch-target] [--verdict-entry FILE] [--fresh] [--artifact PATH]...
-               [--artifacts-dir DIR] --result FILE -- CMD...
+               [--wait-s SECONDS] [--label TEXT] [--scratch-target] [--verdict-entry FILE] [--fresh]
+               [--artifact PATH]... [--artifacts-dir DIR] --result FILE -- CMD...
 
 The hosts are tried in order. Each gets one request, `ssh lanes@HOST run`, with a tar on stdin: request.json and
 patch.diff. The host checks that the base is on its main, takes a free slot of the family, puts the base plus the patch in
@@ -25,16 +25,23 @@ host verifies it, fetches it and runs. A head this checkout doesn't have, or one
 
 HOSTS AND PASSES (coordinator 2026-11-03 01:40Z; the UpCloud box is the second lane host): --hosts lists hosts in order,
 each "user@host" or "user@host/fam,fam" (only those slot families: a host that offers no slot of the run's family is not
-asked). Pass 1 asks every host with "slot_wait_s": 0, so a busy host answers 75 at once and the next is tried; when
-every host was busy, pass 2 asks the first busy one again with the host's own wait (no slot_wait_s). Only then Namespace.
-The overflow reason is busy when any host was busy (capacity), else the last host's.
+asked). Pass 1 asks every host with "slot_wait_s": 0, so a busy host answers 75 at once and the next is tried.
 
-REPOS (owner 2026-11-02 18:3xZ: Namespace only for overflow and coflow): this file is the same in contextstream,
-contextcode and mcp-server; --repo names the host's mirror and slots (sent as "repo", except for contextstream), --family
-the slot family. Only contextstream's --validate sends a verdict key, and only then is nsrun_verdicts.py loaded.
+WAIT (owner 2026-11-03: only coflow and contextstudio use Namespace, so a run with no slot waits for one): when every host was
+busy, the run is queued -- this client asks a busy host again with the host's own slot wait, one request at a time,
+until --wait-s is used up (default: the run's own --timeout). It says so in one line when it starts waiting and once
+more each time it has waited a host's slot wait and is still queued. It does not go anywhere else; when the wait is
+over it returns 75 (ran=False, why="busy"). A host that answers at once with a slot is taken at once, as before, and
+the run never leaves the lane hosts.
+
+REPOS (owner 2026-11-02 18:3xZ, tightened 2026-11-03: Namespace is for coflow and contextstudio only): this file is the same in
+contextstream, contextcode and mcp-server; --repo names the host's mirror and slots (sent as "repo", except for
+contextstream), --family the slot family. Only contextstream's --validate sends a verdict key, and only then is
+nsrun_verdicts.py loaded.
 
 Exit status: the command's, when a host ran it (or reused a passing verdict for exactly this key); 3 when the patch
-doesn't apply; 75 when no host ran it (depot-run then runs it on Namespace). --result gets
+doesn't apply; 75 when no host ran it (the wait ran out, a host is unreachable, or there is no slot of this family).
+--result gets
 {"ran", "run", "where": "lanes", "host", "base", "rc", "reused"}, and with no run "why" the last host passed it over:
 busy, not-ready (a host gap: a tool missing, its off switch), unreachable, no-base (it lacked the base and took no
 bundle), too-big (the patch) or other (serve's 70 or 2).
@@ -170,6 +177,8 @@ def main():
     ap.add_argument("--family", required=True, help="the host's slot family: rust, web, scripts (contextstream), gate, ...")
     ap.add_argument("--repo", default="contextstream", help="REPOS: whose mirror and slots (contextstream, contextcode, mcp-server)")
     ap.add_argument("--timeout", type=int, required=True, help="minutes")
+    ap.add_argument("--wait-s", type=float, default=None, dest="wait_s",
+                    help="seconds to wait for a free slot when every lane host is busy (default: the run's timeout)")
     ap.add_argument("--label", default="")
     ap.add_argument("--scratch-target", action="store_true")
     ap.add_argument("--verdict-entry", default="")
@@ -231,17 +240,28 @@ def main():
         say("no lane host offers a %s slot" % a.family)
         result(ran=False, rc=75, why="other")
         return 75
-    # PASSES: (host, mode, slot_wait_s); 0 in pass 1, None (the host's own wait) in pass 2.
+    # PASSES: (host, mode, slot_wait_s); 0 in pass 1 (ask at once), None in a wait (the host's own slot wait).
+    # WAIT: with no slot free anywhere, the run is queued on a busy host, one request at a time, for --wait-s.
+    wait_total = a.wait_s if a.wait_s is not None else a.timeout * 60
+    started = time.monotonic()
+    deadline = started + max(0.0, wait_total)
     attempts = [(h, None, 0) for h in hosts]
-    busy, why_not = [], "other"   # OVERFLOW: busy hosts (capacity), else why the last host passed the run over
-    second_pass = False
-    while attempts or (busy and not second_pass):
+    busy, why_not = [], "other"   # busy: hosts with no free slot (capacity), else why the last host passed it over
+    pick = 0
+    said_waiting = False
+    while attempts or busy:
         if not attempts:
-            second_pass = True
-            say("every lane host was busy: waiting for a slot on %s" % busy[0])
-            attempts = [(busy[0], None, None)]
+            if not busy or time.monotonic() >= deadline:
+                break
+            host = busy[pick % len(busy)]
+            pick += 1
+            attempts = [(host, None, None)]
+            if not said_waiting:
+                said_waiting = True
+                say("every lane host is busy (%s): waiting for a slot on %s" % (", ".join(busy), host))
         host, mode, wait_s = attempts.pop(0)
-        if wait_s is None:
+        queued = wait_s is None
+        if queued:
             request.pop("slot_wait_s", None)
         else:
             request["slot_wait_s"] = wait_s
@@ -308,6 +328,14 @@ def main():
         # 75 and 2: nothing ran (what came out is serve's own status line). Otherwise a run may have started and stopped.
         unfinished = run.printed and rc not in (75, 2)
         say("%s: %s%s" % (host, why, "; its output above is from a run that didn't finish" if unfinished else ""))
+        if queued and why_not == "busy":
+            say("still waiting for a slot on %s: %d s so far" % (host, int(time.monotonic() - started)))
+            # A host that answers without holding the request at all (not ready, or its slot wait cut short) must not be
+            # hammered: pause a moment before asking again, but never past the deadline.
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    if said_waiting and busy:
+        say("no lane host had a free slot in %d s: nothing else runs it (Namespace is for coflow and contextstudio only)"
+            % int(time.monotonic() - started))
     result(ran=False, rc=75, why="busy" if busy else why_not)
     return 75
 

@@ -16,8 +16,9 @@ name: MCP release
 #     depot ci dispatch --repo contextstream/mcp-server --workflow release.yml --ref main --input mode=dry-run
 #
 # csrun (act on a self-hosted box) runs this same file: plan says so (runner=csrun, from act's ACT=true), and the gate
-# and build jobs then run their command on Namespace through scripts/release/on-namespace.sh (token: REPOS_NAMESPACE_TOKEN)
-# instead of compiling on the runner; publish and hosted run as they are. The secrets below come from csrun's store there.
+# and build jobs then run their command on Latitude's BuildKit through scripts/release/on-lat.sh (on the box itself when
+# that builder can't be reached) instead of compiling on the runner; publish and hosted run as they are. The secrets
+# below come from csrun's store there.
 #
 # Credentials are Depot CI secrets whose only variant is limited to this repository, branch main and this workflow
 # file: MCP_RELEASE_GITHUB_TOKEN, MCP_RELEASE_NPM_TOKEN, MCP_RELEASE_R2_BUCKET_URL, MCP_RELEASE_R2_ACCESS_KEY_ID and

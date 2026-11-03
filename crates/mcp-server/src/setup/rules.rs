@@ -732,6 +732,189 @@ fn project_rules_content(
     rules
 }
 
+/// What a project's rules file holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectRulesForm {
+    /// The whole managed block, with the project's identity header.
+    Full,
+    /// Only the project's identity header. Every editor on this machine that
+    /// reads the file also loads the whole block from its global rules file in
+    /// every session, so a full copy here put the block into each session in
+    /// the project twice (about 45 KB for Claude Code, 58 KB for Codex).
+    Header,
+}
+
+/// Marks a project rules block that holds only the project's identity.
+pub(crate) const PROJECT_HEADER_MARKER: &str = "<!-- contextstream-project-header -->";
+
+/// Set to `full` to keep the whole block in project rules files, for a
+/// checkout whose rules file is committed and read by teammates who have not
+/// run ContextStream setup themselves.
+pub(crate) const ENV_PROJECT_RULES: &str = "CONTEXTSTREAM_PROJECT_RULES";
+
+/// Editors that load their global rules file in every session, beside the
+/// project's rules file. Checked with the real binaries (Claude Code 2.1.317,
+/// Codex 0.163.0) and Gemini CLI's documented memory hierarchy. Other editors
+/// keep the full block in project files.
+fn loads_global_rules_in_every_session(editor: &Editor) -> bool {
+    matches!(
+        editor,
+        Editor::ClaudeCode | Editor::Codex | Editor::GeminiCli
+    )
+}
+
+/// The global rules file `editor` itself reads, which is not always the one
+/// setup writes: Claude Code reads `$CLAUDE_CONFIG_DIR/CLAUDE.md` when that is
+/// set, and Codex reads `AGENTS.override.md` in `$CODEX_HOME` (default
+/// `~/.codex`) in place of `AGENTS.md` when it has content.
+fn global_rules_file_read_by(editor: &Editor) -> Option<PathBuf> {
+    let set_dir = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    match editor {
+        Editor::ClaudeCode => set_dir("CLAUDE_CONFIG_DIR")
+            .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
+            .map(|dir| dir.join("CLAUDE.md")),
+        Editor::Codex => {
+            let dir = set_dir("CODEX_HOME")
+                .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
+            let override_file = dir.join("AGENTS.override.md");
+            let has_content = std::fs::read_to_string(&override_file)
+                .is_ok_and(|content| !content.trim().is_empty());
+            Some(if has_content {
+                override_file
+            } else {
+                dir.join("AGENTS.md")
+            })
+        }
+        _ => editor.rules_path(None),
+    }
+}
+
+/// Whether the global rules file `editor` reads holds the managed block.
+fn global_rules_hold_block(editor: &Editor) -> bool {
+    global_rules_file_read_by(editor)
+        .and_then(|path| std::fs::read_to_string(resolve_rules_file_path(&path)).ok())
+        .is_some_and(|content| content_has_owned_contextstream_rules(&content))
+}
+
+/// The form `editor`'s project rules file takes, given the editors that read
+/// project rules on this machine (`readers`) and whether each one's global
+/// rules file holds the block. Editors sharing the file (several read
+/// `AGENTS.md`) all decide alike, so they never rewrite each other's block.
+pub(crate) fn project_rules_form_for(
+    editor: &Editor,
+    readers: &[Editor],
+    holds_block: impl Fn(&Editor) -> bool,
+) -> ProjectRulesForm {
+    let file = editor.rules_path(Some(Path::new("")));
+    if file.is_none() {
+        return ProjectRulesForm::Full;
+    }
+    let mut sharing: Vec<Editor> = readers
+        .iter()
+        .filter(|reader| reader.rules_path(Some(Path::new(""))) == file)
+        .copied()
+        .collect();
+    if !sharing.contains(editor) {
+        sharing.push(*editor);
+    }
+    if sharing
+        .iter()
+        .all(|reader| loads_global_rules_in_every_session(reader) && holds_block(reader))
+    {
+        ProjectRulesForm::Header
+    } else {
+        ProjectRulesForm::Full
+    }
+}
+
+/// The editors that read project rules on this machine: the ones setup
+/// configured, or, for an install that predates that record, every editor
+/// found installed.
+fn project_rules_readers() -> Vec<Editor> {
+    match mcp_client::activation::configured_client_selection() {
+        Ok(selection) if selection.recorded => selection
+            .clients
+            .iter()
+            .filter_map(|id| Editor::from_id(id))
+            .collect(),
+        _ => super::editors::detect_installed_editors(),
+    }
+}
+
+/// The form `editor`'s project rules take on this machine.
+pub fn project_rules_form(editor: &Editor) -> ProjectRulesForm {
+    project_rules_form_after(editor, false)
+}
+
+/// [`project_rules_form`] right after this run wrote `editor`'s global rules
+/// (`global_written`). A dry run leaves that file as it was, yet the run would
+/// put the block in it, so it counts when it is the file the editor reads.
+pub fn project_rules_form_after(editor: &Editor, global_written: bool) -> ProjectRulesForm {
+    if std::env::var(ENV_PROJECT_RULES).is_ok_and(|value| value.trim().eq_ignore_ascii_case("full"))
+    {
+        return ProjectRulesForm::Full;
+    }
+    let written_is_read = global_written
+        && global_rules_file_read_by(editor)
+            .is_some_and(|read| editor.all_rules_paths(None).contains(&read));
+    project_rules_form_for(editor, &project_rules_readers(), |reader| {
+        (written_is_read && reader == editor) || global_rules_hold_block(reader)
+    })
+}
+
+/// Where the full rules come from, as the header names it.
+fn global_rules_display(editor: &Editor) -> &'static str {
+    match editor {
+        Editor::ClaudeCode => "`~/.claude/CLAUDE.md`",
+        Editor::Codex => "`~/.codex/AGENTS.md`",
+        Editor::GeminiCli => "`~/.gemini/GEMINI.md`",
+        _ => "your global rules file",
+    }
+}
+
+/// The project rules block in [`ProjectRulesForm::Header`]: the project's
+/// identity, the same lines the full block opens with, and where the full rules
+/// come from.
+fn project_rules_header_content(
+    editor: &Editor,
+    workspace_id: Option<&str>,
+    workspace_name: Option<&str>,
+    project_name: Option<&str>,
+) -> String {
+    let global = global_rules_display(editor);
+    let content = format!(
+        "{start}\n{marker}\n# Workspace: {workspace}\n# Project: {project}\n# Workspace ID: {workspace_id}\n\nThis project uses ContextStream: use the workspace and project above with `init(...)` and `context(...)`.\nThe full ContextStream rules are not repeated here. They are in {global}, which {editor_name} loads in every session, in this project and outside it.\nIf your instructions hold no ContextStream rules block from {global}, run `contextstream-mcp update-rules --scope=all` in a terminal to restore it.\n{end}\n",
+        start = CONTEXTSTREAM_START,
+        marker = PROJECT_HEADER_MARKER,
+        workspace = workspace_name.unwrap_or(DEFAULT_WORKSPACE_NAME),
+        project = project_name.unwrap_or("mcp"),
+        workspace_id = workspace_id.unwrap_or(DEFAULT_WORKSPACE_ID),
+        editor_name = editor.display_name(),
+        end = CONTEXTSTREAM_END,
+    );
+    if *editor == Editor::ClaudeCode {
+        apply_mcp_prefix(&content)
+    } else {
+        content
+    }
+}
+
+/// Whether a rules file's managed block is the project header form.
+pub(crate) fn content_is_project_header(content: &str) -> bool {
+    find_contextstream_block_bounds(content)
+        .is_some_and(|(start, end)| content[start..end].contains(PROJECT_HEADER_MARKER))
+}
+
+/// Whether the global rules `editor` reads lack the block a project header
+/// relies on.
+pub(crate) fn project_header_lacks_global_rules(editor: &Editor) -> bool {
+    !global_rules_hold_block(editor)
+}
+
 fn compute_rules_bundle_hash(teaching_contract: &str) -> String {
     let mut material = Vec::new();
     append_fingerprint_component(
@@ -752,6 +935,13 @@ fn compute_rules_bundle_hash(teaching_contract: &str) -> String {
             &format!("{}:project", editor.id()),
             &project_rules_content(editor, None, None, None),
         );
+        if loads_global_rules_in_every_session(editor) {
+            append_fingerprint_component(
+                &mut material,
+                &format!("{}:project-header", editor.id()),
+                &project_rules_header_content(editor, None, None, None),
+            );
+        }
     }
 
     // These sidecars affect whether/how the managed teaching is loaded even
@@ -877,11 +1067,17 @@ fn preview_editor_rules(request: &mcp_types::rules_hash::EditorRulesPreviewReque
         }
         if let Some(project) = project {
             if let Some(path) = editor.all_rules_paths(Some(project)).into_iter().next() {
-                let content = project_rules_content(
+                let form = if read_installed {
+                    project_rules_form(editor)
+                } else {
+                    ProjectRulesForm::Full
+                };
+                let content = project_rules_content_as(
                     editor,
                     workspace_id.as_deref(),
                     workspace_name.as_deref(),
                     project_name.as_deref(),
+                    form,
                 );
                 targets.push(("project", path, content));
             }
@@ -1556,7 +1752,47 @@ pub fn write_editor_rules(editor: &Editor) -> Result<()> {
     Ok(())
 }
 
-/// Write project-level rules file.
+/// A project's rules file in the full form, for tests of the full block;
+/// setup and `update-rules` call [`write_project_rules_as`] with the form for
+/// this machine.
+#[cfg(test)]
+pub fn write_project_rules(
+    editor: &Editor,
+    project_path: &Path,
+    workspace_id: Option<&str>,
+    workspace_name: Option<&str>,
+    project_name: Option<&str>,
+) -> Result<()> {
+    write_project_rules_as(
+        editor,
+        project_path,
+        workspace_id,
+        workspace_name,
+        project_name,
+        ProjectRulesForm::Full,
+    )
+}
+
+/// The project rules content in `form`.
+fn project_rules_content_as(
+    editor: &Editor,
+    workspace_id: Option<&str>,
+    workspace_name: Option<&str>,
+    project_name: Option<&str>,
+    form: ProjectRulesForm,
+) -> String {
+    match form {
+        ProjectRulesForm::Full => {
+            project_rules_content(editor, workspace_id, workspace_name, project_name)
+        }
+        ProjectRulesForm::Header => {
+            project_rules_header_content(editor, workspace_id, workspace_name, project_name)
+        }
+    }
+}
+
+/// Write project-level rules file in `form`; setup and `update-rules` pass
+/// [`project_rules_form_after`], the form for this machine.
 ///
 /// Every editor that declares a project rules target receives that file,
 /// including `AGENTS.md` clients (`codex`, `opencode`, `muse`, `copilot-cli`,
@@ -1565,12 +1801,13 @@ pub fn write_editor_rules(editor: &Editor) -> Result<()> {
 /// workspace/project guidance (and left editors without global rules, like Muse
 /// Code and Crush, with no ContextStream rules at all) while causing setup
 /// verification to report missing project rules files.
-pub fn write_project_rules(
+pub fn write_project_rules_as(
     editor: &Editor,
     project_path: &Path,
     workspace_id: Option<&str>,
     workspace_name: Option<&str>,
     project_name: Option<&str>,
+    form: ProjectRulesForm,
 ) -> Result<()> {
     let paths = editor.all_rules_paths(Some(project_path));
     if paths.is_empty() {
@@ -1584,7 +1821,7 @@ pub fn write_project_rules(
         let _ =
             write_shared_project_rules(project_path, workspace_id, workspace_name, project_name)?;
     }
-    let rules = project_rules_content(editor, workspace_id, workspace_name, project_name);
+    let rules = project_rules_content_as(editor, workspace_id, workspace_name, project_name, form);
 
     let primary = &paths[0];
     write_contextstream_block_to_path(primary, &rules, true)?;
@@ -5651,5 +5888,180 @@ mod global_rules_identity_tests {
             std::fs::write(home.join(".contextstream/installation.json"), "{not json").unwrap();
             assert_eq!(retired_antigravity_gemini_md_rules(), None);
         });
+    }
+}
+
+#[cfg(test)]
+mod project_rules_form_tests {
+    use super::*;
+
+    fn holding(editors: &'static [Editor]) -> impl Fn(&Editor) -> bool {
+        move |editor| editors.contains(editor)
+    }
+
+    #[test]
+    fn a_project_file_names_only_the_project_when_its_readers_load_the_global_block() {
+        use ProjectRulesForm::{Full, Header};
+        let claude = Editor::ClaudeCode;
+        let codex = Editor::Codex;
+        // Claude Code alone reads CLAUDE.md.
+        assert_eq!(
+            project_rules_form_for(&claude, &[claude], holding(&[Editor::ClaudeCode])),
+            Header
+        );
+        assert_eq!(
+            project_rules_form_for(&claude, &[], holding(&[Editor::ClaudeCode])),
+            Header
+        );
+        assert_eq!(
+            project_rules_form_for(&claude, &[claude], holding(&[])),
+            Full
+        );
+        // Readers of other files don't count.
+        assert_eq!(
+            project_rules_form_for(
+                &codex,
+                &[claude, codex, Editor::GeminiCli],
+                holding(&[Editor::Codex])
+            ),
+            Header
+        );
+        // AGENTS.md is shared: every reader has to hold the block globally,
+        // and editors not known to load their global file keep the full one.
+        assert_eq!(
+            project_rules_form_for(
+                &codex,
+                &[codex, Editor::OpenCode],
+                holding(&[Editor::Codex, Editor::OpenCode])
+            ),
+            Full
+        );
+        assert_eq!(
+            project_rules_form_for(
+                &codex,
+                &[codex, Editor::MuseCode],
+                holding(&[Editor::Codex])
+            ),
+            Full
+        );
+        assert_eq!(
+            project_rules_form_for(
+                &Editor::OpenCode,
+                &[Editor::OpenCode],
+                holding(&[Editor::OpenCode])
+            ),
+            Full
+        );
+        // Gemini CLI shares GEMINI.md with Antigravity.
+        assert_eq!(
+            project_rules_form_for(
+                &Editor::GeminiCli,
+                &[Editor::GeminiCli],
+                holding(&[Editor::GeminiCli])
+            ),
+            Header
+        );
+        assert_eq!(
+            project_rules_form_for(
+                &Editor::GeminiCli,
+                &[Editor::GeminiCli, Editor::Antigravity],
+                holding(&[Editor::GeminiCli, Editor::Antigravity])
+            ),
+            Full
+        );
+        // An editor without project rules has nothing to shorten.
+        assert_eq!(
+            project_rules_form_for(&Editor::ClaudeDesktop, &[], holding(&[])),
+            Full
+        );
+    }
+
+    #[test]
+    fn the_project_header_names_the_project_and_where_the_rules_are() {
+        for editor in [Editor::ClaudeCode, Editor::Codex, Editor::GeminiCli] {
+            let header = stamp_block_with_canonical_rules_hash(&project_rules_header_content(
+                &editor,
+                Some("550e8400-e29b-41d4-a716-446655440000"),
+                Some("Example Team"),
+                Some("app"),
+            ));
+            let full = project_rules_content(
+                &editor,
+                Some("550e8400-e29b-41d4-a716-446655440000"),
+                Some("Example Team"),
+                Some("app"),
+            );
+            assert!(content_has_owned_contextstream_rules(&header), "{header}");
+            assert!(content_is_project_header(&header), "{header}");
+            assert!(!content_is_project_header(&full));
+            assert_eq!(
+                parse_workspace_identity_from_rules_content(&header),
+                (
+                    Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+                    Some("Example Team".to_string())
+                )
+            );
+            assert!(header.contains("# Project: app"), "{header}");
+            assert!(header.contains(global_rules_display(&editor)), "{header}");
+            assert!(
+                header.len() * 20 < full.len(),
+                "{} vs {}",
+                header.len(),
+                full.len()
+            );
+        }
+        let claude = project_rules_header_content(&Editor::ClaudeCode, None, None, None);
+        assert!(
+            claude.contains("`mcp__contextstream__init(...)`"),
+            "{claude}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod project_rules_form_machine_tests {
+    use super::*;
+
+    #[test]
+    fn a_global_write_in_the_same_run_counts_only_where_the_editor_reads_it() {
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let saved: Vec<_> = ["HOME", "CLAUDE_CONFIG_DIR", ENV_PROJECT_RULES]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        std::env::set_var("HOME", temp.path());
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::remove_var(ENV_PROJECT_RULES);
+
+        let claude = Editor::ClaudeCode;
+        // Nothing on disk: a dry run's global write still counts.
+        let fresh = (
+            project_rules_form(&claude),
+            project_rules_form_after(&claude, true),
+        );
+        // Claude Code reading another directory's CLAUDE.md does not see it.
+        std::env::set_var("CLAUDE_CONFIG_DIR", temp.path().join("elsewhere"));
+        let elsewhere = project_rules_form_after(&claude, true);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        // Written for real, it counts without being told.
+        write_editor_rules(&claude).expect("global rules");
+        let written = project_rules_form(&claude);
+        std::env::set_var(ENV_PROJECT_RULES, "full");
+        let opted_out = project_rules_form(&claude);
+
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        use ProjectRulesForm::{Full, Header};
+        assert_eq!(fresh, (Full, Header));
+        assert_eq!(elsewhere, Full);
+        assert_eq!(written, Header);
+        assert_eq!(opted_out, Full);
     }
 }

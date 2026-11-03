@@ -2323,12 +2323,15 @@ pub async fn update_rules_scoped(
 
         // Update project rules (some clients, e.g. Claude Desktop, have none)
         if (scope == "project" || scope == "all") && editor.rules_path(Some(&cwd)).is_some() {
-            match rules::write_project_rules(
+            // The global rules above are written first, so the form sees them.
+            let form = rules::project_rules_form_after(editor, updated.contains(&"global rules"));
+            match rules::write_project_rules_as(
                 editor,
                 &cwd,
                 ws_id_ref,
                 ws_name_ref,
                 Some(project_name),
+                form,
             ) {
                 Ok(()) => updated.push("project rules"),
                 Err(e) => {
@@ -4512,12 +4515,16 @@ pub(crate) async fn configure_editor_with_workspace_and_project_name(
     // Clients without project rules (Claude Desktop) are skipped.
     if let Some(project_path) = project_path.filter(|path| editor.rules_path(Some(path)).is_some())
     {
-        match rules::write_project_rules(
+        // After the global rules: a project file names only the project when
+        // every editor reading it loads the whole block from its global file.
+        let form = rules::project_rules_form_after(editor, rules_targets.contains(&"global"));
+        match rules::write_project_rules_as(
             editor,
             project_path,
             workspace_id,
             workspace_name,
             Some(project_name),
+            form,
         ) {
             Ok(()) => {
                 rules_targets.push("project");

@@ -378,17 +378,7 @@ impl ToolHandler for CoordinationTool {
                     .client
                     .ack_coordination_notice(uuid, workspace_id)
                     .await
-                    .map_err(|e| match e {
-                        // A notice belongs to the session it was delivered to; after a
-                        // session moves, the same item reaches it as a new notice.
-                        Error::Http { status: 404, .. } => Error::refused(
-                            mcp_types::ValidationReason::ReferenceNotFound,
-                            format!(
-                                "Notice {notice_id} is not one of this session's notices. A notice belongs to the session it was delivered to; after a session moves, the same item comes back as a new notice: coordination(action=\"inbox\") lists this session's notices with their ids."
-                            ),
-                        ),
-                        other => other,
-                    })?;
+                    .map_err(|e| not_this_sessions_notice(&notice_id, e))?;
                 Ok(ToolResult::with_structured(
                     format!("Acked coordination notice {notice_id}"),
                     result,
@@ -408,6 +398,15 @@ impl ToolHandler for CoordinationTool {
                     .map(str::trim)
                     .filter(|m| !m.is_empty())
                     .ok_or_else(|| Error::Validation("message is required for reply".into()))?;
+                let length = message.chars().count();
+                if length > REPLY_MAX_CHARS {
+                    return Err(Error::refused(
+                        mcp_types::ValidationReason::InvalidValue,
+                        format!(
+                            "`message` is {length} characters; a reply takes at most {REPLY_MAX_CHARS}, and the notice line it becomes shows the first 600. Shorten it, or put the details in a share: coordination(action=\"share\", to=..., title=..., summary=...)."
+                        ),
+                    ));
+                }
                 let result = self
                     .client
                     .reply_coordination_notice(uuid, message, workspace_id)
@@ -420,11 +419,11 @@ impl ToolHandler for CoordinationTool {
                             Error::refused(
                                 mcp_types::ValidationReason::InvalidValue,
                                 format!(
-                                    "Notice {notice_id} can't take a reply: the share it came from didn't name its sender's session. Ack it with coordination(action=\"ack\", notice_id=\"{notice_id}\"), and answer the sender with coordination(action=\"share\", to=\"<their agent name>\", title=..., summary=...). Shares that pass session_id can be replied to."
+                                    "`notice_id` {notice_id} can't take a reply: the share it came from didn't name its sender's session. Ack it with coordination(action=\"ack\", notice_id=\"{notice_id}\"), and answer the sender with coordination(action=\"share\", to=\"<their agent name>\", title=..., summary=...). Shares that pass session_id can be replied to."
                                 ),
                             )
                         }
-                        other => other,
+                        other => not_this_sessions_notice(&notice_id, other),
                     })?;
                 Ok(ToolResult::with_structured(
                     format_reply(&result, &notice_id),
@@ -442,7 +441,8 @@ impl ToolHandler for CoordinationTool {
                 let result = self
                     .client
                     .dismiss_coordination_notice(uuid, workspace_id)
-                    .await?;
+                    .await
+                    .map_err(|e| not_this_sessions_notice(&notice_id, e))?;
                 Ok(ToolResult::with_structured(
                     format!("Dismissed coordination notice {notice_id}"),
                     result,
@@ -502,7 +502,11 @@ impl ToolHandler for CoordinationTool {
                 "Workspace ID. Defaults to active scope.",
                 false,
             )
-            .uuid("project_id", "Project ID. Defaults to active scope.", false)
+            .uuid(
+                "project_id",
+                "Project ID. Defaults to this session's project (set by init in this session). action=\"share\" needs one: pass it when this session has none.",
+                false,
+            )
             .string(
                 "session_id",
                 "Your live session id (the one you pass to context/init): for check_in / inbox, and on share so replies to it reach you.",
@@ -774,6 +778,25 @@ fn format_item(result: &Value, id: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("item");
     format!("Coordination item {id} ({kind}): {title}")
+}
+
+/// The longest reply the API takes (`ReplyNoticeRequest`).
+const REPLY_MAX_CHARS: usize = 2000;
+
+/// The API's 404 for a notice action: the notice is not this session's. A
+/// notice belongs to the session it was delivered to; after a session moves,
+/// the same item reaches it as a new notice. ack said so; reply and dismiss
+/// passed on the bare 404 (2026-11-03).
+fn not_this_sessions_notice(notice_id: &str, error: Error) -> Error {
+    match error {
+        Error::Http { status: 404, .. } => Error::refused(
+            mcp_types::ValidationReason::ReferenceNotFound,
+            format!(
+                "`notice_id` {notice_id} is not one of this session's notices. A notice belongs to the session it was delivered to; after a session moves, the same item comes back as a new notice: coordination(action=\"inbox\") lists this session's notices with their ids."
+            ),
+        ),
+        other => other,
+    }
 }
 
 fn format_reply(result: &Value, notice_id: &str) -> String {
@@ -1342,5 +1365,161 @@ mod short_id_tests {
         assert_eq!(input["limit"], serde_json::json!(6));
         let parsed: CoordinationInput = serde_json::from_value(input).expect("parses");
         assert_eq!(parsed.limit, Some(6));
+    }
+}
+
+#[cfg(test)]
+mod notice_refusal_tests {
+    //! Agents' coordination calls that the API refused (telemetry,
+    //! 2026-11-03): replies and acks to notices that are not this session's
+    //! (404), replies to notices whose share named no sending session, and a
+    //! reply longer than the API takes (400). Each refusal names the argument
+    //! it is about, so an agent knows what to change and the gateway's
+    //! telemetry records it.
+    use super::*;
+    use crate::testing::TestFixtures;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const NOTICE: &str = "660e8400-e29b-41d4-a716-446655440000";
+
+    /// Answers every request with `status` and `body`; returns the request
+    /// lines it saw.
+    fn answer_all(
+        listener: tokio::net::TcpListener,
+        status: u16,
+        body: &'static str,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
+            {
+                let mut buffer = vec![0u8; 16 * 1024];
+                let read = socket.read(&mut buffer).await.expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                lines.push(request.lines().next().unwrap_or_default().to_string());
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            lines
+        })
+    }
+
+    async fn tool() -> (CoordinationTool, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{}", listener.local_addr().expect("addr"));
+        config.api_key = Some("test-key".to_string());
+        (
+            CoordinationTool::new(ContextStreamClient::new(config)),
+            listener,
+        )
+    }
+
+    fn named(tool: &CoordinationTool, error: &Error) -> Option<String> {
+        crate::registry::refused_argument(&tool.input_schema(), &error.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_notice_that_is_not_this_sessions_is_said_so_for_ack_reply_and_dismiss() {
+        for input in [
+            serde_json::json!({"action": "ack"}),
+            serde_json::json!({"action": "reply", "message": "Thanks."}),
+            serde_json::json!({"action": "dismiss"}),
+        ] {
+            let (tool, listener) = tool().await;
+            let _seen = answer_all(
+                listener,
+                404,
+                r#"{"error":{"code":"not_found","message":"Coordination notice not found"}}"#,
+            );
+            let mut input = input;
+            input["notice_id"] = serde_json::json!(NOTICE);
+            input["workspace_id"] = serde_json::json!(TestFixtures::workspace_id());
+            let error = tool.execute(input.clone()).await.expect_err("refused");
+            assert!(
+                matches!(
+                    error,
+                    Error::Refused {
+                        reason: mcp_types::ValidationReason::ReferenceNotFound,
+                        ..
+                    }
+                ),
+                "{input}: {error}"
+            );
+            let text = error.to_string();
+            assert!(
+                text.contains("is not one of this session's notices"),
+                "{input}: {text}"
+            );
+            assert!(
+                text.contains("coordination(action=\"inbox\")"),
+                "{input}: {text}"
+            );
+            assert_eq!(
+                named(&tool, &error).as_deref(),
+                Some("notice_id"),
+                "{input}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_notice_with_no_sending_session_names_the_notice_not_the_action() {
+        let (tool, listener) = tool().await;
+        let _seen = answer_all(
+            listener,
+            400,
+            r#"{"error":{"code":"bad_request","message":"This notice has no origin session to reply to; ack or dismiss it instead"}}"#,
+        );
+        let error = tool
+            .execute(
+                serde_json::json!({"action": "reply", "notice_id": NOTICE, "message": "Thanks.",
+                                        "workspace_id": TestFixtures::workspace_id()}),
+            )
+            .await
+            .expect_err("refused");
+        let text = error.to_string();
+        assert!(text.contains("can't take a reply"), "{text}");
+        // It used to be counted as a bad `action`, the first declared word in it.
+        assert_eq!(named(&tool, &error).as_deref(), Some("notice_id"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_longer_than_the_api_takes_is_refused_before_it_is_sent() {
+        let (tool, listener) = tool().await;
+        let seen = answer_all(listener, 200, "{}");
+        let error = tool
+            .execute(serde_json::json!({"action": "reply", "notice_id": NOTICE,
+                                        "message": "x".repeat(2001),
+                                        "workspace_id": TestFixtures::workspace_id()}))
+            .await
+            .expect_err("too long");
+        let text = error.to_string();
+        assert!(text.contains("2000"), "{text}");
+        assert!(text.contains("2001"), "{text}");
+        assert_eq!(named(&tool, &error).as_deref(), Some("message"), "{text}");
+        assert_eq!(seen.await.unwrap(), Vec::<String>::new(), "nothing is sent");
+    }
+
+    #[test]
+    fn the_schema_says_a_share_needs_a_project() {
+        // "Defaults to active scope." left agents with no project in this
+        // session to find out from the refusal (share missing_argument
+        // project_id, 3 times on 2026-11-03).
+        let tool = CoordinationTool::new(ContextStreamClient::new(TestFixtures::test_config()));
+        let schema = tool.input_schema();
+        let description = schema["properties"]["project_id"]["description"]
+            .as_str()
+            .expect("project_id is described");
+        assert!(description.contains("share"), "{description}");
     }
 }

@@ -1366,3 +1366,64 @@ async fn an_id_the_api_does_not_know_is_refused_as_naming_nothing() {
         );
     }
 }
+
+/// A customer's memory_read get_doc (2026-11-03) named a doc that doesn't
+/// exist and was told "No doc found matching ...", which named no argument,
+/// so the gateway's telemetry couldn't say which one. A doc id the API
+/// doesn't know went further: get_doc, update_doc and delete_doc answered
+/// only "HTTP error (404)". Both now say what the tasks' lookups say.
+#[tokio::test]
+async fn a_doc_reference_that_names_nothing_names_doc_id() {
+    let missing = Uuid::new_v4();
+    let api = Api::start({
+        let mut routes = vec![
+            route("GET", "/api/v1/docs?", 200, items(json!([]))),
+            route("POST", "/api/v1/docs/search", 200, items(json!([]))),
+        ];
+        for method in ["GET", "PATCH", "PUT", "DELETE"] {
+            routes.push(route(
+                method,
+                "/api/v1/docs/",
+                404,
+                json!({"error": "Not found: Content not found"}),
+            ));
+        }
+        routes
+    })
+    .await;
+    let schema = api.memory().input_schema();
+    for input in [
+        json!({"action": "get_doc", "doc_id": "quarterly billing export"}),
+        json!({"action": "get_doc", "doc_id": missing}),
+        json!({"action": "update_doc", "doc_id": missing, "title": "Renamed"}),
+        json!({"action": "delete_doc", "doc_id": missing}),
+    ] {
+        let mut input = input;
+        input["workspace_id"] = json!(api.ws);
+        let error = api
+            .memory()
+            .execute(input.clone())
+            .await
+            .expect_err("a doc reference that names nothing is refused");
+        let text = error.to_string();
+        assert!(
+            matches!(
+                error,
+                mcp_types::Error::Refused {
+                    reason: mcp_types::ValidationReason::ReferenceNotFound,
+                    ..
+                }
+            ),
+            "{input}: {text}"
+        );
+        assert!(
+            text.contains("memory(action=\"list_docs\")"),
+            "{input}: {text}"
+        );
+        assert_eq!(
+            crate::registry::refused_argument(&schema, &text).as_deref(),
+            Some("doc_id"),
+            "{input}: {text}"
+        );
+    }
+}

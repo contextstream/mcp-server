@@ -6338,7 +6338,8 @@ impl MemoryTool {
                         300,
                         || async move { client.get_doc(id).await },
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| DOC.unknown_id(id, error))?;
                     let mut result = result;
                     let text = show_doc(&mut result, input.offset, input.max_chars);
                     consume_grounding_memory_tool(&self.session).await;
@@ -6362,10 +6363,10 @@ impl MemoryTool {
                 .await?;
 
                 if matches.is_empty() {
-                    return Err(Error::Validation(format!(
-                        "No doc found matching \"{}\". Use list_docs to browse available docs.",
-                        query
-                    )));
+                    return Err(Error::refused(
+                        ValidationReason::ReferenceNotFound,
+                        DOC.names_nothing(query),
+                    ));
                 }
 
                 // The rule every reference follows (see `lookup`): one doc
@@ -6379,7 +6380,11 @@ impl MemoryTool {
                 )
                 .found(DOC.kind, query);
                 if let Some(found) = named {
-                    let mut result = self.client.get_doc(found.id).await?;
+                    let mut result = self
+                        .client
+                        .get_doc(found.id)
+                        .await
+                        .map_err(|error| DOC.unknown_id(found.id, error))?;
                     carry_linked_label(&mut result, &matches, found.id);
                     let text = format!(
                         "Resolved doc query \"{}\" to doc ID {}.\n\n{}",
@@ -6437,7 +6442,11 @@ impl MemoryTool {
                         // The API has no update precondition, so a write
                         // landing between this read and the update below
                         // (a few milliseconds) would be overwritten.
-                        let current = self.client.get_doc(id).await?;
+                        let current = self
+                            .client
+                            .get_doc(id)
+                            .await
+                            .map_err(|error| DOC.unknown_id(id, error))?;
                         let current_content = current
                             .get("content")
                             .or_else(|| current.get("data").and_then(|data| data.get("content")))
@@ -6454,7 +6463,11 @@ impl MemoryTool {
                     content,
                     doc_type: input.doc_type,
                 };
-                let mut result = self.client.update_doc(id, params).await?;
+                let mut result = self
+                    .client
+                    .update_doc(id, params)
+                    .await
+                    .map_err(|error| DOC.unknown_id(id, error))?;
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert(
                         "operation_status".to_string(),
@@ -6502,7 +6515,11 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self.client.delete_doc(id).await?;
+                let result = self
+                    .client
+                    .delete_doc(id)
+                    .await
+                    .map_err(|error| DOC.unknown_id(id, error))?;
                 let text = "Doc deleted successfully.";
                 Ok(found.tool_result(text, result))
             }

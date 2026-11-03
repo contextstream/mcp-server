@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.60
+
+- Studio: a connection may ask for its makes to be rehearsals: the header `X-ContextStream-Studio-Rehearsal: 1` on the hosted gateway, or `CONTEXTSTREAM_STUDIO_REHEARSAL=1` for a local binary. It is off unless one of them says on, and the header wins. A rehearsal's `make` is made by Create on its staging engine with placeholder media and charged 0 credits; the answer says so, and its structured result has `held_credits` 0 and `rehearsal: true`. A connection that doesn't ask makes as before.
+
 ## 1.0.59
 
 - Hosted gateway: a session served by mcp.contextstream.io is never told to update the MCP (no `[VERSION_NOTICE]` or `[VERSION]` line from `init`, `context` or setup), since a hosted user has no binary to update. When the gateway itself is behind the latest release, it logs one warning per newer version for its operators instead. A server you run yourself (stdio or local) still tells you when a newer version is out.

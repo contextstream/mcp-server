@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.62
+
+- Rules: in a set-up project, Claude Code, Codex and Gemini CLI read the ContextStream rules once. The full rules stay in the editor's global rules file (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`). The project's file holds only its workspace and project when every editor on the machine that reads it loads that global file; otherwise it keeps the full rules as before. `CONTEXTSTREAM_PROJECT_RULES=full` keeps the full rules in the project's file, for a committed file read by teammates who haven't run setup. Codex, which cuts a project's AGENTS.md at 32 KiB, now reads a project's own instructions after the ContextStream header.
+
 ## 1.0.61
 
 - `memory`: a doc id the API doesn't know is refused as naming nothing by `get_doc`, `update_doc` and `delete_doc`, with the same message a title that matches nothing gets (No docs found matching `doc_id` "<id>", and `memory(action="list_docs")` to see the available ids), instead of a bare "HTTP error (404)". A doc title that matches nothing now names `doc_id` too.

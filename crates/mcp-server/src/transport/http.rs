@@ -3381,6 +3381,7 @@ fn extract_config_override(headers: &HeaderMap) -> Option<ConfigOverride> {
             )
         })
         .and_then(|value| value.trim().parse::<u32>().ok()),
+        studio_rehearsal: parse_header_bool(headers, mcp_tools::domains::studio::REHEARSAL_HEADER),
     };
 
     if override_config.is_empty() {
@@ -5903,6 +5904,46 @@ mod tests {
                 override_config.effective_acceleration_enabled(),
                 Some(false),
                 "new acceleration header must take precedence over deprecated Atlas alias"
+            );
+        }
+
+        #[test]
+        fn test_extract_config_override_reads_the_studio_rehearsal_header_and_nothing_else_turns_it_on(
+        ) {
+            let mut headers = HeaderMap::new();
+            assert!(
+                extract_config_override(&headers).is_none(),
+                "no header, no override"
+            );
+            headers.insert("x-contextstream-search-limit", "25".parse().unwrap());
+            assert_eq!(
+                extract_config_override(&headers)
+                    .expect("config override")
+                    .studio_rehearsal,
+                None,
+                "a normal connection never asks for a rehearsal"
+            );
+            headers.insert("x-contextstream-studio-rehearsal", "1".parse().unwrap());
+            assert_eq!(
+                extract_config_override(&headers)
+                    .expect("config override")
+                    .studio_rehearsal,
+                Some(true)
+            );
+            let mut only = HeaderMap::new();
+            only.insert("X-ContextStream-Studio-Rehearsal", "true".parse().unwrap());
+            assert_eq!(
+                extract_config_override(&only)
+                    .expect("the header alone is an override")
+                    .studio_rehearsal,
+                Some(true)
+            );
+            only.insert("X-ContextStream-Studio-Rehearsal", "0".parse().unwrap());
+            assert_eq!(
+                extract_config_override(&only)
+                    .expect("config override")
+                    .studio_rehearsal,
+                Some(false)
             );
         }
 

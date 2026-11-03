@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A gate part or a release binary on Latitude's BuildKit (lat-chi), for .depot/workflows/release.yml when the self-hosted box
+# A gate part or a release binary on Latitude's BuildKit (lat-chi), for .csrun/workflows/release.yml when the self-hosted box
 # runs the release: the heavy compile leaves the box, whose CPU the contextstream release's validation needs. It builds the
 # stage gate or binary of scripts/release/gate.Dockerfile with this checkout as the context, through a remote buildx builder
 # made in a private buildx config (the release box's ssh config names relbuild-lat1 and its key). Cargo's home and each part's

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and check one release binary (.depot/workflows/release.yml, job build; on the self-hosted box through
+# Build and check one release binary (.csrun/workflows/release.yml, job build; on the self-hosted box through
 # scripts/release/build-on-box.sh).
 #
 #   scripts/release/build.sh <artifact> <version>

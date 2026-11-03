@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The MCP server release, run by Depot CI (.depot/workflows/release.yml). No person takes part.
+"""The MCP server release, run by csrun (.csrun/workflows/release.yml). No person takes part.
 
   plan          What this run does. The version is the one package.json, Cargo.toml and server.json name at the
                 pushed commit (a "prepare MCP X.Y.Z" commit raises it). A version whose every public channel is

@@ -13,15 +13,15 @@ name: MCP release
 #                 key: put, list, get and delete of a probe object under mcp/.release-probe/). Any run that is not a
 #                 clean checkout of main is a dry run.
 #
-#     depot ci dispatch --repo contextstream/mcp-server --workflow release.yml --ref main --input mode=dry-run
+#     csrun dispatch mcp-server release.yml --input mode=dry-run        (the release box's dispatch key)
 #
-# csrun (act on a self-hosted box) runs this same file: plan says so (runner=csrun, from act's ACT=true), and the gate
+# csrun (act on the release box) runs this file: plan says so (runner=csrun), and the gate
 # and build jobs then run their command on Latitude's BuildKit through scripts/release/on-lat.sh (on the box itself when
 # that builder can't be reached) instead of compiling on the runner; publish and hosted run as they are. The secrets
 # below come from csrun's store there.
 #
-# Credentials are Depot CI secrets whose only variant is limited to this repository, branch main and this workflow
-# file: MCP_RELEASE_GITHUB_TOKEN, MCP_RELEASE_NPM_TOKEN, MCP_RELEASE_R2_BUCKET_URL, MCP_RELEASE_R2_ACCESS_KEY_ID and
+# Credentials are in the box's cs-secrets store, under mcp-server/release, and only this workflow's runs get them:
+# MCP_RELEASE_GITHUB_TOKEN, MCP_RELEASE_NPM_TOKEN, MCP_RELEASE_R2_BUCKET_URL, MCP_RELEASE_R2_ACCESS_KEY_ID and
 # MCP_RELEASE_R2_SECRET_ACCESS_KEY. Only the publish step of a release receives them, and the R2 probe of a dry run on main
 # the three R2 ones.
 on:
@@ -53,7 +53,7 @@ env:
 
 jobs:
   plan:
-    runs-on: depot-ubuntu-24.04
+    runs-on: csrun
     timeout-minutes: 10
     outputs:
       ship: ${{ steps.plan.outputs.ship }}
@@ -83,7 +83,7 @@ jobs:
         run: scripts/dev/depot-run --cache-keys >> "$GITHUB_OUTPUT"
       - name: Runner
         id: runner
-        run: echo "runner=$([ "${ACT:-}" = true ] && echo csrun || echo depot)" >> "$GITHUB_OUTPUT"
+        run: echo "runner=csrun" >> "$GITHUB_OUTPUT"
 
   gate:
     needs: plan
@@ -92,7 +92,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [rust, checks]
-    runs-on: ${{ matrix.part == 'rust' && 'depot-ubuntu-24.04-32' || 'depot-ubuntu-24.04-8' }}
+    runs-on: csrun
     timeout-minutes: 60
     env:
       RUSTC_WRAPPER: sccache
@@ -145,17 +145,17 @@ jobs:
       matrix:
         include:
           - artifact: contextstream-mcp-linux-x64
-            runner: depot-ubuntu-24.04-16
+            runner: csrun
           - artifact: contextstream-mcp-linux-x64-remote-acceleration
-            runner: depot-ubuntu-24.04-16
+            runner: csrun
           - artifact: contextstream-mcp-linux-arm64
-            runner: depot-ubuntu-24.04-arm-16
+            runner: csrun
           - artifact: contextstream-mcp-win-x64.exe
-            runner: depot-ubuntu-24.04-16
+            runner: csrun
           - artifact: contextstream-mcp-darwin-arm64
-            runner: depot-ubuntu-24.04-16
+            runner: csrun
           - artifact: contextstream-mcp-darwin-x64
-            runner: depot-ubuntu-24.04-16
+            runner: csrun
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
@@ -249,7 +249,7 @@ jobs:
     if: >-
       !cancelled() && needs.plan.outputs.ship == 'true' &&
       (needs.plan.outputs.build != 'true' || (needs.gate.result == 'success' && needs.build.result == 'success'))
-    runs-on: depot-ubuntu-24.04-4
+    runs-on: csrun
     timeout-minutes: 45
     steps:
       - name: Check out the release commit
@@ -312,7 +312,7 @@ jobs:
   hosted:
     needs: [plan, publish]
     if: needs.plan.outputs.publish == 'true' && needs.publish.result == 'success'
-    runs-on: depot-ubuntu-24.04
+    runs-on: csrun
     timeout-minutes: 80
     steps:
       - name: Check out

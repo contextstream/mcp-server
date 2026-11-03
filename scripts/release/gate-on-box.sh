@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One part of the release gate (scripts/release/gate.sh rust|checks) on the self-hosted release box, in a container of
-# scripts/release/gate.Dockerfile, for .depot/workflows/release.yml when the box runs the release: no release waits for a
+# scripts/release/gate.Dockerfile, for .csrun/workflows/release.yml when the box runs the release: no release waits for a
 # rented machine. The image is built on the box's own BuildKit and kept by its tag (a hash of the Dockerfile and the Rust
 # channel). The part runs on a copy of this checkout as uid 1001, in the box's relgate.slice (no CPU quota; the box's
 # default seccomp profile), with cargo's registry in the volume mcp-gate-cargo and the part's own target dir (./target, as

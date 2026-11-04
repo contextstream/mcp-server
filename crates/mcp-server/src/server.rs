@@ -936,6 +936,50 @@ pub(crate) async fn slipstream_list_changed_notice(
         .then_some(TOOLS_LIST_CHANGED_NOTIFICATION)
 }
 
+/// Whether this surface lists the tools the API defines per caller
+/// (`domains::hosted_tools`): the full surfaces, not the router, coach or
+/// studio-only ones.
+pub(crate) fn lists_hosted_tools(registry: &ToolRegistry) -> bool {
+    !registry.is_router_mode() && !registry.is_coach_surface() && !registry.is_studio_surface()
+}
+
+/// The `tools/list` entries for the tools the API defines for this caller,
+/// waiting at most `hosted_tools::LISTING_BUDGET` for their definitions. A name
+/// the registry has is never shadowed.
+pub(crate) async fn hosted_tools_entries(
+    registry: &ToolRegistry,
+    client: &ContextStreamClient,
+) -> Vec<serde_json::Value> {
+    use domains::hosted_tools;
+    if !lists_hosted_tools(registry) {
+        return Vec::new();
+    }
+    hosted_tools::listing_entries(
+        &hosted_tools::HostedToolsGate::global(),
+        client,
+        hosted_tools::LISTING_BUDGET,
+        |name| registry.get(name).is_some(),
+    )
+    .await
+}
+
+/// After a tool call on stdio: the list-changed notification when the tools the
+/// API defines for this caller differ from what it was last shown.
+pub(crate) async fn hosted_tools_list_changed_notice(
+    registry: &ToolRegistry,
+    client: &ContextStreamClient,
+) -> Option<&'static str> {
+    use domains::hosted_tools;
+    if !lists_hosted_tools(registry) {
+        return None;
+    }
+    hosted_tools::listing_changed(&hosted_tools::HostedToolsGate::global(), client, |name| {
+        registry.get(name).is_some()
+    })
+    .await
+    .then_some(TOOLS_LIST_CHANGED_NOTIFICATION)
+}
+
 /// Run the MCP server with stdio transport.
 pub async fn run_server(
     config: Config,
@@ -1197,7 +1241,8 @@ async fn run_stdio_transport(
             tokenizer_warmup.start();
         }
         if legacy_initialize {
-            announces_tool_changes = registry.get(domains::slipstream::TOOL_NAME).is_some();
+            announces_tool_changes = registry.get(domains::slipstream::TOOL_NAME).is_some()
+                || lists_hosted_tools(&registry);
         }
     }
     debug!("Client disconnected");
@@ -1269,8 +1314,11 @@ async fn run_stdio_tool_calls(
         // the session to another workspace, an agent was turned on): say so, and the
         // client lists tools again.
         if announces_tool_changes {
-            if let Some(notice) = slipstream_list_changed_notice(&registry, &client, &session).await
-            {
+            let notice = match slipstream_list_changed_notice(&registry, &client, &session).await {
+                Some(notice) => Some(notice),
+                None => hosted_tools_list_changed_notice(&registry, &client).await,
+            };
+            if let Some(notice) = notice {
                 writer.write_line(notice).await?;
             }
         }
@@ -2058,6 +2106,13 @@ async fn handle_request_dispatch(
                     (**client).clone(),
                 );
             }
+            if lists_hosted_tools(registry) {
+                result["capabilities"]["tools"]["listChanged"] = serde_json::Value::Bool(true);
+                domains::hosted_tools::prefetch(
+                    domains::hosted_tools::HostedToolsGate::global(),
+                    (**client).clone(),
+                );
+            }
             if crate::readiness_evidence_writes_enabled() {
                 let managed_harness = std::env::var("CONTEXTSTREAM_CLIENT")
                     .ok()
@@ -2091,7 +2146,14 @@ async fn handle_request_dispatch(
 
         "tools/list" => {
             let mut tools = contextstream_tools_list(registry, None);
-            with_slipstream_listing(registry, client, session, None, &mut tools).await;
+            // The listings read at once: one waits for the slower, not the sum.
+            let ((), hosted) = tokio::join!(
+                with_slipstream_listing(registry, client, session, None, &mut tools),
+                hosted_tools_entries(registry, client),
+            );
+            for entry in hosted {
+                insert_sorted(&mut tools, entry);
+            }
             json_rpc_result(id, serde_json::json!({ "tools": tools }))
         }
 
@@ -2292,8 +2354,20 @@ async fn handle_request_dispatch(
                 }
             }
 
+            // A tool the API defines for this caller runs through its transport.
+            let hosted_tool = if registry.get(tool_name).is_none() && lists_hosted_tools(registry) {
+                domains::hosted_tools::find(
+                    &domains::hosted_tools::HostedToolsGate::global(),
+                    client,
+                    tool_name,
+                )
+                .await
+            } else {
+                None
+            };
+
             // MCP lists an unknown tool as a protocol error (#368).
-            if registry.get(tool_name).is_none() {
+            if registry.get(tool_name).is_none() && hosted_tool.is_none() {
                 return json_rpc_error(id, -32602, &unknown_tool_message(registry, tool_name));
             }
 
@@ -2318,11 +2392,14 @@ async fn handle_request_dispatch(
             )
             .with_structured_content(include_workflow_contract)
             .with_observation(wire_observation);
-            let tool_call_outcome = mcp_tools::wire_tokens::run_with_wire_response_context(
-                wire_context,
-                registry.execute(tool_name, arguments),
-            )
-            .await;
+            let tool_call_outcome =
+                mcp_tools::wire_tokens::run_with_wire_response_context(wire_context, async {
+                    match &hosted_tool {
+                        Some(tool) => Ok(domains::hosted_tools::run(client, tool, arguments).await),
+                        None => registry.execute(tool_name, arguments).await,
+                    }
+                })
+                .await;
             let tool_call_latency_ms = tool_call_started.elapsed().as_millis() as u64;
             telemetry
                 .emit_tool_call(
@@ -4288,6 +4365,140 @@ mod tests {
         ));
         let telemetry = AgenticTelemetry::new(client.as_ref().clone(), session.clone());
         (registry, client, session, telemetry)
+    }
+
+    /// A stand-in API for the hosted-tools routes: it defines an `echo` tool and
+    /// answers everything else 404.
+    async fn hosted_tools_stub_api() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let header_end = loop {
+                        let Ok(read) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..read]);
+                        if let Some(at) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    while buffer.len() < header_end + length {
+                        let Ok(read) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        buffer.extend_from_slice(&chunk[..read]);
+                    }
+                    let line = head.lines().next().unwrap_or("").to_string();
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&buffer[header_end..]).unwrap_or_default();
+                    let (status, answer) = if line.starts_with("GET /api/v1/mcp/hosted-tools ") {
+                        (
+                            200,
+                            serde_json::json!({"tools": [{
+                                "name": "echo",
+                                "description": "Answer with the text it is given.",
+                                "input_schema": {
+                                    "type": "object",
+                                    "properties": {"text": {"type": "string"}},
+                                    "required": ["text"]
+                                }
+                            }]}),
+                        )
+                    } else if line.starts_with("POST /api/v1/mcp/hosted-tools/echo/call ") {
+                        (
+                            200,
+                            serde_json::json!({"content": [
+                                {"type": "text", "text": body["arguments"]["text"]}
+                            ]}),
+                        )
+                    } else {
+                        (404, serde_json::json!({}))
+                    };
+                    let answer = answer.to_string();
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                        answer.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn stdio_lists_and_runs_a_tool_the_api_defines_for_the_caller() {
+        let config = Config {
+            api_url: hosted_tools_stub_api().await,
+            api_key: Some("hosted-tools-stdio-test-key".to_string()),
+            ..Config::default()
+        };
+        let client = Arc::new(ContextStreamClient::new(config.clone()));
+        let session = Arc::new(SessionManager::new(client.as_ref().clone(), config.clone()));
+        let registry = Arc::new(build_registry(
+            &config,
+            client.as_ref().clone(),
+            session.clone(),
+        ));
+        let telemetry = AgenticTelemetry::new(client.as_ref().clone(), session.clone());
+        let request = |id: i64, method: &str, params: serde_json::Value| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+
+        let listed: serde_json::Value = serde_json::from_str(
+            &handle_request(
+                &registry,
+                &client,
+                &session,
+                &telemetry,
+                request(1, "tools/list", serde_json::json!({})),
+                mcp_tools::wire_tokens::WireTokenObservation::default(),
+            )
+            .await,
+        )
+        .unwrap();
+        let tools = listed["result"]["tools"].as_array().expect("tools");
+        let echo = tool_by_name(tools, "echo");
+        assert_eq!(echo["inputSchema"]["required"], serde_json::json!(["text"]));
+
+        let called: serde_json::Value = serde_json::from_str(
+            &handle_request(
+                &registry,
+                &client,
+                &session,
+                &telemetry,
+                request(
+                    2,
+                    "tools/call",
+                    serde_json::json!({"name": "echo", "arguments": {"text": "hello"}}),
+                ),
+                mcp_tools::wire_tokens::WireTokenObservation::default(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(called["result"]["isError"], false, "{called}");
+        assert_eq!(called["result"]["content"][0]["text"], "hello", "{called}");
     }
 
     #[tokio::test]

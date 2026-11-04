@@ -18,6 +18,7 @@ pub mod flash;
 pub mod graph;
 pub mod grounding;
 pub mod help;
+pub mod hosted_tools;
 pub mod index_keeper;
 pub mod integrations;
 pub(crate) mod linked_workspaces;

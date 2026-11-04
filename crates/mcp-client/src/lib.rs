@@ -21,6 +21,7 @@ pub mod coach;
 pub mod credit_hold;
 pub mod harness_readiness;
 pub mod harness_remote;
+pub mod hosted_tools;
 pub mod ingest_guard;
 pub mod json;
 pub mod parity;

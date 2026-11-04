@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.64
+
+- `update` refreshes editor rules and hooks only with the version it just installed, and run in your home folder it no longer writes project rules there (which replaced the global rules in ~/.claude/CLAUDE.md with a project header).
+
 ## 1.0.63
 
 - Rules: a machine's ContextStream rules stay where they are. `update` no longer puts the block back into a global rules file left without it, which made sessions in a set-up project load it twice. `CONTEXTSTREAM_PROJECT_RULES=header` moves them back. Each rules write says which form it gave a project's file and why.

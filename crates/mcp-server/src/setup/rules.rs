@@ -749,7 +749,10 @@ pub(crate) const PROJECT_HEADER_MARKER: &str = "<!-- contextstream-project-heade
 
 /// Set to `full` to keep the whole block in project rules files, for a
 /// checkout whose rules file is committed and read by teammates who have not
-/// run ContextStream setup themselves.
+/// run ContextStream setup themselves. Set to `header` to put the block back
+/// in a global rules file this machine keeps without it (see
+/// [`global_rules_left_without_block`]), so project files name only the
+/// project.
 pub(crate) const ENV_PROJECT_RULES: &str = "CONTEXTSTREAM_PROJECT_RULES";
 
 /// Editors that load their global rules file in every session, beside the
@@ -800,35 +803,191 @@ fn global_rules_hold_block(editor: &Editor) -> bool {
         .is_some_and(|content| content_has_owned_contextstream_rules(&content))
 }
 
-/// The form `editor`'s project rules file takes, given the editors that read
-/// project rules on this machine (`readers`) and whether each one's global
-/// rules file holds the block. Editors sharing the file (several read
+/// The explicit choice made with [`ENV_PROJECT_RULES`], if any.
+fn project_rules_choice() -> Option<ProjectRulesForm> {
+    let value = std::env::var(ENV_PROJECT_RULES).ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "full" => Some(ProjectRulesForm::Full),
+        "header" => Some(ProjectRulesForm::Header),
+        _ => None,
+    }
+}
+
+/// The editors setup had recorded before this run replaced the record with
+/// its own selection, so a setup re-run tells an editor it set up earlier from
+/// one it is adding now.
+static SELECTION_BEFORE_SETUP: OnceLock<Option<Vec<String>>> = OnceLock::new();
+
+fn recorded_selection() -> Option<Vec<String>> {
+    match mcp_client::activation::configured_client_selection() {
+        Ok(selection) if selection.recorded => Some(selection.clients),
+        _ => None,
+    }
+}
+
+/// Called by setup just before it records the editors it is configuring.
+pub(crate) fn note_selection_before_setup() {
+    SELECTION_BEFORE_SETUP.get_or_init(recorded_selection);
+}
+
+/// Whether setup configured `editor` on this machine before this run.
+fn set_up_before_this_run(editor: &Editor) -> bool {
+    let selection = match SELECTION_BEFORE_SETUP.get() {
+        Some(before) => before.clone(),
+        None => recorded_selection(),
+    };
+    selection.is_some_and(|clients| clients.iter().any(|id| id == editor.id()))
+}
+
+/// The global rules file `editor` reads, when this machine keeps it without
+/// the block: the editor loads that file in every session, setup configured
+/// the editor before this run, and the file (one setup writes) holds no
+/// ContextStream block. Someone took the block out, so the rules live in the
+/// project files. Putting it back would load the block twice in every session
+/// of each project whose file still holds it, as 1.0.62's `update` did on the
+/// Mac (2026-11-03). Rules writes leave such a file as it is;
+/// `CONTEXTSTREAM_PROJECT_RULES=header` puts the block back.
+pub fn global_rules_left_without_block(editor: &Editor) -> Option<PathBuf> {
+    if project_rules_choice() == Some(ProjectRulesForm::Header)
+        || !loads_global_rules_in_every_session(editor)
+        || !set_up_before_this_run(editor)
+    {
+        return None;
+    }
+    let read = global_rules_file_read_by(editor)?;
+    (editor.all_rules_paths(None).contains(&read) && !global_rules_hold_block(editor))
+        .then_some(read)
+}
+
+/// What setup and update-rules say about a global rules file this machine
+/// keeps without the block.
+pub fn global_rules_kept_line(editor: &Editor, path: &Path) -> String {
+    format!(
+        "{}: left {} without the ContextStream block; this machine keeps the rules in project files. To keep them in the global file instead, run `{}=header contextstream-mcp update-rules --scope=all` in each set-up project.",
+        editor.display_name(),
+        home_relative_display(path),
+        ENV_PROJECT_RULES
+    )
+}
+
+/// `path` as the lines setup prints name it: under `~/` when it is in HOME.
+fn home_relative_display(path: &Path) -> String {
+    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf)) {
+        Some(rest) => format!("`~/{}`", rest.display()),
+        None => format!("`{}`", path.display()),
+    }
+}
+
+/// The global rules file `editor` reads, as the lines setup prints name it.
+fn global_rules_read_display(editor: &Editor) -> String {
+    match global_rules_file_read_by(editor) {
+        Some(path) => home_relative_display(&path),
+        None => global_rules_display(editor).to_string(),
+    }
+}
+
+/// Why a project rules file takes the form it does, for the line setup and
+/// update-rules print about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectRulesReason {
+    /// Every editor reading the file loads the block from its global rules
+    /// file.
+    GlobalHoldsBlock,
+    /// `CONTEXTSTREAM_PROJECT_RULES=full`.
+    AskedForFull,
+    /// This editor reads the file and is not known to load a global rules file
+    /// in every session.
+    ProjectRulesOnly(Editor),
+    /// This editor reads the file, and its global rules file holds no block.
+    GlobalLacksBlock(Editor),
+}
+
+impl ProjectRulesReason {
+    /// What setup and update-rules say about `editor`'s project rules file in
+    /// `form`; nothing for an editor whose project file always holds the whole
+    /// block.
+    pub fn describe(self, editor: &Editor, form: ProjectRulesForm) -> Option<String> {
+        let file = editor
+            .rules_path(Some(Path::new("")))
+            .map(|path| format!("`{}`", path.display()))
+            .unwrap_or_else(|| "the project rules file".to_string());
+        match (form, self) {
+            (ProjectRulesForm::Header, _) => Some(format!(
+                "{file} names the project only: {} loads the rules from {}",
+                editor.display_name(),
+                global_rules_read_display(editor)
+            )),
+            (_, Self::AskedForFull) => Some(format!(
+                "{file} keeps the whole block ({}=full)",
+                ENV_PROJECT_RULES
+            )),
+            (_, Self::ProjectRulesOnly(reader)) if reader != *editor => Some(format!(
+                "{file} keeps the whole block: {} also reads it",
+                reader.display_name()
+            )),
+            (_, Self::GlobalLacksBlock(reader)) => Some(format!(
+                "{file} keeps the whole block: {} holds no ContextStream block, so this machine keeps the rules in project files",
+                global_rules_read_display(&reader)
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// The form `editor`'s project rules file takes, and why, given the editors
+/// that read project rules on this machine (`readers`) and whether each one's
+/// global rules file holds the block. Editors sharing the file (several read
 /// `AGENTS.md`) all decide alike, so they never rewrite each other's block.
+pub(crate) fn project_rules_decision_for(
+    editor: &Editor,
+    readers: &[Editor],
+    holds_block: impl Fn(&Editor) -> bool,
+) -> (ProjectRulesForm, ProjectRulesReason) {
+    let file = editor.rules_path(Some(Path::new("")));
+    if file.is_none() {
+        return (
+            ProjectRulesForm::Full,
+            ProjectRulesReason::ProjectRulesOnly(*editor),
+        );
+    }
+    // The editor itself first, so a reason names it before an editor it
+    // shares the file with.
+    let mut sharing = vec![*editor];
+    sharing.extend(
+        readers
+            .iter()
+            .filter(|reader| *reader != editor && reader.rules_path(Some(Path::new(""))) == file)
+            .copied(),
+    );
+    if let Some(reader) = sharing
+        .iter()
+        .find(|reader| !loads_global_rules_in_every_session(reader))
+    {
+        return (
+            ProjectRulesForm::Full,
+            ProjectRulesReason::ProjectRulesOnly(*reader),
+        );
+    }
+    if let Some(reader) = sharing.iter().find(|reader| !holds_block(reader)) {
+        return (
+            ProjectRulesForm::Full,
+            ProjectRulesReason::GlobalLacksBlock(*reader),
+        );
+    }
+    (
+        ProjectRulesForm::Header,
+        ProjectRulesReason::GlobalHoldsBlock,
+    )
+}
+
+/// The form [`project_rules_decision_for`] chooses.
+#[cfg(test)]
 pub(crate) fn project_rules_form_for(
     editor: &Editor,
     readers: &[Editor],
     holds_block: impl Fn(&Editor) -> bool,
 ) -> ProjectRulesForm {
-    let file = editor.rules_path(Some(Path::new("")));
-    if file.is_none() {
-        return ProjectRulesForm::Full;
-    }
-    let mut sharing: Vec<Editor> = readers
-        .iter()
-        .filter(|reader| reader.rules_path(Some(Path::new(""))) == file)
-        .copied()
-        .collect();
-    if !sharing.contains(editor) {
-        sharing.push(*editor);
-    }
-    if sharing
-        .iter()
-        .all(|reader| loads_global_rules_in_every_session(reader) && holds_block(reader))
-    {
-        ProjectRulesForm::Header
-    } else {
-        ProjectRulesForm::Full
-    }
+    project_rules_decision_for(editor, readers, holds_block).0
 }
 
 /// The editors that read project rules on this machine: the ones setup
@@ -854,14 +1013,21 @@ pub fn project_rules_form(editor: &Editor) -> ProjectRulesForm {
 /// (`global_written`). A dry run leaves that file as it was, yet the run would
 /// put the block in it, so it counts when it is the file the editor reads.
 pub fn project_rules_form_after(editor: &Editor, global_written: bool) -> ProjectRulesForm {
-    if std::env::var(ENV_PROJECT_RULES).is_ok_and(|value| value.trim().eq_ignore_ascii_case("full"))
-    {
-        return ProjectRulesForm::Full;
+    project_rules_decision_after(editor, global_written).0
+}
+
+/// [`project_rules_form_after`], and why.
+pub fn project_rules_decision_after(
+    editor: &Editor,
+    global_written: bool,
+) -> (ProjectRulesForm, ProjectRulesReason) {
+    if project_rules_choice() == Some(ProjectRulesForm::Full) {
+        return (ProjectRulesForm::Full, ProjectRulesReason::AskedForFull);
     }
     let written_is_read = global_written
         && global_rules_file_read_by(editor)
             .is_some_and(|read| editor.all_rules_paths(None).contains(&read));
-    project_rules_form_for(editor, &project_rules_readers(), |reader| {
+    project_rules_decision_for(editor, &project_rules_readers(), |reader| {
         (written_is_read && reader == editor) || global_rules_hold_block(reader)
     })
 }
@@ -5897,6 +6063,48 @@ mod project_rules_form_tests {
 
     fn holding(editors: &'static [Editor]) -> impl Fn(&Editor) -> bool {
         move |editor| editors.contains(editor)
+    }
+
+    #[test]
+    fn a_project_file_says_why_it_takes_its_form() {
+        use ProjectRulesForm::{Full, Header};
+        let claude = Editor::ClaudeCode;
+        let codex = Editor::Codex;
+        assert_eq!(
+            project_rules_decision_for(&claude, &[claude], holding(&[Editor::ClaudeCode])),
+            (Header, ProjectRulesReason::GlobalHoldsBlock)
+        );
+        assert_eq!(
+            project_rules_decision_for(&claude, &[claude], holding(&[])),
+            (Full, ProjectRulesReason::GlobalLacksBlock(claude))
+        );
+        assert_eq!(
+            project_rules_decision_for(
+                &codex,
+                &[codex, Editor::OpenCode],
+                holding(&[Editor::Codex, Editor::OpenCode])
+            ),
+            (Full, ProjectRulesReason::ProjectRulesOnly(Editor::OpenCode))
+        );
+        assert_eq!(
+            ProjectRulesReason::ProjectRulesOnly(Editor::OpenCode).describe(&codex, Full),
+            Some(format!(
+                "`AGENTS.md` keeps the whole block: {} also reads it",
+                Editor::OpenCode.display_name()
+            ))
+        );
+        assert_eq!(
+            ProjectRulesReason::AskedForFull.describe(&claude, Full),
+            Some(
+                "`CLAUDE.md` keeps the whole block (CONTEXTSTREAM_PROJECT_RULES=full)".to_string()
+            )
+        );
+        // An editor whose project file always held the whole block says nothing new.
+        assert_eq!(
+            ProjectRulesReason::ProjectRulesOnly(Editor::OpenCode)
+                .describe(&Editor::OpenCode, Full),
+            None
+        );
     }
 
     #[test]

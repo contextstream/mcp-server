@@ -2332,8 +2332,20 @@ async fn refresh_editor_integrations_after_update(
             Err(e) => update_warn(format!("{}: {}", command.warning_message, e)),
         }
     }
+    if let Some(note) = project_rules_refresh_note(refresh_project_rules) {
+        update_skip(note);
+    }
 
     Ok(())
+}
+
+/// What `update` says when the folder it ran in is no set-up project, so only
+/// the global rules were refreshed: each project's rules file keeps what it had
+/// until a refresh runs in that project.
+fn project_rules_refresh_note(refresh_project_rules: bool) -> Option<&'static str> {
+    (!refresh_project_rules).then_some(
+        "Project rules files were not refreshed: this folder is not a set-up project. To refresh one, run `contextstream-mcp update-rules --scope=project` in it",
+    )
 }
 
 /// Map hook handler names to Claude Code hook event names.
@@ -4622,6 +4634,13 @@ mod tests {
         assert!(args.contains(&UPDATE_HOOKS_ARGS));
         assert!(args.contains(&UPDATE_GLOBAL_RULES_ARGS));
         assert!(args.contains(&UPDATE_PROJECT_RULES_ARGS));
+    }
+
+    #[test]
+    fn update_outside_a_project_says_how_to_refresh_a_project_rules_file() {
+        let note = project_rules_refresh_note(false).expect("a note outside a project");
+        assert!(note.contains("update-rules --scope=project"), "{note}");
+        assert_eq!(project_rules_refresh_note(true), None);
     }
 
     #[test]

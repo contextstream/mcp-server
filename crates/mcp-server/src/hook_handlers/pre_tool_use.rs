@@ -2457,7 +2457,12 @@ pub async fn handle() -> Result<()> {
     // A shell command that a tool the account has says it takes is handed to
     // `contextstream-mcp run`, which sends it there or runs it here. Nothing
     // else about the call changes, and a command no tool takes is left alone.
-    if matches!(editor, EditorFormat::Claude) && tool_lower == "bash" {
+    // Claude Code only: Codex takes a changed input only together with an
+    // `allow` decision, which would also skip the approval its own rules ask for.
+    if matches!(editor, EditorFormat::Claude)
+        && !super::input_is_codex(&input)
+        && tool_lower == "bash"
+    {
         if let Some(rewritten) = super::command_rewrite::rewritten_bash(&tool_input, &cwd) {
             println!("{rewritten}");
             return Ok(());

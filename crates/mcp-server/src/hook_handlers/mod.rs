@@ -51,7 +51,7 @@ use anyhow::Result;
 use mcp_types::config::VERSION;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Nested output for newer Claude hook schema.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -281,6 +281,9 @@ fn current_hook_event_name() -> Option<String> {
 /// previous silent-swallow behavior hid real bugs (a malformed
 /// `tool_input.command` in the host harness would silently bypass the
 /// search-first redirect, for example).
+///
+/// It also notes which client sent the input (see [`note_hook_input`]), so
+/// that what the handler writes back is what that client accepts.
 pub fn read_stdin_json() -> Result<Value> {
     let stdin = std::io::stdin();
     // Read the whole body up front so we can include a snippet in the
@@ -295,7 +298,10 @@ pub fn read_stdin_json() -> Result<Value> {
         return Ok(serde_json::json!({}));
     }
     match serde_json::from_str::<Value>(&body) {
-        Ok(value) => Ok(value),
+        Ok(value) => {
+            note_hook_input(&value);
+            Ok(value)
+        }
         Err(err) => {
             // Include a redacted preview so the operator can tell
             // which command/tool produced the malformed input. Cap
@@ -310,9 +316,165 @@ pub fn read_stdin_json() -> Result<Value> {
     }
 }
 
+/// The Codex event this hook process was started for, once its input showed the
+/// client is Codex. A hook process serves one event, so one value is enough.
+static CODEX_EVENT: Mutex<Option<String>> = Mutex::new(None);
+
+/// Whether the hook input came from the OpenAI Codex CLI.
+///
+/// Every Codex hook event that can carry a model answer sends `turn_id` and
+/// `model` together. Claude Code sends `turn_id` only to its display hook and
+/// `model` only to `SessionStart`, so the pair does not occur there.
+pub fn input_is_codex(input: &Value) -> bool {
+    let present = |field: &str| {
+        input
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    present("turn_id") && present("model")
+}
+
+/// Remember which client sent this hook's input; [`write_stdout_json`] shapes
+/// its output for that client.
+fn note_hook_input(input: &Value) {
+    let event = input_is_codex(input).then(|| {
+        input
+            .get("hook_event_name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(current_hook_event_name)
+            .unwrap_or_default()
+    });
+    *CODEX_EVENT.lock().unwrap_or_else(|err| err.into_inner()) = event;
+}
+
+/// What Codex accepts in one event's output. Codex reads a hook's stdout into a
+/// per-event type that refuses any field it does not list ("hook returned
+/// invalid <Event> hook JSON output"), and refuses a few listed fields for some
+/// events ("unsupported ..."). A hook that fails this way is shown to the person
+/// as a failed hook on every run.
+///
+/// Source: Codex 0.163.0, `codex-rs/hooks` (`schema/generated/*.command.output
+/// .schema.json` and `engine/output_parser.rs`).
+#[derive(Clone, Copy)]
+struct CodexContract {
+    /// `hookSpecificOutput.additionalContext`.
+    context: bool,
+    /// `hookSpecificOutput.permissionDecision` (only `deny`; `allow` needs an
+    /// `updatedInput` and `ask` is not supported).
+    permission: bool,
+    /// Top-level `decision: "block"` with `reason`.
+    block: bool,
+    /// `continue: false` and `stopReason`.
+    stop: bool,
+    /// `suppressOutput`.
+    suppress: bool,
+}
+
+impl CodexContract {
+    fn for_event(event: &str) -> Option<Self> {
+        let (context, permission, block, stop, suppress) = match event {
+            "SessionStart" | "SubagentStart" => (true, false, false, true, true),
+            "UserPromptSubmit" => (true, false, true, true, true),
+            "PreToolUse" => (true, true, true, false, false),
+            "PostToolUse" => (true, false, true, true, false),
+            "PermissionRequest" => (false, false, false, false, false),
+            "Stop" | "SubagentStop" => (false, false, true, true, true),
+            "PreCompact" | "PostCompact" => (false, false, false, true, true),
+            // Codex has no output type for the rest (or no such event).
+            _ => return None,
+        };
+        Some(Self {
+            context,
+            permission,
+            block,
+            stop,
+            suppress,
+        })
+    }
+}
+
+/// What Codex can take from `output` for `event`: the fields it lists for that
+/// event and nothing else. Text only the model could use goes where Codex has a
+/// place for it (`hookSpecificOutput.additionalContext`) and is dropped where
+/// it has none. A PreToolUse `ask` or `allow` cannot be expressed, so its
+/// message goes to the model as context instead.
+fn conform_for_codex(event: &str, mut output: HookOutput) -> HookOutput {
+    let Some(contract) = CodexContract::for_event(event) else {
+        return output;
+    };
+    let specific = output.hook_specific_output.take();
+    let mut context = specific
+        .as_ref()
+        .and_then(|s| s.additional_context.clone())
+        .or_else(|| output.additional_context.take());
+    output.additional_context = None;
+    let mut decision = specific
+        .as_ref()
+        .and_then(|s| s.permission_decision.clone());
+    let mut reason = specific
+        .as_ref()
+        .and_then(|s| s.permission_decision_reason.clone());
+    if contract.permission {
+        let denied = decision.as_deref() == Some("deny")
+            && reason.as_deref().is_some_and(|r| !r.trim().is_empty());
+        if !denied {
+            if let Some(message) = reason.take().filter(|r| !r.trim().is_empty()) {
+                context = Some(match context {
+                    Some(text) => format!("{text}\n\n{message}"),
+                    None => message,
+                });
+            }
+            decision = None;
+        }
+    } else {
+        decision = None;
+        reason = None;
+    }
+    if !contract.context {
+        context = None;
+    }
+    output.hook_specific_output =
+        (context.is_some() || decision.is_some()).then(|| HookSpecificOutput {
+            hook_event_name: Some(event.to_string()),
+            additional_context: context,
+            permission_decision: decision,
+            permission_decision_reason: reason,
+        });
+    if !contract.block {
+        output.decision = None;
+        output.reason = None;
+    }
+    if !contract.stop {
+        output.continue_processing = None;
+        output.stop_reason = None;
+    }
+    if !contract.suppress {
+        output.suppress_output = None;
+    }
+    output
+}
+
+/// The JSON a hook writes for `output`: shaped for Codex when `codex_event` names
+/// the Codex event the hook runs for, as built for everyone else otherwise.
+fn render_hook_output(output: &HookOutput, codex_event: Option<&str>) -> Result<String> {
+    match codex_event {
+        Some(event) => Ok(serde_json::to_string(&conform_for_codex(
+            event,
+            output.clone(),
+        ))?),
+        None => Ok(serde_json::to_string(output)?),
+    }
+}
+
 /// Write hook output to stdout.
 pub fn write_stdout_json(output: &HookOutput) -> Result<()> {
-    let json = serde_json::to_string(output)?;
+    let codex_event = CODEX_EVENT
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    let json = render_hook_output(output, codex_event.as_deref())?;
     println!("{}", json);
     Ok(())
 }
@@ -543,8 +705,8 @@ mod tests {
     // keep env-var state stable while an async hook dispatch runs.
     #![allow(clippy::await_holding_lock)]
     use super::{
-        build_api_http_client, current_hook_event_name, dispatch_hook, input_is_cursor,
-        media_aware_guidance, HookOutput,
+        build_api_http_client, current_hook_event_name, dispatch_hook, input_is_codex,
+        input_is_cursor, media_aware_guidance, render_hook_output, HookOutput, HookSpecificOutput,
     };
     use mcp_types::config::VERSION;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -868,5 +1030,354 @@ mod tests {
             Some(v) => std::env::set_var("CONTEXTSTREAM_HOOK_ENABLED", v),
             None => std::env::remove_var("CONTEXTSTREAM_HOOK_ENABLED"),
         }
+    }
+
+    // ---- What Codex accepts, per event -------------------------------------
+    //
+    // Written from Codex 0.163.0's published hook output schemas
+    // (`codex-rs/hooks/schema/generated/*.command.output.schema.json`, which its
+    // serde types enforce with `deny_unknown_fields`) and `engine/output_parser.rs`
+    // (the "unsupported ..." refusals). Independent of `CodexContract`, so the
+    // two can disagree and fail a test.
+
+    const CODEX_EVENTS: [&str; 10] = [
+        "PermissionRequest",
+        "PostCompact",
+        "PostToolUse",
+        "PreCompact",
+        "PreToolUse",
+        "SessionStart",
+        "Stop",
+        "SubagentStart",
+        "SubagentStop",
+        "UserPromptSubmit",
+    ];
+
+    /// Top-level fields in the event's Codex output type.
+    fn codex_top_level(event: &str) -> &'static [&'static str] {
+        match event {
+            "PermissionRequest" => &[
+                "continue",
+                "hookSpecificOutput",
+                "stopReason",
+                "suppressOutput",
+                "systemMessage",
+            ],
+            "PostCompact" | "PreCompact" => {
+                &["continue", "stopReason", "suppressOutput", "systemMessage"]
+            }
+            "PostToolUse" | "PreToolUse" | "UserPromptSubmit" => &[
+                "continue",
+                "decision",
+                "hookSpecificOutput",
+                "reason",
+                "stopReason",
+                "suppressOutput",
+                "systemMessage",
+            ],
+            "SessionStart" | "SubagentStart" => &[
+                "continue",
+                "hookSpecificOutput",
+                "stopReason",
+                "suppressOutput",
+                "systemMessage",
+            ],
+            "Stop" | "SubagentStop" => &[
+                "continue",
+                "decision",
+                "reason",
+                "stopReason",
+                "suppressOutput",
+                "systemMessage",
+            ],
+            other => panic!("no Codex output type for {other}"),
+        }
+    }
+
+    /// Fields of the event's `hookSpecificOutput` in Codex.
+    fn codex_specific(event: &str) -> &'static [&'static str] {
+        match event {
+            "PermissionRequest" => &["hookEventName", "decision"],
+            "PostToolUse" | "SessionStart" | "SubagentStart" | "UserPromptSubmit" => {
+                &["hookEventName", "additionalContext"]
+            }
+            "PreToolUse" => &[
+                "hookEventName",
+                "additionalContext",
+                "permissionDecision",
+                "permissionDecisionReason",
+                "updatedInput",
+            ],
+            _ => &[],
+        }
+    }
+
+    /// `Err` with Codex's own wording when it would refuse `output` for `event`.
+    fn codex_refuses(event: &str, output: &serde_json::Value) -> Result<(), String> {
+        let object = output.as_object().expect("a JSON object");
+        for key in object.keys() {
+            if !codex_top_level(event).contains(&key.as_str()) {
+                return Err(format!(
+                    "hook returned invalid {event} hook JSON output: unknown field `{key}`"
+                ));
+            }
+        }
+        if let Some(specific) = object.get("hookSpecificOutput") {
+            let specific = specific.as_object().expect("an object");
+            for key in specific.keys() {
+                if !codex_specific(event).contains(&key.as_str()) {
+                    return Err(format!(
+                        "hook returned invalid {event} hook JSON output: unknown field `{key}` in hookSpecificOutput"
+                    ));
+                }
+            }
+            if specific.get("hookEventName").and_then(|v| v.as_str()) != Some(event) {
+                return Err(format!("{event}: hookEventName missing or different"));
+            }
+            match specific.get("permissionDecision").and_then(|v| v.as_str()) {
+                Some("deny") => {
+                    let reason = specific
+                        .get("permissionDecisionReason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if reason.trim().is_empty() {
+                        return Err("PreToolUse deny without a reason".to_string());
+                    }
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "PreToolUse hook returned unsupported permissionDecision:{other}"
+                    ))
+                }
+                None => {
+                    if specific.contains_key("permissionDecisionReason") {
+                        return Err("permissionDecisionReason without permissionDecision".into());
+                    }
+                }
+            }
+        }
+        let stops = output.get("continue") == Some(&serde_json::json!(false))
+            || output.get("stopReason").is_some();
+        let suppresses = output.get("suppressOutput").is_some();
+        match event {
+            "PreToolUse" | "PermissionRequest" if stops || suppresses => {
+                return Err(format!(
+                    "{event} hook returned unsupported continue/stopReason/suppressOutput"
+                ))
+            }
+            "PostToolUse" if suppresses => {
+                return Err("PostToolUse hook returned unsupported suppressOutput".to_string())
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Everything a handler can build, for the event the process runs for.
+    fn every_output(event: &str) -> Vec<(&'static str, HookOutput)> {
+        let mut all = vec![
+            ("empty", HookOutput::empty()),
+            ("context", HookOutput::context("some context".to_string())),
+            ("block", HookOutput::block("not now")),
+            ("deny", HookOutput::deny_pre_tool_use("not allowed")),
+            ("stop", HookOutput::stop_processing("stopped")),
+            ("message", HookOutput::system_message("for the person")),
+            (
+                "legacy additionalContext",
+                HookOutput {
+                    additional_context: Some("legacy".to_string()),
+                    ..HookOutput::empty()
+                },
+            ),
+            (
+                "everything at once",
+                HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        hook_event_name: Some(event.to_string()),
+                        additional_context: Some("ctx".to_string()),
+                        permission_decision: Some("deny".to_string()),
+                        permission_decision_reason: Some("why".to_string()),
+                    }),
+                    additional_context: Some("legacy".to_string()),
+                    decision: Some("block".to_string()),
+                    reason: Some("because".to_string()),
+                    continue_processing: Some(false),
+                    stop_reason: Some("stop".to_string()),
+                    system_message: Some("note".to_string()),
+                    suppress_output: Some(true),
+                },
+            ),
+        ];
+        for decision in ["ask", "allow"] {
+            all.push((
+                decision,
+                HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        hook_event_name: Some(event.to_string()),
+                        additional_context: None,
+                        permission_decision: Some(decision.to_string()),
+                        permission_decision_reason: Some("look at this first".to_string()),
+                    }),
+                    ..HookOutput::empty()
+                },
+            ));
+        }
+        all
+    }
+
+    #[test]
+    fn codex_is_told_from_the_pair_of_turn_id_and_model() {
+        // What Codex sends (PostCompact, from its input schema).
+        assert!(input_is_codex(&serde_json::json!({
+            "hook_event_name": "PostCompact", "session_id": "s", "turn_id": "t-1",
+            "model": "gpt-5", "transcript_path": null, "cwd": "/w", "trigger": "auto"
+        })));
+        // What Claude Code sends: PostCompact has a summary and no turn or model,
+        // SessionStart may name the model, and only its display hook has a turn.
+        for claude in [
+            serde_json::json!({"hook_event_name": "PostCompact", "session_id": "s",
+                "trigger": "auto", "compact_summary": "..."}),
+            serde_json::json!({"hook_event_name": "SessionStart", "source": "compact", "model": "m"}),
+            serde_json::json!({"hook_event_name": "MessageDisplay", "turn_id": "t", "delta": "x"}),
+            serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash"}),
+            serde_json::json!({"turn_id": "", "model": ""}),
+            serde_json::json!({}),
+        ] {
+            assert!(!input_is_codex(&claude), "{claude}");
+        }
+    }
+
+    #[test]
+    fn nothing_we_can_build_is_refused_by_codex_in_any_event() {
+        for event in CODEX_EVENTS {
+            with_hook_env(event, || {
+                for (what, output) in every_output(event) {
+                    let json = render_hook_output(&output, Some(event)).unwrap();
+                    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+                    if let Err(refusal) = codex_refuses(event, &value) {
+                        panic!("{event} / {what}: {refusal}\n{json}");
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn the_checker_would_have_refused_the_old_postcompact_answer() {
+        // The answer that Codex 0.163.0 reported as "hook returned invalid
+        // PostCompact hook JSON output".
+        let old = with_event("PostCompact", || {
+            serde_json::to_string(&HookOutput::context("restored".to_string())).unwrap()
+        });
+        let value: serde_json::Value = serde_json::from_str(&old).unwrap();
+        assert!(codex_refuses("PostCompact", &value).is_err());
+        assert!(codex_refuses(
+            "PreToolUse",
+            &serde_json::json!({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                "permissionDecision": "ask", "permissionDecisionReason": "x"}})
+        )
+        .is_err());
+    }
+
+    fn with_event<T>(event: &str, f: impl FnOnce() -> T) -> T {
+        let mut out = None;
+        with_hook_env(event, || out = Some(f()));
+        out.unwrap()
+    }
+
+    #[test]
+    fn a_codex_postcompact_hook_answers_with_nothing_to_refuse() {
+        with_hook_env("PostCompact", || {
+            let json = render_hook_output(
+                &HookOutput::context("[POST-COMPACTION] restored".to_string()),
+                Some("PostCompact"),
+            )
+            .unwrap();
+            assert_eq!(json, "{}");
+        });
+    }
+
+    #[test]
+    fn claude_code_output_is_not_changed() {
+        // Not Codex (`None`): the output is exactly what the handler built, in
+        // every event, including the top-level context of PostCompact.
+        for event in [
+            "PostCompact",
+            "PreCompact",
+            "PreToolUse",
+            "SessionStart",
+            "Stop",
+            "Notification",
+            "PermissionRequest",
+        ] {
+            with_hook_env(event, || {
+                for (what, output) in every_output(event) {
+                    assert_eq!(
+                        render_hook_output(&output, None).unwrap(),
+                        serde_json::to_string(&output).unwrap(),
+                        "{event} / {what}"
+                    );
+                }
+            });
+        }
+        let post_compact = with_event("PostCompact", || {
+            render_hook_output(&HookOutput::context("kept".to_string()), None).unwrap()
+        });
+        assert_eq!(post_compact, r#"{"additionalContext":"kept"}"#);
+    }
+
+    #[test]
+    fn codex_keeps_what_its_events_take() {
+        let render = |event: &str, output: HookOutput| {
+            serde_json::from_str::<serde_json::Value>(
+                &render_hook_output(&output, Some(event)).unwrap(),
+            )
+            .unwrap()
+        };
+        let context = |event: &str| {
+            with_event(event, || {
+                render(event, HookOutput::context("hello".to_string()))
+            })
+        };
+        for event in ["SessionStart", "SubagentStart", "PreToolUse", "PostToolUse"] {
+            assert_eq!(
+                context(event),
+                serde_json::json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": "hello"}}),
+                "{event}"
+            );
+        }
+        assert_eq!(
+            render("PreToolUse", HookOutput::deny_pre_tool_use("no")),
+            serde_json::json!({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                "permissionDecision": "deny", "permissionDecisionReason": "no"}})
+        );
+        // A PreToolUse `ask` cannot be said to Codex; the message reaches the model.
+        let ask = HookOutput {
+            hook_specific_output: Some(HookSpecificOutput {
+                hook_event_name: Some("PreToolUse".to_string()),
+                additional_context: None,
+                permission_decision: Some("ask".to_string()),
+                permission_decision_reason: Some("a lookalike package".to_string()),
+            }),
+            ..HookOutput::empty()
+        };
+        assert_eq!(
+            render("PreToolUse", ask),
+            serde_json::json!({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                "additionalContext": "a lookalike package"}})
+        );
+        assert_eq!(
+            render("PermissionRequest", HookOutput::system_message("hi")),
+            serde_json::json!({"systemMessage": "hi"})
+        );
+        assert_eq!(
+            render("Stop", HookOutput::block("again")),
+            serde_json::json!({"decision": "block", "reason": "again"})
+        );
+        // An event Codex has no output type for is left as built.
+        assert_eq!(
+            render("SessionEnd", HookOutput::empty()),
+            serde_json::json!({})
+        );
     }
 }

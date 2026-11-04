@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
 
-use super::{read_stdin_json, write_stdout_json, HookOutput};
+use super::{input_is_codex, read_stdin_json, write_stdout_json, HookOutput};
 
 /// Handle the PostCompact hook.
 pub async fn handle() -> Result<()> {
@@ -20,6 +20,17 @@ pub async fn handle() -> Result<()> {
     }
 
     let input = read_stdin_json()?;
+
+    // Codex takes no context from a PostCompact hook: its output type holds only
+    // the universal fields (continue, stopReason, suppressOutput, systemMessage)
+    // and a `{"additionalContext": ...}` answer fails the hook as invalid JSON
+    // output. Codex runs `SessionStart` with source `compact` before the next
+    // turn, and that handler restores the saved state, so there is nothing to
+    // fetch or print here.
+    if input_is_codex(&input) {
+        write_stdout_json(&HookOutput::empty())?;
+        return Ok(());
+    }
 
     let session_id = input
         .get("session_id")

@@ -19,6 +19,7 @@ pub mod cache;
 pub mod checkout_snapshot;
 pub mod client;
 pub mod coach;
+pub mod command_hints;
 pub mod credit_hold;
 pub mod frames;
 pub mod harness_readiness;

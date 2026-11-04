@@ -251,6 +251,20 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Run a command through the tool your account has for it, or here
+    #[command(
+        long_about = "Run a command. When a tool your ContextStream account has says it takes the command, the command goes to that tool (a description of your checkout's changes goes with it; see docs/data-handling.md), its output is printed as it arrives, and this process ends with the command's own exit status. Otherwise, or when that tool does not run it or cannot be reached, the command runs here in the current folder with your shell, exactly as if you had typed it. CONTEXTSTREAM_HOSTED_TOOLS=off always runs it here. The editor hook for Claude Code hands matching shell commands to this command."
+    )]
+    Run {
+        /// The tool to use, when not the one whose hints match the command
+        #[arg(long, value_name = "NAME")]
+        tool: Option<String>,
+
+        /// The command (a single quoted word is read as a shell command line)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+
     /// Install or remove the managed git hooks for local VCS capture
     #[command(
         long_about = "Install (or with --uninstall, remove) the managed git hooks (post-commit, pre-push, post-checkout, post-merge) that capture local commits/pushes/branch-switches/merges into ContextStream. Idempotent; preserves and chains any existing user hooks. Honors the CONTEXTSTREAM_GIT_CAPTURE kill-switch and per-repo .contextstream/config.json git_capture policy."
@@ -916,6 +930,15 @@ fn main() -> Result<()> {
                 .block_on(run_hook(&name));
             Ok(())
         }
+        Some(Commands::Run { tool, command }) => {
+            // A one-shot that is a stand-in for the command it runs: its exit status is
+            // that command's, and nothing else is printed to its output.
+            let status = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(mcp_server::hosted_run::run(tool, command.join(" ")));
+            std::process::exit(status);
+        }
         command => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -1228,6 +1251,10 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
 
         Some(Commands::Hook { .. }) => {
             unreachable!("`main` dispatches hooks on their own current-thread runtime")
+        }
+
+        Some(Commands::Run { .. }) => {
+            unreachable!("`main` dispatches `run` on its own current-thread runtime")
         }
 
         Some(Commands::GitHooks { path, uninstall }) => {

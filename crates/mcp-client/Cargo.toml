@@ -27,6 +27,7 @@ sha2 = "0.11"
 hex = "0.4"
 ignore = { workspace = true }
 flate2 = "1"
+regex = "1"
 tempfile = { workspace = true }
 fs2 = { workspace = true }
 futures = { workspace = true }

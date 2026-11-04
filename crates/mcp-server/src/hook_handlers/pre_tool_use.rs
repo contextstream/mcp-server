@@ -2454,6 +2454,15 @@ pub async fn handle() -> Result<()> {
     let mcp_server_name = extract_mcp_server_name(&input);
     let normalized_contextstream_tool = normalize_contextstream_tool_name(&tool);
     let tool_lower = tool.to_ascii_lowercase();
+    // A shell command that a tool the account has says it takes is handed to
+    // `contextstream-mcp run`, which sends it there or runs it here. Nothing
+    // else about the call changes, and a command no tool takes is left alone.
+    if matches!(editor, EditorFormat::Claude) && tool_lower == "bash" {
+        if let Some(rewritten) = super::command_rewrite::rewritten_bash(&tool_input, &cwd) {
+            println!("{rewritten}");
+            return Ok(());
+        }
+    }
     let is_contextstream_call =
         is_contextstream_tool_call(&editor, &input, &mcp_server_name, &tool, &tool_input);
     let is_mcp_tool = is_mcp_tool_call(&input, &mcp_server_name, &tool);

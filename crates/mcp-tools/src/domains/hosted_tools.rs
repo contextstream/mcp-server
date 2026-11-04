@@ -27,6 +27,7 @@
 use crate::domains::slipstream::listing_workspace;
 use crate::peer;
 use mcp_client::checkout_snapshot::{CheckoutSnapshot, SnapshotError};
+use mcp_client::command_hints::{self, CachedTool, Hints};
 use mcp_client::frames::{self, Event, ExchangeError};
 use mcp_client::hosted_tools::HostedToolsAnswer;
 use mcp_client::ContextStreamClient;
@@ -50,16 +51,11 @@ pub const MAX_TOOLS: usize = 16;
 /// How long one hosted call may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Set to `off` to read no definitions and list no hosted tools.
-pub const ENV_SWITCH: &str = "CONTEXTSTREAM_HOSTED_TOOLS";
+pub const ENV_SWITCH: &str = command_hints::ENV_SWITCH;
 
 /// Whether the value of [`ENV_SWITCH`] turns hosted tools off.
 fn off_by(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "off" | "0" | "false" | "no" | "disabled"
-        )
-    })
+    command_hints::switched_off(value)
 }
 
 /// How a hosted tool's calls run.
@@ -82,6 +78,8 @@ pub struct HostedTool {
     pub transport: Transport,
     /// Extra things a call to this tool carries, named by its definition.
     pub attachments: Vec<Attachment>,
+    /// The shell commands the tool says it takes, when it says.
+    pub command_hints: Option<Hints>,
 }
 
 /// Something a call carries beyond its arguments.
@@ -187,6 +185,7 @@ pub fn parse_catalog(data: &Value) -> Vec<HostedTool> {
                     _ => None,
                 })
                 .collect(),
+            command_hints: Hints::from_definition(item),
         });
         if tools.len() == MAX_TOOLS {
             break;
@@ -322,6 +321,9 @@ impl HostedToolsGate {
             Ok(Ok(answer)) => Read::from_answer(&answer),
             _ => Read::Unreachable,
         };
+        if let Read::Known(tools) = &read {
+            remember_hints(client, identity, tools).await;
+        }
         self.record(identity, read)
     }
 
@@ -343,6 +345,41 @@ impl HostedToolsGate {
             .get(identity)
             .and_then(|entry| entry.shown.clone())
     }
+}
+
+/// Keep the command hints of the caller's tools where the editor hook can read
+/// them (`mcp_client::command_hints`): written when they changed, and also when
+/// there are none any more, so that a tool taken away stops being used. A local
+/// caller only; the hosted gateway has no home folder to keep them in.
+async fn remember_hints(client: &ContextStreamClient, identity: &str, tools: &[HostedTool]) {
+    let config = client.config().await;
+    if config.is_http_transport || !identity.starts_with("local:") {
+        return;
+    }
+    let cached: Vec<CachedTool> = tools
+        .iter()
+        .filter_map(|tool| {
+            Some(CachedTool {
+                name: tool.name.clone(),
+                transport: match tool.transport {
+                    Transport::Api => "api",
+                    Transport::Stream => "stream",
+                }
+                .to_string(),
+                attachments: tool
+                    .attachments
+                    .iter()
+                    .map(|attachment| match attachment {
+                        Attachment::CheckoutSnapshot => "checkout_snapshot".to_string(),
+                    })
+                    .collect(),
+                hints: tool.command_hints.clone()?,
+            })
+        })
+        .collect();
+    let cache = command_hints::Cache::new(identity, &config.api_url, cached);
+    // Best effort, and off the executor: a file that cannot be written only means no rewrite.
+    let _ = tokio::task::spawn_blocking(move || command_hints::write(&cache)).await;
 }
 
 /// The `tools/list` entries for `tools`, leaving out names `taken` says another
@@ -500,6 +537,63 @@ enum Streamed {
     NotRun(ToolResult),
 }
 
+/// The snapshot a tool asks for (`None` for a tool that asks for none), or the
+/// result that tells the caller it could not be taken.
+pub async fn take_snapshot(
+    session: &SessionManager,
+    tool: &HostedTool,
+) -> Result<Option<CheckoutSnapshot>, ToolResult> {
+    if !tool.attachments.contains(&Attachment::CheckoutSnapshot) {
+        return Ok(None);
+    }
+    let Some(folder) = checkout_folder(session).await else {
+        return Err(ToolResult::error(format!(
+            "{} was not run: it needs a snapshot of this checkout and there is no folder",
+            tool.name
+        )));
+    };
+    match CheckoutSnapshot::capture(&folder).await {
+        Ok(taken) => Ok(Some(taken)),
+        Err(error) => Err(snapshot_refusal(&tool.name, &error)),
+    }
+}
+
+/// Make the call to the API: its answer's data, or the result that says why
+/// there is none.
+pub async fn call_api(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    tool: &HostedTool,
+    arguments: &Value,
+    snapshot: Option<&CheckoutSnapshot>,
+) -> Result<Value, ToolResult> {
+    let mut body = serde_json::json!({ "arguments": arguments });
+    if let Some(workspace) = workspace_of(client, session).await {
+        body["workspace_id"] = Value::String(workspace);
+    }
+    if let Some(taken) = snapshot {
+        body["checkout"] = taken.attachment();
+    }
+    let answer = match client
+        .hosted_tool_call(&tool.name, &body, CALL_TIMEOUT)
+        .await
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            return Err(ToolResult::error(format!(
+                "{} could not be reached: {error}",
+                tool.name
+            )))
+        }
+    };
+    if !answer.is_success() {
+        return Err(ToolResult::error(answer.error_message().unwrap_or_else(
+            || format!("{} failed (HTTP {})", tool.name, answer.status),
+        )));
+    }
+    Ok(answer.data)
+}
+
 /// Run a call to `tool` with `arguments`. Every failure is a tool error the
 /// caller reads, never a protocol error.
 pub async fn run(
@@ -508,62 +602,33 @@ pub async fn run(
     tool: &HostedTool,
     arguments: Value,
 ) -> ToolResult {
-    let mut body = serde_json::json!({ "arguments": arguments });
-    let workspace = workspace_of(client, session).await;
-    if let Some(workspace) = &workspace {
-        body["workspace_id"] = Value::String(workspace.clone());
-    }
     // Held until the call is over: the snapshot owns the objects it will be asked for.
-    let mut snapshot: Option<CheckoutSnapshot> = None;
-    if tool.attachments.contains(&Attachment::CheckoutSnapshot) {
-        let Some(folder) = checkout_folder(session).await else {
-            return ToolResult::error(format!(
-                "{} was not run: it needs a snapshot of this checkout and there is no folder",
-                tool.name
-            ));
-        };
-        match CheckoutSnapshot::capture(&folder).await {
-            Ok(taken) => {
-                body["checkout"] = taken.attachment();
-                snapshot = Some(taken);
-            }
-            Err(error) => return snapshot_refusal(&tool.name, &error),
-        }
-    }
+    let snapshot = match take_snapshot(session, tool).await {
+        Ok(snapshot) => snapshot,
+        Err(refusal) => return refusal,
+    };
     // A call asked again after its caller gave up on it picks up what that run
     // found, when the checkout is the same: the run is not lost to a client's timeout.
     let pickup = match (&tool.transport, &snapshot) {
         (Transport::Stream, Some(taken)) => Some(format!(
             "{}\0{}\0{}\0{}",
             tool.name,
-            workspace.as_deref().unwrap_or(""),
-            taken.attachment()["target_tree"].as_str().unwrap_or(""),
-            body["arguments"]
+            workspace_of(client, session).await.unwrap_or_default(),
+            taken.target_tree,
+            arguments
         )),
         _ => None,
     };
     if let Some(done) = pickup.as_deref().and_then(take_given_up) {
         return done;
     }
-    let answer = match client
-        .hosted_tool_call(&tool.name, &body, CALL_TIMEOUT)
-        .await
-    {
-        Ok(answer) => answer,
-        Err(error) => {
-            return ToolResult::error(format!("{} could not be reached: {error}", tool.name))
-        }
+    let data = match call_api(client, session, tool, &arguments, snapshot.as_ref()).await {
+        Ok(data) => data,
+        Err(failure) => return failure,
     };
-    if !answer.is_success() {
-        return ToolResult::error(
-            answer
-                .error_message()
-                .unwrap_or_else(|| format!("{} failed (HTTP {})", tool.name, answer.status)),
-        );
-    }
     match tool.transport {
-        Transport::Api => result_from(&tool.name, &answer.data, String::new()),
-        Transport::Stream => match run_stream(&tool.name, &answer.data, snapshot.as_ref()).await {
+        Transport::Api => result_from(&tool.name, &data, String::new()),
+        Transport::Stream => match run_stream(&tool.name, &data, snapshot.as_ref()).await {
             Streamed::Ran(result) => {
                 let abandoned = peer::current().is_some_and(|peer| peer.was_cancelled());
                 if let (true, Some(key)) = (abandoned, pickup) {
@@ -576,60 +641,87 @@ pub async fn run(
     }
 }
 
-/// Run the call the API answered with a stream for: open it, send the checkout,
-/// report progress while it runs, and turn its result into the tool's.
-async fn run_stream(name: &str, data: &Value, snapshot: Option<&CheckoutSnapshot>) -> Streamed {
+/// The stream an API answer names for a call.
+#[derive(Debug)]
+pub struct StreamCall<'a> {
+    pub url: &'a str,
+    pub token: &'a str,
+    pub protocol: Option<&'a str>,
+    /// The description of the run the API made.
+    pub request: &'a Value,
+    /// The command it is for, as the API has it.
+    pub command: &'a str,
+    /// The folder it is run from, inside the repository.
+    pub cwd: &'a str,
+}
+
+/// Read the stream out of an API answer, or say how the answer is wrong.
+pub fn stream_call(data: &Value) -> Result<StreamCall<'_>, String> {
     let stream = data.get("stream").filter(|stream| stream.is_object());
     let url = stream.and_then(|s| s.get("url")).and_then(Value::as_str);
     let token = stream.and_then(|s| s.get("token")).and_then(Value::as_str);
     let (Some(stream), Some(url), Some(token)) = (stream, url, token) else {
-        return Streamed::NotRun(ToolResult::error(format!(
-            "{name}: the API named no stream for this call"
-        )));
+        return Err("the API named no stream for this call".to_string());
     };
     let Some(request) = stream.get("request").filter(|request| request.is_object()) else {
-        return Streamed::NotRun(ToolResult::error(format!(
-            "{name}: the API described no run for this call"
-        )));
+        return Err("the API described no run for this call".to_string());
     };
-    let command = request
-        .get("command")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let cwd = request
-        .get("cwd")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if stream.get("protocol").and_then(Value::as_str) != Some(frames::PROTOCOL) {
-        return Streamed::NotRun(not_run(
-            name,
-            command,
-            cwd,
-            "its stream is of a kind this client does not know",
-        ));
+    Ok(StreamCall {
+        url,
+        token,
+        protocol: stream.get("protocol").and_then(Value::as_str),
+        request,
+        command: request
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        cwd: request
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    })
+}
+
+/// Run the call on its stream: open it, send the checkout, answer what the
+/// service asks of it, and return the service's `result` frame. What the
+/// service sends meanwhile goes to `events`. `tool_result` asks the service to
+/// make the tool's result itself (it then sends no output as it goes). The
+/// error is why the call was not run there, in words for the caller.
+pub async fn drive_stream(
+    call: &StreamCall<'_>,
+    snapshot: &CheckoutSnapshot,
+    tool_result: bool,
+    events: tokio::sync::mpsc::UnboundedSender<Event>,
+) -> Result<Value, String> {
+    if call.protocol != Some(frames::PROTOCOL) {
+        return Err("its stream is of a kind this client does not know".to_string());
     }
+    let env = frames::forwarded_env(call.request, |variable| std::env::var(variable).ok());
+    let hello = frames::hello(call.request, snapshot.request_fields(), env, tool_result)?;
+    let deadline = frames::deadline_of(call.request);
+    let outcome = async {
+        let socket = frames::connect(call.url, call.token).await?;
+        frames::exchange(socket, &hello, snapshot, deadline, events).await
+    }
+    .await;
+    outcome.map_err(|error| reason_of(&error).to_string())
+}
+
+/// Run the call the API answered with a stream for, and turn its result into the tool's;
+/// the service's heartbeats are reported as progress while it runs.
+async fn run_stream(name: &str, data: &Value, snapshot: Option<&CheckoutSnapshot>) -> Streamed {
+    let call = match stream_call(data) {
+        Ok(call) => call,
+        Err(message) => {
+            return Streamed::NotRun(ToolResult::error(format!("{name}: {message}")));
+        }
+    };
     let Some(snapshot) = snapshot else {
         return Streamed::NotRun(ToolResult::error(format!(
             "{name} was not run: it needs a snapshot of this checkout and none was taken"
         )));
     };
-    let env = frames::forwarded_env(request, |variable| std::env::var(variable).ok());
-    let hello = match frames::hello(request, snapshot.request_fields(), env, true) {
-        Ok(hello) => hello,
-        Err(message) => {
-            return Streamed::NotRun(not_run(name, command, cwd, &message));
-        }
-    };
-    let deadline = frames::deadline_of(request);
-
     let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
-    let exchange = {
-        let hello = &hello;
-        async move {
-            let socket = frames::connect(url, token).await?;
-            frames::exchange(socket, hello, snapshot, deadline, events).await
-        }
-    };
     // The service's heartbeats keep the caller's own clock from running out
     // (clients that reset their timeout on progress). What the service says in
     // them is not passed on.
@@ -647,10 +739,10 @@ async fn run_stream(name: &str, data: &Value, snapshot: Option<&CheckoutSnapshot
             }
         }
     };
-    let (outcome, ()) = tokio::join!(exchange, pump);
+    let (outcome, ()) = tokio::join!(drive_stream(&call, snapshot, true, events), pump);
     match outcome {
-        Ok(frame) => interpret(name, command, cwd, &frame),
-        Err(error) => Streamed::NotRun(not_run(name, command, cwd, reason_of(&error))),
+        Ok(frame) => interpret(name, call.command, call.cwd, &frame),
+        Err(reason) => Streamed::NotRun(not_run(name, call.command, call.cwd, &reason)),
     }
 }
 

@@ -23,6 +23,7 @@ pub mod config;
 pub mod connect;
 pub mod hook_handlers;
 pub mod hooks;
+pub mod hosted_run;
 pub mod limited_mode;
 pub mod link;
 pub mod server;

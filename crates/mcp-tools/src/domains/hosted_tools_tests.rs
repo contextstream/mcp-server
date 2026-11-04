@@ -1009,3 +1009,105 @@ async fn a_call_nobody_gave_up_on_is_run_each_time_and_a_changed_checkout_is_a_n
     run(&client, &session, &tool, arguments).await;
     assert_eq!(sockets.lock().unwrap().len(), 4);
 }
+
+#[tokio::test]
+async fn a_run_without_a_made_result_streams_its_output_and_ends_with_its_status() {
+    let (ws_url, sockets) = frames_service(vec![
+        Step::Output("line one\n"),
+        Step::Pause(20),
+        Step::Output("line two\n"),
+        Step::Json(json!({"type": "result", "ran": true, "exit": 3, "seconds": 1.5})),
+    ])
+    .await;
+    let (url, _) = stream_api(stream_answer(&ws_url, "frames/1")).await;
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let snapshot = take_snapshot(&session, &tool).await.unwrap().unwrap();
+    let arguments = json!({"command": "run the thing"});
+    let data = call_api(&client, &session, &tool, &arguments, Some(&snapshot))
+        .await
+        .unwrap();
+    let call = stream_call(&data).unwrap();
+    assert_eq!((call.command, call.cwd), ("run the thing", "pkg"));
+
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let frame = drive_stream(&call, &snapshot, false, events).await.unwrap();
+    assert_eq!(
+        (frame["ran"].clone(), frame["exit"].clone()),
+        (json!(true), json!(3))
+    );
+    let mut output = Vec::new();
+    while let Ok(event) = inbox.try_recv() {
+        if let Event::Output(bytes) = event {
+            output.extend(bytes);
+        }
+    }
+    assert_eq!(String::from_utf8(output).unwrap(), "line one\nline two\n");
+    // Asked for no made result: the hello does not say `tool_result`.
+    let sockets = sockets.lock().unwrap().clone();
+    assert_eq!(sockets.len(), 1);
+    assert!(
+        sockets[0].hello.get("tool_result").is_none(),
+        "{:?}",
+        sockets[0].hello
+    );
+}
+
+#[tokio::test]
+async fn a_stream_that_cannot_be_used_says_why_before_any_socket_is_opened() {
+    assert!(stream_call(&json!({})).unwrap_err().contains("no stream"));
+    assert!(
+        stream_call(&json!({"stream": {"url": "wss://x/y", "token": "t"}}))
+            .unwrap_err()
+            .contains("described no run")
+    );
+    let (ws_url, sockets) = frames_service(vec![Step::Json(made_result())]).await;
+    let (url, _) = stream_api(stream_answer(&ws_url, "ndjson/9")).await;
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let snapshot = take_snapshot(&session, &tool).await.unwrap().unwrap();
+    let data = call_api(
+        &client,
+        &session,
+        &tool,
+        &json!({"command": "x"}),
+        Some(&snapshot),
+    )
+    .await
+    .unwrap();
+    let call = stream_call(&data).unwrap();
+    let (events, _inbox) = tokio::sync::mpsc::unbounded_channel();
+    let reason = drive_stream(&call, &snapshot, false, events)
+        .await
+        .unwrap_err();
+    assert!(
+        reason.contains("kind this client does not know"),
+        "{reason}"
+    );
+    assert!(sockets.lock().unwrap().is_empty());
+    // A tool that asks for no snapshot takes none.
+    let plain = parse_catalog(&json!({"tools": [
+        {"name": "plain", "description": "x", "input_schema": {"type": "object"}},
+    ]}));
+    assert!(take_snapshot(&session, &plain[0]).await.unwrap().is_none());
+}
+
+#[test]
+fn a_definition_carries_its_command_hints() {
+    let tools = parse_catalog(&json!({"tools": [
+        {"name": "takes", "description": "x", "input_schema": {"type": "object"},
+         "command_hints": {"argument": "command", "patterns": ["^cargo test$"]}},
+        {"name": "takes_none", "description": "x", "input_schema": {"type": "object"}},
+        {"name": "too_broad", "description": "x", "input_schema": {"type": "object"},
+         "command_hints": {"argument": "command", "patterns": [".*"]}},
+    ]}));
+    assert!(tools[0]
+        .command_hints
+        .as_ref()
+        .unwrap()
+        .matches("cargo test"));
+    assert!(tools[1].command_hints.is_none());
+    assert!(tools[2].command_hints.is_none());
+}

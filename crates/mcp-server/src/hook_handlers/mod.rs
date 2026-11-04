@@ -6,6 +6,7 @@
 pub mod antigravity;
 pub mod client_model_extractor;
 pub mod coaching_turn;
+pub mod command_rewrite;
 pub mod common;
 pub mod compliance;
 pub(crate) mod contextagents;

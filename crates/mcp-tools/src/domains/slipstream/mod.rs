@@ -1003,8 +1003,7 @@ pub(crate) async fn caller_identity(client: &ContextStreamClient) -> Option<Stri
         return None;
     }
     let credential = config.api_key.or(config.jwt)?;
-    let digest = Sha256::digest(credential.as_bytes());
-    Some(format!("local:{}", &hex::encode(digest)[..16]))
+    Some(mcp_client::command_hints::local_identity(&credential))
 }
 
 /// The workspace a listing is for: the session's, the hosted connection's

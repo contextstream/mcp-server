@@ -522,6 +522,14 @@ fn keep_given_up(key: String, result: ToolResult) {
     kept.push((key, Instant::now(), result));
 }
 
+/// Whether a result is kept for this tool, workspace and arguments, whatever the checkout was.
+fn has_given_up(prefix: &str) -> bool {
+    let wanted = format!("{prefix}\0");
+    let mut kept = given_up();
+    kept.retain(|(_, at, _)| at.elapsed() < GIVEN_UP_TTL);
+    kept.iter().any(|(key, _, _)| key.starts_with(&wanted))
+}
+
 fn take_given_up(key: &str) -> Option<ToolResult> {
     let mut kept = given_up();
     kept.retain(|(_, at, _)| at.elapsed() < GIVEN_UP_TTL);
@@ -537,12 +545,50 @@ enum Streamed {
     NotRun(ToolResult),
 }
 
-/// The snapshot a tool asks for (`None` for a tool that asks for none), or the
-/// result that tells the caller it could not be taken.
-pub async fn take_snapshot(
+/// A snapshot a tool asked for, begun: whose checkout it is is known, and the
+/// rest is being taken while the caller goes on. Dropping it stops that.
+pub struct PendingSnapshot {
+    /// What a call that carries no more of the snapshot sends: the repository's identity.
+    pub identity: Value,
+    /// The folder the call is about, relative to the repository's root (`""` for the root).
+    pub folder: String,
+    task: Option<tokio::task::JoinHandle<Result<CheckoutSnapshot, SnapshotError>>>,
+}
+
+impl Drop for PendingSnapshot {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl PendingSnapshot {
+    /// The finished snapshot, or the result that tells the caller why there is none.
+    pub async fn finish(mut self, tool: &str) -> Result<CheckoutSnapshot, ToolResult> {
+        let Some(task) = self.task.take() else {
+            return Err(ToolResult::error(format!(
+                "{tool} was not run: the snapshot of this checkout was not taken"
+            )));
+        };
+        match task.await {
+            Ok(Ok(snapshot)) => Ok(snapshot),
+            Ok(Err(error)) => Err(snapshot_refusal(tool, &error)),
+            Err(_) => Err(ToolResult::error(format!(
+                "{tool} was not run: the snapshot of this checkout could not be taken"
+            ))),
+        }
+    }
+}
+
+/// Begin the snapshot a tool asks for (`None` for a tool that asks for none),
+/// or give the result that tells the caller it cannot be taken. Refusals that
+/// do not need the whole checkout (the person's switches, no repository) come
+/// at once, before anything is sent anywhere.
+pub async fn begin_snapshot(
     session: &SessionManager,
     tool: &HostedTool,
-) -> Result<Option<CheckoutSnapshot>, ToolResult> {
+) -> Result<Option<PendingSnapshot>, ToolResult> {
     if !tool.attachments.contains(&Attachment::CheckoutSnapshot) {
         return Ok(None);
     }
@@ -552,10 +598,18 @@ pub async fn take_snapshot(
             tool.name
         )));
     };
-    match CheckoutSnapshot::capture(&folder).await {
-        Ok(taken) => Ok(Some(taken)),
-        Err(error) => Err(snapshot_refusal(&tool.name, &error)),
-    }
+    let start = match CheckoutSnapshot::begin(&folder).await {
+        Ok(start) => start,
+        Err(error) => return Err(snapshot_refusal(&tool.name, &error)),
+    };
+    let identity = start.identity();
+    let folder = start.folder().to_string();
+    let task = tokio::spawn(start.complete());
+    Ok(Some(PendingSnapshot {
+        identity,
+        folder,
+        task: Some(task),
+    }))
 }
 
 /// Make the call to the API: its answer's data, or the result that says why
@@ -565,14 +619,14 @@ pub async fn call_api(
     session: &SessionManager,
     tool: &HostedTool,
     arguments: &Value,
-    snapshot: Option<&CheckoutSnapshot>,
+    checkout: Option<Value>,
 ) -> Result<Value, ToolResult> {
     let mut body = serde_json::json!({ "arguments": arguments });
     if let Some(workspace) = workspace_of(client, session).await {
         body["workspace_id"] = Value::String(workspace);
     }
-    if let Some(taken) = snapshot {
-        body["checkout"] = taken.attachment();
+    if let Some(checkout) = checkout {
+        body["checkout"] = checkout;
     }
     let answer = match client
         .hosted_tool_call(&tool.name, &body, CALL_TIMEOUT)
@@ -602,37 +656,60 @@ pub async fn run(
     tool: &HostedTool,
     arguments: Value,
 ) -> ToolResult {
+    let streamed = tool.transport == Transport::Stream;
+    let workspace = workspace_of(client, session).await.unwrap_or_default();
+    let kept = format!("{}\0{}\0{}", tool.name, workspace, arguments);
     // Held until the call is over: the snapshot owns the objects it will be asked for.
-    let snapshot = match take_snapshot(session, tool).await {
-        Ok(snapshot) => snapshot,
+    let mut pending = match begin_snapshot(session, tool).await {
+        Ok(pending) => pending,
         Err(refusal) => return refusal,
     };
-    // A call asked again after its caller gave up on it picks up what that run
-    // found, when the checkout is the same: the run is not lost to a client's timeout.
-    let pickup = match (&tool.transport, &snapshot) {
-        (Transport::Stream, Some(taken)) => Some(format!(
-            "{}\0{}\0{}\0{}",
-            tool.name,
-            workspace_of(client, session).await.unwrap_or_default(),
-            taken.target_tree,
-            arguments
-        )),
-        _ => None,
-    };
-    if let Some(done) = pickup.as_deref().and_then(take_given_up) {
-        return done;
+    let mut snapshot: Option<CheckoutSnapshot> = None;
+    let mut checkout: Option<Value> = None;
+    // A call to a tool that answers on a stream carries only who the repository
+    // is, so it is made while the rest of the snapshot is taken. A call asked
+    // again after its caller gave up on it picks up what that run found, when
+    // the checkout is the same, so it waits for the snapshot to look for it.
+    let overlap = streamed && !has_given_up(&kept);
+    if let Some(begun) = pending.take() {
+        if overlap {
+            checkout = Some(begun.identity.clone());
+            pending = Some(begun);
+        } else {
+            let taken = match begun.finish(&tool.name).await {
+                Ok(taken) => taken,
+                Err(refusal) => return refusal,
+            };
+            checkout = Some(if streamed {
+                taken.identity()
+            } else {
+                taken.attachment()
+            });
+            snapshot = Some(taken);
+        }
     }
-    let data = match call_api(client, session, tool, &arguments, snapshot.as_ref()).await {
+    if let (true, Some(taken)) = (streamed, &snapshot) {
+        if let Some(done) = take_given_up(&format!("{kept}\0{}", taken.target_tree)) {
+            return done;
+        }
+    }
+    let data = match call_api(client, session, tool, &arguments, checkout).await {
         Ok(data) => data,
         Err(failure) => return failure,
     };
+    if let Some(begun) = pending.take() {
+        snapshot = match begun.finish(&tool.name).await {
+            Ok(taken) => Some(taken),
+            Err(refusal) => return refusal,
+        };
+    }
     match tool.transport {
         Transport::Api => result_from(&tool.name, &data, String::new()),
         Transport::Stream => match run_stream(&tool.name, &data, snapshot.as_ref()).await {
             Streamed::Ran(result) => {
                 let abandoned = peer::current().is_some_and(|peer| peer.was_cancelled());
-                if let (true, Some(key)) = (abandoned, pickup) {
-                    keep_given_up(key, result.clone());
+                if let (true, Some(taken)) = (abandoned, &snapshot) {
+                    keep_given_up(format!("{kept}\0{}", taken.target_tree), result.clone());
                 }
                 result
             }
@@ -700,8 +777,13 @@ pub async fn drive_stream(
     let hello = frames::hello(call.request, snapshot.request_fields(), env, tool_result)?;
     let deadline = frames::deadline_of(call.request);
     let outcome = async {
-        let socket = frames::connect(call.url, call.token).await?;
-        frames::exchange(socket, &hello, snapshot, deadline, events).await
+        let (socket, pack) = tokio::join!(
+            frames::connect(call.url, call.token),
+            snapshot.initial_pack()
+        );
+        let socket = socket?;
+        let pack = pack.map_err(|e| ExchangeError::Snapshot(e.to_string()))?;
+        frames::exchange_with_pack(socket, &hello, pack, snapshot, deadline, events).await
     }
     .await;
     outcome.map_err(|error| reason_of(&error).to_string())

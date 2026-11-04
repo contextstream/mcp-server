@@ -744,7 +744,14 @@ async fn a_stream_call_runs_over_frames_and_returns_what_the_service_made() {
         .cloned()
         .unwrap();
     assert_eq!(call.body["arguments"], json!({"command": "run the thing"}));
-    let target_tree = call.body["checkout"]["target_tree"].clone();
+    // The call to a stream tool carries who the repository is and nothing more of the snapshot.
+    let checkout = call.body["checkout"].as_object().unwrap();
+    assert_eq!(
+        checkout.keys().collect::<Vec<_>>(),
+        ["repo"],
+        "{checkout:?}"
+    );
+    assert_eq!(checkout["repo"].as_object().unwrap().len(), 2);
 
     let sockets = sockets.lock().unwrap().clone();
     assert_eq!(sockets.len(), 1);
@@ -772,7 +779,8 @@ async fn a_stream_call_runs_over_frames_and_returns_what_the_service_made() {
     assert_eq!(hello["timeout_s"], 60);
     assert_eq!(hello["wait_s"], 30);
     assert_eq!(hello["tool_result"], true);
-    assert_eq!(hello["target_tree"], target_tree);
+    assert_eq!(hello["target_tree"].as_str().unwrap().len(), 40);
+    assert_ne!(hello["target_tree"], hello["base_tree"]);
     assert_eq!(hello["overlay"].as_array().unwrap().len(), 1);
     assert_eq!(hello["overlay"][0][2], "a.txt");
     // A variable whose name looks like a credential is not forwarded, set or not.
@@ -1023,11 +1031,18 @@ async fn a_run_without_a_made_result_streams_its_output_and_ends_with_its_status
     let client = client_in_workspace(&url);
     let (_repo, session) = changed_checkout(&client).await;
     let tool = check_tool(&client, &session).await;
-    let snapshot = take_snapshot(&session, &tool).await.unwrap().unwrap();
+    let pending = begin_snapshot(&session, &tool).await.unwrap().unwrap();
     let arguments = json!({"command": "run the thing"});
-    let data = call_api(&client, &session, &tool, &arguments, Some(&snapshot))
-        .await
-        .unwrap();
+    let data = call_api(
+        &client,
+        &session,
+        &tool,
+        &arguments,
+        Some(pending.identity.clone()),
+    )
+    .await
+    .unwrap();
+    let snapshot = pending.finish(&tool.name).await.unwrap();
     let call = stream_call(&data).unwrap();
     assert_eq!((call.command, call.cwd), ("run the thing", "pkg"));
 
@@ -1067,16 +1082,17 @@ async fn a_stream_that_cannot_be_used_says_why_before_any_socket_is_opened() {
     let client = client_in_workspace(&url);
     let (_repo, session) = changed_checkout(&client).await;
     let tool = check_tool(&client, &session).await;
-    let snapshot = take_snapshot(&session, &tool).await.unwrap().unwrap();
+    let pending = begin_snapshot(&session, &tool).await.unwrap().unwrap();
     let data = call_api(
         &client,
         &session,
         &tool,
         &json!({"command": "x"}),
-        Some(&snapshot),
+        Some(pending.identity.clone()),
     )
     .await
     .unwrap();
+    let snapshot = pending.finish(&tool.name).await.unwrap();
     let call = stream_call(&data).unwrap();
     let (events, _inbox) = tokio::sync::mpsc::unbounded_channel();
     let reason = drive_stream(&call, &snapshot, false, events)
@@ -1091,7 +1107,7 @@ async fn a_stream_that_cannot_be_used_says_why_before_any_socket_is_opened() {
     let plain = parse_catalog(&json!({"tools": [
         {"name": "plain", "description": "x", "input_schema": {"type": "object"}},
     ]}));
-    assert!(take_snapshot(&session, &plain[0]).await.unwrap().is_none());
+    assert!(begin_snapshot(&session, &plain[0]).await.unwrap().is_none());
 }
 
 #[test]
@@ -1110,4 +1126,38 @@ fn a_definition_carries_its_command_hints() {
         .matches("cargo test"));
     assert!(tools[1].command_hints.is_none());
     assert!(tools[2].command_hints.is_none());
+}
+
+#[tokio::test]
+async fn a_snapshot_that_cannot_be_finished_ends_the_call_though_it_may_already_have_been_made() {
+    let (ws_url, sockets) = frames_service(vec![Step::Json(made_result())]).await;
+    let (url, api_seen) = stream_api(stream_answer(&ws_url, "frames/1")).await;
+    let client = client_in_workspace(&url);
+    let (repo, session) = changed_checkout(&client).await;
+    // A change over the per-file limit: the snapshot begins, then cannot be finished.
+    std::fs::write(repo.path().join("huge.bin"), vec![0u8; 17 << 20]).unwrap();
+    let tool = check_tool(&client, &session).await;
+    let result = run(
+        &client,
+        &session,
+        &tool,
+        json!({"command": "run the thing"}),
+    )
+    .await;
+    assert!(result.is_error);
+    let message = text_of(&result).join(" ");
+    assert!(
+        message.contains("huge.bin") && message.contains("limit"),
+        "{message}"
+    );
+    assert!(message.contains("yourself"), "{message}");
+    // Nothing was sent over a socket, and the API was asked at most once.
+    assert!(sockets.lock().unwrap().is_empty());
+    let posts = api_seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.method == "POST")
+        .count();
+    assert!(posts <= 1, "{posts}");
 }

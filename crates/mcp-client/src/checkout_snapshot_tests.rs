@@ -642,3 +642,89 @@ fn secret_names_are_told_from_lock_files_and_archives() {
     assert!(ContextStreamClient::should_skip_file("bundle.zip", true));
     assert!(!ContextStreamClient::should_skip_file("main.rs", true));
 }
+
+#[tokio::test]
+async fn the_identity_is_known_before_the_rest_of_the_snapshot_is_taken() {
+    let temp = repo_with_history();
+    write(temp.path(), "a.txt", "alpha, changed\n");
+    let start = CheckoutSnapshot::begin(temp.path()).await.unwrap();
+    let identity = start.identity();
+    let name = temp.path().file_name().unwrap().to_str().unwrap();
+    assert_eq!(identity["repo"]["name"], name);
+    assert_eq!(
+        identity["repo"]["origin_sha256"].as_str().unwrap().len(),
+        64
+    );
+    assert_eq!(identity.as_object().unwrap().len(), 1, "{identity}");
+    assert_eq!(start.folder(), "");
+    let snapshot = start.complete().await.unwrap();
+    assert_eq!(snapshot.identity(), identity);
+    // The rest is what a whole capture gives.
+    let again = CheckoutSnapshot::capture(temp.path()).await.unwrap();
+    assert_eq!(snapshot.base_tree, again.base_tree);
+    assert_eq!(snapshot.target_tree, again.target_tree);
+    assert_eq!(snapshot.overlay, again.overlay);
+    assert_eq!(snapshot.overlay.len(), 1);
+}
+
+#[tokio::test]
+async fn a_checkout_with_nothing_changed_is_its_own_base_tree() {
+    let temp = repo_with_history();
+    let snapshot = CheckoutSnapshot::capture(temp.path()).await.unwrap();
+    assert!(snapshot.overlay.is_empty() && snapshot.deletes.is_empty());
+    assert_eq!(snapshot.target_tree, snapshot.base_tree);
+    assert_eq!(
+        snapshot.base_tree,
+        git_ok(temp.path(), &["rev-parse", "HEAD^{tree}"])
+    );
+    // A change makes the trees differ, and an independent answer agrees on the new one.
+    write(temp.path(), "a.txt", "alpha, changed\n");
+    let changed = CheckoutSnapshot::capture(temp.path()).await.unwrap();
+    assert_ne!(changed.target_tree, changed.base_tree);
+    assert_eq!(
+        changed.target_tree,
+        reference_tree(temp.path(), &["a.txt"], &[])
+    );
+    // Withholding the only change leaves the base tree as the target.
+    std::fs::remove_file(temp.path().join("a.txt")).ok();
+    git_ok(temp.path(), &["checkout", "--", "a.txt"]);
+    write(temp.path(), ".env", "TOKEN=abc\n");
+    let withheld = CheckoutSnapshot::capture(temp.path()).await.unwrap();
+    assert_eq!(withheld.withheld.len(), 1);
+    assert_eq!(withheld.target_tree, withheld.base_tree);
+}
+
+#[tokio::test]
+async fn begin_names_the_folder_and_refuses_what_is_not_a_repository() {
+    let temp = repo_with_history();
+    let start = CheckoutSnapshot::begin(&temp.path().join("src"))
+        .await
+        .unwrap();
+    assert_eq!(start.folder(), "src");
+    assert_eq!(
+        std::fs::canonicalize(start.root()).unwrap(),
+        std::fs::canonicalize(temp.path()).unwrap()
+    );
+    let not_a_repo = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        CheckoutSnapshot::begin(not_a_repo.path()).await,
+        Err(SnapshotError::NotARepository(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_repository_before_its_first_commit_is_its_own_empty_base() {
+    let temp = tempfile::tempdir().unwrap();
+    git_ok(temp.path(), &["init", "-q"]);
+    let snapshot = CheckoutSnapshot::capture(temp.path()).await.unwrap();
+    assert_eq!(snapshot.base_tree, EMPTY_TREE);
+    assert_eq!(snapshot.target_tree, EMPTY_TREE);
+    write(temp.path(), "first.txt", "hello\n");
+    let with_file = CheckoutSnapshot::capture(temp.path()).await.unwrap();
+    assert_eq!(with_file.base_tree, EMPTY_TREE);
+    assert_eq!(with_file.overlay.len(), 1);
+    assert_eq!(
+        with_file.target_tree,
+        reference_tree(temp.path(), &["first.txt"], &[])
+    );
+}

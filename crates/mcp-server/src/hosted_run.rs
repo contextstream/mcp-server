@@ -18,7 +18,7 @@ use mcp_client::frames::Event;
 use mcp_client::ContextStreamClient;
 use mcp_session::SessionManager;
 use mcp_tools::domains::hosted_tools::{
-    call_api, drive_stream, stream_call, take_snapshot, Attachment, HostedTool, Transport,
+    begin_snapshot, call_api, drive_stream, stream_call, Attachment, HostedTool, Transport,
 };
 use serde_json::Value;
 
@@ -89,8 +89,9 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
     let client = ContextStreamClient::new(client_config.clone());
     let session = SessionManager::new(client.clone(), client_config);
 
-    let snapshot = match take_snapshot(&session, &tool).await {
-        Ok(Some(snapshot)) => snapshot,
+    // The call is made while the rest of the snapshot is taken: it needs only who the repository is.
+    let pending = match begin_snapshot(&session, &tool).await {
+        Ok(Some(pending)) => pending,
         Ok(None) => return Remote::Here(None),
         Err(_) => return Remote::Here(Some("this checkout could not be described".to_string())),
     };
@@ -103,16 +104,16 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
         .hints
         .cwd_argument
         .as_ref()
-        .filter(|_| !snapshot.folder.is_empty())
+        .filter(|_| !pending.folder.is_empty())
     {
-        arguments.insert(name.clone(), Value::String(snapshot.folder.clone()));
+        arguments.insert(name.clone(), Value::String(pending.folder.clone()));
     }
     let data = match call_api(
         &client,
         &session,
         &tool,
         &Value::Object(arguments),
-        Some(&snapshot),
+        Some(pending.identity.clone()),
     )
     .await
     {
@@ -122,6 +123,10 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
     let call = match stream_call(&data) {
         Ok(call) => call,
         Err(message) => return Remote::Here(Some(message)),
+    };
+    let snapshot = match pending.finish(&tool.name).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return Remote::Here(Some("this checkout could not be described".to_string())),
     };
 
     let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();

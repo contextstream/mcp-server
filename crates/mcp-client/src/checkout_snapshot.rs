@@ -393,6 +393,118 @@ impl PrivacyIgnore {
     }
 }
 
+/// The first, cheap part of a snapshot: whose checkout it is, and that the
+/// person's switches allow one. See [`CheckoutSnapshot::begin`].
+#[derive(Debug)]
+pub struct SnapshotStart {
+    root: PathBuf,
+    folder: String,
+    repo_name: String,
+    origin_sha256: String,
+    limits: Limits,
+}
+
+impl SnapshotStart {
+    /// The repository's top folder.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The folder the snapshot was asked of, relative to [`SnapshotStart::root`] (`""` for the root).
+    pub fn folder(&self) -> &str {
+        &self.folder
+    }
+
+    /// `{"repo": {"name", "origin_sha256"}}`: who the repository is and nothing
+    /// else of it, for a call that carries no more than that.
+    pub fn identity(&self) -> Value {
+        identity_of(&self.repo_name, &self.origin_sha256)
+    }
+
+    /// The rest of the snapshot: the two trees, the changes and what was withheld.
+    pub async fn complete(self) -> Result<CheckoutSnapshot, SnapshotError> {
+        let SnapshotStart {
+            root: repo,
+            folder,
+            repo_name,
+            origin_sha256,
+            limits,
+        } = self;
+        let (real_objects, head) = tokio::join!(
+            git(
+                &repo,
+                &[],
+                None,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "objects",
+                ],
+            ),
+            git(
+                &repo,
+                &[],
+                None,
+                &["rev-parse", "-q", "--verify", "HEAD^{tree}"],
+            ),
+        );
+        let real_objects = PathBuf::from(text(&real_objects?));
+        let base_tree = match head {
+            Ok(out) if is_oid(&text(&out)) => text(&out),
+            _ => EMPTY_TREE.to_string(),
+        };
+        let temp = tempfile::tempdir().map_err(|e| SnapshotError::Io(e.to_string()))?;
+        let private_objects = temp.path().join("objects");
+        std::fs::create_dir_all(&private_objects).map_err(|e| SnapshotError::Io(e.to_string()))?;
+        let env = GitEnv {
+            repo: repo.clone(),
+            objects: vec![
+                (
+                    "GIT_OBJECT_DIRECTORY".to_string(),
+                    private_objects.to_string_lossy().to_string(),
+                ),
+                (
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES".to_string(),
+                    real_objects.to_string_lossy().to_string(),
+                ),
+            ],
+        };
+
+        // The scratch index is made while git lists the changes; a checkout with
+        // none needs neither it nor a tree of its own: its tree is its base.
+        let (prepared, listed) = tokio::join!(
+            prepare_scratch_index(&env, temp.path(), &base_tree),
+            overlay(&env, limits),
+        );
+        let (overlay, deletes, withheld) = listed?;
+        let target_tree = if overlay.is_empty() && deletes.is_empty() {
+            base_tree.clone()
+        } else {
+            prepared?;
+            finish_target_tree(&env, temp.path(), &overlay, &deletes).await?
+        };
+        Ok(CheckoutSnapshot {
+            root: repo,
+            folder,
+            repo_name,
+            origin_sha256,
+            base_tree,
+            target_tree,
+            overlay,
+            deletes,
+            withheld,
+            git: env,
+            _objects: temp,
+        })
+    }
+}
+
+/// `{"repo": {"name", "origin_sha256"}}`.
+fn identity_of(repo_name: &str, origin_sha256: &str) -> Value {
+    json!({ "repo": {"name": repo_name, "origin_sha256": origin_sha256} })
+}
+
 impl CheckoutSnapshot {
     /// Take a snapshot of the checkout `folder` is in, within the default [`Limits`].
     pub async fn capture(folder: &Path) -> Result<Self, SnapshotError> {
@@ -401,6 +513,19 @@ impl CheckoutSnapshot {
 
     /// Take a snapshot within `limits`.
     pub async fn capture_with(folder: &Path, limits: Limits) -> Result<Self, SnapshotError> {
+        Self::begin_with(folder, limits).await?.complete().await
+    }
+
+    /// Begin a snapshot of the checkout `folder` is in: say whose checkout it is
+    /// (a few quick git questions and the person's switches), so that a caller
+    /// that can use that early may start its own work, and finish the snapshot
+    /// with [`SnapshotStart::complete`] meanwhile.
+    pub async fn begin(folder: &Path) -> Result<SnapshotStart, SnapshotError> {
+        Self::begin_with(folder, Limits::default()).await
+    }
+
+    /// [`CheckoutSnapshot::begin`] within `limits`.
+    pub async fn begin_with(folder: &Path, limits: Limits) -> Result<SnapshotStart, SnapshotError> {
         let shown = folder.display().to_string();
         let top = git(folder, &[], None, &["rev-parse", "--show-toplevel"])
             .await
@@ -443,65 +568,12 @@ impl CheckoutSnapshot {
         } else {
             relative
         };
-
-        let real_objects = {
-            let out = git(
-                &repo,
-                &[],
-                None,
-                &[
-                    "rev-parse",
-                    "--path-format=absolute",
-                    "--git-path",
-                    "objects",
-                ],
-            )
-            .await?;
-            PathBuf::from(text(&out))
-        };
-        let temp = tempfile::tempdir().map_err(|e| SnapshotError::Io(e.to_string()))?;
-        let private_objects = temp.path().join("objects");
-        std::fs::create_dir_all(&private_objects).map_err(|e| SnapshotError::Io(e.to_string()))?;
-        let env = GitEnv {
-            repo: repo.clone(),
-            objects: vec![
-                (
-                    "GIT_OBJECT_DIRECTORY".to_string(),
-                    private_objects.to_string_lossy().to_string(),
-                ),
-                (
-                    "GIT_ALTERNATE_OBJECT_DIRECTORIES".to_string(),
-                    real_objects.to_string_lossy().to_string(),
-                ),
-            ],
-        };
-
-        let base_tree = match git(
-            &repo,
-            &[],
-            None,
-            &["rev-parse", "-q", "--verify", "HEAD^{tree}"],
-        )
-        .await
-        {
-            Ok(out) if is_oid(&text(&out)) => text(&out),
-            _ => EMPTY_TREE.to_string(),
-        };
-
-        let (overlay, deletes, withheld) = overlay(&env, limits).await?;
-        let target_tree = target_tree(&env, temp.path(), &base_tree, &overlay, &deletes).await?;
-        Ok(Self {
-            root: repo.clone(),
+        Ok(SnapshotStart {
+            root: repo,
             folder: relative,
             repo_name: folder_name,
             origin_sha256: origin_digest(&origin),
-            base_tree,
-            target_tree,
-            overlay,
-            deletes,
-            withheld,
-            git: env,
-            _objects: temp,
+            limits,
         })
     }
 
@@ -541,6 +613,11 @@ impl CheckoutSnapshot {
             "deleted": self.deletes.len(),
             "withheld": self.withheld_summary(),
         })
+    }
+
+    /// `{"repo": {"name", "origin_sha256"}}`: the same as [`SnapshotStart::identity`].
+    pub fn identity(&self) -> Value {
+        identity_of(&self.repo_name, &self.origin_sha256)
     }
 
     /// What was left out and why, for the person or the service to be told.
@@ -676,32 +753,31 @@ async fn overlay(
     .map(|s| s.to_string())
     .collect();
     args.extend(left_to_the_service(repo));
-    let status = git(
-        repo,
-        &[],
-        None,
-        &args.iter().map(String::as_str).collect::<Vec<_>>(),
-    )
-    .await?;
     // Tracked files in those folders still count (a vendored node_modules):
     // with no untracked files, git lists only them, without walking an install.
-    let tracked = git(
-        repo,
-        &[],
-        None,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=no",
-            "--no-renames",
-            "--ignore-submodules=all",
-            "--",
-            ":(glob)**/node_modules/**",
-            ":(glob)target/**",
-        ],
-    )
-    .await?;
+    // The two questions are asked together.
+    let untracked_args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (status, tracked) = tokio::join!(
+        git(repo, &[], None, &untracked_args),
+        git(
+            repo,
+            &[],
+            None,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=no",
+                "--no-renames",
+                "--ignore-submodules=all",
+                "--",
+                ":(glob)**/node_modules/**",
+                ":(glob)target/**",
+            ],
+        ),
+    );
+    let status = status?;
+    let tracked = tracked?;
 
     let mut seen = BTreeSet::new();
     let mut changed: Vec<String> = Vec::new();
@@ -850,20 +926,41 @@ fn file_mode(_meta: &std::fs::Metadata) -> String {
     "100644".to_string()
 }
 
-/// The base tree plus the changes, built in a scratch index.
-async fn target_tree(
-    env: &GitEnv,
-    scratch: &Path,
-    base: &str,
-    entries: &[Entry],
-    deletes: &[String],
-) -> Result<String, SnapshotError> {
+/// The environment for the scratch index in `scratch`.
+fn scratch_vars(env: &GitEnv, scratch: &Path) -> Vec<(String, String)> {
     let mut vars = env.objects.clone();
     vars.push((
         "GIT_INDEX_FILE".to_string(),
         scratch.join("index").to_string_lossy().to_string(),
     ));
-    git(&env.repo, &vars, None, &["read-tree", base]).await?;
+    vars
+}
+
+/// Start the scratch index from the base tree.
+async fn prepare_scratch_index(
+    env: &GitEnv,
+    scratch: &Path,
+    base: &str,
+) -> Result<(), SnapshotError> {
+    git(
+        &env.repo,
+        &scratch_vars(env, scratch),
+        None,
+        &["read-tree", base],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The base tree plus the changes: the changes go into the scratch index
+/// [`prepare_scratch_index`] made, and it is written out as a tree.
+async fn finish_target_tree(
+    env: &GitEnv,
+    scratch: &Path,
+    entries: &[Entry],
+    deletes: &[String],
+) -> Result<String, SnapshotError> {
+    let vars = scratch_vars(env, scratch);
     let mut lines: Vec<u8> = Vec::new();
     for entry in entries {
         lines.extend_from_slice(format!("{} {}\t{}", entry.mode, entry.oid, entry.path).as_bytes());

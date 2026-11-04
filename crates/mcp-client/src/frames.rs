@@ -363,12 +363,28 @@ pub async fn exchange<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let hello_bytes =
-        serde_json::to_vec(hello).map_err(|e| ExchangeError::Protocol(e.to_string()))?;
     let first_pack = snapshot
         .initial_pack()
         .await
         .map_err(|e| ExchangeError::Snapshot(e.to_string()))?;
+    exchange_with_pack(ws, hello, first_pack, snapshot, deadline, events).await
+}
+
+/// [`exchange`] with the pack of the changes already built, for a caller that
+/// builds it while the socket is being opened.
+pub async fn exchange_with_pack<S>(
+    ws: WebSocketStream<S>,
+    hello: &Value,
+    first_pack: Vec<u8>,
+    snapshot: &CheckoutSnapshot,
+    deadline: Duration,
+    events: UnboundedSender<Event>,
+) -> Result<Value, ExchangeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let hello_bytes =
+        serde_json::to_vec(hello).map_err(|e| ExchangeError::Protocol(e.to_string()))?;
     let (sink, mut stream) = ws.split();
     let sink = Arc::new(Mutex::new(sink));
     let _sender = AbortOnDrop(tokio::spawn({

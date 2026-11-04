@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.63
+
+- Rules: a machine's ContextStream rules stay where they are. `update` no longer puts the block back into a global rules file left without it, which made sessions in a set-up project load it twice. `CONTEXTSTREAM_PROJECT_RULES=header` moves them back. Each rules write says which form it gave a project's file and why.
+- Search: files in a checkout that lives under a folder named build, dist, docs or similar are no longer treated as build output (they were left unrefreshed, hidden, or ranked as noise).
+
 ## 1.0.62
 
 - Rules: in a set-up project, Claude Code, Codex and Gemini CLI read the ContextStream rules once. The full rules stay in the editor's global rules file (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`). The project's file holds only its workspace and project when every editor on the machine that reads it loads that global file; otherwise it keeps the full rules as before. `CONTEXTSTREAM_PROJECT_RULES=full` keeps the full rules in the project's file, for a committed file read by teammates who haven't run setup. Codex, which cuts a project's AGENTS.md at 32 KiB, now reads a project's own instructions after the ContextStream header.

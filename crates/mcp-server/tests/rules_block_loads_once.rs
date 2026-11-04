@@ -363,3 +363,41 @@ fn the_header_choice_puts_the_block_back_in_the_global_file() {
         1
     );
 }
+
+/// The Mac, 2026-11-04: `update` run in HOME took HOME for a set-up project,
+/// since the global files live there, and wrote HOME's project header into
+/// `~/.claude/CLAUDE.md`, which is also Claude Code's project path
+/// `.claude/CLAUDE.md` for a project at HOME. HOME is no project: its global
+/// files stay as they are and no `~/CLAUDE.md` appears.
+#[test]
+fn a_rules_refresh_in_the_home_folder_writes_no_project_rules() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let elsewhere = checkout(temp.path());
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    record_setup_selection(&home, &["claude"]);
+    std::fs::write(home.join(".claude/CLAUDE.md"), "# My Claude notes\n").unwrap();
+    // Setup wrote the global block (from a project folder).
+    refresh_as_update_does(
+        &home,
+        &elsewhere,
+        "global",
+        &[("CONTEXTSTREAM_PROJECT_RULES", "header")],
+    );
+    let global = read(&home.join(".claude/CLAUDE.md"));
+    assert_eq!(global.matches(FULL_BLOCK_LINE).count(), 1, "{global}");
+
+    for scope in ["project", "all"] {
+        let printed = refresh_as_update_does(&home, &home, scope, &[]);
+        assert_eq!(
+            read(&home.join(".claude/CLAUDE.md")),
+            global,
+            "{scope}: {printed}"
+        );
+        assert!(!home.join("CLAUDE.md").exists(), "{scope}: {printed}");
+        assert!(
+            printed.contains("Project rules: skipped"),
+            "{scope}: {printed}"
+        );
+    }
+}

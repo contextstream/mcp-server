@@ -2283,6 +2283,12 @@ fn update_skip(message: impl AsRef<str>) {
 }
 
 fn should_refresh_project_rules_after_update(cwd: &std::path::Path) -> bool {
+    // HOME holds the global rules files (`~/.claude/CLAUDE.md` is also Claude
+    // Code's project path `.claude/CLAUDE.md` for a project there) and Aider's
+    // `~/.contextstream/rules.md`, so it would always look set up.
+    if !setup::setup_path_is_project_candidate(cwd) {
+        return false;
+    }
     if setup::read_project_config(cwd).ok().flatten().is_some() {
         return true;
     }
@@ -3576,7 +3582,6 @@ async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_else(expected_install_path)
     };
-    let _ = UPDATED_BINARY.set(std::path::PathBuf::from(&install_path));
     let verified_version = verify_and_fix_binary_path(&install_path, &latest);
 
     match verified_version {
@@ -3602,10 +3607,59 @@ async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
         }
     }
 
-    refresh_editor_integrations_after_update(remote_flow, refresh_project_rules).await?;
+    // The editor refresh runs the binary just installed. Any other copy (an
+    // older install in /usr/local/bin, say) would rewrite the rules and hooks
+    // with its own version's logic.
+    let mut candidates = vec![std::path::PathBuf::from(&install_path)];
+    candidates.extend(which::which(binary_name()).ok());
+    match binary_for_post_update(&candidates, &latest, |path| {
+        query_binary_version(&path.to_string_lossy())
+    }) {
+        Some(binary) => {
+            let _ = UPDATED_BINARY.set(binary);
+            refresh_editor_integrations_after_update(remote_flow, refresh_project_rules).await?;
+        }
+        None => update_warn(post_update_refresh_skipped_note(&latest)),
+    }
     update_ok("Update complete");
 
     Ok(())
+}
+
+/// Whether a `--version` line (`contextstream-mcp 1.0.63`) names exactly
+/// `version`.
+fn reports_version(reported: &str, version: &str) -> bool {
+    let version = version.trim().trim_start_matches('v');
+    reported
+        .split_whitespace()
+        .any(|token| token.trim_start_matches('v') == version)
+}
+
+/// The binary `update` refreshes editor rules and hooks with: the first of
+/// `candidates` that reports `latest`, the version just installed. With no
+/// version known, the first candidate, as before. None when no candidate
+/// reports it: refreshing with another version would undo what this one
+/// changed.
+fn binary_for_post_update(
+    candidates: &[std::path::PathBuf],
+    latest: &str,
+    version_of: impl Fn(&std::path::Path) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    if latest.trim().is_empty() {
+        return candidates.first().cloned();
+    }
+    candidates
+        .iter()
+        .find(|path| version_of(path).is_some_and(|reported| reports_version(&reported, latest)))
+        .cloned()
+}
+
+/// What `update` says when it found no installed binary of the new version to
+/// refresh the editors with.
+fn post_update_refresh_skipped_note(latest: &str) -> String {
+    format!(
+        "Editor rules and hooks were not refreshed: no installed contextstream-mcp reports v{latest}, and another version would rewrite them with its own logic. When `contextstream-mcp --version` reports {latest}, run `contextstream-mcp update-hooks --scope=global --only-configured` and `contextstream-mcp update-rules --scope=global --only-configured`."
+    )
 }
 
 /// Download and install binary directly from CDN (used on Windows).
@@ -4634,6 +4688,39 @@ mod tests {
         assert!(args.contains(&UPDATE_HOOKS_ARGS));
         assert!(args.contains(&UPDATE_GLOBAL_RULES_ARGS));
         assert!(args.contains(&UPDATE_PROJECT_RULES_ARGS));
+    }
+
+    #[test]
+    fn update_refreshes_the_editors_only_with_the_version_it_installed() {
+        let installed = std::path::PathBuf::from("/opt/new/contextstream-mcp");
+        let older = std::path::PathBuf::from("/usr/local/bin/contextstream-mcp");
+        let version_of = |path: &std::path::Path| {
+            Some(if path.starts_with("/opt/new") {
+                "contextstream-mcp 1.0.63".to_string()
+            } else {
+                "contextstream-mcp 1.0.62".to_string()
+            })
+        };
+        // The installer's path reported an older copy; PATH has the new one.
+        assert_eq!(
+            binary_for_post_update(&[older.clone(), installed.clone()], "1.0.63", version_of),
+            Some(installed.clone())
+        );
+        // Only older copies: no refresh at all.
+        assert_eq!(
+            binary_for_post_update(std::slice::from_ref(&older), "1.0.63", version_of),
+            None
+        );
+        assert_eq!(
+            binary_for_post_update(std::slice::from_ref(&older), "1.0.6", version_of),
+            None
+        );
+        // No version known: the first candidate, as before.
+        assert_eq!(
+            binary_for_post_update(std::slice::from_ref(&older), "", version_of),
+            Some(older)
+        );
+        assert!(post_update_refresh_skipped_note("1.0.63").contains("update-rules --scope=global"));
     }
 
     #[test]

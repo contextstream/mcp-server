@@ -605,8 +605,7 @@
   that uploaded and deleted nothing.
 - The hosted gateway's CORS preflight answer is now pinned by a test against a
   fixture shared with the edge (#195). The layer itself is unchanged.
-- Not in the binary: the `scripts/dev/depot-run` development helper (#197,
-  #198).
+- Not in the binary: a development helper script (#197, #198).
 - No tool is added or removed.
 
 ## 1.0.28

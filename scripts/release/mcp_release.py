@@ -207,13 +207,13 @@ def channel_state(version, headers):
 
 # RELEASE RUNNERS: which runner may release. The release host sets ACT=true. A run on a runner left out plans nothing
 # (ship and build false), so its gate, builds, publish and hosted jobs are skipped.
-RELEASE_RUNNERS = ("csrun",)
+RELEASE_RUNNERS = ("release-host",)
 
 
 def runner_name(environ=None):
-    """"csrun" when act runs this job, else "depot"."""
+    """"release-host" when act runs this job, else "other"."""
     environ = os.environ if environ is None else environ
-    return "csrun" if environ.get("ACT") == "true" else "depot"
+    return "release-host" if environ.get("ACT") == "true" else "other"
 
 
 def runner_releases(environ=None, runners=RELEASE_RUNNERS):

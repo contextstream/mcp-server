@@ -94,12 +94,12 @@ class FreshInstallCheck(unittest.TestCase):
 class ReleaseRunners(unittest.TestCase):
     """Only the release host releases; any other runner plans nothing."""
 
-    def test_csrun_releases_and_depot_does_not(self):
-        self.assertEqual(release.RELEASE_RUNNERS, ("csrun",))
+    def test_the_release_host_releases_and_another_runner_does_not(self):
+        self.assertEqual(release.RELEASE_RUNNERS, ("release-host",))
         self.assertTrue(release.runner_releases({"ACT": "true"}))
         self.assertFalse(release.runner_releases({}))
         self.assertFalse(release.runner_releases({"ACT": "false"}))
-        self.assertTrue(release.runner_releases({}, runners=("depot", "csrun")), "adding depot back turns it on")
+        self.assertTrue(release.runner_releases({}, runners=("other", "release-host")), "adding another runner turns it on")
 
     def test_plan_drops_ship_and_build_on_a_runner_that_does_not_release(self):
         import inspect

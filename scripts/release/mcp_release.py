@@ -221,8 +221,19 @@ def runner_releases(environ=None, runners=RELEASE_RUNNERS):
     return runner_name(environ) in runners
 
 
-def decide(version, mode, tag_commit, head, state):
-    """(ship, build, commit, reason) for a run. Pure: the tests drive it."""
+def dispatched(environ=None):
+    """Whether a person started this run (a dispatch), as opposed to a push to main."""
+    environ = os.environ if environ is None else environ
+    return environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
+
+def decide(version, mode, tag_commit, head, state, explicit=False):
+    """(ship, build, commit, reason) for a run. Pure: the tests drive it.
+
+    A version that is out on every channel plans nothing, except when `explicit` (a person dispatched the run) and it
+    is still npm latest: the run then ships from the bundle on R2 without building. Every publish step skips what is
+    already done with the same bytes, so this re-runs the outside check and the hosted wait, which is what a run that
+    failed there needs. A push to main never does this."""
     relation = contract.stable_version_relation
     if mode == "dry-run":
         return True, True, head, "dry run of %s at %s" % (version, head[:12])
@@ -230,6 +241,11 @@ def decide(version, mode, tag_commit, head, state):
     done = (state["npm"] and state["registry"] and state["github"] == "published" and state["r2_commit"] == commit
             and state["r2_latest"] is not None and relation(state["r2_latest"], version) != "older")
     if done:
+        if explicit and state["npm_latest"] == version:
+            return True, False, commit, "v%s is fully released: checking every channel again (dispatched)" % version
+        if explicit:
+            return False, False, commit, "v%s is fully released, and npm latest is now %s: nothing to check again" % (
+                version, state["npm_latest"])
         return False, False, commit, "v%s is fully released" % version
     if state["npm_latest"] and relation(version, state["npm_latest"]) == "older":
         raise Refused("v%s is older than npm latest %s; a release never goes back" % (version, state["npm_latest"]))
@@ -270,7 +286,7 @@ def cmd_plan(args):
         status, compare = get_json("%s/repos/%s/compare/%s...main" % (GITHUB_API, REPO, tag_commit), github_headers())
         require(status == 200 and compare.get("status") in ("ahead", "identical"), "tag v%s is not on main" % version)
     state = channel_state(version, github_headers())
-    ship, build, commit, reason = decide(version, mode, tag_commit, head, state)
+    ship, build, commit, reason = decide(version, mode, tag_commit, head, state, explicit=dispatched())
     if (ship or build) and not runner_releases():
         ship, build, reason = False, False, "%s does not release (RELEASE_RUNNERS: %s)" % (runner_name(), ", ".join(RELEASE_RUNNERS))
     if commit != head:
@@ -690,6 +706,60 @@ def cmd_publish(args):
     say(stage="publish", result="PUBLISHED", version=version, commit=commit)
 
 
+# The registry's CDN can lag a fresh publish by several minutes (ETARGET), so a fresh install tries again for ten.
+NPM_INSTALL_ATTEMPTS = 40
+NPM_AUDIT_ATTEMPTS = 8
+NPM_RETRY_PAUSE = 15
+
+
+def npm_install_fresh(install, env, spec, attempts=NPM_INSTALL_ATTEMPTS, pause=NPM_RETRY_PAUSE, run=subprocess.run,
+                      sleep=time.sleep):
+    """Install `spec` into `install`, trying again while the registry catches up: (installed, last problem)."""
+    problem = ""
+    for attempt in range(attempts):
+        try:
+            done = run(["npm", "install", "--prefer-online", "--ignore-scripts", "--no-audit", "--no-fund", spec],
+                       cwd=install, env=env, capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            problem = "npm install did not finish: %s" % error
+        else:
+            if done.returncode == 0:
+                return True, ""
+            lines = (done.stderr or done.stdout or "").strip().splitlines()
+            problem = (lines[-1] if lines else "npm install failed")[:200]
+        if attempt + 1 < attempts:
+            sleep(pause)
+    return False, problem
+
+
+def npm_signatures_verified(install, env, attempts=NPM_AUDIT_ATTEMPTS, pause=NPM_RETRY_PAUSE, run=subprocess.run,
+                            sleep=time.sleep):
+    """`npm audit signatures` in the fresh install, tried again while the registry's signatures catch up."""
+    for attempt in range(attempts):
+        try:
+            audit = run(["npm", "audit", "signatures"], cwd=install, env=env, capture_output=True, text=True, timeout=300)
+            if audit.returncode == 0 and "verified registry signature" in audit.stdout:
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if attempt + 1 < attempts:
+            sleep(pause)
+    return False
+
+
+def fresh_binary_version(install, env, run=subprocess.run):
+    """(last line of `contextstream-mcp --version` from the fresh install, why not): never an exception."""
+    binary = Path(install) / "node_modules/.bin/contextstream-mcp"
+    if not binary.exists():
+        return None, "the install has no node_modules/.bin/contextstream-mcp"
+    try:
+        done = run([str(binary), "--version"], cwd=install, env=env, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return None, "running it failed: %s" % error
+    lines = done.stdout.strip().splitlines()
+    return (lines[-1], "") if lines else (None, "it printed nothing")
+
+
 def cmd_verify(args):
     version, dist = args.version, Path(args.dist)
     failures = []
@@ -711,18 +781,15 @@ def cmd_verify(args):
         env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_RELEASE_")}
         env["CONTEXTSTREAM_MCP_CACHE_DIR"] = str(work / "cache")
         subprocess.run(["npm", "init", "-y"], cwd=install, env=env, capture_output=True, check=True)
-        for attempt in range(10):
-            # The registry's CDN can lag a fresh publish by a minute or two (ETARGET).
-            if subprocess.run(["npm", "install", "--prefer-online", "--ignore-scripts", "--no-audit", "--no-fund",
-                               NPM_PACKAGE + "@" + version], cwd=install, env=env, capture_output=True, timeout=600).returncode == 0:
-                break
-            time.sleep(15)
-        audit = subprocess.run(["npm", "audit", "signatures"], cwd=install, env=env, capture_output=True, text=True)
-        check(audit.returncode == 0 and "verified registry signature" in audit.stdout, "npm signature audit passes")
-        shown = subprocess.run([str(install / "node_modules/.bin/contextstream-mcp"), "--version"], cwd=install, env=env,
-                               capture_output=True, text=True, timeout=300).stdout.strip().splitlines()
-        check(bool(shown) and shown[-1] == "contextstream-mcp " + version,
-              "a fresh npm install downloads and runs the R2 binary: " + (shown[-1] if shown else "nothing"))
+        installed, problem = npm_install_fresh(install, env, NPM_PACKAGE + "@" + version)
+        check(installed, "a fresh npm install of %s@%s works%s" % (NPM_PACKAGE, version, "" if installed else ": " + problem))
+        if installed:
+            check(npm_signatures_verified(install, env), "npm signature audit passes")
+            shown, why = fresh_binary_version(install, env)
+            check(shown == "contextstream-mcp " + version,
+                  "a fresh npm install downloads and runs the R2 binary: " + (shown or why))
+        else:
+            print("skip the signature audit and the binary check: nothing was installed", flush=True)
         check(registry_verify(version, work), "MCP Registry has %s, identical to server.json" % version)
         status, body = http("GET", registry_url(version))
         meta = json.loads(body).get("_meta", {}).get("io.modelcontextprotocol.registry/official", {}) if status == 200 else {}

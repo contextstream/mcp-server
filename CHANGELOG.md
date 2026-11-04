@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.65
+
+- Hosted tools: a tool the service defines for your account is listed with the others and run by the service when called. The server reads the account's tool definitions from the API when a session starts and again after five minutes of use; where there are none, nothing is listed and nothing else changes. `CONTEXTSTREAM_HOSTED_TOOLS=off` lists none and reads no definitions.
+- Hosted tools: such a tool may ask for a snapshot of your checkout's changes: the tree id of your last commit, the name, mode and hash of each changed path, and the content of the changed files; a file of the last commit is sent only when the service says it lacks it. Untracked files that .gitignore excludes, untracked node_modules and Cargo target folders, paths listed in .contextignore or .contextstream/ignore, and uncommitted changes to files that look like credentials are never sent. Off until such a tool exists; `CONTEXTSTREAM_CHECKOUT_SNAPSHOT=off` turns it off.
+- Hosted tools: such a tool may answer a call over a WebSocket stream: it is sent a description of your checkout's changes (see the data-handling doc), reports progress while it runs, and when it does not run the call you are told to run it yourself; `CONTEXTSTREAM_HOSTED_TOOLS=off` turns the whole thing off.
+- Claude Code: when a tool your account has lists the shell commands it takes, a matching shell command is shown and run as `contextstream-mcp run --tool <name> -- '<your command>'`, which sends it there (with the description of your checkout's changes) or, when the tool does not take it, runs it right here as you typed it. Claude Code asks about the changed command like any other; an allow rule for the original does not cover it. `CONTEXTSTREAM_HOSTED_TOOLS=off` leaves every command as it is.
+
 ## 1.0.64
 
 - `update` refreshes editor rules and hooks only with the version it just installed, and run in your home folder it no longer writes project rules there (which replaced the global rules in ~/.claude/CLAUDE.md with a project header).

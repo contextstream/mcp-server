@@ -4051,6 +4051,7 @@ mod auto_mode_tests {
         let note = apply_symbol_anchor_rerank(
             &mut response,
             "project_routing_preserve_explicit_current_scope",
+            None,
         );
 
         assert!(note
@@ -4725,7 +4726,7 @@ mod auto_mode_tests {
         assert!(is_artifact_like_path(
             ".next.bak.1770930141/dev/static/chunks/web_src.js"
         ));
-        assert!(result_has_artifact_like_path(&result));
+        assert!(result_has_artifact_like_path(&result, None));
     }
 
     #[test]
@@ -5605,8 +5606,11 @@ mod auto_mode_tests {
             ..SearchResponse::default()
         };
 
-        let note =
-            apply_symbol_anchor_rerank(&mut response, "project_files(\"/projects/{}/files\" tests");
+        let note = apply_symbol_anchor_rerank(
+            &mut response,
+            "project_files(\"/projects/{}/files\" tests",
+            None,
+        );
 
         assert!(note.is_some());
         assert_eq!(
@@ -6974,7 +6978,7 @@ mod search_quality_tests {
 
         let query = "project_routing_preserve_explicit_current_scope";
         assert!(is_compact_paths_response(&response));
-        assert_eq!(apply_symbol_anchor_rerank(&mut response, query), None);
+        assert_eq!(apply_symbol_anchor_rerank(&mut response, query, None), None);
         assert_eq!(apply_post_rank_fusion(&mut response, query), None);
         assert_eq!(demote_keyword_false_positives(&mut response, query), 0);
         normalize_paths_output(&mut response);
@@ -7015,7 +7019,7 @@ mod search_quality_tests {
 
         let query = "project_routing_preserve_explicit_current_scope";
         assert!(has_client_rerank_evidence(&response));
-        apply_symbol_anchor_rerank(&mut response, query);
+        apply_symbol_anchor_rerank(&mut response, query, None);
         apply_post_rank_fusion(&mut response, query);
         assert_eq!(demote_keyword_false_positives(&mut response, query), 0);
         normalize_paths_output(&mut response);
@@ -7311,6 +7315,93 @@ mod search_quality_tests {
         deduplicate_local_result_locations(&mut response, temp.path());
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.total, Some(1));
+    }
+
+    /// A checkout that lives under a `build/` folder (as on the box's lane
+    /// host, `/build/lanes/...`) holds no build output for that: its rows are
+    /// refreshed, pruned and kept like any other checkout's.
+    #[test]
+    fn a_checkout_under_a_build_folder_is_not_build_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("build/app");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let path = root.join("src/nebula.js");
+        std::fs::write(&path, "line1\nexport const nebulaPrismCalibrate = 3;\n").unwrap();
+        let located = |file: &Path, line: i64| mcp_types::api::SearchResult {
+            id: format!("chunk-{line}"),
+            file_path: Some(file.to_string_lossy().into_owned()),
+            location: Some(format!("{}:{line}", file.display())),
+            start_line: Some(line),
+            content: Some("stale chunk".into()),
+            ..Default::default()
+        };
+
+        let mut response = mcp_types::api::SearchResponse {
+            results: vec![located(&path, 7)],
+            total: Some(1),
+            ..Default::default()
+        };
+        refresh_indexed_result_snippets_from_local_files(
+            &mut response,
+            &root,
+            "nebulaPrismCalibrate",
+            0,
+            500,
+        );
+        assert_eq!(response.results[0].start_line, Some(2));
+        assert_eq!(
+            response.results[0].content.as_deref(),
+            Some("export const nebulaPrismCalibrate = 3;")
+        );
+        assert_eq!(
+            suppress_artifact_rows(
+                &mut response,
+                SearchMode::Hybrid,
+                "nebulaPrismCalibrate",
+                Some(&root)
+            ),
+            0
+        );
+
+        // A row for a file the checkout no longer has goes.
+        let mut stale = mcp_types::api::SearchResponse {
+            results: vec![located(&root.join("src/gone.js"), 1)],
+            total: Some(1),
+            ..Default::default()
+        };
+        prune_deleted_file_results(&mut stale, &root);
+        assert!(stale.results.is_empty());
+    }
+
+    #[test]
+    fn artifact_and_noise_checks_read_only_the_part_inside_the_checkout() {
+        let root = Path::new("/build/lanes/slots/one/tree");
+        assert!(!is_artifact_like_path_in(
+            "/build/lanes/slots/one/tree/src/app.rs",
+            Some(root)
+        ));
+        assert!(is_artifact_like_path_in(
+            "/build/lanes/slots/one/tree/web/dist/app.js",
+            Some(root)
+        ));
+        assert!(is_artifact_like_path_in("web/dist/app.js", Some(root)));
+        // Without a root, an absolute path's folders say nothing.
+        assert!(!is_artifact_like_path_in(
+            "/srv/build/app/src/main.rs",
+            None
+        ));
+        assert!(is_artifact_like_path_in("/srv/app/vendor.min.js", None));
+
+        let site = Path::new("/home/me/docs/site");
+        assert!(!is_symbol_noise_path(
+            "/home/me/docs/site/src/lib.rs",
+            Some(site)
+        ));
+        assert!(is_symbol_noise_path(
+            "/home/me/docs/site/api/docs/guide.md",
+            Some(site)
+        ));
+        assert!(!is_symbol_noise_path("/home/me/docs/site/src/lib.rs", None));
     }
 
     #[test]
@@ -9376,7 +9467,7 @@ mod literal_contract_tests {
             for literal in ["exact", "ignoring_case", "fragment", "none"] {
                 let mut response = page(literal);
                 assert_eq!(
-                    suppress_artifact_rows(&mut response, mode, "nebulaPrismMinified"),
+                    suppress_artifact_rows(&mut response, mode, "nebulaPrismMinified", None),
                     0,
                     "{mode:?} {literal}"
                 );
@@ -9392,7 +9483,7 @@ mod literal_contract_tests {
             for literal in ["exact", "ignoring_case", "fragment"] {
                 let mut response = page(literal);
                 assert_eq!(
-                    suppress_artifact_rows(&mut response, mode, "nebulaPrismMinified"),
+                    suppress_artifact_rows(&mut response, mode, "nebulaPrismMinified", None),
                     0,
                     "{mode:?} {literal}"
                 );
@@ -9400,7 +9491,7 @@ mod literal_contract_tests {
             // ...and unverified build output is still dropped.
             let mut response = page("none");
             assert_eq!(
-                suppress_artifact_rows(&mut response, mode, "nebulaPrismMinified"),
+                suppress_artifact_rows(&mut response, mode, "nebulaPrismMinified", None),
                 3,
                 "{mode:?}"
             );

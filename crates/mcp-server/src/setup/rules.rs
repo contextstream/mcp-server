@@ -1989,9 +1989,27 @@ pub fn write_project_rules_as(
     }
     let rules = project_rules_content_as(editor, workspace_id, workspace_name, project_name, form);
 
+    // A project file is never also a global one: for a project at HOME,
+    // Claude Code's `.claude/CLAUDE.md` is the global rules file itself.
+    let global_files = global_rules_files();
+    let is_global = |path: &Path| {
+        global_files
+            .iter()
+            .any(|global| same_file_path(global, path))
+    };
     let primary = &paths[0];
+    if is_global(primary) {
+        return Err(anyhow::anyhow!(
+            "{} is {}'s global rules file, not a project rules file",
+            primary.display(),
+            editor.display_name()
+        ));
+    }
     write_contextstream_block_to_path(primary, &rules, true)?;
     for legacy in paths.iter().skip(1) {
+        if is_global(legacy) {
+            continue;
+        }
         let _ = write_contextstream_block_to_path(legacy, &rules, false)?;
     }
 
@@ -2010,6 +2028,36 @@ pub fn write_project_rules_as(
 
     record_taught_evidence(editor);
     Ok(())
+}
+
+/// Every editor's global rules files, the ones setup writes and the ones it
+/// cleans up.
+fn global_rules_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for editor in Editor::all() {
+        for path in editor
+            .all_rules_paths(None)
+            .into_iter()
+            .chain(editor.legacy_cleanup_only_rules_paths(None))
+        {
+            if !files.contains(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Whether `a` and `b` name the same file, through symlinked folders too.
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let canonical = |path: &Path| {
+        let parent = path.parent()?.canonicalize().ok()?;
+        Some(parent.join(path.file_name()?))
+    };
+    matches!((canonical(a), canonical(b)), (Some(a), Some(b)) if a == b)
 }
 
 /// Generate rule content for an editor.

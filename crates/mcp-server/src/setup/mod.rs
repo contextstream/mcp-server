@@ -2249,7 +2249,17 @@ pub async fn update_rules_scoped(
         .and_then(|n| n.to_str())
         .unwrap_or("project");
     let include_global = scope == "global" || scope == "all";
-    let include_project = scope == "project" || scope == "all";
+    // HOME and the filesystem root are no project: Claude Code reads a
+    // CLAUDE.md there in every session below it, and HOME's
+    // `.claude/CLAUDE.md` is the global rules file itself.
+    let project_folder = setup_path_is_project_candidate(&cwd);
+    if (scope == "project" || scope == "all") && !project_folder {
+        note!(
+            "Project rules: skipped. {} is not a project folder (your home folder or the filesystem root); rules written there would reach every session below it. Run `contextstream-mcp update-rules --scope=project` inside a project.",
+            cwd.display()
+        );
+    }
+    let include_project = (scope == "project" || scope == "all") && project_folder;
 
     // Rules are injected into every session of an editor. Existing file paths
     // are not proof of current selection or ContextStream ownership, so never
@@ -2327,7 +2337,7 @@ pub async fn update_rules_scoped(
 
         // Update project rules (some clients, e.g. Claude Desktop, have none)
         let mut project_note = None;
-        if (scope == "project" || scope == "all") && editor.rules_path(Some(&cwd)).is_some() {
+        if include_project && editor.rules_path(Some(&cwd)).is_some() {
             // The global rules above are written first, so the form sees them.
             let (form, reason) =
                 rules::project_rules_decision_after(editor, updated.contains(&"global rules"));

@@ -7802,11 +7802,39 @@ fn is_memory_result(item: &mcp_types::api::SearchResult) -> bool {
         .unwrap_or(false)
 }
 
-fn is_symbol_noise_path(path: &str) -> bool {
-    let normalized = path.to_lowercase().replace('\\', "/");
+/// The part of `path` inside the checkout at `root`, which is all the
+/// artifact and noise checks may read: where a checkout lives (say
+/// `/home/me/build/app`, or `/build/lanes/...` on a lane host) says nothing
+/// about its files. A relative path is inside already. An absolute path
+/// outside `root`, or with no root known, keeps only its file name.
+fn path_inside_checkout(path: &str, root: Option<&Path>) -> String {
+    let normalized = path.trim().replace('\\', "/");
+    let candidate = Path::new(&normalized);
+    if !candidate.is_absolute() {
+        return path.to_string();
+    }
+    if let Some(inside) = root.and_then(|root| candidate.strip_prefix(root).ok()) {
+        return inside.to_string_lossy().into_owned();
+    }
+    candidate
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn is_symbol_noise_path(path: &str, root: Option<&Path>) -> bool {
+    let normalized = path_inside_checkout(path, root)
+        .to_lowercase()
+        .replace('\\', "/");
     SYMBOL_NOISE_PATH_TERMS
         .iter()
         .any(|term| normalized.contains(term))
+}
+
+/// [`is_artifact_like_path`] for a path that may be absolute: only the part
+/// inside the checkout at `root` counts.
+fn is_artifact_like_path_in(path: &str, root: Option<&Path>) -> bool {
+    is_artifact_like_path(&path_inside_checkout(path, root))
 }
 
 fn is_artifact_like_path(path: &str) -> bool {
@@ -7829,7 +7857,7 @@ fn is_artifact_like_path(path: &str) -> bool {
         || (normalized.starts_with("archives-") && normalized.contains("/tasks/"))
 }
 
-fn result_has_artifact_like_path(item: &mcp_types::api::SearchResult) -> bool {
+fn result_has_artifact_like_path(item: &mcp_types::api::SearchResult, root: Option<&Path>) -> bool {
     [
         item.file_path.as_deref(),
         item.location.as_deref(),
@@ -7841,7 +7869,7 @@ fn result_has_artifact_like_path(item: &mcp_types::api::SearchResult) -> bool {
     .flatten()
     .map(str::trim)
     .filter(|value| !value.is_empty())
-    .any(is_artifact_like_path)
+    .any(|value| is_artifact_like_path_in(value, root))
 }
 
 fn query_explicitly_targets_artifacts(query: &str) -> bool {
@@ -7870,6 +7898,7 @@ fn suppress_artifact_rows(
     result: &mut SearchResponse,
     requested_mode: SearchMode,
     query: &str,
+    root: Option<&Path>,
 ) -> usize {
     if result.results.is_empty() || !should_filter_artifact_paths(requested_mode, query) {
         return 0;
@@ -7877,7 +7906,7 @@ fn suppress_artifact_rows(
     let before = result.results.len();
     result
         .results
-        .retain(|item| result_has_literal_hit(item) || !result_has_artifact_like_path(item));
+        .retain(|item| result_has_literal_hit(item) || !result_has_artifact_like_path(item, root));
     let removed = before - result.results.len();
     if removed > 0 {
         result.total = Some(result.results.len() as i64);
@@ -7911,7 +7940,11 @@ fn has_client_rerank_evidence(response: &SearchResponse) -> bool {
     !is_compact_paths_response(response) || response.results.iter().any(result_has_rerank_evidence)
 }
 
-fn apply_symbol_anchor_rerank(response: &mut SearchResponse, query: &str) -> Option<String> {
+fn apply_symbol_anchor_rerank(
+    response: &mut SearchResponse,
+    query: &str,
+    root: Option<&Path>,
+) -> Option<String> {
     // `paths` responses carry the server's authoritative file order but omit
     // snippets and scores. Re-ranking their synthetic result rows from path
     // tokens alone can promote a usage file over the exact definition. Fresh
@@ -7942,7 +7975,7 @@ fn apply_symbol_anchor_rerank(response: &mut SearchResponse, query: &str) -> Opt
                 && item
                     .file_path
                     .as_deref()
-                    .map(is_symbol_noise_path)
+                    .map(|path| is_symbol_noise_path(path, root))
                     .unwrap_or(false)
                 && !anchor_match;
             (idx, anchor_match, path_noise, item)
@@ -8525,7 +8558,7 @@ fn prune_deleted_file_results(response: &mut SearchResponse, folder_path: &Path)
         if !ContextStreamClient::ingest_ignores_relative_path(
             folder_path,
             &relative.to_string_lossy(),
-        ) && (local_path.exists() || is_artifact_like_path(file_path))
+        ) && (local_path.exists() || is_artifact_like_path(&relative.to_string_lossy()))
         {
             return true;
         }
@@ -8569,13 +8602,14 @@ fn refresh_indexed_result_snippets_from_local_files(
         let Some(file_path) = item.file_path.as_deref() else {
             continue;
         };
-        if is_artifact_like_path(file_path) {
-            continue;
-        }
-
         let Some(local_path) = local_result_path(folder_path, file_path) else {
             continue;
         };
+        // Only the part inside the checkout says whether it is build output.
+        let relative = local_path.strip_prefix(folder_path).unwrap_or(&local_path);
+        if is_artifact_like_path(&relative.to_string_lossy()) {
+            continue;
+        }
         let Ok(metadata) = std::fs::metadata(&local_path) else {
             continue;
         };
@@ -12710,7 +12744,12 @@ impl SearchTool {
                 );
             }
         }
-        let removed = suppress_artifact_rows(&mut result, requested_mode, &input.query);
+        let removed = suppress_artifact_rows(
+            &mut result,
+            requested_mode,
+            &input.query,
+            folder_path.as_deref().map(Path::new),
+        );
         if removed > 0 {
             mode_fallback_note = append_note(
                 mode_fallback_note,
@@ -13211,7 +13250,11 @@ impl SearchTool {
 
         if literal_page {
             // nothing to rerank
-        } else if let Some(note) = apply_symbol_anchor_rerank(&mut result, &input.query) {
+        } else if let Some(note) = apply_symbol_anchor_rerank(
+            &mut result,
+            &input.query,
+            folder_path.as_deref().map(Path::new),
+        ) {
             push_fallback_stage(&mut fallback_stages, "symbol_anchor_rerank".to_string());
             mode_fallback_note = append_note(mode_fallback_note, &note);
         }

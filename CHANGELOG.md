@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.66
+
+- Hosted tools: the call to a tool that answers over a stream is made as soon as the repository is identified and carries only its folder name and a digest of its origin; the description of your changes is prepared meanwhile and goes over the stream as before. A checkout with no changes builds no scratch tree.
+
 ## 1.0.65
 
 - Hosted tools: a tool the service defines for your account is listed with the others and run by the service when called. The server reads the account's tool definitions from the API when a session starts and again after five minutes of use; where there are none, nothing is listed and nothing else changes. `CONTEXTSTREAM_HOSTED_TOOLS=off` lists none and reads no definitions.

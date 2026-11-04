@@ -38,8 +38,5 @@ __pycache__/
 # Built plugin packages (plugins/build_agent_coach_kit.py)
 /dist/
 
-# Depot agent runs (scripts/dev/depot-run writes one-off workflows here)
-.depot/agent-runs/
-
-# scripts/dev/ns-run brings artifacts back here (one folder per Namespace instance).
+# scripts/dev/ns-run brings artifacts back here (one folder per lane run).
 .depot-run-artifacts/

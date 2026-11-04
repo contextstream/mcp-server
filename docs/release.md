@@ -55,8 +55,8 @@ flowchart TD
      build and its account-connection smoke.
    - `checks` (8 CPUs): `cargo audit`, `cargo deny`, the release contract and version resolution, the public
      boundary, the `.github/scripts` and `scripts/release` tests, the adoption and grounding tests, and `npm test`.
-   - Tools are pinned by sha256. Rust compiles go through sccache on Depot's cache. The toolchain and crates come from
-     the `depot-run` setup cache.
+   - Tools are pinned by sha256. Each part runs on the build host's BuildKit (`scripts/release/on-lat.sh gate`), or on the
+     release box when the build host cannot be reached.
 3. **build** makes the six binaries in parallel, one runner each (16 CPUs).
 
    | Binary | How it is built | How it is checked |

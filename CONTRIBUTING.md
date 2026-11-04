@@ -14,12 +14,11 @@ npm test
 python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 ```
 
-Maintainers with Depot access run builds and tests on a Depot CI runner instead
-of their machine: `scripts/dev/depot-run -- cargo test --locked -p <crate>` for a
-focused run (16 CPUs), `scripts/dev/depot-run --full -- cargo test --locked --workspace`
-for the full suite (32 CPUs). The runner restores its toolchain, crates and checkout
-from caches that `.depot/workflows/depot-run-cache.yml` writes on main; see
-`scripts/dev/depot-run --help`.
+Maintainers run builds and tests on a lane host instead of their machine, on their
+working tree (the merge base with main plus their changes):
+`scripts/dev/ns-run -- cargo test --locked -p <crate>` for a focused run, and
+`scripts/dev/ns-run -- bash scripts/release/gate.sh rust` (or `checks`) for a gate part.
+When every lane is busy the run waits for one; see `scripts/dev/ns-run --help`.
 
 Contributions must not include credentials, customer data, private repository
 history, private operator material, or generated build outputs. Run Gitleaks

@@ -1,6 +1,7 @@
 # Release process
 
-Releases run end to end in Depot CI (`.depot/workflows/release.yml`) with no person in the loop. The logic lives in:
+Releases run end to end on csrun, the self-hosted workflow runner (`.csrun/workflows/release.yml`), with no person
+in the loop. The logic lives in:
 
 - `scripts/release/mcp_release.py`: plan, assemble, publish, verify, the hosted wait and the R2 probe;
 - `scripts/release/gate.sh`: the gate;
@@ -51,13 +52,14 @@ flowchart TD
    - A version older than npm `latest` is refused.
    - If tag `vX.Y.Z` exists, the tag's commit is the release, whatever `main` holds since.
 2. **gate** runs two parts side by side.
-   - `rust` (32 CPUs): `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace --all-targets`, the debug
+   - `rust`: `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace --all-targets`, the debug
      build and its account-connection smoke.
-   - `checks` (8 CPUs): `cargo audit`, `cargo deny`, the release contract and version resolution, the public
+   - `checks`: `cargo audit`, `cargo deny`, the release contract and version resolution, the public
      boundary, the `.github/scripts` and `scripts/release` tests, the adoption and grounding tests, and `npm test`.
    - Tools are pinned by sha256. Each part runs on the build host's BuildKit (`scripts/release/on-lat.sh gate`), or on the
      release box when the build host cannot be reached.
-3. **build** makes the six binaries in parallel, one runner each (16 CPUs).
+3. **build** makes the six binaries in parallel on the build host's BuildKit (`scripts/release/on-lat.sh build`),
+   linux-arm64 cross-compiled, or on the release box when the build host cannot be reached.
 
    | Binary | How it is built | How it is checked |
    |---|---|---|
@@ -95,7 +97,7 @@ flowchart TD
 
 ### The darwin cross-build
 
-Depot CI has no macOS runners, so `build.sh` makes a macOS SDK root without Apple's SDK. It holds:
+The release builds on Linux, with no macOS runner, so `build.sh` makes a macOS SDK root without Apple's SDK. It holds:
 
 - the macOS libc headers and `libSystem.tbd` that Zig ships (no other part of Zig is used);
 - the stubs in `scripts/release/macos-link-stubs` for the three frameworks and `libiconv`;
@@ -112,20 +114,20 @@ README.
 ## Dry run
 
 ```
-depot ci dispatch --repo contextstream/mcp-server --workflow release.yml --ref main --input mode=dry-run
+csrun dispatch mcp-server release.yml --input mode=dry-run
 ```
 
 It gates, builds and assembles the bundle, runs `npm publish --dry-run` and `mcp-publisher validate`, and publishes
 nothing. Dispatched on `main`, it also proves the R2 key: it puts, lists, reads and deletes a probe object under
 `mcp/.release-probe/` (`mcp_release.py r2-probe`). Any run that is not a clean checkout of `main` is a dry run,
-whatever mode it asks for: a branch, or a laptop `depot ci run` with a patch.
+whatever mode it asks for: a branch, or a local run with a patch. A csrun dispatch always runs the head of `main`.
 
 ## Re-running after a failure
 
 Fix the cause, then dispatch the workflow again, or push to `main`. Nothing needs cleaning up first.
 
 ```
-depot ci dispatch --repo contextstream/mcp-server --workflow release.yml --ref main --input mode=release
+csrun dispatch mcp-server release.yml --input mode=release
 ```
 
 Every step skips what is already done with the same bytes, and stops at different bytes:
@@ -141,8 +143,8 @@ A bad artifact that is already public is never replaced: fix forward with the ne
 
 ## Secrets
 
-These are Depot CI secrets. Each has one variant, `main-release`, limited to repository `contextstream/mcp-server`,
-branch `main` and workflow `release.yml`. The publish step of a release gets them, and the R2 probe of a dry run on
+These are kept in the release runner's secret store under this repository's `release.yml`. csrun gives a run only
+the secrets its workflow names, and it runs only `main`. The publish step of a release gets them, and the R2 probe of a dry run on
 `main` gets the three R2 ones. None is printed, written to a file or passed on a command line.
 
 | Secret | Used for |

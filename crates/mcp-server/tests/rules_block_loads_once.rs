@@ -200,3 +200,166 @@ fn contextstream_project_rules_full_keeps_the_whole_block_in_the_checkout() {
         1
     );
 }
+
+/// Records `clients` as the editors setup configured on this machine.
+fn record_setup_selection(home: &Path, clients: &[&str]) {
+    let dir = home.join(".contextstream");
+    std::fs::create_dir_all(&dir).unwrap();
+    let clients = clients
+        .iter()
+        .map(|client| format!("\"{client}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::write(
+        dir.join("installation.json"),
+        format!(
+            "{{\"schema_version\":1,\"installation_id\":\"{WORKSPACE_ID}\",\"created_at\":\"2026-11-03T00:00:00Z\",\"configured_clients\":[{clients}],\"last_install_completed_at\":\"2026-11-03T00:00:00Z\"}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Runs `update-rules` in `dir` the way `contextstream-mcp update` does after
+/// an upgrade (`--only-configured`), and returns what it printed.
+fn refresh_as_update_does(home: &Path, dir: &Path, scope: &str, env: &[(&str, &str)]) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"));
+    command
+        .args([
+            "update-rules",
+            &format!("--scope={scope}"),
+            "--only-configured",
+            &format!("--workspace-id={WORKSPACE_ID}"),
+            "--workspace-name=Example Team",
+        ])
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("CONTEXTSTREAM_WATCH", "0")
+        .env("CONTEXTSTREAM_API_URL", "http://127.0.0.1:9");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let output = command.output().expect("run update-rules");
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "update-rules failed: {printed}");
+    printed
+}
+
+/// A machine whose global rules files hold no block (Claude Code and Codex set
+/// up, then the block taken out of `~/.claude/CLAUDE.md` and
+/// `~/.codex/AGENTS.md`) with a checkout whose files hold it.
+fn machine_keeping_the_rules_in_project_files(
+    root: &Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let home = root.join("home");
+    let project = checkout(root);
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    record_setup_selection(&home, &["claude", "codex"]);
+    std::fs::write(home.join(".claude/CLAUDE.md"), "# My Claude notes\n").unwrap();
+    std::fs::write(home.join(".codex/AGENTS.md"), "# My Codex notes\n").unwrap();
+    let printed = refresh_as_update_does(&home, &project, "project", &[]);
+    for file in ["CLAUDE.md", "AGENTS.md"] {
+        assert_eq!(
+            read(&project.join(file)).matches(FULL_BLOCK_LINE).count(),
+            1,
+            "{file}: {printed}"
+        );
+    }
+    assert!(
+        printed.contains("`~/.claude/CLAUDE.md` holds no ContextStream block"),
+        "{printed}"
+    );
+    (home, project)
+}
+
+/// The Mac, 2026-11-03: its global rules files were left without the block,
+/// so the checkout's files held it. 1.0.62's `update`, run outside the
+/// checkout, put the block back into the global files, and every session in
+/// the checkout loaded it twice again. Now each editor's block stays where it
+/// is.
+#[test]
+fn update_leaves_the_rules_in_project_files_when_the_global_files_hold_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project) = machine_keeping_the_rules_in_project_files(temp.path());
+    let elsewhere = temp.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    // What `update` runs, from a folder that is no project.
+    let printed = refresh_as_update_does(&home, &elsewhere, "global", &[]);
+    assert_eq!(
+        read(&home.join(".claude/CLAUDE.md")),
+        "# My Claude notes\n",
+        "{printed}"
+    );
+    assert_eq!(
+        read(&home.join(".codex/AGENTS.md")),
+        "# My Codex notes\n",
+        "{printed}"
+    );
+    assert!(
+        printed.contains("left `~/.claude/CLAUDE.md` without the ContextStream block"),
+        "{printed}"
+    );
+
+    // And from the checkout: each editor still loads the block once there.
+    refresh_as_update_does(&home, &project, "global", &[]);
+    refresh_as_update_does(&home, &project, "project", &[]);
+    for (global, local) in [
+        (".claude/CLAUDE.md", "CLAUDE.md"),
+        (".codex/AGENTS.md", "AGENTS.md"),
+    ] {
+        let loaded = read(&home.join(global)) + &read(&project.join(local));
+        assert_eq!(
+            loaded.matches(FULL_BLOCK_LINE).count(),
+            1,
+            "{global} + {local}"
+        );
+    }
+}
+
+/// `CONTEXTSTREAM_PROJECT_RULES=header` moves the rules back into the global
+/// file, and later refreshes keep them there.
+#[test]
+fn the_header_choice_puts_the_block_back_in_the_global_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project) = machine_keeping_the_rules_in_project_files(temp.path());
+
+    let printed = refresh_as_update_does(
+        &home,
+        &project,
+        "all",
+        &[("CONTEXTSTREAM_PROJECT_RULES", "header")],
+    );
+    let global = read(&home.join(".claude/CLAUDE.md"));
+    let local = read(&project.join("CLAUDE.md"));
+    assert!(global.contains("# My Claude notes"), "{global}");
+    assert_eq!(global.matches(FULL_BLOCK_LINE).count(), 1, "{global}");
+    assert_eq!(local.matches(FULL_BLOCK_LINE).count(), 0, "{local}");
+    assert!(
+        local.contains(&format!("# Workspace ID: {WORKSPACE_ID}")),
+        "{local}"
+    );
+    assert!(
+        printed.contains("`CLAUDE.md` names the project only"),
+        "{printed}"
+    );
+
+    // Without the choice, refreshes keep this layout too.
+    refresh_as_update_does(&home, temp.path(), "global", &[]);
+    refresh_as_update_does(&home, &project, "project", &[]);
+    assert_eq!(read(&project.join("CLAUDE.md")), local);
+    assert_eq!(
+        read(&home.join(".claude/CLAUDE.md"))
+            .matches(FULL_BLOCK_LINE)
+            .count(),
+        1
+    );
+}

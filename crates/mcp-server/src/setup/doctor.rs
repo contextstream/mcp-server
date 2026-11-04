@@ -1325,12 +1325,18 @@ fn check_editor_surfaces(
                 "contextstream-mcp update-rules --scope global --editors {}",
                 editor.id()
             );
-            checks.push(check_rules_file(
-                "rules_global",
-                &path,
-                CheckStatus::Warn,
-                &fix,
-            ));
+            checks.push(
+                match super::rules::global_rules_left_without_block(editor) {
+                    // The rules live in this machine's project files, which the
+                    // project rules check covers.
+                    Some(kept) => SurfaceCheck::pass(
+                        "rules_global",
+                        "no ContextStream block: this machine keeps the rules in project files",
+                        Some(&kept),
+                    ),
+                    None => check_rules_file("rules_global", &path, CheckStatus::Warn, &fix),
+                },
+            );
         }
 
         checks.push(check_hooks(editor));

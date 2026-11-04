@@ -2308,23 +2308,29 @@ pub async fn update_rules_scoped(
     for editor in &editors_to_update {
         let mut updated = Vec::new();
 
-        // Update global rules
+        // Update global rules, where this machine keeps them.
         if scope == "global" || scope == "all" {
-            match rules::write_editor_rules(editor) {
-                Ok(()) => updated.push("global rules"),
-                Err(e) => {
-                    if !e.to_string().contains("Could not determine rules path") {
-                        warn!("global rules for {}: {}", editor.display_name(), e);
-                        failures.push(format!("{} global rules: {e}", editor.display_name()));
+            if let Some(kept) = rules::global_rules_left_without_block(editor) {
+                note!("{}", rules::global_rules_kept_line(editor, &kept));
+            } else {
+                match rules::write_editor_rules(editor) {
+                    Ok(()) => updated.push("global rules"),
+                    Err(e) => {
+                        if !e.to_string().contains("Could not determine rules path") {
+                            warn!("global rules for {}: {}", editor.display_name(), e);
+                            failures.push(format!("{} global rules: {e}", editor.display_name()));
+                        }
                     }
                 }
             }
         }
 
         // Update project rules (some clients, e.g. Claude Desktop, have none)
+        let mut project_note = None;
         if (scope == "project" || scope == "all") && editor.rules_path(Some(&cwd)).is_some() {
             // The global rules above are written first, so the form sees them.
-            let form = rules::project_rules_form_after(editor, updated.contains(&"global rules"));
+            let (form, reason) =
+                rules::project_rules_decision_after(editor, updated.contains(&"global rules"));
             match rules::write_project_rules_as(
                 editor,
                 &cwd,
@@ -2333,7 +2339,10 @@ pub async fn update_rules_scoped(
                 Some(project_name),
                 form,
             ) {
-                Ok(()) => updated.push("project rules"),
+                Ok(()) => {
+                    updated.push("project rules");
+                    project_note = reason.describe(editor, form);
+                }
                 Err(e) => {
                     warn!("project rules for {}: {}", editor.display_name(), e);
                     failures.push(format!("{} project rules: {e}", editor.display_name()));
@@ -2347,6 +2356,9 @@ pub async fn update_rules_scoped(
                 "{}",
                 change_line(&line, format_args!("{line} would be updated"))
             );
+        }
+        if let Some(project_note) = project_note {
+            note!("  {project_note}");
         }
     }
 
@@ -2405,6 +2417,9 @@ fn selected_editors_summary(editors_to_configure: &[editors::Editor]) -> String 
 }
 
 pub fn persist_setup_editor_selection(editors_to_configure: &[editors::Editor]) -> Result<()> {
+    // Before the record changes: an editor set up earlier keeps its rules
+    // where they are (`rules::global_rules_left_without_block`).
+    rules::note_selection_before_setup();
     if safe_edit::is_dry_run() {
         return Ok(());
     }
@@ -4490,22 +4505,27 @@ pub(crate) async fn configure_editor_with_workspace_and_project_name(
         saved_items.push("Copilot bridge");
     }
 
-    // Generate AI rules (global)
-    match rules::write_editor_rules(editor) {
-        Ok(()) => {
-            rules_targets.push("global");
-        }
-        Err(e) => {
-            // Some editors like Cursor don't have global rules path
-            if e.to_string().contains("Could not determine rules path") {
-                // Skip silently - this is expected for some editors
-            } else {
-                warn!(
-                    "Could not write global rules for {}: {}",
-                    editor.display_name(),
-                    e
-                );
-                issues.push(format!("global rules: {}", e));
+    // Generate AI rules (global), where this machine keeps them.
+    let mut rules_notes = Vec::new();
+    if let Some(kept) = rules::global_rules_left_without_block(editor) {
+        rules_notes.push(rules::global_rules_kept_line(editor, &kept));
+    } else {
+        match rules::write_editor_rules(editor) {
+            Ok(()) => {
+                rules_targets.push("global");
+            }
+            Err(e) => {
+                // Some editors like Cursor don't have global rules path
+                if e.to_string().contains("Could not determine rules path") {
+                    // Skip silently - this is expected for some editors
+                } else {
+                    warn!(
+                        "Could not write global rules for {}: {}",
+                        editor.display_name(),
+                        e
+                    );
+                    issues.push(format!("global rules: {}", e));
+                }
             }
         }
     }
@@ -4517,7 +4537,8 @@ pub(crate) async fn configure_editor_with_workspace_and_project_name(
     {
         // After the global rules: a project file names only the project when
         // every editor reading it loads the whole block from its global file.
-        let form = rules::project_rules_form_after(editor, rules_targets.contains(&"global"));
+        let (form, reason) =
+            rules::project_rules_decision_after(editor, rules_targets.contains(&"global"));
         match rules::write_project_rules_as(
             editor,
             project_path,
@@ -4528,6 +4549,7 @@ pub(crate) async fn configure_editor_with_workspace_and_project_name(
         ) {
             Ok(()) => {
                 rules_targets.push("project");
+                rules_notes.extend(reason.describe(editor, form));
             }
             Err(e) => {
                 warn!(
@@ -4640,6 +4662,9 @@ pub(crate) async fn configure_editor_with_workspace_and_project_name(
         for issue in &issues {
             println!("{}    {} {}", ui::GUTTER, ui.mark(ui::Mark::Fail), issue);
         }
+    }
+    for note in &rules_notes {
+        println!("{}    {}", ui::GUTTER, ui::ui().faint(note));
     }
 
     if had_issues && !safe_edit::is_dry_run() {

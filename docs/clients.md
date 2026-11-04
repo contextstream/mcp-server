@@ -55,6 +55,16 @@ project's rules file is committed and teammates use it without running
 ContextStream setup themselves, run `setup` or `update-rules` with
 `CONTEXTSTREAM_PROJECT_RULES=full` to keep the full rules in it.
 
+A machine's rules stay where they are. When the global rules file of a client
+set up on the machine holds no ContextStream block (someone took it out, so the
+project files carry the rules), `update`, `update-rules` and `setup` leave it
+that way and keep the full rules in the project's file, rather than loading them
+twice. To move them back into the global file, run
+`CONTEXTSTREAM_PROJECT_RULES=header contextstream-mcp update-rules --scope=all`
+in each set-up project. Each rules write says which form it gave a project's
+file and why. `update` run outside a set-up project refreshes only the global
+files, and says so.
+
 `<VS Code user dir>` is `~/.config/Code/User` on Linux,
 `~/Library/Application Support/Code/User` on macOS, and `%APPDATA%\Code\User` on
 Windows. `<Claude config dir>` is `~/.config/Claude`,

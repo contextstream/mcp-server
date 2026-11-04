@@ -1,9 +1,8 @@
 # syntax=docker/dockerfile:1.7
-# The machine the release gate runs on when the release runs on the self-hosted box (scripts/release/gate-on-box.sh): the
-# root of scripts/dev/ns-runner.sh's instances (the same Ubuntu and apt packages, without the build-only docker, wine and fio,
-# plus qemu-user and the arm64 C runtime that check the cross-built linux-arm64 binary;
-# Node; user runner, uid 1001, with sudo) with the Rust toolchain rust-toolchain.toml names baked in (RUST_CHANNEL), with
-# every release target's standard library, and owned by runner (build.sh's rustup target add runs as runner).
+# The machine the release gate can run in: Ubuntu 24.04 with the apt packages the gate needs, plus qemu-user and the arm64 C
+# runtime that check the cross-built linux-arm64 binary; Node; user runner, uid 1001, with sudo; with the Rust toolchain
+# rust-toolchain.toml names baked in (RUST_CHANNEL), with every release target's standard library, and owned by runner
+# (build.sh's rustup target add runs as runner).
 ARG UBUNTU=public.ecr.aws/docker/library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 FROM ${UBUNTU} AS env
 ARG NODE_VERSION=22.23.2

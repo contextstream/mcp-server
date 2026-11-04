@@ -1,6 +1,6 @@
 # Release process
 
-Releases run end to end in Depot CI (`.depot/workflows/release.yml`) with no person in the loop. The logic lives in:
+Releases run end to end from the maintainers' own release tooling, with no person in the loop. The logic in this repository lives in:
 
 - `scripts/release/mcp_release.py`: plan, assemble, publish, verify, the hosted wait and the R2 probe;
 - `scripts/release/gate.sh`: the gate;
@@ -55,8 +55,7 @@ flowchart TD
      build and its account-connection smoke.
    - `checks` (8 CPUs): `cargo audit`, `cargo deny`, the release contract and version resolution, the public
      boundary, the `.github/scripts` and `scripts/release` tests, the adoption and grounding tests, and `npm test`.
-   - Tools are pinned by sha256. Rust compiles go through sccache on Depot's cache. The toolchain and crates come from
-     the `depot-run` setup cache.
+   - Tools are pinned by sha256.
 3. **build** makes the six binaries in parallel, one runner each (16 CPUs).
 
    | Binary | How it is built | How it is checked |
@@ -95,7 +94,7 @@ flowchart TD
 
 ### The darwin cross-build
 
-Depot CI has no macOS runners, so `build.sh` makes a macOS SDK root without Apple's SDK. It holds:
+No macOS runner is used, so `build.sh` makes a macOS SDK root without Apple's SDK. It holds:
 
 - the macOS libc headers and `libSystem.tbd` that Zig ships (no other part of Zig is used);
 - the stubs in `scripts/release/macos-link-stubs` for the three frameworks and `libiconv`;
@@ -111,22 +110,16 @@ README.
 
 ## Dry run
 
-```
-depot ci dispatch --repo contextstream/mcp-server --workflow release.yml --ref main --input mode=dry-run
-```
+A maintainer starts it from the release tooling on `main`, with mode `dry-run`.
 
 It gates, builds and assembles the bundle, runs `npm publish --dry-run` and `mcp-publisher validate`, and publishes
 nothing. Dispatched on `main`, it also proves the R2 key: it puts, lists, reads and deletes a probe object under
 `mcp/.release-probe/` (`mcp_release.py r2-probe`). Any run that is not a clean checkout of `main` is a dry run,
-whatever mode it asks for: a branch, or a laptop `depot ci run` with a patch.
+whatever mode it asks for: a branch, or a local run with a patch.
 
 ## Re-running after a failure
 
-Fix the cause, then dispatch the workflow again, or push to `main`. Nothing needs cleaning up first.
-
-```
-depot ci dispatch --repo contextstream/mcp-server --workflow release.yml --ref main --input mode=release
-```
+Fix the cause, then start the release again from the release tooling with mode `release`, or push to `main`. Nothing needs cleaning up first.
 
 Every step skips what is already done with the same bytes, and stops at different bytes:
 
@@ -141,8 +134,7 @@ A bad artifact that is already public is never replaced: fix forward with the ne
 
 ## Secrets
 
-These are Depot CI secrets. Each has one variant, `main-release`, limited to repository `contextstream/mcp-server`,
-branch `main` and workflow `release.yml`. The publish step of a release gets them, and the R2 probe of a dry run on
+These are secrets of the release tooling, limited to this repository, branch `main` and the release workflow. The publish step of a release gets them, and the R2 probe of a dry run on
 `main` gets the three R2 ones. None is printed, written to a file or passed on a command line.
 
 | Secret | Used for |
@@ -174,10 +166,3 @@ branch `main` and workflow `release.yml`. The publish step of a release gets the
 - **Merge to a live gateway:** about 32 minutes.
 - **The manual process before:** 66 minutes (1.0.29) to every channel and about 90 minutes to the gateway, with an
   operator for the darwin builds, npm 2FA, the registry login and the gateway roll.
-
-| Run | What it was |
-|---|---|
-| `ks5xr3bspx` | dry run |
-| `ps_txqrkdgnph` | release; stopped at npm, old token |
-| `w00vg143pt` | resume; every channel and the gateway |
-| `gjcstzhj8c` | dry run with the R2 probe |

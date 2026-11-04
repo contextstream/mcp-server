@@ -92,7 +92,7 @@ class FreshInstallCheck(unittest.TestCase):
 
 
 class ReleaseRunners(unittest.TestCase):
-    """Off Depot CI: csrun releases; a Depot CI run plans nothing."""
+    """Only the release host releases; any other runner plans nothing."""
 
     def test_csrun_releases_and_depot_does_not(self):
         self.assertEqual(release.RELEASE_RUNNERS, ("csrun",))

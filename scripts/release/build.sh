@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Build and check one release binary (.csrun/workflows/release.yml, job build; on the self-hosted box through
-# scripts/release/build-on-box.sh).
+# Build and check one release binary (the release workflow's build job).
 #
 #   scripts/release/build.sh <artifact> <version>
 #
 # Writes out/<artifact> in the repository root. Linux builds natively on its own architecture, and linux-arm64 also
 # cross-compiles on x86_64 with cargo-zigbuild against glibc 2.39, checked by running it under qemu-aarch64. Windows builds with cargo-xwin (MSVC CRT and SDK, license accepted by
 # the owner) and is run once under Wine. The darwin binaries build with clang and ld64.lld against an SDK root made
-# from Zig's macOS libc headers and the stubs in scripts/release/macos-link-stubs (no macOS runner exists in Depot CI)
+# from Zig's macOS libc headers and the stubs in scripts/release/macos-link-stubs (no macOS runner is used)
 # and are checked structurally, since Linux cannot run them. Every tool download is pinned by sha256. SOURCE_DATE_EPOCH comes from the workflow.
 set -euo pipefail
 

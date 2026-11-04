@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The MCP server release, run by csrun (.csrun/workflows/release.yml). No person takes part.
+"""The MCP server release, run by the release workflow. No person takes part.
 
   plan          What this run does. The version is the one package.json, Cargo.toml and server.json name at the
                 pushed commit (a "prepare MCP X.Y.Z" commit raises it). A version whose every public channel is
@@ -15,7 +15,7 @@
   await-hosted  Wait until the hosted gateway serves the version. The private deployment pins and rolls it on
                 its own after it sees the published release; this repository never dispatches it.
 
-Credentials arrive as environment variables from Depot CI secrets that only main's release workflow receives:
+Credentials arrive as environment variables from secrets that only main's release workflow receives:
 MCP_RELEASE_GITHUB_TOKEN (tag, GitHub release, MCP Registry login), MCP_RELEASE_NPM_TOKEN,
 MCP_RELEASE_R2_BUCKET_URL, MCP_RELEASE_R2_ACCESS_KEY_ID and MCP_RELEASE_R2_SECRET_ACCESS_KEY. None is ever
 printed, written to a file or put on a command line.
@@ -105,7 +105,7 @@ def say(**fields):
 
 def secret(name):
     value = os.environ.get(name, "").strip()
-    require(value, name + " is not set (a Depot CI secret for main's release workflow)")
+    require(value, name + " is not set (a secret of main's release workflow)")
     return value
 
 
@@ -205,9 +205,8 @@ def channel_state(version, headers):
     }
 
 
-# RELEASE RUNNERS (off Depot CI, 2026-11-02): which runner may release. csrun (act on a self-hosted box) sets ACT=true;
-# Depot CI does not. A run on a runner left out plans nothing (ship and build false), so its gate, builds, publish and
-# hosted jobs are skipped. The Depot workflow file csrun also runs stays as it is; adding "depot" back turns it on again.
+# RELEASE RUNNERS: which runner may release. The release host sets ACT=true. A run on a runner left out plans nothing
+# (ship and build false), so its gate, builds, publish and hosted jobs are skipped.
 RELEASE_RUNNERS = ("csrun",)
 
 
@@ -278,7 +277,7 @@ def cmd_plan(args):
                              check=True).stdout.strip()
     patched = patched or head != os.environ.get("GITHUB_SHA", head)
     if mode == "release" and (args.ref != "refs/heads/main" or patched):
-        # Only a clean checkout of main publishes; any other run (a branch, a laptop `depot ci run` patch) is a dry run.
+        # Only a clean checkout of main publishes; any other run (a branch, a patched local checkout) is a dry run.
         say(stage="plan", detail="not a clean checkout of main (%s%s): dry run" % (args.ref, ", patched" if patched else ""))
         mode = "dry-run"
     tag_commit = remote_tag_commit("v" + version)

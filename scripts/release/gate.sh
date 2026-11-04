@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The release gate at the release commit (.csrun/workflows/release.yml, job gate), in two parts that run side by side:
+# The release gate at the release commit (the release workflow's gate job), in two parts that run side by side:
 #
 #   scripts/release/gate.sh rust     fmt, clippy, the workspace tests, the debug build and its account-connection smoke
 #   scripts/release/gate.sh checks   cargo audit and cargo deny, the release contract, the public boundary, every script
@@ -51,7 +51,7 @@ case "$part" in
       step "$t" python3 ".github/scripts/$t.py"
     done
     step release_scripts python3 -m unittest discover -s scripts/release -p 'test_*.py'
-    step release_shell bash -n scripts/release/build.sh scripts/release/gate.sh scripts/release/gate-on-box.sh scripts/release/build-on-box.sh scripts/release/on-lat.sh
+    step release_shell bash -n scripts/release/build.sh scripts/release/gate.sh
     step adoption_tests bash -c 'cd testing/adoption && python3 -m unittest discover -s . -p "test_*.py"'
     for t in testing/grounding/test_*.py; do
       step "grounding_$(basename "$t" .py)" bash -c "cd testing/grounding && python3 $(basename "$t")"

@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::client::ContextStreamClient;
-use mcp_types::{Error, Result};
+use mcp_types::Result;
 
 /// Where the API lists the tools it defines for the caller.
 pub const HOSTED_TOOLS_PATH: &str = "/mcp/hosted-tools";
@@ -51,21 +51,6 @@ impl HostedToolsAnswer {
     }
 }
 
-/// Whether `url` may receive a hosted call: HTTPS, or plain HTTP to this machine.
-pub fn hosted_stream_url_allowed(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    match parsed.scheme() {
-        "https" => parsed.host_str().is_some(),
-        "http" => matches!(
-            parsed.host_str(),
-            Some("localhost") | Some("127.0.0.1") | Some("[::1]")
-        ),
-        _ => false,
-    }
-}
-
 impl ContextStreamClient {
     /// The tool definitions the API offers this caller.
     pub async fn hosted_tools_catalog(
@@ -99,60 +84,11 @@ impl ContextStreamClient {
             .await?;
         Ok(HostedToolsAnswer::from_body(raw.status, raw.body))
     }
-
-    /// Read a call's result from the endpoint the API named for it. The endpoint
-    /// gets the call's own token, never this client's API key; it answers with
-    /// newline-delimited JSON frames, returned whole with the status.
-    pub async fn hosted_tool_stream(
-        &self,
-        url: &str,
-        token: &str,
-        arguments: &Value,
-        timeout: Duration,
-    ) -> Result<(u16, String)> {
-        if !hosted_stream_url_allowed(url) {
-            return Err(Error::Config(
-                "a hosted tool's stream endpoint must be an https URL".to_string(),
-            ));
-        }
-        // Its own client: the call's token goes to the named endpoint only, and a
-        // redirect is never followed to somewhere else.
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|error| Error::Network(error.without_url().to_string()))?;
-        let response = http
-            .post(url)
-            .bearer_auth(token)
-            .json(&serde_json::json!({ "arguments": arguments }))
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(|error| Error::Network(error.without_url().to_string()))?;
-        let status = response.status().as_u16();
-        let text = response
-            .text()
-            .await
-            .map_err(|error| Error::Network(error.without_url().to_string()))?;
-        Ok((status, text))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_stream_endpoint_is_https_or_this_machine() {
-        assert!(hosted_stream_url_allowed("https://example.com/run"));
-        assert!(hosted_stream_url_allowed("http://127.0.0.1:8123/run"));
-        assert!(hosted_stream_url_allowed("http://localhost:8123/run"));
-        assert!(!hosted_stream_url_allowed("http://example.com/run"));
-        assert!(!hosted_stream_url_allowed("ws://example.com/run"));
-        assert!(!hosted_stream_url_allowed("file:///etc/passwd"));
-        assert!(!hosted_stream_url_allowed("not a url"));
-    }
 
     #[test]
     fn an_answer_is_unwrapped_from_the_envelope() {

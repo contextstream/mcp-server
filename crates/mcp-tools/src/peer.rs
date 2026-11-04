@@ -72,6 +72,26 @@ pub struct CallPeer {
     /// The protocol revision the client asked for at `initialize` (its newest), which says
     /// which form fields it can show.
     client_protocol: Option<String>,
+    /// The id of the request this call answers, to tell when its client gave up on it.
+    request_id: Option<String>,
+}
+
+/// Requests the client cancelled (newest last), by their ids as JSON.
+static CANCELLED: std::sync::OnceLock<Mutex<std::collections::VecDeque<String>>> =
+    std::sync::OnceLock::new();
+const CANCELLED_KEPT: usize = 256;
+
+/// Note that the client cancelled the request `request_id` (`notifications/cancelled`).
+/// A call keeps running; this is for it to know, when it ends, that nobody is waiting.
+pub fn note_cancelled(request_id: &Value) {
+    let mut cancelled = CANCELLED
+        .get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cancelled.len() >= CANCELLED_KEPT {
+        cancelled.pop_front();
+    }
+    cancelled.push_back(request_id.to_string());
 }
 
 /// The first revision whose elicitation forms have multi-select fields (an array of
@@ -129,7 +149,28 @@ impl CallPeer {
             last_progress: Arc::new(Mutex::new(None)),
             inline: None,
             client_protocol: None,
+            request_id: None,
         }
+    }
+
+    /// The request this call answers, so that [`CallPeer::was_cancelled`] can tell.
+    pub fn with_request_id(mut self, request_id: Option<&Value>) -> Self {
+        self.request_id = request_id.map(Value::to_string);
+        self
+    }
+
+    /// Whether the client cancelled the request this call answers (its own
+    /// timeout, usually), so that no one is waiting for the result.
+    pub fn was_cancelled(&self) -> bool {
+        let Some(id) = &self.request_id else {
+            return false;
+        };
+        CANCELLED.get().is_some_and(|cancelled| {
+            cancelled
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(id)
+        })
     }
 
     /// The protocol revision the client asked for at `initialize`.

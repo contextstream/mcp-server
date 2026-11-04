@@ -1181,6 +1181,12 @@ async fn run_stdio_transport(
         let method = request.get("method").and_then(serde_json::Value::as_str);
         let is_initialize = method == Some("initialize");
         let is_tool_call = method == Some("tools/call");
+        if method == Some("notifications/cancelled") {
+            // The call it names keeps running; it learns that no one waits when it ends.
+            if let Some(request_id) = request.pointer("/params/requestId") {
+                mcp_tools::peer::note_cancelled(request_id);
+            }
+        }
         let params = request
             .get("params")
             .cloned()
@@ -1281,6 +1287,7 @@ async fn run_stdio_tool_calls(
             announces_tool_changes,
         } = call;
         let wire_observation = mcp_tools::wire_tokens::WireTokenObservation::default();
+        let request_id = request.get("id").cloned();
         let handled = handle_request(
             &registry,
             &client,
@@ -1299,7 +1306,8 @@ async fn run_stdio_tool_calls(
             mcp_tools::peer::CallPeer::progress_token_of(&params),
             !stateless && client_can_elicit,
         )
-        .with_client_protocol(client_protocol.as_deref().filter(|_| !stateless));
+        .with_client_protocol(client_protocol.as_deref().filter(|_| !stateless))
+        .with_request_id(request_id.as_ref());
         if stateless && mcp_tools::peer::CallPeer::stateless_client_can_elicit(&params) {
             call_peer = call_peer.with_inline_input(&params);
         }
@@ -2374,6 +2382,10 @@ async fn handle_request_dispatch(
                 None
             };
 
+            // A hosted tool's result carries its own structured part (how the run went), which
+            // the caller is meant to read; the structured parts of the other tools stay off this wire.
+            let include_structured = include_workflow_contract || hosted_tool.is_some();
+
             // MCP lists an unknown tool as a protocol error (#368).
             if registry.get(tool_name).is_none() && hosted_tool.is_none() {
                 return json_rpc_error(id, -32602, &unknown_tool_message(registry, tool_name));
@@ -2398,7 +2410,7 @@ async fn handle_request_dispatch(
                 call_title.clone(),
                 Some(contextstream_call_icon(tool_name).to_string()),
             )
-            .with_structured_content(include_workflow_contract)
+            .with_structured_content(include_structured)
             .with_observation(wire_observation);
             let tool_call_outcome =
                 mcp_tools::wire_tokens::run_with_wire_response_context(wire_context, async {
@@ -2434,7 +2446,7 @@ async fn handle_request_dispatch(
                         call_title.clone(),
                         Some(contextstream_call_icon(tool_name).to_string()),
                     )
-                    .with_structured_content(include_workflow_contract);
+                    .with_structured_content(include_structured);
                     let mut payload =
                         mcp_tools::wire_tokens::tool_result_payload(&result, &context);
                     with_input_required(&mut payload);

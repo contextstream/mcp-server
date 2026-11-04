@@ -9,9 +9,6 @@ struct Seen {
     method: String,
     path: String,
     query: String,
-    authorization: Option<String>,
-    /// Every header name and value, names lowercased.
-    headers: Vec<(String, String)>,
     body: Value,
 }
 
@@ -85,20 +82,10 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Seen> {
         .split_once('?')
         .map(|(_, q)| q.to_string())
         .unwrap_or_default();
-    let headers = head
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let (key, value) = line.split_once(":")?;
-            Some((key.trim().to_lowercase(), value.trim().to_string()))
-        })
-        .collect();
     Some(Seen {
         method,
         path: path.strip_prefix("/api/v1").unwrap_or(&path).to_string(),
         query,
-        authorization: header("authorization"),
-        headers,
         body: serde_json::from_slice(&buffer[header_end..]).unwrap_or(Value::Null),
     })
 }
@@ -312,62 +299,6 @@ async fn a_hosted_echo_tool_is_listed_and_runs_through_the_api() {
 }
 
 #[tokio::test]
-async fn a_stream_tool_reads_its_result_from_the_endpoint_the_api_names() {
-    let (stream_url, stream_seen) = stub(Arc::new(|method, path, body| match (method, path) {
-        ("POST", "/run") => (
-            200,
-            [
-                json!({"type": "output", "text": "one "}).to_string(),
-                json!({"type": "output", "text": "two"}).to_string(),
-                json!({"type": "result", "content": [{"type": "text", "text": format!("done: {}", body["arguments"]["text"].as_str().unwrap_or_default())}]}).to_string(),
-            ]
-            .join("\n"),
-        ),
-        _ => (404, "{}".to_string()),
-    }))
-    .await;
-    let endpoint = format!("{stream_url}/run");
-    let (url, _) = stub(Arc::new(move |method, path, _| match (method, path) {
-        ("GET", "/mcp/hosted-tools") => (
-            200,
-            json!({"tools": [echo_definition("stream")]}).to_string(),
-        ),
-        ("POST", "/mcp/hosted-tools/echo/call") => (
-            200,
-            json!({"stream": {"url": endpoint, "token": "call-token-1"}}).to_string(),
-        ),
-        _ => (404, "{}".to_string()),
-    }))
-    .await;
-    let client = client(&url);
-    let gate = HostedToolsGate::new();
-    let tool = find(&gate, &client, &session_for(&client), "echo")
-        .await
-        .expect("echo is defined");
-    assert_eq!(tool.transport, Transport::Stream);
-
-    let result = run(&client, &session_for(&client), &tool, json!({"text": "hi"})).await;
-    assert!(!result.is_error, "{result:?}");
-    assert_eq!(text_of(&result), ["one two", "done: hi"]);
-    let seen: Vec<Seen> = stream_seen.lock().unwrap().clone();
-    assert_eq!(seen.len(), 1);
-    // The endpoint gets the call's token, never the API key.
-    assert_eq!(
-        seen[0].authorization.as_deref(),
-        Some("Bearer call-token-1")
-    );
-    assert!(
-        seen[0]
-            .headers
-            .iter()
-            .all(|(name, value)| name != "x-api-key" && !value.contains("hosted-tools-test-key")),
-        "{:?}",
-        seen[0].headers
-    );
-    assert_eq!(seen[0].body, json!({"arguments": {"text": "hi"}}));
-}
-
-#[tokio::test]
 async fn a_failed_call_is_a_tool_error_with_the_apis_message() {
     let (url, _) = stub(Arc::new(|method, path, _| match (method, path) {
         ("GET", "/mcp/hosted-tools") => (200, json!({"tools": [echo_definition("api")]}).to_string()),
@@ -386,14 +317,6 @@ async fn a_failed_call_is_a_tool_error_with_the_apis_message() {
     let result = run(&client, &session_for(&client), &tool, json!({"text": "x"})).await;
     assert!(result.is_error);
     assert_eq!(text_of(&result), ["Not enabled for this workspace"]);
-}
-
-#[test]
-fn a_stream_without_a_result_frame_is_an_error_that_keeps_its_output() {
-    let result = result_from_frames("echo", "{\"type\":\"output\",\"text\":\"partial\"}\n");
-    assert!(result.is_error);
-    assert!(text_of(&result)[0].contains("partial"));
-    assert!(result_from_frames("echo", "").is_error);
 }
 
 #[tokio::test]
@@ -454,6 +377,17 @@ async fn snapshot_tool_api() -> (String, Arc<StdMutex<Vec<Seen>>>) {
         _ => (404, "{}".to_string()),
     }))
     .await
+}
+
+#[test]
+fn the_off_switch_reads_like_the_snapshots() {
+    for off in ["off", "OFF", " 0 ", "false", "no", "disabled"] {
+        assert!(off_by(Some(off)), "{off}");
+    }
+    for on in ["on", "1", "", "yes"] {
+        assert!(!off_by(Some(on)), "{on}");
+    }
+    assert!(!off_by(None));
 }
 
 #[test]
@@ -579,4 +513,499 @@ async fn a_tool_that_needs_a_snapshot_is_not_called_without_one() {
         seen.lock().unwrap().iter().all(|s| s.method != "POST"),
         "the API was called without the snapshot it needs"
     );
+}
+
+// ---- Streams: a call answered over frames ------------------------------------------------------
+
+use futures::{SinkExt, StreamExt};
+use mcp_client::frames::{encode_frame, FrameBuffer};
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::Message;
+
+/// What a stand-in service saw of one socket.
+#[derive(Debug, Clone)]
+struct SocketSeen {
+    path: String,
+    authorization: Option<String>,
+    headers: Vec<(String, String)>,
+    hello: Value,
+    pack_start: Vec<u8>,
+}
+
+/// What a stand-in service does after it has read the hello and the first pack.
+#[derive(Clone)]
+enum Step {
+    Json(Value),
+    Pause(u64),
+    Output(&'static str),
+    /// End the connection.
+    Close,
+}
+
+/// A stand-in service on this machine: each socket gets `steps` after its hello and pack.
+/// Returns its address and what the sockets showed.
+#[allow(clippy::result_large_err)]
+async fn frames_service(steps: Vec<Step>) -> (String, Arc<StdMutex<Vec<SocketSeen>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/v1/run", listener.local_addr().unwrap());
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let steps = steps.clone();
+            let log = log.clone();
+            tokio::spawn(async move {
+                let head = Arc::new(StdMutex::new(None));
+                let capture = head.clone();
+                let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    move |request: &Request, response: Response| {
+                        let headers: Vec<(String, String)> = request
+                            .headers()
+                            .iter()
+                            .map(|(name, value)| {
+                                (
+                                    name.as_str().to_lowercase(),
+                                    value.to_str().unwrap_or("").to_string(),
+                                )
+                            })
+                            .collect();
+                        *capture.lock().unwrap() =
+                            Some((request.uri().path().to_string(), headers));
+                        Ok(response)
+                    },
+                )
+                .await
+                else {
+                    return;
+                };
+                let (path, headers) = head.lock().unwrap().take().unwrap();
+                let mut buffer = FrameBuffer::default();
+                let mut frames: Vec<(u8, Vec<u8>)> = Vec::new();
+                while frames.len() < 2 {
+                    match ws.next().await {
+                        Some(Ok(Message::Binary(bytes))) => {
+                            buffer.push(&bytes);
+                            while let Some(frame) = buffer.next_frame().unwrap() {
+                                frames.push(frame);
+                            }
+                        }
+                        _ => return,
+                    }
+                }
+                let authorization = headers
+                    .iter()
+                    .find(|(name, _)| name == "authorization")
+                    .map(|(_, value)| value.clone());
+                log.lock().unwrap().push(SocketSeen {
+                    path,
+                    authorization,
+                    headers,
+                    hello: serde_json::from_slice(&frames[0].1).unwrap(),
+                    pack_start: frames[1].1.iter().take(4).copied().collect(),
+                });
+                for step in steps {
+                    match step {
+                        Step::Json(value) => {
+                            let frame = encode_frame(b'J', value.to_string().as_bytes());
+                            if ws.send(Message::binary(frame)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Step::Output(text) => {
+                            let frame = encode_frame(b'O', text.as_bytes());
+                            let _ = ws.send(Message::binary(frame)).await;
+                        }
+                        Step::Pause(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+                        Step::Close => return,
+                    }
+                }
+                // Hold the socket until the client closes it.
+                while ws.next().await.is_some() {}
+            });
+        }
+    });
+    (url, seen)
+}
+
+/// The API's answer to a call: a stream at `url`, described by `request`.
+fn stream_answer(url: &str, protocol: &str) -> Value {
+    json!({
+        "stream": {
+            "url": url, "token": "call-token-1", "protocol": protocol,
+            "request": {
+                "id": "call-1", "command": "run the thing", "cwd": "pkg", "env_names": ["API_TOKEN"],
+                "timeout_s": 60, "wait_s": 30, "pipefail": true, "repo_key": "repo-key-1",
+            },
+        },
+        "call": {"id": "c1"},
+    })
+}
+
+/// An API that defines a streamed tool `check`, which wants a snapshot, and answers its calls
+/// with `answer`.
+async fn stream_api(answer: Value) -> (String, Arc<StdMutex<Vec<Seen>>>) {
+    let mut definition = echo_definition("stream");
+    definition["name"] = json!("check");
+    definition["attachments"] = json!(["checkout_snapshot"]);
+    stub(Arc::new(move |method, path, _| match (method, path) {
+        ("GET", "/mcp/hosted-tools") => (200, json!({"tools": [definition.clone()]}).to_string()),
+        ("POST", "/mcp/hosted-tools/check/call") => (200, answer.to_string()),
+        _ => (404, "{}".to_string()),
+    }))
+    .await
+}
+
+/// A repository with one local change and a credentials file, and a session working in it.
+async fn changed_checkout(client: &ContextStreamClient) -> (tempfile::TempDir, SessionManager) {
+    let repo = tempfile::tempdir().unwrap();
+    git_here(repo.path(), &["init", "-q"]);
+    std::fs::write(repo.path().join("a.txt"), "hello\n").unwrap();
+    git_here(repo.path(), &["add", "-A"]);
+    git_here(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "first",
+        ],
+    );
+    std::fs::write(repo.path().join("a.txt"), "hello, changed\n").unwrap();
+    std::fs::write(repo.path().join(".env"), "TOKEN=abc\n").unwrap();
+    let session = session_for(client);
+    session
+        .initialize(
+            Some(uuid::Uuid::parse_str(WORKSPACE).unwrap()),
+            None,
+            Some(repo.path().to_string_lossy().to_string()),
+            None,
+        )
+        .await;
+    (repo, session)
+}
+
+async fn check_tool(client: &ContextStreamClient, session: &SessionManager) -> HostedTool {
+    find(&HostedToolsGate::new(), client, session, "check")
+        .await
+        .expect("check is defined")
+}
+
+fn made_result() -> Value {
+    json!({
+        "type": "result", "ran": true, "exit": 1, "seconds": 4.5, "host": "a-host-name",
+        "tool_result": {
+            "content": [{"type": "text", "text": "1 test failed"}],
+            "structuredContent": {"exit": 1, "ran": true, "cache": "miss"},
+            "isError": true,
+        },
+    })
+}
+
+#[tokio::test]
+async fn a_stream_call_runs_over_frames_and_returns_what_the_service_made() {
+    let (ws_url, sockets) = frames_service(vec![
+        Step::Json(json!({"type": "info", "text": "accepted"})),
+        // Output the service was not asked for is not part of the result.
+        Step::Output("noise the result does not hold"),
+        Step::Json(made_result()),
+    ])
+    .await;
+    let (url, api_seen) = stream_api(stream_answer(&ws_url, "frames/1")).await;
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    assert_eq!(tool.transport, Transport::Stream);
+
+    let result = run(
+        &client,
+        &session,
+        &tool,
+        json!({"command": "run the thing"}),
+    )
+    .await;
+    // The command's own result is returned as the service made it.
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(text_of(&result), ["1 test failed"]);
+    assert_eq!(
+        result.structured_content,
+        Some(json!({"exit": 1, "ran": true, "cache": "miss"}))
+    );
+
+    let call = api_seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|s| s.method == "POST")
+        .cloned()
+        .unwrap();
+    assert_eq!(call.body["arguments"], json!({"command": "run the thing"}));
+    let target_tree = call.body["checkout"]["target_tree"].clone();
+
+    let sockets = sockets.lock().unwrap().clone();
+    assert_eq!(sockets.len(), 1);
+    let socket = &sockets[0];
+    assert_eq!(socket.path, "/v1/run");
+    // The socket gets the call's token, never the API key.
+    assert_eq!(socket.authorization.as_deref(), Some("Bearer call-token-1"));
+    assert!(
+        socket
+            .headers
+            .iter()
+            .all(|(_, value)| !value.contains("hosted-tools-test-key")),
+        "{:?}",
+        socket.headers
+    );
+    assert_eq!(socket.pack_start, b"PACK");
+    // The hello: what the API decided, the checkout, nothing else.
+    let hello = &socket.hello;
+    assert_eq!(hello["type"], "hello");
+    assert_eq!(hello["v"], 1);
+    assert_eq!(hello["id"], "call-1");
+    assert_eq!(hello["repo_key"], "repo-key-1");
+    assert_eq!(hello["cwd"], "pkg");
+    assert_eq!(hello["command"], "run the thing");
+    assert_eq!(hello["timeout_s"], 60);
+    assert_eq!(hello["wait_s"], 30);
+    assert_eq!(hello["tool_result"], true);
+    assert_eq!(hello["target_tree"], target_tree);
+    assert_eq!(hello["overlay"].as_array().unwrap().len(), 1);
+    assert_eq!(hello["overlay"][0][2], "a.txt");
+    // A variable whose name looks like a credential is not forwarded, set or not.
+    assert_eq!(hello["env"], json!({}));
+    let text = hello.to_string();
+    assert!(!text.contains("TOKEN=abc") && !text.contains("hello, changed"));
+    assert!(hello["root"].as_str().unwrap().len() > 1);
+}
+
+#[tokio::test]
+async fn a_run_the_service_declines_is_handed_back_to_the_caller() {
+    let (ws_url, _) = frames_service(vec![Step::Json(
+        json!({"type": "result", "ran": false, "exit": 2, "refused": "something internal", "host": "gateway"}),
+    )])
+    .await;
+    let (url, _) = stream_api(stream_answer(&ws_url, "frames/1")).await;
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let result = run(
+        &client,
+        &session,
+        &tool,
+        json!({"command": "run the thing"}),
+    )
+    .await;
+    assert!(result.is_error);
+    let message = text_of(&result).join(" ");
+    assert!(
+        message.contains("Run it yourself: run the thing (from the folder pkg)"),
+        "{message}"
+    );
+    // What the service said of why is not passed on.
+    assert!(
+        !message.contains("something internal") && !message.contains("gateway"),
+        "{message}"
+    );
+    assert_eq!(result.structured_content, Some(json!({"ran": false})));
+}
+
+#[tokio::test]
+async fn a_service_that_cannot_be_reached_or_ends_early_is_handed_back_the_same_way() {
+    // Nothing listens at the first address; the second service ends the call without a result.
+    let closed = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("ws://{}/v1/run", listener.local_addr().unwrap())
+    };
+    let (ends, _) = frames_service(vec![Step::Json(json!({"type": "info"})), Step::Close]).await;
+    for (address, expect) in [
+        (closed, "could not be reached"),
+        (ends, "ended before a result"),
+    ] {
+        let answer = stream_answer(&address, "frames/1");
+        let (url, _) = stream_api(answer).await;
+        let client = client_in_workspace(&url);
+        let (_repo, session) = changed_checkout(&client).await;
+        let tool = check_tool(&client, &session).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run(
+                &client,
+                &session,
+                &tool,
+                json!({"command": "run the thing"}),
+            ),
+        )
+        .await
+        .expect("the call ends");
+        assert!(result.is_error);
+        let message = text_of(&result).join(" ");
+        assert!(message.contains(expect), "{message}");
+        assert!(
+            message.contains("Run it yourself: run the thing"),
+            "{message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_stream_of_a_kind_this_client_does_not_know_is_not_connected_to() {
+    let (ws_url, sockets) = frames_service(vec![Step::Json(made_result())]).await;
+    let (url, _) = stream_api(stream_answer(&ws_url, "ndjson/9")).await;
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let result = run(
+        &client,
+        &session,
+        &tool,
+        json!({"command": "run the thing"}),
+    )
+    .await;
+    assert!(result.is_error);
+    assert!(
+        text_of(&result)
+            .join(" ")
+            .contains("Run it yourself: run the thing"),
+        "{result:?}"
+    );
+    assert!(sockets.lock().unwrap().is_empty());
+    // An answer with no stream at all is an error the caller reads.
+    let (url, _) = stream_api(json!({"call": {"id": "c1"}})).await;
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let result = run(&client, &session, &tool, json!({})).await;
+    assert!(result.is_error);
+    assert!(text_of(&result)[0].contains("named no stream"));
+}
+
+/// A client that records what is sent to it.
+#[derive(Default)]
+struct Recording {
+    sent: StdMutex<Vec<(String, Value)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::peer::PeerChannel for Recording {
+    async fn notify(&self, method: &str, params: Value) {
+        self.sent.lock().unwrap().push((method.to_string(), params));
+    }
+
+    async fn request(
+        &self,
+        _method: &str,
+        _params: Value,
+        _timeout: Duration,
+    ) -> std::result::Result<Value, String> {
+        Err("not asked".to_string())
+    }
+}
+
+#[tokio::test]
+async fn heartbeats_become_progress_and_pass_on_nothing_the_service_said() {
+    let (ws_url, _) = frames_service(vec![
+        Step::Json(json!({"type": "info", "text": "accepted by host-7"})),
+        Step::Pause(30),
+        Step::Json(json!({"type": "info", "text": "still going on host-7"})),
+        Step::Pause(30),
+        Step::Json(json!({"type": "info", "text": "again"})),
+        Step::Json(made_result()),
+    ])
+    .await;
+    let (url, _) = stream_api(stream_answer(&ws_url, "frames/1")).await;
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let channel = Arc::new(Recording::default());
+    let peer = crate::peer::CallPeer::new(channel.clone(), Some(json!("progress-1")), false);
+    let result = crate::peer::run_with_call_peer(
+        peer,
+        run(
+            &client,
+            &session,
+            &tool,
+            json!({"command": "run the thing"}),
+        ),
+    )
+    .await;
+    assert_eq!(text_of(&result), ["1 test failed"]);
+    let sent = channel.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    let mut last = 0.0;
+    for (method, params) in &sent {
+        assert_eq!(method, "notifications/progress");
+        assert_eq!(params["progressToken"], "progress-1");
+        let progress = params["progress"].as_f64().unwrap();
+        assert!(progress > last, "{sent:?}");
+        last = progress;
+        assert_eq!(params["message"], "still running");
+        assert!(!params.to_string().contains("host-7"));
+    }
+}
+
+#[tokio::test]
+async fn a_call_given_up_on_is_picked_up_by_the_same_call_asked_again() {
+    let (ws_url, sockets) = frames_service(vec![Step::Json(made_result())]).await;
+    let (url, api_seen) = stream_api(stream_answer(&ws_url, "frames/1")).await;
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let arguments = json!({"command": "run the thing", "note": "given-up"});
+
+    // The client cancelled request 4101 while the run went on; its result is kept.
+    crate::peer::note_cancelled(&json!(4101));
+    let channel = Arc::new(Recording::default());
+    let peer = crate::peer::CallPeer::new(channel, None, false).with_request_id(Some(&json!(4101)));
+    let first =
+        crate::peer::run_with_call_peer(peer, run(&client, &session, &tool, arguments.clone()))
+            .await;
+    assert_eq!(text_of(&first), ["1 test failed"]);
+
+    // Asked again, it is the same result at once: no second run, no second call to the API.
+    let again = run(&client, &session, &tool, arguments.clone()).await;
+    assert_eq!(text_of(&again), ["1 test failed"]);
+    assert_eq!(again.structured_content, first.structured_content);
+    assert_eq!(sockets.lock().unwrap().len(), 1);
+    let posts = |seen: &Arc<StdMutex<Vec<Seen>>>| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.method == "POST")
+            .count()
+    };
+    assert_eq!(posts(&api_seen), 1);
+
+    // It is handed out once: a third ask runs again.
+    let third = run(&client, &session, &tool, arguments).await;
+    assert_eq!(text_of(&third), ["1 test failed"]);
+    assert_eq!(sockets.lock().unwrap().len(), 2);
+    assert_eq!(posts(&api_seen), 2);
+}
+
+#[tokio::test]
+async fn a_call_nobody_gave_up_on_is_run_each_time_and_a_changed_checkout_is_a_new_call() {
+    let (ws_url, sockets) = frames_service(vec![Step::Json(made_result())]).await;
+    let (url, _) = stream_api(stream_answer(&ws_url, "frames/1")).await;
+    let client = client_in_workspace(&url);
+    let (repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let arguments = json!({"command": "run the thing", "note": "not-given-up"});
+
+    run(&client, &session, &tool, arguments.clone()).await;
+    run(&client, &session, &tool, arguments.clone()).await;
+    assert_eq!(sockets.lock().unwrap().len(), 2, "each ask is its own run");
+
+    // Given up on, kept: but only for the checkout it was run on.
+    crate::peer::note_cancelled(&json!(4102));
+    let peer = crate::peer::CallPeer::new(Arc::new(Recording::default()), None, false)
+        .with_request_id(Some(&json!(4102)));
+    crate::peer::run_with_call_peer(peer, run(&client, &session, &tool, arguments.clone())).await;
+    assert_eq!(sockets.lock().unwrap().len(), 3);
+    std::fs::write(repo.path().join("a.txt"), "changed once more\n").unwrap();
+    run(&client, &session, &tool, arguments).await;
+    assert_eq!(sockets.lock().unwrap().len(), 4);
 }

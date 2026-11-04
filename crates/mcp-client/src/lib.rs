@@ -20,6 +20,7 @@ pub mod checkout_snapshot;
 pub mod client;
 pub mod coach;
 pub mod credit_hold;
+pub mod frames;
 pub mod harness_readiness;
 pub mod harness_remote;
 pub mod hosted_tools;

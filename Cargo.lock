@@ -1649,6 +1649,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "dirs",
+ "flate2",
  "fs2",
  "futures",
  "hex",

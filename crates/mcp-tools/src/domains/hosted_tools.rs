@@ -16,8 +16,11 @@
 //!
 //! A hosted tool never shadows a tool the registry has.
 
+use crate::domains::slipstream::listing_workspace;
+use mcp_client::checkout_snapshot::{CheckoutSnapshot, SnapshotError};
 use mcp_client::hosted_tools::HostedToolsAnswer;
 use mcp_client::ContextStreamClient;
+use mcp_session::SessionManager;
 use mcp_types::tool::{ContentItem, ToolResult};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -55,6 +58,16 @@ pub struct HostedTool {
     pub input_schema: Value,
     pub annotations: Option<Value>,
     pub transport: Transport,
+    /// Extra things a call to this tool carries, named by its definition.
+    pub attachments: Vec<Attachment>,
+}
+
+/// Something a call carries beyond its arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attachment {
+    /// A snapshot of the checkout (`mcp_client::checkout_snapshot`): the call
+    /// carries who the repository is, its two trees and what was withheld.
+    CheckoutSnapshot,
 }
 
 impl HostedTool {
@@ -140,6 +153,18 @@ pub fn parse_catalog(data: &Value) -> Vec<HostedTool> {
             input_schema,
             annotations: item.get("annotations").filter(|a| a.is_object()).cloned(),
             transport,
+            attachments: item
+                .get("attachments")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter_map(|name| match name {
+                    "checkout_snapshot" => Some(Attachment::CheckoutSnapshot),
+                    // One this client does not know is left out, not an error.
+                    _ => None,
+                })
+                .collect(),
         });
         if tools.len() == MAX_TOOLS {
             break;
@@ -257,12 +282,18 @@ impl HostedToolsGate {
         &self,
         client: &ContextStreamClient,
         identity: &str,
+        workspace: Option<&str>,
         budget: Duration,
     ) -> Arc<Vec<HostedTool>> {
         if let Some(tools) = self.fresh(identity) {
             return tools;
         }
-        let read = match tokio::time::timeout(budget, client.hosted_tools_catalog(budget)).await {
+        let read = match tokio::time::timeout(
+            budget,
+            client.hosted_tools_catalog(workspace, budget),
+        )
+        .await
+        {
             Ok(Ok(answer)) => Read::from_answer(&answer),
             _ => Read::Unreachable,
         };
@@ -304,13 +335,17 @@ fn entries_for(tools: &[HostedTool], taken: &impl Fn(&str) -> bool) -> Vec<Value
 pub async fn listing_entries(
     gate: &HostedToolsGate,
     client: &ContextStreamClient,
+    session: &SessionManager,
     budget: Duration,
     taken: impl Fn(&str) -> bool,
 ) -> Vec<Value> {
     let Some(identity) = crate::domains::slipstream::caller_identity(client).await else {
         return Vec::new();
     };
-    let tools = gate.tools(client, &identity, budget).await;
+    let workspace = workspace_of(client, session).await;
+    let tools = gate
+        .tools(client, &identity, workspace.as_deref(), budget)
+        .await;
     let entries = entries_for(&tools, &taken);
     gate.mark_shown(&identity, Value::Array(entries.clone()).to_string());
     entries
@@ -321,6 +356,7 @@ pub async fn listing_entries(
 pub async fn listing_changed(
     gate: &HostedToolsGate,
     client: &ContextStreamClient,
+    session: &SessionManager,
     taken: impl Fn(&str) -> bool,
 ) -> bool {
     let Some(identity) = crate::domains::slipstream::caller_identity(client).await else {
@@ -329,7 +365,10 @@ pub async fn listing_changed(
     let Some(shown) = gate.shown(&identity) else {
         return false;
     };
-    let tools = gate.tools(client, &identity, CHANGE_CHECK_BUDGET).await;
+    let workspace = workspace_of(client, session).await;
+    let tools = gate
+        .tools(client, &identity, workspace.as_deref(), CHANGE_CHECK_BUDGET)
+        .await;
     let now = Value::Array(entries_for(&tools, &taken)).to_string();
     now != shown
 }
@@ -338,10 +377,12 @@ pub async fn listing_changed(
 pub async fn find(
     gate: &HostedToolsGate,
     client: &ContextStreamClient,
+    session: &SessionManager,
     name: &str,
 ) -> Option<HostedTool> {
     let identity = crate::domains::slipstream::caller_identity(client).await?;
-    gate.tools(client, &identity, LISTING_BUDGET)
+    let workspace = workspace_of(client, session).await;
+    gate.tools(client, &identity, workspace.as_deref(), LISTING_BUDGET)
         .await
         .iter()
         .find(|tool| tool.name == name)
@@ -350,20 +391,80 @@ pub async fn find(
 
 /// Read the caller's definitions in the background, so the `tools/list` after
 /// an initialize finds them ready.
-pub fn prefetch(gate: Arc<HostedToolsGate>, client: ContextStreamClient) {
+pub fn prefetch(
+    gate: Arc<HostedToolsGate>,
+    client: ContextStreamClient,
+    session: Arc<SessionManager>,
+) {
     mcp_client::spawn_with_task_context(async move {
         if let Some(identity) = crate::domains::slipstream::caller_identity(&client).await {
-            gate.tools(&client, &identity, Duration::from_secs(10))
-                .await;
+            let workspace = workspace_of(&client, &session).await;
+            gate.tools(
+                &client,
+                &identity,
+                workspace.as_deref(),
+                Duration::from_secs(10),
+            )
+            .await;
         }
     });
 }
 
+/// The workspace the caller works in, as the API is told it.
+async fn workspace_of(client: &ContextStreamClient, session: &SessionManager) -> Option<String> {
+    listing_workspace(client, session)
+        .await
+        .map(|id| id.to_string())
+}
+
+/// The checkout a call is about: the session's folder, else this process's.
+async fn checkout_folder(session: &SessionManager) -> Option<std::path::PathBuf> {
+    session
+        .state()
+        .await
+        .folder_path
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+}
+
+/// Why a snapshot a tool asked for was not taken, in words the caller reads.
+fn snapshot_refusal(tool: &str, error: &SnapshotError) -> ToolResult {
+    ToolResult::error(format!(
+        "{tool} was not run: it needs a snapshot of this checkout and none was taken ({error}). Do what it was for yourself."
+    ))
+}
+
 /// Run a call to `tool` with `arguments`. Every failure is a tool error the
 /// caller reads, never a protocol error.
-pub async fn run(client: &ContextStreamClient, tool: &HostedTool, arguments: Value) -> ToolResult {
+pub async fn run(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    tool: &HostedTool,
+    arguments: Value,
+) -> ToolResult {
+    let mut body = serde_json::json!({ "arguments": arguments });
+    if let Some(workspace) = workspace_of(client, session).await {
+        body["workspace_id"] = Value::String(workspace);
+    }
+    // Held until the call is over: the snapshot owns the objects it will be asked for.
+    let mut _snapshot: Option<CheckoutSnapshot> = None;
+    if tool.attachments.contains(&Attachment::CheckoutSnapshot) {
+        let Some(folder) = checkout_folder(session).await else {
+            return ToolResult::error(format!(
+                "{} was not run: it needs a snapshot of this checkout and there is no folder",
+                tool.name
+            ));
+        };
+        match CheckoutSnapshot::capture(&folder).await {
+            Ok(snapshot) => {
+                body["checkout"] = snapshot.attachment();
+                _snapshot = Some(snapshot);
+            }
+            Err(error) => return snapshot_refusal(&tool.name, &error),
+        }
+    }
     let answer = match client
-        .hosted_tool_call(&tool.name, &arguments, CALL_TIMEOUT)
+        .hosted_tool_call(&tool.name, &body, CALL_TIMEOUT)
         .await
     {
         Ok(answer) => answer,

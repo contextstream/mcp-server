@@ -16,6 +16,7 @@ pub mod activation;
 pub mod agent_handle;
 pub mod auth;
 pub mod cache;
+pub mod checkout_snapshot;
 pub mod client;
 pub mod coach;
 pub mod credit_hold;

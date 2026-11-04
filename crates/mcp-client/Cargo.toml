@@ -26,6 +26,8 @@ dirs = "7.0"
 sha2 = "0.11"
 hex = "0.4"
 ignore = { workspace = true }
+flate2 = "1"
+tempfile = { workspace = true }
 fs2 = { workspace = true }
 futures = { workspace = true }
 
@@ -36,4 +38,3 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }

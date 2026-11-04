@@ -949,6 +949,7 @@ pub(crate) fn lists_hosted_tools(registry: &ToolRegistry) -> bool {
 pub(crate) async fn hosted_tools_entries(
     registry: &ToolRegistry,
     client: &ContextStreamClient,
+    session: &SessionManager,
 ) -> Vec<serde_json::Value> {
     use domains::hosted_tools;
     if !lists_hosted_tools(registry) {
@@ -957,6 +958,7 @@ pub(crate) async fn hosted_tools_entries(
     hosted_tools::listing_entries(
         &hosted_tools::HostedToolsGate::global(),
         client,
+        session,
         hosted_tools::LISTING_BUDGET,
         |name| registry.get(name).is_some(),
     )
@@ -968,14 +970,18 @@ pub(crate) async fn hosted_tools_entries(
 pub(crate) async fn hosted_tools_list_changed_notice(
     registry: &ToolRegistry,
     client: &ContextStreamClient,
+    session: &SessionManager,
 ) -> Option<&'static str> {
     use domains::hosted_tools;
     if !lists_hosted_tools(registry) {
         return None;
     }
-    hosted_tools::listing_changed(&hosted_tools::HostedToolsGate::global(), client, |name| {
-        registry.get(name).is_some()
-    })
+    hosted_tools::listing_changed(
+        &hosted_tools::HostedToolsGate::global(),
+        client,
+        session,
+        |name| registry.get(name).is_some(),
+    )
     .await
     .then_some(TOOLS_LIST_CHANGED_NOTIFICATION)
 }
@@ -1316,7 +1322,7 @@ async fn run_stdio_tool_calls(
         if announces_tool_changes {
             let notice = match slipstream_list_changed_notice(&registry, &client, &session).await {
                 Some(notice) => Some(notice),
-                None => hosted_tools_list_changed_notice(&registry, &client).await,
+                None => hosted_tools_list_changed_notice(&registry, &client, &session).await,
             };
             if let Some(notice) = notice {
                 writer.write_line(notice).await?;
@@ -2111,6 +2117,7 @@ async fn handle_request_dispatch(
                 domains::hosted_tools::prefetch(
                     domains::hosted_tools::HostedToolsGate::global(),
                     (**client).clone(),
+                    session.clone(),
                 );
             }
             if crate::readiness_evidence_writes_enabled() {
@@ -2149,7 +2156,7 @@ async fn handle_request_dispatch(
             // The listings read at once: one waits for the slower, not the sum.
             let ((), hosted) = tokio::join!(
                 with_slipstream_listing(registry, client, session, None, &mut tools),
-                hosted_tools_entries(registry, client),
+                hosted_tools_entries(registry, client, session),
             );
             for entry in hosted {
                 insert_sorted(&mut tools, entry);
@@ -2359,6 +2366,7 @@ async fn handle_request_dispatch(
                 domains::hosted_tools::find(
                     &domains::hosted_tools::HostedToolsGate::global(),
                     client,
+                    session,
                     tool_name,
                 )
                 .await
@@ -2395,7 +2403,9 @@ async fn handle_request_dispatch(
             let tool_call_outcome =
                 mcp_tools::wire_tokens::run_with_wire_response_context(wire_context, async {
                     match &hosted_tool {
-                        Some(tool) => Ok(domains::hosted_tools::run(client, tool, arguments).await),
+                        Some(tool) => {
+                            Ok(domains::hosted_tools::run(client, session, tool, arguments).await)
+                        }
                         None => registry.execute(tool_name, arguments).await,
                     }
                 })

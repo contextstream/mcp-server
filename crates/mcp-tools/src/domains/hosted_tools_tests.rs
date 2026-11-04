@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct Seen {
     method: String,
     path: String,
+    query: String,
     authorization: Option<String>,
     /// Every header name and value, names lowercased.
     headers: Vec<(String, String)>,
@@ -80,6 +81,10 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Seen> {
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
     let path = target.split('?').next().unwrap_or("").to_string();
+    let query = target
+        .split_once('?')
+        .map(|(_, q)| q.to_string())
+        .unwrap_or_default();
     let headers = head
         .lines()
         .skip(1)
@@ -91,6 +96,7 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Seen> {
     Some(Seen {
         method,
         path: path.strip_prefix("/api/v1").unwrap_or(&path).to_string(),
+        query,
         authorization: header("authorization"),
         headers,
         body: serde_json::from_slice(&buffer[header_end..]).unwrap_or(Value::Null),
@@ -102,6 +108,36 @@ fn client(url: &str) -> ContextStreamClient {
     config.api_url = url.to_string();
     config.api_key = Some("hosted-tools-test-key".to_string());
     ContextStreamClient::new(config)
+}
+
+fn session_for(client: &ContextStreamClient) -> SessionManager {
+    SessionManager::new(client.clone(), TestFixtures::test_config())
+}
+
+const WORKSPACE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+/// A client for `url` whose caller works in `WORKSPACE`.
+fn client_in_workspace(url: &str) -> ContextStreamClient {
+    let mut config = TestFixtures::test_config();
+    config.api_url = url.to_string();
+    config.api_key = Some("hosted-tools-test-key".to_string());
+    config.default_workspace_id = Some(uuid::Uuid::parse_str(WORKSPACE).unwrap());
+    ContextStreamClient::new(config)
+}
+
+fn git_here(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn echo_definition(transport: &str) -> Value {
@@ -185,11 +221,19 @@ async fn an_api_that_defines_no_hosted_tools_lists_none() {
     .await;
     let client = client(&url);
     let gate = HostedToolsGate::new();
-    assert!(listing_entries(&gate, &client, LISTING_BUDGET, |_| false)
+    assert!(listing_entries(
+        &gate,
+        &client,
+        &session_for(&client),
+        LISTING_BUDGET,
+        |_| false
+    )
+    .await
+    .is_empty());
+    assert!(find(&gate, &client, &session_for(&client), "echo")
         .await
-        .is_empty());
-    assert!(find(&gate, &client, "echo").await.is_none());
-    assert!(!listing_changed(&gate, &client, |_| false).await);
+        .is_none());
+    assert!(!listing_changed(&gate, &client, &session_for(&client), |_| false).await);
     // One read, cached: the second lookup asked nothing.
     let reads: Vec<Seen> = seen.lock().unwrap().clone();
     assert_eq!(reads.len(), 1, "{reads:?}");
@@ -218,7 +262,14 @@ async fn a_hosted_echo_tool_is_listed_and_runs_through_the_api() {
     let client = client(&url);
     let gate = HostedToolsGate::new();
 
-    let entries = listing_entries(&gate, &client, LISTING_BUDGET, |_| false).await;
+    let entries = listing_entries(
+        &gate,
+        &client,
+        &session_for(&client),
+        LISTING_BUDGET,
+        |_| false,
+    )
+    .await;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["name"], "echo");
     assert_eq!(
@@ -226,14 +277,26 @@ async fn a_hosted_echo_tool_is_listed_and_runs_through_the_api() {
         "string"
     );
     // A name the registry already has is never shadowed.
-    assert!(
-        listing_entries(&gate, &client, LISTING_BUDGET, |name| name == "echo")
-            .await
-            .is_empty()
-    );
+    assert!(listing_entries(
+        &gate,
+        &client,
+        &session_for(&client),
+        LISTING_BUDGET,
+        |name| name == "echo"
+    )
+    .await
+    .is_empty());
 
-    let tool = find(&gate, &client, "echo").await.expect("echo is defined");
-    let result = run(&client, &tool, json!({"text": "hello"})).await;
+    let tool = find(&gate, &client, &session_for(&client), "echo")
+        .await
+        .expect("echo is defined");
+    let result = run(
+        &client,
+        &session_for(&client),
+        &tool,
+        json!({"text": "hello"}),
+    )
+    .await;
     assert!(!result.is_error, "{result:?}");
     assert_eq!(text_of(&result), ["hello"]);
     assert_eq!(result.structured_content, Some(json!({"echoed": "hello"})));
@@ -245,7 +308,7 @@ async fn a_hosted_echo_tool_is_listed_and_runs_through_the_api() {
         .cloned()
         .collect();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].body, json!({"arguments": {"text": "hello"}}));
+    assert_eq!(calls[0].body["arguments"], json!({"text": "hello"}));
 }
 
 #[tokio::test]
@@ -278,10 +341,12 @@ async fn a_stream_tool_reads_its_result_from_the_endpoint_the_api_names() {
     .await;
     let client = client(&url);
     let gate = HostedToolsGate::new();
-    let tool = find(&gate, &client, "echo").await.expect("echo is defined");
+    let tool = find(&gate, &client, &session_for(&client), "echo")
+        .await
+        .expect("echo is defined");
     assert_eq!(tool.transport, Transport::Stream);
 
-    let result = run(&client, &tool, json!({"text": "hi"})).await;
+    let result = run(&client, &session_for(&client), &tool, json!({"text": "hi"})).await;
     assert!(!result.is_error, "{result:?}");
     assert_eq!(text_of(&result), ["one two", "done: hi"]);
     let seen: Vec<Seen> = stream_seen.lock().unwrap().clone();
@@ -315,8 +380,10 @@ async fn a_failed_call_is_a_tool_error_with_the_apis_message() {
     .await;
     let client = client(&url);
     let gate = HostedToolsGate::new();
-    let tool = find(&gate, &client, "echo").await.unwrap();
-    let result = run(&client, &tool, json!({"text": "x"})).await;
+    let tool = find(&gate, &client, &session_for(&client), "echo")
+        .await
+        .unwrap();
+    let result = run(&client, &session_for(&client), &tool, json!({"text": "x"})).await;
     assert!(result.is_error);
     assert_eq!(text_of(&result), ["Not enabled for this workspace"]);
 }
@@ -335,11 +402,17 @@ async fn a_new_definition_after_a_listing_is_a_change() {
     let client = client(&url);
     let gate = HostedToolsGate::new();
     // Before any listing, nothing counts as a change.
-    assert!(!listing_changed(&gate, &client, |_| false).await);
-    assert!(listing_entries(&gate, &client, LISTING_BUDGET, |_| false)
-        .await
-        .is_empty());
-    assert!(!listing_changed(&gate, &client, |_| false).await);
+    assert!(!listing_changed(&gate, &client, &session_for(&client), |_| false).await);
+    assert!(listing_entries(
+        &gate,
+        &client,
+        &session_for(&client),
+        LISTING_BUDGET,
+        |_| false
+    )
+    .await
+    .is_empty());
+    assert!(!listing_changed(&gate, &client, &session_for(&client), |_| false).await);
     let identity = crate::domains::slipstream::caller_identity(&client)
         .await
         .unwrap();
@@ -349,12 +422,161 @@ async fn a_new_definition_after_a_listing_is_a_change() {
             &json!({"tools": [echo_definition("api")]}),
         ))),
     );
-    assert!(listing_changed(&gate, &client, |_| false).await);
+    assert!(listing_changed(&gate, &client, &session_for(&client), |_| false).await);
     assert_eq!(
-        listing_entries(&gate, &client, LISTING_BUDGET, |_| false)
-            .await
-            .len(),
+        listing_entries(
+            &gate,
+            &client,
+            &session_for(&client),
+            LISTING_BUDGET,
+            |_| false
+        )
+        .await
+        .len(),
         1
     );
-    assert!(!listing_changed(&gate, &client, |_| false).await);
+    assert!(!listing_changed(&gate, &client, &session_for(&client), |_| false).await);
+}
+
+/// A tool whose definition asks for a checkout snapshot, and a stand-in API for it.
+async fn snapshot_tool_api() -> (String, Arc<StdMutex<Vec<Seen>>>) {
+    let mut definition = echo_definition("api");
+    definition["attachments"] = json!(["checkout_snapshot", "something_unknown"]);
+    stub(Arc::new(move |method, path, _| match (method, path) {
+        ("GET", "/mcp/hosted-tools") => (
+            200,
+            json!({"tools": [definition.clone(), echo_definition("api")]}).to_string(),
+        ),
+        ("POST", p) if p.ends_with("/call") => (
+            200,
+            json!({"content": [{"type": "text", "text": "ok"}]}).to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    }))
+    .await
+}
+
+#[test]
+fn a_definition_may_ask_for_a_checkout_snapshot() {
+    let tools = parse_catalog(&json!({"tools": [
+        {"name": "wants_one", "description": "x", "input_schema": {"type": "object"},
+         "attachments": ["checkout_snapshot", "unknown", 7]},
+        {"name": "wants_none", "description": "x", "input_schema": {"type": "object"}},
+    ]}));
+    assert_eq!(tools[0].attachments, vec![Attachment::CheckoutSnapshot]);
+    assert!(tools[1].attachments.is_empty());
+}
+
+#[tokio::test]
+async fn a_call_names_the_workspace_and_carries_a_snapshot_only_when_asked() {
+    let (url, seen) = snapshot_tool_api().await;
+    let client = client_in_workspace(&url);
+    let session = session_for(&client);
+    let repo = tempfile::tempdir().unwrap();
+    git_here(repo.path(), &["init", "-q"]);
+    std::fs::write(repo.path().join("a.txt"), "hello\n").unwrap();
+    git_here(repo.path(), &["add", "-A"]);
+    git_here(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "first",
+        ],
+    );
+    std::fs::write(repo.path().join("a.txt"), "hello, changed\n").unwrap();
+    std::fs::write(repo.path().join(".env"), "TOKEN=abc\n").unwrap();
+    session
+        .initialize(
+            Some(uuid::Uuid::parse_str(WORKSPACE).unwrap()),
+            None,
+            Some(repo.path().to_string_lossy().to_string()),
+            None,
+        )
+        .await;
+
+    let gate = HostedToolsGate::new();
+    let entries = listing_entries(&gate, &client, &session, LISTING_BUDGET, |name| {
+        name == "check"
+    })
+    .await;
+    assert_eq!(
+        entries.len(),
+        1,
+        "the repeated name is listed once: {entries:?}"
+    );
+    let mut tools = parse_catalog(&json!({"tools": [
+        {"name": "wants_one", "description": "x", "input_schema": {"type": "object"},
+         "attachments": ["checkout_snapshot"]},
+        {"name": "wants_none", "description": "x", "input_schema": {"type": "object"}},
+    ]}));
+    let wants_none = tools.pop().unwrap();
+    let wants_one = tools.pop().unwrap();
+
+    let result = run(&client, &session, &wants_one, json!({"text": "x"})).await;
+    assert!(!result.is_error, "{result:?}");
+    let result = run(&client, &session, &wants_none, json!({"text": "y"})).await;
+    assert!(!result.is_error, "{result:?}");
+
+    let seen = seen.lock().unwrap().clone();
+    let catalog = seen.iter().find(|s| s.method == "GET").unwrap();
+    assert_eq!(catalog.query, format!("workspace_id={WORKSPACE}"));
+    let calls: Vec<&Seen> = seen.iter().filter(|s| s.method == "POST").collect();
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert_eq!(call.body["workspace_id"], WORKSPACE);
+    }
+    let asked = &calls[0].body;
+    assert_eq!(asked["arguments"], json!({"text": "x"}));
+    let checkout = &asked["checkout"];
+    assert_eq!(checkout["changed"], 1);
+    assert_eq!(
+        checkout["repo"]["origin_sha256"].as_str().unwrap().len(),
+        64
+    );
+    assert_eq!(
+        checkout["repo"]["name"],
+        repo.path().file_name().unwrap().to_str().unwrap()
+    );
+    assert_eq!(checkout["withheld"][0]["path"], ".env");
+    assert!(checkout["base_tree"].as_str().unwrap().len() == 40);
+    assert_ne!(checkout["base_tree"], checkout["target_tree"]);
+    // No content, no path of a change and no URL is in it.
+    let text = checkout.to_string();
+    assert!(!text.contains("hello, changed") && !text.contains("TOKEN=abc"));
+    assert!(calls[1].body.get("checkout").is_none());
+}
+
+#[tokio::test]
+async fn a_tool_that_needs_a_snapshot_is_not_called_without_one() {
+    let (url, seen) = snapshot_tool_api().await;
+    let client = client_in_workspace(&url);
+    let session = session_for(&client);
+    let not_a_repo = tempfile::tempdir().unwrap();
+    session
+        .initialize(
+            None,
+            None,
+            Some(not_a_repo.path().to_string_lossy().to_string()),
+            None,
+        )
+        .await;
+    let tools = parse_catalog(&json!({"tools": [
+        {"name": "wants_one", "description": "x", "input_schema": {"type": "object"},
+         "attachments": ["checkout_snapshot"]},
+    ]}));
+    let result = run(&client, &session, &tools[0], json!({})).await;
+    assert!(result.is_error);
+    let message = text_of(&result).join(" ");
+    assert!(message.contains("not inside a git repository"), "{message}");
+    assert!(message.contains("yourself"), "{message}");
+    assert!(
+        seen.lock().unwrap().iter().all(|s| s.method != "POST"),
+        "the API was called without the snapshot it needs"
+    );
 }

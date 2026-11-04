@@ -68,24 +68,34 @@ pub fn hosted_stream_url_allowed(url: &str) -> bool {
 
 impl ContextStreamClient {
     /// The tool definitions the API offers this caller.
-    pub async fn hosted_tools_catalog(&self, timeout: Duration) -> Result<HostedToolsAnswer> {
-        let raw = self
-            .send_raw_json("GET", HOSTED_TOOLS_PATH, None, timeout)
-            .await?;
+    pub async fn hosted_tools_catalog(
+        &self,
+        workspace_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<HostedToolsAnswer> {
+        let path = match workspace_id {
+            Some(id) => format!(
+                "{HOSTED_TOOLS_PATH}?workspace_id={}",
+                urlencoding::encode(id)
+            ),
+            None => HOSTED_TOOLS_PATH.to_string(),
+        };
+        let raw = self.send_raw_json("GET", &path, None, timeout).await?;
         Ok(HostedToolsAnswer::from_body(raw.status, raw.body))
     }
 
-    /// Run the hosted tool `name` through the API.
+    /// Run the hosted tool `name` through the API. `body` is
+    /// `{"arguments": …}`, with the caller's `workspace_id` and, for a tool that
+    /// asks for one, a `checkout` (see `checkout_snapshot`).
     pub async fn hosted_tool_call(
         &self,
         name: &str,
-        arguments: &Value,
+        body: &Value,
         timeout: Duration,
     ) -> Result<HostedToolsAnswer> {
         let path = format!("{HOSTED_TOOLS_PATH}/{name}/call");
-        let body = serde_json::json!({ "arguments": arguments });
         let raw = self
-            .send_raw_json("POST", &path, Some(&body), timeout)
+            .send_raw_json("POST", &path, Some(body), timeout)
             .await?;
         Ok(HostedToolsAnswer::from_body(raw.status, raw.body))
     }

@@ -12841,9 +12841,34 @@ impl ContextStreamClient {
         // Always skip these files
         let always_ignored = [
             ".lock", ".lockb", ".zip", ".tar", ".gz", ".rar", ".7z", ".exe", ".dll", ".so",
-            ".dylib", ".pem", ".key", ".p12", ".pfx", ".jks",
+            ".dylib",
         ];
 
+        let name_lower = name.to_lowercase();
+
+        if Self::is_secret_file_name(name) {
+            return true;
+        }
+
+        // Always skip binaries and archives
+        if always_ignored.iter().any(|ext| name_lower.ends_with(ext)) {
+            return true;
+        }
+
+        // Skip media files unless include_media is true
+        if !include_media && Self::is_media_file(name) {
+            return true;
+        }
+
+        false
+    }
+
+    /// Whether a file name is one that holds credentials or key material
+    /// whatever its content (`.env` and its variants, `id_rsa`, `*.pem`,
+    /// `*.key`, `credentials.json`, Terraform state and variable files,
+    /// service-account keys). A lock file or an archive is not one. Anything
+    /// that leaves the machine with a file's content checks this first.
+    pub fn is_secret_file_name(name: &str) -> bool {
         let name_lower = name.to_lowercase();
 
         if matches!(
@@ -12918,17 +12943,10 @@ impl ContextStreamClient {
             }
         }
 
-        // Always skip binaries and archives
-        if always_ignored.iter().any(|ext| name_lower.ends_with(ext)) {
-            return true;
-        }
-
-        // Skip media files unless include_media is true
-        if !include_media && Self::is_media_file(name) {
-            return true;
-        }
-
-        false
+        // Key material.
+        [".pem", ".key", ".p12", ".pfx", ".jks"]
+            .iter()
+            .any(|ext| name_lower.ends_with(ext))
     }
 
     /// Detect content type for media files.

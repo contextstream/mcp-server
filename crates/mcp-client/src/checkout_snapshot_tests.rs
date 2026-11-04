@@ -1,0 +1,644 @@
+use super::*;
+use std::io::Read;
+use std::process::Command as Std;
+
+/// Runs git in `dir`; panics on failure; returns trimmed stdout.
+fn git_ok(dir: &Path, args: &[&str]) -> String {
+    let out = Std::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn write(dir: &Path, rel: &str, content: &str) {
+    let path = dir.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+fn commit_all(dir: &Path, message: &str) {
+    git_ok(dir, &["add", "-A"]);
+    git_ok(
+        dir,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
+}
+
+/// A repository whose last commit holds a few files, and whose index is fresh.
+fn repo_with_history() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    git_ok(dir, &["init", "-q"]);
+    write(dir, "a.txt", "alpha\n");
+    write(dir, "c.txt", "gone soon\n");
+    write(dir, "src/lib.rs", "pub fn one() {}\n");
+    write(dir, "Cargo.lock", "# lock\n");
+    write(dir, ".gitignore", "ignored.log\n");
+    commit_all(dir, "first");
+    git_ok(dir, &["status", "--porcelain"]);
+    temp
+}
+
+/// The tree git itself makes of HEAD plus `add` (paths, relative to the repo
+/// root) and minus `remove`, in a scratch index: an independent answer.
+fn reference_tree(dir: &Path, add: &[&str], remove: &[&str]) -> String {
+    let scratch = tempfile::tempdir().unwrap();
+    let index = scratch.path().join("index");
+    let run = |args: &[&str]| {
+        let out = Std::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_INDEX_FILE", &index)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    if Std::new("git")
+        .args(["rev-parse", "-q", "--verify", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .unwrap()
+        .status
+        .success()
+    {
+        run(&["read-tree", "HEAD"]);
+    }
+    for path in remove {
+        run(&["rm", "-q", "--cached", "--", path]);
+    }
+    for path in add {
+        run(&["add", "-f", "--", path]);
+    }
+    run(&["write-tree"])
+}
+
+fn unpack(pack: &[u8]) -> tempfile::TempDir {
+    let target = tempfile::tempdir().unwrap();
+    git_ok(target.path(), &["init", "-q"]);
+    let mut child = Std::new("git")
+        .args(["unpack-objects", "-q"])
+        .current_dir(target.path())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), pack).unwrap();
+    assert!(child.wait().unwrap().success(), "unpack-objects");
+    target
+}
+
+fn paths(entries: &[Entry]) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = entries
+        .iter()
+        .map(|e| (e.path.clone(), e.mode.clone()))
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[tokio::test]
+async fn a_clean_checkout_has_nothing_on_top_of_its_commit() {
+    let repo = repo_with_history();
+    let snapshot = CheckoutSnapshot::capture(repo.path()).await.unwrap();
+    assert!(snapshot.overlay.is_empty());
+    assert!(snapshot.deletes.is_empty());
+    assert!(snapshot.withheld.is_empty());
+    assert_eq!(
+        snapshot.base_tree,
+        git_ok(repo.path(), &["rev-parse", "HEAD^{tree}"])
+    );
+    assert_eq!(snapshot.target_tree, snapshot.base_tree);
+    assert_eq!(snapshot.folder, "");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_target_tree_is_the_tree_git_makes_of_the_same_files() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let repo = repo_with_history();
+    let dir = repo.path();
+    write(dir, "a.txt", "alpha, changed\n");
+    std::fs::remove_file(dir.join("c.txt")).unwrap();
+    write(dir, "b/new.txt", "brand new\n");
+    write(dir, "script.sh", "#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(
+        dir.join("script.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    symlink("a.txt", dir.join("link")).unwrap();
+    write(dir, "Cargo.lock", "# lock, changed\n");
+    // Never sent: ignored by .gitignore, an install, and Cargo's own target.
+    write(dir, "ignored.log", "noise\n");
+    write(dir, "web/node_modules/pkg/index.js", "module.exports = 1\n");
+    write(
+        dir,
+        "target/CACHEDIR.TAG",
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    );
+    write(dir, "target/debug/app", "binary\n");
+
+    let snapshot = CheckoutSnapshot::capture(dir).await.unwrap();
+
+    assert_eq!(
+        paths(&snapshot.overlay),
+        vec![
+            ("Cargo.lock".to_string(), "100644".to_string()),
+            ("a.txt".to_string(), "100644".to_string()),
+            ("b/new.txt".to_string(), "100644".to_string()),
+            ("link".to_string(), "120000".to_string()),
+            ("script.sh".to_string(), "100755".to_string()),
+        ]
+    );
+    assert_eq!(snapshot.deletes, vec!["c.txt".to_string()]);
+    assert!(snapshot.withheld.is_empty());
+    let expected = reference_tree(
+        dir,
+        &["Cargo.lock", "a.txt", "b/new.txt", "link", "script.sh"],
+        &["c.txt"],
+    );
+    assert_eq!(snapshot.target_tree, expected);
+    // The blob ids are git's.
+    let blob = snapshot.overlay.iter().find(|e| e.path == "a.txt").unwrap();
+    assert_eq!(blob.oid, git_ok(dir, &["hash-object", "a.txt"]));
+}
+
+#[tokio::test]
+async fn a_tracked_file_in_an_install_folder_still_counts() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    git_ok(dir, &["init", "-q"]);
+    write(dir, "vendor/node_modules/dep/index.js", "v1\n");
+    write(dir, "keep.txt", "k\n");
+    commit_all(dir, "vendored");
+    write(dir, "vendor/node_modules/dep/index.js", "v2\n");
+    write(
+        dir,
+        "vendor/node_modules/other/new.js",
+        "untracked install\n",
+    );
+    let snapshot = CheckoutSnapshot::capture(dir).await.unwrap();
+    assert_eq!(
+        paths(&snapshot.overlay),
+        vec![(
+            "vendor/node_modules/dep/index.js".to_string(),
+            "100644".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn taking_a_snapshot_leaves_the_repository_as_it_was() {
+    let repo = repo_with_history();
+    let dir = repo.path();
+    write(dir, "a.txt", "changed\n");
+    write(dir, "new.txt", "new\n");
+    let listing = || {
+        let mut rows: Vec<(String, u64)> = walkdir_files(&dir.join(".git"));
+        rows.sort();
+        rows
+    };
+    let before = (listing(), std::fs::read(dir.join(".git/index")).unwrap());
+    let snapshot = CheckoutSnapshot::capture(dir).await.unwrap();
+    assert_eq!(snapshot.overlay.len(), 2);
+    let after = (listing(), std::fs::read(dir.join(".git/index")).unwrap());
+    assert_eq!(before, after, "the repository changed");
+}
+
+fn walkdir_files(root: &Path) -> Vec<(String, u64)> {
+    let mut rows = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            let meta = entry.metadata().unwrap();
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                rows.push((
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                    meta.len(),
+                ));
+            }
+        }
+    }
+    rows
+}
+
+#[tokio::test]
+async fn credentials_and_listed_paths_stay_on_the_machine() {
+    let repo = repo_with_history();
+    let dir = repo.path();
+    write(dir, ".env", "TOKEN=abc\n");
+    write(dir, ".env.example", "TOKEN=\n");
+    write(dir, "deploy.key", "key material\n");
+    let key_body = "A".repeat(64);
+    write(
+        dir,
+        "notes.txt",
+        &format!(
+            "-----BEGIN PRIVATE KEY-----\n{key_body}\n{key_body}\n-----END PRIVATE KEY-----\n"
+        ),
+    );
+    write(dir, ".contextignore", "private/\n");
+    write(dir, "private/plan.md", "internal\n");
+    write(dir, ".contextstream/ignore", "vault/\n");
+    write(dir, "vault/x.txt", "x\n");
+    write(dir, "Cargo.lock", "# lock, changed\n");
+    write(dir, "fine.txt", "fine\n");
+
+    let snapshot = CheckoutSnapshot::capture(dir).await.unwrap();
+
+    let sent: Vec<&str> = {
+        let mut v: Vec<&str> = snapshot.overlay.iter().map(|e| e.path.as_str()).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        sent,
+        [
+            ".contextignore",
+            ".contextstream/ignore",
+            ".env.example",
+            "Cargo.lock",
+            "fine.txt"
+        ]
+    );
+    let mut withheld: Vec<(&str, &str)> = snapshot
+        .withheld
+        .iter()
+        .map(|w| (w.path.as_str(), w.reason.as_str()))
+        .collect();
+    withheld.sort();
+    let names: Vec<&str> = withheld.iter().map(|(p, _)| *p).collect();
+    assert_eq!(
+        names,
+        [
+            ".env",
+            "deploy.key",
+            "notes.txt",
+            "private/plan.md",
+            "vault/x.txt"
+        ]
+    );
+    assert!(withheld[0].1.contains("credentials"), "{withheld:?}");
+    assert!(withheld[2].1.contains("private key"), "{withheld:?}");
+    assert!(withheld[3].1.contains(".contextignore"), "{withheld:?}");
+    assert!(
+        withheld[4].1.contains(".contextstream/ignore"),
+        "{withheld:?}"
+    );
+    // The tree the service builds is the one without them.
+    let expected = reference_tree(
+        dir,
+        &[
+            ".contextignore",
+            ".contextstream/ignore",
+            ".env.example",
+            "Cargo.lock",
+            "fine.txt",
+        ],
+        &[],
+    );
+    assert_eq!(snapshot.target_tree, expected);
+    // The attachment names them but carries no content.
+    let attachment = snapshot.attachment();
+    assert_eq!(attachment["withheld"].as_array().unwrap().len(), 5);
+    assert!(!attachment.to_string().contains("TOKEN=abc"));
+    assert_eq!(attachment["changed"], 5);
+}
+
+#[tokio::test]
+async fn a_checkout_over_a_limit_is_not_snapshotted() {
+    let repo = repo_with_history();
+    let dir = repo.path();
+    write(dir, "one.txt", "1\n");
+    write(dir, "two.txt", "2\n");
+    write(dir, "three.txt", "3\n");
+    let few = Limits {
+        files: 2,
+        ..Limits::default()
+    };
+    assert!(matches!(
+        CheckoutSnapshot::capture_with(dir, few).await,
+        Err(SnapshotError::TooLarge(_))
+    ));
+    let small_files = Limits {
+        file_bytes: 1,
+        ..Limits::default()
+    };
+    assert!(matches!(
+        CheckoutSnapshot::capture_with(dir, small_files).await,
+        Err(SnapshotError::TooLarge(_))
+    ));
+    let small_total = Limits {
+        total_bytes: 3,
+        ..Limits::default()
+    };
+    assert!(matches!(
+        CheckoutSnapshot::capture_with(dir, small_total).await,
+        Err(SnapshotError::TooLarge(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_service_can_ask_for_the_listing_and_for_blobs() {
+    let repo = repo_with_history();
+    let dir = repo.path();
+    write(dir, "added.txt", "added, not committed\n");
+    let snapshot = CheckoutSnapshot::capture(dir).await.unwrap();
+
+    // The base tree's listing, zlib-compressed.
+    let listing = snapshot
+        .answer_need(&serde_json::json!({"listing": true}))
+        .await
+        .unwrap();
+    let mut plain = Vec::new();
+    flate2::read::ZlibDecoder::new(&listing[..])
+        .read_to_end(&mut plain)
+        .unwrap();
+    let expected = Std::new("git")
+        .args(["ls-tree", "-r", "-z", "--full-tree", &snapshot.base_tree])
+        .current_dir(dir)
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(plain, expected);
+
+    // A blob of the base, and a blob of the changes, in one pack.
+    let base_blob = git_ok(dir, &["rev-parse", "HEAD:a.txt"]);
+    let new_blob = snapshot.overlay[0].oid.clone();
+    let pack = snapshot
+        .answer_need(&serde_json::json!({"blobs": [base_blob, new_blob]}))
+        .await
+        .unwrap();
+    let target = unpack(&pack);
+    assert_eq!(
+        git_ok(target.path(), &["cat-file", "-p", &base_blob]),
+        "alpha"
+    );
+    assert_eq!(
+        git_ok(target.path(), &["cat-file", "-p", &new_blob]),
+        "added, not committed"
+    );
+
+    // The first message after the request holds every change.
+    let first = unpack(&snapshot.initial_pack().await.unwrap());
+    assert_eq!(
+        git_ok(first.path(), &["cat-file", "-p", &new_blob]),
+        "added, not committed"
+    );
+
+    // An object the snapshot does not hold is never given out, though it is in the repository.
+    write(dir, "later.txt", "committed later\n");
+    commit_all(dir, "second");
+    let history_only = git_ok(dir, &["rev-parse", "HEAD:later.txt"]);
+    let refused = snapshot
+        .answer_need(&serde_json::json!({"blobs": [history_only]}))
+        .await;
+    assert!(
+        matches!(refused, Err(SnapshotError::NotHeld)),
+        "{refused:?}"
+    );
+    // Malformed ids are ignored, and nothing asked is an empty answer.
+    let none = snapshot
+        .answer_need(&serde_json::json!({"blobs": ["--all", "xyz"]}))
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+}
+
+#[tokio::test]
+async fn a_repository_without_a_commit_has_the_empty_tree_as_its_base() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    git_ok(dir, &["init", "-q"]);
+    write(dir, "first.txt", "hello\n");
+    let snapshot = CheckoutSnapshot::capture(dir).await.unwrap();
+    assert_eq!(snapshot.base_tree, EMPTY_TREE);
+    assert_eq!(snapshot.overlay.len(), 1);
+    assert_eq!(
+        snapshot.target_tree,
+        reference_tree(dir, &["first.txt"], &[])
+    );
+}
+
+#[tokio::test]
+async fn a_subfolder_is_snapshotted_as_its_whole_repository() {
+    let repo = repo_with_history();
+    let dir = repo.path();
+    write(dir, "src/extra.rs", "pub fn two() {}\n");
+    let snapshot = CheckoutSnapshot::capture(&dir.join("src")).await.unwrap();
+    assert_eq!(snapshot.folder, "src");
+    assert_eq!(snapshot.root, std::fs::canonicalize(dir).unwrap());
+    assert_eq!(snapshot.overlay[0].path, "src/extra.rs");
+    let fields = snapshot.request_fields();
+    assert_eq!(
+        fields.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        ["base_tree", "deletes", "overlay", "root", "target_tree"]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        fields["overlay"][0],
+        serde_json::json!(["100644", snapshot.overlay[0].oid, "src/extra.rs"])
+    );
+}
+
+#[tokio::test]
+async fn names_git_cannot_list_on_a_line_are_still_snapshotted() {
+    let repo = repo_with_history();
+    let dir = repo.path();
+    write(dir, "with space.txt", "s\n");
+    write(dir, "naïve.txt", "u\n");
+    write(dir, "line\nbreak.txt", "n\n");
+    write(dir, "\"quoted\".txt", "q\n");
+    let snapshot = CheckoutSnapshot::capture(dir).await.unwrap();
+    assert_eq!(snapshot.overlay.len(), 4, "{:?}", snapshot.overlay);
+    assert_eq!(
+        snapshot.target_tree,
+        reference_tree(
+            dir,
+            &[
+                "with space.txt",
+                "naïve.txt",
+                "line\nbreak.txt",
+                "\"quoted\".txt"
+            ],
+            &[]
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_nested_repository_is_not_part_of_the_snapshot() {
+    let repo = repo_with_history();
+    let dir = repo.path();
+    let nested = dir.join("tools/inner");
+    std::fs::create_dir_all(&nested).unwrap();
+    git_ok(&nested, &["init", "-q"]);
+    write(&nested, "x.txt", "x\n");
+    let snapshot = CheckoutSnapshot::capture(dir).await.unwrap();
+    assert!(snapshot.overlay.is_empty(), "{:?}", snapshot.overlay);
+}
+
+#[tokio::test]
+async fn a_folder_outside_a_repository_is_not_snapshotted() {
+    let temp = tempfile::tempdir().unwrap();
+    let result = CheckoutSnapshot::capture(temp.path()).await;
+    assert!(
+        matches!(result, Err(SnapshotError::NotARepository(_))),
+        "{:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn the_settings_decide_whether_a_snapshot_may_be_taken() {
+    let base = Settings {
+        origin: "https://github.com/acme/app.git",
+        folder_name: "app",
+        ..Settings::default()
+    };
+    assert_eq!(refusal(&base), None);
+    assert!(refusal(&Settings {
+        local_files_denied: true,
+        ..base.clone()
+    })
+    .unwrap()
+    .contains("no local files"));
+    for off in ["off", "0", "false", "No", " disabled "] {
+        assert!(
+            refusal(&Settings {
+                env_switch: Some(off),
+                ..base.clone()
+            })
+            .is_some(),
+            "{off}"
+        );
+    }
+    assert_eq!(
+        refusal(&Settings {
+            env_switch: Some("on"),
+            ..base.clone()
+        }),
+        None
+    );
+    assert!(refusal(&Settings {
+        project_switch: Some(false),
+        ..base.clone()
+    })
+    .unwrap()
+    .contains(".contextstream/config.json"));
+    assert_eq!(
+        refusal(&Settings {
+            project_switch: Some(true),
+            ..base.clone()
+        }),
+        None
+    );
+    let only_acme = Settings {
+        env_repos: Some("https://github.com/acme/"),
+        ..base.clone()
+    };
+    assert_eq!(refusal(&only_acme), None);
+    let by_name = Settings {
+        env_repos: Some("other, app"),
+        origin: "",
+        ..base.clone()
+    };
+    assert_eq!(refusal(&by_name), None);
+    let elsewhere = Settings {
+        env_repos: Some("https://github.com/other/"),
+        ..base.clone()
+    };
+    assert!(refusal(&elsewhere).unwrap().contains(ENV_REPOS));
+    // An empty list means every repository.
+    assert_eq!(
+        refusal(&Settings {
+            env_repos: Some("  "),
+            ..base
+        }),
+        None
+    );
+}
+
+#[test]
+fn a_repository_is_named_by_its_folder_and_a_digest_of_its_origin() {
+    // The digest of the empty string, and of an origin with a newline after it.
+    let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    assert_eq!(origin_digest(""), empty);
+    assert_eq!(origin_digest("\n"), empty);
+    assert_eq!(
+        origin_digest("git@github.com:acme/app.git\n"),
+        origin_digest("git@github.com:acme/app.git")
+    );
+    assert_ne!(origin_digest("git@github.com:acme/app.git"), empty);
+    assert_eq!(origin_digest("x").len(), 64);
+}
+
+#[test]
+fn big_data_goes_in_pieces_of_at_most_one_mebibyte() {
+    let data = vec![7u8; PIECE_BYTES_MAX * 2 + 5];
+    let sizes: Vec<usize> = in_pieces(&data).map(<[u8]>::len).collect();
+    assert_eq!(sizes, [PIECE_BYTES_MAX, PIECE_BYTES_MAX, 5]);
+    assert_eq!(in_pieces(&[]).count(), 0);
+}
+
+#[test]
+fn secret_names_are_told_from_lock_files_and_archives() {
+    for secret in [
+        ".env",
+        ".env.local",
+        "id_rsa",
+        "server.pem",
+        "tls.KEY",
+        "creds.p12",
+        "credentials.json",
+        "prod.tfvars",
+    ] {
+        assert!(ContextStreamClient::is_secret_file_name(secret), "{secret}");
+        assert!(
+            ContextStreamClient::should_skip_file(secret, true),
+            "{secret}"
+        );
+    }
+    // Ingest skips these; a snapshot must send them: a changed Cargo.lock changes a build.
+    for not_secret in [
+        "Cargo.lock",
+        "yarn.lock",
+        "bun.lockb",
+        "bundle.zip",
+        ".env.example",
+        "main.rs",
+    ] {
+        assert!(
+            !ContextStreamClient::is_secret_file_name(not_secret),
+            "{not_secret}"
+        );
+    }
+    assert!(ContextStreamClient::should_skip_file("Cargo.lock", true));
+    assert!(ContextStreamClient::should_skip_file("bundle.zip", true));
+    assert!(!ContextStreamClient::should_skip_file("main.rs", true));
+}

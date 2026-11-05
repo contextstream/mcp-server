@@ -728,3 +728,269 @@ async fn a_repository_before_its_first_commit_is_its_own_empty_base() {
         reference_tree(temp.path(), &["first.txt"], &[])
     );
 }
+
+fn sha(text: &str) -> String {
+    hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// The digest a snapshot of `dir` names its repository with.
+async fn named_as(dir: &Path) -> String {
+    let identity = CheckoutSnapshot::begin(dir).await.unwrap().identity();
+    identity["repo"]["origin_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The ids of the first commits of `dir`, sorted.
+fn root_commits(dir: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = git_ok(dir, &["rev-list", "--max-parents=0", "HEAD"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// A commit with the tree of HEAD and no parent, made without touching any branch.
+fn parentless_commit(dir: &Path, message: &str) -> String {
+    let tree = git_ok(dir, &["rev-parse", "HEAD^{tree}"]);
+    git_ok(
+        dir,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit-tree",
+            &tree,
+            "-m",
+            message,
+        ],
+    )
+}
+
+#[tokio::test]
+async fn a_repository_with_an_origin_is_named_by_a_digest_of_the_origin() {
+    let temp = repo_with_history();
+    let url = "git@example.com:acme/app.git";
+    git_ok(temp.path(), &["remote", "add", "origin", url]);
+    assert_eq!(named_as(temp.path()).await, sha(url));
+    // Another copy of the same origin is the same repository, whatever its history.
+    let other = tempfile::tempdir().unwrap();
+    git_ok(other.path(), &["init", "-q"]);
+    git_ok(other.path(), &["remote", "add", "origin", url]);
+    assert_eq!(named_as(other.path()).await, sha(url));
+    // The digest, not the URL, is all the identity holds.
+    let identity = CheckoutSnapshot::begin(temp.path())
+        .await
+        .unwrap()
+        .identity();
+    assert!(!identity.to_string().contains("example.com"), "{identity}");
+}
+
+#[tokio::test]
+async fn without_an_origin_the_first_commit_names_the_repository() {
+    let temp = repo_with_history();
+    let first = git_ok(temp.path(), &["rev-parse", "HEAD"]);
+    let named = sha(&format!("root:{first}"));
+    assert_eq!(named_as(temp.path()).await, named);
+    // Later commits do not change it.
+    write(temp.path(), "more.txt", "more\n");
+    commit_all(temp.path(), "second");
+    assert_eq!(named_as(temp.path()).await, named);
+    // It is no longer the digest of the empty string.
+    assert_ne!(named, origin_digest(""));
+    // A copy made in another folder, with the remote taken off, is the same repository.
+    let parent = tempfile::tempdir().unwrap();
+    git_ok(
+        parent.path(),
+        &["clone", "-q", temp.path().to_str().unwrap(), "another-name"],
+    );
+    let copy = parent.path().join("another-name");
+    git_ok(&copy, &["remote", "remove", "origin"]);
+    assert_eq!(named_as(&copy).await, named);
+}
+
+#[tokio::test]
+async fn an_origin_that_is_blank_is_no_origin() {
+    let temp = repo_with_history();
+    let first = git_ok(temp.path(), &["rev-parse", "HEAD"]);
+    git_ok(temp.path(), &["config", "remote.origin.url", " "]);
+    assert_eq!(named_as(temp.path()).await, sha(&format!("root:{first}")));
+}
+
+#[tokio::test]
+async fn several_first_commits_are_all_in_the_name_sorted() {
+    let temp = repo_with_history();
+    let dir = temp.path();
+    let second_root = parentless_commit(dir, "second root");
+    let third_root = parentless_commit(dir, "third root");
+    let tree = git_ok(dir, &["rev-parse", "HEAD^{tree}"]);
+    let join = git_ok(
+        dir,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit-tree",
+            &tree,
+            "-p",
+            "HEAD",
+            "-p",
+            &second_root,
+            "-p",
+            &third_root,
+            "-m",
+            "join",
+        ],
+    );
+    git_ok(dir, &["update-ref", "HEAD", &join]);
+    let ids = root_commits(dir);
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    assert_eq!(
+        named_as(dir).await,
+        sha(&format!("root:{}", ids.join(","))),
+        "{ids:?}"
+    );
+}
+
+/// The inputs and digests that ContextCode pins in its own tests, character for
+/// character: the two name a repository the same way, so a change to one of these
+/// values is a change to both.
+#[test]
+fn the_digests_of_the_shared_inputs_are_fixed() {
+    let digest = |identity: &[u8]| hex::encode(Sha256::digest(identity));
+    // An origin URL, as the digest of the URL itself (and of its trimmed form).
+    assert_eq!(
+        origin_digest("git@github.com:acme/app.git"),
+        "ac4dee71355abf0a1f7c0da63d264fdff4f107b83d8c124a09ccef3bf693eedb"
+    );
+    assert_eq!(
+        origin_digest(" git@github.com:acme/app.git\n"),
+        origin_digest("git@github.com:acme/app.git")
+    );
+    // The first commits' ids: one root, then two roots listed out of order.
+    let one = "0123456789abcdef0123456789abcdef01234567";
+    assert_eq!(
+        digest(root_identity(&format!("{one}\n")).unwrap().as_bytes()),
+        "8714f0af35167c2165576d0b8918a5246398b20d14e764172e15e87d74859649"
+    );
+    let low = "1111111111111111111111111111111111111111";
+    let high = "2222222222222222222222222222222222222222";
+    assert_eq!(
+        digest(
+            root_identity(&format!("{high}\n{low}\n"))
+                .unwrap()
+                .as_bytes()
+        ),
+        "10fe543afe15e64e64f60cac97f7b0781618525cb724580f9847ef8cc05d5c17"
+    );
+    // The folder, before the first commit.
+    assert_eq!(
+        digest(&path_identity(Path::new("/work/app"))),
+        "613c761bfc946f685fac386a0cad288aaea1a1a4f0d2a02d6b0f4b94729c9fea"
+    );
+}
+
+#[test]
+fn the_first_commits_are_named_in_sorted_order_whatever_git_printed() {
+    assert_eq!(root_identity("bbb\naaa\n").as_deref(), Some("root:aaa,bbb"));
+    assert_eq!(root_identity("c\nb\na").as_deref(), Some("root:a,b,c"));
+    assert_eq!(root_identity("abc\r\n").as_deref(), Some("root:abc"));
+    assert_eq!(root_identity(""), None);
+    assert_eq!(root_identity("\n  \n"), None);
+}
+
+#[test]
+fn a_windows_path_loses_the_prefix_that_resolving_it_adds() {
+    assert_eq!(without_verbatim_prefix(r"\\?\C:\work\app"), r"C:\work\app");
+    assert_eq!(
+        without_verbatim_prefix(r"\\?\UNC\host\share\app"),
+        r"\\host\share\app"
+    );
+    assert_eq!(without_verbatim_prefix(r"C:\work\app"), r"C:\work\app");
+    assert_eq!(without_verbatim_prefix("/home/a/app"), "/home/a/app");
+    assert_eq!(
+        without_verbatim_prefix(r"\\?\Volume{1}\app"),
+        r"\\?\Volume{1}\app"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn before_the_first_commit_the_folder_names_the_repository() {
+    let temp = tempfile::tempdir().unwrap();
+    git_ok(temp.path(), &["init", "-q"]);
+    let folder = std::fs::canonicalize(temp.path()).unwrap();
+    let before = named_as(temp.path()).await;
+    assert_eq!(before, sha(&format!("path:{}", folder.to_str().unwrap())));
+    assert_ne!(before, origin_digest(""));
+    // Files that are not committed change nothing.
+    write(temp.path(), "a.txt", "alpha\n");
+    assert_eq!(named_as(temp.path()).await, before);
+    // The first commit gives it the name its history gives.
+    commit_all(temp.path(), "first");
+    let first = git_ok(temp.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(named_as(temp.path()).await, sha(&format!("root:{first}")));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn two_empty_repositories_in_folders_of_one_name_are_two_repositories() {
+    let one = tempfile::tempdir().unwrap();
+    let two = tempfile::tempdir().unwrap();
+    for parent in [&one, &two] {
+        let dir = parent.path().join("app");
+        std::fs::create_dir(&dir).unwrap();
+        git_ok(&dir, &["init", "-q"]);
+    }
+    let first = named_as(&one.path().join("app")).await;
+    let second = named_as(&two.path().join("app")).await;
+    assert_ne!(first, second);
+    assert_eq!(first, named_as(&one.path().join("app")).await);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_odd_folder_name_is_part_of_the_name_as_it_is() {
+    let parent = tempfile::tempdir().unwrap();
+    for name in [
+        "My App, v2",
+        "quote\"and'apostrophe",
+        "ünïcode-日本",
+        "has\nnewline",
+        "a:b;c|d",
+        "-leading-dash",
+        ".dotted",
+        "UPPER Case",
+    ] {
+        let dir = parent.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        git_ok(&dir, &["init", "-q"]);
+        let folder = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(
+            named_as(&dir).await,
+            sha(&format!("path:{}", folder.to_str().unwrap())),
+            "{name:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_folder_is_named_by_the_folder_it_leads_to() {
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    git_ok(&real, &["init", "-q"]);
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let folder = std::fs::canonicalize(&real).unwrap();
+    assert_eq!(
+        named_as(&link).await,
+        sha(&format!("path:{}", folder.to_str().unwrap()))
+    );
+    assert_eq!(named_as(&link).await, named_as(&real).await);
+}

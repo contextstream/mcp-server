@@ -179,7 +179,8 @@ pub struct CheckoutSnapshot {
     pub folder: String,
     /// The repository's folder name, as it is.
     pub repo_name: String,
-    /// [`origin_digest`] of its `origin` URL.
+    /// The SHA-256 that names the repository: of its `origin` URL, else of its first
+    /// commits' ids, else (before the first commit) of its folder path.
     pub origin_sha256: String,
     /// HEAD's tree id ([`EMPTY_TREE`] before the first commit).
     pub base_tree: String,
@@ -276,11 +277,92 @@ fn is_oid(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// The lowercase hex SHA-256 of a repository's trimmed `origin` URL (of the empty
-/// string without one). A digest names the repository without putting a URL,
-/// which may carry credentials, on the wire.
+/// The lowercase hex SHA-256 of a repository's trimmed `origin` URL. A digest
+/// names the repository without putting a URL, which may carry credentials, on
+/// the wire. A repository with no `origin` is named another way (see the
+/// repository's `origin_sha256`).
 pub fn origin_digest(origin: &str) -> String {
     hex::encode(Sha256::digest(origin.trim().as_bytes()))
+}
+
+/// The lowercase hex SHA-256 that names the repository at `repo` (its top folder)
+/// for the service: of its trimmed `origin` URL when it has one, so every copy of
+/// a repository is the same one; with no `origin`, of `root:` and the ids of its
+/// first commits (those without a parent), sorted and joined by `,`, so a copy
+/// that was made without the remote is still the same one; before the first
+/// commit, of `path:` and the folder, symlinks resolved. The same text, hashed the
+/// same way, names the repository for ContextCode, so both share the service's
+/// workspace for it. The URL, the ids and the path stay here; only the digest goes.
+async fn repository_digest(repo: &Path, origin: &str) -> String {
+    let origin = origin.trim();
+    if !origin.is_empty() {
+        return origin_digest(origin);
+    }
+    hex::encode(Sha256::digest(identity_without_origin(repo).await))
+}
+
+/// What names a repository that has no `origin`: see [`repository_digest`].
+async fn identity_without_origin(repo: &Path) -> Vec<u8> {
+    if let Ok(listing) = git(repo, &[], None, &["rev-list", "--max-parents=0", "HEAD"]).await {
+        if let Some(identity) = root_identity(&String::from_utf8_lossy(&listing)) {
+            return identity.into_bytes();
+        }
+    }
+    let resolved = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    path_identity(&resolved)
+}
+
+/// `path:` and the folder, as the system has it.
+fn path_identity(folder: &Path) -> Vec<u8> {
+    let mut identity = b"path:".to_vec();
+    identity.extend(path_bytes(folder));
+    identity
+}
+
+/// `root:` and the ids of `git rev-list --max-parents=0 HEAD`, sorted and joined by
+/// `,`; `None` when it listed none.
+fn root_identity(listing: &str) -> Option<String> {
+    let mut ids: Vec<&str> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+    ids.sort_unstable();
+    Some(format!("root:{}", ids.join(",")))
+}
+
+/// The bytes of a path as the system has them.
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+/// The path as the system's own tools print it.
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    without_verbatim_prefix(&path.to_string_lossy()).into_bytes()
+}
+
+/// A Windows path without the `\\?\` that resolving it adds: `\\?\C:\a` is
+/// `C:\a`, `\\?\UNC\host\share` is `\\host\share`.
+#[cfg(any(not(unix), test))]
+fn without_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    match path.strip_prefix(r"\\?\") {
+        Some(rest)
+            if rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                && rest.as_bytes().get(1) == Some(&b':') =>
+        {
+            rest.to_string()
+        }
+        _ => path.to_string(),
+    }
 }
 
 /// Pathspecs for the untracked folders an installer or a build makes itself.
@@ -568,11 +650,12 @@ impl CheckoutSnapshot {
         } else {
             relative
         };
+        let origin_sha256 = repository_digest(&repo, &origin).await;
         Ok(SnapshotStart {
             root: repo,
             folder: relative,
             repo_name: folder_name,
-            origin_sha256: origin_digest(&origin),
+            origin_sha256,
             limits,
         })
     }

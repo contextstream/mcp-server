@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.70
+
+- Coaching rules: `session(action="add_coached_rule", rule_text="...")` stores a rule you give your agent, in your own words (up to 500 characters; `scope="project"` ties it to one project), and `session(action="list_coached_rules")` lists the rules your agent is coached on, where each came from and where it holds. A `[COACHING]` block in `context()` is kept ahead of general context when the response is trimmed to its budget.
+- `context()` keeps the `[COACHING]` block in its default, condensed answer; it was dropped there before, so a rule you gave your agent reached it only through the editor hook.
+- Hosted tools: a checkout with no `origin` is named to the service by a digest of the ids of its first commits (before its first commit, of its folder path) instead of the digest of the empty string, so repositories without an origin no longer look like one, and a copy made without the remote is still the same repository. Only the digest is sent (see the data-handling doc).
+
 ## 1.0.69
 
 - Hosted tools: the first non-empty line a tool's `--version` prints (standard output, else standard error) is cleaned before it is sent with the description of your environment: any word that looks like a path (it contains a slash or a backslash, or starts with `~`) is left out; your user name, your home folder's name and your computer's name are replaced by `<redacted>` wherever they stand as whole words, in any letter case (names of fewer than three characters are not replaced); spaces are collapsed; and what is left is cut to 200 characters. A tool whose line has nothing left is reported as unknown, and the rest of the description is unchanged. This replaces 1.0.68, which sent the line as the tool printed it. `CONTEXTSTREAM_HOSTED_ENV=off` still sends none of it.

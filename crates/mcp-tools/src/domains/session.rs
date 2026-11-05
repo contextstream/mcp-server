@@ -7366,9 +7366,32 @@ fn condense_context_for_concise(raw: &str) -> String {
     // first line is its title, and "promote replica-… with pg_ctl promote"
     // was dropped as noise (#416).
     let mut memory_line: Option<usize> = None;
+    // The lines of the `<system-reminder>` block being read, tags included.
+    let mut reminder: Option<Vec<String>> = None;
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+
+        // The rules the person taught their agent arrive as a reminder block
+        // whose header is `[COACHING]`: kept whole and where it stands, as a
+        // lesson is. Any other reminder block is dropped, as it always was.
+        if reminder.is_some() {
+            if trimmed == "</system-reminder>" {
+                let mut block = reminder.take().unwrap_or_default();
+                if block.iter().any(|kept| kept.starts_with("[COACHING]")) {
+                    block.push(trimmed.to_string());
+                    out.extend(block);
+                }
+            } else if let Some(block) = reminder.as_mut() {
+                block.push(trimmed.to_string());
+            }
+            continue;
+        }
+        if trimmed == "<system-reminder>" && !in_ctx_block {
+            reminder = Some(vec![trimmed.to_string()]);
+            memory_line = None;
             continue;
         }
 

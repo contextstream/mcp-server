@@ -6628,6 +6628,33 @@ mod typed_item_formatting_tests {
         assert!(kept.chars().count() <= 400, "{}", kept.len());
     }
 
+    /// What `context()` answers by default goes through this view: the rules a
+    /// person taught their agent must be in it, whole and where the API put them.
+    #[test]
+    fn a_coaching_block_survives_the_concise_view_whole_and_in_place() {
+        let input = "<system-reminder>\n[COACHING] You have corrected the agent on these before — do NOT repeat them:\n- When the user will copy text, give it as plain lines. (you corrected this 2×)\n</system-reminder>\n\n[TIME] now_utc=2026-11-05T17:35:32Z\n[PROJECT_ROUTING] status=needs_project_selection\nR:CS-default-context-first\n[CTX]\nW:Personal\n[/CTX]\n";
+        let result = condense_context_for_concise(input);
+        assert_eq!(
+            result,
+            "<system-reminder>\n[COACHING] You have corrected the agent on these before — do NOT repeat them:\n- When the user will copy text, give it as plain lines. (you corrected this 2×)\n</system-reminder>\n[PROJECT_ROUTING] status=needs_project_selection\n[CTX]\nW:Personal\n[/CTX]"
+        );
+    }
+
+    #[test]
+    fn another_system_reminder_is_still_dropped_from_the_concise_view() {
+        let input = "<system-reminder>\n[SOMETHING_ELSE] other notice\nits body\n</system-reminder>\n[PREFERENCE] Use tabs\n";
+        assert_eq!(condense_context_for_concise(input), "[PREFERENCE] Use tabs");
+        // An unclosed block is not carried half-way: it is dropped as before.
+        let open = "[PREFERENCE] Use tabs\n<system-reminder>\n[COACHING] You have corrected the agent\n- a rule";
+        assert_eq!(condense_context_for_concise(open), "[PREFERENCE] Use tabs");
+        // No block, no change.
+        let plain = "[LESSONS_WARNING] Always run tests\nsome noise\n";
+        assert_eq!(
+            condense_context_for_concise(plain),
+            "[LESSONS_WARNING] Always run tests"
+        );
+    }
+
     #[test]
     fn condense_context_also_preserves_preference_tag() {
         let input = "[PREFERENCE] Use dark mode\nrandom line";

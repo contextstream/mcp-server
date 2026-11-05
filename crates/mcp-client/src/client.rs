@@ -14781,6 +14781,77 @@ impl ContextStreamClient {
     }
 
     // =========================================================================
+    // Coaching rules
+    // =========================================================================
+
+    /// The caller's coaching rules, newest first: the ones they added by name
+    /// and the ones learned from their corrections. With a project (given, or
+    /// the session's) it is that project's rules and the workspace-wide ones.
+    /// Endpoint: GET /context/coaching/rules
+    pub async fn list_coached_rules(
+        &self,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        limit: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        let config = self.config.read().await;
+        let (ws_id, proj_id) = scope_ids_with_defaults(workspace_id, project_id, &config);
+        drop(config);
+
+        let mut query_params = vec![];
+        if let Some(id) = ws_id {
+            query_params.push(format!("workspace_id={}", id));
+        }
+        if let Some(id) = proj_id {
+            query_params.push(format!("project_id={}", id));
+        }
+        if let Some(limit) = limit {
+            query_params.push(format!("limit={}", limit));
+        }
+        let path = if query_params.is_empty() {
+            "/context/coaching/rules".to_string()
+        } else {
+            format!("/context/coaching/rules?{}", query_params.join("&"))
+        };
+        self.get::<serde_json::Value>(&path).await
+    }
+
+    /// Add a coaching rule the person states, in their own words. A rule holds
+    /// in every project of the workspace unless `for_project` is set, which
+    /// ties it to `project_id` (else the session's project).
+    /// Endpoint: POST /context/coaching/rules
+    pub async fn add_coached_rule(
+        &self,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        for_project: bool,
+        rule_text: &str,
+    ) -> Result<serde_json::Value> {
+        let config = self.config.read().await;
+        let ws_id = workspace_id_with_default(workspace_id, &config);
+        let proj_id = if for_project {
+            let proj_id = project_id_with_default(workspace_id, project_id, &config);
+            if proj_id.is_none() {
+                return Err(Error::Validation(
+                    "scope=project needs a project: pass project_id, or leave scope out for a rule that holds in every project of the workspace".to_string(),
+                ));
+            }
+            proj_id
+        } else {
+            None
+        };
+        drop(config);
+
+        let body = strip_nulls(serde_json::json!({
+            "workspace_id": ws_id,
+            "project_id": proj_id,
+            "rule_text": rule_text,
+        }));
+        self.post::<serde_json::Value, _>("/context/coaching/rules", &body)
+            .await
+    }
+
+    // =========================================================================
     // Memory
     // =========================================================================
 
@@ -18321,7 +18392,7 @@ impl ContextStreamClient {
             serde_json::json!({"name":"search","category":"search","description":"Search indexed source code with keyword, semantic, pattern, refactor, and exhaustive modes.","key_parameters":["query","mode","project_id","workspace_id","include_content"],"example":"search(query=\"AuthService\", mode=\"refactor\", output_format=\"paths\")"}),
             serde_json::json!({"name":"answer","category":"ai","description":"Ask a natural-language question across authorized ContextStream knowledge with current-truth, evidence, freshness, and coverage metadata.","actions":["query","recent_changes"],"key_parameters":["action","question","workspace_ids","project_ids","visibility","timezone"],"example":"answer(action=\"recent_changes\", question=\"What changed recently?\")"}),
             serde_json::json!({"name":"instruct","category":"session","description":"Read and acknowledge session-scoped injected instructions.","actions":["get","ack"],"key_parameters":["action","session_id","ids"],"example":"instruct(action=\"get\", session_id=\"session-123\")"}),
-            serde_json::json!({"name":"session","category":"session","description":"Ground, capture, recall, and restore durable session context; manage lessons and plans; access Daily Recaps.","actions":["capture","retro_capture","capture_lesson","get_lessons","update_lesson","delete_lesson","recall","ground","set_account_mode","remember","user_context","summary","compress","delta","smart_search","decision_trace","restore_context","resume_list","resume","capture_plan","get_plan","update_plan","list_plans","list_recaps","trigger_recap","list_suggested_rules","suggested_rule_action","suggested_rules_stats"],"key_parameters":["action","workspace_id","project_id","session_id"],"example":"session(action=\"ground\", user_message=\"continue the refactor\")"}),
+            serde_json::json!({"name":"session","category":"session","description":"Ground, capture, recall, and restore durable session context; manage lessons and plans; access Daily Recaps.","actions":["capture","retro_capture","capture_lesson","get_lessons","update_lesson","delete_lesson","recall","ground","set_account_mode","remember","user_context","summary","compress","delta","smart_search","decision_trace","restore_context","resume_list","resume","capture_plan","get_plan","update_plan","list_plans","list_recaps","trigger_recap","list_suggested_rules","suggested_rule_action","suggested_rules_stats","list_coached_rules","add_coached_rule"],"key_parameters":["action","workspace_id","project_id","session_id"],"example":"session(action=\"ground\", user_message=\"continue the refactor\")"}),
             serde_json::json!({"name":"memory","category":"memory","description":"Manage durable nodes, events, tasks, todos, docs, diagrams, and transcripts.","key_parameters":["action","workspace_id","project_id"],"example":"memory(action=\"list_docs\", doc_type=\"runbook\")"}),
             serde_json::json!({"name":"graph","category":"graph","description":"Inspect dependencies, impact, code health, complexity, cycles, and unused code.","key_parameters":["action","project_id","target_type","target_id"],"example":"graph(action=\"circular_dependencies\", project_id=\"<uuid>\")"}),
             serde_json::json!({"name":"project","category":"project","description":"List, inspect, create, index, and manage projects.","key_parameters":["action","project_id","folder_path"],"example":"project(action=\"index_status\")"}),

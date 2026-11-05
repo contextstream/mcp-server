@@ -938,6 +938,10 @@ M:request metrics 403 handling details
     fn grounding_and_checkout_proof_outrank_wire_accounting() {
         assert_eq!(context_wire_text_priority("[GROUNDING] verified"), Some(3));
         assert_eq!(
+            context_wire_text_priority("[COACHING] You have corrected the agent on these before"),
+            Some(3)
+        );
+        assert_eq!(
             context_wire_text_priority("[CHECKOUT_SCOPE] verify upstream"),
             Some(3)
         );
@@ -968,6 +972,31 @@ M:request metrics 403 handling details
             estimated_context_tool_wire_tokens(&text, &structured)
                 <= 120 + CONTEXT_WIRE_ENVELOPE_TOKENS
         );
+    }
+
+    #[test]
+    fn coaching_rules_stay_whole_while_the_budget_shrinks_the_context_pack() {
+        let coaching = "<system-reminder>\n[COACHING] You have corrected the agent on these before — do NOT repeat them:\n- Quote the [path] when you run it\n- Give copyable text as plain lines\n</system-reminder>";
+        let text = format!(
+            "[CTX]\n{}[/CTX]\n{coaching}\n[SEARCH] {}",
+            "repository context and implementation detail\n".repeat(400),
+            "search reminder ".repeat(200),
+        );
+        let (text, _structured) = budget_context_wire_payload(text, json!({}), 300);
+
+        assert!(
+            text.contains("[COACHING] You have corrected the agent"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Quote the [path] when you run it"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Give copyable text as plain lines"),
+            "{text}"
+        );
+        assert!(!text.contains("search reminder search reminder"), "{text}");
     }
 
     #[test]
@@ -1669,10 +1698,10 @@ mod project_routing_tests {
         context_warm_request_identity, decode_distributed_context_cache_envelope,
         distributed_context_cache_scope, encode_distributed_context_cache_envelope,
         format_delta_summary, format_project_routing_notice,
-        format_project_routing_notice_from_value, warm_cache_get, warm_cache_note_delta_emit,
-        warm_cache_put, WarmCacheKey, WarmContextCache, WARM_CONTEXT_CACHE_ENTRY_CAP,
-        WARM_CONTEXT_CACHE_MESSAGE_BYTE_CAP, WARM_CONTEXT_CACHE_PER_CALLER_ENTRY_CAP,
-        WARM_CONTEXT_CACHE_TOTAL_BYTE_CAP,
+        format_project_routing_notice_from_value, warm_cache_forget_caller, warm_cache_get,
+        warm_cache_note_delta_emit, warm_cache_put, WarmCacheKey, WarmContextCache,
+        WARM_CONTEXT_CACHE_ENTRY_CAP, WARM_CONTEXT_CACHE_MESSAGE_BYTE_CAP,
+        WARM_CONTEXT_CACHE_PER_CALLER_ENTRY_CAP, WARM_CONTEXT_CACHE_TOTAL_BYTE_CAP,
     };
     use mcp_types::api::{ContextResponse, ProjectRoutingCandidate, ProjectRoutingContext};
     use serde_json::json;
@@ -1955,6 +1984,49 @@ mod project_routing_tests {
             "the search pagination bug is still returning duplicate items",
         )
         .is_none());
+    }
+
+    #[test]
+    fn forgetting_a_caller_empties_only_its_warm_context_entries() {
+        let workspace_id = Uuid::parse_str("88888888-8888-4888-8888-888888888888").unwrap();
+        let project_id = Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        let mut response: ContextResponse =
+            serde_json::from_value(json!({})).expect("empty ContextResponse");
+        let mut confirmed = routing("confirmed");
+        confirmed.current_project_id = Some(project_id); // quiet routing, so put stores
+        response.project_routing = Some(confirmed);
+        let request_identity = request_identity(Some("gb:v1:forget"));
+        let message = "keep the coaching rule in the next full answer";
+
+        for caller in ["forget-user-a", "forget-user-b"] {
+            warm_cache_put(
+                Some(workspace_id),
+                Some(project_id),
+                caller,
+                &request_identity,
+                message,
+                &response,
+                "[CTX] warm",
+            );
+        }
+        warm_cache_forget_caller("forget-user-a");
+
+        assert!(warm_cache_get(
+            Some(workspace_id),
+            Some(project_id),
+            "forget-user-a",
+            &request_identity,
+            message
+        )
+        .is_none());
+        assert!(warm_cache_get(
+            Some(workspace_id),
+            Some(project_id),
+            "forget-user-b",
+            &request_identity,
+            message
+        )
+        .is_some());
     }
 
     #[test]
@@ -3826,6 +3898,8 @@ mod schema_tests {
                 assert!(values.contains(&"list_suggested_rules"));
                 assert!(values.contains(&"suggested_rule_action"));
                 assert!(values.contains(&"suggested_rules_stats"));
+                assert!(values.contains(&"list_coached_rules"));
+                assert!(values.contains(&"add_coached_rule"));
             }
         }
 

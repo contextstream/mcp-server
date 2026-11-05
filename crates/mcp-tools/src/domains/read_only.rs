@@ -126,6 +126,7 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
             "list_plans",
             "list_suggested_rules",
             "suggested_rules_stats",
+            "list_coached_rules",
         ],
     },
 ];

@@ -364,6 +364,8 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "resume": "Loading resume card",
             "list_suggested_rules": "Listing suggested ContextStream rules",
             "suggested_rules_stats": "Loading ContextStream rule stats",
+            "list_coached_rules": "Listing ContextStream coaching rules",
+            "add_coached_rule": "Saving coaching rule to ContextStream",
             "user_context": "Loading ContextStream user context",
             "remember_user": "Saving user context to ContextStream"
         });
@@ -3497,7 +3499,7 @@ mod tests {
             // alternatives, scope, confidence, supersedes) plus the
             // `supersede_lesson` action value. Additive only.
             "session",
-            "22e134c49bdd7d3f63f01e197bc9373f101bf8e12dbfd971a73c31e829b8f223",
+            "59e16ae4e5764294d3d60cccf017996e3f3dcfea62dbb38bf4b3b4eda2af0db1",
         ),
         (
             "session_capture",
@@ -3509,7 +3511,7 @@ mod tests {
         ),
         (
             "session_read",
-            "4ab66baa7145e4c203542ba4656feb79d70934cb53210f476cac1fe1c8725c05",
+            "f1a5d49e80171b683738f5bc40cb1b2feb939869ad5d52a965e238ae0b4689e5",
         ),
         (
             "session_remember",

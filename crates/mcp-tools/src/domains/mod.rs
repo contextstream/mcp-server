@@ -44,6 +44,8 @@ pub mod workspace;
 pub mod workspace_drift;
 
 #[cfg(test)]
+mod coached_rules_tests;
+#[cfg(test)]
 mod parity_eval_tests;
 #[cfg(test)]
 mod reference_resolution_tests;

@@ -4310,6 +4310,19 @@ impl WarmContextCache {
         Some(removed)
     }
 
+    /// Drop every entry of one caller.
+    fn remove_caller(&mut self, caller_identity: &str) {
+        let keys = self
+            .entries
+            .keys()
+            .filter(|key| key.caller_identity == caller_identity)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
     fn prune_expired(&mut self) {
         let expired = self
             .entries
@@ -4478,6 +4491,15 @@ fn warm_cache_put(
     }
 }
 
+/// Forget a caller's warm context entries, so that its next `context()` is a
+/// full answer. A delta summary says nothing changed since the last full one,
+/// which stops being true once the caller added a coaching rule.
+fn warm_cache_forget_caller(caller_identity: &str) {
+    if let Ok(mut cache) = warm_cache().lock() {
+        cache.remove_caller(caller_identity);
+    }
+}
+
 /// Increment the delta-emit counter for the current warm cache entry.
 /// Called after a delta-only turn, so we can force a full re-emit after
 /// MAX_CONSECUTIVE_DELTAS turns.
@@ -4632,6 +4654,8 @@ fn context_wire_text_priority(line: &str) -> Option<u8> {
         || upper.contains("[CONTEXT_PRESSURE]")
         || upper.contains("[CHECKOUT_SCOPE]")
         || upper.contains("[GROUNDING]")
+        // The rules the person taught: as binding as a lesson or a preference.
+        || upper.contains("[COACHING]")
         || upper.contains("[CRIT]")
         || upper.contains("[HIGH]")
     {
@@ -6070,6 +6094,110 @@ pub(crate) fn render_suggested_rules_stats(result: &Value) -> String {
     );
     if let Some(message) = suggested_rules_message(result) {
         text.push_str(&format!("\n[PARTIAL] suggested rules: {message}"));
+    }
+    text
+}
+
+/// What `scope` asks of `add_coached_rule`: `false` (left out, or `workspace`)
+/// is a rule that holds in every project of the workspace, `true` (`project`)
+/// a rule for one project.
+fn coached_rule_for_project(scope: Option<&str>) -> Result<bool> {
+    match scope
+        .map(|scope| scope.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("") | Some("workspace") => Ok(false),
+        Some("project") => Ok(true),
+        Some(_) => Err(Error::Validation(
+            "scope must be \"workspace\" (the default: the rule holds in every project) or \"project\" (one project only)"
+                .to_string(),
+        )),
+    }
+}
+
+/// A workspace or project id given to a coaching-rule action: a UUID, or nothing.
+fn coached_rule_scope_id(raw: Option<&str>, name: &str) -> Result<Option<Uuid>> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => Uuid::parse_str(value)
+            .map(Some)
+            .map_err(|_| Error::Validation(format!("{name} must be a UUID"))),
+    }
+}
+
+/// One `[COACHING_RULE]` line: where the rule came from, where it holds, how
+/// often it was said, its id and the rule. The stored text goes through
+/// `one_line`, so it cannot start a line of its own.
+fn coached_rule_line(rule: &Value) -> String {
+    let text_field = |key: &str| {
+        rule.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let mut line = format!(
+        "[COACHING_RULE] source={} scope={}",
+        text_field("source").map_or_else(|| "unknown".to_string(), one_line),
+        text_field("scope").map_or_else(|| "unknown".to_string(), one_line),
+    );
+    if let Some(project_id) = text_field("project_id") {
+        line.push_str(&format!(" project_id={}", one_line(project_id)));
+    }
+    if let Some(times) = rule.get("times_corrected").and_then(Value::as_i64) {
+        line.push_str(&format!(" said={times}x"));
+    }
+    line.push_str(&format!(
+        " id={} — {}",
+        text_field("id").map_or_else(|| "unknown".to_string(), one_line),
+        text_field("rule_text").map_or_else(|| "(no text)".to_string(), one_line),
+    ));
+    line
+}
+
+/// Typed lines for `session(action="list_coached_rules")`.
+pub(crate) fn render_coached_rules_list(result: &Value) -> String {
+    let rules: Vec<&Value> = result
+        .get("rules")
+        .and_then(Value::as_array)
+        .map(|rules| rules.iter().collect())
+        .unwrap_or_default();
+    if rules.is_empty() {
+        return "[COACHING_RULES] none yet. Add one with session(action=\"add_coached_rule\", rule_text=\"...\")."
+            .to_string();
+    }
+    let mut text = format!(
+        "[COACHING_RULES] {} rule(s), newest first. They shape the [COACHING] block context() carries; add one with session(action=\"add_coached_rule\", rule_text=\"...\").",
+        rules.len()
+    );
+    for rule in rules {
+        text.push('\n');
+        text.push_str(&coached_rule_line(rule));
+    }
+    text
+}
+
+/// Typed lines for `session(action="add_coached_rule")`.
+pub(crate) fn render_coached_rule_added(result: &Value) -> String {
+    let Some(rule) = result.get("rule").filter(|rule| rule.is_object()) else {
+        return "[COACHING_RULES] the API's answer named no rule; check with session(action=\"list_coached_rules\")."
+            .to_string();
+    };
+    let created = result
+        .get("created")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut text = if created {
+        "[COACHING_RULES] added. context() and the prompt hook carry your coaching rules in their [COACHING] block."
+            .to_string()
+    } else {
+        "[COACHING_RULES] already held: kept, and counted as said again.".to_string()
+    };
+    text.push('\n');
+    text.push_str(&coached_rule_line(rule));
+    if rule.get("scope").and_then(Value::as_str) == Some("workspace") {
+        text.push_str(
+            "\nIt holds in every project of the workspace; scope=\"project\" limits a rule to one project.",
+        );
     }
     text
 }
@@ -17221,6 +17349,9 @@ pub struct SessionInput {
     pub modified_instruction: Option<String>,
     pub modified_keywords: Option<Vec<String>>,
     pub min_confidence: Option<f64>,
+    /// For `add_coached_rule`: the rule, in the person's own words.
+    #[serde(default)]
+    pub rule_text: Option<String>,
     pub is_personal: Option<bool>,
     /// Execution mode override or `set_account_mode` target: team|personal|auto.
     pub account_mode: Option<String>,
@@ -17252,7 +17383,7 @@ const SESSION_TOOL_DESCRIPTION: &str = "Session and memory management — NOT fo
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const SESSION_TOOL_REFERENCE: &str = "Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). Lesson maintenance is supported via action='update_lesson' and action='supersede_lesson' (to delete one: the `delete` tool, action=\"session.delete_lesson\") with lesson_id (UUID or title; delete and supersede need a UUID or the exact title); lessons go to the typed /lessons endpoints first and fall back to memory events only when the server answers 404 (stated with a [PARTIAL] line). DECISIONS: action='capture' with event_type='decision' plus rationale/alternatives/scope/confidence routes to the typed decision create (same as memory(action=\"create_decision\")). PAST SESSIONS LIVE HERE: transcripts of every prior session are captured + indexed and are queryable. `context()` auto-surfaces `[GROUNDING]` prior-work hits; when that grounding is fresh, relevant, and sufficient, do not immediately call action='recall' for the same request. Call action='recall' as the first explicit escalation when `[GROUNDING]` is absent, thin, stale, off-topic, or when the user explicitly requests broader or session-specific history. For after-the-fact durable saves, use action='retro_capture' with title plus content and/or query/transcript_id; it stores the capture rationale, source query, transcript IDs, and source snippets in provenance. Use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills + git) outside context(). Also `memory(action=\"list_transcripts\"|\"search_transcripts\"|\"get_transcript\")` for chronological + full-text access. Save a session_snapshot at turning points so the NEXT session can pick up: action='capture', event_type='session_snapshot'. To pick up earlier work call action='resume' (most recent earlier session; resume_id picks another) or action='resume_list' (recent sessions, newest first), always with session_id set to the id init returned, so your own session is left out. Daily Recaps run around 23:00 in the user's timezone, not at MCP session boundaries; use list_recaps for timestamped history and trigger_recap for a manual asynchronous run. Team/personal mode: action='set_account_mode' with account_mode=team|personal|auto. Actions: capture, retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons, update_lesson, supersede_lesson, recall (retrieve past conversation context when auto-grounding is insufficient), ground (one-shot prior-work bundle — requires user_message or query), remember, user_context, summary, compress, delta, smart_search (searches MEMORY/conversation history only, not code), decision_trace, list_recaps, trigger_recap, restore_context, resume_list (recent sessions, newest first; pass session_id), resume (one session's saved state and newest messages; resume_id picks one, default latest; pass session_id), set_account_mode. Plan actions: capture_plan, get_plan, update_plan, list_plans. Use capture_plan for plans; do not use action='capture' with event_type='plan'. capture_plan requires structured steps and creates linked tasks by default with plan_id and plan_step_id. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats.";
+const SESSION_TOOL_REFERENCE: &str = "Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). Lesson maintenance is supported via action='update_lesson' and action='supersede_lesson' (to delete one: the `delete` tool, action=\"session.delete_lesson\") with lesson_id (UUID or title; delete and supersede need a UUID or the exact title); lessons go to the typed /lessons endpoints first and fall back to memory events only when the server answers 404 (stated with a [PARTIAL] line). DECISIONS: action='capture' with event_type='decision' plus rationale/alternatives/scope/confidence routes to the typed decision create (same as memory(action=\"create_decision\")). PAST SESSIONS LIVE HERE: transcripts of every prior session are captured + indexed and are queryable. `context()` auto-surfaces `[GROUNDING]` prior-work hits; when that grounding is fresh, relevant, and sufficient, do not immediately call action='recall' for the same request. Call action='recall' as the first explicit escalation when `[GROUNDING]` is absent, thin, stale, off-topic, or when the user explicitly requests broader or session-specific history. For after-the-fact durable saves, use action='retro_capture' with title plus content and/or query/transcript_id; it stores the capture rationale, source query, transcript IDs, and source snippets in provenance. Use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills + git) outside context(). Also `memory(action=\"list_transcripts\"|\"search_transcripts\"|\"get_transcript\")` for chronological + full-text access. Save a session_snapshot at turning points so the NEXT session can pick up: action='capture', event_type='session_snapshot'. To pick up earlier work call action='resume' (most recent earlier session; resume_id picks another) or action='resume_list' (recent sessions, newest first), always with session_id set to the id init returned, so your own session is left out. Daily Recaps run around 23:00 in the user's timezone, not at MCP session boundaries; use list_recaps for timestamped history and trigger_recap for a manual asynchronous run. Team/personal mode: action='set_account_mode' with account_mode=team|personal|auto. Actions: capture, retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons, update_lesson, supersede_lesson, recall (retrieve past conversation context when auto-grounding is insufficient), ground (one-shot prior-work bundle — requires user_message or query), remember, user_context, summary, compress, delta, smart_search (searches MEMORY/conversation history only, not code), decision_trace, list_recaps, trigger_recap, restore_context, resume_list (recent sessions, newest first; pass session_id), resume (one session's saved state and newest messages; resume_id picks one, default latest; pass session_id), set_account_mode. Plan actions: capture_plan, get_plan, update_plan, list_plans. Use capture_plan for plans; do not use action='capture' with event_type='plan'. capture_plan requires structured steps and creates linked tasks by default with plan_id and plan_step_id. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Coaching rules (standing instructions the person gives you; they appear in the [COACHING] block of `context()` and of the prompt hook): add_coached_rule with rule_text (one instruction in the person's own words, up to 500 characters; holds in every project of the workspace, or in one project with scope='project'; the same rule said again is kept once), list_coached_rules (the person's rules, learned ones included, with source and scope).";
 
 #[async_trait]
 impl ToolHandler for SessionTool {
@@ -18283,8 +18414,51 @@ impl ToolHandler for SessionTool {
                     result,
                 ))
             }
+            "list_coached_rules" => {
+                let workspace_id =
+                    coached_rule_scope_id(input.workspace_id.as_deref(), "workspace_id")?;
+                let project_id = coached_rule_scope_id(input.project_id.as_deref(), "project_id")?;
+                let result = self
+                    .client
+                    .list_coached_rules(workspace_id, project_id, input.limit)
+                    .await?;
+                Ok(ToolResult::with_structured(
+                    render_coached_rules_list(&result),
+                    result,
+                ))
+            }
+            "add_coached_rule" => {
+                let rule_text = input
+                    .rule_text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| {
+                        Error::Validation(
+                            "rule_text is required: the rule, in the person's own words"
+                                .to_string(),
+                        )
+                    })?;
+                let for_project = coached_rule_for_project(input.scope.as_deref())?;
+                let workspace_id =
+                    coached_rule_scope_id(input.workspace_id.as_deref(), "workspace_id")?;
+                let project_id = coached_rule_scope_id(input.project_id.as_deref(), "project_id")?;
+                let result = self
+                    .client
+                    .add_coached_rule(workspace_id, project_id, for_project, rule_text)
+                    .await?;
+                if let Some(identity) =
+                    super::atlas_warm_cache::current_caller_cache_scope().cache_identity()
+                {
+                    warm_cache_forget_caller(identity);
+                }
+                Ok(ToolResult::with_structured(
+                    render_coached_rule_added(&result),
+                    result,
+                ))
+            }
             _ => Err(Error::Validation(format!(
-                "Unknown action: {}. Use 'capture', 'retro_capture', 'capture_lesson', 'get_lessons', 'update_lesson', 'delete_lesson', 'supersede_lesson', 'recall', 'ground', 'set_account_mode', 'remember', 'user_context', 'summary', 'compress', 'delta', 'smart_search', 'decision_trace', 'list_recaps', 'trigger_recap', 'restore_context', 'resume_list', 'resume', 'capture_plan', 'get_plan', 'update_plan', 'list_plans', 'list_suggested_rules', 'suggested_rule_action', or 'suggested_rules_stats'.",
+                "Unknown action: {}. Use 'capture', 'retro_capture', 'capture_lesson', 'get_lessons', 'update_lesson', 'delete_lesson', 'supersede_lesson', 'recall', 'ground', 'set_account_mode', 'remember', 'user_context', 'summary', 'compress', 'delta', 'smart_search', 'decision_trace', 'list_recaps', 'trigger_recap', 'restore_context', 'resume_list', 'resume', 'capture_plan', 'get_plan', 'update_plan', 'list_plans', 'list_suggested_rules', 'suggested_rule_action', 'suggested_rules_stats', 'list_coached_rules', or 'add_coached_rule'.",
                 input.action
             ))),
         }
@@ -18339,6 +18513,8 @@ impl ToolHandler for SessionTool {
                     "list_suggested_rules",
                     "suggested_rule_action",
                     "suggested_rules_stats",
+                    "list_coached_rules",
+                    "add_coached_rule",
                 ],
                 true,
             )
@@ -18455,7 +18631,7 @@ impl ToolHandler for SessionTool {
             )
             .string(
                 "scope",
-                "Scope of a decision (capture with event_type=decision). For resume_list and resume: project (default when a project is known) or workspace.",
+                "Scope of a decision (capture with event_type=decision). For resume_list and resume: project (default when a project is known) or workspace. For add_coached_rule: workspace (default: every project) or project (needs project_id).",
                 false,
             )
             .number(
@@ -18606,6 +18782,11 @@ impl ToolHandler for SessionTool {
             .number(
                 "min_confidence",
                 "Minimum confidence threshold (for list_suggested_rules)",
+                false,
+            )
+            .string(
+                "rule_text",
+                "The coaching rule, one standing instruction in the person's own words, up to 500 characters (for add_coached_rule)",
                 false,
             )
             .build()

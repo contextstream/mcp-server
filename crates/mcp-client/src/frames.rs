@@ -199,13 +199,28 @@ fn has_login_in_url(value: &str) -> bool {
     })
 }
 
+/// How the caller takes what a call produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// The service makes the tool's result itself and sends no output as it
+    /// goes (`tool_result`).
+    ToolResult,
+    /// The caller takes the output when the call ends, so the service may hold
+    /// it until it has decided the result (`buffered`).
+    Buffered,
+    /// The caller shows output as it arrives.
+    Streamed,
+}
+
 /// The `hello` for a call: what the API decided (`request`), what the
-/// checkout is (`fields`), and the forwarded variables. Nothing else.
+/// checkout is (`fields`), the forwarded variables, and how the caller takes
+/// the output. Nothing else; the local environment is added by
+/// [`with_environment`].
 pub fn hello(
     request: &Value,
     fields: Map<String, Value>,
     env: Map<String, Value>,
-    tool_result: bool,
+    delivery: Delivery,
 ) -> Result<Value, String> {
     let text = |key: &str| {
         request
@@ -236,10 +251,25 @@ pub fn hello(
         hello.insert(key, value);
     }
     hello.insert("env".into(), Value::Object(env));
-    if tool_result {
-        hello.insert("tool_result".into(), json!(true));
+    match delivery {
+        Delivery::ToolResult => {
+            hello.insert("tool_result".into(), json!(true));
+        }
+        Delivery::Buffered => {
+            hello.insert("buffered".into(), json!(true));
+        }
+        Delivery::Streamed => {}
     }
     Ok(Value::Object(hello))
+}
+
+/// `hello` with the description of the local environment
+/// ([`crate::environment::describe`]) added as `environment`.
+pub fn with_environment(mut hello: Value, environment: Option<Value>) -> Value {
+    if let (Some(environment), Some(fields)) = (environment, hello.as_object_mut()) {
+        fields.insert("environment".into(), environment);
+    }
+    hello
 }
 
 /// How long a call may take, as its request declares it.

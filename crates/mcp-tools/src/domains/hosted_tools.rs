@@ -28,7 +28,8 @@ use crate::domains::slipstream::listing_workspace;
 use crate::peer;
 use mcp_client::checkout_snapshot::{CheckoutSnapshot, SnapshotError};
 use mcp_client::command_hints::{self, CachedTool, Hints};
-use mcp_client::frames::{self, Event, ExchangeError};
+use mcp_client::environment;
+use mcp_client::frames::{self, Delivery, Event, ExchangeError};
 use mcp_client::hosted_tools::HostedToolsAnswer;
 use mcp_client::ContextStreamClient;
 use mcp_session::SessionManager;
@@ -762,27 +763,32 @@ pub fn stream_call(data: &Value) -> Result<StreamCall<'_>, String> {
 /// Run the call on its stream: open it, send the checkout, answer what the
 /// service asks of it, and return the service's `result` frame. What the
 /// service sends meanwhile goes to `events`. `tool_result` asks the service to
-/// make the tool's result itself (it then sends no output as it goes). The
-/// error is why the call was not run there, in words for the caller.
+/// make the tool's result itself (it then sends no output as it goes) and
+/// `buffered` that the caller takes the output at the end (see [`Delivery`]).
+/// The service is also told about the local environment while the stream is
+/// opened ([`environment::describe`]). The error is why the call was not run
+/// there, in words for the caller.
 pub async fn drive_stream(
     call: &StreamCall<'_>,
     snapshot: &CheckoutSnapshot,
-    tool_result: bool,
+    delivery: Delivery,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
 ) -> Result<Value, String> {
     if call.protocol != Some(frames::PROTOCOL) {
         return Err("its stream is of a kind this client does not know".to_string());
     }
     let env = frames::forwarded_env(call.request, |variable| std::env::var(variable).ok());
-    let hello = frames::hello(call.request, snapshot.request_fields(), env, tool_result)?;
+    let hello = frames::hello(call.request, snapshot.request_fields(), env, delivery)?;
     let deadline = frames::deadline_of(call.request);
     let outcome = async {
-        let (socket, pack) = tokio::join!(
+        let (socket, pack, environment) = tokio::join!(
             frames::connect(call.url, call.token),
-            snapshot.initial_pack()
+            snapshot.initial_pack(),
+            environment::describe(call.request, &snapshot.root)
         );
         let socket = socket?;
         let pack = pack.map_err(|e| ExchangeError::Snapshot(e.to_string()))?;
+        let hello = frames::with_environment(hello, environment);
         frames::exchange_with_pack(socket, &hello, pack, snapshot, deadline, events).await
     }
     .await;
@@ -821,7 +827,10 @@ async fn run_stream(name: &str, data: &Value, snapshot: Option<&CheckoutSnapshot
             }
         }
     };
-    let (outcome, ()) = tokio::join!(drive_stream(&call, snapshot, true, events), pump);
+    let (outcome, ()) = tokio::join!(
+        drive_stream(&call, snapshot, Delivery::ToolResult, events),
+        pump
+    );
     match outcome {
         Ok(frame) => interpret(name, call.command, call.cwd, &frame),
         Err(reason) => Streamed::NotRun(not_run(name, call.command, call.cwd, &reason)),

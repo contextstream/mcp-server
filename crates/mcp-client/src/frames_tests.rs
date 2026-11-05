@@ -127,7 +127,13 @@ async fn pair() -> (WebSocketStream<DuplexStream>, Worker) {
 }
 
 async fn hello_for(snapshot: &CheckoutSnapshot) -> Value {
-    hello(&request(), snapshot.request_fields(), Map::new(), true).unwrap()
+    hello(
+        &request(),
+        snapshot.request_fields(),
+        Map::new(),
+        Delivery::ToolResult,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -175,13 +181,27 @@ fn a_stream_is_wss_or_this_machine() {
 }
 
 #[test]
+fn the_environment_is_added_to_a_hello_when_there_is_one() {
+    let base = hello(&request(), Map::new(), Map::new(), Delivery::Buffered).unwrap();
+    let environment = json!({"platform": {"os": "linux", "arch": "x86_64"}, "versions": {}});
+    let with = with_environment(base.clone(), Some(environment.clone()));
+    assert_eq!(with["environment"], environment);
+    assert_eq!(with["buffered"], true);
+    let mut without_it = with.clone();
+    without_it.as_object_mut().unwrap().remove("environment");
+    assert_eq!(without_it, base);
+    // Switched off: the hello is what it was.
+    assert_eq!(with_environment(base.clone(), None), base);
+}
+
+#[test]
 fn the_hello_holds_what_the_api_decided_and_nothing_it_did_not() {
     let mut fields = Map::new();
     fields.insert("base_tree".into(), json!("b"));
     fields.insert("target_tree".into(), json!("t"));
     let mut env = Map::new();
     env.insert("TZ".into(), json!("UTC"));
-    let hello = hello(&request(), fields, env, true).unwrap();
+    let hello = hello(&request(), fields, env, Delivery::ToolResult).unwrap();
     assert_eq!(
         hello,
         json!({
@@ -190,18 +210,25 @@ fn the_hello_holds_what_the_api_decided_and_nothing_it_did_not() {
             "base_tree": "b", "target_tree": "t", "env": {"TZ": "UTC"}, "tool_result": true,
         })
     );
-    let without = super::hello(&request(), Map::new(), Map::new(), false).unwrap();
+    let without = super::hello(&request(), Map::new(), Map::new(), Delivery::Streamed).unwrap();
     assert!(without.get("tool_result").is_none());
+    assert!(without.get("buffered").is_none());
+    // A caller that takes the output at the end says so, and a service-made
+    // result is never also called buffered.
+    let buffered = super::hello(&request(), Map::new(), Map::new(), Delivery::Buffered).unwrap();
+    assert_eq!(buffered["buffered"], true);
+    assert!(buffered.get("tool_result").is_none());
+    assert!(hello.get("buffered").is_none());
     for missing in ["id", "repo_key", "command", "timeout_s", "wait_s"] {
         let mut request = request();
         request.as_object_mut().unwrap().remove(missing);
-        let error = super::hello(&request, Map::new(), Map::new(), false).unwrap_err();
+        let error = super::hello(&request, Map::new(), Map::new(), Delivery::Streamed).unwrap_err();
         assert!(error.contains(missing), "{error}");
     }
     // A cwd the API leaves out is the root of the repository.
     let mut request = request();
     request.as_object_mut().unwrap().remove("cwd");
-    let root = super::hello(&request, Map::new(), Map::new(), false).unwrap();
+    let root = super::hello(&request, Map::new(), Map::new(), Delivery::Streamed).unwrap();
     assert_eq!(root["cwd"], "");
 }
 

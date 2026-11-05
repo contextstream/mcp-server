@@ -14,7 +14,7 @@ use std::io::Write;
 use std::path::Path;
 
 use mcp_client::command_hints::{self, CachedTool};
-use mcp_client::frames::Event;
+use mcp_client::frames::{Delivery, Event};
 use mcp_client::ContextStreamClient;
 use mcp_session::SessionManager;
 use mcp_tools::domains::hosted_tools::{
@@ -143,7 +143,10 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
         }
         wrote
     };
-    let (outcome, wrote) = tokio::join!(drive_stream(&call, &snapshot, false, events), writer);
+    let (outcome, wrote) = tokio::join!(
+        drive_stream(&call, &snapshot, Delivery::Buffered, events),
+        writer
+    );
     match outcome {
         Ok(frame) if frame.get("ran").and_then(Value::as_bool) == Some(true) => {
             eprintln!("{}", ran_line(&frame));

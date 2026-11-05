@@ -1047,7 +1047,9 @@ async fn a_run_without_a_made_result_streams_its_output_and_ends_with_its_status
     assert_eq!((call.command, call.cwd), ("run the thing", "pkg"));
 
     let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
-    let frame = drive_stream(&call, &snapshot, false, events).await.unwrap();
+    let frame = drive_stream(&call, &snapshot, Delivery::Streamed, events)
+        .await
+        .unwrap();
     assert_eq!(
         (frame["ran"].clone(), frame["exit"].clone()),
         (json!(true), json!(3))
@@ -1067,6 +1069,55 @@ async fn a_run_without_a_made_result_streams_its_output_and_ends_with_its_status
         "{:?}",
         sockets[0].hello
     );
+}
+
+#[tokio::test]
+async fn the_hello_names_how_the_output_is_taken_and_describes_the_environment() {
+    let (ws_url, sockets) = frames_service(vec![Step::Json(
+        json!({"type": "result", "ran": true, "exit": 0}),
+    )])
+    .await;
+    let mut answer = stream_answer(&ws_url, "frames/1");
+    // Names the API lists are asked about; anything that is not a name is not.
+    answer["stream"]["request"]["versions"] =
+        json!(["no-such-tool-4f2c1", "Not A Name", "no-such-tool-4f2c1"]);
+    let (url, _) = stream_api(answer).await;
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let pending = begin_snapshot(&session, &tool).await.unwrap().unwrap();
+    let data = call_api(
+        &client,
+        &session,
+        &tool,
+        &json!({"command": "run the thing"}),
+        Some(pending.identity.clone()),
+    )
+    .await
+    .unwrap();
+    let snapshot = pending.finish(&tool.name).await.unwrap();
+    let call = stream_call(&data).unwrap();
+    let (events, _inbox) = tokio::sync::mpsc::unbounded_channel();
+    drive_stream(&call, &snapshot, Delivery::Buffered, events)
+        .await
+        .unwrap();
+
+    let sockets = sockets.lock().unwrap().clone();
+    assert_eq!(sockets.len(), 1);
+    let hello = &sockets[0].hello;
+    assert_eq!(hello["buffered"], true);
+    assert!(hello.get("tool_result").is_none(), "{hello:?}");
+    let environment = &hello["environment"];
+    assert_eq!(environment["platform"]["os"], std::env::consts::OS);
+    assert_eq!(environment["platform"]["arch"], std::env::consts::ARCH);
+    assert!(environment["cpus"].as_u64().unwrap() >= 1);
+    assert!(environment["root"].is_boolean());
+    assert!(environment["tz"].is_string());
+    assert_eq!(environment["versions"], json!({"no-such-tool-4f2c1": null}));
+    // Machine facts and tool versions only.
+    let mut keys: Vec<_> = environment.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["cpus", "platform", "root", "tz", "versions"]);
 }
 
 #[tokio::test]
@@ -1095,7 +1146,7 @@ async fn a_stream_that_cannot_be_used_says_why_before_any_socket_is_opened() {
     let snapshot = pending.finish(&tool.name).await.unwrap();
     let call = stream_call(&data).unwrap();
     let (events, _inbox) = tokio::sync::mpsc::unbounded_channel();
-    let reason = drive_stream(&call, &snapshot, false, events)
+    let reason = drive_stream(&call, &snapshot, Delivery::Streamed, events)
         .await
         .unwrap_err();
     assert!(

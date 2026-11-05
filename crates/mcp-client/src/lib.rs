@@ -21,6 +21,7 @@ pub mod client;
 pub mod coach;
 pub mod command_hints;
 pub mod credit_hold;
+pub mod environment;
 pub mod frames;
 pub mod harness_readiness;
 pub mod harness_remote;

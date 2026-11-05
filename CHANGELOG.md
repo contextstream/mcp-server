@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.69
+
+- Hosted tools: the first non-empty line a tool's `--version` prints (standard output, else standard error) is cleaned before it is sent with the description of your environment: any word that looks like a path (it contains a slash or a backslash, or starts with `~`) is left out; your user name, your home folder's name and your computer's name are replaced by `<redacted>` wherever they stand as whole words, in any letter case (names of fewer than three characters are not replaced); spaces are collapsed; and what is left is cut to 200 characters. A tool whose line has nothing left is reported as unknown, and the rest of the description is unchanged. This replaces 1.0.68, which sent the line as the tool printed it. `CONTEXTSTREAM_HOSTED_ENV=off` still sends none of it.
+
 ## 1.0.68
 
 - Hosted tools: a command run with `contextstream-mcp run` says its output is taken when it ends, so the service may hold it until it has decided the result, and every streamed call describes the local environment so the service can tell whether it can reproduce it: operating system and CPU architecture names, CPU count, whether the process runs as root, the time zone's name, and the first line of `<tool> --version` for each tool the service names (found only in your own PATH folders outside the repository, run directly for at most two seconds; a version manager that picks versions by folder may run). Nothing else about your variables, paths or files is sent; a tool's version line is sent as the tool prints it, cut to 200 characters, so it can contain whatever the tool puts there, such as an install path. `CONTEXTSTREAM_HOSTED_ENV=off` sends none of it.

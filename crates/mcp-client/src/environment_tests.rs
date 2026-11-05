@@ -63,7 +63,7 @@ fn a_tool_is_asked_in_the_commands_folder_when_that_is_inside_the_repository() {
 }
 
 #[test]
-fn a_tools_answer_is_its_first_line_cut_short() {
+fn a_tools_answer_is_its_first_non_blank_line() {
     assert_eq!(first_line(b"v24.16.0\n").as_deref(), Some("v24.16.0"));
     assert_eq!(
         first_line(b"\n  \n  rustc 1.99.0 (abc 2026-01-01)  \nsecond\n").as_deref(),
@@ -72,12 +72,157 @@ fn a_tools_answer_is_its_first_line_cut_short() {
     assert_eq!(first_line(b"a\r\nb\r\n").as_deref(), Some("a"));
     assert_eq!(first_line(b""), None);
     assert_eq!(first_line(b"  \n\t\n"), None);
-    let long = "x".repeat(5000);
-    assert_eq!(first_line(long.as_bytes()).unwrap().chars().count(), 200);
-    // Bytes that are not text do not break it; multi-byte characters are not cut in half.
+    // Bytes that are not text do not break it.
     assert_eq!(first_line(b"v1\xff\n").as_deref(), Some("v1\u{fffd}"));
+}
+
+#[test]
+fn a_line_is_cut_to_two_hundred_characters_after_it_is_cleaned() {
+    let none = Names::default();
+    let long = "x".repeat(5000);
+    assert_eq!(redact(&long, &none).unwrap().chars().count(), 200);
+    // Multi-byte characters are not cut in half.
     let wide = "é".repeat(300);
-    assert_eq!(first_line(wide.as_bytes()).unwrap().chars().count(), 200);
+    assert_eq!(redact(&wide, &none).unwrap().chars().count(), 200);
+    // Words that are left out do not use up the 200: the cut is of what is left.
+    let line = format!("{} {}", "/very/long/path".repeat(40), "y".repeat(500));
+    assert_eq!(redact(&line, &none).unwrap(), "y".repeat(200));
+}
+
+#[test]
+fn ordinary_version_lines_are_sent_as_they_are() {
+    let none = Names::default();
+    for line in [
+        "v24.16.0",
+        "rustc 1.99.0 (abc123def 2026-01-01)",
+        "Python 3.12.1",
+        "java 21",
+        "openjdk version \"21.0.2\" 2024-01-16",
+        "protoc 27.3",
+        "go version go1.22.1",
+        "git version 2.43.0",
+        "tool 1.0.0-beta.2+build.5",
+    ] {
+        assert_eq!(redact(line, &none).as_deref(), Some(line), "{line}");
+    }
+    // Spaces are collapsed to one.
+    assert_eq!(redact("a   b\t c", &none).as_deref(), Some("a b c"));
+}
+
+#[test]
+fn words_that_look_like_paths_are_left_out() {
+    let none = Names::default();
+    for (line, left) in [
+        ("tool 1.0 /home/alice/.nvm/bin/node", "tool 1.0"),
+        ("tool 1.0 (prefix=/opt/tool)", "tool 1.0"),
+        ("tool 1.0 (/opt/tool)", "tool 1.0"),
+        ("tool 1.0 ~/bin/tool", "tool 1.0"),
+        ("tool 1.0 (~/bin)", "tool 1.0"),
+        ("tool 1.0 ~", "tool 1.0"),
+        ("tool 1.0 \"~/bin\"", "tool 1.0"),
+        ("tool 1.0 C:\\Users\\alice\\tool.exe", "tool 1.0"),
+        ("tool 1.0 C:/Users/alice/tool.exe", "tool 1.0"),
+        ("tool 1.0 \\\\server\\share\\tool", "tool 1.0"),
+        ("tool 1.0 file:///tmp/x", "tool 1.0"),
+        ("tool 1.0 src=git@host:org/repo.git", "tool 1.0"),
+        ("go version go1.22.1 darwin/arm64", "go version go1.22.1"),
+        ("/usr/local/bin/tool 1.0", "1.0"),
+    ] {
+        assert_eq!(redact(line, &none).as_deref(), Some(left), "{line}");
+    }
+    // Nothing left: nothing is sent.
+    for line in ["/usr/local/bin/tool", "C:\\tools\\x.exe ~/y", "   ", ""] {
+        assert_eq!(redact(line, &none), None, "{line}");
+    }
+}
+
+#[test]
+fn user_home_and_host_names_are_replaced_as_whole_words() {
+    let names = Names::from_parts(
+        Some("alice"),
+        Some(Path::new("/Users/alice")),
+        Some("alice-mbp.local"),
+    );
+    let said = |line: &str| redact(line, &names).unwrap();
+    assert_eq!(
+        said("node built by alice on alice-mbp.local"),
+        "node built by <redacted> on <redacted>"
+    );
+    // Whatever the letter case, and next to punctuation.
+    assert_eq!(
+        said("Built by ALICE (alice)"),
+        "Built by <redacted> (<redacted>)"
+    );
+    assert_eq!(said("user=Alice;"), "user=<redacted>;");
+    assert_eq!(said("alice-mbp 1.0"), "<redacted> 1.0");
+    // Not as part of a longer word.
+    assert_eq!(said("malice 1.0"), "malice 1.0");
+    assert_eq!(said("alicen 1.0"), "alicen 1.0");
+    assert_eq!(said("alice_x 1.0"), "alice_x 1.0");
+    assert_eq!(said("alice2 1.0"), "alice2 1.0");
+    // A path with the name is left out whole, before the name is looked for.
+    assert_eq!(said("/home/alice/bin/x alice"), "<redacted>");
+    assert_eq!(said("tool 1.0 /Users/alice/x"), "tool 1.0");
+}
+
+#[test]
+fn the_home_folders_name_and_the_user_name_may_differ() {
+    let names = Names::from_parts(
+        Some("jsmith"),
+        Some(Path::new("/home/john.smith")),
+        Some("ci"),
+    );
+    let said = |line: &str| redact(line, &names).unwrap();
+    assert_eq!(
+        said("tool for john.smith (jsmith) on ci"),
+        "tool for <redacted> (<redacted>) on ci"
+    );
+}
+
+#[test]
+fn names_of_fewer_than_three_characters_are_not_replaced() {
+    let names = Names::from_parts(Some("al"), Some(Path::new("/home/al")), Some("ci"));
+    assert_eq!(
+        redact("al 1.0 on ci", &names).as_deref(),
+        Some("al 1.0 on ci")
+    );
+    let names = Names::from_parts(Some("bob"), None, None);
+    assert_eq!(redact("by bob", &names).as_deref(), Some("by <redacted>"));
+}
+
+#[test]
+fn a_name_with_a_space_or_outside_ascii_is_replaced_too() {
+    let names = Names::from_parts(Some("John Smith"), None, Some("josé-pc"));
+    assert_eq!(
+        redact("built by John Smith on josé-pc", &names).as_deref(),
+        Some("built by <redacted> on <redacted>")
+    );
+    assert_eq!(
+        redact("built by john smith", &names).as_deref(),
+        Some("built by <redacted>")
+    );
+}
+
+#[test]
+fn a_longer_name_is_replaced_before_its_own_first_label() {
+    let names = Names::from_parts(None, None, Some("build-7.corp.example"));
+    assert_eq!(
+        redact("on build-7.corp.example and build-7", &names).as_deref(),
+        Some("on <redacted> and <redacted>")
+    );
+}
+
+#[test]
+fn the_names_of_this_machine_are_found_and_hidden() {
+    let names = Names::current();
+    for word in &names.words {
+        assert!(word.chars().count() >= MIN_NAME_CHARS, "{word:?}");
+        let hidden = redact(&format!("tool 1.0 by {word}"), &names).unwrap();
+        assert!(hidden.contains("<redacted>"), "{hidden:?}");
+        // Not counting the marker itself (a name could be a piece of it).
+        let rest = hidden.replace("<redacted>", "");
+        assert!(!rest.contains(word.as_str()), "{word:?} in {hidden:?}");
+    }
 }
 
 #[test]
@@ -283,7 +428,7 @@ async fn ask(script: &str, limit: Duration) -> Option<String> {
         &format!("#!/bin/sh\n{script}\n"),
     );
     for _ in 0..3 {
-        let answer = version_of(file.as_os_str(), scratch.path(), limit).await;
+        let answer = version_of(file.as_os_str(), scratch.path(), limit, &Names::default()).await;
         if answer.is_some() {
             return answer;
         }
@@ -350,7 +495,8 @@ async fn a_tool_that_fails_is_missing_or_is_slow_has_no_version() {
         version_of(
             scratch.path().join("no-such-program").as_os_str(),
             scratch.path(),
-            limit
+            limit,
+            &Names::default()
         )
         .await,
         None
@@ -371,18 +517,48 @@ async fn a_tool_is_asked_in_the_folder_it_is_given() {
     let scratch = tempfile::tempdir().unwrap();
     let folder = scratch.path().join("work").join("pkg");
     std::fs::create_dir_all(&folder).unwrap();
-    let tool = plant(scratch.path(), "faketool", "#!/bin/sh\npwd -P\n");
+    // The tool says which folder it runs in by the folder's name alone: its whole
+    // path, if it printed that, would be left out of the line.
+    let named = plant(
+        scratch.path(),
+        "faketool",
+        "#!/bin/sh\necho \"runs-in-$(basename \"$(pwd -P)\")\"\n",
+    );
     let mut answer = None;
     for _ in 0..3 {
-        answer = version_of(tool.as_os_str(), &folder, Duration::from_secs(5)).await;
+        answer = version_of(
+            named.as_os_str(),
+            &folder,
+            Duration::from_secs(5),
+            &Names::default(),
+        )
+        .await;
         if answer.is_some() {
             break;
         }
     }
-    assert_eq!(
-        answer.as_deref(),
-        Some(folder.canonicalize().unwrap().to_str().unwrap())
+    assert_eq!(answer.as_deref(), Some("runs-in-pkg"));
+
+    // A tool that also prints its path: the path is left out of what is sent.
+    let pathy = plant(
+        scratch.path(),
+        "pathtool",
+        "#!/bin/sh\necho \"pathtool 1.0 $(pwd -P)\"\n",
     );
+    let mut answer = None;
+    for _ in 0..3 {
+        answer = version_of(
+            pathy.as_os_str(),
+            &folder,
+            Duration::from_secs(5),
+            &Names::default(),
+        )
+        .await;
+        if answer.is_some() {
+            break;
+        }
+    }
+    assert_eq!(answer.as_deref(), Some("pathtool 1.0"));
 }
 
 #[cfg(unix)]
@@ -402,9 +578,12 @@ async fn the_environment_holds_the_machine_and_the_tools_asked_about() {
     });
     let mut environment = Value::Null;
     for _ in 0..3 {
-        environment = describe_using(&request, &repo, |name| {
-            (name == "faketool").then(|| tool.clone())
-        })
+        environment = describe_using(
+            &request,
+            &repo,
+            |name| (name == "faketool").then(|| tool.clone()),
+            &Names::default(),
+        )
         .await;
         if environment["versions"]["faketool"].is_string() {
             break;
@@ -428,7 +607,7 @@ async fn the_environment_holds_the_machine_and_the_tools_asked_about() {
     );
 
     // No tools named: the key is there and empty.
-    let none = describe_using(&json!({"cwd": "pkg"}), &repo, |_| None).await;
+    let none = describe_using(&json!({"cwd": "pkg"}), &repo, |_| None, &Names::default()).await;
     assert_eq!(none["versions"], json!({}));
 }
 

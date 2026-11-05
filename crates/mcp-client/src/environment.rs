@@ -7,9 +7,10 @@
 //! process runs as root, the time zone's name, and the first line of
 //! `<tool> --version` for each tool the API's request names (`versions`: data
 //! from the API, no list of tools lives here). Nothing else about the machine,
-//! its variables or its files is read or sent. A tool's line is sent as the tool
-//! prints it (cut to 200 characters), so it holds whatever the tool puts there,
-//! such as an install path.
+//! its variables or its files is read or sent. A tool's line is cleaned before
+//! it is sent (see [`redact`]): words in it that look like paths are left out,
+//! the user name, the home folder's name and the host name are replaced, and
+//! what is left is cut to 200 characters.
 //!
 //! A tool is asked its version by running it directly (no shell) in the
 //! command's folder, so a version manager that picks the version by folder
@@ -38,6 +39,11 @@ const MAX_TOOLS: usize = 16;
 const PROBE_LIMIT: Duration = Duration::from_secs(2);
 /// How much of a tool's answer is kept.
 const MAX_LINE_CHARS: usize = 200;
+/// What stands where a user, home folder or host name was.
+const REDACTED: &str = "<redacted>";
+/// Names shorter than this are not replaced: they would also match ordinary
+/// words of a version line.
+const MIN_NAME_CHARS: usize = 3;
 /// How much of a tool's output is read at all.
 const MAX_OUTPUT_BYTES: u64 = 4096;
 /// The longest time zone name sent.
@@ -51,20 +57,26 @@ pub async fn describe(request: &Value, root: &Path) -> Option<Value> {
         return None;
     }
     let path = std::env::var_os("PATH");
+    let hidden = Names::current();
     Some(
-        describe_using(request, root, |name| {
-            find_program(name, path.as_deref(), root)
-        })
+        describe_using(
+            request,
+            root,
+            |name| find_program(name, path.as_deref(), root),
+            &hidden,
+        )
         .await,
     )
 }
 
 /// [`describe`], with `program` choosing what runs for a tool's name (`None`:
-/// there is no such program for it).
+/// there is no such program for it) and `hidden` the names a tool's line must
+/// not carry.
 async fn describe_using(
     request: &Value,
     root: &Path,
     program: impl Fn(&str) -> Option<PathBuf>,
+    hidden: &Names,
 ) -> Value {
     let folder = probe_folder(
         root,
@@ -74,7 +86,7 @@ async fn describe_using(
     let (program, folder) = (&program, &folder);
     let answers = futures::future::join_all(names.iter().map(|name| async move {
         let program = program(name.as_str())?;
-        version_of(program.as_os_str(), folder, PROBE_LIMIT).await
+        version_of(program.as_os_str(), folder, PROBE_LIMIT, hidden).await
     }))
     .await;
     let versions: Map<String, Value> = names
@@ -189,9 +201,14 @@ fn is_program(file: &Path) -> bool {
 }
 
 /// What `<program> --version` printed: its first non-empty line (standard
-/// output, else standard error), cut short. `None` when it is not there, fails,
-/// prints nothing or is not done in `limit`.
-async fn version_of(program: &OsStr, folder: &Path, limit: Duration) -> Option<String> {
+/// output, else standard error), cleaned by [`redact`]. `None` when it is not
+/// there, fails, prints nothing, is nothing but paths or is not done in `limit`.
+async fn version_of(
+    program: &OsStr,
+    folder: &Path,
+    limit: Duration,
+    hidden: &Names,
+) -> Option<String> {
     let mut command = Command::new(program);
     command
         .arg("--version")
@@ -211,7 +228,8 @@ async fn version_of(program: &OsStr, folder: &Path, limit: Duration) -> Option<S
         if !status.ok()?.success() {
             return None;
         }
-        first_line(&out).or_else(|| first_line(&err))
+        let line = first_line(&out).or_else(|| first_line(&err))?;
+        redact(&line, hidden)
     };
     tokio::time::timeout(limit, run).await.ok().flatten()
 }
@@ -228,13 +246,131 @@ async fn read_some(mut pipe: impl AsyncRead + Unpin) -> Vec<u8> {
     kept
 }
 
-/// The first line of `output` that is not blank, trimmed and cut short.
+/// The first line of `output` that is not blank, trimmed.
 pub fn first_line(output: &[u8]) -> Option<String> {
     String::from_utf8_lossy(output)
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .map(|line| line.chars().take(MAX_LINE_CHARS).collect())
+        .map(str::to_string)
+}
+
+/// A tool's line as it may be sent: every word that looks like a path is left
+/// out (it contains a `/` or a `\`, or starts with `~`; a drive path such as
+/// `C:\tools` has a separator too), the user name, home folder name and host
+/// name in `hidden` are replaced by `<redacted>` wherever they stand as whole
+/// words, spaces are collapsed to one, and the rest is cut to 200 characters.
+/// `None` when nothing is left.
+pub fn redact(line: &str, hidden: &Names) -> Option<String> {
+    let kept: Vec<&str> = line
+        .split_whitespace()
+        .filter(|word| !looks_like_path(word))
+        .collect();
+    let cleaned = hidden.hide_in(&kept.join(" "));
+    (!cleaned.is_empty()).then(|| cleaned.chars().take(MAX_LINE_CHARS).collect())
+}
+
+/// Whether a word of a version line names a place on a disk or a server.
+fn looks_like_path(word: &str) -> bool {
+    word.contains(['/', '\\']) || word.trim_start_matches(OPENING).starts_with('~')
+}
+
+/// What may stand before a path in running text.
+const OPENING: [char; 8] = ['(', '[', '{', '<', '"', '\'', '`', '='];
+
+/// Names a tool's line must not carry: who runs it and on which machine.
+#[derive(Debug, Default, Clone)]
+pub struct Names {
+    /// Longest first, so a whole host name goes before its first label does.
+    words: Vec<String>,
+}
+
+impl Names {
+    /// The user name (`USER`, `USERNAME` or `LOGNAME`), the last component of
+    /// the home folder and the host name, with the host's first label.
+    pub fn current() -> Self {
+        let from_env = |name: &str| std::env::var(name).ok();
+        let user = from_env("USER")
+            .or_else(|| from_env("USERNAME"))
+            .or_else(|| from_env("LOGNAME"));
+        let home = dirs::home_dir();
+        Self::from_parts(user.as_deref(), home.as_deref(), host_name().as_deref())
+    }
+
+    /// The names for a user, a home folder and a host. A name of fewer than
+    /// [`MIN_NAME_CHARS`] characters is left out.
+    pub fn from_parts(user: Option<&str>, home: Option<&Path>, host: Option<&str>) -> Self {
+        let home_name = home.and_then(Path::file_name).and_then(OsStr::to_str);
+        let host_label = host.and_then(|name| name.split('.').next());
+        let mut words: Vec<String> = Vec::new();
+        for candidate in [user, home_name, host, host_label].into_iter().flatten() {
+            let candidate = candidate.trim();
+            if candidate.chars().count() >= MIN_NAME_CHARS
+                && !words
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(candidate))
+            {
+                words.push(candidate.to_string());
+            }
+        }
+        words.sort_by_key(|word| std::cmp::Reverse(word.len()));
+        Self { words }
+    }
+
+    /// `text` with each of the names replaced by `<redacted>` where it stands
+    /// as a whole word, whatever its letter case.
+    pub fn hide_in(&self, text: &str) -> String {
+        self.words
+            .iter()
+            .fold(text.to_string(), |text, word| replace_word(&text, word))
+    }
+}
+
+/// `text` with every whole-word, case-insensitive (ASCII) occurrence of `word`
+/// replaced by `<redacted>`. A word is whole when no letter, digit or `_`
+/// stands next to it.
+fn replace_word(text: &str, word: &str) -> String {
+    if word.is_empty() {
+        return text.to_string();
+    }
+    // ASCII lowering keeps every byte offset and character boundary.
+    let lower_text = text.to_ascii_lowercase();
+    let lower_word = word.to_ascii_lowercase();
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while let Some(found) = lower_text[at..].find(&lower_word) {
+        let start = at + found;
+        let end = start + lower_word.len();
+        out.push_str(&text[at..start]);
+        let whole = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word_char(c))
+            && text[end..].chars().next().is_none_or(|c| !is_word_char(c));
+        out.push_str(if whole { REDACTED } else { &text[start..end] });
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+#[cfg(unix)]
+fn host_name() -> Option<String> {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the buffer is valid for its whole length, and gethostname writes
+    // at most that many bytes into it.
+    let status = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if status != 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    String::from_utf8(buffer[..end].to_vec()).ok()
+}
+
+#[cfg(not(unix))]
+fn host_name() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
 }
 
 fn cpus() -> usize {

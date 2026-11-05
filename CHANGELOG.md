@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.67
+
+- Codex hooks: each hook now answers in the shape Codex accepts. Codex refuses a field its event does not list, so the PostCompact hook, which printed a top-level `additionalContext`, failed on every compaction with "hook returned invalid PostCompact hook JSON output". For Codex the PostCompact hook now prints nothing and fetches nothing (Codex runs SessionStart with source `compact` before the next turn, which restores the saved state); a package check's `ask` reaches the model as context, because Codex refuses `ask`; and a shell command is not handed to `run` for Codex, which takes a changed input only together with an `allow`. Claude Code and the other editors get the output they got before.
+
 ## 1.0.66
 
 - Hosted tools: the call to a tool that answers over a stream is made as soon as the repository is identified and carries only its folder name and a digest of its origin; the description of your changes is prepared meanwhile and goes over the stream as before. A checkout with no changes builds no scratch tree.

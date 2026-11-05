@@ -643,6 +643,44 @@ fn secret_names_are_told_from_lock_files_and_archives() {
     assert!(!ContextStreamClient::should_skip_file("main.rs", true));
 }
 
+#[derive(serde::Deserialize)]
+struct CredentialFileNameVector {
+    withheld: Vec<String>,
+    sent: Vec<String>,
+}
+
+/// Shared credential file-name vector (`testdata/credential-file-names.json`,
+/// sha256 `127fa51c62c935cf15fc5529819585f2feb179ef3c0a1e9e08a9a0f927651dce`).
+#[test]
+fn credential_file_names_follow_the_shared_vector() {
+    let expected_sha256 = "127fa51c62c935cf15fc5529819585f2feb179ef3c0a1e9e08a9a0f927651dce";
+    let raw = include_str!("testdata/credential-file-names.json");
+    let normalized = raw.replace("\r\n", "\n");
+    let actual_sha256 = hex::encode(Sha256::digest(normalized.as_bytes()));
+    assert_eq!(actual_sha256, expected_sha256);
+
+    let vector: CredentialFileNameVector = serde_json::from_str(raw).unwrap();
+    assert_eq!(vector.withheld.len(), 47);
+    assert_eq!(vector.sent.len(), 34);
+
+    let mut disagreements = Vec::new();
+    let cases = [(&vector.withheld[..], true), (&vector.sent[..], false)];
+    for (names, expected) in cases {
+        for name in names {
+            let actual = ContextStreamClient::is_secret_file_name(name);
+            if actual != expected {
+                let detail = format!("{name}: expected {expected}, actual {actual}");
+                disagreements.push(detail);
+            }
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "credential file-name disagreements:\n{}",
+        disagreements.join("\n")
+    );
+}
+
 #[tokio::test]
 async fn the_identity_is_known_before_the_rest_of_the_snapshot_is_taken() {
     let temp = repo_with_history();

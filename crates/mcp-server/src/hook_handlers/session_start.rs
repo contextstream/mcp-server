@@ -152,11 +152,15 @@ pub async fn handle() -> Result<()> {
     // The rules that hold on every turn, the same ones the prompt hook shows:
     // after a compaction or resume they would otherwise be gone until the
     // next prompt, and the [COACHING] block was never shown here at all.
-    if let Some(rules) = standing_rules {
+    if let Some(rules) = standing_rules.as_deref() {
         output_text.push('\n');
-        output_text.push_str(&rules);
+        output_text.push_str(rules);
     }
 
+    // A lesson already printed under Standing rules is not printed again.
+    let context = context
+        .as_ref()
+        .and_then(|data| render_initial_context(data, standing_rules.as_deref().unwrap_or("")));
     if let Some(ctx) = context {
         output_text.push('\n');
         output_text.push_str(&ctx);
@@ -432,7 +436,8 @@ fn check_index_status(folder_path: &str) -> IndexInfo {
 // Context Fetching
 // ============================================================================
 
-async fn fetch_initial_context(config: &ApiConfig) -> Option<String> {
+/// The startup context from `GET /api/v1/context`, as the API answered it.
+async fn fetch_initial_context(config: &ApiConfig) -> Option<Value> {
     let mut url = format!(
         "{}/api/v1/context?include_rules=true&include_lessons=true&include_decisions=true&include_plans=true&limit=5",
         config.api_url
@@ -455,8 +460,25 @@ async fn fetch_initial_context(config: &ApiConfig) -> Option<String> {
         return None;
     }
 
-    let data: Value = response.json().await.ok()?;
+    response.json().await.ok()
+}
 
+/// Whether a lesson titled `title` is already on a `[LESSONS_WARNING]` line of
+/// the Standing rules this hook printed.
+fn lesson_already_shown(standing_rules: &str, title: &str) -> bool {
+    let title = title.trim();
+    !title.is_empty()
+        && standing_rules.lines().any(|line| {
+            line.trim_start()
+                .strip_prefix("[LESSONS_WARNING]")
+                .is_some_and(|rest| rest.trim_start().starts_with(title))
+        })
+}
+
+/// The startup sections from `GET /api/v1/context`'s answer. A lesson already
+/// printed under Standing rules (`standing_rules`) is left out of the lessons
+/// section, so it shows once, and takes none of its places.
+fn render_initial_context(data: &Value, standing_rules: &str) -> Option<String> {
     let mut sections = Vec::new();
 
     // Lessons
@@ -464,6 +486,12 @@ async fn fetch_initial_context(config: &ApiConfig) -> Option<String> {
         let kept: Vec<&Value> = lessons
             .iter()
             .filter(|lesson| !is_noise_lesson(lesson))
+            .filter(|lesson| {
+                !lesson_already_shown(
+                    standing_rules,
+                    lesson.get("title").and_then(|t| t.as_str()).unwrap_or(""),
+                )
+            })
             .take(3)
             .collect();
         if !kept.is_empty() {
@@ -844,6 +872,41 @@ mod tests {
         assert!(standing_rules_body(&config, "", "", true)
             .get("session_id")
             .is_none());
+    }
+
+    /// Since the API returns standing lessons at session start too, a standing
+    /// lesson came twice: under Standing rules and in the lessons section. It
+    /// now shows once, under Standing rules; any other lesson keeps its place.
+    #[test]
+    fn a_standing_lesson_prints_once_under_standing_rules() {
+        let hook = "[LESSONS_WARNING] Text the owner will paste goes as plain lines \u{2014} no blockquote\n[COACHING] You have corrected the agent on these before:\n- Give copy text as plain lines.";
+        let standing = standing_rule_lines(hook).expect("standing rules");
+        let data = json!({
+            "lessons": [
+                {"title": "Text the owner will paste goes as plain lines", "prevention": "no blockquote", "severity": "medium"},
+                {"title": "Run migrations only on the remote host", "prevention": "use the lane", "severity": "high"}
+            ]
+        });
+        let context = render_initial_context(&data, &standing).expect("startup context");
+        let printed = format!("{standing}{context}");
+        assert_eq!(
+            printed
+                .matches("Text the owner will paste goes as plain lines")
+                .count(),
+            1
+        );
+        assert!(standing.contains("Text the owner will paste goes as plain lines"));
+        assert!(!context.contains("Text the owner will paste goes as plain lines"));
+        assert!(context.contains("**Run migrations only on the remote host**"));
+
+        // Without Standing rules (an older API, or the hook answer failed), the
+        // lessons section shows every lesson as before.
+        let alone = render_initial_context(&data, "").expect("startup context");
+        assert!(alone.contains("**Text the owner will paste goes as plain lines**"));
+        assert!(alone.contains("**Run migrations only on the remote host**"));
+        // A title that only starts another lesson's line is not that lesson.
+        assert!(!lesson_already_shown(&standing, ""));
+        assert!(!lesson_already_shown(&standing, "Run migrations"));
     }
 
     #[test]

@@ -64,9 +64,10 @@ pub async fn handle() -> Result<()> {
 
     // Try to fetch compact restore state and startup context from API in
     // parallel so SessionStart can stay under the hook timeout budget.
+    let cursor = super::input_is_cursor(&input);
     let context_fut = async {
         if config.api_key.is_empty() {
-            (None, None)
+            (None, None, None)
         } else {
             tokio::join!(
                 async {
@@ -76,7 +77,8 @@ pub async fn handle() -> Result<()> {
                         fetch_restore_context(&config, session_id, trigger).await
                     }
                 },
-                fetch_initial_context(&config)
+                fetch_initial_context(&config),
+                fetch_standing_rules(&config, session_id, &cwd, cursor)
             )
         }
     };
@@ -84,7 +86,7 @@ pub async fn handle() -> Result<()> {
     // Reconcile unflushed local edits (P6 content freshness): drain
     // `dirty-files.json` concurrently with the context fetch so it adds no
     // latency to the session-start budget. Best-effort + bounded + non-billed.
-    let ((restored_context, context), _) = tokio::join!(
+    let ((restored_context, context, standing_rules), _) = tokio::join!(
         context_fut,
         super::dirty_drain::drain_best_effort(std::time::Duration::from_secs(8)),
     );
@@ -145,6 +147,14 @@ pub async fn handle() -> Result<()> {
     if let Some(restored) = restored_context {
         output_text.push('\n');
         output_text.push_str(&restored);
+    }
+
+    // The rules that hold on every turn, the same ones the prompt hook shows:
+    // after a compaction or resume they would otherwise be gone until the
+    // next prompt, and the [COACHING] block was never shown here at all.
+    if let Some(rules) = standing_rules {
+        output_text.push('\n');
+        output_text.push_str(&rules);
     }
 
     if let Some(ctx) = context {
@@ -209,7 +219,6 @@ struct ApiConfig {
     api_key: String,
     api_url: String,
     workspace_id: Option<String>,
-    #[allow(dead_code)]
     project_id: Option<String>,
 }
 
@@ -553,6 +562,104 @@ async fn fetch_initial_context(config: &ApiConfig) -> Option<String> {
     Some(sections.join("\n"))
 }
 
+/// Body for POST /api/v1/context/hook as this hook sends it: the prompt hook's
+/// scope, with `hook_type=session_start` (the API adds the [COACHING] block of
+/// rules the person taught their agent for this hook type too).
+fn standing_rules_body(config: &ApiConfig, session_id: &str, cwd: &str, cursor: bool) -> Value {
+    let mut body = serde_json::Map::new();
+    if let Some(ref ws_id) = config.workspace_id {
+        body.insert("workspace_id".to_string(), Value::String(ws_id.clone()));
+    }
+    if let Some(ref project_id) = config.project_id {
+        body.insert("project_id".to_string(), Value::String(project_id.clone()));
+    }
+    if !session_id.is_empty() {
+        body.insert(
+            "session_id".to_string(),
+            Value::String(session_id.to_string()),
+        );
+    }
+    body.insert(
+        "hook_type".to_string(),
+        Value::String("session_start".to_string()),
+    );
+    if !cwd.trim().is_empty() {
+        body.insert("folder_path".to_string(), Value::String(cwd.to_string()));
+    }
+    body.insert(
+        "editor".to_string(),
+        Value::String(if cursor { "cursor" } else { "claude" }.to_string()),
+    );
+    Value::Object(body)
+}
+
+/// The prompt hook's standing rules, for a session that starts, resumes or was
+/// just compacted. None when the API is unreachable or has none.
+async fn fetch_standing_rules(
+    config: &ApiConfig,
+    session_id: &str,
+    cwd: &str,
+    cursor: bool,
+) -> Option<String> {
+    let url = format!("{}/api/v1/context/hook", config.api_url);
+    let response = super::api_http_client()
+        .post(&url)
+        .header("X-API-Key", &config.api_key)
+        .header("Content-Type", "application/json")
+        .json(&standing_rules_body(config, session_id, cwd, cursor))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let data: Value = response.json().await.ok()?;
+    standing_rule_lines(data.get("data")?.get("context")?.as_str()?)
+}
+
+/// Tags of the lines that hold on every turn.
+const STANDING_RULE_TAGS: [&str; 3] = ["[COACHING]", "[PREFERENCE]", "[LESSONS_WARNING]"];
+
+/// From the hook's answer, the rules that hold on every turn: each
+/// [COACHING], [PREFERENCE] and [LESSONS_WARNING] line with the `- ` lines
+/// that continue it, once each (an older API wrote every preference and
+/// lesson twice), under one header. Everything else in that answer (the core
+/// reminder, decisions, notices) this hook prints already or is per prompt.
+fn standing_rule_lines(context: &str) -> Option<String> {
+    let mut groups: Vec<Vec<&str>> = Vec::new();
+    let mut open = false;
+    for line in context.lines() {
+        let trimmed = line.trim();
+        if STANDING_RULE_TAGS
+            .iter()
+            .any(|tag| trimmed.starts_with(tag))
+        {
+            groups.push(vec![trimmed]);
+            open = true;
+        } else if open && trimmed.starts_with("- ") {
+            if let Some(group) = groups.last_mut() {
+                group.push(trimmed);
+            }
+        } else {
+            open = false;
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let lines: Vec<&str> = groups
+        .into_iter()
+        .filter(|group| seen.insert(group.clone()))
+        .flatten()
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\n## Standing rules (hold on every turn, whatever the task)\n{}\n",
+        lines.join("\n")
+    ))
+}
+
 async fn fetch_restore_context(
     config: &ApiConfig,
     session_id: &str,
@@ -703,6 +810,40 @@ mod tests {
         let task = checkout.join(".claude/worktrees/agent-a1");
         std::fs::create_dir_all(task.join(".git")).unwrap();
         assert!(checkout_sync_status(&task.to_string_lossy()).is_none());
+    }
+
+    /// After a compaction the session starts again: the rules the prompt hook
+    /// shows on every turn are printed here too, once each, whatever the API
+    /// version (an older one wrote each preference and lesson twice).
+    #[test]
+    fn session_start_prints_the_hooks_standing_rules_once() {
+        let hook = "[CONTEXTSTREAM] Default: call context first.\n<system-reminder>\n[COACHING] You have corrected the agent on these before \u{2014} do NOT repeat them:\n- Give text the owner will copy as plain lines.\n</system-reminder>\n<system-reminder>\n[PREFERENCE] tooling: lsh on the owner's Mac\n[LESSONS_WARNING] Text the owner will paste goes as plain lines \u{2014} no blockquote\n- no code fence\n</system-reminder>\n[PREFERENCE] tooling: lsh on the owner's Mac\n[LESSONS_WARNING] Text the owner will paste goes as plain lines \u{2014} no blockquote\n- no code fence\n[DECISION] (today old) Dry-run first\n- not a rule\n[HOOK CONTEXT] Reuse the same session_id";
+        let rules = standing_rule_lines(hook).expect("rules");
+        assert_eq!(
+            rules,
+            "\n## Standing rules (hold on every turn, whatever the task)\n[COACHING] You have corrected the agent on these before \u{2014} do NOT repeat them:\n- Give text the owner will copy as plain lines.\n[PREFERENCE] tooling: lsh on the owner's Mac\n[LESSONS_WARNING] Text the owner will paste goes as plain lines \u{2014} no blockquote\n- no code fence\n"
+        );
+        assert!(standing_rule_lines("[CONTEXTSTREAM] core\n[DECISION] x").is_none());
+
+        let config = ApiConfig {
+            api_key: "k".into(),
+            api_url: "https://api.example".into(),
+            workspace_id: Some("ws".into()),
+            project_id: Some("proj".into()),
+        };
+        let body = standing_rules_body(&config, "sess", "/repo", false);
+        assert_eq!(body["hook_type"], "session_start");
+        assert_eq!(body["workspace_id"], "ws");
+        assert_eq!(body["project_id"], "proj");
+        assert_eq!(body["session_id"], "sess");
+        assert_eq!(body["editor"], "claude");
+        assert_eq!(
+            standing_rules_body(&config, "", "", true)["editor"],
+            "cursor"
+        );
+        assert!(standing_rules_body(&config, "", "", true)
+            .get("session_id")
+            .is_none());
     }
 
     #[test]

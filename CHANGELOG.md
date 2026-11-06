@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.71
+
+- Claude Code: when a session starts, resumes or comes back from a compaction, the SessionStart hook also shows the rules that hold on every turn: the `[COACHING]` block of rules you gave or taught your agent, and the `[PREFERENCE]` and `[LESSONS_WARNING]` lines the prompt hook shows, each once. Before, after a compaction they came back only with the next prompt, and the `[COACHING]` block was never shown at session start.
+
 ## 1.0.70
 
 - Coaching rules: `session(action="add_coached_rule", rule_text="...")` stores a rule you give your agent, in your own words (up to 500 characters; `scope="project"` ties it to one project), and `session(action="list_coached_rules")` lists the rules your agent is coached on, where each came from and where it holds. A `[COACHING]` block in `context()` is kept ahead of general context when the response is trimmed to its budget.

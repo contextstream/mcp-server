@@ -1630,7 +1630,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-acceleration-products"
-version = "1.0.70"
+version = "1.0.71"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1648,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-client"
-version = "1.0.70"
+version = "1.0.71"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-model-registry"
-version = "1.0.70"
+version = "1.0.71"
 dependencies = [
  "mcp-types",
  "serde",
@@ -1689,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-server"
-version = "1.0.70"
+version = "1.0.71"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-session"
-version = "1.0.70"
+version = "1.0.71"
 dependencies = [
  "chrono",
  "dashmap",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-tools"
-version = "1.0.70"
+version = "1.0.71"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1805,7 +1805,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-types"
-version = "1.0.70"
+version = "1.0.71"
 dependencies = [
  "async-trait",
  "chrono",

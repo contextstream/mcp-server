@@ -201,24 +201,51 @@ fn ran_line(frame: &Value) -> String {
     }
 }
 
+/// The shell a command runs with here, outside Windows: bash, the shell the
+/// host, ContextCode's own fallback and mc-pilot run it with. With sh (dash on
+/// most Linux) a command written for bash failed here and passed everywhere
+/// else.
+const LOCAL_SHELL: &str = "bash";
+
 /// Run the command here, in `cwd`, as a shell would: its own streams, its own exit status.
 pub fn run_here(command: &str, cwd: &Path) -> i32 {
+    run_here_with(LOCAL_SHELL, command, cwd)
+}
+
+fn run_here_with(local_shell: &str, command: &str, cwd: &Path) -> i32 {
     let mut shell = if cfg!(windows) {
         let mut shell = std::process::Command::new("cmd");
         shell.arg("/C").arg(command);
         shell
     } else {
-        let mut shell = std::process::Command::new("sh");
+        let mut shell = std::process::Command::new(local_shell);
         shell.arg("-c").arg(command);
         shell
     };
     match shell.current_dir(cwd).status() {
         Ok(status) => status_code(status),
+        // The folder is there, so it is the shell that is missing: say so and
+        // run nothing. sh in its place would read some commands differently.
+        Err(error)
+            if !cfg!(windows) && error.kind() == std::io::ErrorKind::NotFound && cwd.is_dir() =>
+        {
+            eprintln!("{}", missing_shell_message(local_shell));
+            127
+        }
         Err(error) => {
             eprintln!("contextstream: could not run it here: {error}");
             127
         }
     }
+}
+
+/// What is said when the shell a command runs with here is not installed.
+fn missing_shell_message(local_shell: &str) -> String {
+    format!(
+        "contextstream: {local_shell} is not installed here, so the command was not run. \
+         It runs with {local_shell} wherever else it runs; install {local_shell} \
+         (sh would read some commands differently)."
+    )
 }
 
 #[cfg(unix)]
@@ -272,6 +299,35 @@ mod tests {
         assert_eq!(run_here("kill -9 $$", folder.path()), 128 + 9);
         // A word the shell does not know is the shell's 127.
         assert_eq!(run_here("no-such-command-here-x", folder.path()), 127);
+    }
+
+    /// A command the host did not take ran here with sh (dash), and a bash-only
+    /// command failed here and passed everywhere else (ticket d177b042). It
+    /// runs with bash; without bash it is said, and nothing runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_bash_only_command_runs_here_as_everywhere_else_and_no_bash_is_said() {
+        let folder = tempfile::tempdir().unwrap();
+        // Arrays, [[ ]] and $'..' are bash's; dash refuses each of them.
+        assert_eq!(
+            run_here(
+                "a=(x y); [[ ${#a[@]} -eq 2 && $'a\\tb' == *$'\\t'* ]]",
+                folder.path()
+            ),
+            0
+        );
+        // A missing tool reads as bash says it, as on the host.
+        assert_eq!(run_here("no-such-command-here-x", folder.path()), 127);
+
+        // No bash: the command is not run at all, by sh or anything else.
+        assert_eq!(
+            run_here_with("no-such-shell-here-x", "touch ran", folder.path()),
+            127
+        );
+        assert!(!folder.path().join("ran").exists());
+        let said = missing_shell_message("bash");
+        assert!(said.contains("bash is not installed here, so the command was not run"));
+        assert!(said.contains("install bash"));
     }
 
     #[test]

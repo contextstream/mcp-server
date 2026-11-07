@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.72
+
+- Codex hooks on Windows: `setup`, `update-hooks`, and `doctor --repair` write a `commandWindows` override in `~/.codex/hooks.json` that launches `contextstream-mcp.exe` cleanly in both PowerShell and Command Prompt—including install paths with spaces, apostrophes, shell metacharacters, and `\\?\` prefixes—fixing PowerShell's `Unexpected token 'hook'` failure on bare quoted executable paths. Updates keep the `commandWindows` override in place, migrate 1.0.71 entries and local workarounds while preserving other hooks, and note when to run `/hooks` in Codex CLI to approve the updated hook and reload the session.
+- `doctor`: for Codex, `doctor` now runs the effective hook command through the platform shell with sample `PreToolUse` JSON on standard input and checks exit status, JSON output shape, configured timeout, and `~/.codex/config.toml` `[hooks.state]`/`codex_hooks` trust status without writing to disk.
+- `instruct`: read-only calls (`get`, `stats`) and empty `ack` calls made without a `session_id` (such as stateless HTTP connections in Codex or calls before `init`/`context`) return an empty non-error result (`scope_status: "missing_session"`) with guidance instead of a validation error; mutating and verification actions still require `session_id`.
+- Hosted tools: on Unix, when a command passed to `contextstream-mcp run` is not taken by a hosted tool, it now runs locally with `bash -c` instead of `sh -c` so bash syntax behaves the same locally and remotely (reporting clearly if `bash` is not installed); Windows continues to use `cmd /C`.
+- Claude Code: `SessionStart` omits a lesson from "Lessons from Past Mistakes" when its title was already printed under "Standing rules", avoiding duplicate standing lessons at session start, resume, or after compaction.
+
 ## 1.0.71
 
 - Claude Code: when a session starts, resumes or comes back from a compaction, the SessionStart hook also shows the rules that hold on every turn: the `[COACHING]` block of rules you gave or taught your agent, and the `[PREFERENCE]` and `[LESSONS_WARNING]` lines the prompt hook shows, each once. Before, after a compaction they came back only with the next prompt, and the `[COACHING]` block was never shown at session start.

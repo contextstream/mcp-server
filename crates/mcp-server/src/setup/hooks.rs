@@ -743,25 +743,34 @@ fn existing_binary_runs(target: &Path) -> bool {
 // Hook Installation
 // ============================================================================
 
-/// Install hooks for an editor.
-pub fn install_hooks(editor: &Editor, api_key: Option<&str>) -> Result<()> {
+/// Install hooks for an editor and return any post-install / migration guidance
+/// note that should be surfaced to the user.
+pub fn install_hooks_with_note(editor: &Editor, api_key: Option<&str>) -> Result<Option<String>> {
     match editor {
-        Editor::ClaudeCode => install_claude_code_hooks(api_key),
-        Editor::Cursor => install_cursor_hooks(api_key),
-        Editor::Windsurf => install_windsurf_hooks(api_key),
-        Editor::Cline | Editor::RooCode => install_vscode_extension_hooks(editor, api_key),
-        Editor::Codex => install_notice_hooks(codex_hooks_path(), build_codex_hooks_update),
-        Editor::Antigravity => install_antigravity_hooks(),
+        Editor::ClaudeCode => install_claude_code_hooks(api_key).map(|()| None),
+        Editor::Cursor => install_cursor_hooks(api_key).map(|()| None),
+        Editor::Windsurf => install_windsurf_hooks(api_key).map(|()| None),
+        Editor::Cline | Editor::RooCode => {
+            install_vscode_extension_hooks(editor, api_key).map(|()| None)
+        }
+        Editor::Codex => install_codex_hooks_with_guidance(),
+        Editor::Antigravity => install_antigravity_hooks().map(|()| None),
         Editor::KiloCode => {
             // Kilo CLI doesn't support filesystem hooks — enforcement is
             // handled via rules + skills + MCP tools.
-            Ok(())
+            Ok(None)
         }
         _ => {
             // Other editors don't support hooks yet
-            Ok(())
+            Ok(None)
         }
     }
+}
+
+/// Install hooks for an editor.
+#[cfg(test)]
+pub fn install_hooks(editor: &Editor, api_key: Option<&str>) -> Result<()> {
+    install_hooks_with_note(editor, api_key).map(|_| ())
 }
 
 /// Drop ContextStream-owned entries from a raw Claude `hooks` object.
@@ -1184,7 +1193,7 @@ pub(crate) fn hook_config_path(editor: &Editor) -> Option<PathBuf> {
     }
 }
 
-/// Managed hook names of every `command` anywhere under `value`.
+/// Managed hook names of every `command` or `commandWindows` anywhere under `value`.
 fn managed_hook_names_in(value: &Value) -> Vec<String> {
     match value {
         Value::Array(items) => items.iter().flat_map(managed_hook_names_in).collect(),
@@ -1195,6 +1204,13 @@ fn managed_hook_names_in(value: &Value) -> Vec<String> {
                 .and_then(current_managed_hook_name)
                 .map(|name| vec![name.to_string()])
                 .unwrap_or_default();
+            for codex_name in
+                super::codex_hooks::codex_handler_managed_hook_names(&Value::Object(object.clone()))
+            {
+                if !names.contains(&codex_name) {
+                    names.push(codex_name);
+                }
+            }
             names.extend(object.values().flat_map(managed_hook_names_in));
             names
         }
@@ -1202,22 +1218,13 @@ fn managed_hook_names_in(value: &Value) -> Vec<String> {
     }
 }
 
+#[cfg(test)]
 fn is_codex_notice_hook_group(group: &Value) -> bool {
-    group.get("hooks").is_some_and(|hooks| {
-        managed_hook_names_in(hooks)
-            .iter()
-            .any(|name| name == CODEX_NOTICE_HOOK)
-    })
-}
-
-fn codex_notice_hook_group(binary: &str) -> Value {
-    json!({
-        "hooks": [{
-            "type": "command",
-            "command": hook_command(binary, CODEX_NOTICE_HOOK),
-            "timeout": 5,
-        }]
-    })
+    super::codex_hooks::is_codex_notice_hook_group_for_platform(
+        group,
+        &managed_binary_path(),
+        cfg!(windows),
+    )
 }
 
 fn root_object_for_edit(loaded: &safe_edit::LoadedConfig, path: &Path) -> Result<JsonMap> {
@@ -1231,40 +1238,40 @@ fn root_object_for_edit(loaded: &safe_edit::LoadedConfig, path: &Path) -> Result
     }
 }
 
-/// Add (or refresh) the notice hook in Codex's `hooks.json`, leaving every
-/// other entry, ContextStream-owned or not, as it is.
-fn build_codex_hooks_update(loaded: &safe_edit::LoadedConfig, path: &Path) -> Result<Value> {
-    let mut root = root_object_for_edit(loaded, path)?;
-    let mut hooks = hooks_object_of(loaded, path)?;
-    let group = codex_notice_hook_group(&find_binary_path());
-    match hooks.get_mut("PreToolUse") {
-        Some(Value::Array(groups)) => {
-            groups.retain(|existing| !is_codex_notice_hook_group(existing));
-            groups.push(group);
-        }
-        Some(_) => anyhow::bail!(
-            "Refusing to modify {}: \"PreToolUse\" is not an array.",
-            path.display()
-        ),
-        None => {
-            hooks.insert("PreToolUse".to_string(), Value::Array(vec![group]));
-        }
-    }
-    root.insert("hooks".to_string(), Value::Object(hooks));
-    Ok(Value::Object(root))
+/// Add (or migrate/refresh) ContextStream's `mid-run-notices` hook in Codex's
+/// `hooks.json`, preserving all unrelated entries and returning any required
+/// `/hooks` trust-review or reload note when the hook changed.
+fn install_codex_hooks_with_guidance() -> Result<Option<String>> {
+    let path =
+        codex_hooks_path().ok_or_else(|| anyhow::anyhow!("Could not determine the hooks path"))?;
+    let loaded = safe_edit::read_for_edit(&path, safe_edit::JsonDialect::Strict)?;
+    warn_on_nonstandard_syntax(&loaded, &path);
+    let binary = find_binary_path();
+    let managed = managed_binary_path();
+    let (updated, kind) = super::codex_hooks::update_codex_hooks_document_for_platform(
+        &loaded.value,
+        &path,
+        &binary,
+        &managed,
+        cfg!(windows),
+    )?;
+    safe_edit::commit(&path, &loaded, &updated)?;
+    Ok(super::codex_hooks::codex_post_update_guidance(
+        &path,
+        &updated,
+        kind,
+        &managed,
+        safe_edit::is_dry_run(),
+    ))
 }
 
 fn remove_codex_notice_hooks(loaded: &safe_edit::LoadedConfig, path: &Path) -> Result<Value> {
-    let mut root = root_object_for_edit(loaded, path)?;
-    let mut hooks = hooks_object_of(loaded, path)?;
-    if let Some(Value::Array(groups)) = hooks.get_mut("PreToolUse") {
-        groups.retain(|existing| !is_codex_notice_hook_group(existing));
-        if groups.is_empty() {
-            hooks.remove("PreToolUse");
-        }
-    }
-    root.insert("hooks".to_string(), Value::Object(hooks));
-    Ok(Value::Object(root))
+    super::codex_hooks::remove_codex_notice_hooks_from_document_for_platform(
+        &loaded.value,
+        path,
+        &managed_binary_path(),
+        cfg!(windows),
+    )
 }
 
 fn antigravity_hook_entry(binary: &str) -> Value {
@@ -1393,16 +1400,11 @@ fn remove_antigravity_hooks(loaded: &safe_edit::LoadedConfig, path: &Path) -> Re
 }
 
 fn validate_codex_notice_hooks(value: &Value) -> std::result::Result<usize, String> {
-    let groups = value
-        .get("hooks")
-        .and_then(|hooks| hooks.get("PreToolUse"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| "no PreToolUse hooks".to_string())?;
-    if groups.iter().any(is_codex_notice_hook_group) {
-        Ok(1)
-    } else {
-        Err("the mid-run notice hook is not installed".to_string())
-    }
+    super::codex_hooks::validate_codex_notice_hooks_for_platform(
+        value,
+        &managed_binary_path(),
+        cfg!(windows),
+    )
 }
 
 /// Whether setup and doctor see the published plugin's `hooks.json` as
@@ -2080,13 +2082,17 @@ const CURSOR_ENFORCEMENT_CRITICAL_EVENTS: &[&str] = &[
     "preCompact",
 ];
 
-fn hook_command(binary: &str, hook_name: &str) -> String {
+pub(super) fn hook_command_for_platform(binary: &str, hook_name: &str, windows: bool) -> String {
     format!(
         "\"{}\" hook {} {}",
-        escape_for_double_quotes(binary),
+        escape_for_double_quotes_for_platform(binary, windows),
         hook_name,
         MANAGED_HOOK_ARGUMENT
     )
+}
+
+fn hook_command(binary: &str, hook_name: &str) -> String {
+    hook_command_for_platform(binary, hook_name, cfg!(windows))
 }
 
 fn push_claude_hook(config: &mut ClaudeHooksConfig, spec: ClaudeHookSpec, binary: &str) {
@@ -2363,7 +2369,7 @@ fn is_contextstream_hook(hook: &HookEntry) -> bool {
         .any(|command| is_owned_contextstream_hook_command(&command.command))
 }
 
-fn parse_hook_command(command: &str) -> Option<(&str, &str)> {
+pub(super) fn parse_hook_command(command: &str) -> Option<(&str, &str)> {
     let command = command.trim();
     let (program, rest) = if let Some(quoted) = command.strip_prefix('"') {
         let mut escaped = false;
@@ -2438,17 +2444,36 @@ pub(super) fn contains_owned_hook_command(value: &Value) -> bool {
     match value {
         Value::Array(items) => items.iter().any(contains_owned_hook_command),
         Value::Object(object) => {
+            let managed = managed_binary_path();
             object
                 .get("command")
                 .and_then(Value::as_str)
-                .is_some_and(is_owned_contextstream_hook_command)
+                .is_some_and(|cmd| {
+                    is_owned_contextstream_hook_command(cmd)
+                        || super::codex_hooks::is_owned_codex_hook_command_for_platform(
+                            cmd,
+                            &managed,
+                            cfg!(windows),
+                        )
+                })
+                || object
+                    .get("commandWindows")
+                    .or_else(|| object.get("command_windows"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|cmd| {
+                        super::codex_hooks::is_owned_codex_hook_command_for_platform(
+                            cmd,
+                            &managed,
+                            cfg!(windows),
+                        )
+                    })
                 || object.values().any(contains_owned_hook_command)
         }
         _ => false,
     }
 }
 
-fn current_managed_hook_name(command: &str) -> Option<&str> {
+pub(super) fn current_managed_hook_name(command: &str) -> Option<&str> {
     let command = command.trim().strip_prefix("& ").unwrap_or(command.trim());
     let (_, rest) = parse_hook_command(without_quiet_guard(command))?;
     let mut args = rest.split_whitespace();

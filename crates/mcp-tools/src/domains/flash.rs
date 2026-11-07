@@ -95,25 +95,28 @@ impl FlashTool {
     /// connection's own (the session init or context started). A customer's
     /// `instruct(action="get")` without it failed with "session_id is
     /// required" (2026-11-02) although the connection knew its session.
-    async fn session_id_for(&self, input: Option<String>) -> Result<String> {
+    async fn resolve_session_id(&self, input: Option<String>) -> Option<String> {
         if let Some(given) = input
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
         {
-            return Ok(given);
+            return Some(given);
         }
         self.session
             .state()
             .await
             .session_id
             .filter(|own| !own.trim().is_empty())
-            .ok_or_else(|| {
-                Error::Validation(
-                    "session_id is required: pass the session_id that init or context returned \
-                     (this connection has no session yet; call init first)."
-                        .to_string(),
-                )
-            })
+    }
+
+    async fn session_id_for(&self, input: Option<String>) -> Result<String> {
+        self.resolve_session_id(input).await.ok_or_else(|| {
+            Error::Validation(
+                "session_id is required: pass the session_id that init or context returned \
+                 (this connection has no session yet; call init first)."
+                    .to_string(),
+            )
+        })
     }
 
     fn map_entries(entries: Vec<FlashEntryInput>) -> Vec<FlashPushEntry> {
@@ -369,6 +372,43 @@ fn workspace_drift_stats_result(
     ToolResult::with_structured(text, payload)
 }
 
+const MISSING_SESSION_HINT: &str = "Pass the session_id that init or context returned. \
+Stateless hosted HTTP connections and pre-init turn-1 calls have no active connection session; \
+call init(folder_path=\"...\") first on turn 1 and pass its session_id explicitly on every instruct call.";
+
+/// Safe empty-result fallback for `instruct(get)` when `session_id` was omitted
+/// on a stateless connection (such as Codex over hosted HTTP) or before `init`
+/// has established a session. Returning 0 entries with a clear hint avoids
+/// surfacing a red tool-call failure on turn 1 while keeping scope fail-closed.
+fn missing_session_get_result(workspace_id: Option<Uuid>, project_id: Option<Uuid>) -> ToolResult {
+    let text = format!("Loaded 0 instruction entries. {MISSING_SESSION_HINT}");
+    let payload = serde_json::json!({
+        "entries": [],
+        "session_id": Value::Null,
+        "workspace_id": workspace_id.map(|id| id.to_string()),
+        "project_id": project_id.map(|id| id.to_string()),
+        "scope_status": "missing_session",
+        "bootstrapped": false,
+        "hint": MISSING_SESSION_HINT,
+    });
+    ToolResult::with_structured(text, payload)
+}
+
+/// Safe empty-result fallback for `instruct(stats)` when no session is active.
+fn missing_session_stats_result(workspace_id: Option<Uuid>) -> ToolResult {
+    let text = format!("Session stats loaded (version 0, instructions 0). {MISSING_SESSION_HINT}");
+    let payload = serde_json::json!({
+        "version": 0,
+        "instruction_count": 0,
+        "session_id": Value::Null,
+        "workspace_id": workspace_id.map(|id| id.to_string()),
+        "scope_status": "missing_session",
+        "bootstrapped": false,
+        "hint": MISSING_SESSION_HINT,
+    });
+    ToolResult::with_structured(text, payload)
+}
+
 #[async_trait]
 impl ToolHandler for FlashTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
@@ -378,7 +418,35 @@ impl ToolHandler for FlashTool {
         let action = input.action.to_lowercase();
         let explicit_workspace_id = Self::parse_scope_id(&input.workspace_id, "workspace_id")?;
         let explicit_project_id = Self::parse_scope_id(&input.project_id, "project_id")?;
-        let session_id = self.session_id_for(input.session_id).await?;
+        let resolved_session_id = self.resolve_session_id(input.session_id).await;
+        let Some(session_id) = resolved_session_id else {
+            return match action.as_str() {
+                "get" => Ok(missing_session_get_result(
+                    explicit_workspace_id,
+                    explicit_project_id,
+                )),
+                "stats" => Ok(missing_session_stats_result(explicit_workspace_id)),
+                "ack" if input.ids.as_ref().is_none_or(Vec::is_empty) => {
+                    let text =
+                        format!("Acknowledged 0 instruction entries. {MISSING_SESSION_HINT}");
+                    Ok(ToolResult::with_structured(
+                        text,
+                        serde_json::json!({
+                            "acked": 0,
+                            "session_id": Value::Null,
+                            "scope_status": "missing_session",
+                            "hint": MISSING_SESSION_HINT,
+                        }),
+                    ))
+                }
+                _ if !VALID_ACTIONS.contains(&action.as_str()) => Err(Error::Validation(format!(
+                    "Unknown action: {}. Available actions: {}",
+                    action,
+                    VALID_ACTIONS.join(", ")
+                ))),
+                _ => self.session_id_for(None).await.map(|_| unreachable!()),
+            };
+        };
 
         let scope = self
             .resolve_or_bootstrap_scope(explicit_workspace_id, explicit_project_id, &session_id)
@@ -646,7 +714,7 @@ impl ToolHandler for FlashTool {
             )
             .string(
                 "session_id",
-                "The session_id init or context returned. Defaults to this connection's session.",
+                "The session_id init or context returned. Always pass it explicitly after init/context (required on stateless hosted HTTP and before init; stateful local stdio connections default to their active session).",
                 false,
             )
             .integer("limit", "Maximum entries (for get)", false)
@@ -945,14 +1013,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flash_tool_requires_session_id() {
+    async fn flash_tool_degrades_reads_without_session_id_and_requires_it_for_writes() {
         let tool = make_tool();
-        let result = tool.execute(serde_json::json!({ "action": "get" })).await;
-        assert!(result.is_err());
-        let message = result.unwrap_err().to_string();
-        assert!(message.contains("session_id"), "{message}");
-        // It says where the id comes from.
-        assert!(message.contains("init or context returned"), "{message}");
+
+        // Stateless / pre-init read calls (like Codex over hosted HTTP or turn-1
+        // parallel calls) degrade to a clean 0-entry result with an actionable
+        // hint instead of surfacing a red Validation error.
+        let get_res = tool
+            .execute(serde_json::json!({
+                "action": "get",
+                "workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+                "project_id": "550e8400-e29b-41d4-a716-446655440001"
+            }))
+            .await
+            .expect("get without session_id should degrade cleanly");
+        assert!(!get_res.is_error);
+        let get_payload = get_res.structured_content.expect("structured get payload");
+        assert_eq!(get_payload["entries"], serde_json::json!([]));
+        assert_eq!(get_payload["scope_status"], "missing_session");
+        assert_eq!(get_payload["session_id"], Value::Null);
+        assert!(get_payload["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("init or context returned"));
+
+        let stats_res = tool
+            .execute(serde_json::json!({ "action": "stats" }))
+            .await
+            .expect("stats without session_id should degrade cleanly");
+        assert!(!stats_res.is_error);
+        assert_eq!(
+            stats_res.structured_content.expect("structured stats")["scope_status"],
+            "missing_session"
+        );
+
+        let empty_ack_res = tool
+            .execute(serde_json::json!({ "action": "ack", "ids": [] }))
+            .await
+            .expect("empty ack without session_id is a safe no-op");
+        assert!(!empty_ack_res.is_error);
+
+        // Mutating / verification actions still fail closed when no session exists.
+        for write_call in [
+            serde_json::json!({ "action": "bootstrap" }),
+            serde_json::json!({ "action": "push", "entries": [{ "text": "rule" }] }),
+            serde_json::json!({ "action": "ack", "ids": ["entry-1"] }),
+            serde_json::json!({ "action": "checkpoint" }),
+            serde_json::json!({ "action": "verify" }),
+        ] {
+            let err = tool
+                .execute(write_call.clone())
+                .await
+                .expect_err(&format!("expected validation error for {write_call}"));
+            let message = err.to_string();
+            assert!(message.contains("session_id"), "{message}");
+            assert!(message.contains("init or context returned"), "{message}");
+        }
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ pub mod clients;
 pub fn export_antigravity_plugin(out: Option<&std::path::Path>, json: bool) -> anyhow::Result<()> {
     antigravity_plugin::export(out, json)
 }
+pub mod codex_hooks;
 mod credentials;
 pub mod doctor;
 pub mod editors;
@@ -1387,8 +1388,8 @@ pub async fn update_hooks_scoped(
         // Each installer removes only exact managed entries in memory and
         // commits once. Avoiding an uninstall/install pair preserves the
         // original recovery backup and makes refreshes true no-ops.
-        match hooks::install_hooks(editor, None) {
-            Ok(()) => {
+        match hooks::install_hooks_with_note(editor, None) {
+            Ok(note) => {
                 let name = editor.display_name();
                 refresh_note!(
                     "{}",
@@ -1397,6 +1398,9 @@ pub async fn update_hooks_scoped(
                         format!("Hooks would be updated for {name}"),
                     )
                 );
+                if let Some(guidance) = note {
+                    refresh_note!("{}    {}", ui::GUTTER, ui::ui().faint(&guidance));
+                }
                 updated_count += 1;
             }
             Err(e) => {
@@ -4595,9 +4599,12 @@ pub(crate) async fn configure_editor_with_workspace_and_project_name(
 
     // Install hooks only after the executable they reference is known-good.
     if editor.installs_hooks() && helper_ready {
-        match hooks::install_hooks(editor, Some(api_key)) {
-            Ok(()) => {
+        match hooks::install_hooks_with_note(editor, Some(api_key)) {
+            Ok(note) => {
                 saved_items.push("hooks");
+                if let Some(guidance) = note {
+                    rules_notes.push(guidance);
+                }
             }
             Err(e) => {
                 warn!(
@@ -7590,6 +7597,9 @@ mod tests {
 
     #[test]
     fn sibling_checkout_matching_reuses_canonical_worktree_project_and_skips_subpackages() {
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let main_repo = temp.path().join("myapp");
         std::fs::create_dir_all(&main_repo).expect("create main repo");

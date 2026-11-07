@@ -1004,14 +1004,180 @@ fn windsurf_entry_keys_valid(entry: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Check the hooks surface for one editor: the hook entries, and the helper
-/// binary they all call.
+/// Check the hooks surface for one editor: the hook entries, the helper binary
+/// they all call, and (for Codex) live shell execution + trust status.
 fn check_hooks(editor: &Editor) -> SurfaceCheck {
+    if matches!(editor, Editor::Codex) {
+        return check_codex_hooks();
+    }
     let check = check_hooks_config(editor);
     if super::hooks::hooks_run_from_path(editor) {
         return with_path_helper_check(check, super::hooks::path_helper_problem());
     }
     with_helper_check(check, super::hooks::managed_helper_problem())
+}
+
+fn check_codex_hooks() -> SurfaceCheck {
+    const SURFACE: &str = "hooks";
+    let fix = "contextstream-mcp update-hooks --scope global --editors codex";
+    let Some(path) = super::hooks::hook_config_path(&Editor::Codex) else {
+        return SurfaceCheck::skipped(SURFACE, "no hook config path for this editor");
+    };
+    check_codex_hooks_at(
+        &path,
+        super::codex_hooks::codex_config_toml_path().as_deref(),
+        &super::hooks::managed_binary_path(),
+        super::hooks::managed_helper_problem(),
+        fix,
+    )
+}
+
+fn check_codex_hooks_at(
+    path: &Path,
+    config_toml_path: Option<&Path>,
+    managed_binary: &Path,
+    helper_problem: Option<String>,
+    fix: &str,
+) -> SurfaceCheck {
+    const SURFACE: &str = "hooks";
+    if !path.exists() {
+        return SurfaceCheck::problem(
+            SURFACE,
+            CheckStatus::Fail,
+            "hooks file missing",
+            Some(path),
+            fix,
+        );
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) => {
+            return SurfaceCheck::problem(
+                SURFACE,
+                CheckStatus::Fail,
+                format!("unreadable: {error}"),
+                Some(path),
+                fix,
+            );
+        }
+    };
+    let parsed = match try_parse_json_like(&content) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return SurfaceCheck::problem(
+                SURFACE,
+                CheckStatus::Fail,
+                format!("does not parse: {error}"),
+                Some(path),
+                fix,
+            );
+        }
+    };
+
+    if let Err(missing_detail) = super::codex_hooks::find_installed_codex_notice_handler(
+        &parsed,
+        managed_binary,
+        cfg!(windows),
+    ) {
+        return SurfaceCheck::problem(SURFACE, CheckStatus::Fail, missing_detail, Some(path), fix);
+    }
+
+    if let Some(problem) = helper_problem {
+        return SurfaceCheck::problem(
+            SURFACE,
+            CheckStatus::Fail,
+            format!(
+                "the helper binary the hooks run is unusable: {problem}, so every hook fails silently"
+            ),
+            Some(managed_binary),
+            "contextstream-mcp doctor --repair",
+        );
+    }
+
+    let schema_result = super::codex_hooks::validate_codex_notice_hooks_for_platform(
+        &parsed,
+        managed_binary,
+        cfg!(windows),
+    );
+    let probe_result =
+        super::codex_hooks::probe_installed_codex_hook_for_doctor(path, &parsed, managed_binary);
+
+    match (schema_result, probe_result) {
+        (Err(schema_err), Err(probe_err)) => SurfaceCheck::problem(
+            SURFACE,
+            CheckStatus::Fail,
+            format!("{schema_err}; live shell probe failed: {probe_err}"),
+            Some(path),
+            fix,
+        ),
+        (Err(schema_err), Ok(())) => {
+            SurfaceCheck::problem(SURFACE, CheckStatus::Fail, schema_err, Some(path), fix)
+        }
+        (Ok(_), Err(probe_err)) => SurfaceCheck::problem(
+            SURFACE,
+            CheckStatus::Fail,
+            format!("live Codex hook execution failed: {probe_err}"),
+            Some(path),
+            "contextstream-mcp doctor --repair --scope global --editors codex",
+        ),
+        (Ok(count), Ok(())) => {
+            match super::codex_hooks::inspect_codex_hook_trust_for_platform(
+                path,
+                &parsed,
+                config_toml_path,
+                managed_binary,
+                cfg!(windows),
+            ) {
+                Ok(super::codex_hooks::CodexHookTrustState::Trusted { .. }) => SurfaceCheck::pass(
+                    SURFACE,
+                    format!(
+                        "{count} current managed hook entries installed; shell execution verified; trusted in Codex"
+                    ),
+                    Some(path),
+                ),
+                Ok(super::codex_hooks::CodexHookTrustState::Modified { .. }) => {
+                    SurfaceCheck::warning(
+                        SURFACE,
+                        "hook execution verified, but the hook command changed since Codex last trusted it; run /hooks in Codex CLI to review/approve and reload your Codex session",
+                        Some(path),
+                        None,
+                    )
+                }
+                Ok(super::codex_hooks::CodexHookTrustState::Untrusted { .. }) => {
+                    SurfaceCheck::warning(
+                        SURFACE,
+                        "hook execution verified, but Codex has not recorded trust for this hook yet; run /hooks in Codex CLI to review/approve and reload your Codex session",
+                        Some(path),
+                        None,
+                    )
+                }
+                Ok(super::codex_hooks::CodexHookTrustState::DisabledByHookState { .. }) => {
+                    SurfaceCheck::warning(
+                        SURFACE,
+                        "hook execution verified, but this hook is disabled in ~/.codex/config.toml ([hooks.state]); re-enable via /hooks in Codex CLI and reload your Codex session",
+                        Some(path),
+                        None,
+                    )
+                }
+                Ok(super::codex_hooks::CodexHookTrustState::DisabledByFeatureFlag { .. }) => {
+                    SurfaceCheck::warning(
+                        SURFACE,
+                        "hook execution verified, but Codex hooks are disabled (`[features].codex_hooks = false` in ~/.codex/config.toml); set `codex_hooks = true` and reload Codex",
+                        Some(path),
+                        None,
+                    )
+                }
+                Err(error) => SurfaceCheck::warning(
+                    SURFACE,
+                    format!(
+                        "hook execution verified, but could not inspect Codex trust state in ~/.codex/config.toml: {error}"
+                    ),
+                    Some(path),
+                    None,
+                ),
+            }
+        }
+    }
 }
 
 /// The same for hooks that run `contextstream-mcp` from the PATH (the public
@@ -3224,13 +3390,32 @@ fn repair_report_lines(repair: &DoctorRepairReport) -> Vec<String> {
             status_glyph(CheckStatus::Pass)
         ));
     }
+    let mut touched_codex_hooks = false;
     for change in &repair.changes {
+        let normalized_path = change.path.replace('\\', "/");
+        if normalized_path.ends_with("/.codex/hooks.json") || normalized_path == ".codex/hooks.json"
+        {
+            touched_codex_hooks = true;
+        }
         lines.push(format!(
             "{}{} {} {}",
             super::ui::GUTTER,
             ui.accent("→"),
             change.action,
             ui.faint(&change.path)
+        ));
+    }
+    if touched_codex_hooks && repair.failures.is_empty() {
+        let note = if repair.mode == "dry_run" {
+            "After applying Codex hook changes, run /hooks in Codex CLI to review/approve the updated hook and reload your Codex session."
+        } else {
+            "Codex hook updated: run /hooks in Codex CLI to review/approve the updated hook if prompted, then reload your Codex session."
+        };
+        lines.push(format!(
+            "{}{} {}",
+            super::ui::GUTTER,
+            ui.accent("·"),
+            ui.faint(note)
         ));
     }
     for failure in &repair.failures {
@@ -5308,5 +5493,216 @@ mod tests {
         } else {
             std::env::remove_var("HOME");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_hooks_doctor_check_executes_command_and_verifies_exit_output_timeout_and_trust() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let space_quote_dir = temp
+            .path()
+            .join("Program Files (x86)")
+            .join("O'Brien's Tools");
+        std::fs::create_dir_all(&space_quote_dir).expect("create dir");
+        let helper = space_quote_dir.join("mock-cs-mcp.sh");
+        let hooks_path = temp.path().join(".codex").join("hooks.json");
+        let config_path = temp.path().join(".codex").join("config.toml");
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+
+        let write_helper = |body: &str| {
+            std::fs::write(&helper, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let mut perms = std::fs::metadata(&helper).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&helper, perms).unwrap();
+        };
+
+        let write_hooks_with_timeout = |timeout_secs: u64| {
+            let mut doc = super::super::codex_hooks::update_codex_hooks_document_for_platform(
+                &serde_json::Value::Null,
+                &hooks_path,
+                &helper.to_string_lossy(),
+                &helper,
+                false,
+            )
+            .unwrap()
+            .0;
+            doc["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = serde_json::json!(timeout_secs);
+            std::fs::write(&hooks_path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+            doc
+        };
+
+        // 1. Non-zero exit with PowerShell-style stderr -> Fail.
+        write_helper("echo \"Unexpected token 'hook' in expression or statement.\" >&2; exit 1");
+        write_hooks_with_timeout(5);
+        let check = check_codex_hooks_at(
+            &hooks_path,
+            Some(&config_path),
+            &helper,
+            None,
+            "contextstream-mcp update-hooks --scope global --editors codex",
+        );
+        assert_eq!(check.status, CheckStatus::Fail, "{check:?}");
+        assert!(
+            check.detail.contains("Unexpected token 'hook'"),
+            "{}",
+            check.detail
+        );
+
+        // 2. Invalid Codex PreToolUse JSON output (unsupported field) -> Fail.
+        write_helper("cat >/dev/null; printf '%s\\n' '{\"user_message\":\"not-codex\"}'");
+        let check = check_codex_hooks_at(
+            &hooks_path,
+            Some(&config_path),
+            &helper,
+            None,
+            "contextstream-mcp update-hooks --scope global --editors codex",
+        );
+        assert_eq!(check.status, CheckStatus::Fail, "{check:?}");
+        assert!(
+            check.detail.contains("unsupported Codex PreToolUse field"),
+            "{}",
+            check.detail
+        );
+
+        // 3. Command exceeding timeout -> Fail.
+        write_helper("sleep 3; printf '{}'");
+        write_hooks_with_timeout(1);
+        let check = check_codex_hooks_at(
+            &hooks_path,
+            Some(&config_path),
+            &helper,
+            None,
+            "contextstream-mcp update-hooks --scope global --editors codex",
+        );
+        assert_eq!(check.status, CheckStatus::Fail, "{check:?}");
+        assert!(check.detail.contains("timed out"), "{}", check.detail);
+
+        // 4. Valid stdin->stdout execution, untrusted -> Warn with fix: None.
+        write_helper(
+            "stdin_payload=$(cat); case \"$stdin_payload\" in *PreToolUse*) printf '{}' ;; *) exit 2 ;; esac",
+        );
+        let doc = write_hooks_with_timeout(5);
+        let untrusted = check_codex_hooks_at(
+            &hooks_path,
+            Some(&config_path),
+            &helper,
+            None,
+            "contextstream-mcp update-hooks --scope global --editors codex",
+        );
+        assert_eq!(untrusted.status, CheckStatus::Warn, "{untrusted:?}");
+        assert!(
+            untrusted.fix.is_none(),
+            "trust review is an interactive Codex step"
+        );
+        assert!(untrusted.detail.contains("/hooks"), "{}", untrusted.detail);
+
+        // 5. Stale trusted_hash -> Warn (modified).
+        let state_key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        std::fs::write(
+            &config_path,
+            format!(
+                "[hooks.state.{state_key:?}]\nenabled = true\ntrusted_hash = \"sha256:0000\"\n"
+            ),
+        )
+        .unwrap();
+        let modified = check_codex_hooks_at(
+            &hooks_path,
+            Some(&config_path),
+            &helper,
+            None,
+            "contextstream-mcp update-hooks --scope global --editors codex",
+        );
+        assert_eq!(modified.status, CheckStatus::Warn, "{modified:?}");
+        assert!(
+            modified
+                .detail
+                .contains("changed since Codex last trusted it"),
+            "{}",
+            modified.detail
+        );
+
+        // 6. Feature flag disabled -> Warn.
+        let group = &doc["hooks"]["PreToolUse"][0];
+        let handler = &group["hooks"][0];
+        let current_hash = super::super::codex_hooks::codex_hook_identity_hash_for_platform(
+            group,
+            handler,
+            cfg!(windows),
+        )
+        .expect("codex hook identity hash");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[features]\ncodex_hooks = false\n\n[hooks.state.{state_key:?}]\nenabled = true\ntrusted_hash = {current_hash:?}\n"
+            ),
+        )
+        .unwrap();
+        let disabled_flag = check_codex_hooks_at(
+            &hooks_path,
+            Some(&config_path),
+            &helper,
+            None,
+            "contextstream-mcp update-hooks --scope global --editors codex",
+        );
+        assert_eq!(disabled_flag.status, CheckStatus::Warn, "{disabled_flag:?}");
+        assert!(
+            disabled_flag.detail.contains("codex_hooks = false"),
+            "{}",
+            disabled_flag.detail
+        );
+
+        // 7. Matching trusted_hash + enabled -> Pass.
+        std::fs::write(
+            &config_path,
+            format!(
+                "[features]\ncodex_hooks = true\n\n[hooks.state.{state_key:?}]\nenabled = true\ntrusted_hash = {current_hash:?}\n"
+            ),
+        )
+        .unwrap();
+        let trusted = check_codex_hooks_at(
+            &hooks_path,
+            Some(&config_path),
+            &helper,
+            None,
+            "contextstream-mcp update-hooks --scope global --editors codex",
+        );
+        assert_eq!(trusted.status, CheckStatus::Pass, "{trusted:?}");
+        assert!(
+            trusted.detail.contains("shell execution verified"),
+            "{}",
+            trusted.detail
+        );
+    }
+
+    #[test]
+    fn repair_report_lines_explains_codex_trust_review_when_hooks_json_changes() {
+        let applied = DoctorRepairReport {
+            mode: "apply",
+            operations: vec!["hooks"],
+            changes: vec![RepairChange {
+                path: r"C:\Users\O'Brien\.codex\hooks.json".to_string(),
+                action: "modified",
+            }],
+            failures: Vec::new(),
+        };
+        let rendered = repair_report_lines(&applied).join("\n");
+        assert!(rendered.contains("/hooks"), "{rendered}");
+        assert!(rendered.contains("reload your Codex session"), "{rendered}");
+
+        let preview = DoctorRepairReport {
+            mode: "dry_run",
+            operations: vec!["hooks"],
+            changes: vec![RepairChange {
+                path: "/home/dev/.codex/hooks.json".to_string(),
+                action: "would_modify",
+            }],
+            failures: Vec::new(),
+        };
+        let preview_rendered = repair_report_lines(&preview).join("\n");
+        assert!(preview_rendered.contains("/hooks"), "{preview_rendered}");
     }
 }

@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::api::{unreachable, CALL_TIMEOUT};
+use super::api::{unreachable, CALL_TIMEOUT, WRITER_TIMEOUT};
 use super::words::{clip, credits};
 use super::{parse_id, StudioInput, StudioTool, ELICIT_TIMEOUT, MAX_PROMPT_CHARS, TOOL_NAME};
 use crate::domains::destructive::DELETE_TOOL;
@@ -814,7 +814,7 @@ impl StudioTool {
                 &format!("/create/email{path}"),
                 body,
                 key,
-                CALL_TIMEOUT,
+                email_call_timeout(method, path),
             )
             .await
             .map_err(unreachable)
@@ -2935,5 +2935,42 @@ impl StudioTool {
             ),
             json!({"removed": true, "email": email, "was": reason}),
         ))
+    }
+}
+
+/// How long one email call may take: the studio's writer drafts and revises
+/// with its writer model, and everything else is an ordinary call.
+fn email_call_timeout(method: &str, path: &str) -> std::time::Duration {
+    let writes = method == "POST"
+        && (path == "/campaigns/draft"
+            || (path.starts_with("/campaigns/")
+                && (path.ends_with("/revise") || path.ends_with("/suggestions"))));
+    if writes {
+        WRITER_TIMEOUT
+    } else {
+        CALL_TIMEOUT
+    }
+}
+
+#[cfg(test)]
+mod writer_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn the_writer_gets_its_time_and_nothing_else_does() {
+        assert_eq!(
+            email_call_timeout("POST", "/campaigns/draft"),
+            WRITER_TIMEOUT
+        );
+        assert_eq!(
+            email_call_timeout("POST", "/campaigns/0b5e/revise"),
+            WRITER_TIMEOUT
+        );
+        assert_eq!(
+            email_call_timeout("POST", "/campaigns/0b5e/test"),
+            CALL_TIMEOUT
+        );
+        assert_eq!(email_call_timeout("GET", "/campaigns/draft"), CALL_TIMEOUT);
+        assert!(WRITER_TIMEOUT.as_secs() >= 100);
     }
 }

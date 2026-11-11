@@ -14,6 +14,10 @@ use super::words::{credits, quote_problem};
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long an image upload may take.
 pub(crate) const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the studio's email writer may take to draft or revise: it writes
+/// with Claude Fable 5.2 at extra-high effort (then Kimi K3.1 Pro) and the API
+/// answers within 100 s. The ordinary 30 s cut a draft off mid-write.
+pub(crate) const WRITER_TIMEOUT: Duration = Duration::from_secs(110);
 
 /// What a refused call was about, for its sentence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

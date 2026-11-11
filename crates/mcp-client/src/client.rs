@@ -32559,6 +32559,12 @@ mod tests {
 
     #[test]
     fn project_ingest_lease_coalesces_every_caller() {
+        // The lease's lock file lives under HOME, which other tests point at
+        // folders of their own and remove: hold their lock, or this test writes
+        // into their folder and finds its own gone (release gate, 2026-11-11).
+        let _guard = env_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let project_id = Uuid::new_v4();
         let first = ProjectIngestLease::acquire(project_id).expect("first lease");
         let refused = ProjectIngestLease::acquire(project_id).expect_err("coalesced");

@@ -4,7 +4,7 @@
 
 - Release builds: the six release binaries now build side by side on one builder. The Windows build's cargo-xwin cache was shared by all six with a lock, so each binary waited for the one before it. The binaries themselves are built as in 1.0.72; this version changes no behaviour.
 - Dependencies: rustix 1.1.6 (RUSTSEC-2026-0486: its xattr functions marked unwritten bytes as initialized when given a zero-length buffer).
-- Tests: three hash-manifest tests no longer fail when another test writes under the shared `HOME` while their fixture is removed.
+- Tests: the ingest-lease test takes the `HOME` lock the other tests take, and three hash-manifest tests remove their fixture best effort, so the release gate no longer fails when tests run side by side on many cores.
 
 ## 1.0.72
 

@@ -4,6 +4,7 @@
 
 - Release builds: the six release binaries now build side by side on one builder. The Windows build's cargo-xwin cache was shared by all six with a lock, so each binary waited for the one before it. The binaries themselves are built as in 1.0.72; this version changes no behaviour.
 - Dependencies: rustix 1.1.6 (RUSTSEC-2026-0486: its xattr functions marked unwritten bytes as initialized when given a zero-length buffer).
+- Tests: three hash-manifest tests no longer fail when another test writes under the shared `HOME` while their fixture is removed.
 
 ## 1.0.72
 

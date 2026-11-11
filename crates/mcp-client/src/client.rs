@@ -32776,7 +32776,9 @@ mod tests {
         );
         assert_eq!(invalidated.len(), 2);
 
-        std::fs::remove_dir_all(temp_home).expect("clean manifest fixture");
+        // Best effort: HOME is process-wide, so a test running beside this one can write under it while the
+        // fixture is removed (ENOTEMPTY, release gate of 2026-11-11 08:53Z). The assertions above are the test.
+        let _ = std::fs::remove_dir_all(temp_home);
     }
 
     #[test]
@@ -32830,7 +32832,9 @@ mod tests {
             );
         }
 
-        std::fs::remove_dir_all(temp_home).expect("clean manifest fixture");
+        // Best effort: HOME is process-wide, so a test running beside this one can write under it while the
+        // fixture is removed (ENOTEMPTY, release gate of 2026-11-11 08:53Z). The assertions above are the test.
+        let _ = std::fs::remove_dir_all(temp_home);
     }
 
     #[test]
@@ -32904,7 +32908,9 @@ mod tests {
         assert!(!ContextStreamClient::read_hash_manifest(&scope_other_workspace).is_empty());
         assert!(!ContextStreamClient::read_hash_manifest(&scope_other_checkout).is_empty());
 
-        std::fs::remove_dir_all(temp_home).expect("clean manifest fixture");
+        // Best effort: HOME is process-wide, so a test running beside this one can write under it while the
+        // fixture is removed (ENOTEMPTY, release gate of 2026-11-11 08:53Z). The assertions above are the test.
+        let _ = std::fs::remove_dir_all(temp_home);
     }
 
     #[cfg(unix)]

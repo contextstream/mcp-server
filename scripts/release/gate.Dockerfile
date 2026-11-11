@@ -54,6 +54,9 @@ USER runner
 RUN mkdir -p /home/runner/.cache/cargo-xwin
 
 # One release binary (scripts/release/build.sh <artifact> <version>), exported by the stage binary as /<artifact>.
+# Every cache mount a binary locks is its own (its id names the artifact), so the six binaries of a release build side by
+# side on one builder. Until 1.0.72 cargo-xwin's mount was one for all six, and its lock made each build wait for the one
+# before it: the six ended one after another, each about 5 to 6 minutes after the last.
 FROM build-env AS build
 ENV CARGO_HOME=/home/runner/.cargo CI=true
 WORKDIR /home/runner/src
@@ -63,7 +66,7 @@ ARG VERSION
 ARG SOURCE_DATE_EPOCH
 RUN --mount=type=cache,id=mcp-cargo-home,target=/home/runner/.cargo,uid=1001,gid=1001 \
     --mount=type=cache,id=mcp-build-target-${ARTIFACT},target=/home/runner/src/target,uid=1001,gid=1001,sharing=locked \
-    --mount=type=cache,id=mcp-build-xwin,target=/home/runner/.cache/cargo-xwin,uid=1001,gid=1001,sharing=locked \
+    --mount=type=cache,id=mcp-build-xwin-${ARTIFACT},target=/home/runner/.cache/cargo-xwin,uid=1001,gid=1001,sharing=locked \
     git config --global --add safe.directory '*' && bash scripts/release/build.sh "$ARTIFACT" "$VERSION"
 
 FROM scratch AS binary

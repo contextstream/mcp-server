@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.74
+
+- Plan loops: the `session` tool can run a saved plan as a loop with review gates: `start_loop`, `loop_status`, `advance_loop`, `resolve_gate` (approve, request changes with a note, or abort), `abort_loop`, `resume_loop` and `list_loops`. The server keeps no loop state: every action calls the ContextStream API with your own key, the API answers `plan_version_conflict` when the plan changed under a running loop (resume it), and resolving a gate the same way twice changes nothing. `loop_status` and `list_loops` are also on `session_read`.
+
 ## 1.0.73
 
 - Release builds: the six release binaries now build side by side on one builder. The Windows build's cargo-xwin cache was shared by all six with a lock, so each binary waited for the one before it. The binaries themselves are built as in 1.0.72; this version changes no behaviour.

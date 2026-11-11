@@ -199,7 +199,7 @@ pub fn parse_canonical_codex_windows_hook_command(command: &str) -> Option<(Stri
     }
 }
 
-fn is_valid_hook_identifier(name: &str) -> bool {
+pub(super) fn is_valid_hook_identifier(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -248,11 +248,19 @@ pub fn managed_codex_hook_name_in_command(command: &str) -> Option<String> {
 }
 
 fn parse_unmarked_program_and_rest(command: &str) -> Option<(String, &str)> {
+    parse_program_and_rest(command)
+}
+
+/// Split a hook command into its program and the rest. The program may be
+/// bare, `"double quoted"`, PowerShell `'single quoted'` or a
+/// [`powershell_safe_path_expression`], optionally after PowerShell's `&`
+/// call operator.
+pub(super) fn parse_program_and_rest(command: &str) -> Option<(String, &str)> {
     let trimmed = command.trim();
     if let Some(after_amp) = trimmed.strip_prefix('&') {
         let after_amp = after_amp.trim_start();
-        if after_amp.starts_with('\'') {
-            let (program, rest) = parse_powershell_single_quoted(after_amp)?;
+        if after_amp.starts_with('\'') || after_amp.starts_with('(') {
+            let (program, rest) = parse_powershell_safe_path_expression(after_amp)?;
             return Some((program, rest.trim()));
         }
         if let Some((program, rest)) = parse_hook_command(after_amp) {
@@ -291,14 +299,33 @@ fn parse_unmarked_rsplit_hook_command(command: &str) -> Option<(String, &str)> {
     Some((prog.to_string(), hook_name))
 }
 
-fn program_matches_managed_binary(program: &str, managed_binary: &Path, windows: bool) -> bool {
+/// Whether a hook's program is the managed binary. On Windows the comparison
+/// ignores case, `\\?\` prefixes, `/` versus `\`, and backslashes that an
+/// older release doubled (`C:\\Users\\...` after JSON decoding).
+pub(super) fn program_matches_managed_binary(
+    program: &str,
+    managed_binary: &Path,
+    windows: bool,
+) -> bool {
     let managed_str = managed_binary.to_string_lossy();
     if windows {
-        normalize_windows_executable_path(program)
-            .eq_ignore_ascii_case(&normalize_windows_executable_path(&managed_str))
+        comparable_windows_path(program)
+            .eq_ignore_ascii_case(&comparable_windows_path(&managed_str))
     } else {
         program == managed_str
     }
+}
+
+fn comparable_windows_path(path: &str) -> String {
+    let normalized = normalize_windows_executable_path(path).replace('/', "\\");
+    let mut out = String::with_capacity(normalized.len());
+    for ch in normalized.chars() {
+        if ch == '\\' && out.ends_with('\\') {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn is_legacy_unmarked_codex_command(

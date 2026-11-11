@@ -2324,6 +2324,18 @@ pub async fn update_rules_scoped(
 
         // Update global rules, where this machine keeps them.
         if scope == "global" || scope == "all" {
+            // Repair hooks a release wrote in a form the editor cannot run
+            // (or registered twice); files without our hooks stay untouched.
+            if editor.installs_hooks() {
+                match hooks::repair_stale_managed_hooks(editor) {
+                    Ok(true) => updated.push("hooks repaired"),
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!("hooks for {}: {}", editor.display_name(), e);
+                        failures.push(format!("{} hooks: {e}", editor.display_name()));
+                    }
+                }
+            }
             if let Some(kept) = rules::global_rules_left_without_block(editor) {
                 note!("{}", rules::global_rules_kept_line(editor, &kept));
             } else {

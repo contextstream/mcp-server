@@ -49,8 +49,13 @@ pub struct HookCommand {
     #[serde(rename = "type")]
     pub command_type: String,
 
-    /// Shell command to execute.
+    /// Shell command to execute or, with `args`, the program to spawn.
     pub command: String,
+
+    /// Exec form (Claude Code 2.1.139 and later): with `args`, Claude Code
+    /// spawns `command` directly with these arguments and no shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
 
     /// Timeout in seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -779,6 +784,16 @@ pub fn install_hooks(editor: &Editor, api_key: Option<&str>) -> Result<()> {
 /// entries we cannot parse survive untouched — an entry we cannot read is by
 /// definition not one we wrote, so it is preserved verbatim.
 fn strip_contextstream_hook_entries(hooks: &mut serde_json::Map<String, Value>) {
+    strip_contextstream_hook_entries_for_platform(hooks, &managed_binary_path(), cfg!(windows));
+}
+
+/// [`strip_contextstream_hook_entries`] for an explicit managed binary and
+/// platform, so tests can migrate Windows settings on any host.
+fn strip_contextstream_hook_entries_for_platform(
+    hooks: &mut serde_json::Map<String, Value>,
+    managed: &Path,
+    windows: bool,
+) {
     let keys: Vec<String> = hooks.keys().cloned().collect();
     for key in keys {
         let Some(Value::Array(entries)) = hooks.get(&key).cloned() else {
@@ -798,10 +813,7 @@ fn strip_contextstream_hook_entries(hooks: &mut serde_json::Map<String, Value>) 
 
                 let before = commands.len();
                 commands.retain(|command| {
-                    !command
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(is_owned_contextstream_hook_command)
+                    !is_owned_claude_handler_for_platform(command, managed, windows)
                 });
                 let removed_owned_command = commands.len() != before;
                 if removed_owned_command && commands.is_empty() {
@@ -828,7 +840,21 @@ fn merge_contextstream_hooks_into(
     hooks: &mut serde_json::Map<String, Value>,
     new_hooks: ClaudeHooksConfig,
 ) -> Result<()> {
-    strip_contextstream_hook_entries(hooks);
+    merge_contextstream_hooks_into_for_platform(
+        hooks,
+        new_hooks,
+        &managed_binary_path(),
+        cfg!(windows),
+    )
+}
+
+fn merge_contextstream_hooks_into_for_platform(
+    hooks: &mut serde_json::Map<String, Value>,
+    new_hooks: ClaudeHooksConfig,
+    managed: &Path,
+    windows: bool,
+) -> Result<()> {
+    strip_contextstream_hook_entries_for_platform(hooks, managed, windows);
 
     let generated = serde_json::to_value(&new_hooks)?;
     let Value::Object(generated) = generated else {
@@ -1202,6 +1228,7 @@ fn managed_hook_names_in(value: &Value) -> Vec<String> {
                 .get("command")
                 .and_then(Value::as_str)
                 .and_then(current_managed_hook_name)
+                .or_else(|| exec_form_managed_hook_name(object))
                 .map(|name| vec![name.to_string()])
                 .unwrap_or_default();
             for codex_name in
@@ -2095,14 +2122,120 @@ fn hook_command(binary: &str, hook_name: &str) -> String {
     hook_command_for_platform(binary, hook_name, cfg!(windows))
 }
 
-fn push_claude_hook(config: &mut ClaudeHooksConfig, spec: ClaudeHookSpec, binary: &str) {
+/// The arguments every managed hook runs with: `hook <name> <marker>`.
+fn managed_hook_args(hook_name: &str) -> Vec<String> {
+    vec![
+        "hook".to_string(),
+        hook_name.to_string(),
+        MANAGED_HOOK_ARGUMENT.to_string(),
+    ]
+}
+
+/// One Claude Code hook handler for `hook_name`.
+///
+/// Claude Code runs a shell-form `command` with Git Bash on Windows, and with
+/// PowerShell when Git Bash is not installed or the entry sets
+/// `"shell": "powershell"` (code.claude.com/docs/en/hooks). The two parse a
+/// quoted program differently: Bash runs `"C:\...\contextstream-mcp.exe" hook
+/// stop`, while PowerShell reads the quoted path as a string and fails on
+/// `hook`; PowerShell needs `& "C:\..." hook stop`, which Bash rejects. So on
+/// Windows the handler is in exec form: `command` is the executable and
+/// `args` its arguments, which Claude Code (2.1.139 and later) spawns directly
+/// with no shell. No shell's quoting applies, a path with spaces needs no
+/// quoting, and serde_json escapes each backslash exactly once. macOS and
+/// Linux keep the `sh -c` shell form.
+pub(super) fn claude_hook_handler_for_platform(
+    binary: &str,
+    hook_name: &str,
+    timeout: u64,
+    windows: bool,
+) -> HookCommand {
+    if windows {
+        return HookCommand {
+            command_type: "command".to_string(),
+            command: super::codex_hooks::normalize_windows_executable_path(binary),
+            args: Some(managed_hook_args(hook_name)),
+            timeout: Some(timeout),
+        };
+    }
+    HookCommand {
+        command_type: "command".to_string(),
+        command: hook_command_for_platform(binary, hook_name, false),
+        args: None,
+        timeout: Some(timeout),
+    }
+}
+
+/// The managed hook name of an exec-form handler: a non-empty `command` and
+/// `args` of exactly `["hook", <name>, MANAGED_HOOK_ARGUMENT]`.
+fn exec_form_managed_hook_name(handler: &JsonMap) -> Option<&str> {
+    let command = handler.get("command")?.as_str()?;
+    if command.trim().is_empty() {
+        return None;
+    }
+    match handler.get("args")?.as_array()?.as_slice() {
+        [hook, name, marker]
+            if hook.as_str() == Some("hook") && marker.as_str() == Some(MANAGED_HOOK_ARGUMENT) =>
+        {
+            name.as_str()
+                .filter(|name| super::codex_hooks::is_valid_hook_identifier(name))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a Claude Code handler object is ContextStream's, in any form a
+/// release or a hand repair wrote: exec form, or a `command` string in Bash,
+/// PowerShell (`& "..."`, `& '...'`) or cmd syntax, quoted or bare, with
+/// single or doubled backslashes, carrying the marker or (from before the
+/// marker) running the managed binary. Anything else is the user's.
+fn is_owned_claude_handler_for_platform(handler: &Value, managed: &Path, windows: bool) -> bool {
+    let Some(object) = handler.as_object() else {
+        return false;
+    };
+    if object.contains_key("args") {
+        return exec_form_managed_hook_name(object).is_some();
+    }
+    object
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| {
+            is_owned_contextstream_hook_command_for_platform(command, managed, windows)
+        })
+}
+
+/// The hook name of a Claude Code handler written in exactly the form this
+/// platform's install writes: exec form on Windows, a shell `command`
+/// (without PowerShell's call operator) elsewhere.
+fn claude_handler_current_hook_name(handler: &Value, windows: bool) -> Option<&str> {
+    let object = handler.as_object()?;
+    if windows {
+        return exec_form_managed_hook_name(object);
+    }
+    if object.contains_key("args") {
+        return None;
+    }
+    let command = object.get("command")?.as_str()?;
+    if command.trim_start().starts_with('&') {
+        return None;
+    }
+    current_managed_hook_name(command)
+}
+
+fn push_claude_hook(
+    config: &mut ClaudeHooksConfig,
+    spec: ClaudeHookSpec,
+    binary: &str,
+    windows: bool,
+) {
     let entry = HookEntry {
         matcher: spec.matcher.map(str::to_string),
-        hooks: vec![HookCommand {
-            command_type: "command".to_string(),
-            command: hook_command(binary, spec.hook_name),
-            timeout: Some(spec.timeout),
-        }],
+        hooks: vec![claude_hook_handler_for_platform(
+            binary,
+            spec.hook_name,
+            spec.timeout,
+            windows,
+        )],
     };
 
     match spec.event {
@@ -2127,11 +2260,36 @@ fn push_claude_hook(config: &mut ClaudeHooksConfig, spec: ClaudeHookSpec, binary
     }
 }
 
+/// A Cursor hook command. Cursor's desktop app runs hook commands through
+/// PowerShell on Windows (cursor.com/docs/agent/hooks), where a quoted path
+/// alone is a string, not a command: the path is called with `&` and quoted
+/// in single quotes, so nothing in it expands. Elsewhere the command runs in a
+/// POSIX shell.
+pub(super) fn cursor_hook_command_for_platform(
+    binary: &str,
+    hook_name: &str,
+    windows: bool,
+) -> String {
+    if windows {
+        return format!(
+            "& {} hook {} {}",
+            super::codex_hooks::powershell_safe_path_expression(binary),
+            hook_name,
+            MANAGED_HOOK_ARGUMENT
+        );
+    }
+    hook_command_for_platform(binary, hook_name, false)
+}
+
 fn json_hook_entry(binary: &str, spec: JsonHookSpec) -> Value {
     let mut entry = serde_json::Map::new();
     entry.insert(
         "command".to_string(),
-        Value::String(hook_command(binary, spec.hook_name)),
+        Value::String(cursor_hook_command_for_platform(
+            binary,
+            spec.hook_name,
+            cfg!(windows),
+        )),
     );
     if spec.timeout > 0 {
         entry.insert("timeout".to_string(), Value::Number(spec.timeout.into()));
@@ -2306,10 +2464,13 @@ fn is_contextstream_windsurf_hook(entry: &Value) -> bool {
 /// native Rust handlers. Format matches Claude Code settings.json schema:
 ///   { "matcher": "pattern", "hooks": [{ "type": "command", "command": "...", "timeout": N }] }
 fn generate_contextstream_hooks(_api_key: Option<&str>) -> ClaudeHooksConfig {
-    let binary = find_binary_path();
+    generate_contextstream_hooks_for_platform(&find_binary_path(), cfg!(windows))
+}
+
+fn generate_contextstream_hooks_for_platform(binary: &str, windows: bool) -> ClaudeHooksConfig {
     let mut config = ClaudeHooksConfig::default();
     for spec in CLAUDE_HOOK_SPECS {
-        push_claude_hook(&mut config, *spec, &binary);
+        push_claude_hook(&mut config, *spec, binary, windows);
     }
     config
 }
@@ -2403,21 +2564,56 @@ pub(super) fn parse_hook_command(command: &str) -> Option<(&str, &str)> {
 /// must remain refreshable and uninstallable without falling back to unsafe
 /// product-name sniffing.
 fn is_contextstream_hook_command(command: &str) -> bool {
-    let Some((_, rest)) = parse_hook_command(without_quiet_guard(command)) else {
+    let command = without_quiet_guard(command);
+    current_managed_hook_name(command).is_some()
+        || super::codex_hooks::parse_canonical_codex_windows_hook_command(command).is_some()
+        || is_marked_command_with_unquoted_spaced_program(command)
+}
+
+/// A marked command whose program is an unquoted path with spaces, such as
+/// the hand repair `C:/Users/Jane Doe/.contextstream/bin/contextstream-mcp.exe
+/// hook stop <marker>` (which runs only when the path has no spaces): the
+/// whole text before ` hook ` names `contextstream-mcp[.exe]`, and exactly
+/// `<name> <marker>` follows.
+fn is_marked_command_with_unquoted_spaced_program(command: &str) -> bool {
+    let Some((program, tail)) = command.trim().rsplit_once(" hook ") else {
         return false;
     };
-    let mut args = rest.split_whitespace();
-    matches!(
-        (args.next(), args.next(), args.next(), args.next()),
-        (Some("hook"), Some(_), Some(MANAGED_HOOK_ARGUMENT), None)
-    )
+    let mut args = tail.split_whitespace();
+    if !matches!(
+        (args.next(), args.next(), args.next()),
+        (Some(name), Some(MANAGED_HOOK_ARGUMENT), None)
+            if super::codex_hooks::is_valid_hook_identifier(name)
+    ) {
+        return false;
+    }
+    let program = program.trim().trim_start_matches('&').trim();
+    if program.contains(['"', '\'', ';', '|', '&', '<', '>', '`', '$']) {
+        return false;
+    }
+    let basename = program.rsplit(['/', '\\']).next().unwrap_or_default();
+    basename.eq_ignore_ascii_case("contextstream-mcp")
+        || basename.eq_ignore_ascii_case("contextstream-mcp.exe")
 }
 
 /// Recognize unmarked hooks from older ContextStream versions only when their
 /// executable lives at ContextStream's managed-binary path. An unmarked
 /// `contextstream-mcp hook ...` elsewhere may be user-authored and survives.
+#[cfg(test)]
 fn is_legacy_managed_hook_command(command: &str) -> bool {
-    let Some((program, rest)) = parse_hook_command(command) else {
+    is_legacy_managed_hook_command_for_platform(command, &managed_binary_path(), cfg!(windows))
+}
+
+/// The same, for an explicit managed binary and platform. The program may be
+/// bare, `"quoted"`, `'quoted'` or follow PowerShell's `&`; on Windows it
+/// matches the managed path ignoring case, separators and doubled
+/// backslashes.
+fn is_legacy_managed_hook_command_for_platform(
+    command: &str,
+    managed: &Path,
+    windows: bool,
+) -> bool {
+    let Some((program, rest)) = super::codex_hooks::parse_program_and_rest(command) else {
         return false;
     };
     let mut args = rest.split_whitespace();
@@ -2427,17 +2623,20 @@ fn is_legacy_managed_hook_command(command: &str) -> bool {
     ) {
         return false;
     }
-
-    let managed = managed_binary_path().to_string_lossy().to_string();
-    if cfg!(windows) {
-        program.eq_ignore_ascii_case(&managed)
-    } else {
-        program == managed
-    }
+    super::codex_hooks::program_matches_managed_binary(&program, managed, windows)
 }
 
 pub(super) fn is_owned_contextstream_hook_command(command: &str) -> bool {
-    is_contextstream_hook_command(command) || is_legacy_managed_hook_command(command)
+    is_owned_contextstream_hook_command_for_platform(command, &managed_binary_path(), cfg!(windows))
+}
+
+pub(super) fn is_owned_contextstream_hook_command_for_platform(
+    command: &str,
+    managed: &Path,
+    windows: bool,
+) -> bool {
+    is_contextstream_hook_command(command)
+        || is_legacy_managed_hook_command_for_platform(command, managed, windows)
 }
 
 pub(super) fn contains_owned_hook_command(value: &Value) -> bool {
@@ -2467,15 +2666,18 @@ pub(super) fn contains_owned_hook_command(value: &Value) -> bool {
                             cfg!(windows),
                         )
                     })
+                || exec_form_managed_hook_name(object).is_some()
                 || object.values().any(contains_owned_hook_command)
         }
         _ => false,
     }
 }
 
+/// The hook name of a command whose program (bare, `"quoted"`, PowerShell
+/// `'quoted'`, optionally after PowerShell's `&` call operator) is followed by
+/// exactly `hook <name> <marker>`.
 pub(super) fn current_managed_hook_name(command: &str) -> Option<&str> {
-    let command = command.trim().strip_prefix("& ").unwrap_or(command.trim());
-    let (_, rest) = parse_hook_command(without_quiet_guard(command))?;
+    let (_, rest) = super::codex_hooks::parse_program_and_rest(without_quiet_guard(command))?;
     let mut args = rest.split_whitespace();
     match (args.next(), args.next(), args.next(), args.next()) {
         (Some("hook"), Some(hook_name), Some(MANAGED_HOOK_ARGUMENT), None) => Some(hook_name),
@@ -2555,6 +2757,16 @@ fn flat_entry_matches_spec(entry: &Value, spec: JsonHookSpec, windsurf: bool) ->
         return true;
     }
 
+    // Cursor runs hooks through PowerShell on Windows: only `& <path>` runs.
+    if cfg!(windows)
+        && !object
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| command.trim_start().starts_with('&'))
+    {
+        return false;
+    }
+
     object
         .keys()
         .all(|key| matches!(key.as_str(), "command" | "timeout" | "matcher" | "type"))
@@ -2599,6 +2811,14 @@ fn validate_flat_hook_specs(
 fn validate_claude_hook_specs(
     hooks: &serde_json::Map<String, Value>,
 ) -> std::result::Result<usize, String> {
+    validate_claude_hook_specs_for_platform(hooks, &managed_binary_path(), cfg!(windows))
+}
+
+fn validate_claude_hook_specs_for_platform(
+    hooks: &serde_json::Map<String, Value>,
+    managed: &Path,
+    windows: bool,
+) -> std::result::Result<usize, String> {
     let mut owned = 0;
     for entries in hooks.values().filter_map(Value::as_array) {
         for entry in entries {
@@ -2606,10 +2826,7 @@ fn validate_claude_hook_specs(
                 owned += commands
                     .iter()
                     .filter(|command| {
-                        command
-                            .get("command")
-                            .and_then(Value::as_str)
-                            .is_some_and(is_owned_contextstream_hook_command)
+                        is_owned_claude_handler_for_platform(command, managed, windows)
                     })
                     .count();
             }
@@ -2632,10 +2849,7 @@ fn validate_claude_hook_specs(
                                             == Some("command")
                                             && command.get("timeout").and_then(Value::as_u64)
                                                 == Some(spec.timeout)
-                                            && command
-                                                .get("command")
-                                                .and_then(Value::as_str)
-                                                .and_then(current_managed_hook_name)
+                                            && claude_handler_current_hook_name(command, windows)
                                                 == Some(spec.hook_name)
                                     })
                                 },
@@ -2659,6 +2873,36 @@ fn validate_claude_hook_specs(
         ));
     }
     Ok(owned)
+}
+
+/// Re-install `editor`'s hooks when its hook file holds ContextStream entries
+/// that are not exactly the current set: duplicates, a shell syntax the host
+/// does not run, or an older form. A file without ContextStream entries, one
+/// that does not parse, or one with exactly the current set is left as it is,
+/// so a rules refresh repairs broken hooks and never adds hooks the user did
+/// not have. Returns whether it re-installed.
+pub fn repair_stale_managed_hooks(editor: &Editor) -> Result<bool> {
+    if !matches!(
+        editor,
+        Editor::ClaudeCode | Editor::Cursor | Editor::Windsurf
+    ) {
+        return Ok(false);
+    }
+    let Some(path) = hook_config_path(editor) else {
+        return Ok(false);
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Ok(false);
+    };
+    if !contains_owned_hook_command(&value) || validate_managed_hook_config(editor, &value).is_ok()
+    {
+        return Ok(false);
+    }
+    install_hooks_with_note(editor, None)?;
+    Ok(true)
 }
 
 /// Validate complete current managed-hook coverage without interpreting any
@@ -3354,6 +3598,7 @@ mod tests {
                     "contextstream-mcp hook session-start {}",
                     MANAGED_HOOK_ARGUMENT
                 ),
+                args: None,
                 timeout: Some(10),
             }],
         };
@@ -3368,6 +3613,7 @@ mod tests {
             hooks: vec![HookCommand {
                 command_type: "command".to_string(),
                 command: "echo user hook".to_string(),
+                args: None,
                 timeout: None,
             }],
         };
@@ -5237,5 +5483,330 @@ mod customized_settings_tests {
         assert!(published, "bare program is looked up on the PATH");
         assert!(!managed, "an absolute helper path is not");
         assert!(!other_editor);
+    }
+}
+
+#[cfg(test)]
+mod windows_hook_shell_tests {
+    //! Claude Code and Cursor hook commands on Windows, and the migration of
+    //! every ContextStream form found in a Windows `settings.json`: the
+    //! PowerShell `&` form Git Bash rejects, the Bash-quoted form PowerShell
+    //! rejects, the doubled backslashes of 1.0.0 to 1.0.71, the hand repair,
+    //! and duplicates of all of them.
+    use super::*;
+
+    const WIN_BINARY: &str = r"C:\Users\Jane Doe\.contextstream\bin\contextstream-mcp.exe";
+
+    fn win_managed() -> PathBuf {
+        PathBuf::from(WIN_BINARY)
+    }
+
+    fn handlers_of(hooks: &JsonMap) -> Vec<Value> {
+        hooks
+            .values()
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    fn migrate_windows(hooks: &mut JsonMap) {
+        merge_contextstream_hooks_into_for_platform(
+            hooks,
+            generate_contextstream_hooks_for_platform(WIN_BINARY, true),
+            &win_managed(),
+            true,
+        )
+        .expect("migrate");
+    }
+
+    /// Every ContextStream command form for `name`, as the strings Claude
+    /// Code reads after JSON decoding.
+    fn legacy_windows_commands(name: &str) -> Vec<String> {
+        let marker = MANAGED_HOOK_ARGUMENT;
+        let doubled = WIN_BINARY.replace('\\', r"\\");
+        let forward = WIN_BINARY.replace('\\', "/");
+        vec![
+            // PowerShell call operator (fails under Git Bash).
+            format!(r#"& "{WIN_BINARY}" hook {name}"#),
+            format!(r#"& "{WIN_BINARY}" hook {name} {marker}"#),
+            format!(r#"& '{WIN_BINARY}' hook {name} {marker}"#),
+            // Bash-quoted path (fails under PowerShell), 1.0.72 to 1.0.74.
+            format!(r#""{WIN_BINARY}" hook {name} {marker}"#),
+            format!(r#""{WIN_BINARY}" hook {name}"#),
+            // Doubled backslashes, 1.0.0 to 1.0.71.
+            format!(r#""{doubled}" hook {name} {marker}"#),
+            format!(r#""{doubled}" hook {name}"#),
+            format!(r#"& "{doubled}" hook {name}"#),
+            // The hand repair, and the same with forward slashes quoted.
+            format!("{forward} hook {name} {marker}"),
+            format!(r#""{forward}" hook {name}"#),
+            // Codex's PowerShell wrapper.
+            super::super::codex_hooks::codex_windows_hook_command(WIN_BINARY, name),
+        ]
+    }
+
+    #[test]
+    fn windows_claude_handlers_are_exec_form_with_each_backslash_escaped_once() {
+        let config = generate_contextstream_hooks_for_platform(WIN_BINARY, true);
+        let json = serde_json::to_string(&config).expect("serialize");
+
+        assert!(
+            json.contains(
+                r#"{"type":"command","command":"C:\\Users\\Jane Doe\\.contextstream\\bin\\contextstream-mcp.exe","args":["hook","stop","--contextstream-managed-hook=v1"],"timeout":"#
+            ),
+            "{json}"
+        );
+        assert!(!json.contains(r"\\\\"), "a backslash escaped twice: {json}");
+        assert!(
+            !json.contains(r#"\""#),
+            "a quoted program needs a shell: {json}"
+        );
+        assert!(!json.contains(r#""shell""#));
+
+        let value: Value = serde_json::from_str(&json).expect("parse");
+        let hooks = value.as_object().expect("hooks object");
+        let handlers = handlers_of(hooks);
+        assert_eq!(handlers.len(), CLAUDE_HOOK_SPECS.len());
+        for handler in &handlers {
+            assert_eq!(handler["command"], WIN_BINARY);
+            assert!(claude_handler_current_hook_name(handler, true).is_some());
+            assert!(claude_handler_current_hook_name(handler, false).is_none());
+        }
+        assert_eq!(
+            validate_claude_hook_specs_for_platform(hooks, &win_managed(), true),
+            Ok(CLAUDE_HOOK_SPECS.len())
+        );
+    }
+
+    #[test]
+    fn posix_claude_handlers_keep_the_shell_form() {
+        let binary = "/home/jane doe/.contextstream/bin/contextstream-mcp";
+        let value = serde_json::to_value(generate_contextstream_hooks_for_platform(binary, false))
+            .expect("serialize");
+        for handler in handlers_of(value.as_object().unwrap()) {
+            assert!(handler.get("args").is_none());
+            let command = handler["command"].as_str().unwrap();
+            assert!(
+                command.starts_with(&format!("\"{binary}\" hook ")),
+                "{command}"
+            );
+            assert!(claude_handler_current_hook_name(&handler, false).is_some());
+        }
+    }
+
+    #[test]
+    fn every_legacy_windows_form_is_ours_and_user_commands_are_not() {
+        let managed = win_managed();
+        for command in legacy_windows_commands("stop") {
+            assert!(
+                is_owned_contextstream_hook_command_for_platform(&command, &managed, true),
+                "missed: {command}"
+            );
+            let handler = json!({"type": "command", "command": command});
+            assert!(is_owned_claude_handler_for_platform(
+                &handler, &managed, true
+            ));
+            assert!(claude_handler_current_hook_name(&handler, true).is_none());
+        }
+        for command in [
+            r#""C:\Tools\guard.exe" check"#,
+            r#"& "C:\Users\Jane Doe\bin\my-hook.ps1""#,
+            r#""C:\Users\Jane Doe\bin\notify.exe" hook stop"#,
+            r#"& "C:\Users\Jane Doe\.contextstream\bin\contextstream-mcp.exe" hook stop; Remove-Item x"#,
+            r#""C:\Users\Jane Doe\.contextstream\bin\contextstream-mcp.exe" hook stop && del x"#,
+            "contextstream-mcp hook stop && echo user",
+            "contextstream-mcp hook stop",
+            "echo hook stop --contextstream-managed-hook=v1 > log.txt",
+        ] {
+            assert!(
+                !is_owned_contextstream_hook_command_for_platform(command, &managed, true),
+                "user command misclassified: {command}"
+            );
+        }
+        let user_exec =
+            json!({"type": "command", "command": "node", "args": [r"C:\hooks\check.js"]});
+        assert!(!is_owned_claude_handler_for_platform(
+            &user_exec, &managed, true
+        ));
+    }
+
+    /// A settings file shaped like the report: both broken sets registered,
+    /// doubled backslashes, the hand repair, and the user's own hooks.
+    const REPORTED_SETTINGS: &str = r#"{
+      "model": "opus",
+      "hooks": {
+        "SessionStart": [
+          {"hooks": [{"type": "command", "command": "& \"C:\\Users\\Jane Doe\\.contextstream\\bin\\contextstream-mcp.exe\" hook session-start", "timeout": 10}]},
+          {"hooks": [{"type": "command", "command": "\"C:\\\\Users\\\\Jane Doe\\\\.contextstream\\\\bin\\\\contextstream-mcp.exe\" hook session-start --contextstream-managed-hook=v1", "timeout": 10}]},
+          {"hooks": [{"type": "command", "command": "C:/Users/Jane Doe/.contextstream/bin/contextstream-mcp.exe hook session-start --contextstream-managed-hook=v1", "timeout": 10}]}
+        ],
+        "UserPromptSubmit": [
+          {"hooks": [{"type": "command", "command": "& \"C:\\Users\\Jane Doe\\.contextstream\\bin\\contextstream-mcp.exe\" hook user-prompt-submit --contextstream-managed-hook=v1"}]},
+          {"hooks": [{"type": "command", "command": "\"C:\\Users\\Jane Doe\\.contextstream\\bin\\contextstream-mcp.exe\" hook user-prompt-submit --contextstream-managed-hook=v1"}]}
+        ],
+        "PreToolUse": [
+          {"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "\"C:\\Tools\\guard.exe\" check", "shell": "powershell"},
+            {"type": "command", "command": "\"C:\\Users\\Jane Doe\\.contextstream\\bin\\contextstream-mcp.exe\" hook pre-tool-use --contextstream-managed-hook=v1"}
+          ]},
+          {"hooks": [{"type": "command", "command": "& \"C:\\Users\\Jane Doe\\.contextstream\\bin\\contextstream-mcp.exe\" hook pre-tool-use --contextstream-managed-hook=v1"}]}
+        ],
+        "Stop": [
+          {"hooks": [{"type": "command", "command": "\"C:\\Users\\Jane Doe\\.contextstream\\bin\\contextstream-mcp.exe\" hook stop --contextstream-managed-hook=v1"}]},
+          {"hooks": [{"type": "command", "command": "node", "args": ["C:\\hooks\\notify.js"]}]}
+        ],
+        "MyFutureEvent": [{"hooks": [{"type": "command", "command": "echo mine"}]}]
+      }
+    }"#;
+
+    fn user_handlers(hooks: &JsonMap) -> Vec<Value> {
+        handlers_of(hooks)
+            .into_iter()
+            .filter(|handler| !is_owned_claude_handler_for_platform(handler, &win_managed(), true))
+            .collect()
+    }
+
+    #[test]
+    fn the_reported_settings_migrate_to_one_exec_entry_per_event_and_keep_user_hooks() {
+        let settings: Value = serde_json::from_str(REPORTED_SETTINGS).expect("fixture");
+        let mut hooks = settings["hooks"].as_object().unwrap().clone();
+        let users_before = user_handlers(&hooks);
+        assert_eq!(users_before.len(), 3);
+        assert!(validate_claude_hook_specs_for_platform(&hooks, &win_managed(), true).is_err());
+
+        migrate_windows(&mut hooks);
+
+        assert_eq!(
+            validate_claude_hook_specs_for_platform(&hooks, &win_managed(), true),
+            Ok(CLAUDE_HOOK_SPECS.len())
+        );
+        let owned: Vec<Value> = handlers_of(&hooks)
+            .into_iter()
+            .filter(|handler| is_owned_claude_handler_for_platform(handler, &win_managed(), true))
+            .collect();
+        assert_eq!(owned.len(), CLAUDE_HOOK_SPECS.len());
+        assert!(owned
+            .iter()
+            .all(|handler| handler["command"] == WIN_BINARY && handler.get("args").is_some()));
+        assert_eq!(user_handlers(&hooks), users_before);
+        // The user's matcher group keeps its own handler; the unknown event stays.
+        assert_eq!(hooks["PreToolUse"][0]["matcher"], "Bash");
+        assert_eq!(hooks["PreToolUse"][0]["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            hooks["MyFutureEvent"][0]["hooks"][0]["command"],
+            "echo mine"
+        );
+
+        let mut again = hooks.clone();
+        migrate_windows(&mut again);
+        assert_eq!(again, hooks, "a second update changes nothing");
+    }
+
+    #[test]
+    fn every_legacy_form_on_every_event_migrates_to_exactly_one_entry_each() {
+        let mut hooks = JsonMap::new();
+        for spec in CLAUDE_HOOK_SPECS {
+            let event = claude_hook_event_name(spec.event).to_string();
+            let entries = hooks
+                .entry(event)
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .unwrap();
+            for command in legacy_windows_commands(spec.hook_name) {
+                let mut group = json!({"hooks": [{"type": "command", "command": command, "timeout": spec.timeout}]});
+                if let Some(matcher) = spec.matcher {
+                    group["matcher"] = json!(matcher);
+                }
+                entries.push(group);
+            }
+        }
+        migrate_windows(&mut hooks);
+        assert_eq!(
+            validate_claude_hook_specs_for_platform(&hooks, &win_managed(), true),
+            Ok(CLAUDE_HOOK_SPECS.len())
+        );
+        assert_eq!(handlers_of(&hooks).len(), CLAUDE_HOOK_SPECS.len());
+    }
+
+    #[test]
+    fn windows_cursor_commands_call_a_single_quoted_path_in_powershell() {
+        let command = cursor_hook_command_for_platform(WIN_BINARY, "pre-tool-use", true);
+        assert_eq!(
+            command,
+            r"& 'C:\Users\Jane Doe\.contextstream\bin\contextstream-mcp.exe' hook pre-tool-use --contextstream-managed-hook=v1"
+        );
+        assert_eq!(current_managed_hook_name(&command), Some("pre-tool-use"));
+        assert!(is_owned_contextstream_hook_command_for_platform(
+            &command,
+            &win_managed(),
+            true
+        ));
+
+        let odd = cursor_hook_command_for_platform(
+            r"C:\Users\O'Brien $x\.contextstream\bin\contextstream-mcp.exe",
+            "stop",
+            true,
+        );
+        assert!(!odd.contains('$'), "{odd}");
+        assert_eq!(current_managed_hook_name(&odd), Some("stop"));
+
+        let posix =
+            cursor_hook_command_for_platform("/home/u/bin/contextstream-mcp", "stop", false);
+        assert_eq!(
+            posix,
+            format!("\"/home/u/bin/contextstream-mcp\" hook stop {MANAGED_HOOK_ARGUMENT}")
+        );
+    }
+
+    #[test]
+    fn a_rules_refresh_repairs_stale_claude_hooks_once_and_leaves_others_alone() {
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp.path());
+        let settings_path = claude_code_settings_path().expect("settings path");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        let managed = managed_binary_path();
+
+        // Only the user's hooks: nothing to repair, nothing written.
+        let user_only =
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}"#;
+        std::fs::write(&settings_path, user_only).unwrap();
+        let untouched = repair_stale_managed_hooks(&Editor::ClaudeCode).expect("repair");
+        let user_only_after = std::fs::read_to_string(&settings_path).unwrap();
+
+        // A stale duplicate set in the PowerShell form: repaired once.
+        let stale = json!({"hooks": {"Stop": [
+            {"hooks": [{"type": "command", "command": format!("& \"{}\" hook stop", managed.display())}]},
+            {"hooks": [{"type": "command", "command": format!("\"{}\" hook stop {MANAGED_HOOK_ARGUMENT}", managed.display())}]},
+            {"hooks": [{"type": "command", "command": "echo mine"}]}
+        ]}});
+        std::fs::write(&settings_path, stale.to_string()).unwrap();
+        let repaired = repair_stale_managed_hooks(&Editor::ClaudeCode).expect("repair");
+        let after_first = std::fs::read_to_string(&settings_path).unwrap();
+        let repaired_again = repair_stale_managed_hooks(&Editor::ClaudeCode).expect("repair again");
+        let after_second = std::fs::read_to_string(&settings_path).unwrap();
+
+        match previous {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(!untouched);
+        assert_eq!(user_only_after, user_only);
+        assert!(repaired);
+        let value: Value = serde_json::from_str(&after_first).unwrap();
+        assert_eq!(
+            validate_managed_hook_config(&Editor::ClaudeCode, &value),
+            Ok(CLAUDE_HOOK_SPECS.len())
+        );
+        assert!(after_first.contains("echo mine"));
+        assert!(!repaired_again);
+        assert_eq!(after_second, after_first);
     }
 }

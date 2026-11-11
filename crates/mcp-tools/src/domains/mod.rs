@@ -25,6 +25,7 @@ pub(crate) mod linked_workspaces;
 pub(crate) mod lookup;
 pub mod media;
 pub mod memory;
+pub(crate) mod plan_loops;
 pub mod project;
 pub mod project_brief;
 pub mod qa;
@@ -47,6 +48,8 @@ pub mod workspace_drift;
 mod coached_rules_tests;
 #[cfg(test)]
 mod parity_eval_tests;
+#[cfg(test)]
+mod plan_loops_tests;
 #[cfg(test)]
 mod reference_resolution_tests;
 #[cfg(test)]

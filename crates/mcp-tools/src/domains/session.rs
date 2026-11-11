@@ -17378,6 +17378,43 @@ pub struct SessionInput {
     pub is_personal: Option<bool>,
     /// Execution mode override or `set_account_mode` target: team|personal|auto.
     pub account_mode: Option<String>,
+    // Plan loop fields (start_loop, loop_status, advance_loop, resolve_gate,
+    // abort_loop, resume_loop, list_loops).
+    #[serde(default)]
+    pub loop_id: Option<String>,
+    #[serde(default)]
+    pub gate_id: Option<String>,
+    #[serde(default)]
+    pub step_id: Option<String>,
+    /// For `resolve_gate`: the steps a request for changes affects.
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub step_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub max_iterations: Option<i64>,
+    #[serde(default)]
+    pub review_policy: Option<String>,
+    #[serde(default)]
+    pub review_every_n: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub gates: Option<Vec<Value>>,
+    #[serde(default)]
+    pub report_cadence_minutes: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub audience: Option<Vec<String>>,
+    /// For `loop_status`: the events cursor (a sequence number).
+    #[serde(default)]
+    pub after: Option<Value>,
+    /// For `list_loops`: running|awaiting_review|blocked|completed|aborted.
+    #[serde(default)]
+    pub loop_state: Option<String>,
 }
 
 /// Unified session tool handler.
@@ -17402,15 +17439,16 @@ impl SessionTool {
 }
 
 /// Routing summary advertised as the tool description (<= 1024 chars).
-const SESSION_TOOL_DESCRIPTION: &str = "Session and memory management — NOT for codebase/file search (use `search`). LESSONS: on a mistake or correction call action='capture_lesson', not local files. DECISIONS: action='capture', event_type='decision'. PAST SESSIONS: `context()` surfaces `[GROUNDING]`; when it is fresh and sufficient, do not immediately call action='recall'. Use recall as the first explicit escalation when grounding is absent, thin, stale, off-topic, or the user asks for history. smart_search searches MEMORY only, not code. RESUME earlier work: action='resume' or 'resume_list', session_id = id init returned. PLANS: action='capture_plan' (structured steps; creates linked tasks by default); do not use action='capture' for plans. Snapshots: action='capture', event_type='session_snapshot'. Daily Recaps run around 23:00 user time, not at MCP session boundaries. Also: ground, retro_capture, user_context, list_suggested_rules, suggested_rule_action, suggested_rules_stats, set_account_mode. Full reference: the `action` parameter.";
+const SESSION_TOOL_DESCRIPTION: &str = "Session and memory — NOT for codebase/file search (use `search`). LESSONS: on a mistake or correction, action='capture_lesson', not local files. DECISIONS: action='capture', event_type='decision'. PAST SESSIONS: `context()` surfaces `[GROUNDING]`; when it is fresh and sufficient, do not immediately call action='recall'. Recall is the first explicit escalation when grounding is absent, thin, stale, off-topic, or history is asked for. smart_search: MEMORY only, not code. RESUME: action='resume' or 'resume_list', session_id = id init returned. PLANS: action='capture_plan' (structured steps; creates linked tasks by default); do not use action='capture'. PLAN LOOPS: start_loop, advance_loop, resolve_gate, loop_status. Snapshots: action='capture', event_type='session_snapshot'. Daily Recaps run around 23:00 user time, not at MCP session boundaries. Also: ground, retro_capture, user_context, list_suggested_rules, suggested_rule_action, suggested_rules_stats, set_account_mode. Full reference: the `action` parameter.";
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const SESSION_TOOL_REFERENCE: &str = "Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). Lesson maintenance is supported via action='update_lesson' and action='supersede_lesson' (to delete one: the `delete` tool, action=\"session.delete_lesson\") with lesson_id (UUID or title; delete and supersede need a UUID or the exact title); lessons go to the typed /lessons endpoints first and fall back to memory events only when the server answers 404 (stated with a [PARTIAL] line). DECISIONS: action='capture' with event_type='decision' plus rationale/alternatives/scope/confidence routes to the typed decision create (same as memory(action=\"create_decision\")). PAST SESSIONS LIVE HERE: transcripts of every prior session are captured + indexed and are queryable. `context()` auto-surfaces `[GROUNDING]` prior-work hits; when that grounding is fresh, relevant, and sufficient, do not immediately call action='recall' for the same request. Call action='recall' as the first explicit escalation when `[GROUNDING]` is absent, thin, stale, off-topic, or when the user explicitly requests broader or session-specific history. For after-the-fact durable saves, use action='retro_capture' with title plus content and/or query/transcript_id; it stores the capture rationale, source query, transcript IDs, and source snippets in provenance. Use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills + git) outside context(). Also `memory(action=\"list_transcripts\"|\"search_transcripts\"|\"get_transcript\")` for chronological + full-text access. Save a session_snapshot at turning points so the NEXT session can pick up: action='capture', event_type='session_snapshot'. To pick up earlier work call action='resume' (most recent earlier session; resume_id picks another) or action='resume_list' (recent sessions, newest first), always with session_id set to the id init returned, so your own session is left out. Daily Recaps run around 23:00 in the user's timezone, not at MCP session boundaries; use list_recaps for timestamped history and trigger_recap for a manual asynchronous run. Team/personal mode: action='set_account_mode' with account_mode=team|personal|auto. Actions: capture, retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons, update_lesson, supersede_lesson, recall (retrieve past conversation context when auto-grounding is insufficient), ground (one-shot prior-work bundle — requires user_message or query), remember, user_context, summary, compress, delta, smart_search (searches MEMORY/conversation history only, not code), decision_trace, list_recaps, trigger_recap, restore_context, resume_list (recent sessions, newest first; pass session_id), resume (one session's saved state and newest messages; resume_id picks one, default latest; pass session_id), set_account_mode. Plan actions: capture_plan, get_plan, update_plan, list_plans. Use capture_plan for plans; do not use action='capture' with event_type='plan'. capture_plan requires structured steps and creates linked tasks by default with plan_id and plan_step_id. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Coaching rules (standing instructions the person gives you; they appear in the [COACHING] block of `context()` and of the prompt hook): add_coached_rule with rule_text (one instruction in the person's own words, up to 500 characters; holds in every project of the workspace, or in one project with scope='project'; the same rule said again is kept once), list_coached_rules (the person's rules, learned ones included, with source and scope).";
+const SESSION_TOOL_REFERENCE: &str = "Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). Lesson maintenance is supported via action='update_lesson' and action='supersede_lesson' (to delete one: the `delete` tool, action=\"session.delete_lesson\") with lesson_id (UUID or title; delete and supersede need a UUID or the exact title); lessons go to the typed /lessons endpoints first and fall back to memory events only when the server answers 404 (stated with a [PARTIAL] line). DECISIONS: action='capture' with event_type='decision' plus rationale/alternatives/scope/confidence routes to the typed decision create (same as memory(action=\"create_decision\")). PAST SESSIONS LIVE HERE: transcripts of every prior session are captured + indexed and are queryable. `context()` auto-surfaces `[GROUNDING]` prior-work hits; when that grounding is fresh, relevant, and sufficient, do not immediately call action='recall' for the same request. Call action='recall' as the first explicit escalation when `[GROUNDING]` is absent, thin, stale, off-topic, or when the user explicitly requests broader or session-specific history. For after-the-fact durable saves, use action='retro_capture' with title plus content and/or query/transcript_id; it stores the capture rationale, source query, transcript IDs, and source snippets in provenance. Use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills + git) outside context(). Also `memory(action=\"list_transcripts\"|\"search_transcripts\"|\"get_transcript\")` for chronological + full-text access. Save a session_snapshot at turning points so the NEXT session can pick up: action='capture', event_type='session_snapshot'. To pick up earlier work call action='resume' (most recent earlier session; resume_id picks another) or action='resume_list' (recent sessions, newest first), always with session_id set to the id init returned, so your own session is left out. Daily Recaps run around 23:00 in the user's timezone, not at MCP session boundaries; use list_recaps for timestamped history and trigger_recap for a manual asynchronous run. Team/personal mode: action='set_account_mode' with account_mode=team|personal|auto. Actions: capture, retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons, update_lesson, supersede_lesson, recall (retrieve past conversation context when auto-grounding is insufficient), ground (one-shot prior-work bundle — requires user_message or query), remember, user_context, summary, compress, delta, smart_search (searches MEMORY/conversation history only, not code), decision_trace, list_recaps, trigger_recap, restore_context, resume_list (recent sessions, newest first; pass session_id), resume (one session's saved state and newest messages; resume_id picks one, default latest; pass session_id), set_account_mode. Plan actions: capture_plan, get_plan, update_plan, list_plans. Use capture_plan for plans; do not use action='capture' with event_type='plan'. capture_plan requires structured steps and creates linked tasks by default with plan_id and plan_step_id. Plan loop actions (a saved plan run step by step that stops at review gates for a person; ContextStream holds every bit of loop state, and each action is one call with your own key): start_loop (plan_id = UUID or title; optional config: max_iterations 1-20, default 5; review_policy explicit|every_step|every_n|milestone_only with review_every_n for every_n; gates [{step_id, type human_review|status_report, required, reviewer_roles, reviewer_user_ids, channel coflow|contextstream|both, sla_hours}]; report_cadence_minutes 0 for off or 5-10080; audience role labels), loop_status (loop_id, or plan_id for the plan's latest loop; after = an events cursor, 0 for the first page, also lists the loop's events), advance_loop (loop_id, step_id = the step the loop expects, once it is done, summary), resolve_gate (loop_id, gate_id, outcome approve|request_changes|abort, note required for request_changes, step_ids = the steps to redo), abort_loop (loop_id, reason), resume_loop (loop_id, optional higher max_iterations; only a blocked loop resumes), list_loops (workspace_id, project_id, loop_state, limit). Status awaiting_review means stop until the open gate is resolved; when the loop carries a replan_context, use its review note on the next pass. A refused transition (409) says what it means: step_out_of_order, plan_version_conflict (the plan changed: call resume_loop), gate_already_resolved, loop_already_running, illegal_transition. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Coaching rules (standing instructions the person gives you; they appear in the [COACHING] block of `context()` and of the prompt hook): add_coached_rule with rule_text (one instruction in the person's own words, up to 500 characters; holds in every project of the workspace, or in one project with scope='project'; the same rule said again is kept once), list_coached_rules (the person's rules, learned ones included, with source and scope).";
 
 #[async_trait]
 impl ToolHandler for SessionTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let input = super::plan_loops::normalize_loop_input(input);
         let mut input: SessionInput =
             serde_json::from_value(input.clone()).map_err(|e| Error::Validation(e.to_string()))?;
 
@@ -18381,6 +18419,11 @@ impl ToolHandler for SessionTool {
                     Err(err) => Err(err),
                 }
             }
+            action @ ("start_loop" | "loop_status" | "advance_loop" | "resolve_gate"
+            | "abort_loop" | "resume_loop" | "list_loops") => {
+                super::plan_loops::execute(&self.client, self.session.as_ref(), action, input)
+                    .await
+            }
             "user_context" => {
                 use mcp_client::SessionUserContextParams;
                 let params = SessionUserContextParams {
@@ -18481,7 +18524,7 @@ impl ToolHandler for SessionTool {
                 ))
             }
             _ => Err(Error::Validation(format!(
-                "Unknown action: {}. Use 'capture', 'retro_capture', 'capture_lesson', 'get_lessons', 'update_lesson', 'delete_lesson', 'supersede_lesson', 'recall', 'ground', 'set_account_mode', 'remember', 'user_context', 'summary', 'compress', 'delta', 'smart_search', 'decision_trace', 'list_recaps', 'trigger_recap', 'restore_context', 'resume_list', 'resume', 'capture_plan', 'get_plan', 'update_plan', 'list_plans', 'list_suggested_rules', 'suggested_rule_action', 'suggested_rules_stats', 'list_coached_rules', or 'add_coached_rule'.",
+                "Unknown action: {}. Use 'capture', 'retro_capture', 'capture_lesson', 'get_lessons', 'update_lesson', 'delete_lesson', 'supersede_lesson', 'recall', 'ground', 'set_account_mode', 'remember', 'user_context', 'summary', 'compress', 'delta', 'smart_search', 'decision_trace', 'list_recaps', 'trigger_recap', 'restore_context', 'resume_list', 'resume', 'capture_plan', 'get_plan', 'update_plan', 'list_plans', 'start_loop', 'loop_status', 'advance_loop', 'resolve_gate', 'abort_loop', 'resume_loop', 'list_loops', 'list_suggested_rules', 'suggested_rule_action', 'suggested_rules_stats', 'list_coached_rules', or 'add_coached_rule'.",
                 input.action
             ))),
         }
@@ -18538,6 +18581,13 @@ impl ToolHandler for SessionTool {
                     "suggested_rules_stats",
                     "list_coached_rules",
                     "add_coached_rule",
+                    "start_loop",
+                    "loop_status",
+                    "advance_loop",
+                    "resolve_gate",
+                    "abort_loop",
+                    "resume_loop",
+                    "list_loops",
                 ],
                 true,
             )
@@ -18812,8 +18862,154 @@ impl ToolHandler for SessionTool {
                 "The coaching rule, one standing instruction in the person's own words, up to 500 characters (for add_coached_rule)",
                 false,
             )
+            // Plan loops. start_loop and loop_status take the plan as
+            // plan_id (a UUID or a title), the other loop actions loop_id.
+            .string(
+                "loop_id",
+                "Loop ID (for loop_status, advance_loop, resolve_gate, abort_loop, resume_loop); start_loop, loop_status and list_loops show it",
+                false,
+            )
+            .string(
+                "gate_id",
+                "Open gate ID (for resolve_gate); loop_status shows it",
+                false,
+            )
+            .string(
+                "step_id",
+                "The step the loop expects, once it is done (for advance_loop); loop_status names it",
+                false,
+            )
+            .string(
+                "summary",
+                "What was done in the step (for advance_loop)",
+                false,
+            )
+            .string_enum(
+                "outcome",
+                "Gate outcome (for resolve_gate)",
+                mcp_client::plan_loops::GATE_OUTCOMES,
+                false,
+            )
+            .string(
+                "note",
+                "Review note (for resolve_gate): required for request_changes; the loop carries it into the next pass as replan_context",
+                false,
+            )
+            .array(
+                "step_ids",
+                "Steps a request_changes affects, to redo on the next pass (for resolve_gate)",
+                "string",
+                false,
+            )
+            .string("reason", "Why the loop is aborted (for abort_loop)", false)
+            .integer(
+                "max_iterations",
+                "Most passes the loop may make, 1-20, default 5 (for start_loop); resume_loop takes a higher one for a loop blocked at its limit",
+                false,
+            )
+            .string_enum(
+                "review_policy",
+                "Which steps get a review gate (for start_loop): explicit (default; only the listed gates), every_step, every_n (with review_every_n), milestone_only (the last step)",
+                mcp_client::plan_loops::REVIEW_POLICIES,
+                false,
+            )
+            .integer(
+                "review_every_n",
+                "With review_policy=every_n: a gate on every n-th step and the last (for start_loop)",
+                false,
+            )
+            .property(
+                "gates",
+                serde_json::json!({
+                    "type": "array",
+                    "description": "Review gates (for start_loop). A gate opens when its step is completed and reviews that step's result; a listed gate overrides the policy's gate for its step.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step_id": { "type": "string", "description": "The plan step whose result the gate reviews" },
+                            "type": { "type": "string", "enum": mcp_client::plan_loops::GATE_TYPES, "description": "human_review stops the loop for a person (when required); status_report only reports" },
+                            "required": { "type": "boolean", "description": "Default true" },
+                            "reviewer_roles": { "type": "array", "items": { "type": "string" }, "description": "Role labels such as engineering, product, design" },
+                            "reviewer_user_ids": { "type": "array", "items": { "type": "string" }, "description": "User UUIDs; when set, only they may resolve it" },
+                            "channel": { "type": "string", "enum": mcp_client::plan_loops::GATE_CHANNELS, "description": "Where it is announced; default both" },
+                            "sla_hours": { "type": "integer", "description": "1-720; default 24 for human_review" }
+                        },
+                        "required": ["step_id"]
+                    }
+                }),
+                false,
+            )
+            .integer(
+                "report_cadence_minutes",
+                "Status report cadence (for start_loop): 0 for none, else 5-10080",
+                false,
+            )
+            .array(
+                "audience",
+                "Role labels the loop's reports are for, default [\"engineering\"] (for start_loop)",
+                "string",
+                false,
+            )
+            .integer(
+                "after",
+                "Events cursor (for loop_status): next_after of the previous page, 0 for the first; with it, loop_status also lists the loop's events",
+                false,
+            )
+            .string_enum(
+                "loop_state",
+                "Loop state filter (for list_loops)",
+                mcp_client::plan_loops::LOOP_STATES,
+                false,
+            )
             .build()
     }
+}
+
+/// A plan named for a plan loop action: a UUID is taken as given; anything
+/// else is a title, looked up in scope as update_plan does.
+pub(crate) async fn resolve_loop_plan(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    reference: &str,
+    workspace_id: Option<&str>,
+    project_id: Option<&str>,
+    action: LookupAction,
+    retry: &str,
+) -> Result<Lookup> {
+    let reference = reference.trim();
+    if let Ok(id) = Uuid::parse_str(reference) {
+        return Ok(Lookup::Found(lookup::Found::by_id(id)));
+    }
+    let scope = resolve_read_scope(client, session, workspace_id, project_id).await?;
+    let workspace_id = scope.workspace_id.ok_or_else(|| {
+        Error::Validation(
+            "workspace_id is required to look a plan up by title. Run init(folder_path=\"...\"), pass workspace_id, or pass plan_id as a UUID.".to_string(),
+        )
+    })?;
+    let plans = client
+        .list_plans_filtered(
+            workspace_id.into(),
+            scope.project_id,
+            Some(reference),
+            None,
+            Some(100),
+        )
+        .await?;
+    lookup::resolve_reference(
+        &LookupContext {
+            kind: PLANS,
+            action,
+            retry,
+            hint: None,
+        },
+        reference,
+        &plan_lookup_candidates(&collect_unique_plan_candidates(&[&plans])),
+        || {
+            format!(
+                "No plan found matching '{reference}'. Try session(action=\"list_plans\", query=\"{reference}\") to inspect candidates."
+            )
+        },
+    )
 }
 
 /// Register all session tools.

@@ -354,6 +354,13 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "get_lessons": "Loading ContextStream lessons",
             "get_plan": "Loading plan from ContextStream",
             "list_plans": "Listing ContextStream plans",
+            "start_loop": "Starting plan loop in ContextStream",
+            "loop_status": "Loading plan loop from ContextStream",
+            "advance_loop": "Advancing plan loop in ContextStream",
+            "resolve_gate": "Resolving plan loop gate in ContextStream",
+            "abort_loop": "Aborting plan loop in ContextStream",
+            "resume_loop": "Resuming plan loop in ContextStream",
+            "list_loops": "Listing ContextStream plan loops",
             "summary": "Loading ContextStream session summary",
             "compress": "Compressing ContextStream session",
             "delta": "Loading ContextStream session delta",
@@ -3498,8 +3505,11 @@ mod tests {
             // Advanced in Wave 3b: additive inputs (successor_id, rationale,
             // alternatives, scope, confidence, supersedes) plus the
             // `supersede_lesson` action value. Additive only.
+            // Advanced for plan loops (contract v1.2): seven loop actions and
+            // their inputs. Additive only: without them it is Wave 3b's
+            // contract (plan_loop_inputs_only_add_to_the_session_schemas).
             "session",
-            "59e16ae4e5764294d3d60cccf017996e3f3dcfea62dbb38bf4b3b4eda2af0db1",
+            "a7eba49505de3148bc5157b1cf6d59e91a9d4353c944e661e0635dd8bdc4858f",
         ),
         (
             "session_capture",
@@ -3510,8 +3520,10 @@ mod tests {
             "e14ad74849d35160cb0ebfb04a92cf6b90598c9ae1d1bf78ec28901b109c8c66",
         ),
         (
+            // Advanced for plan loops: loop_status and list_loops, and the
+            // loop inputs. Additive only, as for `session`.
             "session_read",
-            "f1a5d49e80171b683738f5bc40cb1b2feb939869ad5d52a965e238ae0b4689e5",
+            "0cb5d5497838e3b0999995e58f327a85e41420b7fea63c8e3a7bdd7f7c5d378c",
         ),
         (
             "session_remember",
@@ -3794,6 +3806,67 @@ mod tests {
             }
         }
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn plan_loop_inputs_only_add_to_the_session_schemas() {
+        // The plan loop actions (contract v1.2) added actions and parameters
+        // to `session` and `session_read`. Without them both schemas are
+        // exactly the contracts they had before (Wave 3b's), so the plan
+        // actions and every other parameter are unchanged.
+        const LOOP_ACTIONS: &[&str] = &[
+            "start_loop",
+            "loop_status",
+            "advance_loop",
+            "resolve_gate",
+            "abort_loop",
+            "resume_loop",
+            "list_loops",
+        ];
+        const LOOP_PARAMS: &[&str] = &[
+            "loop_id",
+            "gate_id",
+            "step_id",
+            "summary",
+            "outcome",
+            "note",
+            "step_ids",
+            "reason",
+            "max_iterations",
+            "review_policy",
+            "review_every_n",
+            "gates",
+            "report_cadence_minutes",
+            "audience",
+            "after",
+            "loop_state",
+        ];
+        let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        for (name, before) in [
+            (
+                "session",
+                "59e16ae4e5764294d3d60cccf017996e3f3dcfea62dbb38bf4b3b4eda2af0db1",
+            ),
+            (
+                "session_read",
+                "f1a5d49e80171b683738f5bc40cb1b2feb939869ad5d52a965e238ae0b4689e5",
+            ),
+        ] {
+            let mut schema = tool_by_name(&tools, name)["inputSchema"].clone();
+            let properties = schema["properties"]
+                .as_object_mut()
+                .expect("schema properties");
+            for param in LOOP_PARAMS {
+                assert!(properties.remove(*param).is_some(), "{name}: {param}");
+            }
+            let actions = properties["action"]["enum"]
+                .as_array_mut()
+                .expect("action enum");
+            let listed = actions.len();
+            actions.retain(|action| !LOOP_ACTIONS.contains(&action.as_str().unwrap_or_default()));
+            assert!(actions.len() < listed, "{name} lists no loop action");
+            assert_eq!(schema_contract_hash(&schema), before, "{name}");
+        }
     }
 
     /// Every surface a client can be configured into, including the hosted

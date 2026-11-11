@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.75
+
+- Windows hooks: Claude Code runs a hook command with Git Bash on Windows, or with PowerShell when Git Bash is not installed, and ContextStream's hooks were written for only one of them. PowerShell reads `"C:\...\contextstream-mcp.exe" hook stop` as a string followed by `hook` (ParserError), and Git Bash rejects the `& "..."` form, so every hook could fail and block tool calls. Each Claude Code hook on Windows is now in exec form: `command` is the executable and `args` its arguments (`hook`, the hook name, the marker), which Claude Code 2.1.139 and later starts directly with no shell, also when the path has spaces. macOS and Linux keep their shell command. Cursor, whose desktop app runs hooks through PowerShell on Windows, now calls the path with `&` in single quotes.
+- Hook repair: `update-hooks` (which `contextstream-mcp update` runs) recognises every ContextStream hook an earlier release or a hand repair wrote, including the PowerShell `&` form, the Bash-quoted form, the doubled backslashes 1.0.71 and earlier wrote on Windows and unquoted forward-slash paths, and replaces them with exactly one entry per event; your own hooks are kept and a second run changes nothing. `update-rules` repairs Claude Code, Cursor and Windsurf hooks the same way when their file holds ContextStream hooks that are not exactly the current set, and leaves any other hook file as it is. `doctor` reports Windows hooks in an older form, with `update-hooks` as the fix.
+
 ## 1.0.74
 
 - Plan loops: the `session` tool can run a saved plan as a loop with review gates: `start_loop`, `loop_status`, `advance_loop`, `resolve_gate` (approve, request changes with a note, or abort), `abort_loop`, `resume_loop` and `list_loops`. The server keeps no loop state: every action calls the ContextStream API with your own key, the API answers `plan_version_conflict` when the plan changed under a running loop (resume it), and resolving a gate the same way twice changes nothing. `loop_status` and `list_loops` are also on `session_read`.

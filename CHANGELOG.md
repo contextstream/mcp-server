@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.73
+
+- Release builds: the six release binaries now build side by side on one builder. The Windows build's cargo-xwin cache was shared by all six with a lock, so each binary waited for the one before it. The binaries themselves are built as in 1.0.72; this version changes no behaviour.
+
 ## 1.0.72
 
 - Codex hooks on Windows: `setup`, `update-hooks`, and `doctor --repair` write a `commandWindows` override in `~/.codex/hooks.json` that launches `contextstream-mcp.exe` cleanly in both PowerShell and Command Prompt—including install paths with spaces, apostrophes, shell metacharacters, and `\\?\` prefixes—fixing PowerShell's `Unexpected token 'hook'` failure on bare quoted executable paths. Updates keep the `commandWindows` override in place, migrate 1.0.71 entries and local workarounds while preserving other hooks, and note when to run `/hooks` in Codex CLI to approve the updated hook and reload the session.
